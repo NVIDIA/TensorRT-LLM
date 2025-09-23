@@ -6,7 +6,7 @@ from .flashinfer_attention import *
 from .flashinfer_rope import *
 from .linear import *
 from .mla import *
-from .mxfp4 import *
+from .mxfp4_moe import *
 from .quant import *
 from .rms_norm import *
 from .torch_attention import *

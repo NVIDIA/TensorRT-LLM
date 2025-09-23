@@ -339,6 +339,7 @@ def torch_quant_nvfp4_moe_fake(
 #   next_states:     [B, S, H]
 
 
+# GPT-OSS uses this style
 @torch.library.custom_op("auto_deploy::torch_moe_dense_mlp", mutates_args=())
 def torch_moe_dense_mlp(
     hidden_states: torch.Tensor,

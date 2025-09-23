@@ -2,7 +2,6 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import (
@@ -10,6 +9,7 @@ from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import (
     register_ad_pattern,
 )
 
+from ...custom_ops import IS_TRITON_KERNELS_AVAILABLE
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -107,84 +107,6 @@ class MatchMOEDenseMLP(BaseTransform):
         register_ad_pattern(
             search_fn=_moe_dense_mlp_pattern,
             replace_fn=_moe_dense_mlp_repl,
-            patterns=patterns,
-            dummy_args=dummy_args,
-            op_ignore_types=op_ignore_types,
-            scalar_workaround=scalar_workaround,
-        )
-
-        num_matches = patterns.apply(graph)
-        info = TransformInfo(
-            skipped=False,
-            num_matches=num_matches,
-            is_clean=False,
-            has_valid_shapes=False,
-        )
-        return gm, info
-
-
-def _router_pattern(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    top_k: int = 2,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    hidden_dim = hidden_states.shape[-1]
-    hidden_states = hidden_states.reshape(-1, hidden_dim)  # [T, H]
-    router_logits = F.linear(hidden_states, weight, bias)  # (seq_len, num_experts)
-    router_top_value, router_indices = torch.topk(router_logits, top_k, dim=-1)  # (seq_len, top_k)
-    router_top_value = torch.nn.functional.softmax(
-        router_top_value, dim=1, dtype=router_top_value.dtype
-    )
-    router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
-    return router_scores
-
-
-def _router_repl(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    top_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.auto_deploy.torch_moe_router(hidden_states, weight, bias, top_k)
-
-
-# This is currently not working because the pattern "crosses mutation barrier"
-@TransformRegistry.register("match_moe_router_pattern")
-class MatchMOERouter(BaseTransform):
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm,
-        factory,
-        shared_config,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        graph = gm.graph
-        patterns = ADPatternMatcherPass()
-        print(str(graph))
-
-        B, S, H = 4, 8, 64  # batch, seq, hidden
-        E = 16  # num_experts
-        K = 3  # top_k
-
-        dummy_args = [
-            torch.randn(B, S, H, device="meta", dtype=torch.float16),  # hidden_states
-            torch.randn(E, H, device="meta", dtype=torch.float16),  # weight  [E, H]
-            torch.randn(E, device="meta", dtype=torch.float16),  # bias    [E]
-            3,
-        ]
-
-        op_ignore_types = {
-            torch.ops.aten.view.default: (int,),
-            torch.ops.aten.reshape.default: (int,),
-            torch.ops.aten.softmax.int: (torch.dtype,),
-        }
-
-        scalar_workaround = {"top_k": K}
-
-        register_ad_pattern(
-            search_fn=_router_pattern,
-            replace_fn=_router_repl,
             patterns=patterns,
             dummy_args=dummy_args,
             op_ignore_types=op_ignore_types,
@@ -305,7 +227,7 @@ def _register_mxfp4_expert_params(
 @TransformRegistry.register("insert_mxfp4_mlp")
 class InsertMXFP4MLP(BaseTransform):
     """
-    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::mxfp4_mlp op,
+    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::triton_mxfp4_mlp op,
     and register MXFP4 expert params (blocks + scales) on the experts module.
     """
 
@@ -316,6 +238,14 @@ class InsertMXFP4MLP(BaseTransform):
         factory,
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            info = TransformInfo(
+                skipped=True,
+                num_matches=0,
+                is_clean=False,
+                has_valid_shapes=True,
+            )
+            return gm, info
         num_matches = 0
 
         for n in list(gm.graph.nodes):
@@ -369,10 +299,10 @@ class InsertMXFP4MLP(BaseTransform):
                 dn_blocks_attr = gm.graph.create_node("get_attr", dn_blocks_name)
                 dn_scales_attr = gm.graph.create_node("get_attr", dn_scales_name)
 
-            n.target = torch.ops.auto_deploy.mxfp4_mlp.default
+            n.target = torch.ops.auto_deploy.triton_mxfp4_mlp.default
             n.kwargs = {}
 
-            # mxfp4_mlp(
+            # triton_mxfp4_mlp(
             #   hidden_states,
             #   router_weight, router_bias, top_k,
             #   gate_up_blocks, gate_up_bias, gate_up_scales, alpha, limit,
@@ -427,9 +357,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     world_size: int,
 ):
     """
-    Transform a call to auto_deploy::mxfp4_mlp into:
+    Transform a call to auto_deploy::triton_mxfp4_mlp into:
       - sharded expert parameters along dim 0 (this rank's slice),
-      - call to auto_deploy::mxfp4_mlp_ep(..., local_lo, local_hi),
+      - call to auto_deploy::triton_mxfp4_mlp_ep(..., local_lo, local_hi),
       - followed by torch_dist_all_reduce.
 
     Expects the original op signature:
@@ -475,7 +405,7 @@ def _insert_sharded_mxfp4_mlp_ep(
         args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
 
     args_ep = tuple(args) + (int(world_size), int(rank))
-    node.target = torch.ops.auto_deploy.mxfp4_mlp_ep.default
+    node.target = torch.ops.auto_deploy.triton_mxfp4_mlp_ep.default
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
@@ -496,8 +426,16 @@ class MXFP4EPSharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> GraphModule:
         """
-        Walk the graph, rewrite every mxfp4_mlp into the EP form on this rank.
+        Walk the graph, rewrite every triton_mxfp4_mlp into the EP form on this rank.
         """
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            info = TransformInfo(
+                skipped=True,
+                num_matches=0,
+                is_clean=False,
+                has_valid_shapes=True,
+            )
+            return gm, info
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         if world_size <= 1:
             info = TransformInfo(
@@ -510,7 +448,7 @@ class MXFP4EPSharding(BaseTransform):
 
         num_matches = 0
         for n in list(gm.graph.nodes):
-            if is_op(n, torch.ops.auto_deploy.mxfp4_mlp):
+            if is_op(n, torch.ops.auto_deploy.triton_mxfp4_mlp):
                 _insert_sharded_mxfp4_mlp_ep(gm, n, local_rank, world_size)
                 num_matches += 1
         info = TransformInfo(

@@ -1,4 +1,3 @@
-# tests/unittest/_torch/auto_deploy/unit/singlegpu/ops/test_mxfp4_mlp_ep_dtypes.py
 from functools import partial
 
 import pytest
@@ -6,6 +5,7 @@ import torch
 import torch.distributed as dist
 from _dist_test_utils import get_device_counts
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.mxfp4_moe import IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.auto_deploy.distributed.common import spawn_multiprocess_job
 
 
@@ -59,7 +59,7 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
     alpha = 1.0
     limit = 1.0
 
-    ref_out = torch.ops.auto_deploy.mxfp4_mlp(
+    ref_out = torch.ops.auto_deploy.triton_mxfp4_mlp(
         x,
         router_weight,
         router_bias,
@@ -85,7 +85,7 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
 
     assert (gate_up_scales != 0).all() and (down_scales != 0).all(), "Zero scales on shard."
 
-    part_out = torch.ops.auto_deploy.mxfp4_mlp_ep(
+    part_out = torch.ops.auto_deploy.triton_mxfp4_mlp_ep(
         x,
         router_weight,
         router_bias,
@@ -107,6 +107,10 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
     torch.testing.assert_close(part_out, ref_out, rtol=5e-2, atol=5e-2, equal_nan=True)
 
 
+@pytest.mark.skipif(
+    not IS_TRITON_KERNELS_AVAILABLE,
+    reason="triton_kernels unavailable",
+)
 @pytest.mark.parametrize("num_experts", [32])  # TODO: include remainder case
 @pytest.mark.parametrize("topk", [8])  # must be <= num_experts
 @pytest.mark.parametrize("device_count", get_device_counts())
