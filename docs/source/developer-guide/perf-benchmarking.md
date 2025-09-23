@@ -465,5 +465,5 @@ kv_cache_config:
 ```
 
 ```{tip}
-The two valid values for `kv_cache_dtype` are `auto` and `fp8`.
+The two valid values for `kv_cache_config.dtype` are `auto` and `fp8`.
 ```
