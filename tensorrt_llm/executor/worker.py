@@ -161,7 +161,7 @@ class GenerationExecutorWorker(BaseWorker):
 
         return self._iteration_result_task(self.stats_queues, self.fetch_stats,
                                            self._iter_stats_result,
-                                           stats_serializer)
+                                           self._stats_serializer)
 
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
