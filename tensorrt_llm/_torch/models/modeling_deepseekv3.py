@@ -52,7 +52,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
