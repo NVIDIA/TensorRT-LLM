@@ -13,6 +13,11 @@ namespace torch_ext
 {
 torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)
 {
+    TORCH_CHECK(input.dim() == 2, "input must be 2D");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(input.sizes()[1] == weight.sizes()[1], "input.size(1) must match weight.size(1)");
+    TORCH_CHECK(weight.sizes()[0] == bias.sizes()[0], "weight.size(0) must match bias.size(0)");
     CHECK_INPUT(input, torch::kBFloat16);
     CHECK_INPUT(weight, torch::kBFloat16);
     CHECK_INPUT(bias, torch::kBFloat16);

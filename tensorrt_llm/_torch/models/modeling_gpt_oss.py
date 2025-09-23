@@ -36,6 +36,9 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
+# Use TinyGEMM when the number of tokens is not larger than this threshold
+MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+
 
 class AttentionBlock(Attention):
 
@@ -219,6 +222,15 @@ class MLPBlock(torch.nn.Module):
             device=device,
             dtype=pretrained_config.torch_dtype)
 
+    def compute_gate_output(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
+            weight = self.gate.weight
+            bias = self.gate.bias
+            g = torch.ops.trtllm.gptoss_tinygemm(x, weight, bias)
+        else:
+            g = self.gate(x)
+        return g
+
     def forward_normal(
         self,
         x: torch.Tensor,
@@ -231,7 +243,7 @@ class MLPBlock(torch.nn.Module):
         # t = self.norm(x) was done in the parent block
         t = x
 
-        g = self.gate(t)
+        g = self.compute_gate_output(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -266,7 +278,7 @@ class MLPBlock(torch.nn.Module):
             if (isinstance(self.experts, (TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
 
-        g = self.gate(t)
+        g = self.compute_gate_output(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
