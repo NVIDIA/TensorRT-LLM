@@ -363,7 +363,8 @@ public:
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
                     DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
-                    info.getIndexFromEnd(), info.getLastBlockKey(), nullptr, !common::getEnvKVCacheTransferOutputPath().empty());
+                    info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
+                    !common::getEnvKVCacheTransferOutputPath().empty());
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);

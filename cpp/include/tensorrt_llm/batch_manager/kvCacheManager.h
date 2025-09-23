@@ -604,9 +604,6 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
-    //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
-    std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
-
     [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
@@ -982,9 +979,6 @@ public:
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
-
-    std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(
-        GenerationRequest const& sequence, SizeType32 windowSize) const;
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
@@ -1419,10 +1413,6 @@ public:
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
         = 0;
 
-    [[nodiscard]] virtual std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-        = 0;
-
     /// @brief Get the last block id (beam 0) for a given sequence and window size
     [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
         = 0;
@@ -1779,9 +1769,6 @@ public:
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override;
-
-    std::vector<SizeType32> getNewlyAllocatedBlockIds(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
     runtime::ITensor::SharedPtr getUniquePrimaryPool() const override;
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;

@@ -199,12 +199,6 @@ public:
         NB_OVERRIDE_PURE(getBatchCacheBlockIds, requestIds, windowSize);
     }
 
-    std::vector<SizeType32> getNewlyAllocatedBlockIds(
-        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
-    {
-        NB_OVERRIDE_PURE(getNewlyAllocatedBlockIds, requestId, windowSize);
-    }
-
     SizeType32 getUsedNumBlocks() const override
     {
         NB_OVERRIDE_PURE(getUsedNumBlocks);
@@ -471,8 +465,6 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())

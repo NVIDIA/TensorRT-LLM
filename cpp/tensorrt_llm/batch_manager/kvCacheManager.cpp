@@ -1597,29 +1597,6 @@ void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeTyp
     }
 }
 
-std::vector<KVCacheBlock::IdType> BlockManager::getNewlyAllocatedBlockIds(
-    GenerationRequest const& sequence, SizeType32 windowSize) const
-{
-    return mWindowBlockManagers.at(windowSize).getNewlyAllocatedBlockIds(sequence);
-}
-
-std::vector<KVCacheBlock::IdType> WindowBlockManager::getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const
-{
-    std::vector<KVCacheBlock::IdType> allocatedBlockIds;
-    for (auto const& beamBlockIds : sequence.getCacheBlockIds(mWindowSize))
-    {
-        for (auto const& blockId : beamBlockIds)
-        {
-            auto const& block = mAllBlocksById.at(blockId);
-            if (!blockInRadixTree(block))
-            {
-                allocatedBlockIds.push_back(blockId);
-            }
-        }
-    }
-    return allocatedBlockIds;
-}
-
 void BlockManager::releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize)
 {
     mWindowBlockManagers.at(windowSize).releaseLastBlock(sequence);
@@ -2787,12 +2764,6 @@ std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheB
         result.emplace_back(sequence.getCacheBlockIds(windowSize));
     }
     return result;
-}
-
-std::vector<SizeType32> KVCacheManager::getNewlyAllocatedBlockIds(
-    LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-{
-    return mBlockManager.getNewlyAllocatedBlockIds(getSequence(requestId), windowSize);
 }
 
 std::optional<KVCacheBlock::IdType> KVCacheManager::getLastBlockId(LlmRequest::RequestIdType requestId) const

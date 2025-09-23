@@ -195,13 +195,6 @@ public:
             getBatchCacheBlockIds, requestIds, windowSize);
     }
 
-    std::vector<SizeType32> getNewlyAllocatedBlockIds(
-        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
-    {
-        PYBIND11_OVERLOAD_PURE(
-            std::vector<SizeType32>, tbk::BaseKVCacheManager, getNewlyAllocatedBlockIds, requestId, windowSize);
-    }
-
     SizeType32 getUsedNumBlocks() const override
     {
         PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getUsedNumBlocks);
@@ -475,8 +468,6 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::call_guard<py::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, py::call_guard<py::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
-            py::call_guard<py::gil_scoped_release>())
-        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
             py::call_guard<py::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             py::call_guard<py::gil_scoped_release>())
