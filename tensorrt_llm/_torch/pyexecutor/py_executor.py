@@ -971,7 +971,7 @@ class PyExecutor:
             # When overlap scheduler is enabled, and we already prepared the draft tokens in the previous batch,
             # we don't need to initialize py_draft_tokens at this stage because we haven't append the accepted tokens to the request yet.
             if not self.has_previous_draft_tokens:
-                # If speculation is off, this function sets py_draft_tokens to None
+                # If speculation is off, this function sets py_draft_tokens to []
                 # for all active requests. If it's on, we initialize py_draft_tokens
                 # with dummy draft tokens to make the scheduler aware of the fact
                 # that speculation is about to happen.
