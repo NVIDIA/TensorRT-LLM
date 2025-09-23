@@ -208,7 +208,7 @@ def test_regex(client: openai.OpenAI, model_name: str):
 
 def test_ebnf(client: openai.OpenAI, model_name: str):
     ebnf_grammar = """
-root ::= city | description
+root ::= description
 city ::= "London" | "Paris" | "Berlin" | "Rome"
 description ::= city " is " status
 status ::= "the capital of " country
