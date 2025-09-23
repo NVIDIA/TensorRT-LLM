@@ -125,7 +125,7 @@ if [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures '100-real' --binding_type pybind --clean"
+        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
         if ! srun --container-name=${container_name} \
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
