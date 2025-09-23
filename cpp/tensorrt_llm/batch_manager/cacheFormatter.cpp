@@ -72,8 +72,8 @@ BlockRange getBlockRangeForReceiving(
         auto const totalUniqueTokens = llmRequest.getPromptLen();
         auto const usedBlocks = std::min<SizeType32>(
             static_cast<SizeType32>((totalUniqueTokens + tokensPerBlock - 1) / tokensPerBlock), totalBlocks);
-        auto const reusedBlocks = std::min<SizeType32>(
-            static_cast<SizeType32>((prepopulatedTokens + tokensPerBlock - 1) / tokensPerBlock), usedBlocks);
+        auto const reusedBlocks
+            = std::min<SizeType32>(static_cast<SizeType32>((prepopulatedTokens / tokensPerBlock)), usedBlocks);
 
         std::vector<SizeType32> newBlockIds;
         if (reusedBlocks < usedBlocks)
