@@ -1159,9 +1159,10 @@ class PyExecutor:
                     if self.enable_attention_dp:
                         local_can_forward = self.executor_request_queue.num_fetch_requests + \
                             len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
-                        all_can_forward = self.dist.allgather(local_can_forward)
+                        all_can_forward = self.dist.tp_allgather(
+                            local_can_forward)
                         if all(all_can_forward):
-                            time.sleep(30)
+                            time.sleep(10)
                             can_forward = True
                         else:
                             if self.dist.rank == 0:
