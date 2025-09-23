@@ -10,10 +10,8 @@ from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import (
 )
 
 from ...custom_ops import IS_TRITON_KERNELS_AVAILABLE
-from ...models.factory import ModelFactory
-from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 
 def _moe_dense_mlp_pattern(
@@ -332,128 +330,6 @@ class InsertMXFP4MLP(BaseTransform):
 
             num_matches += 1
 
-        info = TransformInfo(
-            skipped=(num_matches == 0),
-            num_matches=num_matches,
-            is_clean=False,
-            has_valid_shapes=True,
-        )
-        return gm, info
-
-
-def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
-    """Return tensor_node[lo:hi, ...] via aten.slice along dim 0."""
-    lo = int(lo)
-    hi = int(hi)
-    with gm.graph.inserting_after(tensor_node):
-        # aten.slice.Tensor(self, dim, start, end, step)
-        return gm.graph.call_function(
-            torch.ops.aten.slice.Tensor,
-            args=(tensor_node, 0, lo, hi, 1),
-        )
-
-
-def _insert_sharded_mxfp4_mlp_ep(
-    gm: GraphModule,
-    node: Node,
-    rank: int,
-    world_size: int,
-):
-    """
-    Transform a call to auto_deploy::triton_mxfp4_mlp into:
-      - sharded expert parameters along dim 0 (this rank's slice),
-      - call to auto_deploy::triton_mxfp4_mlp_ep(..., local_lo, local_hi),
-      - followed by torch_dist_all_reduce.
-
-    Expects the original op signature:
-      (hidden_states,
-       router_weight, router_bias, top_k,
-       gate_up_blocks, gate_up_bias, gate_up_scales,
-       alpha, limit,
-       down_blocks, down_bias, down_scales)
-    """
-
-    IDX_GATE_UP_BLOCKS = 4
-    IDX_GATE_UP_BIAS = 5
-    IDX_GATE_UP_SCALES = 6
-    IDX_DOWN_BLOCKS = 9
-    IDX_DOWN_BIAS = 10
-    IDX_DOWN_SCALES = 11
-
-    gate_up_blocks_node = node.args[IDX_GATE_UP_BLOCKS]
-    num_experts = int(gate_up_blocks_node.meta["val"].shape[0])
-
-    # Compute per-rank [lower, upper)
-    base = num_experts // world_size
-    rem = num_experts % world_size
-    if rank < rem:
-        local_lo = rank * (base + 1)
-        local_hi = local_lo + (base + 1)
-    else:
-        local_lo = rem * (base + 1) + (rank - rem) * base
-        local_hi = local_lo + base
-
-    # Prepare new args with slices for this rank
-    args = list(node.args)
-    with gm.graph.inserting_before(node):
-        args[IDX_GATE_UP_BLOCKS] = _slice_expert_dim(
-            gm, args[IDX_GATE_UP_BLOCKS], local_lo, local_hi
-        )
-        args[IDX_GATE_UP_BIAS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BIAS], local_lo, local_hi)
-        args[IDX_GATE_UP_SCALES] = _slice_expert_dim(
-            gm, args[IDX_GATE_UP_SCALES], local_lo, local_hi
-        )
-        args[IDX_DOWN_BLOCKS] = _slice_expert_dim(gm, args[IDX_DOWN_BLOCKS], local_lo, local_hi)
-        args[IDX_DOWN_BIAS] = _slice_expert_dim(gm, args[IDX_DOWN_BIAS], local_lo, local_hi)
-        args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
-
-    args_ep = tuple(args) + (int(world_size), int(rank))
-    node.target = torch.ops.auto_deploy.triton_mxfp4_mlp_ep.default
-    node.args = args_ep
-
-    # Add a dist all-reduce after the op (sum partial results across EP ranks)
-    with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
-        node.replace_all_uses_with(red)
-        # keep dataflow: red(input=node)
-        red.replace_input_with(red, node)
-
-
-@TransformRegistry.register("ep_sharding_mxfp4")
-class MXFP4EPSharding(BaseTransform):
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> GraphModule:
-        """
-        Walk the graph, rewrite every triton_mxfp4_mlp into the EP form on this rank.
-        """
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            info = TransformInfo(
-                skipped=True,
-                num_matches=0,
-                is_clean=False,
-                has_valid_shapes=True,
-            )
-            return gm, info
-        local_rank, world_size = shared_config.local_rank, shared_config.world_size
-        if world_size <= 1:
-            info = TransformInfo(
-                skipped=True,
-                num_matches=0,
-                is_clean=True,
-                has_valid_shapes=True,
-            )
-            return gm, info
-
-        num_matches = 0
-        for n in list(gm.graph.nodes):
-            if is_op(n, torch.ops.auto_deploy.triton_mxfp4_mlp):
-                _insert_sharded_mxfp4_mlp_ep(gm, n, local_rank, world_size)
-                num_matches += 1
         info = TransformInfo(
             skipped=(num_matches == 0),
             num_matches=num_matches,
