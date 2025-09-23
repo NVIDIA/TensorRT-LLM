@@ -346,6 +346,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
             cuda_graph_config=cuda_graph_config,
             enable_chunked_prefill=True,
+            max_num_tokens=256,
             speculative_config=spec_config,
             # Two-model eagle3 does not support overlap scheduler
             disable_overlap_scheduler=not eagle3_one_model)
@@ -366,6 +367,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=256,
                   speculative_config=spec_config,
                   disable_overlap_scheduler=True)
         with llm:
@@ -1166,6 +1168,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
@@ -1828,6 +1831,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=256,
                   speculative_config=mtp_config)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
@@ -1852,6 +1856,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=256,
                   speculative_config=mtp_config)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
@@ -2050,7 +2055,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 enable_chunked_prefill=True) as llm:
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
 
             assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -2183,7 +2189,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 enable_chunked_prefill=True) as llm:
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
             task = GSM8K(self.MODEL_NAME)
@@ -2617,6 +2624,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   **pytorch_config,
                   kv_cache_config=kv_cache_config,
                   enable_chunked_prefill=enable_chunked_prefill,
+                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                   speculative_config=spec_config,
                   build_config=None)
 
