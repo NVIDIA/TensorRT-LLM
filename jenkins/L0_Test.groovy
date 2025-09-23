@@ -1678,6 +1678,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
             "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+            "NCCL_GRAPH_REGISTER=0",
             "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
             "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
             extraInternalEnv,
