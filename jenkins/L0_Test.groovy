@@ -375,6 +375,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
             "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
             "pytest",
             "--collect-only",
+            "--splitting-algorithm least_duration",
             "--test-list=${cleanedTestDBList}",
             "--quiet",
             "--splits ${splits}",
