@@ -200,11 +200,10 @@ class ModelDrafter(Drafter):
         """
         try:
             for req in scheduled_requests.all_requests():
-                if self.use_static_draft_loop:
-                    req.d2t = self.draft_model_engine.model.draft_model.model.d2t.data
-                    req.py_draft_use_greedy_sampling = True
-                else:
-                    req.d2t = self.draft_model_engine.model.model.d2t.data
+                draft_model = self.draft_model_engine.model.draft_model if self.use_static_draft_loop else self.draft_model_engine.model
+                if hasattr(draft_model.model, "d2t"):
+                    req.d2t = draft_model.model.d2t.data
+                req.py_draft_use_greedy_sampling = self.use_static_draft_loop
 
             draft_batch = ScheduledRequests()
 
@@ -651,7 +650,7 @@ class ModelDrafter(Drafter):
             # Only update target inputs, cleanup will be done in executor loop
             self._update_target_inputs_with_draft_tokens(
                 target_inputs,
-                outputs,
+                outputs["new_draft_tokens"],
                 draft_position=0,
                 draft_length=self.max_draft_tokens,
                 draft_batch=draft_batch,

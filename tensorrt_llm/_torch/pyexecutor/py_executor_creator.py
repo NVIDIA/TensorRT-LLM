@@ -41,12 +41,6 @@ from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
-# Development function to control chain drafter feature.
-# It's here so that unit tests can mock it and turn it off.
-def _get_allow_chain_drafter() -> bool:
-    return True
-
-
 class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
     DRAFTER = "Drafter"
@@ -346,13 +340,11 @@ def create_py_executor(
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
 
-            if _get_allow_chain_drafter():
-                use_chain_drafter = (
-                    guided_decoding_config is None
-                    and draft_spec_config._allow_greedy_draft_tokens
-                    and pytorch_backend_config.attn_backend == "TRTLLM")
-            else:
-                use_chain_drafter = False
+            use_chain_drafter = (
+                guided_decoding_config is None
+                and draft_spec_config.allow_chain_drafter
+                and draft_spec_config._allow_greedy_draft_tokens
+                and pytorch_backend_config.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:

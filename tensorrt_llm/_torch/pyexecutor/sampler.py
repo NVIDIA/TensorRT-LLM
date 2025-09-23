@@ -287,11 +287,13 @@ def greedy_search_sampling_batch(
     softmax_indices: Optional[torch.IntTensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     next_tokens = torch.argmax(logits, dim=-1)
+    index_to_scatter = next_tokens
     if softmax_indices is not None:
-        logits = logits[softmax_indices.to(logits.device, non_blocking=True)]
+        logits = logits[softmax_indices]
+        index_to_scatter = next_tokens[softmax_indices]
     probs = torch.zeros_like(logits)
     probs.scatter_(dim=-1,
-                   index=next_tokens.unsqueeze(-1),
+                   index=index_to_scatter.unsqueeze(-1),
                    src=torch.ones_like(logits))
     return next_tokens, probs
 
