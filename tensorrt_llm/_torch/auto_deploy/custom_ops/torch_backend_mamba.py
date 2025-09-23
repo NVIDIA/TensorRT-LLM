@@ -282,6 +282,7 @@ def _torch_cached_ssm_transform_fake(
     return torch.empty_like(
         hidden_states,
         memory_format=torch.contiguous_format,
+        dtype=torch.float32,
     )
 
 
