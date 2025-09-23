@@ -130,14 +130,17 @@ struct WindowSizeMetadata
     SizeType32 temporaryAttentionWindow; // Temporary kv cache length per sequence.
                                          // Only needed when chunked context + sliding window attention are used
                                          // together. And it should only be considered when allocating blocks.
+    SizeType32 windowSize;
+    bool isSWA;
 
     std::string toString()
     {
         return tensorrt_llm::common::fmtstr(
             "WindowSizeMetadata{ .allottedPrimaryBlocks=%d, .allottedSecondaryBlocks=%d, .absolutePoolsOffset=%d, "
-            ".numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, .maxNumBlocks=%d, .temporaryAttentionWindow=%d }",
+            ".numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, .maxNumBlocks=%d, .temporaryAttentionWindow=%d, "
+            ".windowSize=%d, .isSWA=%d }",
             allottedPrimaryBlocks, allottedSecondaryBlocks, absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq,
-            maxNumBlocks, temporaryAttentionWindow);
+            maxNumBlocks, temporaryAttentionWindow, windowSize, isSWA);
     }
 };
 
@@ -512,6 +515,8 @@ private:
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
     // Number of front blocks removed from the sequence
     SizeType32 mNumFrontBlocksRemoved;
+    // Set of used blocks by the sequence
+    std::set<KVCacheBlock::IdType> mUsedBlocks;
 };
 
 // attach metadata to a pool pointer
@@ -763,7 +768,7 @@ public:
 
     //! \brief Bring offloaded block from secondary to primary memory.
     //! \details Does nothing if block is already in primary memory.
-    void onboardBlock(BlockPtr const& offloadBlock,
+    void onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Bring block from primary to secondary memory.
@@ -826,6 +831,23 @@ public:
     //! \brief Unpin blocks by starting from a block id and walking prev pointers.
     void unpinBlocksById(KVCacheBlock::IdType blockId);
 
+    void initializeSequenceStorageValidity(LlmRequest::RequestIdType requestId)
+    {
+        mIsValidStoreForReuseSequence[requestId] = true;
+    }
+
+    void releaseSequenceStorageValidity(LlmRequest::RequestIdType requestId)
+    {
+        mIsValidStoreForReuseSequence.erase(requestId);
+    }
+
+    //! \brief Return whether this sequence is valid for store for reuse
+    [[nodiscard]] bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId) const
+    {
+        TLLM_CHECK_WITH_INFO(mIsValidStoreForReuseSequence.count(requestId) > 0, "Sequence should be bookkeeped");
+        return mIsValidStoreForReuseSequence.at(requestId);
+    }
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -846,7 +868,8 @@ private:
         std::optional<std::chrono::milliseconds> durationMs);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
-    [[nodiscard]] BlockPtr getFreeBlock(
+    //! \param sequence Sequence which the free block is allocated for
+    [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
@@ -933,6 +956,14 @@ private:
 
     // Mutex for the cached blocks root
     std::mutex mCachedBlocksRootMutex;
+
+    // Record which sequence is using the block
+    std::map<KVCacheBlock::IdType, LlmRequest::RequestIdType> mBlockToSequence;
+    // Record whether a sequence has all blocks held valid.
+    // The boolean value is set to true upon first encounter of a new sequence.
+    // It may be invalidated to false when other sequence acquires a block that
+    // is used by another sequence.
+    std::map<LlmRequest::RequestIdType, bool> mIsValidStoreForReuseSequence;
 };
 
 class BlockManager
@@ -1008,7 +1039,7 @@ public:
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
-    void onboardBlock(BlockPtr const& offloadBlock, SizeType32 windowSize,
+    void onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Bring block from primary to secondary memory for window size.
@@ -1244,6 +1275,48 @@ public:
     //! there may be more than one context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence, bool isEnableBlockReuse);
 
+    //! \brief Return whether the sequence is already managed by the block manager
+    [[nodiscard]] bool isSequenceHeld(LlmRequest::RequestIdType requestId) const
+    {
+        return mManagedSequences.count(requestId) > 0;
+    }
+
+    //! \brief Add a sequence to the managed sequences
+    //! \details Take the sequence into account for the manager. Initialize
+    //! sequence storage validity under all window sizes.
+    void holdSequence(LlmRequest::RequestIdType requestId)
+    {
+        mManagedSequences.insert(requestId);
+        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
+        {
+            mWindowBlockManagers.at(windowSize).initializeSequenceStorageValidity(requestId);
+        }
+    }
+
+    //! \brief Remove a sequence from the managed sequences.
+    //! \details Remove sequence from the managed sequences and remove sequence
+    //! storage
+    void releaseSequence(LlmRequest::RequestIdType requestId)
+    {
+        mManagedSequences.erase(requestId);
+        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
+        {
+            mWindowBlockManagers.at(windowSize).releaseSequenceStorageValidity(requestId);
+        }
+    }
+
+    //! \brief Return whether the sequence is still valid for store-for-reuse
+    //! regarding the specific window size.
+    //! \details Currently this utility function is only used under
+    //! kvCacheManagerTest.cpp. Checking for store-for-reuse for each window
+    //! size is done in an iterating fashion under BlockManager::releaseBlocks.
+    bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
+    {
+        TLLM_CHECK_WITH_INFO(
+            mWindowBlockManagers.count(windowSize) > 0, "Querying window size is not found under mWindowBlockManager");
+        return mWindowBlockManagers.at(windowSize).isSequenceValidForStoreForReuse(requestId);
+    }
+
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1278,6 +1351,8 @@ private:
     std::vector<SizeType32> mLayerToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
+    // Record what sequences are currently managed by the block manager
+    std::set<LlmRequest::RequestIdType> mManagedSequences;
 };
 
 struct OffsetTableDimensions
