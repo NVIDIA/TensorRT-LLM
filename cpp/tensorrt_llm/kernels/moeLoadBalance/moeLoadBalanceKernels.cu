@@ -19,6 +19,7 @@
 #include <cub/cub.cuh>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
 
 namespace cg = cooperative_groups;
@@ -27,6 +28,8 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 int getOwnerDevice(unsigned long long int stepAndOwner)
 {
@@ -138,6 +141,9 @@ __global__ void zeroExpertTokenCountKernel(MoeLoadBalanceMetaInfo metaInfo, int*
     TYPE oldExpertTokenCount = {0};
     int* expertTokenCountPtr = expertTokenCount + metaInfo.expertCount * blockIdx.x;
     TYPE* typedExpertTokenCountPtr = reinterpret_cast<TYPE*>(expertTokenCountPtr);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     typedExpertTokenCountPtr[threadIdx.x] = oldExpertTokenCount;
 }
 
@@ -177,6 +183,9 @@ __global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, int* expertToke
         sharedExpertCount[i] = 0;
     }
     __syncthreads();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     for (int idx = threadIdx.x + blockIdx.x * blockDim.x; idx < totalEltCount; idx += gridDim.x * blockDim.x)
     {
         int expertId = gatheredRawExpertIds[idx];
@@ -282,11 +291,10 @@ void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int nu
         }
         dim3 gridDim(1);
         dim3 blockDim(threadCount);
-        void* args[]
-            = {&metaInfo, static_cast<void*>(const_cast<int**>(&enabled)), static_cast<void*>(&localExpertTokenCount)};
         TLLM_CHECK_WITH_INFO(
             threadCount <= 1024, "expertCount=%d is too large and not supported now.", metaInfo.expertCount);
-        TLLM_CUDA_CHECK(cudaLaunchKernel(kernelFunc, gridDim, blockDim, &args[0], 0, stream));
+        launchWithPdlWhenEnabled(
+            "zeroExpertTokenCount", kernelFunc, gridDim, blockDim, 0, stream, metaInfo, enabled, localExpertTokenCount);
     }
 
     {
@@ -299,7 +307,7 @@ void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int nu
             blockCount = smCount;
         }
         int sharedMemorySize = metaInfo.expertCount * sizeof(int);
-        statisticKernel<<<blockCount, threadCount, sharedMemorySize, stream>>>(
+        launchWithPdlWhenEnabled("statisticKernel", statisticKernel, blockCount, threadCount, sharedMemorySize, stream,
             metaInfo, localExpertTokenCount, totalEltCount, enabled, localRawExpertIds);
     }
 }
@@ -326,6 +334,10 @@ __global__ void moeComputeRouteNoRedundantKernel(MoeLoadBalanceMetaInfo metaInfo
     }
 
     int blockOffset = blockIdx.x * THREAD_COUNT * ITEM_PER_THREAD;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
     for (; blockOffset < tokenCount * metaInfo.topK; blockOffset += gridDim.x * THREAD_COUNT * ITEM_PER_THREAD)
     {
@@ -501,6 +513,10 @@ __global__ void moeComputeRouteSortKernel(MoeLoadBalanceMetaInfo metaInfo, MoePl
 
     int expertIds[ITEM_PER_THREAD];
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     for (int blockOffset = blockIdx.x * THREAD_COUNT * ITEM_PER_THREAD; blockOffset < tokenCount * metaInfo.topK;
          blockOffset += gridDim.x * THREAD_COUNT * ITEM_PER_THREAD)
     {
@@ -586,14 +602,15 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
     int dynamicShmSize = sizeof(int16_t) * metaInfo.epSize * metaInfo.slotCountPerRank;
     if (metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
     {
+        auto* kernelFn = moeComputeRouteNoRedundantKernel<1024, kThreadCount, kEltPerThread>;
         // no redundant expert, so we don't need complex routing, but just assign to the correct solt.
-        moeComputeRouteNoRedundantKernel<1024, kThreadCount, kEltPerThread>
-            <<<blockCount, kThreadCount, dynamicShmSize, stream>>>(
-                metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount);
+        launchWithPdlWhenEnabled("moeComputeRouteNoRedundant", kernelFn, blockCount, kThreadCount, dynamicShmSize,
+            stream, metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount);
     }
     else
     {
-        moeComputeRouteKernel<1024, kThreadCount, kEltPerThread><<<blockCount, kThreadCount, dynamicShmSize, stream>>>(
+        auto* kernelFn = moeComputeRouteKernel<1024, kThreadCount, kEltPerThread>;
+        launchWithPdlWhenEnabled("moeComputeRoute", kernelFn, blockCount, kThreadCount, dynamicShmSize, stream,
             metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount, offsetByEpRank);
     }
 }
