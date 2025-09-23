@@ -60,6 +60,7 @@ class KVCachePromptLookup;
 class BlockManager;
 class KVCacheManager;
 class KVCacheTransferManager;
+class WindowBlockManager;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
@@ -256,7 +257,20 @@ class KVCachePromptLookup
 public:
     explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
-    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool createNodes);
+    [[nodiscard]] std::vector<BlockKey> getBlockKeys(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const;
+
+    //! \brief Find first new context block for each window block manager.
+    //! \param llmRequest The new request.
+    //! \param inputLength Number of useful prompt tokens. If zero, length of prompt minus 1 is used.
+    //! \param allowPartiallyFilledBlock Allow matching of blocks that are not full.
+    //! \param windowBlockManagers Map of window block managers vs window size. Method will search for a new context block for each window size.
+    //! \return map of BlockKey vs windowSize. The block key is that of first new context block for that window size.
+    [[nodiscard]] std::unordered_map<SizeType32,BlockKey> findNewContextBlock(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, std::vector<SizeType32> const& windowSizes) const;
+
+    //! \brief Find matching nodes for a given prompt prefix
+    //! \param allowPartiallyFilledBlock Allow last block in prompt to have less than tokensPerBlock tokens.
+    //! \param enablePartialReuse Allow matching tokens to be copied from block that does not match entire prompt.
+    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool createNodes);
 
 private:
     // Root of search structure
@@ -761,11 +775,6 @@ public:
     //! \details Does nothing if block is already in secondary memory.
     void offloadBlock(BlockPtr const& block);
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
-
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
         return mBufferManager;
@@ -815,17 +824,9 @@ private:
     SizeType32 loadOrAllocateBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes, SizeType32 numContextBlocks,
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
 
-    //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
-    void freeChildren(BlockPtr const& block, executor::RetentionPriority priority,
-        std::optional<std::chrono::milliseconds> durationMs);
-
     //! \brief Find block least likely to be reused, free it if necessary and return.
     [[nodiscard]] BlockPtr getFreeBlock(
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
-        std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
-
-    //! \brief Free block from previous block and claim it from free blocks list.
-    void claimLeafBlock(BlockPtr const& block, std::optional<executor::RetentionPriority> priority = std::nullopt,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.

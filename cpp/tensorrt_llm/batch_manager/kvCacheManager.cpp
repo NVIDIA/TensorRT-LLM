@@ -414,23 +414,24 @@ KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensP
 {
 }
 
-std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool create)
+std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const
 {
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
         ? llmRequest.getUniqueTokens(beamIdx)
         : *(llmRequest.getEncoderUniqueTokens().value());
-    if (inputLength == 0) inputLength = static_cast<SizeType32>(uniqueTokens.size());
+    auto usefulInputLength = (inputLength <= 0) ? static_cast<SizeType32>(uniqueTokens.size()) - inputLength : inputLength;
 
     // Ignore last token because it can't be recovered
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
-    // Add empty block if last token is separated
-    if (inputLength % mTokensPerBlock == 1)
-    {
-        blockedUniqueTokens.emplace_back();
-    }
-
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usefulInputLength, mTokensPerBlock, allowPartiallyFilledBlock);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+
+    return blockKeys;
+}
+
+std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool create)
+{
+    auto blockKeys = getBlockKeys(llmRequest, inputLength, allowPartiallyFilledBlock);
 
     std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> results;
     auto searchRoot = mRoot;
@@ -449,6 +450,45 @@ std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::look
         results.emplace_back(std::make_tuple(partialMatch,numMatched,matchingNode));
         searchRoot = matchingNode;
     }
+    return results;
+}
+
+// Return BlockKey of first new context block for all window sizes. If no new context block was found for a window size, return value will not have an entry for that window size.
+std::unordered_map<SizeType32,BlockKey> KVCachePromptLookup::findNewContextBlock(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, std::vector<SizeType32> const& windowSizes) const
+{
+    auto blockKeys = getBlockKeys(llmRequest, inputLength, allowPartiallyFilledBlock);
+
+    // New context block is the block key of the first block that isn't found in search structure.
+    std::unordered_set<SizeType32> stillLooking;
+    for (auto const windowSize : windowSizes)
+    {
+        stillLooking.insert(windowSize);
+    }
+    std::unordered_map<SizeType32,BlockKey> results;
+    auto searchRoot = mRoot;
+    BlockKey prevBlockKey;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingNode] = searchRoot != nullptr
+            ? searchRoot->findMatchingNode(blockKey, false)
+            : std::make_tuple(false, 0, nullptr);
+        for (auto const windowSize : windowSizes)
+        {
+            if (stillLooking.count(windowSize) && (matchingNode == nullptr || matchingNode->getBlock(windowSize) == nullptr))
+            {
+                // Found new context block for current window size
+                results[windowSize] = blockKey;
+                stillLooking.erase(windowSize);
+            }
+        }
+        searchRoot = matchingNode;
+        if (stillLooking.size() == 0)
+        {
+            // Not looking for any more new context block
+            break;
+        }
+    }
+
     return results;
 }
 
@@ -795,7 +835,7 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
 {
     // Lookup prompt nodes once for all window block managers
     auto constexpr beamIdx = 0;
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, 0, mEnablePartialReuse, true);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, false, false, true);
     for (auto const& [windowSize, _] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
@@ -917,34 +957,6 @@ void WindowBlockManager::startScheduling()
     }
 }
 
-void WindowBlockManager::claimLeafBlock(BlockPtr const& block, std::optional<executor::RetentionPriority> priority,
-    std::optional<std::chrono::milliseconds> durationMs)
-{
-    // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
-    // This is so it can check if the parent should be queued for eviction.
-    mEvictionPolicy->claimBlock(block, priority, durationMs);
-    block->freeLeafBlock();
-}
-
-void WindowBlockManager::freeChildren(
-    BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
-{
-    // Free all descendants of block
-    for (auto const& p : block->getNextBlocks())
-    {
-        auto childBlock = p.second;
-        freeChildren(childBlock, priority, durationMs);
-    }
-
-    // Free block
-    if (mEventManager && blockInRadixTree(block))
-    {
-        mEventManager->enqueueRemovedEvent(block, mWindowSize);
-    }
-
-    claimLeafBlock(block, priority, durationMs);
-}
-
 BlockPtr WindowBlockManager::getFreeBlock(
     executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
 {
@@ -980,13 +992,6 @@ BlockPtr WindowBlockManager::getFreeBlock(
         mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
         block = offloadBlock;
     }
-
-    // Ensure that returned block is a leaf block by freeing all it's children.
-    // Most blocks returned by mEvictionPolicy->getFreeBlock will be leaf blocks,
-    // but there are situations where they are not. One example is when a primary
-    // block has children in secondary memory and offloading is not possible
-    // because there are no free secondary blocks.
-    freeChildren(block, priority, durationMs);
 
     return block;
 }
@@ -1077,32 +1082,21 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
 {
     TLLM_CHECK_WITH_INFO(
         !isVariableWindow(), "The optimization of delaying requests won't work for variable window attention");
-    auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
-    return onlyManager.findNewContextBlock(uniqueTokens, llmRequest);
-}
+    // TODO: Deciding whether a request should be delayed should be done for each window block manager,
+    // aggregate decision is true if any of them returns true
+    // For now we replicate old behavior
 
-std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
-    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
-{
-    auto blockedUniqueTokens
-        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size(), mTokensPerBlock, false);
-    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-    BlockKey ret;
-    ret.loraTaskId = llmRequest.getLoraTaskId();
-    auto searchRoot = mCachedBlocksRoot;
-    for (auto const& blockKey : blockKeys)
-    {
-        ret.uniqueTokens.insert(ret.uniqueTokens.end(), blockKey.uniqueTokens.begin(), blockKey.uniqueTokens.end());
-        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, false, false)
-            : std::make_tuple(false, 0, nullptr);
-        if (matchingBlock == nullptr)
-        {
-            return ret;
-        }
-        searchRoot = std::move(matchingBlock);
-    }
-    return std::nullopt;
+    // Copy window sizes we are interested in (just first one for now)
+    std::vector<SizeType32> windowSizes;
+    windowSizes.reserve(1);
+    auto firstWindowSize = mWindowBlockManagers.cbegin()->first;
+    windowSizes.emplace_back(firstWindowSize);
+
+    // Get blockKey for first window size
+    auto newBlockKeys = mLookup->findNewContextBlock(llmRequest, 0, true, windowSizes);
+
+    // If newBlockKeys does not have an entry for firstWindowSize, it means no new context block was found
+    return newBlockKeys.count(firstWindowSize) ? newBlockKeys.at(firstWindowSize) : std::nullopt;
 }
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
@@ -1242,7 +1236,8 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength, mEnablePartialReuse, false);
+    // TODO: Should this be inputLength - 1, or should caller do the subtraction? Leaning towards caller doing subtraction
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength, true, mEnablePartialReuse, false);
     // Find kv cache blocks to reuse for each window manager
     mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedPromptNodes);
 }
@@ -1543,7 +1538,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // Create nodes if no match is found.
     if (storeBlocksForReuse)
     {
-        auto matchedPromptNodes = mLookup->lookup(llmRequest, 0, mEnablePartialReuse, true);
+        auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, true, mEnablePartialReuse, true);
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
@@ -1586,7 +1581,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     }
 
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, 0, mEnablePartialReuse, true);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, false, false, true);
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
@@ -2011,6 +2006,7 @@ void KVCacheManager::addSequence(
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
         if (!sequence.isCyclic() && mEnableBlockReuse)
         {
+            // TODO: Should this be effectiveInputLength - 1?
             mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
         }
         else
