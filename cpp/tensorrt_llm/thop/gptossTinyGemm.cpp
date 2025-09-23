@@ -15,6 +15,8 @@ torch::Tensor tinygemm2_cuda_forward(torch::Tensor input, torch::Tensor weight, 
     CHECK_CUDA(x);                                                                                                     \
     CHECK_CONTIGUOUS(x)
 
+namespace torch_ext
+{
 torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)
 {
     CHECK_INPUT(input);
@@ -22,6 +24,7 @@ torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch
     CHECK_INPUT(bias);
     return tinygemm2_cuda_forward(input, weight, bias);
 }
+} // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -32,5 +35,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("gptoss_tinygemm", &torch_ext::gptoss_tinygemm);
+    m.impl("gptoss_tinygemm", &torch_ext::tinygemm2_forward);
 }
