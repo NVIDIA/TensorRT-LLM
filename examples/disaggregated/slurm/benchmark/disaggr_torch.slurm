@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # Parse arguments
-num_ctx_servers=$1
-ctx_tp_size=$2
-ctx_pp_size=$3
-ctx_batch_size=$4
-ctx_max_num_tokens=$5
-ctx_enable_attention_dp=$6
-ctx_gpu_frac=$7
-num_gen_servers=$8
-gen_tp_size=$9
+num_ctx_servers=${1}
+ctx_tp_size=${2}
+ctx_pp_size=${3}
+ctx_batch_size=${4}
+ctx_max_num_tokens=${5}
+ctx_enable_attention_dp=${6}
+ctx_gpu_frac=${7}
+num_gen_servers=${8}
+gen_tp_size=${9}
 gen_pp_size=${10}
 gen_batch_size=${11}
 gen_max_num_tokens=${12}
@@ -28,13 +28,16 @@ benchmark_ratio=${23}
 streaming=${24}
 cache_max_tokens=${25}
 dataset_file=${26}
-mount_dir=${27}
+container_mount=${27}
 container_image=${28}
 model_path=${29}
 trtllm_repo=${30}
 build_wheel=${31}
 work_dir=${32}
 nsys_on=${33}
+seq_offset=${34}  # Offset added to sequence lengths
+numa_bind=${35}    # Whether to enable NUMA binding
+benchmark_mode=${36}  # Benchmark mode: e2e or gen_only
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -70,10 +73,13 @@ echo "  multi_round: ${multi_round}"
 echo "  benchmark_ratio: ${benchmark_ratio}"
 echo "  streaming: ${streaming}"
 echo "  cache_max_tokens: ${cache_max_tokens}"
+echo "  seq_offset: ${seq_offset}"
+echo "  numa_bind: ${numa_bind}"
+echo "  benchmark_mode: ${benchmark_mode}"
 echo
 echo "Environment Configuration:"
 echo "  dataset_file: ${dataset_file}"
-echo "  mount_dir: ${mount_dir}"
+echo "  container_mount: ${container_mount}"
 echo "  container_image: ${container_image}"
 echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
@@ -105,7 +111,7 @@ cleanup_on_failure() {
 echo "Starting container..."
 if ! srun -l --container-image=${container_image} \
         --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${container_mount} \
         --mpi=pmix \
         echo "Container up." &> ${full_logdir}/container_launch.log; then
     cleanup_on_failure "Failed to start container. Check ${full_logdir}/container_launch.log"
@@ -114,12 +120,14 @@ fi
 # Build TensorRT-LLM if needed
 if [ -d "${trtllm_repo}" ]; then
     echo "Installing TensorRT-LLM from ${trtllm_repo}..."
+    TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
         build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures '100-real' --binding_type pybind --clean"
         if ! srun --container-name=${container_name} \
-            --container-mounts=${mount_dir}:${mount_dir} \
+            --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
             bash -c "cd ${trtllm_repo} && ${build_command}" \
             &> ${full_logdir}/build.log; then
@@ -130,7 +138,7 @@ if [ -d "${trtllm_repo}" ]; then
 
     echo "Installing TensorRT-LLM..."
     if ! srun --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${container_mount} \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
         bash -c "cd ${trtllm_repo} && pip install -e ." \
         &> ${full_logdir}/install.log; then
@@ -142,12 +150,11 @@ fi
 # Generate worker config
 echo "Generating worker config..."
 # Sequence Length Configuration
-seq_offset=203            # Offset added to sequence lengths
-ctx_max_seq_len=$((isl + seq_offset))
-gen_max_seq_len=$((isl + osl + seq_offset))
+ctx_max_seq_len=$((isl + seq_offset))  # Add sequence offset to input sequence length
+gen_max_seq_len=$((isl + osl + seq_offset))  # Add sequence offset to total sequence length
 if ! srun -l -N 1 -n 1 \
         --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${container_mount} \
         --mpi=pmix --overlap \
         python3 ${work_dir}/gen_worker_config.py \
                 --work_dir ${full_logdir} \
@@ -202,10 +209,10 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "GEN" ${i} ${model_path} "8336" "${enable_pdl}" "${full_logdir}" ${nsys_on} \
+        "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
@@ -217,10 +224,10 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --ntasks-per-node=${gpus_per_node} \
         --container-image=${container_image} \
         --container-name=${container_name} \
-        --container-mounts=${mount_dir}:${mount_dir} \
+        --container-mounts=${container_mount} \
         --mpi=pmix \
         bash ${work_dir}/start_worker.sh \
-        "CTX" ${i} ${model_path} "8336" "${enable_pdl}" "${full_logdir}" ${nsys_on} \
+        "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
 
@@ -228,7 +235,7 @@ done
 echo "Starting server..."
 srun -l --container-name=${container_name} \
     --container-image=${container_image} \
-    --container-mounts=${mount_dir}:${mount_dir} \
+    --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
     bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} \
         &> ${full_logdir}/output_server.log &
@@ -238,7 +245,7 @@ echo "Starting benchmark..."
 if [ "${use_nv_sa_benchmark}" = "true" ]; then
     echo "Using NVIDIA SA benchmark script..."
     if ! srun -l --container-name=${container_name} \
-            --container-mounts=${mount_dir}:${mount_dir} \
+            --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark_nv_sa.sh \
             "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
@@ -248,7 +255,7 @@ if [ "${use_nv_sa_benchmark}" = "true" ]; then
 else
     echo "Using default benchmark script..."
     if ! srun -l --container-name=${container_name} \
-            --container-mounts=${mount_dir}:${mount_dir} \
+            --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 -n 1 \
             bash ${work_dir}/run_benchmark.sh \
             "${model_path}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \

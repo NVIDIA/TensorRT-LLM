@@ -13,23 +13,27 @@ job_name="<job_name>"
 ##############################################################
 # User Configuration - Review and edit the following variables
 
+numa_bind=true
+benchmark_mode="e2e" # e2e or gen_only
+
 # Hardware Configuration
 gpus_per_node=4  # Modify this with your hardware configuration
 
 # Benchmark Configuration
-use_nv_sa_benchmark=true   # Whether to use NVIDIA SA benchmark script instead of default one
+use_nv_sa_benchmark=false   # Whether to use NVIDIA SA benchmark script instead of default one
 isl=1024                   # Input sequence length
 osl=1024                   # Output sequence length
 multi_round=8              # Number of benchmark rounds
 benchmark_ratio=0.8        # Benchmark ratio
 streaming=true             # Enable streaming mode
 cache_max_tokens=4608     # Cache transceiver max tokens
+seq_offset=203  # Offset added to sequence lengths
 # Dataset file for benchmarking
 dataset_file="<dataset_file>"
 
 # Environment Configuration
 # Directories mount to the container
-mount_dir="<mount_dir>"
+container_mount="<container_mount>" # path1:path1,path2:path2
 # Container image
 container_image="<container_image>"
 # Path to the model directory
@@ -54,7 +58,6 @@ if [[ ! -f "${slurm_file}" ]]; then
 fi
 
 # Validate required paths
-[[ ! -d "${mount_dir}" ]] && { echo "Error: mount_dir '${mount_dir}' not found" >&2; exit 1; }
 [[ ! -d "${model_path}" ]] && { echo "Error: model_path not found: ${model_path}" >&2; exit 1; }
 [[ ! -d "${work_dir}" ]] && { echo "Error: work_dir '${work_dir}' not found" >&2; exit 1; }
 [[ ! -f "${dataset_file}" ]] && { echo "Error: dataset_file '${dataset_file}' not found" >&2; exit 1; }
@@ -116,8 +119,8 @@ run_single() {
         "${gen_num}" "${gen_tp_size}" "${gen_pp_size}" "${gen_batch_size}" "${gen_max_num_tokens}" "${gen_enable_attention_dp}" "${gen_gpu_frac}" \
         "${gen_eplb_num_slots}" "${mtp_size}" "${gen_concurrency_list}" \
         "${gpus_per_node}" "${use_nv_sa_benchmark}" "${isl}" "${osl}" "${multi_round}" "${benchmark_ratio}" \
-        "${streaming}" "${cache_max_tokens}" "${dataset_file}" "${mount_dir}" "${container_image}" \
-        "${model_path}" "${trtllm_repo}" "${build_wheel}" "${work_dir}" "${nsys_on}"
+        "${streaming}" "${cache_max_tokens}" "${dataset_file}" "${container_mount}" "${container_image}" \
+        "${model_path}" "${trtllm_repo}" "${build_wheel}" "${work_dir}" "${nsys_on}" "${seq_offset}" "${numa_bind}" "${benchmark_mode}"
     set +x
 }
 

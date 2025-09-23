@@ -6,7 +6,7 @@ set -u
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 # Add parameter validation
-if [ "$#" -lt 6 ]; then
+if [ "$#" -lt 7 ]; then
     echo "Error: Missing required arguments"
     echo "Usage: $0 model_name dataset_file multi_round concurrency_list streaming log_path"
     exit 1

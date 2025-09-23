@@ -3,13 +3,16 @@ set -u
 set -e
 set -x
 
-role=$1
-instance_id=$2
-model_path=$3
-port=$4
-enable_pdl=$5
-work_dir=$6
-enable_nsys=${7:-false}
+role=${1}
+instance_id=${2}
+model_path=${3}
+port=${4}
+benchmark_mode=${5}
+concurrency=${6}
+enable_pdl=${7}
+numa_bind=${8}
+work_dir=${9}
+enable_nsys=${10}
 
 unset UCX_TLS
 echo "enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
@@ -21,8 +24,18 @@ if [ "${enable_pdl}" = "true" ]; then
     export TRTLLM_ENABLE_PDL=1
 fi
 
-numa_bind_cmd="numactl -m 0,1"
-echo "numactl -m 0,1 - Only allocate memory from nodes on GB200"
+if [ "${numa_bind}" = "true" ]; then
+    numa_bind_cmd="numactl -m 0,1"
+    echo "numactl -m 0,1 - Only allocate memory from nodes on GB200"
+else
+    numa_bind_cmd=""
+    echo "Not binding memory. If on GB200, use \"numactl -m 0,1\" to only allocate memory from nodes."
+fi
+
+if [ "${benchmark_mode}" = "gen_only" ]; then
+    export TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1
+    export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${concurrency}
+fi
 
 if [ "${role}" = "CTX" ]; then
     config_file=${work_dir}/ctx_config.yaml
@@ -46,10 +59,7 @@ fi
 #check if nsys is enabled
 if [ "${enable_nsys}" != "true" ]; then
     echo "nsys is not enabled, start normal flow"
-    # Create log directory if it doesn't exist
-    mkdir -p ${work_dir}
-    # Start the worker and redirect output to the log file
-    trtllm-llmapi-launch ${numa_bind_cmd} trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file} 2>&1 | tee -a ${work_dir}/output_workers.log
+    trtllm-llmapi-launch ${numa_bind_cmd} trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
 else
     nsys_prefix=""
     nsys_file=${work_dir}/nsys_worker_proc_${instance_id}_${SLURM_PROCID}
@@ -62,11 +72,8 @@ else
     elif [ "${role}" = "CTX" ]; then
         echo "nsys is not enabled on ctx_gpus"
     fi
-    # Create log directory if it doesn't exist
-    mkdir -p ${work_dir}
-    # Start the worker with nsys profiling and redirect output to the log file
     ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
         trtllm-serve ${model_path} \
             --host $(hostname) --port ${port} \
-            --extra_llm_api_options ${config_file} 2>&1 | tee -a ${work_dir}/output_workers.log
+            --extra_llm_api_options ${config_file}
 fi
