@@ -226,7 +226,7 @@ class MLPBlock(torch.nn.Module):
         if x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
             weight = self.gate.weight
             bias = self.gate.bias
-            g = torch.ops.trtllm.gptoss_tinygemm(x, weight, bias)
+            g = torch.ops.trtllm.tinygemm2(x, weight, bias)
         else:
             g = self.gate(x)
         return g

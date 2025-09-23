@@ -27,12 +27,10 @@ torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def(
-        "gptoss_tinygemm(Tensor input, Tensor conv_weight, "
-        "Tensor bias) -> Tensor");
+    m.def("tinygemm2(Tensor input, Tensor weight, Tensor bias) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("gptoss_tinygemm", &torch_ext::tinygemm2_forward);
+    m.impl("tinygemm2", &torch_ext::tinygemm2_forward);
 }

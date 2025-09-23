@@ -17,11 +17,10 @@
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
-add_library(gptoss_tinygemm2_src OBJECT ${SRC_CPP} ${SRC_CU})
+add_library(tinygemm2_src OBJECT ${SRC_CPP} ${SRC_CU})
 
-target_compile_options(gptoss_tinygemm2_src
+target_compile_options(tinygemm2_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=32>)
 
-set_property(TARGET gptoss_tinygemm2_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET gptoss_tinygemm2_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                  ON)
+set_property(TARGET tinygemm2_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET tinygemm2_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
