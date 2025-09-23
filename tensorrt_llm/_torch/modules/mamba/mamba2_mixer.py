@@ -158,6 +158,7 @@ class Mamba2Mixer(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
+        mup_vector: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         # calculate split size
@@ -180,6 +181,10 @@ class Mamba2Mixer(nn.Module):
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
+        # Apply optional per-block scaling vector (mup_vector) if provided
+        if mup_vector is not None:
+            # Broadcast over token dimension; ensure dtype compatibility
+            zxbcdt = zxbcdt * mup_vector.to(dtype=zxbcdt.dtype)
         z, xbc, dt = torch.split(
             zxbcdt,
             [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
