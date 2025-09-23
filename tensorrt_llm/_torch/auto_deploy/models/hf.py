@@ -218,15 +218,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
         model.eval()
-        from transformers.quantizers import AutoHfQuantizer
 
-        hf_quantizer = AutoHfQuantizer.from_config(
-            model_config.quantization_config,
-            pre_quantized=True,
-        )
-
-        dtype = hf_quantizer.update_dtype(model_config.dtype)
-        model.to(dtype)
+        if self._quant_config_reader is not None:
+            model = self._quant_config_reader.post_process_model(model, model_config)
 
         return model
 
@@ -444,13 +438,19 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config_reader is not None:
             return
-        # TODO: specified by user or auto-detect
         reader_cls = QuantConfigReaderRegistry.get("modelopt")
         result = reader_cls.from_file(fetched_dir)
+        # Fallback to HF reader if ModelOPT not present
+        if result is None:
+            hf_cls = QuantConfigReaderRegistry.get("hf")
+            try:
+                result = hf_cls.from_file(fetched_dir)
+            except Exception:
+                # Skip HF reader if it errors out during probing
+                result = None
         if result is None:
             return
         reader, extra_model_kwargs = result
-
         if reader is not None:
             self._quant_config_reader = reader
             self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)

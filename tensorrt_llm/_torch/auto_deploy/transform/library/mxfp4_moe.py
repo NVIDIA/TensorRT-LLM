@@ -224,12 +224,14 @@ def _register_mxfp4_expert_params(
     )
 
 
-@TransformRegistry.register("insert_mxfp4_mlp")
+@TransformRegistry.register("quantize_mxfp4_moe")
 class InsertMXFP4MLP(BaseTransform):
     """
     Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::triton_mxfp4_mlp op,
     and register MXFP4 expert params (blocks + scales) on the experts module.
     """
+
+    algo_name: str = "mxfp4"
 
     def _apply(
         self,
@@ -238,14 +240,15 @@ class InsertMXFP4MLP(BaseTransform):
         factory,
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            info = TransformInfo(
-                skipped=True,
-                num_matches=0,
-                is_clean=False,
-                has_valid_shapes=True,
+        qcfg = factory.get_quant_config()
+        if (
+            not qcfg
+            or qcfg.get("quant_method", "") != self.algo_name
+            or not IS_TRITON_KERNELS_AVAILABLE
+        ):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-            return gm, info
         num_matches = 0
 
         for n in list(gm.graph.nodes):
