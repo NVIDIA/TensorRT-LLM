@@ -621,7 +621,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         capture_graph = torch.cuda.is_current_stream_capturing()
 
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
-                      cache_name: str, pin_memory: bool) -> torch.Tensor:
+                      cache_name: str) -> torch.Tensor:
             """
             Finds a compatible, reusable buffer from a cache or creates a new one.
 
@@ -637,7 +637,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 tensor_shape: The required shape.
                 dtype: The required dtype.
                 cache_name: The key for the specific list of buffers to search in.
-                pin_memory: This buffer block shall be kept in buffer pool if provided
             Returns:
                 An existing compatible buffer or a newly created one.
             """
@@ -645,27 +644,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
 
             return buffers.get_buffer(tensor_shape, dtype, cache_name,
-                                      pin_memory)
+                                      capture_graph)
 
-        def get_empty_like(like_tensor: torch.Tensor, cache_name: str,
-                           pin_memory: bool) -> torch.Tensor:
+        def get_empty_like(like_tensor: torch.Tensor,
+                           cache_name: str) -> torch.Tensor:
             return get_empty(like_tensor.shape,
                              cache_name=cache_name,
-                             dtype=like_tensor.dtype,
-                             pin_memory=pin_memory)
+                             dtype=like_tensor.dtype)
 
-        self.prompt_lens_cuda = get_empty((self.max_num_sequences, ),
-                                          cache_name="prompt_lens_cuda",
-                                          dtype=torch.int,
-                                          pin_memory=capture_graph)
+        self.prompt_lens_cuda = get_empty(
+            (self.max_num_sequences, ),
+            cache_name="prompt_lens_cuda",
+            dtype=torch.int,
+        )
         self.prompt_lens_cpu = torch.empty_like(
             self.prompt_lens_cuda,
             device='cpu',
             pin_memory=True,
         )
         self.kv_lens_cuda = get_empty_like(self.prompt_lens_cuda,
-                                           cache_name="kv_lens_cuda",
-                                           pin_memory=capture_graph)
+                                           cache_name="kv_lens_cuda")
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
@@ -687,7 +685,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 ],
                 cache_name="kv_cache_block_offsets",
                 dtype=torch.int32,
-                pin_memory=capture_graph)
+            )
             self.host_kv_cache_block_offsets = torch.empty_like(
                 self.kv_cache_block_offsets,
                 device='cpu',
@@ -703,7 +701,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     ],
                     cache_name="block_ids_per_seq",
                     dtype=torch.int32,
-                    pin_memory=capture_graph)
+                )
                 self.kv_block_ids_per_seq = get_empty(
                     [
                         self.kv_cache_manager.max_batch_size,
@@ -711,14 +709,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     ],
                     cache_name="kv_block_ids_per_seq",
                     dtype=torch.int32,
-                    pin_memory=capture_graph)
+                )
             if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
                 self.ctx_cached_token_indptr = get_empty(
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_cached_token_indptr",
                     dtype=torch.int64,
-                    pin_memory=capture_graph)
+                )
                 self.host_ctx_cached_token_indptr = torch.zeros_like(
                     self.ctx_cached_token_indptr,
                     device='cpu',
@@ -728,17 +726,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     (self.max_num_requests + 1, ),
                     cache_name="ctx_uncached_token_indptr",
                     dtype=torch.int64,
-                    pin_memory=capture_graph)
+                )
                 self.host_ctx_uncached_token_indptr = torch.zeros_like(
                     self.ctx_uncached_token_indptr,
                     device='cpu',
                     pin_memory=True,
                 )
                 # context full seqlens include cached tokens and uncached tokens
-                self.ctx_kv_indptr = get_empty((self.max_num_requests + 1, ),
-                                               cache_name="ctx_kv_indptr",
-                                               dtype=torch.int64,
-                                               pin_memory=capture_graph)
+                self.ctx_kv_indptr = get_empty(
+                    (self.max_num_requests + 1, ),
+                    cache_name="ctx_kv_indptr",
+                    dtype=torch.int64,
+                )
                 self.host_ctx_kv_indptr = torch.zeros_like(
                     self.ctx_kv_indptr,
                     device='cpu',

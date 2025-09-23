@@ -7,7 +7,7 @@ import torch
 
 from ...inputs.multimodal import MultimodalParams
 from ..expert_statistic import ExpertStatistic
-from ..memory_buffer_utils import get_memory_buffer
+from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..utils import make_weak_ref, piecewise_cuda_graph
@@ -54,7 +54,7 @@ class CUDAGraphRunner:
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
             self._create_shared_static_tensors()
-        self.cuda_graph_meta_buffers = get_memory_buffer()
+        self.cuda_graph_meta_buffers = get_memory_buffers()
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
