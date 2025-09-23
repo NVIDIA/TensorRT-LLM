@@ -1437,7 +1437,7 @@ def bf16_mxe2m1_block_scale_moe_runner(
 @dataclass(frozen=True)
 class FP8FP4BlockScaleMoEInputs:
 
-    routing_logits: torch.Tensor
+    routing_logits: Optional[torch.Tensor]
     routing_bias: Optional[torch.Tensor]
     hidden_states: torch.Tensor
     gemm1_weights: torch.Tensor
@@ -1447,6 +1447,8 @@ class FP8FP4BlockScaleMoEInputs:
     output1_scale_scalar: torch.Tensor
     output1_scale_gate_scalar: torch.Tensor
     output2_scale_scalar: torch.Tensor
+    topk_weights: Optional[torch.Tensor] = None
+    topk_ids: Optional[torch.Tensor] = None
 
 
 class FP8FP4BlockScaleMoERunner(TunableRunner):
@@ -1506,7 +1508,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.num_experts,
             self.top_k,
         )
-        instance_key = (tile_tokens_dim, )
+        instance_key = (tile_tokens_dim, self.act_type)
         if instance_key not in FP8FP4BlockScaleMoERunner.runner_dict:
             FP8FP4BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP8FP4BlockScaleMoERunner(
@@ -1519,8 +1521,8 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
 
-        kernel_runner = self.get_runner(inputs[0].shape[0])
         args = FP8FP4BlockScaleMoEInputs(*inputs)
+        kernel_runner = self.get_runner(args.hidden_states.shape[0])
 
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
@@ -1530,7 +1532,8 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.num_experts, self.top_k, self.n_group, self.topk_group,
             self.intermediate_size, self.local_expert_offset,
             self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, self.do_finalize, tactic)
+            self.routing_method_type, self.do_finalize, tactic,
+            args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
@@ -1606,28 +1609,29 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 @torch.library.custom_op("trtllm::fp8_fp4_block_scale_moe_runner",
                          mutates_args=())
 def fp8_fp4_block_scale_moe_runner(
-    routing_logits: torch.Tensor,
-    routing_bias: Optional[torch.Tensor],
-    hidden_states: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
-    gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
-    output1_scale_scalar: torch.Tensor,
-    output1_scale_gate_scalar: torch.Tensor,
-    output2_scale_scalar: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    n_group: Optional[int],
-    topk_group: Optional[int],
-    intermediate_size: int,
-    local_expert_offset: int,
-    local_num_experts: int,
-    routed_scaling_factor: Optional[float],
-    routing_method_type: int,
-    do_finalize: bool,
-    act_type: int,
-) -> List[torch.Tensor]:
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
 
@@ -1645,8 +1649,17 @@ def fp8_fp4_block_scale_moe_runner(
         act_type,
     )
 
-    inputs = [
-        routing_logits,
+    # Use dummy routing logits for autotuner
+    if routing_logits is None:
+        routing_logits_for_tuner = torch.randn(hidden_states.shape[0],
+                                               num_experts,
+                                               dtype=torch.bfloat16,
+                                               device=hidden_states.device)
+    else:
+        routing_logits_for_tuner = routing_logits
+
+    input_tensors_for_tuner = [
+        routing_logits_for_tuner,
         routing_bias,
         hidden_states,
         gemm1_weights,
@@ -1662,23 +1675,50 @@ def fp8_fp4_block_scale_moe_runner(
         "trtllm::fp8_fp4_block_scale_moe_runner",
         [kernel_runner],
         kernel_runner.tuning_config,
-        inputs,
+        input_tensors_for_tuner,
     )
 
-    return kernel_runner(inputs, tactic=best_tactic)
+    input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
+    # replace dummy routing logits with actual routing logits
+    input_tensors[0] = routing_logits
+    return kernel_runner(input_tensors, tactic=best_tactic)
 
 
-def fp8_fp4_block_scale_fake_output_without_finalize(
-    hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
-    num_experts: int,
-    top_k: int,
-    routing_bias: Optional[torch.Tensor],
-):
+@fp8_fp4_block_scale_moe_runner.register_fake
+def _(routing_logits,
+      routing_bias,
+      hidden_states,
+      gemm1_weights,
+      gemm1_weights_scale,
+      gemm2_weights,
+      gemm2_weights_scale,
+      output1_scale_scalar,
+      output1_scale_gate_scalar,
+      output2_scale_scalar,
+      num_experts,
+      top_k,
+      n_group,
+      topk_group,
+      intermediate_size,
+      local_expert_offset,
+      local_num_experts,
+      routed_scaling_factor,
+      routing_method_type,
+      do_finalize,
+      act_type,
+      topk_weights: Optional[torch.Tensor] = None,
+      topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
 
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
+    if do_finalize:
+        return [
+            hidden_states.new_empty((num_tokens, hidden_size),
+                                    dtype=torch.bfloat16)
+        ]
 
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
     expanded_row_count = num_tokens * top_k
     max_padding_required = (tile_tokens_dim - 1) * num_experts
     max_num_padded_tokens = fp4_utils.pad_up(
@@ -1690,43 +1730,3 @@ def fp8_fp4_block_scale_fake_output_without_finalize(
         hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
         hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
     ]
-
-
-@fp8_fp4_block_scale_moe_runner.register_fake
-def _(
-    routing_logits,
-    routing_bias,
-    hidden_states,
-    gemm1_weights,
-    gemm1_weights_scale,
-    gemm2_weights,
-    gemm2_weights_scale,
-    output1_scale_scalar,
-    output1_scale_gate_scalar,
-    output2_scale_scalar,
-    num_experts,
-    top_k,
-    n_group,
-    topk_group,
-    intermediate_size,
-    local_expert_offset,
-    local_num_experts,
-    routed_scaling_factor,
-    routing_method_type,
-    do_finalize,
-    act_type,
-) -> List[torch.Tensor]:
-    if do_finalize:
-        num_tokens = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-        return [
-            hidden_states.new_empty((num_tokens, hidden_size),
-                                    dtype=torch.bfloat16)
-        ]
-
-    return fp8_fp4_block_scale_fake_output_without_finalize(
-        hidden_states,
-        num_experts,
-        top_k,
-        routing_bias,
-    )

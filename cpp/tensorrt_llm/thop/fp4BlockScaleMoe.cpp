@@ -461,15 +461,15 @@ public:
 
     [[nodiscard]] std::vector<torch::Tensor> run(torch::optional<torch::Tensor> const& routing_logits,
         torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
-        torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
-        torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
-        torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
-        torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
-        int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
-        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
-        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor,
-        int64_t const routing_method_type, bool const do_finalize, int64_t moeConfigIndex,
-        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+        torch::Tensor const& gemm1_weights, torch::Tensor const& gemm1_weights_scale,
+        torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale,
+        torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
+        torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
+        int64_t const local_expert_offset, int64_t const local_num_experts,
+        std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
+        int64_t moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
+        torch::optional<torch::Tensor> const& topk_ids)
     {
 
         // Autotuner has requested a default or 'fallback' config index

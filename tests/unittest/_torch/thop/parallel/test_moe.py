@@ -1380,7 +1380,8 @@ class TestMoeFp4:
 
     def run_moe_fp8_fp4_test(self, num_tokens: int, hidden_size: int,
                              intermediate_size: int, routing_info: dict,
-                             use_autotune: bool) -> None:
+                             use_autotune: bool,
+                             use_topk_as_input: bool) -> None:
 
         torch.random.manual_seed(0)
 
@@ -1413,6 +1414,12 @@ class TestMoeFp4:
             assert num_experts > n_groups
             assert num_experts % n_groups == 0
             assert top_k < (top_k_groups * num_experts / n_groups)
+
+        if use_topk_as_input:
+            if routing_method_type != RoutingMethodType.DeepSeekV3 or num_tokens != 150 or use_autotune:
+                pytest.skip(
+                    "use_topk_as_input is tested only with routing_method_type=DeepSeekV3 and num_tokens=150 and use_autotune=False"
+                )
 
         if routing_method_type == RoutingMethodType.DeepSeekV3:
             expert_logits = torch.randn((num_tokens, num_experts),
@@ -1574,6 +1581,14 @@ class TestMoeFp4:
         scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
             1.0 / args.gemm2_scales_global)
 
+        if use_topk_as_input:
+            topk_ids = permute_info["topKIndices"].to(torch.int32)
+            topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
+            expert_logits = None
+        else:
+            topk_ids = None
+            topk_weights = None
+
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
                 expert_logits,
@@ -1596,7 +1611,9 @@ class TestMoeFp4:
                 routed_scaling,
                 routing_method_type,
                 do_finalize=True,
-                act_type=ActType.SwiGlu.value)
+                act_type=ActType.SwiGlu.value,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights)
 
         output_dequant_actual = output[0].to(torch.float)
 
