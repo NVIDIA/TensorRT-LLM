@@ -42,6 +42,7 @@ def create_kv_cache_transceiver(
         cache_transceiver_config.backend = BackendTypeCpp.UCX
         # Ordered by priority
         env_vars = [("TRTLLM_USE_NIXL_KVCACHE", BackendTypeCpp.NIXL),
+                    ("TRTLLM_USE_MOONCAKE_KVCACHE", BackendTypeCpp.MOONCAKE),
                     ("TRTLLM_USE_MPI_KVCACHE", BackendTypeCpp.MPI)]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":

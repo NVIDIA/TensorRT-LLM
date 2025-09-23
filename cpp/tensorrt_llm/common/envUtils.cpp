@@ -278,6 +278,12 @@ bool getEnvUseNixlKvCache()
     return useNixlKvCache;
 }
 
+bool getEnvUseMooncakeKvCache()
+{
+    static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
+    return useMooncakeKvCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;

@@ -81,6 +81,11 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
             backendType = executor::CacheTransceiverConfig::BackendType::NIXL;
             TLLM_LOG_INFO("Enable NIXL KV cache transport.");
         }
+        else if (common::getEnvUseMooncakeKvCache())
+        {
+            backendType = executor::CacheTransceiverConfig::BackendType::MOONCAKE;
+            TLLM_LOG_INFO("Enable MOONCAKE KV cache transport.");
+        }
         else if (common::getEnvUseMPIKvCache())
         {
             backendType = executor::CacheTransceiverConfig::BackendType::MPI;
@@ -188,6 +193,12 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
             mCacheTransBufferManager.get(), *mCacheState);
         TLLM_LOG_INFO("NIXL Connection Manager created");
+    }
+    else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
+    {
+        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+            mCacheTransBufferManager.get(), *mCacheState);
+        TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
     {

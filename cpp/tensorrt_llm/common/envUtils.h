@@ -58,7 +58,10 @@ bool getEnvEnablePDL();
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
+
+bool getEnvUseMooncakeKvCache();
 
 std::string getEnvUCXInterface();
 

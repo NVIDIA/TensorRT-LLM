@@ -347,6 +347,14 @@ template <typename... Args>
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
         return func(std::forward<Args>(args)...);
     }
+    if (backend == "mooncake")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateMooncakeFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateMooncakeFuncType>(
+            "libtensorrt_llm_mooncake_wrapper.so", "createMooncakeTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
     TLLM_THROW("Unknown backend name.");
 }
 

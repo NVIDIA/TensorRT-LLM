@@ -191,7 +191,9 @@ AgentConnectionManager::AgentConnectionManager(
     mAgentName = genUniqueAgentName();
     // Create Agent
     BaseAgentConfig config{mAgentName, true};
-    m_Agent = makeTransferAgent("nixl", &config);
+    // m_Agent = makeTransferAgent("nixl", &config);
+    // hardcode for now
+    m_Agent = makeTransferAgent("mooncake", &config);
     mCacheTransBufferManager = cacheTransBufferManager;
     auto recvBufferCount = mCacheTransBufferManager->getRecvBufferCount();
     auto sendBufferCount = mCacheTransBufferManager->getSendBufferCount();
