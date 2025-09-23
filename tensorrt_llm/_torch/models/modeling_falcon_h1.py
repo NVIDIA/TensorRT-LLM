@@ -91,61 +91,6 @@ class FalconH1MLP(nn.Module):
         return x
 
 
-class FalconH1AttentionDecoderLayer(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[FalconH1Config], layer_idx: int):
-        super().__init__()
-        config = model_config.pretrained_config
-
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        key_multiplier = getattr(config, "key_multiplier", 1.0)
-        # Map key scaling (multiplying K) to q_scaling in TRT attention
-        # qk_scale = 1 / (sqrt(head_dim) * q_scaling)
-        # Multiplying K by key_multiplier is equivalent to setting q_scaling = 1 / key_multiplier
-        q_scaling = 1.0 / key_multiplier if key_multiplier not in (0.0, None) else 1.0
-
-        # Build RoPE params equivalent to vLLM
-        rope = RopeParams.from_config(config)
-        head_dim = (config.hidden_size // config.num_attention_heads
-                    if not hasattr(config, "head_dim") or not isinstance(getattr(config, "head_dim"), int)
-                    else getattr(config, "head_dim"))
-        if hasattr(config, "partial_rotary_factor"):
-            rotary_dim = int(head_dim * getattr(config, "partial_rotary_factor"))
-        elif hasattr(config, "attn_rotary_emb"):
-            rotary_dim = int(getattr(config, "attn_rotary_emb"))
-        else:
-            rotary_dim = head_dim
-        rope.dim = rotary_dim
-        rope.theta = getattr(config, "rope_theta", 1e11)
-        rope.max_positions = max_position_embeddings
-
-        pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.rope_gpt_neox,
-            rope=rope,
-            is_neox=True,
-        )
-
-        self.attn = Attention(hidden_size=config.hidden_size,
-                              num_attention_heads=config.num_attention_heads,
-                              num_key_value_heads=config.num_key_value_heads,
-                              max_position_embeddings=max_position_embeddings,
-                              bias=False,
-                              pos_embd_params=pos_embd_params,
-                              layer_idx=layer_idx,
-                              dtype=config.torch_dtype,
-                              config=model_config,
-                              q_scaling=q_scaling)
-
-    def forward(self,
-                position_ids: Optional[torch.IntTensor],
-                hidden_states: torch.Tensor,
-                attn_metadata: AttentionMetadata,
-                residual: Optional[torch.Tensor] = None,
-                **kwargs):
-        output = self.attn(position_ids, hidden_states, attn_metadata)
-        return output, residual
-
-
 class FalconH1SSMDecoderLayer(nn.Module):
 
     def __init__(self, model_config: ModelConfig[FalconH1Config], layer_idx: int):
@@ -205,6 +150,61 @@ class FalconH1SSMDecoderLayer(nn.Module):
                             attn_metadata,
                             mamba_metadata,
                             mup_vector=self.mup_vector)
+        return output, residual
+
+
+class FalconH1AttentionDecoderLayer(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[FalconH1Config], layer_idx: int):
+        super().__init__()
+        config = model_config.pretrained_config
+
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        key_multiplier = getattr(config, "key_multiplier", 1.0)
+        # Map key scaling (multiplying K) to q_scaling in TRT attention
+        # qk_scale = 1 / (sqrt(head_dim) * q_scaling)
+        # Multiplying K by key_multiplier is equivalent to setting q_scaling = 1 / key_multiplier
+        q_scaling = 1.0 / key_multiplier if key_multiplier not in (0.0, None) else 1.0
+
+        # Build RoPE params equivalent to vLLM
+        rope = RopeParams.from_config(config)
+        head_dim = (config.hidden_size // config.num_attention_heads
+                    if not hasattr(config, "head_dim") or not isinstance(getattr(config, "head_dim"), int)
+                    else getattr(config, "head_dim"))
+        if hasattr(config, "partial_rotary_factor"):
+            rotary_dim = int(head_dim * getattr(config, "partial_rotary_factor"))
+        elif hasattr(config, "attn_rotary_emb"):
+            rotary_dim = int(getattr(config, "attn_rotary_emb"))
+        else:
+            rotary_dim = head_dim
+        rope.dim = rotary_dim
+        rope.theta = getattr(config, "rope_theta", 1e11)
+        rope.max_positions = max_position_embeddings
+
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=rope,
+            is_neox=True,
+        )
+
+        self.attn = Attention(hidden_size=config.hidden_size,
+                              num_attention_heads=config.num_attention_heads,
+                              num_key_value_heads=config.num_key_value_heads,
+                              max_position_embeddings=max_position_embeddings,
+                              bias=False,
+                              pos_embd_params=pos_embd_params,
+                              layer_idx=layer_idx,
+                              dtype=config.torch_dtype,
+                              config=model_config,
+                              q_scaling=q_scaling)
+
+    def forward(self,
+                position_ids: Optional[torch.IntTensor],
+                hidden_states: torch.Tensor,
+                attn_metadata: AttentionMetadata,
+                residual: Optional[torch.Tensor] = None,
+                **kwargs):
+        output = self.attn(position_ids, hidden_states, attn_metadata)
         return output, residual
 
 
