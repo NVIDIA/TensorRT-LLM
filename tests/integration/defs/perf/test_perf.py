@@ -32,7 +32,6 @@ from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, MultiNodeProbe,
                     PerfBenchScriptTestCmds, PerfDisaggScriptTestCmds,
                     PerfMetricType, PerfScriptTestCmds, generate_test_nodes,
-                    multi_node_disagg_server_command_wrapper,
                     multi_node_llm_command_wrapper)
 
 if not hasattr(re, "Pattern"):
@@ -1957,6 +1956,112 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         }
         return ctx_config, gen_config
 
+    def _create_shared_config_file(self, config_path, config_data):
+        """
+        Create config file with clear process responsibility:
+        - Single process: create directly
+        - Multi-process: only first node's first process creates files
+        """
+        # Single process: simple and direct creation
+        if not MultiNodeProbe.is_multi_node():
+            with open(config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(config_data, f)
+            print_info(f"Config file created (single-process): {config_path}")
+            return
+        
+        # Multi-process: only first node's first process creates files
+        if  MultiNodeProbe.is_first_process():
+            # This process is responsible for creating all shared config files
+            if not os.path.exists(config_path):
+                # Create directory if needed
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                
+                # Create the config file atomically
+                temp_path = config_path + ".tmp"
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(config_data, f)
+                
+                # Atomic rename to final path
+                os.rename(temp_path, config_path)
+                print_info(f"Config file created (first-process): {config_path}")
+            else:
+                print_info(f"Config file already exists: {config_path}")
+        else:
+            # Other processes: just acknowledge that file creation is handled elsewhere
+            print_info(f"Config file creation delegated to first-process: {config_path}")
+            
+            # Note: The actual waiting for file readiness happens in _wait_for_config_files_ready
+
+    def _wait_for_config_files_ready(self, config_paths, timeout=30):
+        """
+        Wait for all config files to be created and readable.
+        With clear process responsibility, this is much simpler.
+        """
+        import time
+        
+        # Single process: files should be immediately available
+        if not MultiNodeProbe.is_multi_node():
+            for config_path in config_paths:
+                if not os.path.exists(config_path):
+                    raise RuntimeError(f"Config file {config_path} was not created properly")
+            print_info(f"All config files ready (single-process): {config_paths}")
+            return
+        
+        # Multi-process: different behavior based on process role
+        if MultiNodeProbe.is_first_process():
+            # This process (first process on each node) creates files, they should be immediately available
+            for config_path in config_paths:
+                if not self._is_config_file_ready(config_path):
+                    raise RuntimeError(f"Config file {config_path} was not created properly by this process")
+            print_info(f"All config files ready (creator-process): {config_paths}")
+            return
+        else:
+            # Other processes on the same node: wait for first-process on this node to create files
+            print_info(f"Waiting for config files to be created by first-process on this node: {config_paths}")
+            start_time = time.time()
+            check_interval = 0.1
+            
+            while time.time() - start_time < timeout:
+                all_ready = True
+                
+                for config_path in config_paths:
+                    if not self._is_config_file_ready(config_path):
+                        all_ready = False
+                        break
+                
+                if all_ready:
+                    print_info(f"All config files ready (waiting-process): {config_paths}")
+                    return
+                
+                time.sleep(check_interval)
+                check_interval = min(check_interval * 1.2, 1.0)  # Exponential backoff, max 1s
+            
+            # Timeout reached
+            missing_files = [path for path in config_paths if not self._is_config_file_ready(path)]
+            raise RuntimeError(f"Timeout waiting for config files created by first-process on this node. Missing: {missing_files}")
+
+    def _is_config_file_ready(self, config_path):
+        """
+        Check if a config file exists and is readable/parseable.
+        """
+        try:
+            # Check if file exists
+            if not os.path.exists(config_path):
+                return False
+            
+            # Check if file is readable and has valid content
+            with open(config_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if not content:  # Empty file
+                    return False
+            
+            # Try to parse as YAML to ensure it's valid
+            yaml.safe_load(content)
+            return True
+            
+        except (IOError, OSError, yaml.YAMLError):
+            return False
+
     def _gen_disagg_server_config(self):
         if MultiNodeProbe.is_multi_node():
             hostname = MultiNodeProbe.get_other_node_ip()
@@ -1980,12 +2085,20 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def _get_disagg_worker_deploy_command(self):
         ctx_config, gen_config = self._gen_disagg_worker_config()
+        
+        # Ensure working directory exists (double safety check)
+        os.makedirs(self._working_dir, exist_ok=True)
+        
+        # Use shared file names - all processes use the same config files
         ctx_config_path = os.path.join(self._working_dir, "ctx_config.yaml")
         gen_config_path = os.path.join(self._working_dir, "gen_config.yaml")
-        with open(ctx_config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(ctx_config, f)
-        with open(gen_config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(gen_config, f)
+        
+        # Safely create shared config files with file locking
+        self._create_shared_config_file(ctx_config_path, ctx_config)
+        self._create_shared_config_file(gen_config_path, gen_config)
+        
+        # CRITICAL: Wait for all config files to be ready before proceeding
+        self._wait_for_config_files_ready([ctx_config_path, gen_config_path])
 
         print_info(f"ctx_server_config: {ctx_config}")
         print_info(f"gen_server_config: {gen_config}")
@@ -2019,18 +2132,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def _get_disagg_server_deploy_command(self):
         server_config = self._gen_disagg_server_config()
-        server_config_path = os.path.join(self._working_dir,
-                                          "server_config.yaml")
-        with open(server_config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(server_config, f)
+        
+        # Use shared server config file
+        server_config_path = os.path.join(self._working_dir, "server_config.yaml")
+        
+        # Safely create shared config file with file locking
+        self._create_shared_config_file(server_config_path, server_config)
+        
+        # CRITICAL: Wait for server config file to be ready before proceeding
+        self._wait_for_config_files_ready([server_config_path])
+        
         return f'trtllm-serve disaggregated -c {server_config_path} -t 3600 -r 3600'
 
     def _get_disagg_client_command(self):
         client_dir = os.path.join(self._llm_root,
                                   "examples/disaggregated/clients")
+        
+        # Use shared server config file
+        server_config_path = f'{self._working_dir}/server_config.yaml'
+        
         client_cmd = [
             'python3', f'{client_dir}/disagg_client.py', '-c',
-            f'{self._working_dir}/server_config.yaml', '-p',
+            server_config_path, '-p',
             f'{client_dir}/prompts.json', '--ignore-eos',
             '--server-start-timeout',
             str(3600)
@@ -2085,16 +2208,10 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     The actual test definition for TensorRT LLM perf test.
     """
     working_dir = llm_venv.get_working_directory()
-
-    if MultiNodeProbe.is_multi_node():
-        # Add process ID to avoid conflicts in multi-process environment
-        process_id = os.getpid()
-        mpi_rank = os.environ.get("SLURM_PROCID", "0")
-        process_working_dir = os.path.join(working_dir,
-                                           f"rank{mpi_rank}-pid{process_id}")
-        os.makedirs(process_working_dir, exist_ok=True)
-        working_dir = process_working_dir
-
+    
+    # Handle directory creation - all processes use the same shared directory
+    os.makedirs(working_dir, exist_ok=True)
+    
     test_runner = MultiMetricPerfTest(perf_case_name)
     test_runner.set_runtime_configs(llm_root, working_dir,
                                     trt_performance_cache_fpath)

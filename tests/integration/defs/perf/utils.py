@@ -435,23 +435,36 @@ class PerfDisaggScriptTestCmds(NamedTuple):
 
     def run_cmd_on_single_node(self, cmd_idx: int, venv) -> str:
         output = ""
+        
+        # Generate log file names based on whether it's multi-node or single process
+        def get_log_filename(base_name):
+            if MultiNodeProbe.is_multi_node():
+                # Multi-process: use process-specific names to avoid conflicts
+                import os
+                process_id = os.getpid()
+                mpi_rank = os.environ.get("SLURM_PROCID", "0")
+                return f'{base_name}_rank{mpi_rank}_pid{process_id}.log'
+            else:
+                # Single process: use simple names
+                return f'{base_name}.log'
+        
         try:
             with (  # Start ctx workers
-                    open('output_ctx.log', 'w') as output_ctx,
+                    open(get_log_filename('output_ctx'), 'w') as output_ctx,
                     popen(self.ctx_cmd,
                           stdout=output_ctx,
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as ctx_workers_proc,
                     # Start gen workers
-                    open('output_gen.log', 'w') as output_gen,
+                    open(get_log_filename('output_gen'), 'w') as output_gen,
                     popen(self.gen_cmd,
                           stdout=output_gen,
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as gen_workers_proc,
                     # Start server
-                    open('output_server.log', 'w') as output_server,
+                    open(get_log_filename('output_server'), 'w') as output_server,
                     popen(self.server_cmd,
                           stdout=output_server,
                           stderr=subprocess.STDOUT,
@@ -473,42 +486,55 @@ class PerfDisaggScriptTestCmds(NamedTuple):
 
     def run_cmd_on_multi_node(self, cmd_idx: int, venv) -> str:
         output = ""
-        # Initialize variables to None for safe cleanup
-        output_ctx = None
-        output_gen = None
-        output_server = None
-        ctx_workers_proc = None
-        gen_workers_proc = None
-        server_proc = None
-
+        # Use context managers to properly handle process lifecycle
+        ctx_managers = []
+        
+        # Generate log file names based on whether it's multi-node or single process
+        def get_log_filename(base_name):
+            if MultiNodeProbe.is_multi_node():
+                # Multi-process: use process-specific names to avoid conflicts
+                import os
+                process_id = os.getpid()
+                mpi_rank = os.environ.get("SLURM_PROCID", "0")
+                return f'{base_name}_rank{mpi_rank}_pid{process_id}.log'
+            else:
+                # Single process: use simple names
+                return f'{base_name}.log'
+        
         try:
             if MultiNodeProbe.is_first_node():
                 # Start ctx workers
-                output_ctx = open('output_ctx.log', 'w')
-                ctx_workers_proc = popen(self.ctx_cmd,
-                                         stdout=output_ctx,
-                                         stderr=subprocess.STDOUT,
-                                         env=venv._new_env,
-                                         shell=True)
+                output_ctx = open(get_log_filename('output_ctx'), 'w')
+                ctx_workers_cm = popen(self.ctx_cmd,
+                                      stdout=output_ctx,
+                                      stderr=subprocess.STDOUT,
+                                      env=venv._new_env,
+                                      shell=True)
+                ctx_workers_proc = ctx_workers_cm.__enter__()
+                ctx_managers.append((ctx_workers_cm, output_ctx))
 
             if MultiNodeProbe.is_second_node():
                 # Start gen workers
-                output_gen = open('output_gen.log', 'w')
-                gen_workers_proc = popen(self.gen_cmd,
-                                         stdout=output_gen,
-                                         stderr=subprocess.STDOUT,
-                                         env=venv._new_env,
-                                         shell=True)
+                output_gen = open(get_log_filename('output_gen'), 'w')
+                gen_workers_cm = popen(self.gen_cmd,
+                                      stdout=output_gen,
+                                      stderr=subprocess.STDOUT,
+                                      env=venv._new_env,
+                                      shell=True)
+                gen_workers_proc = gen_workers_cm.__enter__()
+                ctx_managers.append((gen_workers_cm, output_gen))
 
-            if MultiNodeProbe.is_first_node(
-            ) and MultiNodeProbe.is_first_process():
+            if MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process():
                 # Start server
-                output_server = open('output_server.log', 'w')
-                server_proc = popen(self.server_cmd,
-                                    stdout=output_server,
-                                    stderr=subprocess.STDOUT,
-                                    env=venv._new_env,
-                                    shell=True)
+                output_server = open(get_log_filename('output_server'), 'w')
+                server_cm = popen(self.server_cmd,
+                                 stdout=output_server,
+                                 stderr=subprocess.STDOUT,
+                                 env=venv._new_env,
+                                 shell=True)
+                server_proc = server_cm.__enter__()
+                ctx_managers.append((server_cm, output_server))
+                
                 # wait for server to be ready
                 self.wait_for_endpoint_ready(
                     f"http://localhost:8000/health",
@@ -517,30 +543,19 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                 check_output(self.client_cmd, env=venv._new_env)
                 # start benchmark
                 output += check_output(self.benchmark_cmd, env=venv._new_env)
+        
+        except Exception as e:
+            # Handle any errors during execution
+            print_error(f"Error in multi-node execution: {e}")
+            raise
         finally:
-            # Safely terminate processes
-            if server_proc is not None:
-                server_proc.terminate()
-            if ctx_workers_proc is not None:
-                ctx_workers_proc.terminate()
-            if gen_workers_proc is not None:
-                gen_workers_proc.terminate()
-
-            # Wait for processes to finish
-            if server_proc is not None:
-                server_proc.wait()
-            if ctx_workers_proc is not None:
-                ctx_workers_proc.wait()
-            if gen_workers_proc is not None:
-                gen_workers_proc.wait()
-
-            # Close file handles
-            if output_ctx is not None:
-                output_ctx.close()
-            if output_gen is not None:
-                output_gen.close()
-            if output_server is not None:
-                output_server.close()
+            # Properly exit all context managers
+            for cm, file_handle in reversed(ctx_managers):
+                try:
+                    cm.__exit__(None, None, None)
+                    file_handle.close()
+                except Exception as e:
+                    print_error(f"Error during cleanup: {e}")
 
         return output
 
@@ -723,15 +738,14 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 )
                 outputs.pop(cmd_idx)
             else:
-                self._perf_result = self.get_perf_result(outputs)
-
-                # Stop the timer
-                self._end_timestamp = datetime.utcnow()
-
                 #For multinode - Only perform write result on first node and first process
                 #For single node - Not care this one, assume its single CPU process
                 if not MultiNodeProbe.is_multi_node() or \
                     (MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process()):
+                    self._perf_result = self.get_perf_result(outputs)
+
+                    # Stop the timer
+                    self._end_timestamp = datetime.utcnow()
                     # Write results to output csv and/or yaml files.
                     self._write_result(full_test_name, session_data_writer,
                                        output_dir, outputs, original_test_name,
