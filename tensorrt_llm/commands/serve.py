@@ -108,7 +108,6 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
-    backend = backend if backend in ["pytorch", "_autodeploy"] else None
     llm_args = {
         "model":
         model,
@@ -171,6 +170,7 @@ def launch_server(host: str,
         llm_args["kv_cache_config"].enable_block_reuse = False
         llm = AutoDeployLLM(**llm_args)
     elif backend == 'tensorrt' or backend == 'trt':
+        llm_args.pop("backend")
         llm = LLM(**llm_args)
     else:
         raise click.BadParameter(
