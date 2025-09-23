@@ -2179,7 +2179,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=SamplerType.auto,
         description=
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
-        status="prototype")
+        status="beta")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
