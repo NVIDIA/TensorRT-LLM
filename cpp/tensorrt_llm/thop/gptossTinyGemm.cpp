@@ -9,19 +9,13 @@
 torch::Tensor tinygemm2_cuda_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
 
 // C++ interface
-#define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
-#define CHECK_INPUT(x)                                                                                                 \
-    CHECK_CUDA(x);                                                                                                     \
-    CHECK_CONTIGUOUS(x)
-
 namespace torch_ext
 {
 torch::Tensor tinygemm2_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias)
 {
-    CHECK_INPUT(input);
-    CHECK_INPUT(weight);
-    CHECK_INPUT(bias);
+    CHECK_INPUT(input, torch::kBFloat16);
+    CHECK_INPUT(weight, torch::kBFloat16);
+    CHECK_INPUT(bias, torch::kBFloat16);
     return tinygemm2_cuda_forward(input, weight, bias);
 }
 } // namespace torch_ext
