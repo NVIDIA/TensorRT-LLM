@@ -229,7 +229,7 @@ def allgather(
     return output
 
 
-def alltoall(
+def alltoall_helix(
     inputs: List[torch.Tensor],
     group: List[int],
 ) -> List[torch.Tensor]:
@@ -256,20 +256,15 @@ def alltoall(
     assert n_ranks > 0, "group must be non-empty"
     assert n_ranks == len(set(group)), "group must be unique"
 
-    assert len(
-        inputs
-    ) % n_ranks == 0, "inputs length must be a multiple of the group size"
+    assert len(inputs) % n_ranks == 0,\
+        "inputs length must be a multiple of the group size"
     num_lists = len(inputs) // n_ranks
-    outputs = []
     for il in range(num_lists):
         ref_input = inputs[il * n_ranks]
         assert all([inputs[i].shape == ref_input.shape for i in range(il * n_ranks + 1, (il + 1) * n_ranks)]),\
             "all input tensors in a group must have the same shape"
-        outputs.append(ref_input.new_empty((n_ranks, ) + ref_input.shape))
 
-    output_list = [out[i] for out in outputs for i in range(n_ranks)]
-    torch.ops.trtllm.alltoall(output_list, inputs, group, num_lists)
-    return outputs
+    return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
 
 
 def reducescatter(

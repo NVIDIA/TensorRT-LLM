@@ -37,15 +37,15 @@ namespace torch_ext
 namespace
 {
 
-class AllToAllOp
+class AllToAllHelixOp
 {
 public:
-    AllToAllOp(std::set<int> group)
+    AllToAllHelixOp(std::set<int> group)
         : mGroup(std::move(group))
     {
     }
 
-    ~AllToAllOp() = default;
+    ~AllToAllHelixOp() = default;
 
     int initialize()
     {
@@ -56,7 +56,7 @@ public:
         return 0;
     }
 
-    void run(torch::TensorList output_list, torch::TensorList input_list, torch::optional<int64_t> num_lists)
+    std::vector<torch::Tensor> run(torch::TensorList input_list, torch::optional<int64_t> num_lists)
     {
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
         auto num_lists_ = static_cast<int>(num_lists.value_or(1));
@@ -64,24 +64,27 @@ public:
         // note: ensures that input_list size > 0
         TLLM_CHECK_WITH_INFO(static_cast<int>(input_list.size()) == num_ranks * num_lists_,
             "input_list size should be equal to group size * num_lists");
-        TLLM_CHECK_WITH_INFO(static_cast<int>(output_list.size()) == num_ranks * num_lists_,
-            "output_list size should be equal to group size * num_lists");
+        std::vector<torch::Tensor> output_list(static_cast<size_t>(num_lists_));
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
         ncclGroupStart();
         for (int il = 0; il < num_lists_; ++il)
         {
             auto off = il * num_ranks;
+            auto output_shape = input_list[off].sizes().vec();
+            output_shape.insert(output_shape.begin(), num_ranks);
+            auto output = torch::empty(output_shape, input_list[off].options());
+            output_list[il] = output;
             auto type = tensorrt_llm::runtime::TorchUtils::dataType(input_list[off].scalar_type());
             auto nccl_type = (*getDtypeMap())[type];
             for (int r = 0; r < num_ranks; ++r)
             {
                 auto const& input = input_list[off + r];
-                auto& output = output_list[off + r];
                 ncclSend(input.data_ptr(), input.numel(), nccl_type, r, *mNcclComm, stream);
-                ncclRecv(output.mutable_data_ptr(), output.numel(), nccl_type, r, *mNcclComm, stream);
+                ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, *mNcclComm, stream);
             }
         }
         NCCLCHECK_THROW(ncclGroupEnd());
+        return output_list;
     }
 
 private:
@@ -93,8 +96,8 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-void alltoall(torch::TensorList output_list, torch::TensorList input_list, torch::List<int64_t> group_,
-    torch::optional<int64_t> num_lists)
+std::vector<torch::Tensor> alltoall_helix(
+    torch::TensorList input_list, torch::List<int64_t> group_, torch::optional<int64_t> num_lists)
 {
 #if ENABLE_MULTI_DEVICE
     std::set<int> group;
@@ -102,9 +105,11 @@ void alltoall(torch::TensorList output_list, torch::TensorList input_list, torch
     {
         group.insert(static_cast<int>(rank));
     }
-    AllToAllOp op(group);
+    AllToAllHelixOp op(group);
     op.initialize();
-    op.run(output_list, input_list, num_lists);
+    return op.run(input_list, num_lists);
+#else
+    return {};
 #endif // ENABLE_MULTI_DEVICE
 }
 
@@ -112,10 +117,10 @@ void alltoall(torch::TensorList output_list, torch::TensorList input_list, torch
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("alltoall(Tensor[] output_list, Tensor[] input_list, int[] group, int? num_lists) -> ()");
+    m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("alltoall", &torch_ext::alltoall);
+    m.impl("alltoall_helix", &torch_ext::alltoall_helix);
 }

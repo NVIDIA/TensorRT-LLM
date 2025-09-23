@@ -24,7 +24,7 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed import alltoall
+from tensorrt_llm._torch.distributed import alltoall_helix
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -51,7 +51,7 @@ def run_single_rank(single_rank_forward_func, *args, **kwargs):
 
 @torch.inference_mode()
 def run_alltoall_op(input_tensors, expected_recv_tensors, group):
-    """Run alltoall operation on a single rank."""
+    """Run alltoall_helix operation on a single rank."""
     rank = tensorrt_llm.mpi_rank()
     input_tensors = input_tensors[rank]
     expected_recv_tensors = expected_recv_tensors[rank]
@@ -60,8 +60,8 @@ def run_alltoall_op(input_tensors, expected_recv_tensors, group):
     # Move input tensors to GPU
     input_tensors = [t.cuda() for t in input_tensors]
 
-    # Call alltoall
-    output_tensors = alltoall(input_tensors, group)
+    # Call alltoall_helix
+    output_tensors = alltoall_helix(input_tensors, group)
 
     # Verify output
     expected_recv_tensors = [t.cuda() for t in expected_recv_tensors]
