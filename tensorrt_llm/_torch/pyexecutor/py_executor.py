@@ -912,16 +912,17 @@ class PyExecutor:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
                         self._update_requests(previous_batch.sample_state)
 
-                        if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
-                            self._send_disagg_ctx_cache(
-                                previous_batch.scheduled_ctx_reqs)
-
                         self._handle_canceled_requests()
 
                         self._handle_logits_communication(
                             previous_batch, prev_microbatch_id)
 
-                        finished_requests = self._handle_responses()
+                        context_requests = []
+                        if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
+                            context_requests = previous_batch.scheduled_ctx_reqs
+
+                        finished_requests = self._handle_responses(
+                            context_requests)
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
                             previous_scheduled_batch)
@@ -1812,8 +1813,6 @@ class PyExecutor:
                         request, cache_block_ids):
                     self.resource_manager.free_resources(request)
         else:
-            if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and request.is_context_only_request:
-                self.kv_cache_manager.pin_blocks(request.py_request_id)
             self.resource_manager.free_resources(request)
 
     @nvtx_range("_handle_canceled_requests")
@@ -1883,13 +1882,18 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
-    def _handle_responses(self):
+    def _handle_responses(self, context_requests: List[LlmRequest] = None):
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
+        if context_requests is not None:
+            context_requests_map = set(
+                [request.py_request_id for request in context_requests])
+        else:
+            context_requests_map = set()
         for request in self.active_requests:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it
@@ -1922,19 +1926,30 @@ class PyExecutor:
                     request_done = request.is_finished
                     new_responses.append((req_id, response))
 
-            if request_done or request.is_disagg_context_complete_state:
-                if request.is_disagg_context_transmission_state:
-                    if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
-                        requests_to_terminate.append(request)
-                    self.ctx_in_transmission_requests.append(
-                        (request,
-                         self.kv_cache_manager.get_last_block_id(
-                             request.py_request_id)))
-                else:
+            if request_done:
+                if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
+                    if request.py_request_id in context_requests_map:
+                        block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                            request, True)
+                        self.ctx_in_transmission_requests.append(
+                            (request, block_id))
                     requests_to_terminate.append(request)
+                else:
+                    if request.is_disagg_context_transmission_state:
+                        self.ctx_in_transmission_requests.append(
+                            (request, None))
+                    else:
+                        if request.py_request_id in context_requests_map:
+                            self.ctx_in_transmission_requests.append(
+                                (request, None))
+                        else:
+                            requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
-        self.active_requests.clear()
+
+        if context_requests is not None and self.kv_cache_transceiver:
+            self._send_disagg_ctx_cache(context_requests)
+
         self.active_requests.extend(new_active_requests)
         for request in requests_to_terminate:
             self._terminate_request(request)

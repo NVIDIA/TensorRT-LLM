@@ -103,10 +103,19 @@ public:
             void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth, llmRequest);
     }
 
-    void removeSequence(tb::LlmRequest::RequestIdType requestId,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt) override
+    std::optional<tbk::KVCacheBlock::IdType> removeSequence(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt,
+        bool pinOnRelease = false) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, removeSequence, requestId, llmRequest);
+        PYBIND11_OVERLOAD_PURE(std::optional<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, removeSequence,
+            requestId, llmRequest, pinOnRelease);
+    }
+
+    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
+    {
+        PYBIND11_OVERLOAD_PURE(std::optional<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, storeBlocksForReuse,
+            requestId, llmRequest, pinBlocks);
     }
 
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
@@ -462,6 +471,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, py::call_guard<py::gil_scoped_release>())
+        .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
+            py::call_guard<py::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, py::call_guard<py::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             py::call_guard<py::gil_scoped_release>())

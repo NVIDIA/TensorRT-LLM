@@ -67,7 +67,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 28);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 29);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -116,10 +116,17 @@ public:
         NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
     }
 
-    void removeSequence(tb::LlmRequest::RequestIdType requestId,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt) override
+    std::optional<tbk::KVCacheBlock::IdType> removeSequence(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt,
+        bool pinOnRelease = false) override
     {
-        NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest);
+        NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
+    }
+
+    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
+    {
+        NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
     }
 
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
@@ -460,6 +467,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())

@@ -54,10 +54,12 @@ public:
         blockIds.reserve(numBlocksToCollect);
         for (int32_t i = 0; i < numBlocksToCollect; ++i)
         {
-            TLLM_CHECK_WITH_INFO(lastBlock->getPrevBlock(), "last block has no prev block");
+            TLLM_CHECK_WITH_INFO(
+                lastBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId, "last block has no block id");
             blockIds.push_back(lastBlock->getBlockId());
             if (i + 1 < numBlocksToCollect)
             {
+                TLLM_CHECK_WITH_INFO(lastBlock->getPrevBlock(), "last block has no prev block");
                 lastBlock = lastBlock->getPrevBlock();
             }
         }

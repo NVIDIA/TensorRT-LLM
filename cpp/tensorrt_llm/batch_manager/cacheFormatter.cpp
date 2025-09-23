@@ -82,7 +82,10 @@ BlockRange getBlockRangeForReceiving(
         }
         else
         {
-            newBlockIds.clear();
+            if (usedBlocks > 0 && usedBlocks <= totalBlocks)
+            {
+                newBlockIds.push_back(allBlockIds[usedBlocks - 1]);
+            }
         }
         range.setBlockIds(std::move(newBlockIds));
         return range;
