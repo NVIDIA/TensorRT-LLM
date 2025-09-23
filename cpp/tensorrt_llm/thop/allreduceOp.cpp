@@ -355,7 +355,7 @@ private:
     {
 
         TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(),
-            "UserBuffer has not been initialized (required for NCCL_DEVICE)")
+            "UserBuffer has not been initialized (required for NCCL_DEVICE)");
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
