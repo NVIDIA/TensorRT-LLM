@@ -64,8 +64,13 @@ def ctx_gen_kv_cache_dtype(request):
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
                          ids=["mha", "mla"])
+@pytest.mark.parametrize("backend", [
+    trtllm.CacheTransceiverBackendType.NIXL,
+    trtllm.CacheTransceiverBackendType.UCX
+],
+                         ids=["NIXL", "UCX"])
 def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
-                                             attention_type):
+                                             attention_type, backend):
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
     ctx_kv_cache_dtype, gen_kv_cache_dtype = ctx_gen_kv_cache_dtype
@@ -73,8 +78,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = trtllm.CacheTransceiverConfig(
-        backend=trtllm.CacheTransceiverBackendType.DEFAULT,
-        max_tokens_in_buffer=512)
+        backend=backend, max_tokens_in_buffer=512)
     dist = MPIDist(mapping=mapping)
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_ctx, attention_type,

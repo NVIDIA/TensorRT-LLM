@@ -1608,6 +1608,49 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("fp8kv,cuda_graph,overlap_scheduler",
+                          [(False, False, False), (True, True, True)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids(
+        "batch_wait_timeout_iters,batch_wait_max_tokens_ratio", [(0, 0),
+                                                                 (10, 0.75),
+                                                                 (10, 0),
+                                                                 (0, 0.75)])
+    def test_nvfp4_batch_waiting(self, torch_compile, fp8kv, cuda_graph,
+                                 overlap_scheduler, mtp_nextn,
+                                 batch_wait_timeout_iters,
+                                 batch_wait_max_tokens_ratio):
+        moe_backend = "CUTLASS"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
+            max_num_streams=3) if torch_compile else None
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            batch_wait_timeout_iters=batch_wait_timeout_iters,
+            batch_wait_max_tokens_ratio=batch_wait_max_tokens_ratio,
+            moe_config=MoeConfig(backend=moe_backend))
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=False,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
@@ -2052,18 +2095,24 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
-        [(8, 1, 4, 3, False, False, True, True, 1),
-         (8, 1, 8, 0, True, True, True, True, 24),
-         (8, 1, 8, 1, True, True, True, True, 24)],
-        ids=["latency", "throughput", "throughput_mtp"])
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        [(8, 1, 4, 3, False, False, True, True, 1, "_DEFAULT"),
+         (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
+         (8, 1, 8, 1, True, True, True, True, 24, "_DEFAULT"),
+         (8, 1, 8, 1, True, True, True, True, 24, "TRTLLM")],
+        ids=[
+            "latency", "throughput", "throughput_mtp", "throughput_mtp_trtllm"
+        ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size):
+                            max_batch_size, moe_backend):
         if get_sm_version() == 100 or get_sm_version() == 103:
-            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+            moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
+            moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
+            if moe_backend != "_DEFAULT":
+                pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
