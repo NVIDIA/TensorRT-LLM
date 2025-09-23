@@ -1162,8 +1162,8 @@ class PyExecutor:
                         all_can_forward = self.dist.tp_allgather(
                             local_can_forward)
                         if all(all_can_forward):
-                            time.sleep(10)
                             can_forward = True
+                            time.sleep(10)
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
