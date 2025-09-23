@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
+import transformers
 from tqdm import tqdm
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
@@ -586,6 +587,32 @@ class ModelLoader:
             return tokenizer
         else:
             logger.warning(f"Failed to load tokenizer from {model_dir}")
+            return None
+
+    @staticmethod
+    def load_hf_generation_config(
+            model_dir, **kwargs) -> Optional[transformers.GenerationConfig]:
+        try:
+            return transformers.GenerationConfig.from_pretrained(
+                model_dir, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf generation config from {model_dir}, encounter error: {e}"
+            )
+            return None
+
+    @staticmethod
+    def load_hf_model_config(
+            model_dir,
+            trust_remote_code: bool = True,
+            **kwargs) -> Optional[transformers.PretrainedConfig]:
+        try:
+            return transformers.PretrainedConfig.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf model config from {model_dir}, encounter error: {e}"
+            )
             return None
 
 

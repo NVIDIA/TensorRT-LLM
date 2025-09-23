@@ -162,22 +162,34 @@ You are a helpful assistant."""
         messages=messages,
         max_completion_tokens=256,
         response_format={
-            "type":
-            "structural_tag",
-            "structures": [
-                {
-                    "begin": "<function=get_current_weather>",
-                    "schema":
-                    tool_get_current_weather["function"]["parameters"],
-                    "end": "</function>",
-                },
-                {
-                    "begin": "<function=get_current_date>",
-                    "schema": tool_get_current_date["function"]["parameters"],
-                    "end": "</function>",
-                },
-            ],
-            "triggers": ["<function="],
+            "type": "structural_tag",
+            "format": {
+                "type":
+                "triggered_tags",
+                "triggers": ["<function="],
+                "tags": [
+                    {
+                        "begin": "<function=get_current_weather>",
+                        "content": {
+                            "type":
+                            "json_schema",
+                            "json_schema":
+                            tool_get_current_weather["function"]["parameters"]
+                        },
+                        "end": "</function>",
+                    },
+                    {
+                        "begin": "<function=get_current_date>",
+                        "content": {
+                            "type":
+                            "json_schema",
+                            "json_schema":
+                            tool_get_current_date["function"]["parameters"]
+                        },
+                        "end": "</function>",
+                    },
+                ],
+            },
         },
     )
 

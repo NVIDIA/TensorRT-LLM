@@ -30,7 +30,7 @@ There are multiple MOE backends inside TRT-LLM, not all of them supporting every
 | B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
 | B200/GB200 EP<=8 | FP8 | DEEPGEMM |
 | GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
-| GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
+| GB200 NVL72 EP>8 | FP8 | WIDEEP without EPLB |
 
 The default moe backend is `CUTLASS`, so for the combination which is not supported by `CUTLASS`, one must set the `moe_config.backend` explicitly to run the model.
 

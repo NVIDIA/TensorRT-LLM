@@ -29,9 +29,10 @@ _add_trt_llm_dll_directory()
 
 import sys
 
-# Need to import xgrammar before tensorrt_llm library,
-# otherwise `MemoryError: std::bad_alloc` pattern error will be raised.
-import xgrammar  # noqa
+# Need to import torch before tensorrt_llm library, otherwise some shared binary files
+# cannot be found for the public PyTorch, raising errors like:
+# ImportError: libc10.so: cannot open shared object file: No such file or directory
+import torch  # noqa
 
 import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.functional as functional
