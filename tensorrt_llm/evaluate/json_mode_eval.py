@@ -64,7 +64,8 @@ class JsonModeEval(Evaluator):
                 schema["x-guidance"] = {"lenient": True}
                 schema = json.dumps(schema)
             sampling_args = {
-                "guided_decoding": GuidedDecodingParams(json=schema)
+                "guided_decoding": GuidedDecodingParams(json=schema),
+                "temperature": 0,
             }
             yield sample["prompt"], sampling_args, sample["completion"], sample[
                 "schema"]
