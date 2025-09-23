@@ -185,7 +185,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> DecoderModelForCausalLM:
+    ) -> Tuple[DecoderModelForCausalLM, ModelConfig]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -267,7 +267,7 @@ class ModelLoader:
 
             torch.cuda.current_stream().synchronize()
 
-        return model
+        return model, config
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,

@@ -173,10 +173,10 @@ class PyTorchModelEngine(ModelEngine):
                 max_seq_len=max_seq_len,
                 lora_config=lora_config,
             )
-            self.model = loader.load(checkpoint_dir=model_path,
-                                     checkpoint_loader=checkpoint_loader)
+            self.model, config = loader.load(
+                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             moe_load_balancer = maybe_create_moe_load_balancer(
-                self.model.model_config, self.mapping)
+                config, self.mapping)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
                 moe_load_balancer.register_weight_slots_after_to_cuda()
