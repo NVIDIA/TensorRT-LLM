@@ -513,7 +513,7 @@ class MTPWorker(nn.Module):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn metadata
-        if attn_metadata.is_cuda_graph and attn_metadata is not None:
+        if attn_metadata is not None:
             self.restore_attn_metadata(attn_metadata=attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
