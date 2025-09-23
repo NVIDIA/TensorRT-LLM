@@ -41,13 +41,14 @@ REQUEST_TYPE_MAPPING = {
 
 class LogitsStorage:
 
-    def __init__(self,
-                 seq_length: int,
-                 use_device_memory=True,
-                 should_exclude_last=False,
-                 use_chunked_logits=False,
-                 streaming=False,
-                 chunk_size=8):
+    def __init__(
+        self,
+        seq_length: int,
+        use_device_memory=True,
+        should_exclude_last=False,
+        use_chunked_logits=False,
+        chunk_size=8
+    ):  # logic adpted from HandleGenerationLogits.cpp to use chunked transfer
         if should_exclude_last:
             # Exclude last logits is used when overlap scheduler is used, that generates one extra token,
             # so we should make sure there's memory for that extra +1.
@@ -57,7 +58,6 @@ class LogitsStorage:
         self._should_exclude_last = should_exclude_last
         self.use_chunked_logits = use_chunked_logits
         self.chunk_size = chunk_size
-        self.streaming = streaming
         self._logits_indices = []
 
         # Lazily initialized by _init() upon first append()
@@ -144,15 +144,10 @@ class LogitsStorage:
         """Add a logits fragment to device storage"""
         self._device_fragments.append(logits.clone())
 
-        # Streaming mode: transfer immediately after each fragment (size=1).
+        # Streaming mode: transfer immediately after each fragment (self.chunk_size=1).
         # Non-streaming mode: batch transfer every chunk_size steps.
-        if self.streaming:
-            if len(self._device_fragments
-                   ) == 1:  # Only one token at a time in streaming
-                self._transfer_chunk_to_host()
-        else:
-            if len(self._device_fragments) == self.chunk_size:
-                self._transfer_chunk_to_host()
+        if len(self._device_fragments) == self.chunk_size:
+            self._transfer_chunk_to_host()
 
     def _transfer_chunk_to_host(self):
         """Transfer accumulated fragments to host"""
@@ -244,19 +239,21 @@ class PyResult:
                  use_chunked_logits: bool = True,
                  chunk_size: int = 8):
         self._streaming = streaming
+        if self._streaming:
+            self._chunk_size = 1
+        else:
+            self._chunk_size = chunk_size
         self._context_logits = LogitsStorage(
             prompt_len,
             use_device_memory,
             use_chunked_logits=use_chunked_logits,
-            streaming=streaming,
-            chunk_size=chunk_size) if return_context_logits else None
+            chunk_size=self._chunk_size) if return_context_logits else None
         self._generation_logits = LogitsStorage(
             max_new_tokens,
             use_device_memory,
             exclude_last_generation_logits,
             use_chunked_logits=use_chunked_logits,
-            streaming=streaming,
-            chunk_size=chunk_size) if return_generation_logits else None
+            chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
 
