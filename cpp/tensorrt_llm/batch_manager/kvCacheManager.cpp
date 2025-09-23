@@ -2450,12 +2450,55 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     };
 
     std::map<SizeType32, float> windowSizeToShare;
-    // NOTE: Righteously, blocks allocated should be proportional with
-    // regard to window size. Currently, we are first allocating identical
-    // number of blocks for all layers to achieve identical performance.
-    for (auto const& [windowSize, _] : windowSizeToLayers)
+    // By default, we allocate equal proportion shares of memory for all
+    // window sizes (see the else case). With TRTLLM_WINDOW_SIZE_SHARES,
+    // we can override this behavior to adjust the memory share of each
+    // window size. For example, if we have window size of [512, 32768],
+    // then setting TRTLLM_WINDOW_SIZE_SHARES=0.4,0.6 will be allocating
+    // 40% of the memory to window size 512 and 60% of the memory to window
+    // size 32768.
+    if (auto envStr = std::getenv("TRTLLM_WINDOW_SIZE_SHARES"))
     {
-        windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
+        std::stringstream ss(envStr);
+        std::vector<float> shares;
+        float share;
+        while (ss >> share)
+        {
+            shares.push_back(share);
+            if (ss.peek() == ',')
+                ss.ignore();
+        }
+
+        TLLM_CHECK_WITH_INFO(shares.size() == windowSizeToLayers.size(),
+            "Number of shares in TRTLLM_WINDOW_SIZE_SHARES (%ld) must match number of window sizes (%ld)",
+            shares.size(), windowSizeToLayers.size());
+        float sumShares = 0.0f;
+        for (auto s : shares)
+        {
+            TLLM_CHECK_WITH_INFO(0.0f <= s && s <= 1.0f, "Shares must be in value range [0,1], got %f", s);
+            sumShares += s;
+        }
+        TLLM_CHECK_WITH_INFO(sumShares > 0.0f, "Sum of shares must be > 0.");
+        // Normalize shares to 1.0
+        for (auto& s : shares)
+        {
+            s /= sumShares;
+        }
+        size_t i = 0;
+        for (auto const& [windowSize, _] : windowSizeToLayers)
+        {
+            windowSizeToShare[windowSize] = shares[i++];
+        }
+    }
+    else
+    {
+        // NOTE: Righteously, blocks allocated should be proportional with
+        // regard to window size. Currently, we are first allocating identical
+        // number of blocks for all layers to achieve identical performance.
+        for (auto const& [windowSize, _] : windowSizeToLayers)
+        {
+            windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
+        }
     }
 
     std::vector<SizeType32> blocksPrimary;
