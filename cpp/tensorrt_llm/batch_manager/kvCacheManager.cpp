@@ -408,7 +408,7 @@ LookupNodePtr KVCacheBlock::getLookupNode() const
 }
 
 KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock)
-    : mRoot(std::make_shared<KVCachePromptLookupNode>())
+    : mRoot(std::make_shared<KVCachePromptLookupNode>(BlockKey(),false))
     , mCacheType(cacheType)
     , mTokensPerBlock(tokensPerBlock)
 {
@@ -443,7 +443,8 @@ std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::look
         if (create && matchingNode == nullptr)
         {
             // No match, create blank prompt node
-            matchingNode = std::make_shared<KVCachePromptLookupNode>(blockKey);
+            bool isFull = static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock;
+            matchingNode = std::make_shared<KVCachePromptLookupNode>(blockKey,isFull);
             matchingNode->setPrevNode(searchRoot);
             searchRoot->addNextNode(blockKey, matchingNode);
         }
@@ -1096,7 +1097,14 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
     auto newBlockKeys = mLookup->findNewContextBlock(llmRequest, 0, true, windowSizes);
 
     // If newBlockKeys does not have an entry for firstWindowSize, it means no new context block was found
-    return newBlockKeys.count(firstWindowSize) ? newBlockKeys.at(firstWindowSize) : std::nullopt;
+    if (newBlockKeys.count(firstWindowSize))
+    {
+        return newBlockKeys.at(firstWindowSize);
+    }
+    else
+    {
+        return std::nullopt;
+    }
 }
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
@@ -1108,7 +1116,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
 {
     SizeType32 numMatchedTokens{0};
-    auto searchRoot = mCachedBlocksRoot;
 
     // The last block cannot be shared between beams because it will be written to.
     // Make sure a unique block is allocated per beam.
@@ -1124,7 +1131,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
-            numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
+            numMatchedTokens += numMatched > 0 ? numMatched : matchingNode->getUniqueTokens().size();
             if (perBlockRetentions[bi].retentionPriority.has_value()
                 && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
             {
@@ -1150,7 +1157,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
-                searchRoot = matchingBlock;
             }
             onboardBlock(matchingBlock);
             addBlockToAllBeams(matchingBlock, sequence);
@@ -1161,7 +1167,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
                 reusedBlockIds.insert(matchingBlockId);
                 ++mReusedUniqueBlocks;
             }
-            ++blockItr;
         }
         else
         {
@@ -1172,14 +1177,15 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
             addBlockToAllBeams(freeBlock, sequence);
             TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - No match, allocated new block %d for sequence %lu",
                 mLogPrefix.c_str(), freeBlock->getBlockId(), sequence.getRequestId());
+            /*
             // TODO: Clean this up. Does it need to be done here? Should be done when block is stored.
-            if (blockItr != blockKeys.end())
+            if (matchingBlock != nullptr)
             {
                 freeBlock->setBlockKey(
-                    *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
-                ++blockItr;
+                    *blockItr, nodeItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
             }
             freeBlock->setHash();
+            */
             ++mMissedBlocks;
         }
     }
@@ -1196,21 +1202,11 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
                                               executor::KvCacheRetentionConfig::kDefaultRetentionPriority),
                 perBlockRetentions[bi].durationMs);
             addBlockToBeam(freeBlock, sequence, beamIdx);
-            if (blockItr != blockKeys.end())
-            {
-                freeBlock->setBlockKey(
-                    *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
-                ++blockItr;
-            }
-            freeBlock->setHash();
             TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Beam %d. Allocated non-shared block %d for bi %d",
                 mLogPrefix.c_str(), beamIdx, freeBlock->getBlockId(), bi);
+            // TODO: freeBlock->setBlockKey + setHash
         }
         ++mMissedBlocks;
-        if (blockItr != blockKeys.end())
-        {
-            ++blockItr;
-        }
     }
 
     return numMatchedTokens;
@@ -1385,26 +1381,30 @@ void WindowBlockManager::storeBlocks(
     std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     TLLM_LOG_DEBUG(
-        "%s::storeBlocks - %zu blockKeys, %zu blockIds", mLogPrefix.c_str(), blockKeys.size(), blockIds.size());
+        "%s::storeBlocks - %zu lookupNodes, %zu blockIds", mLogPrefix.c_str(), lookupNodes.size(), blockIds.size());
 
     auto numNodes = lookupNodes.size();
     TLLM_CHECK_WITH_INFO(numNodes <= blockIds.size(), "BlockIds not provided for all lookup nodes");
+    std::vector<BlockPtr> storedBlocks;
+    // TODO: Verify that storedBlocks is supposed to be vector of newly stored blocks
     for (std::size_t blockCnt = 0; blockCnt < numNodes; ++blockCnt)
     {
         auto const bid = blockIds[blockCnt];
         TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
         auto& block = mAllBlocksById[bid];
         auto const [partialMatch, numMatched, matchedNode] = lookupNodes[blockCnt];
-        auto& matchedBlock = matchedNode->getBlock(mWindowSize);
+        auto matchedBlock = matchedNode->getBlock(mWindowSize);
         if (matchedBlock == nullptr)
         {
             auto prevNode = matchedNode->getPrevNode();
             auto prevBlock = prevNode != nullptr ? prevNode->getBlock(mWindowSize) : nullptr;
+            auto blockKey = matchedNode->getBlockKey();
             block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
             block->setPrevBlockInSeq(prevBlock);
             block->setHash(); // TODO: Why this is necessary? Can it be replaced with hash from matchedNode?
             block->setLookupNode(matchedNode, mWindowSize);
             matchedNode->setBlock(mWindowSize, block);
+            storedBlocks.push_back(block);
         }
     }
     if (mEventManager)
@@ -1538,12 +1538,12 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // Create nodes if no match is found.
     if (storeBlocksForReuse)
     {
-        auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, true, mEnablePartialReuse, true);
+        auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, true, mEnablePartialReuse, true);
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
             auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
-            manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx])
+            manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx]);
         }
     }
     for (auto& [windowSize, manager] : mWindowBlockManagers)
@@ -1581,11 +1581,11 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     }
 
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, false, false, true);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, false, false, true);
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
-        manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx])
+        manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx]);
     }
 }
 
