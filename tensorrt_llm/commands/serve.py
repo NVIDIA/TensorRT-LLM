@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import signal  # Added import
 import subprocess  # nosec B404
@@ -506,6 +507,19 @@ def disaggregated(config_file: Optional[str],
                                 server_start_timeout_secs=server_start_timeout,
                                 metadata_server_cfg=metadata_server_cfg,
                                 metrics_interval_secs=metrics_log_interval)
+
+    # Disable GC by default
+    #   When concurrency is high, the number of Python objects increases, so
+    #   GC runs frequently and takes a long time to process. In this case,
+    #   requests are not immediately forwarded to CTX workers and GEN workers,
+    #   causing them to run with small batch sizes. Disabling GC can mitigate
+    #   this problem.
+    #   By testing this feature, we didn't observe significant RSS or VMS
+    #   increment, and observed that `count0` (obtained by `gc.get_count()`)
+    #   increases by fewer than 1,000 after every 200,000 requests, while the
+    #   maximum value of `count0` exceeded 3,000,000 during the test.
+    if int(os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1")):
+        gc.disable()
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

@@ -70,15 +70,21 @@ private:
                 expIdx[ie].score = static_cast<float>(finalScore);
             }
 
-            // convert back to io_dtype and store the topk expert results in hostData.mPtrExpertIdx
+            // convert back to io_dtype and store the topk expert results in hostData.mPtrTopKPacked
             for (int ie = 0; ie < param.topK; ++ie)
             {
                 PackedType si{static_cast<T>(expIdx[ie].score), expIdx[ie].idx};
-                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrExpertIdxHost))[it * param.topK + ie] = si;
-                if (param.getExpWeights)
+                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
+
+                if (param.useTopKAsInput)
                 {
-                    bufferCast<T>(*this->mPtrExpertWeightsHost)[it * param.topK + ie]
-                        = static_cast<T>(expIdx[ie].score);
+                    bufferCast<int32_t>(*this->mPtrTopKIdsHost)[it * param.topK + ie]
+                        = static_cast<int32_t>(expIdx[ie].idx);
+                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(expIdx[ie].score);
+                }
+                else if (param.getExpWeights)
+                {
+                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(expIdx[ie].score);
                 }
             }
         }
@@ -97,8 +103,18 @@ private:
     {
         RoutingKernelTest<T>::setCommonParams(param, routingData);
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-        routingData.mPtrScores = bufferCast<T>(*this->mPtrScoresDevice);
-        routingData.mPtrExpertIdx = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrExpertIdxDevice));
+
+        routingData.mPtrTopKPacked = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedDevice));
+        if (param.useTopKAsInput)
+        {
+            routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrScores = nullptr;
+        }
+        else
+        {
+            routingData.mPtrTopKIds = nullptr;
+            routingData.mPtrScores = bufferCast<T>(*this->mPtrScoresDevice);
+        }
     }
 
     void callTestedFunction(
@@ -118,7 +134,8 @@ TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
         /*numExperts=*/128, /*topK=*/1,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
         /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };
@@ -129,7 +146,7 @@ TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
         /*numExperts=*/128, /*topK=*/1,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -140,7 +157,41 @@ TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelization)
         /*numExperts=*/128, /*topK=*/1,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationTopKAsInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/3,
+        /*numExperts=*/128, /*topK=*/1,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
+        /*requiredComputeCapability*/ 8);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelizationTopKAsInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/10,
+        /*numExperts=*/128, /*topK=*/1,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelizationTopKAsInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/300,
+        /*numExperts=*/128, /*topK=*/1,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
         /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
     this->runTest(param);
 };

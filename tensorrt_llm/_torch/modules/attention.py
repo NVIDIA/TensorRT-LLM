@@ -24,7 +24,7 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
-from .rotary_embedding import RotaryEmbedding
+from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -271,11 +271,19 @@ class Attention(nn.Module):
 
         self.rotary_emb = None
         if not self.rope_fusion and self.pos_embd_params is not None:
-            self.rotary_emb = RotaryEmbedding(
-                self.pos_embd_params.rope,
-                head_dim=self.head_dim,
-                is_neox=self.pos_embd_params.is_neox,
-            )
+            if self.pos_embd_params.type.is_mrope():
+                self.rotary_emb = MRotaryEmbedding(
+                    self.pos_embd_params.rope,
+                    head_dim=self.head_dim,
+                    is_neox=self.pos_embd_params.is_neox,
+                    mrope_section=self.pos_embd_params.mrope_section,
+                )
+            else:
+                self.rotary_emb = RotaryEmbedding(
+                    self.pos_embd_params.rope,
+                    head_dim=self.head_dim,
+                    is_neox=self.pos_embd_params.is_neox,
+                )
 
         self.attn = create_attention(
             self.attn_backend,

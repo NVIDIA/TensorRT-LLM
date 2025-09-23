@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+import xgrammar
 from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
@@ -85,18 +86,11 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
-class StructuralTag(OpenAIBaseModel):
-    begin: str
-    schema_: Optional[dict[str, Any]] = Field(alias="schema")
-    end: str
-
-
 class ResponseFormat(OpenAIBaseModel):
     # type must be one of "text", "json", "json_object", or "structural_tag"
     type: Literal["text", "json", "json_object", "structural_tag"]
     schema: Optional[dict] = None
-    structures: Optional[List[StructuralTag]] = None
-    triggers: Optional[List[str]] = None
+    format: Optional[xgrammar.structural_tag.Format] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
