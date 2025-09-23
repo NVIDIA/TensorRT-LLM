@@ -107,7 +107,7 @@ def test_dynamic_spec_decode(enforce_single_worker,
         # The spec decode algorithm currently guarantees identical results
         assert text_spec == text_ref
 
-        
+
 # This test is a supplement to test_dynamic_spec_decode, because forcing single process will disable people to use SIGINT(ctrl-c) when testing
 # Dynamic spec decode in this test is expected to firstly start with mode OFF
 # then it naturally turns ON when the remaining effective requests is less than self.concurrency.
@@ -116,7 +116,8 @@ def test_dynamic_spec_decode(enforce_single_worker,
 # Later: len(requests): 1, max_batch_size: 3, token_cap: 1638 -> num_effective_requests: 1, self.max_concurrency: 2 -> spec decode ON
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
-def test_dynamic_spec_decode_without_force_single_process(disable_overlap_scheduler: bool):
+def test_dynamic_spec_decode_without_force_single_process(
+        disable_overlap_scheduler: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
