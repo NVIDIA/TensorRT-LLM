@@ -22,6 +22,126 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                       DecoderModelForCausalLM,
                                                       register_auto_model)
+from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm._torch.attention_backend.interface import (
+    PositionalEmbeddingParams, RopeParams)
+
+
+class FalconH1AttentionDecoderLayer(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[FalconH1Config], layer_idx: int):
+        super().__init__()
+        config = model_config.pretrained_config
+
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        key_multiplier = getattr(config, "key_multiplier", 1.0)
+        # Map key scaling (multiplying K) to q_scaling in TRT attention
+        # qk_scale = 1 / (sqrt(head_dim) * q_scaling)
+        # Multiplying K by key_multiplier is equivalent to setting q_scaling = 1 / key_multiplier
+        q_scaling = 1.0 / key_multiplier if key_multiplier not in (0.0, None) else 1.0
+
+        # Build RoPE params equivalent to vLLM
+        rope = RopeParams.from_config(config)
+        head_dim = (config.hidden_size // config.num_attention_heads
+                    if not hasattr(config, "head_dim") or not isinstance(getattr(config, "head_dim"), int)
+                    else getattr(config, "head_dim"))
+        if hasattr(config, "partial_rotary_factor"):
+            rotary_dim = int(head_dim * getattr(config, "partial_rotary_factor"))
+        elif hasattr(config, "attn_rotary_emb"):
+            rotary_dim = int(getattr(config, "attn_rotary_emb"))
+        else:
+            rotary_dim = head_dim
+        rope.dim = rotary_dim
+        rope.theta = getattr(config, "rope_theta", 1e11)
+        rope.max_positions = max_position_embeddings
+
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=rope,
+            is_neox=True,
+        )
+
+        self.attn = Attention(hidden_size=config.hidden_size,
+                              num_attention_heads=config.num_attention_heads,
+                              num_key_value_heads=config.num_key_value_heads,
+                              max_position_embeddings=max_position_embeddings,
+                              bias=False,
+                              pos_embd_params=pos_embd_params,
+                              layer_idx=layer_idx,
+                              dtype=config.torch_dtype,
+                              config=model_config,
+                              q_scaling=q_scaling)
+
+    def forward(self,
+                position_ids: Optional[torch.IntTensor],
+                hidden_states: torch.Tensor,
+                attn_metadata: AttentionMetadata,
+                residual: Optional[torch.Tensor] = None,
+                **kwargs):
+        output = self.attn(position_ids, hidden_states, attn_metadata)
+        return output, residual
+
+
+class FalconH1SSMDecoderLayer(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[FalconH1Config], layer_idx: int):
+        super().__init__()
+        config = model_config.pretrained_config
+
+        self.config = config
+        self.tp_size = model_config.mapping.tp_size
+
+        self.mamba = Mamba2Mixer(d_model=config.hidden_size,
+                                 d_state=config.mamba_d_state,
+                                 d_conv=config.mamba_d_conv,
+                                 nheads=config.mamba_n_heads,
+                                 n_groups=config.mamba_n_groups,
+                                 head_dim=config.mamba_d_head,
+                                 chunk_size=getattr(config, "mamba_chunk_size",
+                                                    getattr(config, "chunk_size", 128)),
+                                 layer_idx=layer_idx,
+                                 rms_norm_eps=config.rms_norm_eps,
+                                 dtype=config.torch_dtype,
+                                 config=model_config)
+
+        # Prepare non-learnable per-block scaling vector (mup_vector)
+        # following vLLM's FalconH1SSMDecoderLayer implementation.
+        ssm_multipliers = getattr(config, "ssm_multipliers", [1.0, 1.0, 1.0, 1.0, 1.0])
+        d_ssm = (int(getattr(config, "mamba_expand", 0) * config.hidden_size)
+                 if getattr(config, "mamba_d_ssm", None) is None else getattr(config, "mamba_d_ssm"))
+        groups_time_state_size = config.mamba_n_groups * config.mamba_d_state
+        vector_shape = (2 * d_ssm + 2 * groups_time_state_size + config.mamba_n_heads) // self.tp_size
+        mup_vector = torch.ones(1, vector_shape)
+
+        # Z: [0 : d_ssm]
+        mup_vector[:, : d_ssm // self.tp_size] *= ssm_multipliers[0]
+        # X: [d_ssm : 2*d_ssm]
+        mup_vector[:, (d_ssm // self.tp_size):(2 * d_ssm // self.tp_size)] *= ssm_multipliers[1]
+        # B: [2*d_ssm : 2*d_ssm + G*S]
+        start = (2 * d_ssm) // self.tp_size
+        end = (2 * d_ssm + groups_time_state_size) // self.tp_size
+        mup_vector[:, start:end] *= ssm_multipliers[2]
+        # C: [2*d_ssm + G*S : 2*d_ssm + 2*G*S]
+        start = (2 * d_ssm + groups_time_state_size) // self.tp_size
+        end = (2 * d_ssm + 2 * groups_time_state_size) // self.tp_size
+        mup_vector[:, start:end] *= ssm_multipliers[3]
+        # dt: [2*d_ssm + 2*G*S : end]
+        start = (2 * d_ssm + 2 * groups_time_state_size) // self.tp_size
+        mup_vector[:, start:] *= ssm_multipliers[4]
+
+        self.register_buffer("mup_vector", mup_vector, persistent=False)
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                attn_metadata: AttentionMetadata,
+                mamba_metadata: Mamba2Metadata,
+                residual: Optional[torch.Tensor] = None,
+                **kwargs):
+        output = self.mamba(hidden_states,
+                            attn_metadata,
+                            mamba_metadata,
+                            mup_vector=self.mup_vector)
+        return output, residual
 
 
 class FalconH1ParallelHybridLayer(DecoderLayer):
@@ -33,27 +153,10 @@ class FalconH1ParallelHybridLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         # Branch modules
-        self.self_attn = Attention(hidden_size=config.hidden_size,
-                                   num_attention_heads=config.num_attention_heads,
-                                   num_key_value_heads=config.num_key_value_heads,
-                                   max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
-                                   bias=False,
-                                   pos_embd_params=None,
-                                   layer_idx=layer_idx,
-                                   dtype=config.torch_dtype,
-                                   config=model_config)
+        self.self_attn = FalconH1AttentionDecoderLayer(model_config,
+                                                       layer_idx)
 
-        self.mamba = Mamba2Mixer(d_model=config.hidden_size,
-                                 d_state=config.mamba_d_state,
-                                 d_conv=config.mamba_d_conv,
-                                 nheads=config.mamba_n_heads,
-                                 n_groups=config.mamba_n_groups,
-                                 head_dim=config.mamba_d_head,
-                                 chunk_size=getattr(config, "mamba_chunk_size", getattr(config, "chunk_size", 128)),
-                                 layer_idx=layer_idx,
-                                 rms_norm_eps=config.rms_norm_eps,
-                                 dtype=config.torch_dtype,
-                                 config=model_config)
+        self.mamba = FalconH1SSMDecoderLayer(model_config, layer_idx)
 
         # FFN uses fused gate_up and down with SiLU gating
         intermediate_size = (config.intermediate_size[0]
@@ -90,13 +193,16 @@ class FalconH1ParallelHybridLayer(DecoderLayer):
 
         # Attention branch
         attn_input = hidden_states * self._attn_in_mul
-        attn_hidden = self.self_attn(position_ids=None,
-                                     hidden_states=attn_input,
-                                     attn_metadata=attn_metadata)
+        attn_hidden, _ = self.self_attn(position_ids=position_ids,
+                                        hidden_states=attn_input,
+                                        attn_metadata=attn_metadata)
 
         # Mamba branch
         ssm_input = hidden_states * self._ssm_in_mul
-        mamba_hidden = self.mamba(ssm_input, attn_metadata, **kwargs)
+        mamba_hidden, _ = self.mamba(hidden_states=ssm_input,
+                                     attn_metadata=attn_metadata,
+                                     mamba_metadata=kwargs.get(
+                                         "mamba_metadata"))
 
         hidden_states = attn_hidden * self._attn_out_mul + mamba_hidden * self._ssm_out_mul
         hidden_states = hidden_states + residual
@@ -116,6 +222,7 @@ class FalconH1Model(DecoderModel):
         config = self.model_config.pretrained_config
 
         # embeddings
+        # TODO: vllm differentiates between is_first_rank and not, do we need that?
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
@@ -129,12 +236,14 @@ class FalconH1Model(DecoderModel):
         self.layers = nn.ModuleList(layers)
 
         # final norm
+        # TODO: vllm differentiates between is_last_rank and not, do we need that?
         self.final_layernorm = RMSNorm(hidden_size=config.hidden_size,
                               eps=config.rms_norm_eps,
                               dtype=config.torch_dtype)
 
         self.mamba_metadata: Optional[Mamba2Metadata] = None
 
+        # TODO: simplify?
         embed_mul = getattr(config, "embedding_multiplier", 1.0)
         self.register_buffer("_embed_mul", torch.tensor(embed_mul, dtype=torch.float32), persistent=False)
 
@@ -150,8 +259,9 @@ class FalconH1Model(DecoderModel):
             )
 
         if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            chunk_size = getattr(self.model_config.pretrained_config, "mamba_chunk_size", getattr(self.model_config.pretrained_config, "chunk_size", 128))
-            self.mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests, chunk_size=chunk_size)
+            self.mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests,
+                chunk_size=self.model_config.pretrained_config.mamba_chunk_size)
         self.mamba_metadata.prepare(attn_metadata)
 
         if inputs_embeds is None:
@@ -173,10 +283,6 @@ class FalconH1Model(DecoderModel):
 class FalconH1ForCausalLM(DecoderModelForCausalLM[FalconH1Model, FalconH1Config]):
 
     def __init__(self, model_config: ModelConfig[FalconH1Config]):
-        # import debugpy
-        # debugpy.listen(5678)
-        # debugpy.wait_for_client()
-
         if not model_config.mapping.tp_size in [1, 2, 4, 8]:
             raise ValueError("TP has to be either 1, 2, 4 or 8")
 
@@ -201,6 +307,10 @@ class FalconH1ForCausalLM(DecoderModelForCausalLM[FalconH1Model, FalconH1Config]
                     nk = nk.replace('.mamba.A_log', '.mamba.A')
                 if '.dt_proj.bias' in nk:
                     nk = nk.replace('.dt_proj.bias', '.dt_bias')
+                if '.mamba' in nk:
+                    nk = nk.replace('.mamba', '.mamba.mamba')
+                if '.self_attn.' in nk:
+                    nk = nk.replace('.self_attn.', '.self_attn.attn.')
                 # Flatten conv1d weights [out, 1, k] -> [out, k]
                 if nk.endswith('.mamba.conv1d.weight') and v.ndim == 3 and v.shape[1] == 1:
                     v = v.squeeze(1).contiguous()
