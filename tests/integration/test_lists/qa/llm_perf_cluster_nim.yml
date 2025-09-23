@@ -1,5 +1,5 @@
 version: 0.0.1
-llm_perf_cluster:
+llm_perf_cluster_nim:
 - condition:
     ranges:
       system_gpu_count:
