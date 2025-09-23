@@ -194,4 +194,4 @@ def _torch_ssm_transform_meta(
     time_step_limit: List[float],
     chunk_size: int,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    return torch.empty_like(hidden_states, dtype=torch.float32)
