@@ -3425,54 +3425,6 @@ static const struct TestMetaV2
     return code
 
 
-# This is used to add some kernels running in cubins.
-# The source code of paged context fmha kernels are not in this repo, but we have cubins for them.
-# Other kernels are for passing CI cases.
-def modify_cubin_header(cubin_header):
-    result = cubin_header
-
-    # for CI cases
-    def add_kernel_line(result, target, addition):
-        pos = result.find(target)
-        if pos != -1:
-            end_pos = result.find('\n', pos)
-            if end_pos == -1:
-                end_pos = len(result)
-            result = result[:end_pos + 1] + addition + result[end_pos:]
-        return result
-
-    target = "#ifndef EXCLUDE_SM_80"
-    addition = """extern unsigned char cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin[];
-extern uint32_t cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin_len;
-extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
-extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;"""
-    result = add_kernel_line(result, target, addition)
-
-    def modify_kernel_line(result, target, new_line):
-        lines = result.split('\n')
-        for i, line in enumerate(lines):
-            if target in line:
-                lines[i] = new_line
-                break
-        return '\n'.join(lines)
-
-    target = "fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_causal_sm80_kernel_nl_tiled"
-    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 128, 128, 64, 64, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_causal_sm80_kernel_nl_tiled", 65536, 128, 128, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
-    result = modify_kernel_line(result, target, new_line)
-
-    target = "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled"
-    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 64, 128, 128, 128, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled", 81920, 128, 64, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
-    result = modify_kernel_line(result, target, new_line)
-
-    # make sure only one empty line at the end
-    lines = result.split('\n')
-    while lines and not lines[-1].strip():
-        lines.pop()
-    lines.append('')
-
-    return '\n'.join(lines)
-
-
 def generate_files(specs_names):
 
     kfiles = []
@@ -3534,8 +3486,6 @@ def generate_files(specs_names):
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
-    #if generate_cu_trtllm:
-        #cubin_header = modify_cubin_header(cubin_header)
 
     with open('./generated/fmha_cubin.h', 'w') as f:
         f.write(cubin_header)
