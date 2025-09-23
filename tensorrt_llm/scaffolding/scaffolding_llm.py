@@ -208,7 +208,7 @@ class ScaffoldingLlm:
 
     def shutdown(self, shutdown_workers=False):
 
-        def shutdown_workers():
+        def shutdown_workers_func():
             for worker in self.workers.values():
                 worker.shutdown()
 
@@ -228,4 +228,4 @@ class ScaffoldingLlm:
             self.shutdown_event.set()
 
         if shutdown_workers:
-            shutdown_workers()
+            shutdown_workers_func()

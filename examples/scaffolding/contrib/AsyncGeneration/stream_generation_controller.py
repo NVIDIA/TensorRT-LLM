@@ -42,8 +42,7 @@ class NativeStreamGenerationController(Controller):
                     "custom_sampling_params")
             elif self.custom_sampling_params:
                 task.custom_sampling_params = self.custom_sampling_params
-            stream_task = StreamGenerationTask()
-            stream_task.__dict__ = copy.deepcopy(task.__dict__)
+            stream_task = StreamGenerationTask.create_from_generation_task(task)
             stream_task.streaming_step = self.stream_step
             stream_tasks.append(stream_task)
         lst = list(range(len(stream_tasks)))
