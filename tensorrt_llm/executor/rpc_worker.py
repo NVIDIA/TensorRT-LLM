@@ -34,13 +34,15 @@ class RpcWorker(BaseWorker):
         - `shutdown`: Shutdown the worker.
     """
 
+    # Number of RPC server workers
+    NUM_WORKERS = 6
+
     def __init__(
         self,
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         kv_connector_config: Optional[KvCacheConnectorConfig] = None,
@@ -60,8 +62,11 @@ class RpcWorker(BaseWorker):
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
         )
-        # Store garbage_collection_gen0_threshold if needed in the future
-        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        # Extract garbage_collection_gen0_threshold from llm_args if available
+        self.garbage_collection_gen0_threshold = (
+            llm_args.garbage_collection_gen0_threshold if llm_args is not None
+            and hasattr(llm_args, 'garbage_collection_gen0_threshold') else
+            None)
         self.shutdown_event = Event()
 
         self._response_queue = Queue()
@@ -101,11 +106,13 @@ class RpcWorker(BaseWorker):
                                             timeout=timeout)
         return responses
 
+    async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
+        return await asyncio.to_thread(self.fetch_stats)
+
     # for streaming performance
     async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
         while not self.shutdown_event.is_set():
-            responses = await asyncio.to_thread(self.fetch_responses
-                                                )  # run blocking call in thread
+            responses = await self.fetch_responses_async()
             if responses:  # Only yield if there are actual responses
                 logger_debug(
                     f"RpcWorker {mpi_rank()} is yielding responses: {responses}",
@@ -117,6 +124,20 @@ class RpcWorker(BaseWorker):
         logger_debug(
             f"RpcWorker {mpi_rank()} quitting fetch_responses_loop_async",
             color="yellow")
+
+    async def fetch_stats_loop_async(
+            self,
+            timeout: Optional[float] = None) -> AsyncGenerator[list, None]:
+        while not self.shutdown_event.is_set():
+            logger_debug(f"RpcWorker {mpi_rank()} is fetching stats async")
+            timeout = timeout or 0.1
+            await asyncio.sleep(timeout)
+            stats = await self.fetch_stats_async()
+            # Always yield stats, even if empty, to prevent the client looks like hanging
+            # TODO: Remove the empty stats to reduce the IPC overhead
+            yield stats
+        logger_debug(f"RpcWorker {mpi_rank()} quitting fetch_stats_loop_async",
+                     color="yellow")
 
     def setup_engine(self):
         # Force all the ranks to wait here, and start creating the executor simultaneously.
@@ -146,7 +167,6 @@ class RpcWorker(BaseWorker):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
@@ -162,7 +182,6 @@ class RpcWorker(BaseWorker):
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
@@ -184,7 +203,7 @@ class RpcWorker(BaseWorker):
                          color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
             # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
-            rpc_server = RPCServer(worker, num_workers=6)
+            rpc_server = RPCServer(worker, num_workers=RpcWorker.NUM_WORKERS)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
 

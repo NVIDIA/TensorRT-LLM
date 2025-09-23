@@ -173,6 +173,18 @@ class TestRpcWorkerTP1:
 
         await process_request_streaming()
 
+    @pytest.mark.asyncio
+    async def test_fetch_stats_loop_async(self):
+        await asyncio.sleep(1)
+        results = []
+        async for stats in self.client.fetch_stats_loop_async(
+        ).remote_streaming():
+            results.append(stats)  # empty stats
+            print(f"fetch_stats_async batch, received {len(stats)} stats")
+            if len(results) >= 10:
+                break
+        assert len(results) >= 10
+
 
 class TestRpcWorkerTP2:
 

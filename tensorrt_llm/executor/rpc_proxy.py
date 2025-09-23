@@ -185,9 +185,6 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         return result
 
-    def fetch_responses_remote(self):
-        return self.rpc_client.fetch_responses().remote(timeout=20)
-
     def fetch_stats_remote(self):
         return self.rpc_client.fetch_stats().remote()
 

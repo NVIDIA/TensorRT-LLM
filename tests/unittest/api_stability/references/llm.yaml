@@ -179,6 +179,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      orchestrator_type:
+        annotation: Optional[Literal["rpc"]]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:

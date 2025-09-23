@@ -1550,6 +1550,13 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
+    orchestrator_type: Optional[Literal["rpc"]] = Field(
+        default=None,
+        description=
+        "The orchestrator type to use. Defaults to None, which uses MPI.",
+        status="prototype",
+    )
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
@@ -2434,13 +2441,6 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
-        status="prototype",
-    )
-
-    orchestrator_type: Optional[Literal["ray", "rpc"]] = Field(
-        default=None,
-        description=
-        "The orchestrator type to use. Defaults to None, which uses MPI.",
         status="prototype",
     )
 

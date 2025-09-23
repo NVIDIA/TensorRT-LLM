@@ -207,6 +207,14 @@ class RPCServer:
                     f"Dispatcher received request {req}, pending: {self._num_pending_requests}"
                 )
 
+    # TODO optimization: resolve the sequential scheduling for the remote calls
+    # Suppose tons of submit remote call block the FIFO queue, and the later get_stats remote calls may be blocked
+    # There could be two dispatch modes:
+    # 1. (current) mix mode, share the same routine/pool
+    # 2. (promising) stream mode, specific remote_call -> stream -> specific routine/pool
+    #    - get_stats() - 1, remote_call -> dedicated queue -> dedicated routine/pool
+    #    - submit() - 3 -> dedicated queue -> dedicated routine/pool
+    # TODO potential optimization: for submit(), batch the ad-hoc requests in an interval like 5ms, reduce the IPC count
     async def _worker_routine(self, stop_event: threading.Event):
         """The routine executed by each worker thread."""
         assert self._client_socket is not None, "Client socket is not bound"
@@ -306,6 +314,7 @@ class RPCServer:
                 logger_debug(
                     f"RPC Server running async task {req.method_name} in worker"
                 )
+                # TODO: let num worker control the pool size
                 result = await asyncio.wait_for(loop.run_in_executor(
                     self._executor, call_with_kwargs),
                                                 timeout=req.timeout)
