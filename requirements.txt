@@ -40,7 +40,7 @@ prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
-pillow==10.3.0
+pillow>=10.3.0
 wheel<=0.45.1
 optimum
 # evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
