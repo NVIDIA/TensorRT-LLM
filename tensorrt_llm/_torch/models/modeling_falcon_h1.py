@@ -17,7 +17,6 @@ from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
-from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                       DecoderModelForCausalLM,
@@ -25,6 +24,71 @@ from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
+from tensorrt_llm._torch.modules.linear import (Linear, TensorParallelMode,
+                                                WeightMode, WeightsLoadingConfig)
+
+class FalconH1MLP(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[FalconH1Config],
+                 intermediate_size: int, bias: bool = False):
+        super().__init__()
+        config = model_config.pretrained_config
+
+        # Handle list intermediate_size
+        self.intermediate_size = (intermediate_size[0]
+                                  if isinstance(intermediate_size, list)
+                                  else intermediate_size)
+
+        self.hidden_size = config.hidden_size
+        self.dtype = config.torch_dtype
+        self.tp_size = model_config.mapping.tp_size
+
+        # Multipliers
+        self.gate_multiplier, self.down_multiplier = getattr(
+            config, "mlp_multipliers", (1.0, 1.0))
+
+        # gate_up fused projection: produces [gate, up]
+        self.gate_up_proj = Linear(
+            self.hidden_size,
+            2 * self.intermediate_size,
+            bias=bias,
+            dtype=self.dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            weights_loading_config=WeightsLoadingConfig(
+                weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+            force_dynamic_quantization=model_config.force_dynamic_quantization,
+        )
+
+        # down projection
+        self.down_proj = Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=bias,
+            dtype=self.dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+            force_dynamic_quantization=model_config.force_dynamic_quantization,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # gate_up outputs [gate, up] concatenated along last dim (local dims under TP)
+        x = self.gate_up_proj(x)
+        local_intermediate = self.intermediate_size // self.tp_size
+        gate = x[..., :local_intermediate]
+        up = x[..., local_intermediate:]
+        # Apply gate multiplier to gate branch, SiLU then multiply
+        gate = F.silu(gate * self.gate_multiplier)
+        x = gate * up
+        x = self.down_proj(x)
+        x = x * self.down_multiplier
+        return x
 
 
 class FalconH1AttentionDecoderLayer(nn.Module):
@@ -158,16 +222,11 @@ class FalconH1ParallelHybridLayer(DecoderLayer):
 
         self.mamba = FalconH1SSMDecoderLayer(model_config, layer_idx)
 
-        # FFN uses fused gate_up and down with SiLU gating
-        intermediate_size = (config.intermediate_size[0]
-                             if isinstance(config.intermediate_size, list)
-                             else config.intermediate_size)
-        self.feed_forward = MLP(hidden_size=config.hidden_size,
-                                intermediate_size=intermediate_size,
-                                bias=False,
-                                activation=F.silu,
-                                dtype=config.torch_dtype,
-                                config=model_config)
+        # FFN uses fused gate_up and down with SiLU gating (FalconH1-specific)
+        intermediate_size = config.intermediate_size
+        self.feed_forward = FalconH1MLP(model_config,
+                                        intermediate_size=intermediate_size,
+                                        bias=False)
 
         # Norms
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -192,14 +251,12 @@ class FalconH1ParallelHybridLayer(DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Attention branch
-        attn_input = hidden_states * self._attn_in_mul
         attn_hidden, _ = self.self_attn(position_ids=position_ids,
-                                        hidden_states=attn_input,
+                                        hidden_states=hidden_states * self._attn_in_mul,
                                         attn_metadata=attn_metadata)
 
         # Mamba branch
-        ssm_input = hidden_states * self._ssm_in_mul
-        mamba_hidden, _ = self.mamba(hidden_states=ssm_input,
+        mamba_hidden, _ = self.mamba(hidden_states=hidden_states * self._ssm_in_mul,
                                      attn_metadata=attn_metadata,
                                      mamba_metadata=kwargs.get(
                                          "mamba_metadata"))
