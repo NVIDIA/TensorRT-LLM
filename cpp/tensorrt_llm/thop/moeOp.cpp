@@ -32,6 +32,7 @@
 #include <ATen/native/cuda/Resize.h>
 
 #include <functional>
+#include <map>
 
 #define C10_THROW_ERROR_FORMATTED(ErrorType, ...)                                                                      \
     do                                                                                                                 \
