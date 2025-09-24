@@ -16,7 +16,6 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
-from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 from ..utils.node_utils import extract_op_args
 from .attention_interface import (
@@ -49,9 +48,106 @@ def _build_conv_state_from_sequence(input_bt_c: torch.Tensor, kernel_size: int) 
     return torch.nn.functional.pad(input_b_c_t, (pad_amount, 0))
 
 
+def _cuda_causal_conv1d_prefill(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+    padding_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prefill path using TRT-LLM forward kernel; returns (y, conv_state[K-1])."""
+    assert padding_mode == "zeros", "padding_mode must be zeros"
+    # Shapes: convert input to [B, C, T]
+    x_b_c_t = input.transpose(1, 2).contiguous()
+    k = weight.shape[-1]
+    # Weight to [C, K]
+    w2d = weight.squeeze(1) if weight.ndim == 3 else weight
+    w2d = w2d.contiguous()
+    # Initialize state [B, C, K-1] to zeros
+    conv_state = torch.zeros(
+        x_b_c_t.shape[0], x_b_c_t.shape[1], k - 1, device=x_b_c_t.device, dtype=x_b_c_t.dtype
+    )
+    # Run TRT forward (in-place on x_b_c_t and conv_state)
+    torch.ops.trtllm.causal_conv1d_fwd(
+        x_b_c_t, w2d, bias, conv_state, None, None, None, False, PAD_SLOT_ID
+    )
+    y = x_b_c_t.transpose(1, 2)
+    return y, conv_state
+
+
+def _cuda_causal_conv1d_decode(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+    padding_mode: str,
+    conv_state_cache: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode path using TRT-LLM update kernel for last-step output and cache update.
+
+    Returns (y, updated_conv_state) where y: [B, 1, C_out] and updated state: [B, C_in, K].
+    """
+    assert padding_mode == "zeros", "padding_mode must be zeros"
+    # For cached decode we currently support stride=1 and dilation=1 (standard causal conv)
+    assert stride == 1, "cached causal conv1d currently supports stride == 1 only"
+    assert dilation == 1, "cached causal conv1d currently supports dilation == 1 only"
+
+    batch_size, seq_len, _ = input.shape
+    assert seq_len == 1, "decode path expects seq_len == 1"
+
+    kernel_size = weight.shape[-1]
+    # TRT update expects state len >= K-1
+    assert conv_state_cache.shape[-1] >= kernel_size - 1, (
+        "conv_state_cache's last dim must be >= kernel_size - 1"
+    )
+
+    # TRT-LLM update kernel expects depthwise form: weight [dim, width], groups == dim
+    in_channels = input.shape[-1]
+    assert groups == in_channels, (
+        "cuda cached causal conv decode currently supports depthwise conv with groups == in_channels"
+    )
+    # Convert weight to [dim, width]
+    if weight.ndim == 3:
+        # Expect [C_out, C_in/groups, K] with C_in/groups == 1
+        assert weight.shape[-2] == 1 and weight.shape[0] == in_channels, (
+            "expected depthwise weight with shape [C, 1, K] matching input channels"
+        )
+        weight_2d = weight.squeeze(-2)
+    elif weight.ndim == 2:
+        weight_2d = weight
+        assert weight_2d.shape[0] == in_channels, (
+            "weight rows must match input channels for depthwise conv"
+        )
+    else:
+        raise AssertionError("unsupported weight rank for causal conv update; expected 2D or 3D")
+
+    # Prepare buffers for TRT-LLM update kernel call.
+    # TRT-LLM update kernel signature (Python):
+    # torch.ops.trtllm.causal_conv1d_update(x, conv_state, weight, bias,
+    #                                       activation_val, cache_seqlens,
+    #                                       conv_state_indices, pad_slot_id)
+    # We set activation to None and other optional args to None to get a plain linear conv.
+    # Convert input to [B, C, T]
+    x_b_c_t = input.transpose(1, 2).contiguous()
+    updated_cache = conv_state_cache.clone()
+    torch.ops.trtllm.causal_conv1d_update(
+        x_b_c_t, updated_cache, weight_2d, bias, False, None, None, PAD_SLOT_ID
+    )
+    y = x_b_c_t.transpose(1, 2)
+    return y, updated_cache
+
+
 # ---------------------------------------------------------------
 # Metadata + flattened cached op that integrates with the AD i/f
 # ---------------------------------------------------------------
+
+
 @torch.library.custom_op("auto_deploy::cuda_causal_conv_prepare_metadata", mutates_args=())
 def cuda_causal_conv_prepare_metadata(
     input_ids: torch.Tensor,
@@ -121,86 +217,62 @@ def _cuda_cached_causal_conv1d(
     b, s = input.shape[:2]
     num_seq = seq_len.shape[0]
 
-    # Split by lengths: assume prefills first, decodes after
     if s == 1:
-        num_prefill = 0
-        num_decode = num_seq
-    else:
-        prefill_mask = seq_len > 1
-        num_prefill = int(prefill_mask.sum().item())
-        num_decode = num_seq - num_prefill
+        # Generate-only batch
+        slot_idx_long = slot_idx.to(torch.long)
+        cache_batch = conv_state_cache.index_select(0, slot_idx_long)
 
-    # Flatten tokens
+        y, updated_state = _cuda_causal_conv1d_decode(
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            groups,
+            padding_mode,
+            cache_batch,
+        )
+
+        conv_state_cache.index_copy_(0, slot_idx_long, updated_state.to(conv_state_cache.dtype))
+        # Custom op must not return an alias of any input; return a fresh tensor
+        return y.to(input.dtype).contiguous().clone()
+
+    # Context/mixed phase (flattened sequences)
     bs = b * s
-    inp_flat = input.reshape(bs, *input.shape[2:])  # [total_s, C_in]
+    flat_idx = torch.arange(bs, device=input.device, dtype=torch.long)
+
+    inp_flat = input.reshape(bs, *input.shape[2:])
     y = torch.empty(b, s, weight.shape[0], device=input.device, dtype=input.dtype)
     y_flat = y.view(bs, *y.shape[2:])
 
-    # Prepare weight as [dim, width] (depthwise)
-    if weight.ndim == 3:
-        assert weight.shape[-2] == 1
-        w2d = weight.squeeze(-2)
-    else:
-        w2d = weight
+    for i in range(num_seq):
+        length_i = seq_len[i]
+        if length_i.eq(0):
+            continue
+        start_i = seq_start[i]
+        end_i = start_i + length_i
 
-    total_prefill_tokens = 0
+        mask_i = (flat_idx >= start_i.to(torch.long)) & (flat_idx < end_i.to(torch.long))
+        idx_i = torch.nonzero(mask_i, as_tuple=False).squeeze(-1)
 
-    # PREFILL: concatenate all prefill tokens and run one varlen forward
-    if num_prefill > 0:
-        seq_len_prefill = seq_len[:num_prefill].to(torch.int32)
-        total_prefill_tokens = int(seq_len_prefill.sum().item())
+        inp_seq = inp_flat.index_select(0, idx_i).unsqueeze(0)
 
-        # x_varlen: (dim, cu_seq_len)
-        x_varlen = inp_flat[:total_prefill_tokens].transpose(0, 1).contiguous()
-
-        # Metadata
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=input.device),
-                torch.cumsum(seq_len_prefill, dim=0, dtype=torch.int32),
-            ],
-            dim=0,
-        ).contiguous()
-        cache_indices = slot_idx[:num_prefill].to(torch.int32).contiguous()
-        has_initial_state = torch.zeros(num_prefill, dtype=torch.bool, device=input.device)
-
-        # Run varlen conv; updates conv_state_cache in-place per cache_indices
-        y_varlen = causal_conv1d_fn(
-            x_varlen,
-            w2d,
+        y_seq, conv_state_i = _cuda_causal_conv1d_prefill(
+            inp_seq,
+            weight,
             bias,
-            query_start_loc=cu_seqlens,
-            cache_indices=cache_indices,
-            has_initial_state=has_initial_state,
-            conv_states=conv_state_cache,
-            activation=None,
-            pad_slot_id=PAD_SLOT_ID,
-        )  # (dim, total_prefill_tokens)
-
-        # Scatter outputs back to y
-        y_prefill = y_varlen.transpose(0, 1)  # [total_prefill_tokens, C_out]
-        y_flat[:total_prefill_tokens].copy_(y_prefill.to(y_flat.dtype))
-
-    # DECODE: batch update for single-token sequences
-    if num_decode > 0:
-        # Use true start offsets for decode tokens (tail after prefills)
-        decode_idx = seq_start[num_prefill:].to(torch.long)
-        x_decode = inp_flat.index_select(0, decode_idx)  # [num_decode, C_in]
-
-        y_dec = causal_conv1d_update(
-            x_decode,  # [batch, dim]
-            conv_state_cache,
-            w2d,
-            bias,
-            activation=None,
-            cache_seqlens=None,
-            conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
-            pad_slot_id=PAD_SLOT_ID,
+            stride,
+            padding,
+            dilation,
+            groups,
+            padding_mode,
         )
 
-        if y_dec.dim() == 3:
-            y_dec = y_dec.squeeze(-1)
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
+        y_flat.index_copy_(0, idx_i, y_seq[0].to(y_flat.dtype))
+
+        slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
+        conv_state_cache.index_copy_(0, slot_i, conv_state_i.to(conv_state_cache.dtype))
 
     # Custom op must not return an alias of any input; return a fresh tensor
     return y.contiguous().clone()

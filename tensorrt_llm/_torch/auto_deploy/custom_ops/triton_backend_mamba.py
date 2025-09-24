@@ -45,116 +45,109 @@ def _triton_cached_ssm_transform(
 ) -> torch.Tensor:
     """Flattened cached SSM transform op that respects slot-indexed state caches.
 
-    Split mixed batches into prefill (seq_len>1) and decode (seq_len==1):
-    - Prefill: run one varlen combined scan over concatenated prefill tokens and update final states per slot.
-    - Decode: batch single-token updates with selective_state_update and update states per slot.
+    Implements generate-only (s==1) via selective_state_update and prefill/mixed (s>1) via
+    mamba_chunk_scan_combined, updating the slot-indexed cache in-op. Returns y only.
     """
     b, s = hidden_states.shape[:2]
     num_seq = seq_len.shape[0]
 
-    # Flatten tokens for indexing/scatter
-    bs = b * s
-    device = hidden_states.device
-    hs_flat = hidden_states.reshape(bs, *hidden_states.shape[2:])  # [bs, H, D]
-    B_flat = B.reshape(bs, *B.shape[2:])  # [bs, G, N]
-    C_flat = C.reshape(bs, *C.shape[2:])  # [bs, G, N]
-    dt_flat = dt.reshape(bs, dt.shape[2])  # [bs, H]
-
-    y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
-    y_flat = y.view(bs, *y.shape[2:])
-
-    num_heads = hidden_states.shape[2]
-    head_dim = hidden_states.shape[3]
-    ssm_state_size = B.shape[3]
-
     if s == 1:
-        num_prefill = 0
-        num_decode = num_seq
-    else:
-        prefill_mask = seq_len > 1
-        num_prefill = int(prefill_mask.sum().item())
-        num_decode = num_seq - num_prefill
+        # Generate-only batch: gather cache slices for slots (already sanitized by metadata)
+        slot_idx_long = slot_idx.to(torch.long)
+        ssm_batch = ssm_state_cache.index_select(dim=0, index=slot_idx_long)
 
-    # Prefill: concatenate tokens at the front and run combined scan
-    if num_prefill > 0:
-        seq_len_prefill = seq_len[:num_prefill].to(torch.int32)
-        total_prefill_tokens = int(seq_len_prefill.sum().item())
-        prefill_idx = torch.arange(total_prefill_tokens, device=device, dtype=torch.long)
+        # Shapes
+        batch_size = b
+        num_heads = hidden_states.shape[2]
+        head_dim = hidden_states.shape[3]
+        n_groups = B.shape[2]
+        ssm_state_size = B.shape[3]
 
-        hs_prefill = hs_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, H, D]
-        B_prefill = B_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, G, N]
-        C_prefill = C_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, G, N]
-        dt_prefill = dt_flat.index_select(0, prefill_idx).unsqueeze(0)  # [1, S_p, H]
-
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=device),
-                torch.cumsum(seq_len_prefill, dim=0),
-            ],
-            dim=0,
-        )
-        seq_ids = torch.arange(num_prefill, device=device, dtype=torch.int32)
-        seq_idx_prefill = torch.repeat_interleave(seq_ids, seq_len_prefill).view(1, -1)
-
-        y_prefill, varlen_states = mamba_chunk_scan_combined(
-            hs_prefill,
-            dt_prefill,
-            A,
-            B_prefill,
-            C_prefill,
-            chunk_size=chunk_size,
-            D=D,
-            z=None,
-            dt_bias=dt_bias,
-            initial_states=None,
-            seq_idx=seq_idx_prefill,
-            chunk_indices=None,
-            chunk_offsets=None,
-            cu_seqlens=cu_seqlens,
-            dt_softplus=True,
-            dt_limit=(time_step_limit[0], time_step_limit[1]),
-            return_final_states=False,
-            return_varlen_states=True,
-        )
-
-        y_flat.index_copy_(0, prefill_idx, y_prefill[0].to(y_flat.dtype))
-        ssm_state_cache.index_copy_(
-            0, slot_idx[:num_prefill].to(torch.long), varlen_states.to(ssm_state_cache.dtype)
-        )
-
-    # Decode: batch single-token updates via selective_state_update
-    if num_decode > 0:
-        decode_idx = seq_start[num_prefill:].to(torch.long)
-        slot_idx_decode = slot_idx[num_prefill:].to(torch.long)
-
-        x_decode = hs_flat.index_select(0, decode_idx)  # [nd, H, D]
-        B_decode = B_flat.index_select(0, decode_idx)  # [nd, G, N]
-        C_decode = C_flat.index_select(0, decode_idx)  # [nd, G, N]
-        dt_decode = dt_flat.index_select(0, decode_idx)  # [nd, H]
-
-        dt_hp = dt_decode[:, :, None].expand(-1, num_heads, head_dim)
+        # Prepare per-head, per-dim tensors
+        dt_hp = dt[:, 0, :][:, :, None].expand(batch_size, num_heads, head_dim)
         dt_bias_hp = dt_bias[..., None].expand(num_heads, head_dim)
         dt_pre = torch.nn.functional.softplus(dt_hp + dt_bias_hp.to(dtype=dt_hp.dtype))
         dt_pre = torch.clamp(dt_pre, time_step_limit[0], time_step_limit[1])
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
+        B_grouped = B.reshape(batch_size, n_groups, ssm_state_size)
+        C_grouped = C.reshape(batch_size, n_groups, ssm_state_size)
+        x = hidden_states.reshape(batch_size, num_heads, head_dim)
 
+        # compute new state; avoid mutating input cache slice
+        updated_state = ssm_batch.clone()
+        # Provide a zero dt_bias tensor to satisfy kernel arg expansion; we've already
+        # applied dt_bias and softplus/clamp into dt_pre above.
         dt_bias_zero = torch.zeros_like(dt_bias_hp)
-        y_dec = selective_state_update(
-            ssm_state_cache,
-            x_decode,
+        y_hp = selective_state_update(
+            updated_state,
+            x,
             dt_pre,
             A_full,
-            B_decode,
-            C_decode,
+            B_grouped,
+            C_grouped,
             D=D_full,
             z=None,
             dt_bias=dt_bias_zero,
             dt_softplus=False,
-            state_batch_indices=slot_idx_decode,
-        )  # [nd, H, D]
+        )
+        y = y_hp.reshape(batch_size, 1, num_heads, head_dim)
 
-        y_flat.index_copy_(0, decode_idx, y_dec.to(y_flat.dtype))
+        # Scatter updated states back to global cache
+        ssm_state_cache.index_copy_(0, slot_idx_long, updated_state.to(ssm_state_cache.dtype))
+
+        return y.to(hidden_states.dtype)
+
+    # Context/mixed phase (flattened sequences). Expect b == 1, but handle general b robustly.
+    bs = b * s
+    flat_idx = torch.arange(bs, device=hidden_states.device, dtype=torch.long)
+
+    # NOTE: use reshape to force contiguous format after reshape
+    hs_flat = hidden_states.reshape(bs, *hidden_states.shape[2:])
+    B_flat = B.reshape(bs, *B.shape[2:])
+    C_flat = C.reshape(bs, *C.shape[2:])
+    dt_flat = dt.reshape(bs, *dt.shape[2:])
+
+    # NOTE: need contiguous format to process it sequentially
+    y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+    y_flat = y.view(bs, *y.shape[2:])
+
+    for i in range(num_seq):
+        length_i = seq_len[i]
+        if length_i.eq(0):
+            continue
+
+        start_i = seq_start[i]
+        end_i = start_i + length_i
+
+        mask_i = (flat_idx >= start_i.to(torch.long)) & (flat_idx < end_i.to(torch.long))
+        idx_i = torch.nonzero(mask_i, as_tuple=False).squeeze(-1)
+
+        hs_seq = hs_flat.index_select(0, idx_i).unsqueeze(0)
+        B_seq = B_flat.index_select(0, idx_i).unsqueeze(0)
+        C_seq = C_flat.index_select(0, idx_i).unsqueeze(0)
+        dt_seq = dt_flat.index_select(0, idx_i).unsqueeze(0)
+
+        y_seq, ssm_state_i = mamba_chunk_scan_combined(
+            hs_seq,
+            dt_seq,
+            A,
+            B_seq,
+            C_seq,
+            chunk_size=chunk_size,
+            D=D,
+            z=None,
+            dt_bias=dt_bias,
+            seq_idx=None,
+            dt_softplus=True,
+            dt_limit=(time_step_limit[0], time_step_limit[1]),
+            return_final_states=True,
+        )
+
+        y_flat.index_copy_(0, idx_i, y_seq[0].to(y_flat.dtype))
+
+        slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
+        ssm_state_cache.index_copy_(0, slot_i, ssm_state_i.to(ssm_state_cache.dtype))
 
     return y
 
