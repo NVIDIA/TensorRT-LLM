@@ -245,22 +245,36 @@ class GenerationResultBase:
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
-        if logprobs_result:
+        # prompt logprobs handling
+        if logprobs_result and logprobs_result.prompt is not None:  # both backends
+            output.prompt_logprobs = logprobs_result.prompt
+        # generation logprobs handling (provenance varies by backend)
+        if logprobs_result and logprobs_result.generation is not None:  # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
-            output.prompt_logprobs = logprobs_result.prompt
             output.logprobs += logprobs_result.generation
-        elif response_tensors.log_probs is not None:
-            # handle logprobs directly from response tensors
+        elif response_tensors.log_probs is not None:  # PyTorch backend
+            # handle logprobs directly from response tensors given by sampler
             output._last_logprobs_len = len(output.logprobs)
-            output.logprobs = response_tensors.log_probs[src_idx]
+            # In streaming mode, since out-of-order responses are not possible,
+            # each streamed response_tensors.log_probs[src_idx]
+            # contains a streamwise monotonically growing list of logprobs.
+            # so we need to accumulate only the new ones unique to that particular streamed response
+            assert output._last_logprobs_len <= len(
+                response_tensors.log_probs[src_idx]
+            ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                f"{len(response_tensors.log_probs[src_idx])})")
+            output.logprobs += response_tensors.log_probs[src_idx][
+                output._last_logprobs_len:]
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                # Check if logprobs is a list (not a dict or other structure)
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
+
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
@@ -716,7 +730,12 @@ def compute_logprobs(
     output_token_ids: Optional[list[int]],
 ) -> LogProbsResult:
     """
-    Compute top-K logprobs and ranks for each token position.
+    Compute top-K logprobs from logits when engine doesn't provide them directly.
+
+    Used for post-processing logits into logprobs.
+    - Prompt logprobs (from context_logits): always used.
+    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
+    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
 
     Returns:
         LogProbsResult, a NamedTuple containing:

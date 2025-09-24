@@ -278,6 +278,17 @@ class LlmResponse:
     def has_error(self):
         return self.error_msg is not None
 
+    def clear_context_logits(self):
+        """Clear context logits from the response result.
+
+        This is used to drop context logits after prompt_logprobs have been computed
+        when the user didn't explicitly request them.
+        """
+        if self.result and hasattr(self.result, '_py_result'):
+            py_result = self.result._py_result
+            if hasattr(py_result, '_context_logits'):
+                py_result._context_logits = None
+
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
@@ -379,10 +390,36 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
-    def create_response(
-            self,
-            use_fast_logits=False,
-            mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
+    def create_response(self,
+                        use_fast_logits=False,
+                        mpi_world_rank=0) -> LlmResponse | None:
+        """Create an LlmResponse from the current request state.
+
+        This method generates a response containing the request's execution results,
+        including generated tokens, logits, and completion status. It wraps the
+        parent class's serialized result in a PyTorch-specific LlmResponse object.
+
+        Args:
+            use_fast_logits (bool, optional, default=False): Only applicable for TRT-backend with speculative decoding enabled. When returning generation logits under speculative decoding,
+            `use_fast_logits=True` replaces tensor payloads with tiny metadata so the target pulls logits
+            directly (zero-copy/IPC), reducing overhead; ignored on PyTorch.
+            mpi_world_rank (int, optional, default=0): Only applicable for TRT-backend, with speculative decoding
+            enabled, and `use_fast_logits=True`. Contains the MPI world rank of the process containing the draft
+            model, that produces the generation logits. This helps transfer logits from the draft model to the
+            target model without going through the serialization/transport path.
+
+        Returns:
+            LlmResponse | None: An LlmResponse object containing the request results
+            if there is valid output, otherwise None.
+            The response includes:
+            - request_id: The request identifier (parent ID for child requests)
+            - result: LlmResult wrapping both serialized and PyTorch-specific results
+            - client_id: The client identifier for request routing
+
+        Note:
+            Returns None if the serialized result is empty (len(result) == 0),
+            indicating no output was generated for this request iteration.
+        """
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
         return LlmResponse(
