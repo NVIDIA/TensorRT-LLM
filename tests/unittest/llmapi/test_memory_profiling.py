@@ -19,15 +19,12 @@ def test_profile_kvcache():
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.9)
     cuda_graph_config = CudaGraphConfig(max_batch_size=512)
-
     VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
 
     build_config = BuildConfig(max_batch_size=2048,
                                max_beam_width=1,
                                max_seq_len=8192)
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9, )
-
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
@@ -73,9 +70,11 @@ def test_profile_kvcache():
 
     profiling_data = {"enable_mm_reqs": False}
     torchllm_args = TorchLlmArgs(**llm_args)
-    create_py_executor(llm_args=torchllm_args,
-                       checkpoint_dir=VLM_MODEL_PATH,
-                       profiling_stage_data=profiling_data)
+    py_executor_2 = create_py_executor(llm_args=torchllm_args,
+                                       checkpoint_dir=VLM_MODEL_PATH,
+                                       profiling_stage_data=profiling_data)
     vlm_max_gpu_total_bytes_no_mm_reqs = profiling_data["max_gpu_total_bytes"]
+    py_executor_2.shutdown()
+    torch.cuda.empty_cache()
 
     assert vlm_max_gpu_total_bytes_with_mm_reqs < vlm_max_gpu_total_bytes_no_mm_reqs, f"available KVCache for VLMs is expected to be less when profiling with mm reqs, but got {vlm_max_gpu_total_bytes_with_mm_reqs} for mm reqs and {vlm_max_gpu_total_bytes_no_mm_reqs} without mm reqs"
