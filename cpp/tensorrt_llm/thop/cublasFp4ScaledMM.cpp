@@ -148,6 +148,25 @@ Tensor cublas_fp4_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor con
     return cublas_fp4_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, alpha, beta, out);
 }
 
+torch::Tensor cublas_fp4_scaled_mm_meta(torch::Tensor const& mat_a, torch::Tensor const& mat_b,
+    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha, torch::Tensor const& beta,
+    c10::optional<torch::ScalarType> out_dtype)
+{
+    auto const out_dtype_ = out_dtype.value_or(torch::kBFloat16);
+
+    // Simplified and more stable shape inference
+    // Avoid complex checks that might trigger recompilation
+    auto m = mat_a.size(0);
+    auto n = mat_b.size(0);
+
+    // Output shape: [M, N]
+    std::vector<int64_t> output_size = {m, n};
+
+    // Use the most stable tensor creation method
+    // Copy all properties from input tensor to ensure consistency
+    return torch::empty(output_size, mat_a.options().dtype(out_dtype_));
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
