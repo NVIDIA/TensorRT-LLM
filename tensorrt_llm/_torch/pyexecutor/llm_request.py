@@ -344,6 +344,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             tensorrt_llm.bindings.internal.runtime.
             TaskLayerModuleConfig] | None = None
 
+        self.py_tokens = super().get_tokens()
+
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
@@ -376,6 +378,17 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
+    def get_tokens(self, beam: int) -> int:
+        return self.py_tokens[beam]
+
+    def get_last_tokens(self, beam: int) -> int:
+        return self.py_tokens[beam][-1]
+
+    def add_new_token(self, token: int, beam: int) -> int:
+        self.py_tokens[beam].append(token)
+        # sync to C++ side
+        return super().add_new_token(token, beam)
 
     def create_response(
             self,
