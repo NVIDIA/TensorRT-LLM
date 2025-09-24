@@ -1,5 +1,6 @@
 import random
 from contextlib import contextmanager, nullcontext
+from typing import Optional
 
 import pytest
 
@@ -19,8 +20,9 @@ from .lora_test_utils import (
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, llm_test_harness, prompts,
-                       run_llm_abort_request,
+                       llm_get_stats_test_harness,
+                       llm_return_logprobs_test_harness, llm_test_harness,
+                       prompts, run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
@@ -171,6 +173,31 @@ def test_llm_reward_model():
 
     assert scores.shape == (tokenized_input.shape[1], 2)
     assert not outputs[0].outputs[0].text
+
+
+def test_llm_topk_logprobs():
+    topk_logprobs = 3
+    max_tokens = 10
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     logprobs=topk_logprobs)
+    outputs = llm.generate(prompts, sampling_params)
+    logprobs = outputs[0].outputs[0].logprobs
+
+    assert len(logprobs) == max_tokens
+    for step_logprobs in logprobs:
+        assert len(step_logprobs) == topk_logprobs
+
+        logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
+                         for logprob_obj in step_logprobs.values()]
+        sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+
+        for i in range(len(sorted_by_rank) - 1):
+            current_logprob, current_rank = sorted_by_rank[i]
+            next_logprob, next_rank = sorted_by_rank[i + 1]
+            assert current_logprob >= next_logprob
+            assert current_rank == i + 1
+            assert next_rank == current_rank + 1
 
 
 def test_llm_perf_metrics():
@@ -881,3 +908,45 @@ def test_min_tokens(use_speculative: bool):
 
     assert len(res.outputs) == 1
     assert len(res.outputs[0].token_ids) == output_len
+
+
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
+    [
+        (2, None, True, False,
+         "pytorch"),  # prompt_logprobs with context_logits
+        (None, 1, False, False,
+         "pytorch"),  # generation logprobs only (top-1, PyTorch limit)
+        (2, None, False, False,
+         "pytorch"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "pytorch"),  # no logprobs at all
+    ])
+def test_llm_return_logprobs(prompt_logprobs: Optional[int],
+                             logprobs: Optional[int],
+                             return_context_logits: bool,
+                             return_generation_logits: bool, backend: str):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     backend=backend)
+
+
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (None, 1, False,
+         False),  # generation logprobs only (top-1, PyTorch limit)
+        (2, None, True, False),  # prompt_logprobs with context_logits
+        (2, None, False, False),  # prompt_logprobs only
+        (2, 1, False, False),  # both prompt and generation logprobs
+    ])
+def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
+                                       return_context_logits,
+                                       return_generation_logits):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     streaming=True,
+                                     backend="pytorch")

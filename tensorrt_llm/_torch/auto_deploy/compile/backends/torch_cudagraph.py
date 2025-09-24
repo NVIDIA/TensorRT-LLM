@@ -25,8 +25,8 @@ class CapturedGraph(nn.Module):
         self._in_spec = in_spec
         self._out_spec = out_spec
         self.model = model
-        self.max_batch_size = max(cuda_graph_batch_sizes)
-        ad_logger.info(f"Setting max batch size to {self.max_batch_size}")
+        self.cuda_graph_max_batch_size = max(cuda_graph_batch_sizes)
+        ad_logger.info(f"Setting {self.cuda_graph_max_batch_size=}")
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
         self.graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
         self._input_buffers: List[torch.Tensor] = [
@@ -86,22 +86,31 @@ class CapturedGraph(nn.Module):
         self._args_hash = self._get_hash(args_static)
 
         # sanity checks on the batched inputs
-        msg_bs = "Max batch size too small."
+        msg_bs = (
+            f"Input batch size exceeds maximum CUDA graph batch size. "
+            f"CUDA graph max batch size: {self.cuda_graph_max_batch_size}, "
+            f"but got input batch sizes: {[input.shape[0] for input in args_batched]}. "
+            f"Did you intentionally set the maximal value of cuda_graph_batch_sizes lower "
+            f"than the max_batch_size? It will fall back to non-CUDA graph forward pass for "
+            f"batch sizes exceeding the max_batch_size."
+        )
         msg_ndim = "Expecting at least a 2D for batched input tensors."
-        assert all(self.max_batch_size >= input.shape[0] for input in args_batched), msg_bs
+        if any(self.cuda_graph_max_batch_size < input.shape[0] for input in args_batched):
+            ad_logger.info(msg_bs)
         assert all(input.ndim > 1 for input in args_batched), msg_ndim
 
-        # repeat the batched input tensors to the max batch size
+        # repeat the batched input tensors to the cuda_graph_max_batch_size
         self._input_buffers = [
-            input[:1].repeat_interleave(self.max_batch_size, dim=0) for input in args_batched
+            input[:1].repeat_interleave(self.cuda_graph_max_batch_size, dim=0)
+            for input in args_batched
         ]
 
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
 
-        # capture output once with max batch size to capture output buffers
+        # capture output once with cuda_graph_max_batch_size to capture output buffers
         with CudaGraphWarmUpPhase():
-            ad_logger.info(f"Warm up with {self.max_batch_size=} before graph capture")
+            ad_logger.info(f"Warm up with {self.cuda_graph_max_batch_size=} before graph capture")
             out = self.model(*args, **kwargs)
         self._out_buffer_flat, out_spec = tree_flatten(out)
         assert out_spec == self._out_spec, "Output spec mismatch."
@@ -168,12 +177,22 @@ class TorchCudagraphCompiler(BackendCompiler):
             ad_logger.info(f"Using heuristic cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}")
         else:
             # Sanitize user-provided sizes: clamp to [1, max_batch_size], dedupe, sort desc
+            # No point capturing CUDA graphs for batch sizes larger than max_batch_size
             effective = {
                 min(max(1, int(b)), int(self.max_batch_size))
                 for b in requested
                 if isinstance(b, (int, float)) and b > 0
             }
             self.cuda_graph_batch_sizes = sorted(effective, reverse=True)
+
+            # Log if we clamped any values
+            original_values = [int(b) for b in requested if isinstance(b, (int, float)) and b > 0]
+            clamped_values = [v for v in original_values if v > self.max_batch_size]
+            if clamped_values:
+                ad_logger.info(
+                    f"Clamped CUDA graph batch sizes {clamped_values} to max_batch_size={self.max_batch_size}"
+                )
+
             ad_logger.info(
                 f"Using explicit cuda_graph_batch_sizes: requested={requested}"
                 f" -> effective={self.cuda_graph_batch_sizes}"

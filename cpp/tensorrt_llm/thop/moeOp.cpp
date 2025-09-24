@@ -32,6 +32,7 @@
 #include <ATen/native/cuda/Resize.h>
 
 #include <functional>
+#include <map>
 
 #define C10_THROW_ERROR_FORMATTED(ErrorType, ...)                                                                      \
     do                                                                                                                 \
@@ -389,11 +390,13 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
-
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
+
+        // output is smaller than workspace. Create output after workspace to avoid output_shape occupied a little
+        // piece of memory which makes a big partition of memory segment can't be used by workspace.
+        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
+        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -709,7 +712,7 @@ private:
     // e.g. 16 nvfp4 elements are packed into a single int64 element
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
-    WorkspaceInfo workspace_info;
+    std::map<cudaStream_t, WorkspaceInfo> mStreamWorkspaces;
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
@@ -766,6 +769,7 @@ private:
             experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
+        auto& workspace_info = mStreamWorkspaces[stream];
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
 
@@ -785,6 +789,8 @@ private:
                 TLLM_LOG_DEBUG("MoE workspace size is not enough, increase the size from %ld bytes to %ld bytes",
                     workspace_info.workspace.numel(), total_workspace_size);
             }
+            // Release memory first to avoid OOM.
+            workspace_info = WorkspaceInfo();
             workspace_info.workspace = torch::empty({static_cast<long>(total_workspace_size)},
                 torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
         }
