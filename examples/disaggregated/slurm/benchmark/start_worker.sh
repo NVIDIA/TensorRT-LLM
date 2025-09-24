@@ -3,19 +3,19 @@ set -u
 set -e
 set -x
 
-role=$1
-instance_id=$2
-model_path=$3
-port=$4
-benchmark_mode=$5
-concurrency=$6
-enable_pdl=$7
-numa_bind=$8
-work_dir=$9
-nsys_folder=${10:-}
+role=${1}
+instance_id=${2}
+model_path=${3}
+port=${4}
+benchmark_mode=${5}
+concurrency=${6}
+enable_pdl=${7}
+numa_bind=${8}
+work_dir=${9}
+enable_nsys=${10}
 
 unset UCX_TLS
-echo "concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
+echo "enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 
 export TLLM_LOG_LEVEL=INFO
@@ -56,13 +56,13 @@ if [ "${SLURM_NODEID}" = "0" ]; then
     echo "hostname saved to ${work_dir}/hostnames/${role}_${instance_id}.txt"
 fi
 
-#check if nsys_folder is provided
-if [ -z "${nsys_folder:-}" ]; then
+#check if nsys is enabled
+if [ "${enable_nsys}" != "true" ]; then
     echo "nsys is not enabled, start normal flow"
     trtllm-llmapi-launch ${numa_bind_cmd} trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
 else
     nsys_prefix=""
-    nsys_file=${nsys_folder}/nsys_worker_proc_${instance_id}_${SLURM_PROCID}
+    nsys_file=${work_dir}/nsys_worker_proc_${instance_id}_${SLURM_PROCID}
     export TLLM_PROFILE_RECORD_GC=1
     export TLLM_NVTX_DEBUG=1
     if [ "${role}" = "GEN" ] && [ "$SLURM_PROCID" = "0" ]; then

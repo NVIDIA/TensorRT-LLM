@@ -217,6 +217,7 @@ class GenerationResultBase:
         return self._context_logits
 
     @property
+    # TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.
     def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
         return self._mm_embedding_handle
 
@@ -369,6 +370,17 @@ class GenerationResultBase:
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
+                if self.disaggregated_params is not None:
+                    self.disaggregated_params.multimodal_embedding_handles = [
+                        response_result.mm_embedding_handle
+                    ],
+                    self.disaggregated_params.multimodal_hashes = self._multimodal_hashes
+                else:
+                    self.disaggregated_params = DisaggregatedParams(
+                        multimodal_embedding_handles=[
+                            response_result.mm_embedding_handle
+                        ],
+                        multimodal_hashes=self._multimodal_hashes)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -519,6 +531,12 @@ class GenerationResult(GenerationResultBase):
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
         self._aborted = False
+
+        # Pipelined multimodal hashes from request to result
+        mm_hashes = getattr(
+            getattr(getattr(generation_request, "multimodal_params", None),
+                    "multimodal_input", None), "multimodal_hashes", None)
+        self._multimodal_hashes = mm_hashes
 
     @property
     def request_id(self) -> int:

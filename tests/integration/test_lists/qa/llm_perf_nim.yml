@@ -308,6 +308,7 @@ llm_perf_nim:
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-bfloat16-input_output_len:200,2000-reqs:64-con:200-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-bfloat16-input_output_len:200,2000-reqs:8-con:1-gpus:8] # timeout for h20, move to l2 test
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-bfloat16-input_output_len:2000,200-reqs:64-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-maxbs:1-maxnt:544-input_output_len:512,32-quant:fp8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-bfloat16-input_output_len:128,128-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-bfloat16-maxbs:16-maxnt:5000-input_output_len:5000,500-reqs:64-con:250-gpus:8]
 

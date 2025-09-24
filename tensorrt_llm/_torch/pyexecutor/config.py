@@ -49,7 +49,14 @@ class PyTorchConfig:
     attention_dp_time_out_iters: int = 50
     attention_dp_batching_wait_iters: int = 10
 
+    max_num_tokens: int = 8192
+
     batch_wait_timeout_ms: float = 0
+    # Iterations to wait before scheduling context even if token budget not reached (0 disables).
+    batch_wait_timeout_iters: int = 0
+    # Threshold ratio of max_num_tokens for token accumulation before scheduling context.
+    # Value range: [0, 1] (0 disables).
+    batch_wait_max_tokens_ratio: float = 0.0
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
@@ -57,11 +64,6 @@ class PyTorchConfig:
     moe_disable_finalize_fusion: bool = False
     use_low_precision_moe_combine: bool = False
 
-    enable_mixed_sampler: bool = False
-    """
-    If true, will iterate over sampling_params of each request and use the
-    corresponding sampling strategy, e.g. top-k, top-p, etc.
-    """
     sampler_type: SamplerType = SamplerType.auto
     """
     The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto.

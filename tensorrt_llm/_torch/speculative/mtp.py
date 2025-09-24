@@ -250,7 +250,7 @@ class MTPSampler(TorchSampler):
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens
+        new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = self.BEAM
