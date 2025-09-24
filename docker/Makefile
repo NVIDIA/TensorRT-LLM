@@ -139,7 +139,7 @@ CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
 CONAN_DIR         ?= $(CODE_DIR)/cpp/.conan
 USER_CACHE_DIR    ?= $(shell readlink -f "${HOME_DIR}/.cache")
 RUN_CMD           ?=
-CONTAINER_NAME    ?= tensorrt_llm
+CONTAINER_NAME    ?= tensorrt_llm2
 WORK_DIR          ?= $(CODE_DIR)
 DOCKER_PULL       ?= 0
 
