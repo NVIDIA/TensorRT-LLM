@@ -1860,6 +1860,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
         "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
     ]
