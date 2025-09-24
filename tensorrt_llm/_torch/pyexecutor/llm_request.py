@@ -237,11 +237,10 @@ class PyResult:
                  exclude_last_generation_logits: bool = False,
                  use_chunked_logits: bool = True,
                  chunk_size: int = 8):
+        if streaming and use_chunked_logits:
+            assert chunk_size == 1, "chunk_size must be 1 in streaming mode"
         self._streaming = streaming
-        if self._streaming:
-            self._chunk_size = 1
-        else:
-            self._chunk_size = chunk_size
+        self._chunk_size = chunk_size
         self._context_logits = LogitsStorage(
             prompt_len,
             use_device_memory,
@@ -261,6 +260,7 @@ class PyResult:
             self._context_logits.append(context_logits)
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
+        import pdb; pdb.set_trace()
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
 
@@ -461,7 +461,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # Chunked logits parameters
         self.py_use_chunked_logits = use_chunked_logits
-        self.py_logits_chunk_size = logits_chunk_size
+        self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -475,8 +475,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_context_logits,
                                   return_generation_logits,
                                   exclude_last_generation_logits,
-                                  use_chunked_logits=use_chunked_logits,
-                                  chunk_size=logits_chunk_size)
+                                  use_chunked_logits=self.py_use_chunked_logits,
+                                  chunk_size=self.py_logits_chunk_size)
         self.child_requests = []
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None

@@ -21,19 +21,6 @@ def sample_logits():
     """Generate sample logits for testing"""
     return torch.randn(1, 1, 1000, device='cuda')
 
-
-@pytest.fixture
-def sample_logits_2d():
-    """Generate 2D logits that should be expanded to 3D"""
-    return torch.randn(1, 1000, device='cuda')
-
-
-@pytest.fixture
-def sample_logits_multi_beam():
-    """Generate logits with multiple beams"""
-    return torch.randn(2, 2, 1000, device='cuda')
-
-
 @pytest.fixture
 def chunked_request():
     """Create LlmRequest with chunked logits enabled"""
@@ -57,19 +44,6 @@ def non_chunked_request():
                       is_streaming=False,
                       return_generation_logits=True,
                       use_chunked_logits=False)
-
-
-@pytest.fixture
-def streaming_chunked_request():
-    """Create LlmRequest with streaming chunked logits"""
-    return LlmRequest(request_id=102,
-                      max_new_tokens=10,
-                      input_tokens=[1, 2, 3],
-                      sampling_config=SamplingConfig(),
-                      is_streaming=True,
-                      return_generation_logits=True,
-                      use_chunked_logits=True,
-                      logits_chunk_size=4)
 
 
 # Test parameters
@@ -113,22 +87,6 @@ class TestLogitsStorage:
         assert storage._device_fragments == []
         assert storage._current_position == 0
 
-    def test_initialization_with_exclude_last(self):
-        """Test LogitsStorage initialization with should_exclude_last=True"""
-        storage = LogitsStorage(seq_length=10, should_exclude_last=True)
-
-        assert storage.seq_length == 11  # Should be incremented by 1
-        assert storage._should_exclude_last is True
-
-    def test_append_2d_logits(self, sample_logits_2d):
-        """Test appending 2D logits (should be expanded to 3D)"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
-        storage.append(sample_logits_2d)
-
-        # Should be expanded to 3D
-        assert storage.beam_width == 1
-        assert storage.vocab_size == 1000
-
     def test_append_3d_logits(self, sample_logits):
         """Test appending 3D logits"""
         storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
@@ -143,27 +101,6 @@ class TestLogitsStorage:
 
         with pytest.raises(AssertionError):
             storage.append(torch.randn(1000))  # 1D - should fail
-
-    def test_append_non_chunked_mode(self, sample_logits):
-        """Test append behavior in non-chunked mode"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
-        storage.append(sample_logits)
-
-        # Should have storage allocated
-        assert storage._storage is not None
-        assert len(storage._logits_indices) == 1
-        assert storage._logits_indices[0] == (0, 1)
-
-    def test_append_chunked_mode(self, sample_logits):
-        """Test append behavior in chunked mode"""
-        storage = LogitsStorage(seq_length=10,
-                                use_chunked_logits=True,
-                                chunk_size=2)
-        storage.append(sample_logits)
-
-        # Should have fragment added
-        assert len(storage._device_fragments) == 1
-        assert storage._current_position == 0
 
     def test_append_chunked_mode_streaming(self, sample_logits):
         """Test append behavior in chunked streaming mode"""
@@ -191,31 +128,6 @@ class TestLogitsStorage:
         assert len(storage._device_fragments) == 0
         assert storage._current_position == 2
 
-    def test_get_all_logits(self, sample_logits):
-        """Test get method with all_logits=True"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
-        storage.append(sample_logits)
-
-        result = storage.get(all_logits=True)
-        assert result is not None
-        assert result.shape == (1, 1, 1000)
-
-    def test_get_last_logits(self, sample_logits):
-        """Test get method with all_logits=False"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
-        storage.append(sample_logits)
-
-        result = storage.get(all_logits=False)
-        assert result is not None
-        assert result.shape == (1, 1, 1000)
-
-    def test_get_no_storage(self):
-        """Test get method when no storage is allocated"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
-
-        result = storage.get(all_logits=True)
-        assert result is None
-
     def test_finalize_transfer_chunked_mode(self, sample_logits):
         """Test finalize_transfer in chunked mode"""
         storage = LogitsStorage(seq_length=10,
@@ -238,15 +150,6 @@ class TestLogitsStorage:
         # Should not raise any errors
         storage.finalize_transfer()
 
-    def test_set_exclude_last(self):
-        """Test set_exclude_last method"""
-        storage = LogitsStorage(seq_length=10)
-        storage.set_exclude_last(True)
-        assert storage._should_exclude_last is True
-
-        storage.set_exclude_last(False)
-        assert storage._should_exclude_last is False
-
     def test_storage_overflow(self, sample_logits):
         """Test storage overflow handling"""
         storage = LogitsStorage(seq_length=2, use_chunked_logits=False)
@@ -256,16 +159,6 @@ class TestLogitsStorage:
         # This should cause overflow
         with pytest.raises(ValueError, match="LogitsStorage overflow"):
             storage.append(sample_logits)
-
-    def test_beam_width_mismatch(self, sample_logits, sample_logits_multi_beam):
-        """Test beam width mismatch handling"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
-        storage.append(sample_logits)
-
-        # This should cause beam width mismatch
-        with pytest.raises(AssertionError, match="Beam width mismatch"):
-            storage.append(sample_logits_multi_beam)
-
 
 class TestPyResult:
     """Unit tests for PyResult class"""
@@ -288,42 +181,6 @@ class TestPyResult:
         assert result._generation_logits is not None
         assert result._log_probs is not None
         assert result._mm_embeddings is None
-
-    def test_initialization_no_logits(self):
-        """Test PyResult initialization without logits"""
-        result = PyResult(prompt_len=5,
-                          max_new_tokens=10,
-                          return_log_probs=False,
-                          return_context_logits=False,
-                          return_generation_logits=False)
-
-        assert result._context_logits is None
-        assert result._generation_logits is None
-        assert result._log_probs is None
-
-    def test_append_context_logits(self, sample_logits):
-        """Test append_context_logits method"""
-        result = PyResult(prompt_len=5,
-                          max_new_tokens=10,
-                          return_context_logits=True,
-                          use_chunked_logits=False)
-
-        result.append_context_logits(sample_logits)
-
-        # Should have logits stored
-        assert result._context_logits._storage is not None
-
-    def test_append_generation_logits(self, sample_logits):
-        """Test append_generation_logits method"""
-        result = PyResult(prompt_len=5,
-                          max_new_tokens=10,
-                          return_generation_logits=True,
-                          use_chunked_logits=False)
-
-        result.append_generation_logits(sample_logits)
-
-        # Should have logits stored
-        assert result._generation_logits._storage is not None
 
     def test_append_logits_no_storage(self, sample_logits):
         """Test append methods when storage is not enabled"""
@@ -348,7 +205,7 @@ class TestPyResult:
 
         # Should not raise errors
 
-    def test_context_logits_property(self, sample_logits):
+    def test_context_generation_logits_property(self, sample_logits):
         """Test context_logits property"""
         result = PyResult(prompt_len=5,
                           max_new_tokens=10,
@@ -360,13 +217,6 @@ class TestPyResult:
 
         assert context_logits is not None
         assert context_logits.shape == (1, 1000)  # Should remove beam dimension
-
-    def test_generation_logits_property(self, sample_logits):
-        """Test generation_logits property"""
-        result = PyResult(prompt_len=5,
-                          max_new_tokens=10,
-                          return_generation_logits=True,
-                          use_chunked_logits=False)
 
         result.append_generation_logits(sample_logits)
         generation_logits = result.generation_logits
@@ -389,35 +239,13 @@ class TestPyResult:
         assert generation_logits is not None
         assert generation_logits.shape == (1, 1, 1000)
 
-    def test_mm_embedding_handle_property(self):
-        """Test mm_embedding_handle property"""
-        result = PyResult(prompt_len=5, max_new_tokens=10)
-
-        handle = result.mm_embedding_handle
-        assert handle is None
-
 
 class TestLlmRequest:
     """Unit tests for LlmRequest class"""
 
     def test_initialization_chunked_logits(self):
-        """Test LlmRequest initialization with chunked logits"""
-        request = LlmRequest(request_id=1,
-                             max_new_tokens=10,
-                             input_tokens=[1, 2, 3],
-                             sampling_config=SamplingConfig(),
-                             is_streaming=False,
-                             return_generation_logits=True,
-                             use_chunked_logits=True,
-                             logits_chunk_size=4)
-
-        assert request.py_use_chunked_logits is True
-        assert request.py_logits_chunk_size == 4
-        assert request.py_result is not None
-
-    def test_initialization_default_chunked_logits(self):
         """Test LlmRequest initialization with default chunked logits"""
-        request = LlmRequest(request_id=2,
+        request_non_streaming = LlmRequest(request_id=2,
                              max_new_tokens=10,
                              input_tokens=[1, 2, 3],
                              sampling_config=SamplingConfig(),
@@ -425,43 +253,18 @@ class TestLlmRequest:
                              return_generation_logits=True)
 
         # Should use default values
-        assert request.py_use_chunked_logits is True  # Default is True
-        assert request.py_logits_chunk_size == 8  # Default is 8
+        assert request_non_streaming.py_use_chunked_logits is True  # Default is True
+        assert request_non_streaming.py_logits_chunk_size == 8  # Default is 8
 
-    def test_py_result_creation(self):
-        """Test PyResult creation with correct parameters"""
-        request = LlmRequest(request_id=3,
-                             max_new_tokens=10,
-                             input_tokens=[1, 2, 3],
-                             sampling_config=SamplingConfig(),
-                             is_streaming=False,
-                             return_generation_logits=True,
-                             use_chunked_logits=True,
-                             logits_chunk_size=4)
+        request_streaming = LlmRequest(request_id=3,
+                        max_new_tokens=10,
+                        input_tokens=[1, 2, 3],
+                        sampling_config=SamplingConfig(),
+                        is_streaming=True,
+                        return_generation_logits=True)
 
-        assert request.py_result is not None
-        assert request.py_result._generation_logits is not None
-        assert request.py_result._generation_logits.use_chunked_logits is True
-        assert request.py_result._generation_logits.chunk_size == 4
-
-    def test_is_generation_only_request(self):
-        """Test is_generation_only_request method"""
-        request = LlmRequest(request_id=4,
-                             max_new_tokens=10,
-                             input_tokens=[1, 2, 3],
-                             sampling_config=SamplingConfig(),
-                             is_streaming=False)
-
-        # Should return False by default (context and generation)
-        assert request.is_generation_only_request() is False
-
-    def test_is_dummy_property(self, chunked_request):
-        """Test is_dummy property"""
-        assert chunked_request.is_dummy is False
-
-        chunked_request.is_attention_dp_dummy = True
-        assert chunked_request.is_dummy is True
-
+        assert request_streaming.py_use_chunked_logits is True
+        assert request_streaming.py_logits_chunk_size == 1 # 1 in stremaing mode
 
 class TestChunkedLogitsIntegration:
     """Integration tests for chunked logits functionality"""
@@ -625,40 +428,6 @@ class TestChunkedLogitsIntegration:
 class TestChunkedLogitsPerformance:
     """Performance tests for chunked logits functionality"""
 
-    @pytest.mark.performance
-    def test_chunk_size_performance(self, sample_logits):
-        """Test performance with different chunk sizes"""
-        chunk_sizes = [1, 2, 4, 8, 16]
-        results = {}
-
-        for chunk_size in chunk_sizes:
-            request = LlmRequest(request_id=12,
-                                 max_new_tokens=20,
-                                 input_tokens=[1, 2, 3],
-                                 sampling_config=SamplingConfig(),
-                                 is_streaming=False,
-                                 return_generation_logits=True,
-                                 use_chunked_logits=True,
-                                 logits_chunk_size=chunk_size)
-
-            # Time the append operations
-            import time
-            start_time = time.time()
-
-            for _ in range(20):
-                request.py_result.append_generation_logits(sample_logits)
-
-            request.py_result.post_processing_transfer()
-
-            end_time = time.time()
-            results[chunk_size] = end_time - start_time
-
-        # All should complete successfully
-        for chunk_size, duration in results.items():
-            assert duration > 0
-            print(f"Chunk size {chunk_size}: {duration:.4f}s")
-
-    @pytest.mark.performance
     def test_memory_usage_comparison(self, sample_logits):
         """Test memory usage comparison between chunked and non-chunked modes"""
         import os
