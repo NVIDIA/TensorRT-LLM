@@ -102,12 +102,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
         num_tokens: int,
     ):
         num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            max_tile_tokens_dim=128
-        )
+        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                    self.num_experts,
+                                                    self.top_k,
+                                                    max_tile_tokens_dim=128)
         instance_key = (tile_tokens_dim, )
         if instance_key not in FP4BlockScaleMoERunner.runner_dict:
             FP4BlockScaleMoERunner.runner_dict[
@@ -321,7 +319,9 @@ def fp4_block_scale_fake_output_without_finalize(
     hidden_size = hidden_states.shape[1] * (2 if isinstance(
         hidden_states, Fp4QuantizedTensor) else 1)
 
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k,
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                num_experts,
+                                                top_k,
                                                 max_tile_tokens_dim=128)
 
     expanded_row_count = num_tokens * top_k
@@ -447,12 +447,10 @@ class FP8BlockScaleMoERunner(TunableRunner):
         num_tokens: int,
     ):
         num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            max_tile_tokens_dim=64
-        )
+        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                    self.num_experts,
+                                                    self.top_k,
+                                                    max_tile_tokens_dim=64)
         instance_key = (tile_tokens_dim, )
         if instance_key not in FP8BlockScaleMoERunner.runner_dict:
             FP8BlockScaleMoERunner.runner_dict[
@@ -730,12 +728,10 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
         # We use the num_tokens after round mapping to generate tile tokens dim.
         # This is to keep the tuning tokens aligned with the tokens used for inference.
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            max_tile_tokens_dim=128
-        )
+        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                    self.num_experts,
+                                                    self.top_k,
+                                                    max_tile_tokens_dim=128)
         instance_key = (tile_tokens_dim, self.act_type, True)
         if instance_key not in MxE4m3MxE2m1BlockScaleMoERunner.runner_dict:
             MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[
@@ -1000,13 +996,11 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         num_tokens: int,
     ):
         num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            self.imbalance_factor,
-            max_tile_tokens_dim=64
-        )
+        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                    self.num_experts,
+                                                    self.top_k,
+                                                    self.imbalance_factor,
+                                                    max_tile_tokens_dim=64)
         instance_key = (tile_tokens_dim, self.act_type, False)
         if instance_key not in E4m3MxE2m1BlockScaleMoERunner.runner_dict:
             E4m3MxE2m1BlockScaleMoERunner.runner_dict[
@@ -1261,13 +1255,11 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         num_tokens: int,
     ):
         num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            self.imbalance_factor,
-            max_tile_tokens_dim=64
-        )
+        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                    self.num_experts,
+                                                    self.top_k,
+                                                    self.imbalance_factor,
+                                                    max_tile_tokens_dim=64)
         instance_key = (tile_tokens_dim, self.act_type)
         if instance_key not in Bf16MxE2m1BlockScaleMoERunner.runner_dict:
             Bf16MxE2m1BlockScaleMoERunner.runner_dict[
@@ -1513,12 +1505,10 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         num_tokens: int,
     ):
         num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            max_tile_tokens_dim=64
-        )
+        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                    self.num_experts,
+                                                    self.top_k,
+                                                    max_tile_tokens_dim=64)
         instance_key = (tile_tokens_dim, self.act_type)
         if instance_key not in FP8FP4BlockScaleMoERunner.runner_dict:
             FP8FP4BlockScaleMoERunner.runner_dict[
@@ -1729,7 +1719,10 @@ def _(routing_logits,
                                     dtype=torch.bfloat16)
         ]
 
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k, max_tile_tokens_dim=64)
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                num_experts,
+                                                top_k,
+                                                max_tile_tokens_dim=64)
     expanded_row_count = num_tokens * top_k
     max_padding_required = (tile_tokens_dim - 1) * num_experts
     max_num_padded_tokens = fp4_utils.pad_up(
