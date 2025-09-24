@@ -87,27 +87,6 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
-        # DeepSeek R1 model with fp4 quantization
-        {
-            'patterns': [
-                'deepseek_r1_nvfp4-bench-pytorch-float16-kv_frac:0.85-input_output_len:4000,1000-reqs:1024-ep:8-tp:8-gpus:8',
-            ],
-            'config': {
-                'enable_attention_dp': True,
-                'cuda_graph_config': {
-                    'enable_padding': True,
-                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
-                },
-                'moe_config': {
-                    'backend': 'CUTLASS',
-                    'max_num_tokens': 3072,
-                },
-                'kv_cache_config': {
-                    'free_gpu_memory_fraction': 0.85,
-                    'dtype': 'fp8',
-                }
-            }
-        },
         # DeepSeek R1 model with specific batch size 128
         {
             'patterns':
