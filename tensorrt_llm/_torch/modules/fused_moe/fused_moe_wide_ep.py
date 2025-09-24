@@ -191,7 +191,6 @@ class WideEPMoE(MoE):
         self.use_postquant_alltoall = False
         self.use_low_precision_combine = False
         if self.enable_alltoall:
-            self.quant_config.quant_mode
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1")
             self.use_low_precision_combine = (os.environ.get(
@@ -719,10 +718,10 @@ class WideEPMoE(MoE):
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
                 if self.use_low_precision_combine:
                     assert self.has_nvfp4 or self.has_w4afp8 or self.has_fp8_qdq, "Low precision combine only supports nvfp4, w4afp8 and fp8 qdq"
-                    precision = 0
+                    precision = "fp8"
                     global_scales = None
                     if self.has_nvfp4:
-                        precision = 1
+                        precision = "nvfp4"
                         global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
                             final_hidden_states, recv_expert_count)
                     final_hidden_states = self.deep_ep_buffer.low_latency_combine_low_precision(
