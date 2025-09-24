@@ -7,6 +7,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
                     NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
+from tensorrt_llm.logger import logger
 import torch
 import torch.nn.functional as F
 
@@ -336,6 +337,11 @@ class GenerationResultBase:
                 self._outputs[0] = response.res
             else:
                 self._outputs[0]._postprocess_result = response.res
+            self._outputs[0].request_perf_metrics = response.request_perf_metrics
+            if response.disaggregated_params:
+                self._outputs[0].disaggregated_params = response.disaggregated_params
+            else:
+                self._outputs[0].disaggregated_params = self.disaggregated_params
             if response.metrics:
                 self.metrics_dict = response.metrics
 
