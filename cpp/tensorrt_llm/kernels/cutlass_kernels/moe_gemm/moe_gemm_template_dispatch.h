@@ -541,20 +541,20 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     static constexpr auto fp8_only_flag = use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
     static constexpr auto fp4_only_flag
         = (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
+    static constexpr auto fp8fp4_mixed_flag
+        = use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
     auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(weight_only_flag | simt_only_flag
-        | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag);
+        | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
     TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper), "Blackwell and hopper flags are mutually exclusive");
 
     sm = use_wfp4afp8 && sm == 103 ? 100 : sm;
     if (sm >= 100 && sm < 120
-        && !tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()
-        && !(std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>))
+        && !tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
     {
         TLLM_LOG_TRACE("Blackwell is not supported for this configuration, not selecting any TMA WS implementations");
         return {};
     }
-    if ((sm == 120 || sm == 121) && !tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()
-        && !(std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>))
+    if ((sm == 120 || sm == 121) && !tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>())
     {
         TLLM_LOG_TRACE(
             "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS implementations");
@@ -617,26 +617,6 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
             tma_ws_configs.end());
     }
 
-    // Filter out SM120 mixed FP8xFP4 configs that use K=64 tiles ("...64B")
-    // Prefer K in {128, 256} only for MX path on SM120.
-    if (sm == 120 || sm == 121)
-    {
-        constexpr bool IsFp8xFp4
-            = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
-        if constexpr (IsFp8xFp4)
-        {
-            // Restrict SM120 MXFP8xMXFP4 to 128x128x128 only
-            tma_ws_configs.erase(
-                std::remove_if(
-                    tma_ws_configs.begin(), tma_ws_configs.end(), [](cutlass_extensions::CutlassGemmConfig const& cfg)
-                    {
-                        return cfg.sm_version >= 120
-                            && cfg.tile_config_sm120 != cutlass_extensions::CutlassTileConfigSM120::CtaShape128x128x128B;
-                    }),
-                tma_ws_configs.end());
-        }
-    }
-
     return tma_ws_configs;
 }
 
@@ -651,12 +631,11 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecializ
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized(int sm)
 {
-    constexpr bool IsFp8xFp4 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
     return (sm == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
         || (sm >= 100 && sm < 120
-            && (tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>() || IsFp8xFp4))
+            && (tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>()))
         || ((sm == 120 || sm == 121)
-            && (tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>() || IsFp8xFp4));
+            && (tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()));
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -762,8 +741,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             }
         }
 
-        if constexpr ((tensorrt_llm::kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>()
-                || (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>))
+        if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>()
             && !use_w4_groupwise)
         {
             // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small

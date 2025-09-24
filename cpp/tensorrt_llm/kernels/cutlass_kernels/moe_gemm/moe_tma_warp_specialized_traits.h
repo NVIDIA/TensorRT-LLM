@@ -87,7 +87,8 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
 constexpr bool isValidTmaWarpSpecializedMOESpecialisation()
 {
     // Check at least one of the implementations are valid
-    return isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>()
+    return isValidSM120MOESpecialisation<T, WeightType>()
+        || isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>()
         || isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, Fusion>();
 }
 
