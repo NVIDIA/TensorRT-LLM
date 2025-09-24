@@ -41,6 +41,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
@@ -614,7 +615,8 @@ public:
 
     //! \brief Release blocks of the sequence.
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
-    void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+    std::optional<KVCacheBlock::IdType> releaseBlocks(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -788,9 +790,10 @@ public:
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
     //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
-    //! \return The id of the last block stored in the reuse tree, if any were stored.
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocks(std::vector<BlockKey> const& blockKeys,
-        std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks = false);
+    //! \return Pair of (num blocks stored for reuse, id of the last block stored if any).
+    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -817,6 +820,7 @@ public:
     {
         return mIsSWA;
     }
+
     [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey);
 
@@ -980,7 +984,7 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> releaseBlocks(
+    std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
@@ -1013,8 +1017,9 @@ public:
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocks(std::vector<BlockKey> const& blockKeys,
-        std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize, bool pinBlocks = false)
+    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        SizeType32 windowSize, bool pinBlocks = false)
     {
         return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
     }
