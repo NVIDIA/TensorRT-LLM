@@ -494,7 +494,7 @@ class WideEPMoE(MoE):
         use_allgather = not use_all_to_all
 
         # If alltoall is disabled, we need also disable use_postquant_alltoall
-        use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
+        use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all and self.has_any_quant
 
         # Prepare additional information for profiling in case padding is applied when using alltoall.
         # Only the non-alltoall case is considered for profiling in the warmup phase.
