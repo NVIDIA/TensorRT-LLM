@@ -1100,9 +1100,9 @@ class TorchSampler(Sampler):
             request.add_new_token(new_token, self.BEAM)
         else:
             new_token = add_token(request,
-                              new_tokens,
-                              beam=self.BEAM,
-                              step=num_accepted)
+                                  new_tokens,
+                                  beam=self.BEAM,
+                                  step=num_accepted)
         stop = self._handle_stop_criteria(request, new_token)
 
         return num_accepted
