@@ -174,8 +174,7 @@ class LogitsStorage:
 
     def finalize_transfer(self):
         """Force transfer of any remaining fragments to host (for chunked mode)"""
-        if self.use_chunked_logits and hasattr(
-                self, '_device_fragments') and self._device_fragments:
+        if self.use_chunked_logits and self._device_fragments:
             self._transfer_chunk_to_host()
 
     def set_exclude_last(self, should_exclude_last: bool) -> None:
