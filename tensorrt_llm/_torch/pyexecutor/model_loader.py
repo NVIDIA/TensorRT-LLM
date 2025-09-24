@@ -179,7 +179,6 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
-        self.moe_load_balancer = None
 
     def load(
         self,
