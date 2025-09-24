@@ -1,4 +1,3 @@
-// TODO: Perhaps modify for sm120
 /*
  * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
