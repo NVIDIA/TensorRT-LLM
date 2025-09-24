@@ -45,6 +45,7 @@ inline void gpuAssert(cudaError_t code, char const* file, int line, bool abort =
     }
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 __device__ uint64_t gclock64()
 {
     unsigned long long int rv;
@@ -159,6 +160,7 @@ __device__ uint32_t elect_one_sync()
         : "r"(0xFFFFFFFF));
     return pred;
 }
+#endif
 
 struct Profile
 {
@@ -175,6 +177,7 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
     const __grid_constant__ CUtensorMap weight_map, const __grid_constant__ CUtensorMap activation_map,
     Profile* profile = nullptr)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 
     if (PROFILE && threadIdx.x == 0 && blockIdx.y == 0)
         profile[blockIdx.x].start = gclock64();
@@ -440,4 +443,5 @@ __global__ __launch_bounds__(384, 1) void kernel(__nv_bfloat16* output, __nv_bfl
                 profile[blockIdx.x].complete = gclock64();
         }
     }
+#endif // end if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 }
