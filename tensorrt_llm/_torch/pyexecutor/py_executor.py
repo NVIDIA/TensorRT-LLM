@@ -1764,10 +1764,13 @@ class PyExecutor:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
+            elif cp_type == CpType.HELIX:
+                # Take the usual route with _update_request_states_tp().
+                pass
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
-        else:
-            self._update_request_states_tp(scheduled_requests)
+                raise NotImplementedError(
+                    f'Unsupported cp type {cp_type.name}.')
+        self._update_request_states_tp(scheduled_requests)
 
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
