@@ -1,0 +1,10 @@
+Curl Chat Client For Multimodal
+===============================
+Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
+
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/ae8270b713446948246f16fadf4e2a32e35d0f62/examples/serve/curl_chat_client_for_multimodal.sh.
+
+.. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
+    :lines: 1-88
+    :language: bash
+    :linenos:
