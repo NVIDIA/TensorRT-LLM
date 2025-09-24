@@ -274,8 +274,6 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
 #if {guard_act} && {guard_weight}
         INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_sched}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, {"true" if operation.dynamic_cga else "false"}, false, {"true" if operation.swap_ab else "false"});
 #endif"""
-    # if operation.arch == 120:
-    #     print(f"instantiation: {instantiation}")
     return instantiation
 
 
@@ -652,7 +650,6 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
-    # modified here!
     supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
@@ -913,8 +910,7 @@ if __name__ == "__main__":
         # Only w4a8fp8 and not wfp4afp8
         return (op.act_type != op.weight_type) and (
             op.gemm_kind == GemmKind.Grouped) and (op.act_type != DataType.e4m3
-                                                   or op.weight_type != e2m1)
-                             
+                                                   or op.weight_type != e2m1)                             
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
     GROUP_SIZE = 8
     op_groups = dict()
