@@ -11,7 +11,8 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, MoEAllReduce)
+                                             AllReduceParams, AllReduceStrategy,
+                                             MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version
@@ -163,7 +164,6 @@ class Llama4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         skip_attn_scaling: bool = False,
     ):
@@ -176,14 +176,14 @@ class Llama4Attention(Attention):
             q = self._attention_scaling(q, position_ids)
 
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.forward_impl(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        attention_mask,
-                                        None,
-                                        None,
-                                        mrope_config,
+        attn_output = self.forward_impl(q=q,
+                                        k=k,
+                                        v=v,
+                                        attn_metadata=attn_metadata,
+                                        attention_mask=attention_mask,
+                                        attention_window_size=None,
+                                        attention_mask_data=None,
+                                        mrope_config=None,
                                         attention_sinks=None)
 
         if isinstance(attn_output, tuple):
@@ -201,7 +201,6 @@ class Llama4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -213,7 +212,6 @@ class Llama4Attention(Attention):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 attention_mask=attention_mask,
-                mrope_config=mrope_config,
                 all_reduce_params=all_reduce_params,
                 lora_params=lora_params,
                 **kwargs,
@@ -223,7 +221,6 @@ class Llama4Attention(Attention):
                                       hidden_states=hidden_states,
                                       attn_metadata=attn_metadata,
                                       attention_mask=attention_mask,
-                                      mrope_config=mrope_config,
                                       all_reduce_params=all_reduce_params)
 
 
@@ -652,7 +649,12 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
-        self.all_reduce = AllReduce(mapping=model_config.mapping)
+        # TODO: This is a temporary fix to disable oneshot kernel for pre-Blackwell arch to avoid perf regressions
+        self.all_reduce = AllReduce(
+            strategy=model_config.allreduce_strategy
+            if get_sm_version() >= 100 else AllReduceStrategy.NCCL,
+            mapping=model_config.mapping,
+        )
 
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
