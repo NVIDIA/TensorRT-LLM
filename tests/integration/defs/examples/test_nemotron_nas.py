@@ -172,8 +172,6 @@ def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
     )
 
 
-@pytest.mark.skip(
-    reason="TODO: Resolve the hanging issue while running the test")
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("nemotron_nas_model_root", [
@@ -223,7 +221,10 @@ def test_nemotron_super_49b_real_lora_torch(nemotron_nas_example_root, llm_venv,
                                          temperature=0.7,
                                          top_p=0.9)
 
-        lora_request = [LoRARequest("nemotron-lora", 0, llm_lora_model_root)]
+        lora_request = [
+            LoRARequest("nemotron-lora", 0, llm_lora_model_root),
+            LoRARequest("nemotron-lora", 1, llm_lora_model_root)
+        ]
 
         print("Running inference with real LoRA adapter...")
         outputs = llm.generate(prompts,
