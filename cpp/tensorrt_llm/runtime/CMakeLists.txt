@@ -88,26 +88,17 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 if(NOT WIN32)
-  find_package(libnuma QUIET CONFIG)
+  find_path(NUMA_INCLUDE_DIR numa.h)
+  find_library(NUMA_LIBRARY numa)
 
-  if(NOT libnuma_FOUND)
-    message(
-      STATUS "libnuma not found via Conan, falling back to system libnuma")
-    find_path(NUMA_INCLUDE_DIR numa.h)
-    find_library(NUMA_LIBRARY numa)
-
-    if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
-      add_library(libnuma::libnuma UNKNOWN IMPORTED)
-      set_target_properties(
-        libnuma::libnuma
-        PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
-                   INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
-    else()
-      message(FATAL_ERROR "NUMA library not found, please install libnuma-dev")
-    endif()
+  if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
+    add_library(libnuma::libnuma UNKNOWN IMPORTED)
+    set_target_properties(
+      libnuma::libnuma
+      PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
+                 INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
   else()
-    message(STATUS "libnuma found.")
+    message(FATAL_ERROR "NUMA library not found, please install libnuma-dev")
   endif()
   target_link_libraries(runtime_src PUBLIC libnuma::libnuma)
-  target_link_options(runtime_src PUBLIC ${CONAN_LIBNUMA_LINK_OPTIONS})
 endif()
