@@ -359,6 +359,8 @@ class BaseWorker(GenerationExecutor):
             assert (
                 not self._is_pytorch_backend
                 or self.engine.kv_cache_transceiver is not None
+                or request.disaggregated_params.request_type
+                == "context_and_generation"
             ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:

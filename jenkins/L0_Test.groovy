@@ -37,11 +37,11 @@ LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202508051130-6090"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202509091430-7383"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202509091430-7383"
 
-LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
-LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202509091430-7383"
+LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202509091430-7383"
 
 DLFW_IMAGE_12_9 = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
 
@@ -1274,6 +1274,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
     if (stageName.contains("-DeepSeek-")) {
         makoArgs += ["auto_trigger=deepseek"]
+    } else if (stageName.contains("-GptOss-")) {
+        makoArgs += ["auto_trigger=gpt_oss"]
     } else {
         makoArgs += ["auto_trigger=others"]
     }
@@ -2039,6 +2041,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
+        "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
@@ -2187,10 +2190,11 @@ def launchTestJobs(pipeline, testFilter)
     // multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
         // Disable GB200 multi-node testing in L0 pre-merge until the configuration issue is resolved (https://nvbugs/5455140)
-        // "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
-        // "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
-        // "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
-        // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 5, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     // ]
     multiNodesSBSAConfigs = [:]
     multiNodesSBSAConfigs += (1..7).collectEntries { i ->

@@ -368,7 +368,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   exclude_last_generation_logits)
         self.child_requests = []
 
-        self._py_embedding_bias_1d = None
+        self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
             # Pre-squeeze to 1D if needed (remove batch dimension)
             if self.embedding_bias.dim() > 1:

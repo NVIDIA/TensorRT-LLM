@@ -142,6 +142,9 @@ class ADEngine(ModelEngine):
         self.pytorch_backend_config.attention_dp_time_out_iters = 50
         self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
         self.pytorch_backend_config.batch_wait_timeout_ms = 0
+        self.pytorch_backend_config.batch_wait_timeout_iters = 0
+        self.pytorch_backend_config.batch_wait_max_tokens_ratio = 0.0
+        self.pytorch_backend_config.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
@@ -337,16 +340,11 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require enable_mixed_sampler=True to have good outputs, see
-    # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
-    # We should expose mixed_sample to our build_and_run_ad script so we can configure this
-    # correctly for models as needed.
     sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
         max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=ad_config.max_beam_width,
-        enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
 
