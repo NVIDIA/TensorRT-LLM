@@ -63,6 +63,14 @@ void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperatio
         mOperationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(cublasOperation_t)));
     check_cuda_error(
         cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAcc, sizeof(int8_t)));
+
+    // Set pointer mode for FP4 GEMM
+    if (mAType == CUDA_R_4F_E2M1)
+    {
+        cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
+    }
 }
 
 void CublasMMWrapper::setScaleDescriptors(void* scale_a, void* scale_b)
@@ -71,6 +79,39 @@ void CublasMMWrapper::setScaleDescriptors(void* scale_a, void* scale_b)
         cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_a, sizeof(void*)));
     check_cuda_error(
         cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b, sizeof(void*)));
+
+    // Set scaling modes for FP4 GEMM
+    if (mAType == CUDA_R_4F_E2M1)
+    {
+        // Set scaling mode - cuBLASLt requires e4m3 format scaling factors
+        cublasLtMatmulMatrixScale_t AScaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        cublasLtMatmulMatrixScale_t BScaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        cublasLtMatmulMatrixScale_t CScaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        cublasLtMatmulMatrixScale_t DScaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        cublasLtMatmulMatrixScale_t DOutScaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &AScaleMode, sizeof(AScaleMode)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &BScaleMode, sizeof(BScaleMode)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_C_SCALE_MODE, &CScaleMode, sizeof(CScaleMode)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_D_SCALE_MODE, &DScaleMode, sizeof(DScaleMode)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_MODE, &DOutScaleMode, sizeof(DOutScaleMode)));
+
+        // Set C/D matrix scale pointers to nullptr
+        void const* c_scale_ptr = nullptr;
+        void const* d_scale_ptr = nullptr;
+        void const* d_out_scale_ptr = nullptr;
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_C_SCALE_POINTER, &c_scale_ptr, sizeof(c_scale_ptr)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &d_scale_ptr, sizeof(d_scale_ptr)));
+        check_cuda_error(cublasLtMatmulDescSetAttribute(
+            mOperationDesc, CUBLASLT_MATMUL_DESC_D_OUT_SCALE_POINTER, &d_out_scale_ptr, sizeof(d_out_scale_ptr)));
+    }
 }
 
 void CublasMMWrapper::setBiasDescriptor(void* bias)
@@ -247,6 +288,13 @@ void CublasMMWrapper::setFP8GemmConfig(cudaDataType_t outputType)
 }
 #endif
 
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+void CublasMMWrapper::setFP4GemmConfig(cudaDataType_t outputType)
+{
+    setGemmConfig(CUDA_R_4F_E2M1, CUDA_R_4F_E2M1, outputType, CUDA_R_32F);
+}
+#endif
+
 void CublasMMWrapper::setGemmConfig(
     cudaDataType_t aType, cudaDataType_t bType, cudaDataType_t cType, cudaDataType_t computeType)
 {
@@ -254,7 +302,13 @@ void CublasMMWrapper::setGemmConfig(
     mBType = bType;
     mCType = cType;
     bool isFp16ComputeType = computeType == CUDA_R_16F;
-    if (isFp16ComputeType)
+    if (mAType == CUDA_R_4F_E2M1)
+    {
+        // for cublaslt nvfp4 gemm, fp32 compute type and fp32 scale type are required
+        mComputeType = CUBLAS_COMPUTE_32F;
+        mScaleType = CUDA_R_32F;
+    }
+    else if (isFp16ComputeType)
     {
         mComputeType = CUBLAS_COMPUTE_16F;
         mScaleType = CUDA_R_16F;
@@ -480,6 +534,68 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasL
     return heuristics;
 #endif
 }
+
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+void CublasMMWrapper::Fp4Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
+    void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+    void const* b_sf, float const* alpha, float const* beta)
+{
+    // Verify FP4 configuration
+    TLLM_CHECK_WITH_INFO(mAType == CUDA_R_4F_E2M1 && mBType == CUDA_R_4F_E2M1,
+        "FP4 GEMM requires FP4 input types. Call setFP4GemmConfig() first.");
+
+    // Validate input pointers
+    TLLM_CHECK_WITH_INFO(A != nullptr, "A pointer is null");
+    TLLM_CHECK_WITH_INFO(B != nullptr, "B pointer is null");
+    TLLM_CHECK_WITH_INFO(C != nullptr, "C pointer is null");
+    TLLM_CHECK_WITH_INFO(a_sf != nullptr, "a_sf pointer is null");
+    TLLM_CHECK_WITH_INFO(b_sf != nullptr, "b_sf pointer is null");
+    TLLM_CHECK_WITH_INFO(alpha != nullptr, "alpha pointer is null");
+    TLLM_CHECK_WITH_INFO(beta != nullptr, "beta pointer is null");
+
+    // Create descriptors for FP4 GEMM
+    createDescriptors(transa, transb, m, n, k, lda, ldb, ldc, 0);
+
+    // Create D descriptor for FP4 GEMM (output descriptor)
+    cublasLtMatrixLayout_t Ddesc = NULL;
+    check_cuda_error(cublasLtMatrixLayoutCreate(&Ddesc, mCType, m, n, ldc));
+
+    // Set scaling descriptors
+    setScaleDescriptors(const_cast<void*>(a_sf), const_cast<void*>(b_sf));
+
+    // Validate cuBLASLt handle
+    TLLM_CHECK_WITH_INFO(mCublasLtHandle != nullptr, "cuBLASLt handle is null");
+
+    // Get heuristic algorithm using D descriptor
+    auto heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, Ddesc);
+
+    if (heuristics.empty())
+    {
+        if (Ddesc)
+            cublasLtMatrixLayoutDestroy(Ddesc);
+        destroyDescriptors();
+        throw std::runtime_error("No suitable cuBLASLt algorithm found for FP4 GEMM");
+    }
+
+    // Use the first valid heuristic
+    auto const& heuristic = heuristics[0];
+    bool hasAlgo = heuristic.state == CUBLAS_STATUS_SUCCESS && heuristic.workspaceSize <= CUBLAS_WORKSPACE_SIZE;
+
+    int workspaceSize = mCublasWorkspace == NULL ? 0 : CUBLAS_WORKSPACE_SIZE;
+
+    // Call cuBLASLt matmul directly
+    check_cuda_error(cublasLtMatmul(getCublasLtHandle(), mOperationDesc, alpha, A, mADesc, B, mBDesc, beta, C, mCDesc,
+        C, Ddesc, (hasAlgo ? (&heuristic.algo) : NULL), mCublasWorkspace, workspaceSize, mStream));
+
+    // Synchronize stream
+    sync_check_cuda_error(mStream);
+
+    // Clean up descriptors
+    if (Ddesc)
+        cublasLtMatrixLayoutDestroy(Ddesc);
+    destroyDescriptors();
+}
+#endif
 
 } // namespace common
 

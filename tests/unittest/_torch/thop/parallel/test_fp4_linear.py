@@ -390,6 +390,155 @@ def nvfp4_gemm_perf_test(
                 buffer_idx = buffer_idx + 1
 
 
+@pytest.mark.skipif(
+    get_sm_version() != 100,
+    reason="This test is only supported in Blackwell architecture",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
+                                 (128, 2112, 7168), (128, 4096, 7168),
+                                 (128, 7168, 2048), [127, 1024, 3200]])
+def test_fp4_linear_cublaslt(dtype, mnk):
+    """Test cuBLASLt FP4 GEMM implementation and compare with nvfp4_gemm"""
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+    torch.manual_seed(0)
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w_sf_global = (448 * 6) / w.abs().max().float()
+    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+
+    with torch.inference_mode():
+        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
+            x, x_sf_global, scaling_vector_size, False)
+
+        alpha_ref = 1.0 / (w_sf_global * x_sf_global)
+        alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
+        beta_tensor = torch.tensor(0.0, dtype=torch.float32).cuda()
+
+        # Use cuBLASLt FP4 GEMM
+        output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
+            mat_a=x_fp4,
+            mat_b=w_fp4,
+            scale_a=x_sf_block,
+            scale_b=w_sf_block,
+            alpha=alpha_tensor,
+            beta=beta_tensor,
+            out_dtype=dtype)
+
+    # Reference implementation: use torch.ops.trtllm.nvfp4_gemm (CUTLASS)
+    with torch.inference_mode():
+        output_cutlass = torch.ops.trtllm.nvfp4_gemm(x_fp4, w_fp4, x_sf_block,
+                                                     w_sf_block, alpha_ref,
+                                                     dtype)
+
+    # Compare results
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output_cublaslt, output_cutlass)
+
+
+def cublaslt_fp4_gemm_perf_test(
+    dtype,
+    SEQ_LEN,
+    OUTPUT_SIZE,
+    HIDDEN_SIZE,
+    test_ref=True,
+    use_cold_l2_cache=True,
+    warmup_iterations=2,
+    iterations=1000,
+):
+    """cuBLASLt FP4 GEMM performance test and comparison with nvfp4_gemm"""
+    import nvtx
+
+    torch.manual_seed(0)
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w_sf_global = (448 * 6) / w.abs().max().float()
+    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+
+    # Calculate correct alpha scaling factor
+    alpha_ref = 1.0 / (w_sf_global * x_sf_global)
+    alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
+    beta_tensor = torch.tensor(0.0, dtype=torch.float32).cuda()
+
+    if test_ref:
+        with nvtx.annotate(
+                f"cublaslt tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="blue"):
+            with torch.inference_mode(), autotune():
+                output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
+                    mat_a=x_fp4,
+                    mat_b=w_fp4,
+                    scale_a=x_sf_block,
+                    scale_b=w_sf_block,
+                    alpha=alpha_tensor,
+                    beta=beta_tensor,
+                    out_dtype=dtype)
+
+        # Compare with CUTLASS reference implementation
+        with nvtx.annotate(
+                f"cutlass ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="orange"):
+            with torch.inference_mode(), autotune():
+                output_cutlass = torch.ops.trtllm.nvfp4_gemm(
+                    x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref, dtype)
+
+        torch.testing.assert_close(output_cublaslt,
+                                   output_cutlass,
+                                   rtol=1e-2,
+                                   atol=1e-2)
+        print(
+            f"cuBLASLt vs CUTLASS comparison PASSED for shape ({SEQ_LEN}, {OUTPUT_SIZE}, {HIDDEN_SIZE})"
+        )
+
+    # Warmup
+    with nvtx.annotate(
+            f"cublaslt warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+            color="green"):
+        for _ in range(warmup_iterations):
+            output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
+                mat_a=x_fp4,
+                mat_b=w_fp4,
+                scale_a=x_sf_block,
+                scale_b=w_sf_block,
+                alpha=alpha_tensor,
+                beta=beta_tensor,
+                out_dtype=dtype)
+
+    # Performance test
+    with nvtx.annotate(
+            f"cublaslt run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+            color="green"):
+        for i in range(iterations):
+            output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
+                mat_a=x_fp4,
+                mat_b=w_fp4,
+                scale_a=x_sf_block,
+                scale_b=w_sf_block,
+                alpha=alpha_tensor,
+                beta=beta_tensor,
+                out_dtype=dtype)
+
+    if test_ref:
+        torch.testing.assert_close(output_cublaslt,
+                                   output_cutlass,
+                                   rtol=1e-2,
+                                   atol=1e-2)
+        print(
+            f"cuBLASLt performance test PASSED for shape ({SEQ_LEN}, {OUTPUT_SIZE}, {HIDDEN_SIZE})"
+        )
+
+
 if __name__ == "__main__":
     # m, n, k
     fp4_linear_perf_test(torch.bfloat16, 128, 7168, 16384)
@@ -412,3 +561,17 @@ if __name__ == "__main__":
         nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
         nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
         nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
+
+    # cuBLASLt performance tests
+    cublaslt_fp4_gemm_perf_test(torch.bfloat16, 128, 7168, 16384)
+    cublaslt_fp4_gemm_perf_test(torch.bfloat16, 128, 24576, 1536)
+    cublaslt_fp4_gemm_perf_test(torch.bfloat16, 128, 2112, 7168)
+    cublaslt_fp4_gemm_perf_test(torch.bfloat16, 128, 4096, 7168)
+    cublaslt_fp4_gemm_perf_test(torch.bfloat16, 128, 7168, 2048)
+
+    for tokens in [128, 8192]:
+        cublaslt_fp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
+        cublaslt_fp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
+        cublaslt_fp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
+        cublaslt_fp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
+        cublaslt_fp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
