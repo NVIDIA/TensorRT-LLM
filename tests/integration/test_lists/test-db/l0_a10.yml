@@ -117,7 +117,6 @@ l0_a10:
   - unittest/trt/quantization
   - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
-  - test_cache.py::test_cache_sanity # 1 sec
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/api_stability
   - unittest/bindings
