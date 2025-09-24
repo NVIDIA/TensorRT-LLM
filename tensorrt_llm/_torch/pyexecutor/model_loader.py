@@ -16,8 +16,9 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+from ..models.modeling_utils import MetaInitMode, timing
+from ..modules.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer, maybe_create_moe_load_balancer)
 from .config import LoadFormat, PyTorchConfig
 
 _KV_CACHE_MAP = {
@@ -184,7 +185,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> Tuple[DecoderModelForCausalLM, ModelConfig]:
+    ):
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -199,7 +200,8 @@ class ModelLoader:
                                                 checkpoint_loader)
         load_format = self.pytorch_backend_config.load_format
 
-        with timing("Model init total"):
+        with timing("Model init total"), maybe_create_moe_load_balancer(
+                config, self.mapping) as moe_load_balancer:
             try:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
@@ -264,9 +266,15 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
+            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                moe_load_balancer.register_weight_slots_after_to_cuda()
+                logger.info("moe_load_balancer finalizing model...")
+                moe_load_balancer.finalize_model()
+                logger.info("moe_load_balancer finalize model done")
+
             torch.cuda.current_stream().synchronize()
 
-        return model, config
+        return model, moe_load_balancer
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,
