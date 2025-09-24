@@ -332,13 +332,9 @@ class KvCacheCreator:
             logger.info(
                 f"max_tokens={self._max_kv_tokens_in} is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
             )
-        if is_vswa:
-            # For VSWA KvCacheManager now it can only use max_gpu_total_bytes
-            self._kv_cache_config.max_tokens = None
-        else:
-            # For non-VSWA KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
-            self._kv_cache_config.max_tokens = int(
-                kv_cache_max_memory // self._get_kv_size_per_token())
+        # For KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
+        self._kv_cache_config.max_tokens = int(kv_cache_max_memory //
+                                               self._get_kv_size_per_token())
         # ---------------------------handle max_tokens---------------------------------
 
         # ---------------------------handle max_gpu_total_bytes---------------------------------
@@ -704,7 +700,7 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
-                              enable_mixed_sampler: bool, max_batch_size: int,
+                              max_batch_size: int,
                               speculative_config: SpeculativeConfig,
                               max_beam_width: int):
     max_num_sequences = max_batch_size * mapping.pp_size
@@ -715,7 +711,6 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
         max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
-        enable_mixed_sampler=enable_mixed_sampler,
     )
 
 
@@ -729,7 +724,6 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,
-        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler,
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width)

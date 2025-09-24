@@ -88,8 +88,11 @@ class ModelList(OpenAIBaseModel):
 
 class ResponseFormat(OpenAIBaseModel):
     # type must be one of "text", "json", "json_object", or "structural_tag"
-    type: Literal["text", "json", "json_object", "structural_tag"]
+    type: Literal["text", "json", "json_object", "regex", "ebnf",
+                  "structural_tag"]
     schema: Optional[dict] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
     format: Optional[xgrammar.structural_tag.Format] = None
 
 
@@ -187,6 +190,10 @@ def _response_format_to_guided_decoding_params(
         return GuidedDecodingParams(json=response_format.schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "regex":
+        return GuidedDecodingParams(regex=response_format.regex)
+    elif response_format.type == "ebnf":
+        return GuidedDecodingParams(grammar=response_format.ebnf)
     elif response_format.type == "structural_tag":
         return GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,
@@ -247,9 +254,9 @@ class CompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = Field(
         default=None,
         description=
-        ("Similar to chat completion, this parameter specifies the format of "
-         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json'} are "
-         "supported."),
+        ("Similar to chat completion, this parameter specifies the format of output. "
+         "{'type': 'text'}, {'type': 'json'}, {'type': 'json_object'}, {'type': 'regex'}, "
+         "{'type': 'ebnf'}, {'type': 'structural_tag'} are supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
