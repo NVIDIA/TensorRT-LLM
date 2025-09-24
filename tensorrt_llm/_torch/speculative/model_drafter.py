@@ -478,7 +478,8 @@ class ModelDrafter(Drafter):
         return draft_batch, req_id_to_old_request
 
     def process_static_draft_outputs(
-            self, outputs: Any, draft_batch: ScheduledRequests,
+            self, outputs: torch.Tensor | SampleState,
+            draft_batch: ScheduledRequests,
             req_id_to_old_request: Dict[int, LlmRequest]) -> None:
         """
         Process outputs from static draft loop, update target requests, and clean up resources.
@@ -488,7 +489,13 @@ class ModelDrafter(Drafter):
             draft_batch: The draft batch that was processed
             req_id_to_old_request: Mapping from draft request ID to original request
         """
-        outputs_host = outputs.cpu()
+        if isinstance(outputs, torch.Tensor):
+            # For non-overlap scheduler path.
+            outputs_host = outputs.cpu()
+        else:
+            outputs_host = outputs.host.new_tokens
+            outputs.sampler_event.synchronize()
+
         for token_idx in range(self.max_draft_tokens):
             for req_idx, req in enumerate(draft_batch.all_requests()):
                 target_model_req = req_id_to_old_request[req.py_request_id]
@@ -645,6 +652,17 @@ class ModelDrafter(Drafter):
                 draft_length=self.max_draft_tokens,
                 draft_batch=draft_batch,
                 req_id_to_old_request=req_id_to_old_request)
+
+            new_tokens_host = outputs.to(device='cpu', non_blocking=True)
+            sampler_event = torch.cuda.Event()
+            sampler_event.record()
+
+            outputs = SampleState(
+                scheduled_requests=draft_batch,
+                device=SampleStateTensors(new_tokens=outputs),
+                host=SampleStateTensors(new_tokens=new_tokens_host),
+                sampler_event=sampler_event)
+
             return target_inputs, outputs, draft_batch
 
         # Handle guided decoder and sampling for non-static loop
