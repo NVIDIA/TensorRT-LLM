@@ -3022,9 +3022,13 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         [
             (4, 1, 4, False, False, False, "TRTLLM",
              True),  # TP8 has bug when we use TRTLLM moe backend and eagle3
+            (4, 1, 4, False, False, False, "CUTLASS", False),
+            (4, 1, 4, False, False, False, "CUTLASS", True),
         ],
         ids=[
             "latency_moe_trtllm_eagle3",
+            "latency_moe_cutlass",
+            "latency_moe_cutlass_eagle3",
         ],
     )
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
