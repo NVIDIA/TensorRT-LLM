@@ -654,14 +654,20 @@ def _insert_sharded_moe(
 
 def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
     """Return tensor_node[lo:hi, ...] via aten.slice along dim 0."""
-    lo = int(lo)
-    hi = int(hi)
     with gm.graph.inserting_after(tensor_node):
         # aten.slice.Tensor(self, dim, start, end, step)
         return gm.graph.call_function(
             torch.ops.aten.slice.Tensor,
             args=(tensor_node, 0, lo, hi, 1),
         )
+
+
+def _split_range_last_remainder(n: int, world_size: int, rank: int):
+    """[lo, hi) split along dim0; last rank gets remainder."""
+    base = n // world_size
+    lo = base * rank
+    hi = n if rank == world_size - 1 else base * (rank + 1)
+    return lo, hi
 
 
 def _insert_sharded_mxfp4_mlp_ep(
@@ -671,9 +677,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     world_size: int,
 ):
     """
-    Transform a call to auto_deploy::triton_mxfp4_mlp into:
+    Transform a call to auto_deploy::triton_mxfp4_moe into:
       - sharded expert parameters along dim 0 (this rank's slice),
-      - call to auto_deploy::triton_mxfp4_mlp_ep(..., local_lo, local_hi),
+      - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
       - followed by torch_dist_all_reduce.
 
     Expects the original op signature:
@@ -694,32 +700,19 @@ def _insert_sharded_mxfp4_mlp_ep(
     gate_up_blocks_node = node.args[IDX_GATE_UP_BLOCKS]
     num_experts = int(gate_up_blocks_node.meta["val"].shape[0])
 
-    # Compute per-rank [lower, upper)
-    base = num_experts // world_size
-    rem = num_experts % world_size
-    if rank < rem:
-        local_lo = rank * (base + 1)
-        local_hi = local_lo + (base + 1)
-    else:
-        local_lo = rem * (base + 1) + (rank - rem) * base
-        local_hi = local_lo + base
+    local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
 
     # Prepare new args with slices for this rank
     args = list(node.args)
-    with gm.graph.inserting_before(node):
-        args[IDX_GATE_UP_BLOCKS] = _slice_expert_dim(
-            gm, args[IDX_GATE_UP_BLOCKS], local_lo, local_hi
-        )
-        args[IDX_GATE_UP_BIAS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BIAS], local_lo, local_hi)
-        args[IDX_GATE_UP_SCALES] = _slice_expert_dim(
-            gm, args[IDX_GATE_UP_SCALES], local_lo, local_hi
-        )
-        args[IDX_DOWN_BLOCKS] = _slice_expert_dim(gm, args[IDX_DOWN_BLOCKS], local_lo, local_hi)
-        args[IDX_DOWN_BIAS] = _slice_expert_dim(gm, args[IDX_DOWN_BIAS], local_lo, local_hi)
-        args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
+    args[IDX_GATE_UP_BLOCKS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BLOCKS], local_lo, local_hi)
+    args[IDX_GATE_UP_BIAS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BIAS], local_lo, local_hi)
+    args[IDX_GATE_UP_SCALES] = _slice_expert_dim(gm, args[IDX_GATE_UP_SCALES], local_lo, local_hi)
+    args[IDX_DOWN_BLOCKS] = _slice_expert_dim(gm, args[IDX_DOWN_BLOCKS], local_lo, local_hi)
+    args[IDX_DOWN_BIAS] = _slice_expert_dim(gm, args[IDX_DOWN_BIAS], local_lo, local_hi)
+    args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
 
     args_ep = tuple(args) + (int(world_size), int(rank))
-    node.target = torch.ops.auto_deploy.triton_mxfp4_mlp_ep.default
+    node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
@@ -761,7 +754,7 @@ class MXFP4EPShardingInfo(EPShardingInfo):
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
-        if not is_op(node, torch.ops.auto_deploy.triton_mxfp4_mlp):
+        if not is_op(node, torch.ops.auto_deploy.triton_mxfp4_moe):
             ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
             return False
         return True
@@ -806,7 +799,7 @@ EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
-    (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_mlp), MXFP4EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
 
 

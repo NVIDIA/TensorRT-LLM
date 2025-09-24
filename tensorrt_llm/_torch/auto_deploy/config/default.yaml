@@ -31,7 +31,6 @@ transforms:
     stage: pattern_matcher
   match_dense_moe_pattern:
     stage: pattern_matcher
-    run_shape_prop: true
   match_repeat_kv:
     stage: pattern_matcher
   match_eager_attention:
@@ -69,7 +68,6 @@ transforms:
     stage: pattern_matcher
   quantize_mxfp4_moe:
     stage: pattern_matcher
-    run_shape_prop: true
   # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
     stage: sharding
@@ -77,6 +75,7 @@ transforms:
     use_sharding_from_factory: false
     support_partial_config: false
     sharding_dims: ['tp', 'ep', 'bmm']
+    requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding

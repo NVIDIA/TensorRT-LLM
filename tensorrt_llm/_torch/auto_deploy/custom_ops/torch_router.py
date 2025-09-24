@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 @torch.library.custom_op("auto_deploy::torch_moe_router", mutates_args=())
 def torch_moe_router(
-    hidden_states: torch.Tensor,  # [B, S, H]
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
     weight: torch.Tensor,  # [E, H]
     bias: torch.Tensor,  # [E]
     top_k: int = 2,
@@ -18,7 +18,6 @@ def torch_moe_router(
       - scatter back to full expert space
     Returns:
       router_scores:  [B*S, E]
-      router_indices: [B*S, top_k] (int64)
     """
     hidden_dim = hidden_states.shape[-1]
     hidden_states = hidden_states.reshape(-1, hidden_dim)  # [T, H]
@@ -38,9 +37,12 @@ def _torch_moe_router_fake(
     bias: torch.Tensor,
     top_k: int = 2,
 ) -> torch.Tensor:
-    # Expect 3D input [B,S,H]; infer token count and experts from params
-    B, S, H = hidden_states.shape
+    dim = hidden_states.dim()
+    if dim == 3:
+        B, S, H = hidden_states.shape
+        T = B * S
+    else:  # dim = 2
+        T, H = hidden_states.shape
     E = weight.shape[0]
-    T = B * S
     scores = torch.empty((T, E), device="meta", dtype=hidden_states.dtype)
     return scores

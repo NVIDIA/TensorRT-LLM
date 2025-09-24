@@ -10,6 +10,7 @@ from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import (
 )
 
 from ...custom_ops import IS_TRITON_KERNELS_AVAILABLE
+from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
@@ -121,24 +122,6 @@ class MatchMOEDenseMLP(BaseTransform):
         return gm, info
 
 
-def _get_param(gm: GraphModule, name: str) -> torch.Tensor:
-    return gm.get_parameter(name)
-
-
-def _get_submodule_of_param(gm: GraphModule, param_name: str) -> Tuple[nn.Module, str, str]:
-    # Returns (module, module_path, attr_name)
-    if "." not in param_name:
-        # param on the root
-        return gm, "", param_name
-    mod_path, _, attr = param_name.rpartition(".")
-    return gm.get_submodule(mod_path), mod_path, attr
-
-
-def _ensure_param(mod: nn.Module, name: str, tensor: torch.Tensor) -> None:
-    if not hasattr(mod, name):
-        mod.register_parameter(name, nn.Parameter(tensor, requires_grad=False))
-
-
 def _get_alpha_limit_from_dense(node: Node) -> Tuple[float, float]:
     # torch_moe_dense_mlp(hidden, routing, gu_w, gu_b, dn_w, dn_b, alpha, limit)
     # alpha/limit may be in args or kwargs
@@ -171,9 +154,9 @@ def _register_mxfp4_expert_params(
       (gu_blocks_name, gu_scales_name, dn_blocks_name, dn_scales_name)
     """
     # Shapes from existing params
-    gu_b = _get_param(gm, gate_up_b_name)  # [E, 2I]
-    gu_w = _get_param(gm, gate_up_w_name)  # typically [E, H, 2I] or [E, 2I, H]
-    dn_b = _get_param(gm, down_b_name)  # [E, H]
+    gu_b = gm.get_parameter(gate_up_b_name)  # [E, 2I]
+    gu_w = gm.get_parameter(gate_up_w_name)  # [E, 2I, H]
+    dn_b = gm.get_parameter(down_b_name)  # [E, H]
 
     E = int(gu_b.shape[0])
     I2 = int(gu_b.shape[1])  # 2I
@@ -183,8 +166,6 @@ def _register_mxfp4_expert_params(
     assert gu_w.dim() == 3, "gate_up_w must be rank-3"
     if gu_w.shape[1] == I2:
         H = int(gu_w.shape[2])
-    elif gu_w.shape[2] == I2:
-        H = int(gu_w.shape[1])
     else:
         # Fallback: use down bias last dim
         H = int(dn_b.shape[1])
@@ -193,7 +174,7 @@ def _register_mxfp4_expert_params(
     H_blk = max(1, H // 32)
     I_blk = max(1, In // 32)
 
-    experts_mod, experts_path, _ = _get_submodule_of_param(gm, gate_up_w_name)
+    experts_mod, experts_path, _ = get_submodule_of_param(gm, gate_up_w_name)
 
     # New param names under experts module
     gu_blocks_name = "gate_up_proj_blocks"
@@ -207,10 +188,10 @@ def _register_mxfp4_expert_params(
     dn_blocks = torch.zeros((E, H, I_blk, 16), dtype=torch.uint8)
     dn_scales = torch.zeros((E, H, I_blk), dtype=torch.uint8)
 
-    _ensure_param(experts_mod, gu_blocks_name, gu_blocks)
-    _ensure_param(experts_mod, gu_scales_name, gu_scales)
-    _ensure_param(experts_mod, dn_blocks_name, dn_blocks)
-    _ensure_param(experts_mod, dn_scales_name, dn_scales)
+    experts_mod.register_parameter(gu_blocks_name, nn.Parameter(gu_blocks, requires_grad=False))
+    experts_mod.register_parameter(gu_scales_name, nn.Parameter(gu_scales, requires_grad=False))
+    experts_mod.register_parameter(dn_blocks_name, nn.Parameter(dn_blocks, requires_grad=False))
+    experts_mod.register_parameter(dn_scales_name, nn.Parameter(dn_scales, requires_grad=False))
 
     # Full GM attribute paths for new params
     prefix = (experts_path + ".") if experts_path else ""
@@ -225,7 +206,7 @@ def _register_mxfp4_expert_params(
 @TransformRegistry.register("quantize_mxfp4_moe")
 class InsertMXFP4MLP(BaseTransform):
     """
-    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::triton_mxfp4_mlp op,
+    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::triton_mxfp4_moe op,
     and register MXFP4 expert params (blocks + scales) on the experts module.
     """
 
@@ -300,10 +281,10 @@ class InsertMXFP4MLP(BaseTransform):
                 dn_blocks_attr = gm.graph.create_node("get_attr", dn_blocks_name)
                 dn_scales_attr = gm.graph.create_node("get_attr", dn_scales_name)
 
-            n.target = torch.ops.auto_deploy.triton_mxfp4_mlp.default
+            n.target = torch.ops.auto_deploy.triton_mxfp4_moe.default
             n.kwargs = {}
 
-            # triton_mxfp4_mlp(
+            # triton_mxfp4_moe(
             #   hidden_states,
             #   router_weight, router_bias, top_k,
             #   gate_up_blocks, gate_up_bias, gate_up_scales, alpha, limit,

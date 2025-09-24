@@ -59,7 +59,7 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
     alpha = 1.0
     limit = 1.0
 
-    ref_out = torch.ops.auto_deploy.triton_mxfp4_mlp(
+    ref_out = torch.ops.auto_deploy.triton_mxfp4_moe(
         x,
         router_weight,
         router_bias,
@@ -85,7 +85,7 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
 
     assert (gate_up_scales != 0).all() and (down_scales != 0).all(), "Zero scales on shard."
 
-    part_out = torch.ops.auto_deploy.triton_mxfp4_mlp_ep(
+    part_out = torch.ops.auto_deploy.triton_mxfp4_moe_ep(
         x,
         router_weight,
         router_bias,
@@ -111,8 +111,8 @@ def _run_mxfp4_mlp_ep_dtype_test(num_experts: int, topk: int, rank: int, world_s
     not IS_TRITON_KERNELS_AVAILABLE,
     reason="triton_kernels unavailable",
 )
-@pytest.mark.parametrize("num_experts", [32])  # TODO: include remainder case
-@pytest.mark.parametrize("topk", [8])  # must be <= num_experts
+@pytest.mark.parametrize("num_experts", [6, 8])
+@pytest.mark.parametrize("topk", [4])  # must be <= num_experts
 @pytest.mark.parametrize("device_count", get_device_counts())
 def test_mxfp4_mlp_ep_dtypes(device_count, num_experts, topk):
     if topk > num_experts:

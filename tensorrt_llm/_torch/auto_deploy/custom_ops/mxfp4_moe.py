@@ -49,10 +49,10 @@ RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, torch.Tensor, torch.Tensor
 
 def _prepare_weights_scales(
     hidden_size: int,
-    gate_up_blocks: torch.Tensor,  # [E_local, 2I, H] or [E_local, H, 2I]
-    gate_up_scales: torch.Tensor,  # broadcastable; first dim = E_local
-    down_blocks: torch.Tensor,  # [E_local, I, H] or [E_local, H, I]
-    down_scales: torch.Tensor,  # broadcastable; first dim = E_local
+    gate_up_blocks: torch.Tensor,  # [E_local, 2I, H//32, 16] in unit8
+    gate_up_scales: torch.Tensor,  # [E_local, 2I, H//32] in unit8
+    down_blocks: torch.Tensor,  # [E_local, H, I//32, 16] in uint8
+    down_scales: torch.Tensor,  # [E_local, H, I//32] in uint8
 ):
     local_experts = gate_up_blocks.size(0)
     intermediate_size = gate_up_blocks.shape[1] // 2
@@ -79,7 +79,7 @@ def _prepare_weights_scales(
 
 
 def _run_mxfp4_mlp_core(
-    hidden_states: torch.Tensor,  # [B,S,H] or [T,H]
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
     router_weight: torch.Tensor,
     router_bias: torch.Tensor,
     gate_up_blocks: torch.Tensor,
@@ -93,15 +93,14 @@ def _run_mxfp4_mlp_core(
     route_fn: RouteFn,  # injects routing variant
 ) -> torch.Tensor:
     """
-    Shared core for both triton_mxfp4_mlp and triton_mxfp4_mlp_ep.
+    Shared core for both triton_mxfp4_moe and triton_mxfp4_moe_ep.
     - route_fn encapsulates the only difference: how we produce (routing_data, gather_idx, scatter_idx).
     """
-    batch_size = hidden_states.shape[0]
+    leading_shape = hidden_states.shape[:-1]
     hidden_size = hidden_states.shape[-1]
     x = hidden_states.reshape(-1, hidden_size)
 
     router_logits = F.linear(x, router_weight, router_bias)
-
     # route (global vs EP-aware)
     with torch.cuda.device(router_logits.device):
         routing_data, gather_idx, scatter_idx = route_fn(router_logits)
@@ -149,31 +148,30 @@ def _run_mxfp4_mlp_core(
         gammas=routing_data.gate_scal,
     )
 
-    y = y.reshape(batch_size, -1, hidden_size)
+    y = y.reshape(*leading_shape, hidden_size)
     return y
 
 
-@torch.library.custom_op("auto_deploy::triton_mxfp4_mlp", mutates_args=())
-def triton_mxfp4_mlp(
-    hidden_states: torch.Tensor,  # [B, S, H] or [T, H]
+@torch.library.custom_op("auto_deploy::triton_mxfp4_moe", mutates_args=())
+def triton_mxfp4_moe(
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
     # router
     router_weight: torch.Tensor,  # [E, H]
     router_bias: torch.Tensor,  # [E]
     top_k: int,
     # gate_up path
-    gate_up_blocks: torch.Tensor,  # [E, 2I, H] or [E, H, 2I]
+    gate_up_blocks: torch.Tensor,  # [E, 2I, H//32, 16] in unit8
     gate_up_bias: torch.Tensor,  # [E, 2I]
-    gate_up_scales: torch.Tensor,  # broadcastable
+    gate_up_scales: torch.Tensor,  # [E, 2I, H//32] in unit8
     alpha: float,
     limit: float,
     # down path
-    down_blocks: torch.Tensor,  # [E, I, H] or [E, H, I]
+    down_blocks: torch.Tensor,  # [E, H, I//32, 16] in uint8
     down_bias: torch.Tensor,  # [E, H]
-    down_scales: torch.Tensor,  # broadcastable
+    down_scales: torch.Tensor,  # [E, H, I//32] in uint8
 ) -> torch.Tensor:
     def _global_route_fn(logits: torch.Tensor):
-        # identical to your previous global routing
-        return routing(logits, top_k)  # -> (routing_data, gather_idx, scatter_idx)
+        return routing(logits, top_k)
 
     return _run_mxfp4_mlp_core(
         hidden_states,
@@ -191,7 +189,7 @@ def triton_mxfp4_mlp(
     )
 
 
-@triton_mxfp4_mlp.register_fake
+@triton_mxfp4_moe.register_fake
 def _mxfp4_mlp_fake(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -209,22 +207,22 @@ def _mxfp4_mlp_fake(
     return torch.empty_like(hidden_states)
 
 
-@torch.library.custom_op("auto_deploy::triton_mxfp4_mlp_ep", mutates_args=())
-def triton_mxfp4_mlp_ep(
-    hidden_states: torch.Tensor,  # [B,S,H] or [T,H]
+@torch.library.custom_op("auto_deploy::triton_mxfp4_moe_ep", mutates_args=())
+def triton_mxfp4_moe_ep(
+    hidden_states: torch.Tensor,  # [B, S, H] or [B*S, H]
     # router (replicated across EP)
     router_weight: torch.Tensor,  # [E_total, H]
     router_bias: torch.Tensor,  # [E_total]
     top_k: int,
     # expert params (already sharded along dim 0)
-    gate_up_blocks: torch.Tensor,  # [E_local, 2I, H] or [E_local, H, 2I]
+    gate_up_blocks: torch.Tensor,  # [E_local, 2I, H//32, 16] in unit8
     gate_up_bias: torch.Tensor,  # [E_local, 2I]
-    gate_up_scales: torch.Tensor,  # first dim = E_local
+    gate_up_scales: torch.Tensor,  # [E_local, 2I, H//32] in unit8
     alpha: float,
     limit: float,
-    down_blocks: torch.Tensor,  # [E_local, I, H] or [E_local, H, I]
+    down_blocks: torch.Tensor,  # [E_local, H, I//32, 16] in uint8
     down_bias: torch.Tensor,  # [E_local, H]
-    down_scales: torch.Tensor,  # first dim = E_local
+    down_scales: torch.Tensor,  # [E_local, H, I//32] in uint8
     # EP topology
     ep_size: int,
     ep_rank: int,
@@ -250,7 +248,7 @@ def triton_mxfp4_mlp_ep(
     )
 
 
-@triton_mxfp4_mlp_ep.register_fake
+@triton_mxfp4_moe_ep.register_fake
 def _mxfp4_mlp_ep_fake(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -267,5 +265,4 @@ def _mxfp4_mlp_ep_fake(
     ep_size: int,
     ep_rank: int,
 ):
-    # Keep shapes consistent for export/fake tensor propagation.
     return torch.empty_like(hidden_states)

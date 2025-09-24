@@ -193,3 +193,20 @@ class HFQuantConfigReader(QuantConfigReader):
             return
         model.to(new_dtype)
         return model
+
+
+def autodetect_quant_config_reader(
+    fetched_dir: str,
+) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
+    """Try ModelOPT first; if not found, fall back to HF. Returns (reader, extra_kwargs) or None."""
+    reader_cls = QuantConfigReaderRegistry.get("modelopt")
+    result = reader_cls.from_file(fetched_dir)
+    # Fallback to HF reader if ModelOPT not present
+    if result is None:
+        hf_cls = QuantConfigReaderRegistry.get("hf")
+        try:
+            result = hf_cls.from_file(fetched_dir)
+        except Exception:
+            # Skip HF reader if it errors out during probing
+            result = None
+    return result
