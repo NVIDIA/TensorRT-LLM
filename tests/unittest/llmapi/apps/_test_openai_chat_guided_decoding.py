@@ -60,9 +60,188 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
-@pytest.fixture(scope="module")
-def tool_get_current_weather():
-    return {
+def test_json_schema(client: openai.OpenAI, model_name: str):
+    json_schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "pattern": "^[\\w]+$"
+            },
+            "population": {
+                "type": "integer"
+            },
+        },
+        "required": ["name", "population"],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        },
+        {
+            "role":
+            "user",
+            "content":
+            "Give me the information of the capital of France in the JSON format.",
+        },
+    ]
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "json",
+            "schema": json_schema
+        },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    jsonschema.validate(json.loads(message.content), json_schema)
+
+
+def test_json_schema_user_profile(client: openai.OpenAI, model_name: str):
+    json_schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "The full name of the user."
+            },
+            "age": {
+                "type": "integer",
+                "description": "The age of the user, in years."
+            },
+        },
+        "required": ["name", "age"],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        },
+        {
+            "role":
+            "user",
+            "content":
+            f"Give an example JSON for an employee profile that fits this schema: {json_schema}",
+        },
+    ]
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "json",
+            "schema": json_schema
+        },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    first_json = json.loads(message.content)
+    jsonschema.validate(first_json, json_schema)
+
+    messages.extend([
+        {
+            "role": "assistant",
+            "content": message.content,
+        },
+        {
+            "role": "user",
+            "content": "Give me another one with a different name and age.",
+        },
+    ])
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "json",
+            "schema": json_schema
+        },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    second_json = json.loads(message.content)
+    jsonschema.validate(second_json, json_schema)
+
+    assert (
+        first_json["name"] != second_json["name"]
+    ), "The model should have generated a different name in the second turn."
+    assert (
+        first_json["age"] != second_json["age"]
+    ), "The model should have generated a different age in the second turn."
+
+
+def test_regex(client: openai.OpenAI, model_name: str):
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        },
+        {
+            "role": "user",
+            "content": "What is the capital of France?",
+        },
+    ]
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "regex",
+            "regex": "(Paris|London)"
+        },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    assert re.match(r"(Paris|London)", message.content)
+
+
+def test_ebnf(client: openai.OpenAI, model_name: str):
+    ebnf_grammar = """
+root ::= description
+city ::= "London" | "Paris" | "Berlin" | "Rome"
+description ::= city " is " status
+status ::= "the capital of " country
+country ::= "England" | "France" | "Germany" | "Italy"
+"""
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful geography bot."
+        },
+        {
+            "role": "user",
+            "content": "Give me the information of the capital of France.",
+        },
+    ]
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "ebnf",
+            "ebnf": ebnf_grammar
+        },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    assert message.content == "Paris is the capital of France"
+
+
+def test_structural_tag(client: openai.OpenAI, model_name: str):
+    tool_get_current_weather = {
         "type": "function",
         "function": {
             "name": "get_current_weather",
@@ -94,10 +273,7 @@ def tool_get_current_weather():
         },
     }
 
-
-@pytest.fixture(scope="module")
-def tool_get_current_date():
-    return {
+    tool_get_current_date = {
         "type": "function",
         "function": {
             "name": "get_current_date",
@@ -117,11 +293,7 @@ def tool_get_current_date():
         },
     }
 
-
-def test_chat_structural_tag(client: openai.OpenAI, model_name: str,
-                             tool_get_current_weather, tool_get_current_date):
-    system_prompt = f"""
-# Tool Instructions
+    system_prompt = f"""# Tool Instructions
 - Always execute python code in messages that you share.
 - When looking for real time information use relevant functions if available else fallback to brave_search
 You have access to the following functions:
