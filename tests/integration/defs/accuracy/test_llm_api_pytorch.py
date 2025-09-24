@@ -3179,7 +3179,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3219,7 +3221,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3265,7 +3269,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 4, True, True, True),
@@ -3303,7 +3309,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3351,7 +3359,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
