@@ -283,13 +283,14 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_dummy_text(self, input_seq_len: int):
-        return self.tokenizer.decode(
-            np.random.randint(
-                low=0,
-                high=self.model_config.
-                vocab_size,  # Note: high is exclusive in NumPy
-                size=input_seq_len))
+    def get_dummy_text(self, input_seq_len: int) -> str:
+        ids = np.random.randint(
+            low=0,
+            high=int(
+                self.model_config.vocab_size),  # high is exclusive in NumPy
+            size=input_seq_len,
+        ).tolist()
+        return self.tokenizer.decode(ids, skip_special_tokens=True)
 
     def get_dummy_images(self, max_width: int, max_height: int,
                          num_images: int):
@@ -1013,7 +1014,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
         return [
             "image.pixel_values", "image.image_grid_thw",
             "video.pixel_values_videos", "video.video_grid_thw",
-            "multimodal_embedding", "mrope_config.mrope_position_ids"
+            "multimodal_embedding"
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
@@ -1066,12 +1067,12 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
             return [
                 "image.pixel_values", "video.pixel_values_videos",
                 "image.image_grid_thw", "video.video_grid_thw",
-                "multimodal_embedding", "mrope_config.mrope_position_ids"
+                "multimodal_embedding"
             ]
         else:
             return [
                 "image.pixel_values", "video.pixel_values_videos",
-                "multimodal_embedding", "mrope_config.mrope_position_ids"
+                "multimodal_embedding"
             ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
