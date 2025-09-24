@@ -709,7 +709,7 @@ private:
     // e.g. 16 nvfp4 elements are packed into a single int64 element
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
-    WorkspaceInfo workspace_info;
+    std::map<cudaStream_t, WorkspaceInfo> mStreamWorkspaces;
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
@@ -766,6 +766,7 @@ private:
             experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
+        auto& workspace_info = mStreamWorkspaces[stream];
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
 
