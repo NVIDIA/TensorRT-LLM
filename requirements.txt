@@ -34,7 +34,7 @@ nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu12
 # nvidia-cuda-nvrtc-cu12  # <For CUDA 12.9>
 nvidia-cuda-nvrtc
-transformers==4.55.0
+transformers==4.56.0
 prometheus_client
 prometheus_fastapi_instrumentator
 pydantic>=2.9.1
@@ -56,10 +56,11 @@ uvicorn
 setuptools<80
 ordered-set
 peft
+patchelf==0.18.0
 einops
 flashinfer-python>=0.3.0
 opencv-python-headless
-xgrammar==0.1.21
+xgrammar==0.1.25
 llguidance==0.7.29
 jsonschema
 backoff

@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 from torch import nn
@@ -23,7 +23,7 @@ from ..modules.embedding import Embedding
 # isort: off
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 TRTLLMGenFusedMoE, create_moe)
+                                 create_moe)
 from ..modules.fused_moe.routing import (get_cached_perfect_router_logits,
                                          precompute_common_perfect_router_logits
                                          )
@@ -151,7 +151,10 @@ class MLPBlock(torch.nn.Module):
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(
-            top_k=pretrained_config.num_experts_per_tok)
+            top_k=pretrained_config.num_experts_per_tok,
+            output_dtype=torch.bfloat16
+            if config.moe_backend.upper() == "TRTLLM" else torch.float32)
+
         self.swiglu_alpha = torch.tensor(
             [1.702] * (self.num_experts // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
@@ -260,7 +263,7 @@ class MLPBlock(torch.nn.Module):
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
-            if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
+            if (isinstance(self.experts, (TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
 
         g = self.gate(t)
@@ -273,7 +276,7 @@ class MLPBlock(torch.nn.Module):
             g = self._create_ideal_expert_load_balanced_logits(
                 num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
-        # Let CutlassFusedMoE handle allgather internally
+        # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
         # Pass the normalized tensor (t) as input to experts, not x
         expert_output = self.experts(x=t,
                                      router_logits=g,
@@ -498,7 +501,6 @@ class Transformer(DecoderModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -515,7 +517,6 @@ class Transformer(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
-                mrope_config=mrope_config,
                 spec_metadata=spec_metadata,
             )
 

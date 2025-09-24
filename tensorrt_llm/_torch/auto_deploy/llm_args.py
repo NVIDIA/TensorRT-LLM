@@ -105,12 +105,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="Disable the overlap scheduler in trtllm runtime",
     )
 
-    enable_mixed_sampler: bool = Field(
-        default=False,
-        description="If true, will iterate over sampling_params of each request and use the corresponding "
-        "sampling strategy, e.g. top-k, top-p, etc.",
-    )
-
     world_size: int = Field(
         default=1,
         ge=0,

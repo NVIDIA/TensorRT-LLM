@@ -6,7 +6,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -226,19 +226,9 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
-@pytest.mark.parametrize(
-    "enable_mixed_sampler,enable_logprobs",
-    [
-        (False, False),  # Fast path: no mixed sampler, no logits, greedy
-        (True,
-         False),  # Batched strategy path: mixed sampler enabled, same strategy
-        (False,
-         True),  # Per-request path: mixed sampler disabled, logprobs enabled
-    ])
 @pytest.mark.part0
-def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
-                                                      enable_logprobs):
-    """Test embedding bias application in all 3 TorchSampler paths: fast, batched strategy, and per-request"""
+def test_embedding_bias_with_torch_sampler_strategies():
+    """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     vocab_size_padded = 32000
@@ -250,17 +240,17 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
         "embedding_bias": embedding_bias,
     }
 
-    if enable_logprobs:
-        sampling_kwargs["logprobs"] = 1
     # All test cases use greedy sampling for simplicity
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
-    llm_test_harness(llama_model_path,
-                     prompts, ["Z Z Z Z Z Z"],
-                     sampling_params=sampling_params,
-                     backend="pytorch",
-                     enable_mixed_sampler=enable_mixed_sampler)
+    llm_test_harness(
+        llama_model_path,
+        prompts,
+        ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        backend="pytorch",
+    )
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
@@ -861,15 +851,29 @@ def test_llm_with_proxy_error():
 
 
 @pytest.mark.part0
-@pytest.mark.xfail(reason="https://nvbugs/5513423")
-def test_min_tokens():
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_min_tokens(use_speculative: bool):
     """Check min_tokens is respected."""
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=global_kvcache_config,
-              enable_mixed_sampler=True,
-              max_seq_len=20000)
+    llm_common_config = dict(
+        model=llama_model_path,
+        max_batch_size=2,
+        kv_cache_config=global_kvcache_config,
+        max_num_tokens=2048,
+    )
 
-    output_len = 5000
+    if use_speculative:
+        spec_config = NGramDecodingConfig(
+            max_draft_len=4,
+            max_matching_ngram_size=2,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=True,
+        )
+        llm = LLM(**llm_common_config, speculative_config=spec_config)
+    else:
+        llm = LLM(**llm_common_config)
+
+    output_len = 2000
     sampling_params = SamplingParams(max_tokens=output_len,
                                      min_tokens=output_len,
                                      temperature=1)
