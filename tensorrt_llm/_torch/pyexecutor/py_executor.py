@@ -1155,6 +1155,9 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
+                # In gen-only benchmarking mode, wait until the number of scheduled generation
+                # requests reaches the required threshold before starting forward pass,
+                # to ensure consistent batch sizes for accurate performance measurement.
                 if not self.is_warmup and not can_forward:
                     if self.enable_attention_dp:
                         local_can_forward = self.executor_request_queue.num_fetch_requests + \
@@ -1176,7 +1179,7 @@ class PyExecutor:
                                ) < self.benchmark_req_queues_size:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {len(scheduled_batch.generation_requests)}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                    f"sleep 10 seconds, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
                                 )
                             time.sleep(10)
                             continue
