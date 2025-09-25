@@ -8,6 +8,7 @@ from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
 from .modeling_gpt_oss import GptOssForCausalLM
+from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
@@ -26,6 +27,7 @@ from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
+from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
@@ -40,6 +42,7 @@ __all__ = [
     "Gemma3ForCausalLM",
     "Gemma3VLM",
     "HCXVisionForCausalLM",
+    "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
@@ -64,6 +67,7 @@ __all__ = [
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
     "GptOssForCausalLM",
+    "SeedOssForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":

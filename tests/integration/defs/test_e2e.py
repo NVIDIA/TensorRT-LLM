@@ -1677,20 +1677,12 @@ def test_openai_mmencoder_example(llm_root, llm_venv):
          str(test_root / "_test_openai_mmencoder.py")])
 
 
-def test_openai_chat_structural_tag_example(llm_venv):
+def test_openai_chat_guided_decoding(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_chat_structural_tag.py")
+        str(test_root / "_test_openai_chat_guided_decoding.py")
     ])
-
-
-def test_openai_chat_json_example(llm_venv):
-    test_root = unittest_path() / "llmapi" / "apps"
-
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_chat_json.py")])
 
 
 @pytest.mark.skip_less_device(2)
@@ -1767,6 +1759,22 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
     ])
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(40000)
+@pytest.mark.parametrize("gen_config", ["gen_tp2pp1", "gen_tp1pp2"])
+@pytest.mark.parametrize("ctx_config", ["ctx_tp2pp1", "ctx_tp1pp2"])
+def test_openai_disagg_multi_nodes_completion(llm_root, llm_venv, ctx_config,
+                                              gen_config):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root /
+            f"_test_disagg_serving_multi_nodes.py::test_completion[{ctx_config}-{gen_config}]"
+            ),
+    ])
+
+
 ### PyTorch examples
 
 
@@ -1836,6 +1844,14 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Qwen3-30B-A3B',
                  'Qwen3/Qwen3-30B-A3B',
                  marks=pytest.mark.skip_less_device_memory(80000)),
+    pytest.param(
+        'Qwen3-30B-A3B_fp8_hf',
+        'Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf',
+        marks=(skip_pre_hopper, pytest.mark.skip_less_device_memory(40000))),
+    pytest.param(
+        'Qwen3-30B-A3B_nvfp4_hf',
+        'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
+        marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
     pytest.param('Llama3.3-70B-FP8',
                  'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
                  marks=skip_pre_blackwell),

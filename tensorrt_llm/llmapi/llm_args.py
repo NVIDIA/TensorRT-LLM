@@ -356,7 +356,11 @@ class DecodingBaseConfig(StrictBaseModel):
     # When specified, speculation will be disabled at batch sizes above
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
+
     load_format: Optional[str] = None
+
+    # If set, drafting uses greedy sampling, irrespective of sampling parameters.
+    _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -2170,17 +2174,11 @@ class TorchLlmArgs(BaseLlmArgs):
                               description="Attention backend to use.",
                               status="beta")
 
-    enable_mixed_sampler: bool = Field(
-        default=False,
-        description=
-        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
-        status="beta")
-
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
-        status="prototype")
+        status="beta")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
@@ -2207,6 +2205,18 @@ class TorchLlmArgs(BaseLlmArgs):
         default=0,
         description=
         "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
+        status="prototype")
+
+    batch_wait_timeout_iters: int = Field(
+        default=0,
+        description=
+        "Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays.",
+        status="prototype")
+
+    batch_wait_max_tokens_ratio: float = Field(
+        default=0,
+        description=
+        "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays.",
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
@@ -2482,6 +2492,31 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError("batch_wait_timeout_ms must be greater than 0")
         return self
 
+    @model_validator(mode='after')
+    def validate_batch_wait_timeout_iters(self) -> 'TorchLlmArgs':
+        if self.batch_wait_timeout_iters < 0:
+            raise ValueError(
+                f"batch_wait_timeout_iters must be >= 0, got {self.batch_wait_timeout_iters}"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_batch_wait_max_tokens_ratio(self) -> 'TorchLlmArgs':
+        if self.batch_wait_max_tokens_ratio < 0 or self.batch_wait_max_tokens_ratio > 1:
+            raise ValueError(
+                f"batch_wait_max_tokens_ratio must be in range [0, 1], got {self.batch_wait_max_tokens_ratio}"
+            )
+        return self
+
+    def get_executor_config(
+        self,
+        _hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+    ) -> _ExecutorConfig:
+        executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
+        executor_config.mm_encoder_only = self.mm_encoder_only
+        return executor_config
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2503,7 +2538,6 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
-            enable_mixed_sampler=self.enable_mixed_sampler,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
@@ -2548,7 +2582,10 @@ class TorchLlmArgs(BaseLlmArgs):
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
             AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            batch_wait_timeout_iters=self.batch_wait_timeout_iters,
+            batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
+        )
 
 
 def update_llm_args_with_extra_dict(
@@ -2580,6 +2617,22 @@ def update_llm_args_with_extra_dict(
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
+
+    # For trtllm-bench or trtllm-serve, build_config may be passed for the PyTorch
+    # backend, overwriting the knobs there since build_config always has the highest priority
+    if "build_config" in llm_args:
+        for key in [
+                "max_batch_size",
+                "max_num_tokens",
+                "max_beam_width",
+                "max_seq_len",
+        ]:
+            if key in llm_args_dict:
+                logger.info(
+                    f"Overriding {key} from build_config to {llm_args_dict[key]}"
+                )
+                setattr(llm_args["build_config"], key, llm_args_dict[key])
+
     return llm_args
 
 

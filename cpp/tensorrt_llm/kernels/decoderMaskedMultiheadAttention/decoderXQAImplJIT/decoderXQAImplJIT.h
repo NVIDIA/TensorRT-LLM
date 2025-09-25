@@ -50,6 +50,9 @@ private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     std::shared_ptr<DecoderXQARunnerResource> mResource;
 
+    //! Whether DecoderXQAImplJIT needs to compile 2 sets (tilesize = 16, 32) kernels for spec-dec
+    bool needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const;
+
     //! Whether DecoderXQAImplJIT supports xqaParams.
     bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
     //! Whether DecoderXQAImplJIT has perf gain over the default (non-XQA-optimized) implementation.
