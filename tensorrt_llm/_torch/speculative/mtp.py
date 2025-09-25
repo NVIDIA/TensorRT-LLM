@@ -250,7 +250,7 @@ class MTPSampler(TorchSampler):
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens
+        new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = self.BEAM
@@ -513,7 +513,7 @@ class MTPWorker(nn.Module):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn metadata
-        if attn_metadata.is_cuda_graph and attn_metadata is not None:
+        if attn_metadata is not None:
             self.restore_attn_metadata(attn_metadata=attn_metadata)
 
         # prepare next new tokens to support overlap scheduler

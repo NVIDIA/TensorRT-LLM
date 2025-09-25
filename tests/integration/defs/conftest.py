@@ -75,11 +75,20 @@ def wget(url, out):
 
 
 def llm_models_root() -> str:
-    """return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path"""
-    DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
-    LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
+    """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
 
-    return LLM_MODELS_ROOT
+    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    assert root.exists(), (
+        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
+    )
+
+    return str(root)
 
 
 def tests_path() -> Path:
@@ -141,14 +150,13 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
 
         @wraps(f)
         def decorated(*args, **kwargs):
-            if llm_models_root() is not None:
-                cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
-                if os.path.exists(cached_dir):
-                    return cached_dir
-                elif fail_if_path_is_invalid:
-                    assert (
-                        False
-                    ), f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
+            cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
+            if os.path.exists(cached_dir):
+                return cached_dir
+            elif fail_if_path_is_invalid:
+                assert (
+                    False
+                ), f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
             return f(*args, **kwargs)
 
         return decorated
@@ -284,35 +292,11 @@ def gemma_example_root(llm_root, llm_venv):
     "Get gemma example root"
 
     example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
-    # https://nvbugs/4559583 Jax dependency broke the entire pipeline in TRT container
-    # due to the dependency incompatibility with torch, which forced reinstall everything
-    # and caused pipeline to fail. We manually install gemma dependency as a WAR.
-    llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
-    # Install Jax because it breaks dependency
-    google_extension = [
-        "-f",
-        "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
-    ]
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
 
-    # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
-    # "jax[cuda12_pip]~=0.4.19" specifies "nvidia-cudnn-cu12>=8.9" but actually requires "nvidia-cudnn-cu12~=8.9".
-    if "x86_64" in platform.machine():
-        llm_venv.run_cmd(["-m", "pip", "install", "nvidia-cudnn-cu12~=8.9"])
-
-    if "Windows" in platform.system():
-        llm_venv.run_cmd([
-            "-m", "pip", "install", "jax~=0.4.19", "jaxlib~=0.4.19", "--no-deps"
-        ] + google_extension)
-    else:
-        llm_venv.run_cmd([
-            "-m",
-            "pip",
-            "install",
-            "jax[cuda12_pip]~=0.4.19",
-            "jaxlib[cuda12_pip]~=0.4.19",
-            "--no-deps",
-        ] + google_extension)
-    llm_venv.run_cmd(["-m", "pip", "install", "flax~=0.8.0"])
     return example_root
 
 

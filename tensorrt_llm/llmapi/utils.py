@@ -355,9 +355,26 @@ class AsyncQueue:
         if self._tainted:
             raise AsyncQueue.MixedSyncAsyncAPIError()
 
-        if timeout is None or timeout > 0:
-            # This may raise asyncio.TimeoutError
-            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        # Blocking path: timeout is None (wait indefinitely)
+        if timeout is None:
+            # Wait indefinitely until the queue is non-empty.
+            # It is necessary to check if the queue is empty after waking.
+            # Because multiple waiting coroutines may be awakened simultaneously when a new item entries empty queue.
+            # These coroutines will all pop this item from queue, and then raise IndexError.
+            while not self._q:
+                await self._event.wait()
+        # Blocking path: timeout > 0 (timed wait, retry with remaining time).
+        elif timeout > 0:
+            # Compute the deadline; if the queue is still empty after waking, continue waiting for the remaining time.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while not self._q:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                # This may raise asyncio.TimeoutError.
+                await asyncio.wait_for(self._event.wait(), timeout=remaining)
+        # Non-blocking path: timeout <= 0.
         elif not self._q:
             raise asyncio.QueueEmpty()
 
@@ -520,6 +537,9 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         arg_line = f"{indent}    {field_name} ({type_str}): "
         if status := field_info.get("status", None):
             arg_line += f":tag:`{status}` "
+        elif LABEL_STABLE_APIS:
+            arg_line += f":tag:`stable` "
+
         if field_description:
             arg_line += field_description.split('\n')[0]  # First line with type
 
@@ -551,6 +571,10 @@ def get_type_repr(cls):
     if module_name == 'builtins':  # Special case for built-in types
         return cls.__qualname__
     return f"{module_name}.{cls.__qualname__}"
+
+
+LABEL_STABLE_APIS: bool = True
+""" Whether to label the stable APIs with `stable` tags. """
 
 
 class ApiParamTagger:

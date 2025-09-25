@@ -7,13 +7,14 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
+import transformers
 from tqdm import tqdm
 
-from .._utils import (global_mpi_rank, mpi_barrier, mpi_broadcast, mpi_rank,
-                      release_gc)
+from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
+                      mpi_broadcast, mpi_rank, release_gc)
 from ..auto_parallel import AutoParallelConfig
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
@@ -588,6 +589,32 @@ class ModelLoader:
             logger.warning(f"Failed to load tokenizer from {model_dir}")
             return None
 
+    @staticmethod
+    def load_hf_generation_config(
+            model_dir, **kwargs) -> Optional[transformers.GenerationConfig]:
+        try:
+            return transformers.GenerationConfig.from_pretrained(
+                model_dir, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf generation config from {model_dir}, encounter error: {e}"
+            )
+            return None
+
+    @staticmethod
+    def load_hf_model_config(
+            model_dir,
+            trust_remote_code: bool = True,
+            **kwargs) -> Optional[transformers.PretrainedConfig]:
+        try:
+            return transformers.PretrainedConfig.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf model config from {model_dir}, encounter error: {e}"
+            )
+            return None
+
 
 class CachedModelLoader:
     '''
@@ -616,6 +643,17 @@ class CachedModelLoader:
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
 
+    def _submit_to_all_workers(
+        self,
+        task: Callable[..., Any],
+        *args,
+        **kwargs,
+    ) -> List[Any]:
+        if self.llm_args.parallel_config.is_multi_gpu:
+            return self.mpi_session.submit_sync(task, *args, **kwargs)
+        else:
+            return [task(*args, **kwargs)]
+
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
@@ -636,9 +674,11 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                self._hf_model_dir = download_hf_model(
-                    self.model_loader.model_obj.model_name,
-                    self.llm_args.revision)
+                hf_model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=self.model_loader.model_obj.model_name,
+                    revision=self.llm_args.revision)
+                self._hf_model_dir = hf_model_dirs[0]
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
@@ -814,6 +854,17 @@ class CachedModelLoader:
             build_task(self.get_engine_dir())
 
         return self.get_engine_dir()
+
+    @print_traceback_on_error
+    @staticmethod
+    def _node_download_hf_model(
+        model: str,
+        revision: Optional[str] = None,
+    ) -> Optional[Path]:
+        if local_mpi_rank() == 0:
+            return download_hf_model(model, revision)
+        else:
+            return None
 
     @print_traceback_on_error
     @staticmethod

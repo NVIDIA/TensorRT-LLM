@@ -452,7 +452,7 @@ def chat_harmony_streaming_post_processor(
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
-        outputs=rsp.outputs,
+        result=rsp,
         model=args.model,
         request_id=args.request_id,
         done=rsp._done,

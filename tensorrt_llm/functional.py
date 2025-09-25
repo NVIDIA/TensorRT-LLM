@@ -5358,7 +5358,7 @@ def gpt_attention(
             An INT32 tensor of shape [1].
             by default, the max_attention_window_size is determined by the shape of cache_indir_table.
             And we support independent max_attention_window_size for each layer.
-            This controls the sliding-window-attention/cyclic-kv-cache features.
+            This controls the sliding-window-attention kv-cache features.
 
         context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape

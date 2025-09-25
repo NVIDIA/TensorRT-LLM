@@ -183,15 +183,19 @@ class BaseMoeRoutingMethod(nn.Module):
 
 class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
 
-    def __init__(self, top_k: int, force_enable_pytorch_op: bool = False):
+    def __init__(self,
+                 top_k: int,
+                 output_dtype: torch.dtype = torch.float32,
+                 force_enable_pytorch_op: bool = False):
         super().__init__()
         self.top_k = top_k
         self.force_enable_pytorch_op = force_enable_pytorch_op
+        self.output_dtype = output_dtype
 
     def apply_pytorch(
             self, router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         topk_values, topk_indices = torch.topk(torch.nn.functional.softmax(
-            router_logits.float(), dim=-1),
+            router_logits.to(self.output_dtype), dim=-1),
                                                k=self.top_k,
                                                dim=-1)
         return topk_indices.to(torch.int32), topk_values
@@ -203,7 +207,7 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
             return self.apply_pytorch(router_logits)
         else:
             return torch.ops.trtllm.default_moe_routing_op(
-                router_logits, self.top_k)
+                router_logits, self.top_k, self.output_dtype)
 
     @property
     def routing_method_type(self):
@@ -228,11 +232,13 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
     def __init__(
         self,
         top_k: int,
+        output_dtype: torch.dtype = torch.float32,
         force_enable_pytorch_op: bool = False,
     ):
         super().__init__()
         self.top_k = top_k
         self.force_enable_pytorch_op = force_enable_pytorch_op
+        self.output_dtype = output_dtype
 
     def apply_pytorch(
             self, router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -240,7 +246,7 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
                                                k=self.top_k,
                                                dim=-1)
         return topk_indices.to(torch.int32), torch.nn.functional.softmax(
-            topk_values.float(), dim=-1)
+            topk_values.to(self.output_dtype), dim=-1)
 
     def apply(self,
               router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -249,7 +255,7 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
             return self.apply_pytorch(router_logits)
         else:
             return torch.ops.trtllm.renorm_moe_routing_op(
-                router_logits, self.top_k)
+                router_logits, self.top_k, self.output_dtype)
 
     @property
     def routing_method_type(self):
@@ -258,16 +264,18 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
 
 class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
 
-    def __init__(self, top_k: int):
+    def __init__(self, top_k: int, output_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.top_k = top_k
+        self.output_dtype = output_dtype
 
     def apply(self,
               router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         topk_values, topk_indices = torch.topk(router_logits,
                                                k=self.top_k,
                                                dim=-1)
-        return topk_indices.to(torch.int32), torch.sigmoid(topk_values.float())
+        return topk_indices.to(torch.int32), torch.sigmoid(
+            topk_values.float()).to(self.output_dtype)
 
     @property
     def routing_method_type(self):
@@ -396,15 +404,16 @@ class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
 
 class RenormalizeNaiveMoeRoutingMethod(RenormalizeMoeRoutingMethod):
 
-    def __init__(self, top_k: int):
-        super().__init__()
+    def __init__(self, top_k: int, output_dtype: torch.dtype = torch.float32):
+        super().__init__(top_k, output_dtype)
         self.top_k = top_k
+        self.output_dtype = output_dtype
 
     def apply(self,
               router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         #x = topk(softmax()); x /= x.sum() is mathematically equivalent to softmax(topk)
         topk_indices, topk_values = self.apply_pytorch(router_logits)
-        return topk_indices.to(torch.int32), topk_values
+        return topk_indices.to(torch.int32), topk_values.to(self.output_dtype)
 
     @property
     def routing_method_type(self) -> RoutingMethodType:

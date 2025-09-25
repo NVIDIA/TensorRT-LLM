@@ -44,7 +44,7 @@ from .handle_logits import HandleLogits
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse)
+                          LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
@@ -190,6 +190,7 @@ class PyExecutor:
         self.active = True
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
+        self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
@@ -198,6 +199,10 @@ class PyExecutor:
         self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
         self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
         self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
+        self.batch_wait_timeout_iters = model_engine.pytorch_backend_config.batch_wait_timeout_iters
+        self.batch_wait_max_tokens_ratio = model_engine.pytorch_backend_config.batch_wait_max_tokens_ratio
+        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
+
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -244,6 +249,7 @@ class PyExecutor:
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
+        self.batch_wait_iters_count = 0
 
         # request fetcher initialization
         self.executor_request_queue = ExecutorRequestQueue(
@@ -968,10 +974,21 @@ class PyExecutor:
                 self.model_engine.spec_config.max_draft_len)
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
+            # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
+            for request in self.active_requests:
+                if request.state not in (
+                        LlmRequestState.GENERATION_IN_PROGRESS,
+                        LlmRequestState.DISAGG_GENERATION_INIT):
+                    continue
+                max_draft_len = self.model_engine.spec_config.max_draft_len
+                request.draft_tokens = [
+                    0
+                ] * max_draft_len if max_draft_len > 0 else []
+
             # When overlap scheduler is enabled, and we already prepared the draft tokens in the previous batch,
             # we don't need to initialize py_draft_tokens at this stage because we haven't append the accepted tokens to the request yet.
             if not self.has_previous_draft_tokens:
-                # If speculation is off, this function sets py_draft_tokens to None
+                # If speculation is off, this function sets py_draft_tokens to []
                 # for all active requests. If it's on, we initialize py_draft_tokens
                 # with dummy draft tokens to make the scheduler aware of the fact
                 # that speculation is about to happen.
@@ -1130,7 +1147,7 @@ class PyExecutor:
                     req.py_draft_tokens = [0] * max_draft_len
                     req.py_draft_pages_allocated = max_draft_len
                 else:
-                    req.py_draft_tokens = None
+                    req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0
 
         except Exception as e:
@@ -1198,13 +1215,18 @@ class PyExecutor:
                     previous_tensors = self.previous_batch and self.previous_batch.sample_state
                     target_inputs = None
                     draft_outputs = None
-                    if self.drafter is not None and self.use_spec_decode:
+                    # If there are previous draft tokens, we need to update the target requests to accept some draft tokens.
+                    # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
+                    # so we'll set the target model's input to None and skip updating the target requests after target model forward.
+                    use_previous_draft_tokens = self.has_previous_draft_tokens
+                    if self.drafter is not None and (self.use_spec_decode or
+                                                     use_previous_draft_tokens):
                         target_inputs, draft_outputs, draft_batch = self._handle_speculative_decoding(
                             scheduled_batch, previous_tensors)
 
                     # Use the draft_model's outputs if we've launched the draft model.
                     # Otherwise, use the previous batch's outputs.
-                    if target_inputs is not None:
+                    if target_inputs is not None or use_previous_draft_tokens:
                         previous_tensors_device = target_inputs
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
@@ -1215,7 +1237,7 @@ class PyExecutor:
                     if target_inputs is not None:
                         self._process_draft_results(scheduled_batch,
                                                     draft_outputs, draft_batch)
-                    elif self.previous_batch is not None:
+                    elif self.previous_batch is not None and not use_previous_draft_tokens:
                         self._update_requests(self.previous_batch.sample_state)
 
                     if self.guided_decoder is not None:
@@ -1392,6 +1414,27 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    def _waiting_requests(self, context_requests: list[LlmRequest],
+                          generation_requests: list[LlmRequest]):
+        if not self.enable_batch_waiting:
+            return context_requests
+
+        waited_context_requests = []
+        stop_waiting = False
+        num_scheduled_ctx_tokens = sum(
+            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
+        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                                       for gen_req in generation_requests)
+        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
+        stop_waiting = self.batch_wait_iters_count >= self.batch_wait_timeout_iters or num_scheduled_tokens >= self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        if stop_waiting:
+            waited_context_requests = context_requests
+            self.batch_wait_iters_count = 0
+        else:
+            self.batch_wait_iters_count += 1
+        return waited_context_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
@@ -1399,6 +1442,14 @@ class PyExecutor:
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
+                scheduler_output.context_requests,
+                scheduler_output.generation_requests)
+
+        # if no generation requests, no need to wait, to avoid dead waiting
+        if not self.enable_attention_dp and self.enable_batch_waiting and len(
+                scheduler_output.context_requests) > 0 and len(
+                    scheduler_output.generation_requests) > 0:
+            scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
@@ -1850,7 +1901,8 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens
+            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
+                request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
             if request.return_perf_metrics:
@@ -1969,19 +2021,21 @@ class PyExecutor:
             self.inflight_req_ids.erase(req.request_id)
 
     def _handle_speculative_decoding(self, scheduled_batch, previous_tensors):
-        with request_context(is_draft=True, scheduled_requests=scheduled_batch):
+        with request_context(is_draft=self.draft_model_engine is not None,
+                             scheduled_requests=scheduled_batch):
             # Do an early checking to see if we need to forward the draft model.
             # If needed, the overlap should happen between the target requests and the draft requests.
             # Otherwise, we can still do overlap between the previous target requests and the current target requests.
             has_draft_batch = (
-                self.previous_batch is not None
+                self.previous_batch is not None and self.use_spec_decode
                 and self.drafter.should_forward_draft_model(scheduled_batch))
 
-            if has_draft_batch:
+            if has_draft_batch or self.has_previous_draft_tokens:
                 self._update_requests(self.previous_batch.sample_state)
                 if self.has_previous_draft_tokens:
                     self._prepare_draft_requests()
 
+            if has_draft_batch:
                 target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None)
@@ -1998,26 +2052,27 @@ class PyExecutor:
         """
         Append the draft tokens to the target requests, and clean up the draft resources.
         """
-        req_id_to_old_request = {
-            req.py_request_id: req
-            for req in scheduled_batch.all_requests()
-        }
+        with request_context(is_draft=self.draft_model_engine is not None,
+                             scheduled_requests=scheduled_batch):
+            req_id_to_old_request = {
+                req.py_request_id: req
+                for req in scheduled_batch.all_requests()
+            }
 
-        if self.drafter.use_static_draft_loop:
-            self.drafter.process_static_draft_outputs(draft_outputs,
-                                                      draft_batch,
-                                                      req_id_to_old_request)
-        elif draft_outputs is not None:
-            self.drafter.process_dynamic_draft_outputs(draft_outputs,
-                                                       req_id_to_old_request)
+            if self.drafter.use_static_draft_loop:
+                self.drafter.process_static_draft_outputs(
+                    draft_outputs, draft_batch, req_id_to_old_request)
+            elif draft_outputs is not None:
+                self.drafter.process_dynamic_draft_outputs(
+                    draft_outputs, req_id_to_old_request)
 
-        # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
-        self.drafter.pad_draft_tokens_for_cuda_graph(scheduled_batch)
-        # add_batch must be called again to restore to target requests with updated draft tokens.
-        if self.guided_decoder is not None:
-            self.guided_decoder.add_batch(scheduled_batch)
-            if hasattr(self.drafter, "guided_decoder"):
-                self.guided_decoder.rollback_draft_tokens()
+            # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
+            self.drafter.pad_draft_tokens_for_cuda_graph(scheduled_batch)
+            # add_batch must be called again to restore to target requests with updated draft tokens.
+            if self.guided_decoder is not None:
+                self.guided_decoder.add_batch(scheduled_batch)
+                if hasattr(self.drafter, "guided_decoder"):
+                    self.guided_decoder.rollback_draft_tokens()
 
 
 class DisaggPPTerminationHandler:

@@ -111,10 +111,6 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
-      enable_mixed_sampler:
-        annotation: bool
-        default: False
-        status: beta
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
@@ -128,6 +124,14 @@ methods:
         default: False
         status: prototype
       batch_wait_timeout_ms:
+        annotation: float
+        default: 0
+        status: prototype
+      batch_wait_timeout_iters:
+        annotation: int
+        default: 0
+        status: prototype
+      batch_wait_max_tokens_ratio:
         annotation: float
         default: 0
         status: prototype

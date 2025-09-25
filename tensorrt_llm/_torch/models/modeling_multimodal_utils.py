@@ -150,6 +150,13 @@ def get_multimodal_embeddings(
                                      encoder_outputs)
 
     # Step 4: Gather all embeddings for the batch
+    for param in multimodal_params:
+        # concatenate if embeds is a list of tensors
+        embeds = param.multimodal_data.get("multimodal_embedding")
+        if isinstance(embeds, list):
+            param.multimodal_data["multimodal_embedding"] = torch.cat(embeds,
+                                                                      dim=0)
+
     all_embeddings = torch.cat([
         param.multimodal_data["multimodal_embedding"]
         for param in multimodal_params

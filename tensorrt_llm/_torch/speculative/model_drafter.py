@@ -12,14 +12,14 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
-from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
-                                  TorchSampler)
+from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from .drafter import Drafter
 
 if TYPE_CHECKING:
+    from ...llmapi.llm_args import DecodingBaseConfig
     from ..pyexecutor.model_engine import ModelEngine
     from .interface import SpeculativeDecodingMode
 
@@ -56,7 +56,7 @@ class ModelDrafter(Drafter):
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
         if max_draft_tokens < 0:
-            raise ValueError(f"max_draft_tokens must be >= 0")
+            raise ValueError("max_draft_tokens must be >= 0")
 
         # Model and resource management
         self.draft_model_engine = draft_model_engine
@@ -68,30 +68,32 @@ class ModelDrafter(Drafter):
         self.max_draft_tokens = max_draft_tokens
         # Sampling
         self.sampler = sampler
-        self._request_draft_logits = False
-        if isinstance(sampler, TorchSampler):
-            self._request_draft_logits = sampler.enable_mixed_sampler
         self.guided_decoder = guided_decoder
 
         self.use_static_draft_loop = draft_model_engine.model_is_wrapped
         if self.use_static_draft_loop:
             # TODO: enable sampling/guided decoding on static draft loop
             assert guided_decoder is None
-            assert not sampler.enable_mixed_sampler
+            assert spec_config._allow_greedy_draft_tokens
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
         """Create a draft request with common parameters."""
-        return LlmRequest(input_tokens=input_tokens,
-                          request_id=request.py_request_id,
-                          max_new_tokens=request.py_max_new_tokens,
-                          sampling_config=request.sampling_config,
-                          guided_decoding_params=request.guided_decoding_params,
-                          target_seq_slot=request.py_seq_slot,
-                          return_perf_metrics=request.return_perf_metrics,
-                          is_streaming=False,
-                          is_draft=True,
-                          return_generation_logits=self._request_draft_logits)
+        return LlmRequest(
+            input_tokens=input_tokens,
+            request_id=request.py_request_id,
+            max_new_tokens=request.py_max_new_tokens,
+            sampling_config=request.sampling_config,
+            guided_decoding_params=request.guided_decoding_params,
+            target_seq_slot=request.py_seq_slot,
+            return_perf_metrics=request.return_perf_metrics,
+            is_streaming=False,
+            exclude_last_generation_logits=
+            True,  # prepare_draft_tokens uses overlap scheduling
+            is_draft=True,
+            # NB: self.sampler is shared with PyExecutor
+            return_generation_logits=self.sampler.should_provide_draft_probs(
+                request))
 
     def _initialize_draft_tokens(self, request: LlmRequest) -> Tuple[int, int]:
         """Initialize draft token tracking for a request."""
@@ -285,23 +287,20 @@ class ModelDrafter(Drafter):
                      outputs: Dict[str, Any]) -> Optional[SampleState]:
         """Sample tokens from draft model outputs."""
         try:
-            if self.sampler is not None:
-                num_context_logits_prefix_sum = [0]
-                prefix_sum = 0
-                for request in draft_batch.context_requests:
-                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
-                    num_context_logits_prefix_sum.append(prefix_sum)
+            num_context_logits_prefix_sum = [0]
+            prefix_sum = 0
+            for request in draft_batch.context_requests:
+                prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                num_context_logits_prefix_sum.append(prefix_sum)
 
-                HandleLogits()(
-                    draft_batch.context_requests,
-                    draft_batch.generation_requests, outputs["logits"],
-                    self.sampler.beam_width(draft_batch.all_requests()),
-                    num_context_logits_prefix_sum,
-                    self.sampler.is_generation_model())
+            HandleLogits()(draft_batch.context_requests,
+                           draft_batch.generation_requests, outputs["logits"],
+                           self.sampler.beam_width(draft_batch.all_requests()),
+                           num_context_logits_prefix_sum,
+                           self.sampler.is_generation_model())
 
-                return self.sampler.sample_async(draft_batch, outputs,
-                                                 num_context_logits_prefix_sum)
-            return None
+            return self.sampler.sample_async(draft_batch, outputs,
+                                             num_context_logits_prefix_sum)
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")
             return None
@@ -317,8 +316,7 @@ class ModelDrafter(Drafter):
 
     def update_requests(self, sample_state: SampleState) -> None:
         """Update requests with sample state."""
-        if self.sampler is not None:
-            self.sampler.update_requests(sample_state)
+        self.sampler.update_requests(sample_state)
 
     def process_decoded_tokens(
             self, draft_batch: ScheduledRequests,
@@ -334,8 +332,7 @@ class ModelDrafter(Drafter):
                 continue
 
             target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
-            if self._request_draft_logits:
-                target_model_req.py_draft_logits = req.py_result.generation_logits
+            target_model_req.py_draft_logits = req.py_result.generation_logits  # forwards Nones
             if req.state != LlmRequestState.GENERATION_COMPLETE and len(
                     target_model_req.py_draft_tokens
             ) < target_model_req.py_draft_pages_allocated:
@@ -396,6 +393,7 @@ class ModelDrafter(Drafter):
         new_tokens_lens = None
         next_draft_tokens = None
         has_draft_tokens = False
+        batch_size = new_tokens.shape[1]
         # Iterate through generation requests and copy tokens based on accepted draft tokens
         for request in scheduled_batch.all_requests():
             idx = request.py_seq_slot
@@ -411,9 +409,8 @@ class ModelDrafter(Drafter):
 
         if has_draft_tokens:
             # We already updated the target state, so the new_tokens_lens should be all ones.
-            new_tokens_lens = torch.ones(scheduled_batch.batch_size,
-                                         device=device)
-            next_draft_tokens = torch.zeros(scheduled_batch.batch_size,
+            new_tokens_lens = torch.ones(batch_size, device=device)
+            next_draft_tokens = torch.zeros(batch_size,
                                             self.max_draft_tokens,
                                             device=device)
 
@@ -438,15 +435,15 @@ class ModelDrafter(Drafter):
         Update target inputs with new draft tokens from sample state.
         """
         if draft_tensors is not None:
-            for request in draft_batch.all_requests():
+            for req_idx, request in enumerate(draft_batch.all_requests()):
                 # Skip prefill requests
                 if target_inputs.next_draft_tokens is None:
                     continue
 
                 # Get the index of the draft/target tokens in the device tensor
-                draft_idx = request.py_seq_slot
+                draft_idx = req_idx if self.use_static_draft_loop else request.py_batch_idx
                 target_idx = req_id_to_old_request[
-                    request.py_request_id].py_seq_slot
+                    request.py_request_id].py_batch_idx
                 target_inputs.new_tokens[draft_position + 1:draft_position +
                                          draft_length + 1, target_idx,
                                          0] = draft_tensors[0:draft_length,
