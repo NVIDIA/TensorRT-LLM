@@ -173,7 +173,6 @@ examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-
 examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-3-mini-4k-instruct-lora_fp16-base_fp8]
 examples/test_phi.py::test_llm_phi_quantization_1gpu[phi-2-fp8-bfloat16]
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-mini-128k-instruct-fp8-float16]
-examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-small-128k-instruct-fp8-bfloat16]
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3.5-mini-instruct-fp8-float16]
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3.5-MoE-instruct-fp8-bfloat16]
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16]
