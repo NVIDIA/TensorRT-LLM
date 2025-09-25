@@ -215,6 +215,46 @@
             "act": "swiglu",
             "patchF2fp": false,
             "clampLimit": 2
+        },
+        "BatchedGemmE2m1E4m3LowLatency": {
+            "dtypeA": "e2m1",
+            "dtypeB": "e4m3",
+            "dtypeC": "e4m3",
+            "dtypeMmaA": "e4m3",
+            "sfBlockSizeA": 32,
+            "mmaM": 128,
+            "mmaN": 8,
+            "mmaK": 32,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 256,
+            "epilogueTileM": 128,
+            "epilogueTileN": 8,
+            "numStages": 3,
+            "numStagesMma": 1,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "sliceK": false,
+            "transposeMmaOutput": true,
+            "useShuffledMatrixA": true,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "gridTriggerSecondaryB": true,
+            "gridWaitForPrimaryA": false,
+            "gridWaitForPrimaryB": true,
+            "sfLayoutB": "8x4",
+            "sfLayoutC": "8x4",
+            "batch": "N",
+            "numTokens": 2,
+            "numExperts": 2,
+            "useCudaGraph": true,
+            "biasType": "m",
+            "act": "swiglu",
+            "clampLimit": 2
         }
     },
     "configs": [
@@ -503,6 +543,44 @@
                 [16, 16, 16, 3],
                 [32, 32, 32, 3],
                 [64, 64, 64, 3]
+            ],
+            "tileScheduler,numStagesMma": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "Fp4xFp8_FC1",
+            "_template": "BatchedGemmE2m1E4m3LowLatency",
+            "routeAct": "ldgsts",
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "useUnrollLoop2xForMma": [true, false],
+            "mmaN,tileN,epilogueTileN,tileK,numStages": [
+                [8, 8, 8, 512, 3],
+                [8, 8, 8, 256, 5],
+                [16, 16, 16, 256, 5],
+                [32, 32, 32, 256, 5],
+                [64, 64, 64, 256, 4]
+            ],
+            "tileScheduler,numStagesMma": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "Fp4xFp8_FC2",
+            "_template": "BatchedGemmE2m1E4m3LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "mmaN,tileN,epilogueTileN,tileK,numStages": [
+                [8, 8, 8, 512, 3],
+                [8, 8, 8, 256, 5],
+                [16, 16, 16, 256, 5],
+                [32, 32, 32, 256, 5],
+                [64, 64, 64, 256, 4]
             ],
             "tileScheduler,numStagesMma": [
                 ["static", 1],

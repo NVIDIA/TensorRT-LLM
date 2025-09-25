@@ -247,6 +247,10 @@ class GenerationExecutorWorker(BaseWorker):
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
 
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self.shutdown()
+        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
+
 
 @print_traceback_on_error
 def worker_main(

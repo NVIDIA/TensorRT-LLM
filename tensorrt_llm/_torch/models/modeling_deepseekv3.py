@@ -58,8 +58,7 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
-                                 MoEWeightLoadingMode, TRTLLMGenFusedMoE,
-                                 create_moe)
+                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -393,28 +392,6 @@ class DeepseekV3WeightLoader:
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
-
-                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and is_sm_100f() and hasattr(module, "weight_scale"):
-                    weight, weight_scale = resmooth_to_fp8_e8m0(
-                        module.weight, module.weight_scale)
-                    transfromed_scale = transform_sf_into_required_layout(
-                        weight_scale,
-                        mn=weight.shape[0],
-                        k=weight.shape[1],
-                        recipe=(1, 128, 128),
-                        is_sfa=False)
-                    module.weight = nn.Parameter(weight, requires_grad=False)
-                    module.weight_scale = nn.Parameter(transfromed_scale,
-                                                       requires_grad=False)
-        if not self.is_draft_model:
-            for idx, layer in enumerate(
-                    self.model.model.layers[:self.config.num_hidden_layers]):
-                if idx == self.config.num_hidden_layers - 1:
-                    layer.next_layer_layernorm = self.model.model.norm
-                else:
-                    layer.next_layer_layernorm = self.model.model.layers[
-                        idx + 1].input_layernorm
 
 
 class DeepseekV3MTPHead(nn.Module):
@@ -854,13 +831,6 @@ class Deepseekv3MoE(nn.Module):
                               all_rank_num_tokens, do_finalize):
         # max-throughput
         use_dp_padding = False
-        if self.use_dp and self.mapping.tp_size > 1:
-            if isinstance(self.experts, TRTLLMGenFusedMoE):
-                hidden_states = allgather(hidden_states,
-                                          self.mapping,
-                                          dim=0,
-                                          sizes=all_rank_num_tokens)
-
         router_logits = self.gate(hidden_states)
 
         routed_output = self.experts(
@@ -1548,3 +1518,32 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def load_weights(self, weights: Dict):
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
+
+    def post_load_weights(self):
+        all_named_modules = dict(self.model.named_modules())
+        for name, module in tqdm(all_named_modules.items(),
+                                 desc="Post loading weights"):
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
+                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                ) and is_sm_100f() and hasattr(module, "weight_scale"):
+                    weight, weight_scale = resmooth_to_fp8_e8m0(
+                        module.weight, module.weight_scale)
+                    transfromed_scale = transform_sf_into_required_layout(
+                        weight_scale,
+                        mn=weight.shape[0],
+                        k=weight.shape[1],
+                        recipe=(1, 128, 128),
+                        is_sfa=False)
+                    module.weight = nn.Parameter(weight, requires_grad=False)
+                    module.weight_scale = nn.Parameter(transfromed_scale,
+                                                       requires_grad=False)
+
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm

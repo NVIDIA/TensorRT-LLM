@@ -11,6 +11,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
@@ -359,6 +360,8 @@ class BaseWorker(GenerationExecutor):
             assert (
                 not self._is_pytorch_backend
                 or self.engine.kv_cache_transceiver is not None
+                or request.disaggregated_params.request_type
+                == "context_and_generation"
             ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
@@ -632,8 +635,9 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            response = _maybe_wrap_response(self.worker, response,
-                                            self.worker._is_pytorch_backend)
+            if not response.has_error():
+                response = _maybe_wrap_response(self.worker, response,
+                                                self.worker._is_pytorch_backend)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -701,24 +705,60 @@ def _get_params_for_first_rsp(
     return None, None
 
 
+def _compute_pytorch_prompt_logprobs(
+        generation_result: GenerationResult,
+        response: LlmResponse) -> Optional[LogProbsResult]:
+    """Compute prompt logprobs for PyTorch backend (cached when streaming) """
+    logprob_params = generation_result._logprob_params  # should be present and non None
+    assert logprob_params is not None
+    if generation_result._streaming:
+        cached = getattr(generation_result, '_cached_prompt_logprobs', None)
+        if cached is not None:
+            return LogProbsResult(
+                prompt=cached, generation=None
+            )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
+    context_logits = response.result.context_logits
+    assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
+    logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
+                                       context_logits, None, None)
+    if generation_result._streaming:
+        generation_result._cached_prompt_logprobs = logprobs_result.prompt
+
+    return logprobs_result
+
+
 def _get_logprobs(worker,
-                  response: tllm.Response,
+                  response: Union[tllm.Response, LlmResponse],
                   is_pytorch_backend=False) -> Optional[LogProbsResult]:
-    """Compute logprob and prompt logprob and clear out logits if applicable.
+    """Compute logprobs from response logits when needed.
+
+    Logprobs provenance varies by backend:
+    - PyTorch: Generation logprobs computed in sampler, only prompt logprobs computed here
+    - TRT: Both prompt and generation logprobs computed here from logits
     """
-    if is_pytorch_backend:
-        # _get_logprobs() is a WAR for the TRT backend, where top-k logprobs are computed post runtime.
-        # In the PyTorch backend, logprobs are already computed during runtime if requested.
-        return None
 
     logprobs_result = None
     generation_result = worker._results.get(response.client_id, None)
 
     if not generation_result:
-        return
+        return None
 
     logprob_params = getattr(generation_result, "_logprob_params", None)
     if logprob_params:
+        if is_pytorch_backend:
+            if not logprob_params.prompt_logprobs:
+                # PyTorch: generation logprobs computed in sampler, no post-processing needed
+                return None
+            else:
+                logprobs_result = _compute_pytorch_prompt_logprobs(
+                    generation_result, response)
+
+                if logprob_params.drop_context_logits:
+                    response.clear_context_logits()
+
+                return logprobs_result
+
+        # TRT backend: compute both prompt and generation logprobs from logits
         logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
                                            logprob_params.logprobs,
                                            response.result.context_logits,

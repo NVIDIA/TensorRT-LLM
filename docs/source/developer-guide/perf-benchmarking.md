@@ -423,7 +423,7 @@ checkpoint. For the Llama-3.1 models, TensorRT LLM provides the following checkp
 - [`nvidia/Llama-3.1-70B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8)
 - [`nvidia/Llama-3.1-405B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8)
 
-To understand more about how to quantize your own checkpoints, refer to ModelOpt [documentation](https://nvidia.github.io/TensorRT-Model-Optimizer/getting_started/3_quantization.html).
+To understand more about how to quantize your own checkpoints, refer to ModelOpt [documentation](https://nvidia.github.io/TensorRT-Model-Optimizer/deployment/1_tensorrt_llm.html).
 
 `trtllm-bench` utilizes the `hf_quant_config.json` file present in the pre-quantized checkpoints above. The configuration
 file is present in checkpoints quantized with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
@@ -460,9 +460,10 @@ If you would like to force the KV cache quantization, you can specify the follow
 when the checkpoint precision is `null`:
 
 ```yaml
-kv_cache_dtype: "fp8"
+kv_cache_config:
+  dtype: fp8
 ```
 
 ```{tip}
-The two valid values for `kv_cache_dtype` are `auto` and `fp8`.
+The two valid values for `kv_cache_config.dtype` are `auto` and `fp8`.
 ```

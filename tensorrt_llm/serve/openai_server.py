@@ -23,6 +23,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
+from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, tracing
@@ -681,8 +682,16 @@ class OpenAIServer:
                     postproc_args=postproc_args,
                 )
                 trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
+
+                prompt = prompt_inputs(prompt)
+                if prompt.get("prompt") is not None:
+                    prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(self.llm.input_processor, prompt, sampling_params)
+                    tokens_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, query_token_ids=extra_processed_inputs.get("query_token_ids") if extra_processed_inputs is not None else None)
+                else:
+                    tokens_prompt = prompt
+
                 promise = self.llm.generate_async(
-                    inputs=prompt,
+                    inputs=tokens_prompt,
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
@@ -739,7 +748,6 @@ class OpenAIServer:
 
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                # await self._extract_metrics(res)
                 for pp_res in pp_results:
                     yield pp_res
 
