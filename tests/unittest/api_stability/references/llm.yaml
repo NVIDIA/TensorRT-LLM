@@ -76,7 +76,7 @@ methods:
         default: null
         status: deprecated
       orchestrator_type:
-        annotation: Optional[str]
+        annotation: Optional[Literal['ray']]
         default: null
         status: prototype
       build_config:

@@ -90,23 +90,23 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     # Access group ranks
     @property
     def tp_group(self) -> List[int]:
-        return get_process_group_ranks(self.tp_group_pg)
+        return self._get_group_ranks(self.tp_group_pg)
 
     @property
     def pp_group(self) -> List[int]:
-        return get_process_group_ranks(self.pp_group_pg)
+        return self._get_group_ranks(self.pp_group_pg)
 
     @property
     def cp_group(self) -> List[int]:
-        return get_process_group_ranks(self.cp_group_pg)
+        return self._get_group_ranks(self.cp_group_pg)
 
     @property
     def moe_tp_group(self) -> List[int]:
-        return get_process_group_ranks(self.moe_tp_group_pg)
+        return self._get_group_ranks(self.moe_tp_group_pg)
 
     @property
     def moe_ep_group(self) -> List[int]:
-        return get_process_group_ranks(self.moe_ep_group_pg)
+        return self._get_group_ranks(self.moe_ep_group_pg)
 
     def build_mesh(self):
         cls = DeviceMeshTopologyImpl
@@ -157,3 +157,8 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
         else:
             assert name in cls.device_mesh.mesh_dim_names, f"Dimension name {name} not found in device mesh."
             return cls.device_mesh[name]
+
+    def _get_group_ranks(self, pg) -> List[int]:
+        if self.world_size == 1:
+            return [0]
+        return get_process_group_ranks(pg)

@@ -18,6 +18,8 @@ def main():
         max_seq_len=1024,
         max_batch_size=1,
         orchestrator_type="ray",  # Enable Ray orchestrator
+        # Enable 2-way tensor parallelism
+        # tensor_parallel_size=2
     )
 
     # Sample prompts.
