@@ -8,10 +8,86 @@ import pandas as pd
 import yaml
 
 
+
+def extract_config_from_log_filename(log_file):
+    """
+    Extract configuration from log filename using the naming pattern:
+    serve.{model_label}.tp{tp}.ep{ep}.adp{enable_attention_dp}.attn{attn_backend}.moe{moe_backend}.gpu{free_gpu_mem_fraction}.batch{max_batch_size}.isl{isl}.osl{osl}.tokens{max_num_tokens}.moetokens{moe_max_num_tokens}.concurrency{concurrency}.iter{iteration}.log
+    """
+    filename = Path(log_file).name
+    
+    # Define regex pattern to match the log filename format
+    pattern = r'serve\.([^.]+)\.tp(\d+)\.ep(\d+)\.adp([^.]+)\.attn([^.]+)\.moe([^.]*)\.gpu([^.]+\.[^.]*)\.batch(\d+)\.isl(\d+)\.osl(\d+)\.tokens(\d+)\.moetokens([^.]*)\.concurrency(\d+)\.iter(\d+)\.log'
+    
+    match = re.match(pattern, filename)
+    if not match:
+        print(f"Warning: Could not parse filename {filename}")
+        return None
+    
+    # Extract all groups from the match
+    groups = match.groups()
+    
+    try:
+        model_label = groups[0]
+        tp = int(groups[1])
+        ep = int(groups[2])
+        enable_attention_dp_str = groups[3]
+        attn_backend = groups[4]
+        moe_backend = groups[5]
+        free_gpu_mem_fraction = float(groups[6])
+        max_batch_size = int(groups[7])
+        isl = int(groups[8])
+        osl = int(groups[9])
+        max_num_tokens = int(groups[10])
+        moe_max_num_tokens_str = groups[11]
+        concurrency = int(groups[12])
+        iteration = int(groups[13])
+        
+        # Handle moe_max_num_tokens (could be "N/A", empty, or a number)
+        moe_max_num_tokens = ""
+        if moe_max_num_tokens_str and moe_max_num_tokens_str != "N/A":
+            try:
+                moe_max_num_tokens = int(moe_max_num_tokens_str)
+            except ValueError:
+                moe_max_num_tokens = ""
+        elif not moe_max_num_tokens_str:
+            moe_max_num_tokens = ""
+        
+        # Handle enable_attention_dp (convert string to boolean)
+        enable_attention_dp_bool = enable_attention_dp_str.lower() == "true"
+        
+        # Note: We don't have GPUs information in the filename, so we'll leave it empty
+        # and let the caller handle this if needed
+        
+        return {
+            'model_name': model_label,
+            'gpus': tp,
+            'tp': tp,
+            'ep': ep,
+            'attn_backend': attn_backend,
+            'moe_backend': moe_backend,
+            'enable_attention_dp': enable_attention_dp_bool,
+            'free_gpu_mem_fraction': free_gpu_mem_fraction,
+            'max_batch_size': max_batch_size,
+            'isl': isl,
+            'osl': osl,
+            'max_num_tokens': max_num_tokens,
+            'moe_max_num_tokens': moe_max_num_tokens,
+            'concurrency': concurrency,
+            'iteration': iteration,
+            'found_in_filename': True
+        }
+    except (ValueError, IndexError) as e:
+        print(f"Warning: Could not parse filename {filename}: {e}")
+        return None
+
+
 def extract_config_from_log_content(log_file):
     """
-    Extract configuration from log file content using "Completed benchmark with Configuration:" pattern
+    Extract configuration from log file content using "Completed benchmark with Configuration:" pattern.
+    If that fails, try to extract from the log filename as a fallback.
     """
+    # First try to extract from log content
     try:
         with open(log_file, 'r') as f:
             for line in f:
@@ -106,38 +182,39 @@ def extract_config_from_log_content(log_file):
                         print(
                             f"Warning: Incomplete configuration in {log_file} - missing required fields"
                         )
-                        return None
+                        # Fall through to try filename extraction
     except Exception as e:
         print(f"Warning: Could not read {log_file}: {e}")
+        # Fall through to try filename extraction
 
-    return None
+    # If log content extraction failed, try extracting from filename
+    print(f"Trying to extract configuration from filename: {log_file}")
+    filename_config = extract_config_from_log_filename(log_file)
+    if filename_config:
+        print(f"Successfully extracted configuration from filename")
+        return filename_config
+    else:
+        print(f"Could not extract configuration from filename either")
+        return None
 
 
-def extract_metrics_from_log(log_file):
+def extract_and_update_metrics(log_file, test_case, metrics_dict):
     """
-    Extract Total Token throughput and User throughput from log file
+    Extract metrics from log file and update the metrics_dict
     """
-    total_throughput = ""
-    user_throughput = ""
-
     try:
         with open(log_file, 'r') as f:
             for line in f:
-                if "Total Token throughput (tok/s):" in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        total_throughput = parts[4]
-                elif "User throughput (tok/s):" in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 4:
-                        user_throughput = parts[3]
+                for metric_name, metric_header in metrics_dict.items():
+                    if metric_header in line:
+                        metric_value = line.strip().split()[-1]
+                        test_case[metric_name] = metric_value
+                        break
     except Exception as e:
         print(f"Warning: Could not read {log_file}: {e}")
 
-    return total_throughput, user_throughput
 
-
-def generate_all_test_cases(benchmark_config):
+def generate_all_test_cases(benchmark_config, metrics_dict):
     """
     Generate all test cases from benchmark_config.yaml including all concurrency iterations
     """
@@ -165,8 +242,8 @@ def generate_all_test_cases(benchmark_config):
             test_case_config = base_config.copy()
             test_case_config['concurrency'] = concurrency
             test_case_config['iterations'] = iterations
-            test_case_config['TPS/System'] = ""
-            test_case_config['TPS/User'] = ""
+            for metric_name, _ in metrics_dict.items():
+                test_case_config[metric_name] = ""
             all_test_cases.append(test_case_config)
 
     return all_test_cases
@@ -180,9 +257,8 @@ def match_log_to_test_case(log_config, test_case):
     if not log_config:
         return False
 
-    # Check if all key parameters match exactly
+    # Check if all key parameters match exactly    
     return (log_config['model_name'] == test_case['model_name']
-            and log_config['gpus'] == test_case['gpus']
             and log_config['tp'] == test_case['tp']
             and log_config['ep'] == test_case['ep']
             and log_config['attn_backend'] == test_case['attn_backend']
@@ -201,11 +277,11 @@ def match_log_to_test_case(log_config, test_case):
             and log_config['concurrency'] == test_case['concurrency'])
 
 
-def create_test_case_row(test_case):
+def create_test_case_row(test_case, metrics_dict):
     """
     Create a row for a test case with empty performance data
     """
-    return {
+    row = {
         'model_name': test_case['model_name'],
         'GPUs': test_case['gpus'],
         'TP': test_case['tp'],
@@ -221,9 +297,10 @@ def create_test_case_row(test_case):
         'moe_max_num_tokens': test_case['moe_max_num_tokens'],
         'Concurrency': test_case['concurrency'],
         'Iterations': test_case['iterations'],
-        'TPS/System': test_case['TPS/System'],
-        'TPS/User': test_case['TPS/User'],
     }
+    for metric_name, _ in metrics_dict.items():
+        row[metric_name] = test_case[metric_name]
+    return row
 
 
 def parse_benchmark_results(input_folder, output_csv, config_file):
@@ -255,8 +332,15 @@ def parse_benchmark_results(input_folder, output_csv, config_file):
         print(f"Error: Could not load {config_file}: {e}")
         return
 
+    # Metrics to extract from log file
+    metrics_dict = {
+        "TPS/System": "Total Token throughput (tok/s):",
+        "TPS/User": "User throughput (tok/s):",
+        "Benchmark Duration": "Benchmark duration (s):",
+    }
+
     # Generate all test cases from config
-    all_test_cases = generate_all_test_cases(benchmark_config)
+    all_test_cases = generate_all_test_cases(benchmark_config, metrics_dict)
     print(f"Generated {len(all_test_cases)} test cases from configuration")
 
     # Find all serve.*.log files
@@ -274,30 +358,26 @@ def parse_benchmark_results(input_folder, output_csv, config_file):
             print(f"  Skipped - could not parse configuration")
             continue
 
-        # Extract performance metrics
-        total_throughput, user_throughput = extract_metrics_from_log(log_file)
-
         # Find matching test case in table
         matched = False
         for test_case in all_test_cases:
             if match_log_to_test_case(log_config, test_case):
                 # Update performance data
-                test_case['TPS/System'] = total_throughput
-                test_case['TPS/User'] = user_throughput
+                extract_and_update_metrics(log_file, test_case, metrics_dict)
                 matched = True
                 matched_count += 1
                 break
 
         if not matched:
             print(
-                f"  Skipped - no matching test case found for test case {test_case}"
+                f"  Skipped - no matching test case found for log case {log_config}"
             )
 
     print(f"Successfully matched {matched_count} log files to test cases")
 
     table_rows = []
     for test_case in all_test_cases:
-        row = create_test_case_row(test_case)
+        row = create_test_case_row(test_case, metrics_dict)
         table_rows.append(row)
 
     # Add empty rows between different test configurations

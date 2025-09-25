@@ -1,0 +1,17 @@
+test_cases:
+  - id: 1
+    model: "70B-FP8"
+    gpus: 1
+    tp: 1
+    ep: 1
+    attn_backend: "TRTLLM"
+    moe_backend: ""
+    enable_attention_dp: false
+    free_gpu_mem_fraction: 0.9
+    max_batch_size: 1024
+    isl: 1024
+    osl: 1024
+    max_num_tokens: 16384
+    moe_max_num_tokens: ""
+    concurrency_iterations:
+      - [1, 10]

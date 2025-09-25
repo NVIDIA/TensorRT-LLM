@@ -661,6 +661,8 @@ def ONLY_MULTI_GPU_TEST = "only_multi_gpu_test"
 @Field
 def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 @Field
+def ONLY_PERF_SANITY_TEST = "only_perf_sanity_test"
+@Field
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
@@ -683,6 +685,7 @@ def testFilter = [
     (ADD_MULTI_GPU_TEST): false,
     (ONLY_MULTI_GPU_TEST): false,
     (DISABLE_MULTI_GPU_TEST): false,
+    (ONLY_PERF_SANITY_TEST): false,
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_ONE_GROUP_CHANGED): "",
@@ -1662,124 +1665,176 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
-    stage ("[${stageName}] Run Pytest")
-    {
-        echoNodeAndGpuInfo(pipeline, stageName)
-        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
+    if (stageName.contains("Perf-Sanity")) {
+        stage("[${stageName}] Run Perf Sanity")
+        {
+            echoNodeAndGpuInfo(pipeline, stageName)
+            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
-        def extraInternalEnv = ""
-        def pytestTestTimeout = "3600"
+            def testTimeout = "3600"
 
-        // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
-        extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
-
-        def testDBList = renderTestDB(testList, llmSrc, stageName)
-        testList = "${testList}_${splitId}"
-        def testCmdLine = [
-            "LLM_ROOT=${llmSrc}",
-            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-            "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
-            "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
-            extraInternalEnv,
-            "pytest",
-            "-v",
-            testFilter[(DETAILED_LOG)] ? "-s" : "",
-            "--timeout-method=thread",
-            "--apply-test-list-correction",
-            "--splitting-algorithm least_duration",
-            "--timeout=${pytestTestTimeout}",
-            "--rootdir ${llmSrc}/tests/integration/defs",
-            "--test-prefix=${stageName}",
-            "--splits ${splits}",
-            "--group ${splitId}",
-            "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
-            "--test-list=${testDBList}",
-            "--output-dir=${WORKSPACE}/${stageName}/",
-            "--csv=${WORKSPACE}/${stageName}/report.csv",
-            "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
-            "-o junit_logging=out-err"
-        ]
-        if (perfMode) {
-            testCmdLine += [
-                "--perf",
-                "--perf-log-formats csv",
-                "--perf-log-formats yaml"
+            def bench_dir = "${llmSrc}/tests/scripts/perf-sanity"
+            def config_file = "${testList}.yaml"
+            def output_folder = "${WORKSPACE}/${stageName}"
+            def testCmdLine = [
+                "LLM_MODELS_ROOT=${llmSrc}",
+                "python3",
+                "${bench_dir}/run_benchmark_serve.py",
+                "--output_folder ${output_folder}",
+                "--config_file ${bench_dir}/${config_file}",
+                // "--timeout ${testTimeout}",
             ]
-        }
-        // Test Coverage
-        def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
-        sh "echo ${TRTLLM_WHL_PATH}"
-        def coverageConfigFile = "${llmSrc}/${stageName}/.coveragerc"
-        sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
-        sh """
-            echo '[run]' > ${coverageConfigFile}
-            echo 'branch = True' >> ${coverageConfigFile}
-            echo 'data_file = ${WORKSPACE}/${stageName}/.coverage.${stageName}' >> ${coverageConfigFile}
-            echo '[paths]' >> ${coverageConfigFile}
-            echo 'source =\n    ${llmSrc}/tensorrt_llm/\n    ${TRTLLM_WHL_PATH}/tensorrt_llm/' >> ${coverageConfigFile}
-            cat ${coverageConfigFile}
-        """
-        testCmdLine += [
-            "--cov=${llmSrc}/examples/",
-            "--cov=${llmSrc}/tensorrt_llm/",
-            "--cov=${TRTLLM_WHL_PATH}/tensorrt_llm/",
-            "--cov-report=",
-            "--cov-config=${coverageConfigFile}"
-        ]
 
-        def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
-        def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
-        if (!containerLD_LIBRARY_PATH.contains("${containerPIP_LLM_LIB_PATH}:")) {
-            echo "Prepend ${containerPIP_LLM_LIB_PATH} into \${LD_LIBRARY_PATH}"
-            containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
-        }
-        containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
-        withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
-            withCredentials([
-                usernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    usernameVariable: 'GITLAB_API_USER',
-                    passwordVariable: 'GITLAB_API_TOKEN'
-                ),
-                string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
-            ]) {
-                sh "env | sort"
-                try {
-                    sh """
-                        rm -rf ${stageName}/ && \
-                        cd ${llmSrc}/tests/integration/defs && \
-                        ${testCmdLine.join(" ")}
-                    """
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
-                    if (isRerunFailed) {
-                        error "The tests still failed after rerun attempt."
+            def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
+            def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
+            if (!containerLD_LIBRARY_PATH.contains("${containerPIP_LLM_LIB_PATH}:")) {
+                echo "Prepend ${containerPIP_LLM_LIB_PATH} into \${LD_LIBRARY_PATH}"
+                containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
+            }
+            containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
+            withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                        usernameVariable: 'GITLAB_API_USER',
+                        passwordVariable: 'GITLAB_API_TOKEN'
+                    ),
+                    string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
+                ]) {
+                    sh "env | sort"
+                    try {
+                        sh """
+                            sh "mkdir -p ${output_folder}"
+                            sh "${testCmdLine.join(" ")}"
+                        """
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        throw e
                     }
                 }
             }
         }
+    } else {
+        stage ("[${stageName}] Run Pytest")
+        {
+            echoNodeAndGpuInfo(pipeline, stageName)
+            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
-        if (perfMode) {
-            basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
-            basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
-            stage("Check perf result") {
-                sh """
-                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
-                    ${stageName}/perf_script_test_results.csv \
-                    ${basePerfPath}
-                """
+            def extraInternalEnv = ""
+            def pytestTestTimeout = "3600"
+
+            // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
+            extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
+            // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
+            extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
+
+            def testDBList = renderTestDB(testList, llmSrc, stageName)
+            testList = "${testList}_${splitId}"
+            def testCmdLine = [
+                "LLM_ROOT=${llmSrc}",
+                "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+                "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
+                "MODEL_CACHE_DIR=${MODEL_CACHE_DIR}",
+                extraInternalEnv,
+                "pytest",
+                "-v",
+                testFilter[(DETAILED_LOG)] ? "-s" : "",
+                "--timeout-method=thread",
+                "--apply-test-list-correction",
+                "--splitting-algorithm least_duration",
+                "--timeout=${pytestTestTimeout}",
+                "--rootdir ${llmSrc}/tests/integration/defs",
+                "--test-prefix=${stageName}",
+                "--splits ${splits}",
+                "--group ${splitId}",
+                "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
+                "--test-list=${testDBList}",
+                "--output-dir=${WORKSPACE}/${stageName}/",
+                "--csv=${WORKSPACE}/${stageName}/report.csv",
+                "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
+                "-o junit_logging=out-err"
+            ]
+            if (perfMode) {
+                testCmdLine += [
+                    "--perf",
+                    "--perf-log-formats csv",
+                    "--perf-log-formats yaml"
+                ]
             }
-            stage("Create perf report") {
-                sh """
-                    python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
-                    --output_path ${stageName}/report.pdf \
-                    --files ${stageName}/perf_script_test_results.csv \
-                    ${basePerfPath}
-                """
+            // Test Coverage
+            def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
+            sh "echo ${TRTLLM_WHL_PATH}"
+            def coverageConfigFile = "${llmSrc}/${stageName}/.coveragerc"
+            sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
+            sh """
+                echo '[run]' > ${coverageConfigFile}
+                echo 'branch = True' >> ${coverageConfigFile}
+                echo 'data_file = ${WORKSPACE}/${stageName}/.coverage.${stageName}' >> ${coverageConfigFile}
+                echo '[paths]' >> ${coverageConfigFile}
+                echo 'source =\n    ${llmSrc}/tensorrt_llm/\n    ${TRTLLM_WHL_PATH}/tensorrt_llm/' >> ${coverageConfigFile}
+                cat ${coverageConfigFile}
+            """
+            testCmdLine += [
+                "--cov=${llmSrc}/examples/",
+                "--cov=${llmSrc}/tensorrt_llm/",
+                "--cov=${TRTLLM_WHL_PATH}/tensorrt_llm/",
+                "--cov-report=",
+                "--cov-config=${coverageConfigFile}"
+            ]
+
+            def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
+            def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
+            if (!containerLD_LIBRARY_PATH.contains("${containerPIP_LLM_LIB_PATH}:")) {
+                echo "Prepend ${containerPIP_LLM_LIB_PATH} into \${LD_LIBRARY_PATH}"
+                containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
+            }
+            containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
+            withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                        usernameVariable: 'GITLAB_API_USER',
+                        passwordVariable: 'GITLAB_API_TOKEN'
+                    ),
+                    string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
+                ]) {
+                    sh "env | sort"
+                    try {
+                        sh """
+                            rm -rf ${stageName}/ && \
+                            cd ${llmSrc}/tests/integration/defs && \
+                            ${testCmdLine.join(" ")}
+                        """
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                        if (isRerunFailed) {
+                            error "The tests still failed after rerun attempt."
+                        }
+                    }
+                }
+            }
+
+            if (perfMode) {
+                basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
+                basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
+                stage("Check perf result") {
+                    sh """
+                        python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
+                        ${stageName}/perf_script_test_results.csv \
+                        ${basePerfPath}
+                    """
+                }
+                stage("Create perf report") {
+                    sh """
+                        python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
+                        --output_path ${stageName}/report.pdf \
+                        --files ${stageName}/perf_script_test_results.csv \
+                        ${basePerfPath}
+                    """
+                }
             }
         }
     }
@@ -2129,6 +2184,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
+    fullSet = x86TestConfigs.keySet()
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
         def config = VANILLA_CONFIG
@@ -2146,7 +2202,6 @@ def launchTestJobs(pipeline, testFilter)
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
-    fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
@@ -2170,8 +2225,18 @@ def launchTestJobs(pipeline, testFilter)
         }
         runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
     }]]}
-
     parallelJobs += parallelSlurmJobs
+
+    perfSanityTestConfigs = [
+        "DGX_B200-8_GPUs-PyTorch-Perf-Sanity-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
+    ]
+    fullSet += perfSanityTestConfigs.keySet()
+
+    parallelPerfSanityJobs = perfSanityTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "b100-ts2", "amd64"), {
+        def config = VANILLA_CONFIG
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
+    }]]}
+    parallelJobs += parallelPerfSanityJobs
 
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
@@ -2475,9 +2540,9 @@ def launchTestJobs(pipeline, testFilter)
     parallelJobs += sanityCheckJobs
 
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
-
+    perfSanityJobs = parallelJobs.findAll {it.key.contains("Perf-Sanity")}
     // Start as a normal pre-merge job
-    parallelJobsFiltered = parallelJobs - multiGpuJobs - postMergeJobs
+    parallelJobsFiltered = parallelJobs - multiGpuJobs - postMergeJobs - perfSanityJobs
 
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
@@ -2527,6 +2592,11 @@ def launchTestJobs(pipeline, testFilter)
     // Check --disable-multi-gpu-test, if true, remove multi-GPU test stages.
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         parallelJobsFiltered -= multiGpuJobs
+    }
+
+    // Check --only-perf-sanity-test, if true, only run perf sanity test stages.
+    if (testFilter[(ONLY_PERF_SANITY_TEST)]) {
+        parallelJobsFiltered = perfSanityJobs
     }
 
     // Check --gpu-type, filter test stages.
