@@ -182,6 +182,10 @@ def launch_server(host: str,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
+    # Optionally disable GC (default: not disabled)
+    if int(os.getenv("TRTLLM_SERVER_DISABLE_GC", "0")):
+        gc.disable()
+
     asyncio.run(server(host, port))
 
 
