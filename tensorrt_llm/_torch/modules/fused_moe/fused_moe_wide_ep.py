@@ -195,9 +195,8 @@ class WideEPMoE(MoE):
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
-            self.use_low_precision_combine = (os.environ.get(
-                "TRTLLM_MOE_USE_LOW_PRECISION_COMBINE", "0")
-                                              == "1") and qm.has_nvfp4()
+            self.use_low_precision_combine = model_config.use_low_precision_moe_combine and qm.has_nvfp4(
+            )
 
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
