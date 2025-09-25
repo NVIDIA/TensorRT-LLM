@@ -1625,7 +1625,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
         else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3>
             && std::is_same_v<InputActivationsType, __nv_fp8_e4m3>)
         {
-            TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
+            TLLM_CHECK_WITH_INFO(!prequant_scales, "FP8 is not supported for AWQ");
             return quant_params.mxfp8_mxfp4.fc1.weight_block_scale
                 ? &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
@@ -3689,7 +3689,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size, experts_per_token,
             num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
             fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
-            use_w4afp8 ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
+            (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
         auto const* gemm1_input = gemm1_input_expand;
 
         sync_check_cuda_error(stream);
@@ -4755,6 +4755,7 @@ template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>;
 #endif
 #endif
 #ifdef ENABLE_FP4

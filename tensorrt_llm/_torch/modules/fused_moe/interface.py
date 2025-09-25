@@ -195,6 +195,9 @@ class MoE(nn.Module):
     def load_weights(self, weights: List[Dict]):
         raise NotImplementedError
 
+    def post_load_weights(self):
+        pass
+
     @abstractmethod
     def forward_impl(
         self,

@@ -346,6 +346,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
             cuda_graph_config=cuda_graph_config,
             enable_chunked_prefill=True,
+            max_num_tokens=256,
             speculative_config=spec_config,
             # Two-model eagle3 does not support overlap scheduler
             disable_overlap_scheduler=not eagle3_one_model)
@@ -366,6 +367,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=256,
                   speculative_config=spec_config,
                   disable_overlap_scheduler=True)
         with llm:
@@ -696,8 +698,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8), (4, 1, 1),
-                                    (4, 1, 2), (4, 1, 4)],
-        ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4"])
+                                    (4, 1, 2), (4, 1, 4), (4, 2, 1)],
+        ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4", "tp4pp2"])
     def test_fp8(self, cuda_graph, tp_size, pp_size, ep_size):
         if get_device_memory() < 140000 and get_device_count() < 8:
             pytest.skip("Not enough memory for this test")
@@ -1057,28 +1059,40 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(
-        reason=
-        "Skipped because cyclic kv cache is disabled on the feature branch")
-    def test_auto_dtype_vswa(self):
-        # # NOTE: Test with VSWA kv cache config.
-        # self.kv_cache_config.max_attention_window = [
-        #     512, 512, 512, 512, 512, 32768
-        # ]  # Gemma3 1B attention window size pattern
-        # # TODO: uncomment to use the real window pattern when optimal KV cache allocation is supported
+    def test_auto_dtype_vswa_without_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
 
-        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_auto_dtype_chunked_prefill(self):
-        # # NOTE: Test with VSWA kv cache config.
-        # self.kv_cache_config.max_attention_window = [
-        #     512, 512, 512, 512, 512, 32768
-        # ]  # Gemma3 1B attention window size pattern
-        # # TODO: uncomment to use the real window pattern when optimal KV cache allocation is supported
+    def test_auto_dtype_vswa_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
 
         # chunked prefill case or more features
         extra_llm_config = dict(
@@ -1086,7 +1100,27 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             max_num_tokens=1024,
         )
         with LLM(self.MODEL_PATH,
-                 kv_cache_config=self.kv_cache_config,
+                 kv_cache_config=kv_cache_config,
+                 **extra_llm_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa_chunked_prefill_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        # chunked prefill case or more features
+        extra_llm_config = dict(
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
                  **extra_llm_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1166,6 +1200,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config) as llm:
@@ -1828,6 +1863,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=256,
                   speculative_config=mtp_config)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
@@ -1852,6 +1888,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=256,
                   speculative_config=mtp_config)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
@@ -2050,7 +2087,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 enable_chunked_prefill=True) as llm:
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
 
             assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -2183,7 +2221,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 enable_chunked_prefill=True) as llm:
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
             task = GSM8K(self.MODEL_NAME)
@@ -2617,6 +2656,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   **pytorch_config,
                   kv_cache_config=kv_cache_config,
                   enable_chunked_prefill=enable_chunked_prefill,
+                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                   speculative_config=spec_config,
                   build_config=None)
 
@@ -2982,9 +3022,13 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         [
             (4, 1, 4, False, False, False, "TRTLLM",
              True),  # TP8 has bug when we use TRTLLM moe backend and eagle3
+            (4, 1, 4, False, False, False, "CUTLASS", False),
+            (4, 1, 4, False, False, False, "CUTLASS", True),
         ],
         ids=[
             "latency_moe_trtllm_eagle3",
+            "latency_moe_cutlass",
+            "latency_moe_cutlass_eagle3",
         ],
     )
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
@@ -3139,7 +3183,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3179,7 +3225,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3225,7 +3273,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 4, True, True, True),
@@ -3263,7 +3313,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3311,7 +3363,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "kv_cache_dtype",
+        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",

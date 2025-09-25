@@ -63,11 +63,6 @@ class PyTorchConfig:
 
     moe_disable_finalize_fusion: bool = False
 
-    enable_mixed_sampler: bool = False
-    """
-    If true, will iterate over sampling_params of each request and use the
-    corresponding sampling strategy, e.g. top-k, top-p, etc.
-    """
     sampler_type: SamplerType = SamplerType.auto
     """
     The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto.

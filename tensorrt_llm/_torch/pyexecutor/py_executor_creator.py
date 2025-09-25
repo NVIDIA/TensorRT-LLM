@@ -32,7 +32,8 @@ from ..distributed import MPIDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla)
+                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    validate_feature_combination)
 from .config import PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -338,6 +339,9 @@ def create_py_executor(
             checkpoint_loader=checkpoint_loader,
         )
 
+    validate_feature_combination(llm_args, model_engine,
+                                 pytorch_backend_config.sampler_type)
+
     if has_draft_model_engine:
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
@@ -349,7 +353,7 @@ def create_py_executor(
             if _get_allow_chain_drafter():
                 use_chain_drafter = (
                     guided_decoding_config is None
-                    and not pytorch_backend_config.enable_mixed_sampler
+                    and draft_spec_config._allow_greedy_draft_tokens
                     and pytorch_backend_config.attn_backend == "TRTLLM")
             else:
                 use_chain_drafter = False
