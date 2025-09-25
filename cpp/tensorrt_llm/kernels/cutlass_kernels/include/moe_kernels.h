@@ -553,6 +553,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
         || std::is_same_v<T, __nv_fp8_e5m2>) &&!std::is_same_v<WeightType, cutlass::uint4b_t>;
     static constexpr bool use_w4afp8
         = std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, __nv_fp8_e4m3>;
+    static constexpr bool use_fp8_input = std::is_same_v<InputType, __nv_fp8_e4m3>;
     static_assert(!std::is_same_v<BackBoneType, __nv_fp8_e4m3>, "Current logic requires backbone type to be >=16-bits");
     static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3>, "Current logic requires output type to be >=16-bits");
 #else
