@@ -32,10 +32,12 @@ def _preload_python_lib():
     """
     Preload Python library.
 
-    On Linux, when using virtual environment on top of non-system Python installation,
+    On Linux, the python executable links to libpython statically,
+    so the dynamic library `libpython3.x.so` is not loaded.
+    When using virtual environment on top of non-system Python installation,
     our libraries installed under `$VENV_PREFIX/lib/python3.x/site-packages/`
-    have difficulties loading `$PREFIX/lib/libpython3.x.so.1.0` on their own
-    since venv does not symlink `libpython3.x.so` into `$VENV_PREFIX/lib/`.
+    have difficulties loading `$PREFIX/lib/libpython3.x.so.1.0` on their own,
+    since venv does not symlink `libpython3.x.so` into `$VENV_PREFIX/lib/`,
     and the relative path from `$VENV_PREFIX` to `$PREFIX` is arbitrary.
 
     We preload the libraries here since the Python executable under `$PREFIX/bin`
