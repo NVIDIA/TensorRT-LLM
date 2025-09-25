@@ -186,7 +186,7 @@ def construct_gpu_properties(mako_opts, device_index=0):
                     err_msg = r"Could not find a chip name associated with this device id - {}. Chip name won't be reported".format(
                         entity)
                     logger.warning(err_msg)
-            
+
         gpu_name = full_name.replace("NVIDIA", "").strip()
         assert gpu_name != "", "device_product_name is empty after removing substring 'NVIDIA' and leading/trailing whitespaces."
 
