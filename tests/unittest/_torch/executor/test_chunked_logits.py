@@ -253,7 +253,7 @@ class TestLlmRequest:
                              return_generation_logits=True)
 
         # Should use default values
-        assert request_non_streaming.py_use_chunked_logits is True  # Default is True
+        assert request_non_streaming.py_use_chunked_generation_logits is True  # Default is True
         assert request_non_streaming.py_logits_chunk_size == 8  # Default is 8
 
         request_streaming = LlmRequest(request_id=3,
@@ -263,7 +263,7 @@ class TestLlmRequest:
                         is_streaming=True,
                         return_generation_logits=True)
 
-        assert request_streaming.py_use_chunked_logits is True
+        assert request_streaming.py_use_chunked_generation_logits is True
         assert request_streaming.py_logits_chunk_size == 1 # 1 in stremaing mode
 
 class TestChunkedLogitsIntegration:

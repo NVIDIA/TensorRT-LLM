@@ -82,6 +82,6 @@ class HandleLogits:
 
         # Finalize any remaining logits transfers for all requests in chunked mode
         for llm_req in chain(context_requests, generation_requests):
-            if llm_req.py_use_chunked_logits:
+            if llm_req.py_use_chunked_generation_logits:
                 if llm_req.py_return_generation_logits or llm_req.py_return_context_logits:
                     llm_req.py_result.post_processing_transfer()
