@@ -305,8 +305,11 @@ def buildImage(config, imageKeyToTag)
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
 
-        if (target == "rockylinux8") {
+        if (target == "rockylinux8" || target == "rockylinux8_12_9") {
             BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        }
+        if (target == "rockylinux8_12_9") {
+            TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG_12_9=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
 
         // Replace the base image and triton image with the internal mirror
@@ -431,6 +434,20 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         ],
         "Build CI image (RockyLinux8 Python312)": [
             target: "rockylinux8",
+            args: "PYTHON_VERSION=3.12.3",
+            postTag: "-py312",
+        ],
+        "Build CI image for CUDA12.9 (x86_64 tritondevel)": [:],
+        "Build CI image for CUDA12.9 (SBSA tritondevel)": [
+            arch: "arm64",
+        ],
+        "Build CI image for CUDA12.9 (RockyLinux8 Python310)": [
+            target: "rockylinux8_12_9",
+            args: "PYTHON_VERSION=3.10.12",
+            postTag: "-py310",
+        ],
+        "Build CI image for CUDA12.9 (RockyLinux8 Python312)": [
+            target: "rockylinux8_12_9",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
