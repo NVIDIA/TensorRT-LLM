@@ -29,7 +29,8 @@ class SingleProcessGroup:
 
     @staticmethod
     def get_group():
-        return SingleProcessGroup()
+        return dist.group.WORLD if dist.is_initialized(
+        ) else SingleProcessGroup()
 
     @staticmethod
     def rank():

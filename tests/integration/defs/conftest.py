@@ -2443,6 +2443,8 @@ def torch_empty_cache() -> None:
 
 @pytest.fixture(autouse=True)
 def ray_cleanup(llm_venv) -> None:
+    yield
+
     if mpi_disabled():
         llm_venv.run_cmd([
             "-m",
