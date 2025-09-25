@@ -20,6 +20,7 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp8.h>
 #include <torch/extension.h>
 #include <unordered_map>
