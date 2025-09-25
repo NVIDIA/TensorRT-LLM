@@ -117,7 +117,7 @@ class Attention(nn.Module):
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
-        attn_output_gate: bool = False,
+        attn_output_gate: Optional[bool] = False,
     ):
         """
         Initialize the Attention module.
@@ -137,6 +137,7 @@ class Attention(nn.Module):
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
+            attn_output_gate (Optional[bool]): Whether to use the output gate in the attention OP. If None, whether to use is decided by the capability of the attention backend.
         """
         super().__init__()
         self.layer_idx = layer_idx

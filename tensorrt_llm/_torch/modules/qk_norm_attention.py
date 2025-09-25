@@ -157,7 +157,7 @@ class QKNormRoPEAttention(Attention):
         q_scaling: float = 1.0,
         disable_deep_gemm: bool = False,
         use_gemma_rms_norm: bool = False,
-        attn_output_gate: bool = False,
+        attn_output_gate: Optional[bool] = False,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -168,7 +168,7 @@ class QKNormRoPEAttention(Attention):
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
         rope_fusion = not self.fuse_qk_norm_rope and not skip_rope
-        if self.attn_output_gate and use_gemma_rms_norm:
+        if attn_output_gate and use_gemma_rms_norm:
             rope_fusion = False
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
