@@ -990,7 +990,7 @@ class PyTorchModelEngine(ModelEngine):
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
 
-                memo = dict()
+                memo = weakref.WeakValueDictionary()
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
