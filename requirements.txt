@@ -51,7 +51,7 @@ click
 click_option_group
 aenum
 pyzmq
-fastapi==0.115.4
+fastapi>=0.115.4,<=0.117.1
 uvicorn
 setuptools<80
 ordered-set
