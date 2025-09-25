@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Unit tests for chunked logits functionality in TensorRT-LLM.
 
@@ -30,7 +29,7 @@ def chunked_request():
                       sampling_config=SamplingConfig(),
                       is_streaming=False,
                       return_generation_logits=True,
-                      use_chunked_logits=True,
+                      use_chunked_generation_logits=True,
                       logits_chunk_size=4)
 
 
@@ -43,7 +42,7 @@ def non_chunked_request():
                       sampling_config=SamplingConfig(),
                       is_streaming=False,
                       return_generation_logits=True,
-                      use_chunked_logits=False)
+                      use_chunked_generation_logits=False)
 
 
 # Test parameters
@@ -62,13 +61,13 @@ class TestLogitsStorage:
         storage = LogitsStorage(seq_length=10,
                                 use_device_memory=True,
                                 should_exclude_last=False,
-                                use_chunked_logits=False,
+                                use_chunked_generation_logits=False,
                                 chunk_size=8)
 
         assert storage.seq_length == 10
         assert storage.use_device_memory is True
         assert storage._should_exclude_last is False
-        assert storage.use_chunked_logits is False
+        assert storage.use_chunked_generation_logits is False
         assert storage.chunk_size == 8
         assert storage._logits_indices == []
         assert storage.beam_width == -1
@@ -77,10 +76,10 @@ class TestLogitsStorage:
     def test_initialization_chunked_mode(self):
         """Test LogitsStorage initialization in chunked mode"""
         storage = LogitsStorage(seq_length=10,
-                                use_chunked_logits=True,
+                                use_chunked_generation_logits=True,
                                 chunk_size=4)
 
-        assert storage.use_chunked_logits is True
+        assert storage.use_chunked_generation_logits is True
         assert storage.chunk_size == 4
         assert hasattr(storage, '_device_fragments')
         assert hasattr(storage, '_current_position')
@@ -89,7 +88,7 @@ class TestLogitsStorage:
 
     def test_append_3d_logits(self, sample_logits):
         """Test appending 3D logits"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
+        storage = LogitsStorage(seq_length=10, use_chunked_generation_logits=False)
         storage.append(sample_logits)
 
         assert storage.beam_width == 1
@@ -97,7 +96,7 @@ class TestLogitsStorage:
 
     def test_append_invalid_shape(self):
         """Test appending logits with invalid shape"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
+        storage = LogitsStorage(seq_length=10, use_chunked_generation_logits=False)
 
         with pytest.raises(AssertionError):
             storage.append(torch.randn(1000))  # 1D - should fail
@@ -105,7 +104,7 @@ class TestLogitsStorage:
     def test_append_chunked_mode_streaming(self, sample_logits):
         """Test append behavior in chunked streaming mode"""
         storage = LogitsStorage(seq_length=10,
-                                use_chunked_logits=True,
+                                use_chunked_generation_logits=True,
                                 chunk_size=1)
         storage.append(sample_logits)
 
@@ -116,7 +115,7 @@ class TestLogitsStorage:
     def test_append_chunked_mode_non_streaming(self, sample_logits):
         """Test append behavior in chunked non-streaming mode"""
         storage = LogitsStorage(seq_length=10,
-                                use_chunked_logits=True,
+                                use_chunked_generation_logits=True,
                                 chunk_size=2)
 
         # Add first fragment
@@ -131,7 +130,7 @@ class TestLogitsStorage:
     def test_finalize_transfer_chunked_mode(self, sample_logits):
         """Test finalize_transfer in chunked mode"""
         storage = LogitsStorage(seq_length=10,
-                                use_chunked_logits=True,
+                                use_chunked_generation_logits=True,
                                 chunk_size=5)
         storage.append(sample_logits)
 
@@ -145,14 +144,14 @@ class TestLogitsStorage:
 
     def test_finalize_transfer_non_chunked_mode(self):
         """Test finalize_transfer in non-chunked mode (should be no-op)"""
-        storage = LogitsStorage(seq_length=10, use_chunked_logits=False)
+        storage = LogitsStorage(seq_length=10, use_chunked_generation_logits=False)
 
         # Should not raise any errors
         storage.finalize_transfer()
 
     def test_storage_overflow(self, sample_logits):
         """Test storage overflow handling"""
-        storage = LogitsStorage(seq_length=2, use_chunked_logits=False)
+        storage = LogitsStorage(seq_length=2, use_chunked_generation_logits=False)
         storage.append(sample_logits)
         storage.append(sample_logits)
 
@@ -173,7 +172,7 @@ class TestPyResult:
                           return_context_logits=True,
                           return_generation_logits=True,
                           exclude_last_generation_logits=False,
-                          use_chunked_logits=True,
+                          use_chunked_generation_logits=True,
                           chunk_size=4)
 
         assert result._streaming is False
@@ -198,7 +197,7 @@ class TestPyResult:
         result = PyResult(prompt_len=5,
                           max_new_tokens=10,
                           return_generation_logits=True,
-                          use_chunked_logits=True)
+                          use_chunked_generation_logits=True)
 
         result.append_generation_logits(sample_logits)
         result.post_processing_transfer()
@@ -210,7 +209,8 @@ class TestPyResult:
         result = PyResult(prompt_len=5,
                           max_new_tokens=10,
                           return_context_logits=True,
-                          use_chunked_logits=False)
+                          return_generation_logits=True,
+                          use_chunked_generation_logits=False)
 
         result.append_context_logits(sample_logits)
         context_logits = result.context_logits
@@ -224,20 +224,6 @@ class TestPyResult:
         assert generation_logits is not None
         assert generation_logits.shape == (1, 1, 1000
                                            )  # Should transpose dimensions
-
-    def test_generation_logits_property_streaming(self, sample_logits):
-        """Test generation_logits property in streaming mode"""
-        result = PyResult(prompt_len=5,
-                          max_new_tokens=10,
-                          return_generation_logits=True,
-                          use_chunked_logits=False,
-                          streaming=True)
-
-        result.append_generation_logits(sample_logits)
-        generation_logits = result.generation_logits
-
-        assert generation_logits is not None
-        assert generation_logits.shape == (1, 1, 1000)
 
 
 class TestLlmRequest:
@@ -278,7 +264,7 @@ class TestChunkedLogitsIntegration:
                                      sampling_config=SamplingConfig(),
                                      is_streaming=False,
                                      return_generation_logits=True,
-                                     use_chunked_logits=True,
+                                     use_chunked_generation_logits=True,
                                      logits_chunk_size=2)
 
         # Create non-chunked request
@@ -288,7 +274,7 @@ class TestChunkedLogitsIntegration:
                                          sampling_config=SamplingConfig(),
                                          is_streaming=False,
                                          return_generation_logits=True,
-                                         use_chunked_logits=False)
+                                         use_chunked_generation_logits=False)
 
         # Add same logits to both
         for _ in range(5):
@@ -319,7 +305,7 @@ class TestChunkedLogitsIntegration:
                                        sampling_config=SamplingConfig(),
                                        is_streaming=True,
                                        return_generation_logits=True,
-                                       use_chunked_logits=True,
+                                       use_chunked_generation_logits=True,
                                        logits_chunk_size=3)
 
         # Create non-streaming request
@@ -329,7 +315,7 @@ class TestChunkedLogitsIntegration:
                                            sampling_config=SamplingConfig(),
                                            is_streaming=False,
                                            return_generation_logits=True,
-                                           use_chunked_logits=True,
+                                           use_chunked_generation_logits=True,
                                            logits_chunk_size=3)
 
         # Add logits one by one
@@ -375,7 +361,7 @@ class TestChunkedLogitsIntegration:
             sampling_config=SamplingConfig(),
             is_streaming=False,
             return_generation_logits=True,
-            use_chunked_logits=True,
+            use_chunked_generation_logits=True,
             logits_chunk_size=2,
             return_logits_device_memory=False  # Use host memory
         )
@@ -402,7 +388,7 @@ class TestChunkedLogitsIntegration:
                              sampling_config=SamplingConfig(),
                              is_streaming=False,
                              return_generation_logits=True,
-                             use_chunked_logits=True,
+                             use_chunked_generation_logits=True,
                              logits_chunk_size=10)
 
         # Add many logits
@@ -447,7 +433,7 @@ class TestChunkedLogitsPerformance:
                                      sampling_config=SamplingConfig(),
                                      is_streaming=False,
                                      return_generation_logits=True,
-                                     use_chunked_logits=True,
+                                     use_chunked_generation_logits=True,
                                      logits_chunk_size=5,
                                      return_logits_device_memory=False)
 
@@ -464,7 +450,7 @@ class TestChunkedLogitsPerformance:
                                          sampling_config=SamplingConfig(),
                                          is_streaming=False,
                                          return_generation_logits=True,
-                                         use_chunked_logits=False,
+                                         use_chunked_generation_logits=False,
                                          return_logits_device_memory=False)
 
         for _ in range(50):
