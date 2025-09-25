@@ -305,9 +305,9 @@ def buildImage(config, imageKeyToTag)
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
 
-        // if (target == "rockylinux8" || target == "rockylinux8_12_9") {
-        //     BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        // }
+        if (target == "rockylinux8" || target == "rockylinux8_12_9") {
+            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        }
         if (target == "rockylinux8_12_9") {
             TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG_12_9=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
