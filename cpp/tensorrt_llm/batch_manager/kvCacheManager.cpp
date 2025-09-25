@@ -600,6 +600,21 @@ BlockPtr BlockManager::getFreeBlock(
 }
 
 // ===== hstu modification start =====
+LlmRequest::RequestIdType BlockManager::getRequestIdToEvict(
+    OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup) const
+{
+    if (!freezedIdGroup.has_value())
+        return mSeqLRUList.back();
+    
+    for (auto it = std::rbegin(mSeqLRUList); it != std::rend(mSeqLRUList); ++it) {
+        if (freezedIdGroup->find(*it) != freezedIdGroup->end())
+            continue;
+        return *it;
+    }
+    TLLM_CHECK_WITH_INFO(false, "Cannot find sequence to evict for more cache space.");
+    return mSeqLRUList.back();
+}
+
 void BlockManager::evictBlocks(GenerationRequest& sequence, SizeType32 numBlocksToEvict)
 {
     auto const requestId = sequence.getRequestId();
@@ -1808,7 +1823,9 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 
 // ===== hstu modification start =====
 void KVCacheManager::addSequenceWithEviction(
-    RequestIdType requestId, SizeType32 start_pos, SizeType32 length, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
+    RequestIdType requestId, SizeType32 start_pos, SizeType32 length, SizeType32 beamWidth, 
+    OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup,
+    OptionalRef<LlmRequest> llmRequest)
 {
     TLLM_CHECK_WITH_INFO(length <= mMaxBlocksPerSeq * mTokensPerBlock, 
         "Do not accept delta length %d, %d x %d.", length, mMaxBlocksPerSeq, mTokensPerBlock);
@@ -1824,7 +1841,7 @@ void KVCacheManager::addSequenceWithEviction(
             start_pos, start_pos + length);
     }
     if (mSequences.end() == oldSeqIt && (SizeType32)mSequences.size() == mMaxNumSequences) {
-        auto requestIdToEvict = mBlockManager.getRequestIdToEvict();
+        auto requestIdToEvict = mBlockManager.getRequestIdToEvict(freezedIdGroup);
         mSeqCacheStartPos.erase(requestIdToEvict);
         auto node = mSequences.extract(requestIdToEvict);
         mBlockManager.evictSequence(node.mapped());
@@ -1858,7 +1875,7 @@ void KVCacheManager::addSequenceWithEviction(
 
     SizeType32 numBlocksRequired = newBlocks - curBlocks;
     while (numBlocksRequired > getNumFreeBlocks()) {
-        auto requestIdToEvict = mBlockManager.getRequestIdToEvict();
+        auto requestIdToEvict = mBlockManager.getRequestIdToEvict(freezedIdGroup);
         // SizeType32 numBlocks = mSequences.at(requestIdToEvict).getCacheBlockIds().at(0).size();
         // if (numBlocks + getNumFreeBlocks() > numBlocksRequired) {
         //     SizeType32 numBlocksToEvict = numBlocksRequired - getNumFreeBlocks();

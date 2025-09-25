@@ -693,10 +693,8 @@ public:
     }
 
     // ===== hstu modification start =====
-    [[nodiscard]] LlmRequest::RequestIdType getRequestIdToEvict() const
-    {
-        return mSeqLRUList.back();
-    }
+    LlmRequest::RequestIdType getRequestIdToEvict(
+        OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup = std::nullopt) const;
     // ===== hstu modification end =====
 
     //! \brief Perform per-request bookkeeping
@@ -911,7 +909,8 @@ public:
 
     // ===== hstu modification start =====
     virtual void addSequenceWithEviction(LlmRequest::RequestIdType requestId, SizeType32 start_pos, SizeType32 inputLength,
-        SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest = std::nullopt)
+        SizeType32 beamWidth, OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup = std::nullopt,
+        OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
     virtual void offloadSequence(
@@ -1181,7 +1180,8 @@ public:
     
     // ===== hstu modification start =====
     void addSequenceWithEviction(LlmRequest::RequestIdType requestId, SizeType32 start_pos, SizeType32 length,
-        SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest = std::nullopt);
+        SizeType32 beamWidth, OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup = std::nullopt,
+        OptionalRef<LlmRequest> llmRequest = std::nullopt);
 
     void offloadSequence(
         LlmRequest::RequestIdType requestId, std::optional<SizeType32> numTokens = std::nullopt) override;
