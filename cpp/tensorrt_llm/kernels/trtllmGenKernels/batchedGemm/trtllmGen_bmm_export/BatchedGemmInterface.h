@@ -524,12 +524,13 @@ public:
     // Returns true if the configuration of the cubin can be executed for the given params.
     bool isValidConfig(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
+    // Creates GemmOptions from kernel and data.
+    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
+
 private:
     // Aligns the pointer to the alignment
     template <typename Dtype>
     inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
-    // Creates GemmOptions from kernel and data.
-    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the size of the workspace buffers in bytes
     std::vector<size_t> getWorkspaceSizesInBytes(BatchedGemmConfig const& config, BatchedGemmData const& data) const;

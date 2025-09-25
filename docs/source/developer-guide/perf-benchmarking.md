@@ -460,9 +460,10 @@ If you would like to force the KV cache quantization, you can specify the follow
 when the checkpoint precision is `null`:
 
 ```yaml
-kv_cache_dtype: "fp8"
+kv_cache_config:
+  dtype: fp8
 ```
 
 ```{tip}
-The two valid values for `kv_cache_dtype` are `auto` and `fp8`.
+The two valid values for `kv_cache_config.dtype` are `auto` and `fp8`.
 ```
