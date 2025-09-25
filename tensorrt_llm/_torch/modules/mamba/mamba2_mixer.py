@@ -130,14 +130,18 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
-        # norm
-        self.norm = RMSNormGated(
-            self.tp_d_inner,
-            eps=rms_norm_eps,
-            norm_before_gate=False,
-            group_size=self.tp_d_inner // self.tp_ngroups,
-            dtype=dtype,
-        )
+        # norm (only create if mamba_rms_norm is True)
+        mamba_rms_norm = getattr(config.pretrained_config, 'mamba_rms_norm', True)
+        if mamba_rms_norm:
+            self.norm = RMSNormGated(
+                self.tp_d_inner,
+                eps=rms_norm_eps,
+                norm_before_gate=False,
+                group_size=self.tp_d_inner // self.tp_ngroups,
+                dtype=dtype,
+            )
+        else:
+            self.norm = None
 
         # out_proj
         self.out_proj = Linear(
@@ -306,8 +310,9 @@ class Mamba2Mixer(nn.Module):
 
         out = torch.cat(out, dim=0)
 
-        # norm
-        out = self.norm(out)
+        # norm (only apply if norm exists)
+        if self.norm is not None:
+            out = self.norm(out)
 
         # out_proj
         out = self.out_proj(out)
