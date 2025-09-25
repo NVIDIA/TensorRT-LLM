@@ -46,40 +46,30 @@ class MllamaDecoderLayer(DecoderLayer):
         layer_idx: int,
     ) -> None:
         super().__init__()
-        pretrained_config = config.pretrained_config
-        # llama_config for reusing the LlamaAttention
-        llama_config = ModelConfig(
-            pretrained_config=pretrained_config.text_config,
-            mapping=config.mapping,
-            quant_config=config.quant_config,
-            quant_config_dict=config.quant_config_dict,
-            attn_backend=config.attn_backend)
-        llama_config.pretrained_config.attention_bias = False
-        llama_config.pretrained_config.mlp_bias = False
 
         self.layer_idx = layer_idx
 
         self.self_attn = LlamaAttention(
-            llama_config,
+            config,
             layer_idx=layer_idx,
         )
 
         self.mlp = GatedMLP(
-            hidden_size=llama_config.pretrained_config.hidden_size,
-            intermediate_size=llama_config.pretrained_config.intermediate_size,
-            bias=llama_config.pretrained_config.mlp_bias,
-            dtype=llama_config.pretrained_config.torch_dtype,
-            config=llama_config,
+            hidden_size=config.pretrained_config.hidden_size,
+            intermediate_size=config.pretrained_config.intermediate_size,
+            bias=config.pretrained_config.mlp_bias,
+            dtype=config.pretrained_config.torch_dtype,
+            config=config,
         )
         self.input_layernorm = RMSNorm(
-            hidden_size=llama_config.pretrained_config.hidden_size,
-            eps=llama_config.pretrained_config.rms_norm_eps,
-            dtype=llama_config.pretrained_config.torch_dtype)
+            hidden_size=config.pretrained_config.hidden_size,
+            eps=config.pretrained_config.rms_norm_eps,
+            dtype=config.pretrained_config.torch_dtype)
 
         self.post_attention_layernorm = RMSNorm(
-            hidden_size=llama_config.pretrained_config.hidden_size,
-            eps=llama_config.pretrained_config.rms_norm_eps,
-            dtype=llama_config.pretrained_config.torch_dtype)
+            hidden_size=config.pretrained_config.hidden_size,
+            eps=config.pretrained_config.rms_norm_eps,
+            dtype=config.pretrained_config.torch_dtype)
 
     def forward(
         self,
@@ -120,6 +110,17 @@ class MllamaTextModel(nn.Module):
     ):
         super().__init__()
         pretrained_config = config.pretrained_config
+        # llama_config for reusing the LlamaAttention
+        self.model_config = ModelConfig(
+            pretrained_config=pretrained_config.text_config,
+            mapping=config.mapping,
+            quant_config=config.quant_config,
+            quant_config_dict=config.quant_config_dict,
+            attn_backend=config.attn_backend)
+        self.model_config.pretrained_config.attention_bias = False
+        self.model_config.pretrained_config.mlp_bias = False
+
+        pretrained_config = config.pretrained_config
         text_config = pretrained_config.text_config
         self.padding_id = text_config.pad_token_id
         self.vocab_size = text_config.vocab_size
@@ -137,7 +138,8 @@ class MllamaTextModel(nn.Module):
                 # TODO: Cross-attention decoder layer impl.
                 layers.append(None)
             else:
-                layers.append(MllamaDecoderLayer(config, layer_idx=layer_id))
+                layers.append(
+                    MllamaDecoderLayer(self.model_config, layer_idx=layer_id))
 
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(hidden_size=text_config.hidden_size,
@@ -184,12 +186,14 @@ class MllamaForCausalLM(nn.Module):
         cache_config=None,
     ):
         super().__init__()
-        self.config = config
+        self.config = self.model_config = config
         pretrain_config = config.pretrained_config
         text_config = pretrain_config.text_config
 
         self.vocab_size = text_config.vocab_size
         self.model = MllamaTextModel(config, cache_config)
+        self.model_config.extra_attrs.update(
+            self.model.model_config.extra_attrs)
 
         # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
         # will considering per layer QuantConfig in the future.
@@ -289,6 +293,8 @@ class MllamaForConditionalGeneration(nn.Module):
             config,
             cache_config=cache_config,
         )
+        self.model_config.extra_attrs.update(
+            self.language_model.model_config.extra_attrs)
         self.multi_modal_projector = nn.Linear(
             pretrained_config.vision_config.vision_output_dim,
             pretrained_config.text_config.hidden_size,

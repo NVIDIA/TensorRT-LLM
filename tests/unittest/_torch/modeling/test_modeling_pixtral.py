@@ -3,6 +3,7 @@ import os
 import pathlib
 import pickle
 import sys
+from copy import deepcopy
 
 import cloudpickle
 import mpi4py
@@ -15,6 +16,7 @@ import tensorrt_llm
 from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_pixtral
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -92,10 +94,12 @@ def test_pixtral_vision_model_vs_hf():
     height, width, channels = 123, 456, 3
     pixel_values = torch.randn(batch_size, channels, height, width, device=device, dtype=dtype)
     image_sizes = torch.tensor([[height, width], [height - 7, width - 11]])
-    out = pixtral_model(
-        pixel_values=pixel_values,
-        image_sizes=image_sizes,
-    )
+    extra_attrs = deepcopy(pixtral_model.model_config.extra_attrs)
+    with model_extra_attrs(extra_attrs):
+        out = pixtral_model(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+        )
     with torch.autocast(device_type="cuda", dtype=dtype):
         hf_out = (
             hf_pixtral_model(
@@ -143,8 +147,9 @@ def test_tensor_parallelism(mpi_pool_executor, tmp_path):
     height, width, channels = 123, 456, 3
     pixel_values = torch.randn(batch_size, channels, height, width, device=device, dtype=dtype)
     image_sizes = torch.tensor([[height, width], [height - 7, width - 11]])
-
-    ref_out = pixtral_model(pixel_values=pixel_values, image_sizes=image_sizes)
+    extra_attrs = deepcopy(pixtral_model.model_config.extra_attrs)
+    with model_extra_attrs(extra_attrs):
+        ref_out = pixtral_model(pixel_values=pixel_values, image_sizes=image_sizes)
 
     # Move to CPU before sending across process barrier.
     ref_out = ref_out.to("cpu")
@@ -213,10 +218,11 @@ def _run_pixtral_and_compare_against_ref(
     params_fraction = rank_num_params / total_num_params
     assert params_fraction < 1.0
     assert params_fraction == pytest.approx(1.0 / world_size, rel=1e-2)
-
-    out = pixtral_model(
-        pixel_values=pixel_values,
-        image_sizes=image_sizes,
-    )
+    extra_attrs = deepcopy(pixtral_model.model_config.extra_attrs)
+    with model_extra_attrs(extra_attrs):
+        out = pixtral_model(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+        )
     torch.testing.assert_close(out, expected_output, atol=0.2, rtol=0.2)
     return True
