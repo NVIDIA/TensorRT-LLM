@@ -434,8 +434,14 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     port_name = mpi_publish_name()
 
     prompt = "What is the capital of Germany?"
-
-    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
+    mpi_info = MPI.Info.Create()
+    mpi_info.Set("oversubscribe", "true")
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib",
+                             "OMPI_MCA_rmaps_base_oversubscribe": "1"
+                         },
+                         mpi_info=mpi_info) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
