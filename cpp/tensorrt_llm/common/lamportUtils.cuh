@@ -127,7 +127,7 @@ struct LamportBufferLayout
     // Implicitly inlined
     [[nodiscard]] __device__ __host__ size_t getTotalBytes() const
     {
-        return num_stages * (bytes_per_buffer / num_stages) * num_lamport_buffers;
+        return num_stages * static_cast<size_t>(bytes_per_buffer / num_stages) * num_lamport_buffers;
     }
 
     // Implicitly inlined
@@ -136,7 +136,8 @@ struct LamportBufferLayout
     {
         // Typecast to avoid warnings
         return reinterpret_cast<void*>(reinterpret_cast<char*>(buffer_base_ptr)
-            + ((lamport_index * num_stages + stage_index) * (bytes_per_buffer / num_stages)));
+            + static_cast<size_t>(
+                (lamport_index * num_stages + stage_index) * static_cast<size_t>(bytes_per_buffer / num_stages)));
     }
 };
 // Current Index

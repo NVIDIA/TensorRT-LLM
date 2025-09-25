@@ -367,13 +367,14 @@ class MNNVLAllReduce(nn.Module):
         is_one_shot = num_tokens * hidden_dim * group_size * dtype.itemsize <= 64 * 1024 * 8
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
-            return num_tokens * hidden_dim * group_size * dtype.itemsize
+            workspace_size = num_tokens * hidden_dim * group_size * dtype.itemsize
         else:
             # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
             # 2 Stage is required for the two-shot allreduce.
-            return 2 * math.ceil(
+            workspace_size = 2 * math.ceil(
                 num_tokens /
                 group_size) * group_size * hidden_dim * dtype.itemsize
+        return workspace_size
 
     def forward(
         self,
@@ -395,11 +396,20 @@ class MNNVLAllReduce(nn.Module):
         input = input.view(-1, shape[-1])
         (num_tokens, hidden_dim) = input.shape
 
+        workspace_size_bytes = self.get_required_workspace_size(
+            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
+
+        # We use uint32_t to store workspace size related info. Safeguard against overflow.
+        if workspace_size_bytes >= 2**32 - 1:
+            # Raise an error so we can fallback to other allreduce strategies
+            raise ValueError(
+                f"[MNNVL AllReduce] Shard ({num_tokens}, {hidden_dim}), TP Size {self.mapping.tp_size}: Required Workspace size {workspace_size_bytes} bytes is too large!"
+            )
+
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,
             self.dtype,
-            buffer_size_bytes=self.get_required_workspace_size(
-                num_tokens, hidden_dim, self.mapping.tp_size, self.dtype),
+            buffer_size_bytes=workspace_size_bytes,
         )
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
