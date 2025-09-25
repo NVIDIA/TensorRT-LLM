@@ -34,7 +34,9 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
-        self.slot_manager = SlotManager(max_num_requests)
+        # There could be dummy request for padding batch when using CUDA graph.
+        # Reserve one more slot for the dummy request.
+        self.slot_manager = SlotManager(max_num_requests + 1)
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
