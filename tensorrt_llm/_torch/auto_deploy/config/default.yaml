@@ -54,6 +54,8 @@ transforms:
     stage: pattern_matcher
   quantize_int4_from_graph:
     stage: pattern_matcher
+  quantize_int4_linear_from_config:
+    stage: pattern_matcher
   quantize_fp8_linear_from_config:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
