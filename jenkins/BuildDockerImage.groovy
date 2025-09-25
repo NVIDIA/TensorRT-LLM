@@ -308,7 +308,10 @@ def buildImage(config, imageKeyToTag)
         if (target == "rockylinux8" || target == "rockylinux8_12_9") {
             BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
-        if (target == "rockylinux8_12_9") {
+        if (target == "tritondevel_12_9") {
+            BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_TAG_12_9=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        }
+        if (target == "tritondevel_12_9" || target == "rockylinux8_12_9") {
             TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG_12_9=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
 
@@ -437,10 +440,13 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        // "Build CI image for CUDA12.9 (x86_64 tritondevel)": [:],
-        // "Build CI image for CUDA12.9 (SBSA tritondevel)": [
-        //     arch: "arm64",
-        // ],
+        "Build CI image for CUDA12.9 (x86_64 tritondevel)": [
+            target: "tritondevel_12_9",
+        ],
+        "Build CI image for CUDA12.9 (SBSA tritondevel)": [
+            target: "tritondevel_12_9",
+            arch: "arm64",
+        ],
         "Build CI image for CUDA12.9 (RockyLinux8 Python310)": [
             target: "rockylinux8_12_9",
             args: "PYTHON_VERSION=3.10.12",
