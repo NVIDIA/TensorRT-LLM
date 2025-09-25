@@ -140,6 +140,7 @@ class CutlassMoEOp(MoEOp):
             output_dtype: torch.dtype,
             # Quantization parameters
             quant_scales: List[torch.Tensor],
+            use_all_to_all: bool,
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
             # Performance tuning (only runtime-variable parameters)
@@ -158,7 +159,7 @@ class CutlassMoEOp(MoEOp):
         ep_rank = module.ep_rank
         cluster_size = module.cluster_size
         cluster_rank = module.cluster_rank
-        enable_alltoall = module.enable_alltoall
+        use_all_to_all = use_all_to_all
         swiglu_alpha = module.swiglu_alpha
         swiglu_beta = module.swiglu_beta
         swiglu_limit = module.swiglu_limit
@@ -212,7 +213,7 @@ class CutlassMoEOp(MoEOp):
             ep_rank,
             cluster_size,
             cluster_rank,
-            enable_alltoall,
+            use_all_to_all,
             min_latency_mode,
             self.gemm_tactics,
             unpadded_hidden_size,
@@ -235,6 +236,7 @@ class CutlassMoEOp(MoEOp):
             output_dtype: torch.dtype,
             # Quantization parameters
             quant_scales: List[torch.Tensor],
+            use_all_to_all: bool,
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
             # Performance tuning (only runtime-variable parameters)
@@ -265,15 +267,15 @@ class CutlassMoEOp(MoEOp):
             use_fused_finalize: Use fused finalization
             tuner_num_tokens: Number of tokens for tuner input
             tuner_top_k: Top-k value for tuning
+            use_all_to_all: Whether to use all-to-all communication
 
         Returns:
             Computed MoE output tensor
         """
-        # Extract enable_alltoall from module to determine tuner_input logic
-        enable_alltoall = module.enable_alltoall
+        use_all_to_all = use_all_to_all
 
         # Compute tuner_input per fused_moe logic
-        if enable_alltoall:
+        if use_all_to_all:
             assert tuner_num_tokens is not None
             assert tuner_top_k is not None
             tuner_input = input[:tuner_num_tokens]
@@ -297,6 +299,7 @@ class CutlassMoEOp(MoEOp):
                                 w2_bias=w2_bias,
                                 output_dtype=output_dtype,
                                 quant_scales=quant_scales,
+                                use_all_to_all=use_all_to_all,
                                 input_sf=input_sf,
                                 swizzled_input_sf=swizzled_input_sf,
                                 min_latency_mode=min_latency_mode,
