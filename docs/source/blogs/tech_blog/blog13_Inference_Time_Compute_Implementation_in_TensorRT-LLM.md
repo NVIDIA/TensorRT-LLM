@@ -16,6 +16,7 @@ By NVIDIA TensorRT LLM Team and UCSD Hao AI Lab
     - [Introduction for Dynasor](#dynasor-introduction)
     - [Implement Dynasor-CoT in Scaffolding](#dynasor-cot-implement-in-scaffolding)
     - [Implement Dynasor-CoT based Majority Voting in Scaffolding](#dynasor-cot-based-majority-vote-in-scaffolding)
+    - [Acknowledgements](#dynasor-acknowledgements)
     - [Reference](#dynasor-reference)
   - [Feature List on Scaffolding](#scaffolding-feature-list)
   - [Future Work](#scaffolding-future-work)
@@ -400,6 +401,11 @@ llm = ScaffoldingLlm(
     )
 results = llm.generate(prompts)
 ```
+
+
+### Acknowledgements
+This work demonstrates an outstanding example of cross-team collaboration between the TensorRT LLM and UCSD Hao AI Lab. We sincerely appreciate the support from everyone who contributed to making this happen.
+
 
 ### Reference
 [1] Y. Fu*, J. Chen*, Y. Zhuang, Z. Fu, I. Stoica, and H. Zhang, "Dynasor: More Efficient Chain-of-Thought Through Certainty Probing," Hao-AI-Lab Blog, Feb. 16, 2025. [Online]. Available: https://hao-ai-lab.github.io/blogs/dynasor-cot/
