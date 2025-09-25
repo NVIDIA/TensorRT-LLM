@@ -231,7 +231,7 @@ l0_dgx_h100:
       backend: pytorch
       orchestrator: ray
   tests:
-    - unittest/_torch/ray/multi_gpu -m "gpu2"
+    - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu2"
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
     - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
     - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False]
