@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 @dataclass
 class ReasoningParserResult:
-    in_reasoning: bool
     content: str = ""
     reasoning_content: str = ""
 
@@ -39,13 +38,12 @@ class DeepSeekR1Parser(BaseReasoningParser):
                                      reasoning_content: str):
         if len(content) == 0:
             reasoning_parser_result = ReasoningParserResult(
-                True, reasoning_content=reasoning_content)
+                reasoning_content=reasoning_content)
         elif len(reasoning_content) == 0:
-            reasoning_parser_result = ReasoningParserResult(False,
-                                                            content=content)
+            reasoning_parser_result = ReasoningParserResult(content=content)
         else:
             reasoning_parser_result = ReasoningParserResult(
-                False, content=content, reasoning_content=reasoning_content)
+                content=content, reasoning_content=reasoning_content)
         return reasoning_parser_result
 
     def parse(self, text: str) -> ReasoningParserResult:
@@ -53,14 +51,14 @@ class DeepSeekR1Parser(BaseReasoningParser):
             splits = text.partition(self.reasoning_start)
             if splits[1] == "":
                 # no reasoning start tag found
-                return ReasoningParserResult(False, content=text)
+                return ReasoningParserResult(content=text)
             # reasoning start tag found
             # text before reasoning start tag is dropped
             text = splits[2]
         splits = text.partition(self.reasoning_end)
         reasoning_content, content = splits[0], splits[2]
-        return ReasoningParserResult(not bool(content), content,
-                                     reasoning_content)
+        return ReasoningParserResult(content=content,
+                                     reasoning_content=reasoning_content)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         self._buffer += delta_text
@@ -70,13 +68,13 @@ class DeepSeekR1Parser(BaseReasoningParser):
         if (self.reasoning_start.startswith(delta_text)
                 or self.reasoning_end.startswith(delta_text)):
             # waiting for more text to determine if it's a reasoning start or end tag
-            return ReasoningParserResult(self.in_reasoning)
+            return ReasoningParserResult()
 
         if not self.in_reasoning:
             begin_idx = delta_text.find(self.reasoning_start)
             if begin_idx == -1:
                 self._buffer = ""
-                return ReasoningParserResult(False, content=delta_text)
+                return ReasoningParserResult(content=delta_text)
             self.in_reasoning = True
             # set reasoning_content, will be processed by the next block
             reasoning_content = delta_text[begin_idx +
@@ -95,13 +93,13 @@ class DeepSeekR1Parser(BaseReasoningParser):
                     self._buffer = ""
                     reasoning_content = delta_text
                 return ReasoningParserResult(
-                    True, reasoning_content=reasoning_content)
+                    reasoning_content=reasoning_content)
             reasoning_content = delta_text[:end_idx]
             content = delta_text[end_idx + len(self.reasoning_end):]
             self.in_reasoning = False
             self._buffer = ""
-            return ReasoningParserResult(self.in_reasoning, content,
-                                         reasoning_content)
+            return ReasoningParserResult(content=content,
+                                         reasoning_content=reasoning_content)
         raise RuntimeError("Unreachable code reached.")
 
 
