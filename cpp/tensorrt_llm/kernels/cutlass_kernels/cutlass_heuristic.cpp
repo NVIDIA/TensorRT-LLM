@@ -461,8 +461,15 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         std::vector<CutlassGemmConfig> candidate_configs;
-        if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
+        if (config & CutlassGemmConfig::FP8FP4_MIXED){
+            // Mixed FP8 x FP4: restrict to 128x128x128B only
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
+                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+            return candidate_configs;
+        }
+        else if (config & CutlassGemmConfig::FP4_ONLY)
         {
+            // FP4 x FP4: allow all four tiles
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
@@ -473,10 +480,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
             return candidate_configs;
         }
-        else
-        {
-            TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
-        }
+        TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
     }
     else
     {
