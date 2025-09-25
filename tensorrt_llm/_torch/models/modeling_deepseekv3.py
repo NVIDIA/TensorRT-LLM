@@ -831,7 +831,7 @@ class Deepseekv3MoE(nn.Module):
                               all_rank_num_tokens, do_finalize):
         # max-throughput
         use_dp_padding = False
-        # Add attention DP padding on SM120 for context comm performance
+        # Add DP padding on SM120 for context comm performance
         enable_dp_padding = (
             get_sm_version() == 120
             and (not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or
