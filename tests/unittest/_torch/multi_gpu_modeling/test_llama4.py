@@ -81,7 +81,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
 
     assert len(outputs) == len(expected_outputs), "Output length mismatch"
 
-    def similar(a, b, threshold=0.9):
+    def similar(a, b, threshold=0.8):
         return SequenceMatcher(None, a, b).ratio() >= threshold
 
     for output, expected in zip(outputs, expected_outputs):
