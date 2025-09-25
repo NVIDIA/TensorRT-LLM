@@ -304,7 +304,7 @@ class SequenceInfo:
         return tuple(getattr(self, k) for k in self._cached_constants)
 
     @property
-    def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
+    def named_dynamic_shapes(self) -> Dict[str, DynamicShape]:
         """Return dynamic shapes of sequence info tensors.
 
         NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
