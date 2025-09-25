@@ -43,7 +43,11 @@ class CleanupInputConstraints(BaseTransform):
                 raise TypeError(f"Unexpected type {type(s)} in symbolic shape.")
 
         # update the max constraint for each vr
-        max_total = math.prod(vr.upper for vr in vrs)
+        # NOTE: this is more a heuristic anyway than a strict constraint. We just want to make sure
+        # that this never gets triggered. So we multiply by 1000 to be safe. Not that it has to
+        # be a symint (not an int) --> so that's why we use a heuristic based on the existing
+        # symint values instead of just using e.g. max_num_tokens...
+        max_total = math.prod(vr.upper for vr in vrs) * 1000
         for vr in vrs:
             object.__setattr__(vr, "upper", max_total)
 
