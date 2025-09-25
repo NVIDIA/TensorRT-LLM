@@ -201,6 +201,21 @@ public:
             }
             switch (mActivationDtype)
             {
+#ifdef ENABLE_FP8
+            case c10::ScalarType::Float8_e4m3fn:
+            {
+                if (isInt4Quant() and mUseW4GroupScaling)
+                {
+                    mKernelRunner = std::make_unique<
+                        kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>>();
+                }
+                else
+                {
+                    C10_THROW_ERROR_FORMATTED(Error, "FP8 activation type is not supported for non-W4A8 quantization");
+                }
+                break;
+            }
+#endif
             case c10::ScalarType::Half: mKernelRunner = create_weight_quant_runner<half>(); break;
             case c10::ScalarType::BFloat16: mKernelRunner = create_weight_quant_runner<__nv_bfloat16>(); break;
             default: C10_THROW_ERROR_FORMATTED(Error, "Unsupported activation type for int-type weight");
@@ -390,11 +405,13 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
-
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
+
+        // output is smaller than workspace. Create output after workspace to avoid output_shape occupied a little
+        // piece of memory which makes a big partition of memory segment can't be used by workspace.
+        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
+        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -787,6 +804,8 @@ private:
                 TLLM_LOG_DEBUG("MoE workspace size is not enough, increase the size from %ld bytes to %ld bytes",
                     workspace_info.workspace.numel(), total_workspace_size);
             }
+            // Release memory first to avoid OOM.
+            workspace_info = WorkspaceInfo();
             workspace_info.workspace = torch::empty({static_cast<long>(total_workspace_size)},
                 torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
         }
