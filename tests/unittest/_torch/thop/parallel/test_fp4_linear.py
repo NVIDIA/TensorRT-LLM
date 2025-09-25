@@ -400,6 +400,10 @@ def nvfp4_gemm_perf_test(
                                  (128, 7168, 2048), [127, 1024, 3200]])
 def test_fp4_linear_cublaslt(dtype, mnk):
     """Test cuBLASLt FP4 GEMM implementation and compare with nvfp4_gemm"""
+    from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
+    if not IS_CUBLASLT_AVAILABLE:
+        pytest.skip("cuBLASLt FP4 GEMM not available in this build")
+
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 

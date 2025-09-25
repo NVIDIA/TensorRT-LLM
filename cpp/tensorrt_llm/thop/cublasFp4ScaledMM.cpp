@@ -19,8 +19,10 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp8.h>
 #include <torch/extension.h>
+#include <unordered_map>
 
 using torch::Tensor;
 
@@ -41,9 +43,12 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     int32_t k_compressed = a.sizes()[1];
     int32_t k = k_compressed * 2;
 
-    // Use thread-local CublasMMWrapper for FP4 GEMM
-    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
-    if (cublasWrapper == nullptr)
+    // Use device-aware thread-local CublasMMWrapper for FP4 GEMM
+    at::cuda::CUDAGuard deviceGuard(a.device());
+
+    thread_local std::unordered_map<int, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
+    auto& cublasWrapper = cublasWrappers[a.get_device()];
+    if (!cublasWrapper)
     {
         auto cublasHandle = getCublasHandle();
         auto cublasLtHandle = getCublasLtHandle();
@@ -111,6 +116,15 @@ Tensor& cublas_fp4_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
     CHECK_TH_CUDA(alpha);
     CHECK_TH_CUDA(beta);
     CHECK_TH_CUDA(out);
+
+    // Ensure all tensors are on the same device
+    auto const deviceIndex = mat_a.get_device();
+    TORCH_CHECK(mat_b.get_device() == deviceIndex, "mat_b must be colocated with mat_a");
+    TORCH_CHECK(scale_a.get_device() == deviceIndex, "scale_a must be colocated with mat_a");
+    TORCH_CHECK(scale_b.get_device() == deviceIndex, "scale_b must be colocated with mat_a");
+    TORCH_CHECK(alpha.get_device() == deviceIndex, "alpha must be colocated with mat_a");
+    TORCH_CHECK(beta.get_device() == deviceIndex, "beta must be colocated with mat_a");
+    TORCH_CHECK(out.get_device() == deviceIndex, "out must be colocated with mat_a");
 
     // Check dimensions
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && out.dim() == 2);

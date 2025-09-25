@@ -55,6 +55,14 @@ option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
 option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
        ON)
 option(ENABLE_CUBLASLT_FP4_GEMM "Enable cuBLASLt FP4 GEMM support" ON)
+if(NOT ${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+  set(ENABLE_CUBLASLT_FP4_GEMM
+      OFF
+      CACHE BOOL "" FORCE)
+  message(
+    STATUS
+      "CUDA ${CUDAToolkit_VERSION} < 12.8: disabling ENABLE_CUBLASLT_FP4_GEMM")
+endif()
 option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM

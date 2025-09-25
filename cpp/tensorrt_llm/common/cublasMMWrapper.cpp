@@ -64,6 +64,7 @@ void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperatio
     check_cuda_error(
         cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAcc, sizeof(int8_t)));
 
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
     // Set pointer mode for FP4 GEMM
     if (mAType == CUDA_R_4F_E2M1)
     {
@@ -71,6 +72,7 @@ void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperatio
         check_cuda_error(cublasLtMatmulDescSetAttribute(
             mOperationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
     }
+#endif
 }
 
 void CublasMMWrapper::setScaleDescriptors(void* scale_a, void* scale_b)
