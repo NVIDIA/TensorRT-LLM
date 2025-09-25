@@ -234,7 +234,8 @@ def test_fused_moe_alltoall(alltoall_method_type):
                 dtype=dtype,
                 reduce_results=True,
                 model_config=ModelConfig(mapping=mapping,
-                                         max_num_tokens=MAX_NUM_TOKENS),
+                                         max_num_tokens=MAX_NUM_TOKENS,
+                                         moe_max_num_tokens=MAX_NUM_TOKENS),
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])

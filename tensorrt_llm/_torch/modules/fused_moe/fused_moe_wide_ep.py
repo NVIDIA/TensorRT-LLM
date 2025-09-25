@@ -672,6 +672,7 @@ class WideEPMoE(MoE):
             None,  # w2_bias
             output_dtype,
             quant_scales=quant_scales,
+            use_all_to_all=use_all_to_all,
             input_sf=x_sf,
             swizzled_input_sf=False,
             min_latency_mode=False,

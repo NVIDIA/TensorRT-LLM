@@ -77,6 +77,7 @@ class MoEOp(ABC):
             output_dtype: torch.dtype,
             # Quantization parameters
             quant_scales: List[torch.Tensor],
+            use_all_to_all: bool,
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
             # Performance tuning (only runtime-variable parameters)
@@ -102,6 +103,7 @@ class MoEOp(ABC):
             w2_bias: Optional bias
             output_dtype: Output data type
             quant_scales: Quantization scales
+            use_all_to_all: Whether to use all-to-all communication
             input_sf: Input scaling factor
             swizzled_input_sf: Whether input_sf is swizzled
             min_latency_mode: Use minimum latency optimizations
@@ -127,6 +129,7 @@ class MoEOp(ABC):
             output_dtype: torch.dtype,
             # Quantization parameters
             quant_scales: List[torch.Tensor],
+            use_all_to_all: bool,
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
             # Performance tuning (only runtime-variable parameters)
@@ -151,6 +154,7 @@ class MoEOp(ABC):
             w2_bias: Optional bias for w2 projection
             output_dtype: Desired output data type
             quant_scales: Quantization scales for weights
+            use_all_to_all: Whether to use all-to-all communication
             input_sf: Optional input scale factors for quantization
             swizzled_input_sf: Whether input scale factors are swizzled
             min_latency_mode: Use minimum latency optimizations
@@ -175,6 +179,7 @@ class MoEOp(ABC):
                                 w2_bias=w2_bias,
                                 output_dtype=output_dtype,
                                 quant_scales=quant_scales,
+                                use_all_to_all=use_all_to_all,
                                 input_sf=input_sf,
                                 swizzled_input_sf=swizzled_input_sf,
                                 min_latency_mode=min_latency_mode,
