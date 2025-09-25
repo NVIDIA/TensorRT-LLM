@@ -149,8 +149,7 @@ class SequenceInfo:
         self._num_pages = max(
             self.max_batch_size,
             (self.max_num_tokens) // self.page_size  # floored number of pages
-            + (self.max_num_tokens / self.max_batch_size % self.page_size > 0)  # check for overflow
-            * self.max_batch_size,  # +1 page per sequence if overflow is required
+            + (self.max_num_tokens % self.page_size > 0) * self.max_batch_size,  # +1 per sequence
         )
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
@@ -703,10 +702,6 @@ class SequenceInfo:
         if slot_idx is not None:
             free_slot_idx = self._get_unique_value(set(slot_idx), self.max_batch_size)
             self._store_arg("slot_idx", slot_idx, reset_val=free_slot_idx)
-
-        # check for updated slot_idx
-        if slot_idx is not None:
-            self._store_arg("slot_idx", slot_idx)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
