@@ -2,10 +2,10 @@ import torch  # noqa
 import torch.export as te
 from torch.export import Dim  # noqa
 
-# import pytest
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device  # noqa
+from _model_test_utils import get_small_model_config
 
 MODEL_DIR = "ibm-ai-platform/Bamba-9B-v2"
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
@@ -14,43 +14,36 @@ EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
 EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
-# @pytest.mark.parametrize(
-#     "model_on_meta_during_export",
-#     [
-#         True,
-#         False,
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "export_func",
-#     [
-#         "torch_export_to_gm",
-#         "torch_export",
-#     ],
-# )
-def test_bamba_patches(
-    model_on_meta_during_export: bool = True,
-    export_func: str = "torch_export_to_gm",
-    use_cache: bool = True,
-):
-    llm_args = AutoDeployConfig(
-        **{
+def test_bamba_patches():
+    model_on_meta_during_export = True
+    export_func: str = "torch_export_to_gm"
+    use_cache: bool = True
+
+    # NOTE: set to False if you want to locally test the full model
+    use_small_config: bool = True
+
+    common_kwargs = {
+        "world_size": 0,
+        "runtime": "demollm",
+        "compile_backend": "torch-simple",
+        "attn_backend": "flashinfer",
+        "model_factory": "AutoModelForCausalLM",
+        "max_seq_len": 512,
+    }
+
+    if use_small_config:
+        llm_args = get_small_model_config(MODEL_DIR, **common_kwargs)["args"]
+        llm_args["model_kwargs"]["use_cache"] = use_cache
+    else:
+        llm_args = {
             "model": MODEL_DIR,
-            "world_size": 0,
-            "runtime": "demollm",
-            "compile_backend": "torch-simple",
-            "attn_backend": "flashinfer",
-            "model_factory": "AutoModelForCausalLM",
+            **common_kwargs,
             "model_kwargs": {
-                # "use_cache": True,
                 "use_cache": use_cache,
                 "torch_dtype": "bfloat16",
-                # "num_hidden_layers": 10,
             },
-            "max_seq_len": 512,
-            "skip_loading_weights": False,
-        },
-    )
+        }
+    llm_args = AutoDeployConfig(**llm_args)
 
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -85,8 +78,7 @@ def test_bamba_patches(
             dynamic_shapes=dynamic_shapes,
             patch_list=[
                 "bamba",
-                # For "unsupported scalarType".
-                "autocast_noop",
+                "autocast_noop",  # For "unsupported scalarType".
             ],
         )
 
@@ -112,18 +104,14 @@ def test_bamba_patches(
         gm = _run_export()
         factory.load_or_random_init(gm, device="cuda")
         move_to_device(gm, "cuda")
-
-    factory.load_or_random_init(model, device="cuda")
-
-    _verify_generation(factory, model, tokenizer)
-    # return
-
-    print("====== EXPORTING GRAPH MODULE ======")
-    if not model_on_meta_during_export:
+        factory._to_maybe_random(model, "cuda")
+        model.load_state_dict(gm.state_dict())
+    else:
+        factory.load_or_random_init(model, device="cuda")
         gm = _run_export()
         move_to_device(gm, "cuda")
 
-    gm.model.A_log = model.model.A_log
+    _verify_generation(factory, model, tokenizer)
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
@@ -142,20 +130,12 @@ def test_bamba_patches(
     atol, rtol = 1e-3, 1e-3
     for comp, outs in outputs_for_comparison.items():
         print(f"====== COMPARISON ({comp}) ======")
-        try:
-            torch.testing.assert_close(
-                outs,
-                out_original,
-                rtol=rtol,
-                atol=atol,
-            )
-            print("Passed!")
-        except AssertionError as e:
-            print(e)
-            diff = torch.abs(outs.logits - out_original.logits)
-            print(f"abs diff: {diff}")
-            print(f"average diff: {diff.mean()}")
-            print(f"{comp=}")
+        torch.testing.assert_close(
+            outs,
+            out_original,
+            rtol=rtol,
+            atol=atol,
+        )
 
 
 def _verify_generation(factory, model, tokenizer):
@@ -179,18 +159,6 @@ def _generate(tokenizer, model):
     inputs = tokenizer(messages, return_tensors="pt", return_token_type_ids=False).to(model.device)
     response = model.generate(**inputs, max_new_tokens=64)
     print("\n".join(tokenizer.batch_decode(response, skip_special_tokens=True)))
-
-
-# def _get_example_inputs(llm_args, factory, device):
-#     batch_size = min(2, llm_args.max_batch_size)
-#     seq_len = min(4, llm_args.max_seq_len)
-#     inputs = {"input_ids": torch.ones(batch_size, seq_len, dtype=torch.int)}
-#     for key, value in inputs.items():
-#         if isinstance(value, torch.Tensor):
-#             dtype = torch.bfloat16 if isinstance(value, torch.FloatTensor) else None
-#             inputs[key] = value.to(device=device, dtype=dtype)
-#
-#     return inputs
 
 
 if __name__ == "__main__":
