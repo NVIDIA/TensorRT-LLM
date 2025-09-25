@@ -198,6 +198,10 @@ rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 rockylinux8_%: BASE_TAG = 13.0.0-devel-rockylinux8
 
+rockylinux8_12_9_%: STAGE = tritondevel
+rockylinux8_12_9_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+rockylinux8_12_9_%: BASE_TAG = 12.9.1-devel-rockylinux8
+
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
