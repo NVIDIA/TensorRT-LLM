@@ -889,8 +889,8 @@ if __name__ == "__main__":
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
     operations = []
     operations += generate_sm120_operations(has_arch(120) or has_arch(121))
-    operations += generate_sm103_operations(has_arch(103))
-    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+    operations += generate_sm103_operations(has_arch(103) and not has_arch(110))
+    operations += generate_sm100_operations(has_arch(100) or has_arch(103) or has_arch(110))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 

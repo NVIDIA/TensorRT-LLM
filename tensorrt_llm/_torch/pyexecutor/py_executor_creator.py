@@ -420,7 +420,7 @@ def create_py_executor(
 
         sm_version = get_sm_version()
         if kv_cache_config.enable_block_reuse and sm_version not in [
-                90, 100, 103, 120
+                90, 100, 103, 120, 110
         ]:
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "

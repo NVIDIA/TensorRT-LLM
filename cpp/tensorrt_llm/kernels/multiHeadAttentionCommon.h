@@ -113,6 +113,7 @@ constexpr int32_t kSM_90 = 90;
 constexpr int32_t kSM_100 = 100;
 constexpr int32_t kSM_100f = 10100;
 constexpr int32_t kSM_103 = 103;
+constexpr int32_t kSM_110 = 110;
 constexpr int32_t kSM_120 = 120;
 constexpr int32_t kSM_121 = 121;
 

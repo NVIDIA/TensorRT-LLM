@@ -695,7 +695,7 @@ def get_sm_version():
 def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version == 100 or sm_version == 103
+    return sm_version == 100 or sm_version == 103 or sm_version == 110
 
 
 def is_trace_enabled(env_var: str):

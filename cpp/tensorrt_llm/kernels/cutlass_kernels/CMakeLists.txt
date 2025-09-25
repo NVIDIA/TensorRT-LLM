@@ -73,13 +73,16 @@ function(process_target target_name enable_hopper enable_blackwell)
   if(${enable_blackwell}
      AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "110" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
           OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
          ))
 
     # Both 100 and 103 support these kernels
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+       OR "103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "110" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       )
       # No kernels should be parsed, unless blackwell is specified. This is a
       # build time improvement
       target_compile_definitions(${target_name}
@@ -88,7 +91,8 @@ function(process_target target_name enable_hopper enable_blackwell)
                                  PUBLIC COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
     endif()
     # SM103 only kernels
-    if("103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    if("103" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+        OR "110" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       target_compile_definitions(${target_name}
                                  PUBLIC COMPILE_BLACKWELL_SM103_TMA_GEMMS)
       target_compile_definitions(
@@ -143,6 +147,7 @@ function(add_instantiations library base_dir)
   glob_src_create_target(90 90)
   glob_src_create_target(100 100f)
   glob_src_create_target(103 103)
+  glob_src_create_target(110 110)
   glob_src_create_target(120 120f)
 endfunction()
 
@@ -255,7 +260,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   process_target(_moe_gemm_hopper_fp4 true false)
 
   add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
-  set_cuda_architectures(_moe_gemm_fp4 100f 103 120f)
+  set_cuda_architectures(_moe_gemm_fp4 100f 110 120f)
   process_target(_moe_gemm_fp4 false true)
 
   add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})

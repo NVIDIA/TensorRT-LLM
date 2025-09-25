@@ -141,6 +141,9 @@ function(setup_cuda_architectures)
     if("103" IN_LIST CMAKE_CUDA_ARCHITECTURES_CLEAN)
       list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN "100")
     endif()
+    if("110" IN_LIST CMAKE_CUDA_ARCHITECTURES_CLEAN)
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN "100")
+    endif()
     list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
     set(CMAKE_CUDA_ARCHITECTURES_RAW ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
   endif()
@@ -173,6 +176,7 @@ function(setup_cuda_architectures)
       90
       100
       103
+      110
       120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
@@ -200,7 +204,7 @@ function(setup_cuda_architectures)
   endif()
   # Compatibility low bounds: Always compile kernels for these architectures. 86
   # is enabled to avoid perf regression when using 80 kernels.
-  set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 120)
+  set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 110 120)
   # Exclude Tegra architectures
   set(ARCHITECTURES_NO_COMPATIBILITY 87 101)
 
