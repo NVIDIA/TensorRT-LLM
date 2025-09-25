@@ -241,6 +241,9 @@ class PyResult:
             assert chunk_size == 1, "chunk_size must be 1 in streaming mode"
         self._streaming = streaming
         self._chunk_size = chunk_size
+
+        # Note that in C++ implemnetation both context logits and generation logits are stored on host memory. 
+        # Here we only use host memory for generation logits if in chunked model. 
         self._context_logits = LogitsStorage(
             prompt_len,
             use_device_memory,
