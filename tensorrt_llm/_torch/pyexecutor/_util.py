@@ -13,6 +13,8 @@ from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
+from tensorrt_llm.inputs.registry import (create_input_processor,
+                                          create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SpeculativeConfig,
