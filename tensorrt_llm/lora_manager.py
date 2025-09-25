@@ -5,7 +5,7 @@ import re
 import tarfile
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -21,6 +21,7 @@ from .layers.linear import ColumnLinear
 from .lora_helper import (
     LoraConfig,
     get_default_trtllm_modules_to_hf_modules,
+    get_lora_weights_converters,
     get_missing_qkv_modules_from_lora_modules,
 )
 from .mapping import Mapping
@@ -243,7 +244,7 @@ class LoraModelConfig:
     trtllm_modules_to_hf_modules: dict[str, str]
     hidden_size: int
     dtype: str
-    swap_gate_up_proj_lora_b_weight: bool = True
+    lora_weights_converters: List[str] = field(default_factory=lambda: ["default"])
 
 
 class HfLoraLoader:
@@ -970,19 +971,6 @@ class LoraManager(object):
         )
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
 
-        def preprocess_lora_weights(lora_model, model_config):
-            # Swap weights of gate_up_proj
-            if getattr(model_config, "swap_gate_up_proj_lora_b_weight", True):
-                for key, value in lora_model.items():
-                    if "gate_up_proj.lora_B.weight" in key:
-                        original_weights = value.contiguous().clone()
-                        half_split = original_weights.shape[0] // 2
-                        first_half = original_weights[:half_split, :]
-                        second_half = original_weights[half_split:, :]
-                        value = torch.cat((second_half, first_half), dim=0)
-                        lora_model[key] = value
-            return lora_model
-
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._cpp_lora_weights:
                 self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
@@ -992,7 +980,9 @@ class LoraManager(object):
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
-            lora_model = preprocess_lora_weights(lora_model, model_config)
+            lora_weights_converters = getattr(model_config, "lora_weights_converters", ["default"])
+            for callable_func in get_lora_weights_converters(lora_weights_converters):
+                lora_model = callable_func(lora_model)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))

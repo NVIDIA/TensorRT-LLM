@@ -14,7 +14,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+
+import torch
 
 from ._utils import DictConversion
 
@@ -79,6 +81,36 @@ def use_lora(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
 
 
+def get_lora_weights_converters(names: List[str]) -> List[Callable]:
+
+    def default(lora_model):
+        """Default model weights converter in TRTLLM"""
+        for key, value in lora_model.items():
+            # Swap gate_up_proj.lora_B.weight to match with TRTLLM format.
+            if "gate_up_proj.lora_B.weight" in key:
+                original_weights = value.contiguous().clone()
+                half_split = original_weights.shape[0] // 2
+                first_half = original_weights[:half_split, :]
+                second_half = original_weights[half_split:, :]
+                value = torch.cat((second_half, first_half), dim=0)
+                lora_model[key] = value
+        return lora_model
+
+    def no_op(lora_model):
+        return lora_model
+
+    converter_mapping = {
+        "default": default,
+        "no_op": no_op,
+    }
+    callables = []
+    for name in names:
+        if name not in converter_mapping:
+            raise ValueError(f"Unsupported LoRA weights converter: {name}")
+        callables.append(converter_mapping[name])
+    return callables
+
+
 @dataclass
 class LoraConfig(DictConversion):
     lora_dir: List[str] = field(default_factory=list)
@@ -88,7 +120,8 @@ class LoraConfig(DictConversion):
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
     max_loras: Optional[int] = None
     max_cpu_loras: Optional[int] = None
-    swap_gate_up_proj_lora_b_weight: bool = True
+    lora_weights_converters: List[str] = field(
+        default_factory=lambda: ["default"])
 
     def __post_init__(self):
         assert self.lora_ckpt_source in [
