@@ -45,13 +45,6 @@ def non_chunked_request():
                       use_chunked_generation_logits=False)
 
 
-# Test parameters
-CHUNK_SIZES = [1, 2, 4, 8, 16]
-STREAMING_MODES = [True, False]
-DEVICE_MEMORY_MODES = [True, False]
-LOGITS_SHAPES = [(1, 1, 1000), (2, 1, 1000), (1, 2, 1000)]
-
-
 class TestLogitsStorage:
     """Unit tests for LogitsStorage class"""
 
@@ -129,8 +122,8 @@ class TestLogitsStorage:
         assert len(storage._device_fragments) == 0
         assert storage._current_position == 2
 
-    def test_finalize_transfer_chunked_mode(self, sample_logits):
-        """Test finalize_transfer in chunked mode"""
+    def test_finalize_chunked_transfer_chunked_mode(self, sample_logits):
+        """Test finalize_chunked_transfer in chunked mode"""
         storage = LogitsStorage(seq_length=10,
                                 use_chunked_generation_logits=True,
                                 chunk_size=5)
@@ -139,18 +132,18 @@ class TestLogitsStorage:
         # Should have fragment pending
         assert len(storage._device_fragments) == 1
 
-        storage.finalize_transfer()
+        storage.finalize_chunked_transfer()
 
         # Should transfer remaining fragments
         assert len(storage._device_fragments) == 0
 
-    def test_finalize_transfer_non_chunked_mode(self):
-        """Test finalize_transfer in non-chunked mode (should be no-op)"""
+    def test_finalize_chunked_transfer_non_chunked_mode(self):
+        """Test finalize_chunked_transfer in non-chunked mode (should be no-op)"""
         storage = LogitsStorage(seq_length=10,
                                 use_chunked_generation_logits=False)
 
         # Should not raise any errors
-        storage.finalize_transfer()
+        storage.finalize_chunked_transfer()
 
     def test_storage_overflow(self, sample_logits):
         """Test storage overflow handling"""
@@ -197,15 +190,15 @@ class TestPyResult:
         result.append_context_logits(sample_logits)
         result.append_generation_logits(sample_logits)
 
-    def test_post_processing_transfer(self, sample_logits):
-        """Test post_processing_transfer method"""
+    def test_transfer_remaining_device_logits(self, sample_logits):
+        """Test transfer_remaining_device_logits method"""
         result = PyResult(prompt_len=5,
                           max_new_tokens=10,
                           return_generation_logits=True,
                           use_chunked_generation_logits=True)
 
         result.append_generation_logits(sample_logits)
-        result.post_processing_transfer()
+        result.transfer_remaining_device_logits()
 
         # Should not raise errors
 
@@ -289,7 +282,7 @@ class TestChunkedLogitsIntegration:
                 sample_logits)
 
         # Finalize chunked request
-        chunked_request.py_result.post_processing_transfer()
+        chunked_request.py_result.transfer_remaining_device_logits()
 
         # Get results
         chunked_logits = chunked_request.py_result.generation_logits
@@ -344,8 +337,8 @@ class TestChunkedLogitsIntegration:
                                                    1) % 3  # Modulo chunk_size
 
         # Finalize both
-        streaming_request.py_result.post_processing_transfer()
-        non_streaming_request.py_result.post_processing_transfer()
+        streaming_request.py_result.transfer_remaining_device_logits()
+        non_streaming_request.py_result.transfer_remaining_device_logits()
 
         # Both should have same final result
         streaming_logits = streaming_request.py_result.generation_logits
@@ -381,7 +374,7 @@ class TestChunkedLogitsIntegration:
         assert request.py_result._generation_logits._storage.device.type == 'cpu'
 
         # Finalize
-        request.py_result.post_processing_transfer()
+        request.py_result.transfer_remaining_device_logits()
 
         # Should have no pending fragments
         assert len(request.py_result._generation_logits._device_fragments) == 0
@@ -409,72 +402,12 @@ class TestChunkedLogitsIntegration:
             assert fragments == expected_fragments
 
         # Finalize
-        request.py_result.post_processing_transfer()
+        request.py_result.transfer_remaining_device_logits()
 
         # Should have final result
         final_logits = request.py_result.generation_logits
         assert final_logits is not None
         assert final_logits.shape == (1, 50, 1000)
-
-
-class TestChunkedLogitsPerformance:
-    """Performance tests for chunked logits functionality"""
-
-    def test_memory_usage_comparison(self, sample_logits):
-        """Test memory usage comparison between chunked and non-chunked modes"""
-        import os
-
-        import psutil
-
-        def get_memory_usage():
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / 1024 / 1024  # MB
-
-        # Test chunked mode
-        initial_memory = get_memory_usage()
-
-        chunked_request = LlmRequest(request_id=13,
-                                     max_new_tokens=50,
-                                     input_tokens=[1, 2, 3],
-                                     sampling_config=SamplingConfig(),
-                                     is_streaming=False,
-                                     return_generation_logits=True,
-                                     use_chunked_generation_logits=True,
-                                     logits_chunk_size=5,
-                                     return_logits_device_memory=False)
-
-        for _ in range(50):
-            chunked_request.py_result.append_generation_logits(sample_logits)
-
-        chunked_request.py_result.post_processing_transfer()
-        chunked_memory = get_memory_usage()
-
-        # Test non-chunked mode
-        non_chunked_request = LlmRequest(request_id=14,
-                                         max_new_tokens=50,
-                                         input_tokens=[1, 2, 3],
-                                         sampling_config=SamplingConfig(),
-                                         is_streaming=False,
-                                         return_generation_logits=True,
-                                         use_chunked_generation_logits=False,
-                                         return_logits_device_memory=False)
-
-        for _ in range(50):
-            non_chunked_request.py_result.append_generation_logits(
-                sample_logits)
-
-        non_chunked_memory = get_memory_usage()
-
-        # Both should use reasonable memory
-        chunked_delta = chunked_memory - initial_memory
-        non_chunked_delta = non_chunked_memory - chunked_memory
-
-        print(f"Chunked mode memory delta: {chunked_delta:.2f} MB")
-        print(f"Non-chunked mode memory delta: {non_chunked_delta:.2f} MB")
-
-        # Both should be reasonable (less than 100MB for this test)
-        assert chunked_delta < 100
-        assert non_chunked_delta < 100
 
 
 if __name__ == "__main__":

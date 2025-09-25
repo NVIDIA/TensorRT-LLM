@@ -156,8 +156,6 @@ class LogitsStorage:
 
         # Allocate host storage if needed
         assert self._storage is not None, "Storage should be initialized"
-        # if self._storage is None:
-        #     self._init(self._device_fragments[0])
 
         # Merge fragments on device first
         merged_logits = torch.cat(self._device_fragments, dim=0)
@@ -172,7 +170,7 @@ class LogitsStorage:
         self._current_position = end_pos
         self._device_fragments.clear()
 
-    def finalize_transfer(self):
+    def finalize_chunked_transfer(self):
         """Force transfer of any remaining fragments to host (for chunked mode)"""
         if self.use_chunked_generation_logits and self._device_fragments:
             self._transfer_chunk_to_host()
@@ -274,12 +272,10 @@ class PyResult:
         self._mm_embeddings = SharedTensorContainer.from_tensor(
             mm_embeddings).dump_to_dict()
 
-    def post_processing_transfer(self):
-        """Finalize any remaining logits transfers (for chunked mode)"""
-        if self._context_logits:
-            self._context_logits.finalize_transfer()
+    def transfer_remaining_device_logits(self):
+        """Finalize any remaining generation logits transfers (for chunked mode)"""
         if self._generation_logits:
-            self._generation_logits.finalize_transfer()
+            self._generation_logits.finalize_chunked_transfer()
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -400,8 +396,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             is_first_draft: bool = False,
-            use_chunked_generation_logits:
-        bool = True,  # should only be used for generation logits
+            use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             **kwargs):
 
