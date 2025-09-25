@@ -29,8 +29,8 @@ class MoERunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-            lambda x: min(last_positive_power_of_2(x), 8192)), ),
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
         tune_max_num_tokens=8192,
     )
 
