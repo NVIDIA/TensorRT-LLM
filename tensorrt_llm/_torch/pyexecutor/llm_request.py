@@ -242,12 +242,11 @@ class PyResult:
         self._streaming = streaming
         self._chunk_size = chunk_size
 
-        # Note that in C++ implemnetation both context logits and generation logits are stored on host memory. 
-        # Here we only use host memory for generation logits if in chunked model. 
+        # Note that in C++ implemnetation both context logits and generation logits are stored on host memory.
+        # Here we only use host memory for generation logits if in chunked model.
         self._context_logits = LogitsStorage(
-            prompt_len,
-            use_device_memory,
-            use_chunked_generation_logits=False) if return_context_logits else None
+            prompt_len, use_device_memory, use_chunked_generation_logits=False
+        ) if return_context_logits else None
         self._generation_logits = LogitsStorage(
             max_new_tokens,
             use_device_memory,
@@ -401,7 +400,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             is_first_draft: bool = False,
-            use_chunked_generation_logits: bool = True, # should only be used for generation logits
+            use_chunked_generation_logits:
+        bool = True,  # should only be used for generation logits
             logits_chunk_size: int = 8,
             **kwargs):
 
@@ -468,16 +468,17 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
 
-        self.py_result = PyResult(self.py_prompt_len,
-                                  self.py_max_new_tokens,
-                                  return_logits_device_memory,
-                                  self.streaming,
-                                  return_log_probs,
-                                  return_context_logits,
-                                  return_generation_logits,
-                                  exclude_last_generation_logits,
-                                  use_chunked_generation_logits=self.py_use_chunked_generation_logits,
-                                  chunk_size=self.py_logits_chunk_size)
+        self.py_result = PyResult(
+            self.py_prompt_len,
+            self.py_max_new_tokens,
+            return_logits_device_memory,
+            self.streaming,
+            return_log_probs,
+            return_context_logits,
+            return_generation_logits,
+            exclude_last_generation_logits,
+            use_chunked_generation_logits=self.py_use_chunked_generation_logits,
+            chunk_size=self.py_logits_chunk_size)
         self.child_requests = []
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None

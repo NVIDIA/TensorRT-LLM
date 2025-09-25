@@ -5,12 +5,11 @@ This module tests the chunked logits storage system that provides memory-efficie
 logits handling through device-side fragments and batched host transfers.
 """
 
-
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    LlmRequest, LogitsStorage, PyResult)
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LogitsStorage, PyResult)
 from tensorrt_llm.bindings import SamplingConfig
 
 
@@ -19,6 +18,7 @@ from tensorrt_llm.bindings import SamplingConfig
 def sample_logits():
     """Generate sample logits for testing"""
     return torch.randn(1, 1, 1000, device='cuda')
+
 
 @pytest.fixture
 def chunked_request():
@@ -88,7 +88,8 @@ class TestLogitsStorage:
 
     def test_append_3d_logits(self, sample_logits):
         """Test appending 3D logits"""
-        storage = LogitsStorage(seq_length=10, use_chunked_generation_logits=False)
+        storage = LogitsStorage(seq_length=10,
+                                use_chunked_generation_logits=False)
         storage.append(sample_logits)
 
         assert storage.beam_width == 1
@@ -96,7 +97,8 @@ class TestLogitsStorage:
 
     def test_append_invalid_shape(self):
         """Test appending logits with invalid shape"""
-        storage = LogitsStorage(seq_length=10, use_chunked_generation_logits=False)
+        storage = LogitsStorage(seq_length=10,
+                                use_chunked_generation_logits=False)
 
         with pytest.raises(AssertionError):
             storage.append(torch.randn(1000))  # 1D - should fail
@@ -144,20 +146,23 @@ class TestLogitsStorage:
 
     def test_finalize_transfer_non_chunked_mode(self):
         """Test finalize_transfer in non-chunked mode (should be no-op)"""
-        storage = LogitsStorage(seq_length=10, use_chunked_generation_logits=False)
+        storage = LogitsStorage(seq_length=10,
+                                use_chunked_generation_logits=False)
 
         # Should not raise any errors
         storage.finalize_transfer()
 
     def test_storage_overflow(self, sample_logits):
         """Test storage overflow handling"""
-        storage = LogitsStorage(seq_length=2, use_chunked_generation_logits=False)
+        storage = LogitsStorage(seq_length=2,
+                                use_chunked_generation_logits=False)
         storage.append(sample_logits)
         storage.append(sample_logits)
 
         # This should cause overflow
         with pytest.raises(ValueError, match="LogitsStorage overflow"):
             storage.append(sample_logits)
+
 
 class TestPyResult:
     """Unit tests for PyResult class"""
@@ -232,25 +237,26 @@ class TestLlmRequest:
     def test_initialization_chunked_logits(self):
         """Test LlmRequest initialization with default chunked logits"""
         request_non_streaming = LlmRequest(request_id=2,
-                             max_new_tokens=10,
-                             input_tokens=[1, 2, 3],
-                             sampling_config=SamplingConfig(),
-                             is_streaming=False,
-                             return_generation_logits=True)
+                                           max_new_tokens=10,
+                                           input_tokens=[1, 2, 3],
+                                           sampling_config=SamplingConfig(),
+                                           is_streaming=False,
+                                           return_generation_logits=True)
 
         # Should use default values
         assert request_non_streaming.py_use_chunked_generation_logits is True  # Default is True
         assert request_non_streaming.py_logits_chunk_size == 8  # Default is 8
 
         request_streaming = LlmRequest(request_id=3,
-                        max_new_tokens=10,
-                        input_tokens=[1, 2, 3],
-                        sampling_config=SamplingConfig(),
-                        is_streaming=True,
-                        return_generation_logits=True)
+                                       max_new_tokens=10,
+                                       input_tokens=[1, 2, 3],
+                                       sampling_config=SamplingConfig(),
+                                       is_streaming=True,
+                                       return_generation_logits=True)
 
         assert request_streaming.py_use_chunked_generation_logits is True
-        assert request_streaming.py_logits_chunk_size == 1 # 1 in stremaing mode
+        assert request_streaming.py_logits_chunk_size == 1  # 1 in streaming mode
+
 
 class TestChunkedLogitsIntegration:
     """Integration tests for chunked logits functionality"""
@@ -347,7 +353,7 @@ class TestChunkedLogitsIntegration:
 
         assert streaming_logits is not None
         assert non_streaming_logits is not None
-        # In non-streaming mode, logits are retrived as a single tensor, where in streaming mode, logits is the last token.
+        # In non-streaming mode, logits are retrieved as a single tensor, where in streaming mode, logits is the last token.
         assert torch.allclose(streaming_logits,
                               non_streaming_logits[-1],
                               atol=1e-6)
