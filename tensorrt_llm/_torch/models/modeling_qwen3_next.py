@@ -437,9 +437,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if not do_finalize:
-            # assert not self.enable_attention_dp
-            ### TODO: support do_finalize == False?
-            assert False
+            # TODO: support do_finalize == False
+            raise NotImplementedError(
+                "do_finalize == False is not supported yet")
 
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             if isinstance(self.experts, TRTLLMGenFusedMoE):

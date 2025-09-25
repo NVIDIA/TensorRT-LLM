@@ -929,10 +929,9 @@ Dynamo supports TensorRT LLM as one of its inference engine. For details on how 
 
 ## Qwen3-Next
 
-To run Qwen3-Next, we need to install the latest transformers and then we can run it directly. (Note that it does not support IFB now. So, we recommend to use BS = 1 first.)
+Below is the command to run the Qwen3-Next model.
 
 ```bash
-pip install git+https://github.com/huggingface/transformers
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir /Qwen3-Next-80B-A3B-Thinking --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 4
 
 ```
