@@ -68,7 +68,8 @@ def test_single_completion(client: openai.OpenAI, model_name):
     assert completion.usage == openai.types.CompletionUsage(
         completion_tokens=completion_tokens,
         prompt_tokens=prompt_tokens,
-        total_tokens=prompt_tokens + completion_tokens)
+        total_tokens=prompt_tokens + completion_tokens,
+        prompt_tokens_details=openai.types.PromptTokensDetails(cached_tokens=0))
 
     # test using token IDs
     completion = client.completions.create(
