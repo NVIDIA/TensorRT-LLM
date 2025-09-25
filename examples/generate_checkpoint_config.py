@@ -12,7 +12,7 @@ def parse_arguments():
         '--output_path',
         type=str,
         default='config.json',
-        help='The path to save the TensorRT-LLM checkpoint config.json file')
+        help='The path to save the TensorRT LLM checkpoint config.json file')
     parser.add_argument('--architecture', type=str, default='GPTForCausalLM')
     parser.add_argument('--dtype',
                         type=str,

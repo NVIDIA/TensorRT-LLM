@@ -269,7 +269,7 @@ class AutoTunerStatistics:
 
 
 class AutoTuner:
-    """AutoTuner for optimizing TensorRT-LLM operations.
+    """AutoTuner for optimizing TensorRT LLM operations.
 
     This class handles automatic performance tuning of tensor operations by profiling
     different implementations and caching the best performing configurations.
