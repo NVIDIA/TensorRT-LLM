@@ -2233,15 +2233,11 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                // Save either lastBlockId (reuse enabled and no VSWA) or just the request
                 std::optional<SizeType32> lastBlockId{};
                 auto kvMgr = mModel->getKVCacheManager();
                 if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
                 {
-                    if (auto last = kvMgr->getLastBlockId(llmReq->mRequestId))
-                    {
-                        lastBlockId = last.value();
-                    }
+                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
                     mModel->terminateRequest(llmReq);
                 }
                 inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
