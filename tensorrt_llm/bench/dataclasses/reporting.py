@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple
 
-from tensorrt_llm._torch.pyexecutor.model_engine import \
+from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
