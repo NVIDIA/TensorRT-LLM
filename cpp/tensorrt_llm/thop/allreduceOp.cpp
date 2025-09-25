@@ -163,10 +163,11 @@ public:
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
+        size_t hidden_size = input.size(-1);
         size_t bytes_per_element = input.element_size();
         TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
-        AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
+        AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, hidden_size);
 
         // Log runtime strategy
         auto const rank = COMM_SESSION.getRank();
@@ -657,7 +658,7 @@ private:
         return {};
     }
 
-    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
+    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t hidden_size)
     {
         AllReduceStrategyType runtime_strategy;
         if (mStrategy == AllReduceStrategyType::UB)
@@ -682,7 +683,7 @@ private:
             }
             else
             {
-                runtime_strategy = selectImplementation(seq_len, size, mGroup.size(), mType);
+                runtime_strategy = selectImplementation(seq_len, hidden_size, mGroup.size(), mType);
             }
         }
         return runtime_strategy;
@@ -892,10 +893,10 @@ private:
     }
 
     AllReduceStrategyType selectImplementation(
-        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type)
+        size_t seq_len, size_t hidden_size, int world_size, nvinfer1::DataType type)
     {
-
-        if (isUsingLowPrecision(message_size))
+        auto const message_size = seq_len * hidden_size;
+        if (isUsingLowPrecision(hidden_size))
         {
             return AllReduceStrategyType::LOWPRECISION;
         }
@@ -955,37 +956,9 @@ private:
         }
         else
         {
-            // The heuristic is based on the following assumptions:
-            //  __________________________________
-            // |              \ TWO-SHOT zone |
-            // | ONE-SHOT zone    \           | NCCL zone
-            // |_______________________\______|___
-            // sm_major is 9 or 10
-            auto const sm_major = std::min(10, std::max(9, tensorrt_llm::common::getSMVersion() / 10));
-
-            TORCH_CHECK(
-                m2DHeuristicThreshold.find(sm_major) != m2DHeuristicThreshold.end(), "SM major version not supported");
-            TORCH_CHECK(m2DHeuristicThreshold[sm_major].find(world_size) != m2DHeuristicThreshold[sm_major].end(),
-                "TP size not supported");
-
-            auto const [nccl_num_token_threshold, two_shot_numel_threshold]
-                = m2DHeuristicThreshold[sm_major][world_size];
-
-            if (seq_len >= nccl_num_token_threshold)
-            {
-                strategy = AllReduceStrategyType::NCCL;
-            }
-            else
-            {
-                if (message_size >= two_shot_numel_threshold)
-                {
-                    strategy = AllReduceStrategyType::TWOSHOT;
-                }
-                else
-                {
-                    strategy = AllReduceStrategyType::ONESHOT;
-                }
-            }
+            // strategy = SelectStrategyLP(seq_len, hidden_size, world_size, mOp);
+            strategy = tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
+                seq_len, hidden_size, mOp, world_size);
         }
         return strategy;
     }
@@ -1015,22 +988,6 @@ private:
     float mEps;
     std::shared_ptr<ncclComm_t> mNcclComm;
     static std::unordered_map<int, std::unordered_map<int, std::pair<size_t, size_t>>> m2DHeuristicThreshold;
-};
-
-// (SM major_version, TP_size) -> (NCCL_num_token_threshold, TWO_SHOT_numel_threshold)
-std::unordered_map<int, std::unordered_map<int, std::pair<size_t, size_t>>> AllreduceOp::m2DHeuristicThreshold{
-    {9,
-        {
-            {2, {4096, 4096 * 4096}},
-            {4, {4096, 1024 * 1024}},
-            {8, {2048, 512 * 512}},
-        }},
-    {10,
-        {
-            {2, {4096, 4096 * 4096}},
-            {4, {4096, 1024 * 2048}},
-            {8, {4096, 1024 * 1024}},
-        }},
 };
 
 } // namespace
