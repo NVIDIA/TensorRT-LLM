@@ -6,9 +6,16 @@ set -ex
 # CUDA version is usually aligned with the latest NGC CUDA image tag.
 # Only use when public CUDA image is not ready.
 CUDA_VER="13.0.0_580.65.06"
+
+# For CUDA 12.9
+CUDA_VER_12_9="12.9.1_575.57.08"
+NVCC_VERSION_OUTPUT=$(nvcc --version)
+if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) == ${CUDA_VER_12_9%%.*_*} ]]; then
+    CUDA_VER="${CUDA_VER_12_9}"
+fi
+
 CUDA_VER_SHORT="${CUDA_VER%_*}"
 
-NVCC_VERSION_OUTPUT=$(nvcc --version)
 OLD_CUDA_VER=$(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1)
 echo "The version of pre-installed CUDA is ${OLD_CUDA_VER}."
 
