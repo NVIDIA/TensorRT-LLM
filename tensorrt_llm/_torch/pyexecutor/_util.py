@@ -10,8 +10,10 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (PeftCacheConfig, SamplerType,
-                                          SpeculativeConfig)
+from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
+                                          MTPDecodingConfig, PeftCacheConfig,
+                                          SamplerType, SpeculativeConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -332,13 +334,9 @@ class KvCacheCreator:
             logger.info(
                 f"max_tokens={self._max_kv_tokens_in} is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
             )
-        if is_vswa:
-            # For VSWA KvCacheManager now it can only use max_gpu_total_bytes
-            self._kv_cache_config.max_tokens = None
-        else:
-            # For non-VSWA KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
-            self._kv_cache_config.max_tokens = int(
-                kv_cache_max_memory // self._get_kv_size_per_token())
+        # For KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
+        self._kv_cache_config.max_tokens = int(kv_cache_max_memory //
+                                               self._get_kv_size_per_token())
         # ---------------------------handle max_tokens---------------------------------
 
         # ---------------------------handle max_gpu_total_bytes---------------------------------
@@ -853,3 +851,99 @@ def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
         f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
     )
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
+
+
+def validate_feature_combination(llm_args, model_engine, sampler_type):
+    # Validate the flags for features' combination
+    def init_feature_status(llm_args) -> Dict[str, bool]:
+        assert isinstance(
+            llm_args, TorchLlmArgs
+        ), "Expect TorchLlmArgs used for feature status validation."
+        feature_list = [
+            "overlap_scheduler",
+            "cuda_graph",
+            "attention_dp",
+            "disaggregated_serving",
+            "chunked_prefill",
+            "mtp",
+            "eagle3_one_model",
+            "eagle3_two_model",
+            "torch_sampler",
+            "trtllm_sampler",
+            "kv_cache_reuse",
+            "slide_window_attention",
+            "guided_decoding",
+        ]
+        feature_status: Dict[str, bool] = dict.fromkeys(feature_list)
+        feature_status[
+            "overlap_scheduler"] = not llm_args.disable_overlap_scheduler
+        feature_status["cuda_graph"] = llm_args.cuda_graph_config is not None
+        feature_status["attention_dp"] = llm_args.enable_attention_dp
+        feature_status[
+            "disaggregated_serving"] = llm_args.cache_transceiver_config is not None
+        feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
+        feature_status["mtp"] = (
+            isinstance(llm_args.speculative_config, MTPDecodingConfig)
+            and llm_args.speculative_config.num_nextn_predict_layers > 0)
+        feature_status["eagle3_one_model"] = (
+            isinstance(llm_args.speculative_config, EagleDecodingConfig)
+            and llm_args.speculative_config.eagle3_one_model)
+        feature_status["eagle3_two_model"] = (
+            isinstance(llm_args.speculative_config, EagleDecodingConfig)
+            and not llm_args.speculative_config.eagle3_one_model)
+        feature_status[
+            "torch_sampler"] = sampler_type == SamplerType.TorchSampler
+        feature_status[
+            "trtllm_sampler"] = sampler_type == SamplerType.TRTLLMSampler
+
+        feature_status[
+            "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
+        feature_status["slide_window_attention"] = (
+            hasattr(model_engine.model.model_config.pretrained_config,
+                    "layer_types") and "sliding_attention"
+            in model_engine.model.model_config.pretrained_config.layer_types)
+        feature_status[
+            "guided_decoding"] = llm_args.guided_decoding_backend is not None
+        assert all(v is not None for v in feature_status.values()
+                   ), "feature status has not been fully initialized."
+        assert all(
+            k in feature_list for k in
+            feature_status.keys()), "unexpected feature type in feature_status."
+        return feature_status
+
+    feature_status: Dict[str, bool] = init_feature_status(llm_args)
+
+    ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
+
+    CONFLICT_RULES = [
+        {
+            "features": ["mtp", "slide_window_attention"],
+            "message":
+            ERR_MSG_TMPL.format(feature1="mtp",
+                                feature2="slide_window_attention")
+        },
+        {
+            "features": ["trtllm_sampler", "mtp"],
+            "message":
+            ERR_MSG_TMPL.format(feature1="trtllm_sampler", feature2="mtp") +
+            " Please use sampler type auto instead."
+        },
+        {
+            "features": ["trtllm_sampler", "eagle3_one_model"],
+            "message":
+            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
+                                feature2="eagle3_one_model") +
+            " Please use sampler type auto instead."
+        },
+        {
+            "features": ["trtllm_sampler", "eagle3_two_model"],
+            "message":
+            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
+                                feature2="eagle3_two_model") +
+            " Please use sampler type auto instead."
+        },
+        # Add new conflict rules here in the future
+    ]
+    for rule in CONFLICT_RULES:
+        if all(feature_status[feature] for feature in rule["features"]):
+            raise ValueError(rule["message"])

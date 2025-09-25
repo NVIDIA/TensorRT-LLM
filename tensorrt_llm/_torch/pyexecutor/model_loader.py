@@ -266,6 +266,10 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
+            for module in model.modules():
+                if hasattr(module, 'post_load_weights'):
+                    module.post_load_weights()
+
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
                 logger.info("moe_load_balancer finalizing model...")

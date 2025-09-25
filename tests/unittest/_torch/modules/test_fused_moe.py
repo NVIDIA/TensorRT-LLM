@@ -884,6 +884,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
+    fused_moe.post_load_weights()
 
     def swiglu_fused_moe(x):
         x, gate = x.chunk(2, dim=-1)
