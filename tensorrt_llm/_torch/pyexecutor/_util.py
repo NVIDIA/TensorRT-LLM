@@ -254,7 +254,6 @@ class KvCacheCreator:
         py_executor.enable_iter_perf_stats = False
         req_ids = []
         if py_executor.dist.mapping.rank == 0:
-            # import pdb; pdb.set_trace()
             req_ids = py_executor.enqueue_requests(self._dummy_reqs)
         req_ids = py_executor.dist.broadcast(req_ids, root=0)
         py_executor.is_warmup = True
