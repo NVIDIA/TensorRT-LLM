@@ -57,8 +57,8 @@ from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 MoEWeightLoadingMode, WideEPMoE, create_moe)
+from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
+                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -832,11 +832,7 @@ class Deepseekv3MoE(nn.Module):
         # max-throughput
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
-        enable_dp_padding = (
-            get_sm_version() == 120
-            and (not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or
-                 (not self.experts.has_fp8_qdq and self.experts.has_nvfp4)))
-        if self.use_dp and self.mapping.tp_size > 1 and enable_dp_padding:
+        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
