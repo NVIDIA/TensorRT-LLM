@@ -13,6 +13,7 @@ import yaml
 max_retries = 3
 max_attempts = 540
 
+
 class BenchmarkRunner:
 
     def __init__(self,
@@ -44,7 +45,8 @@ class BenchmarkRunner:
         self.execution_plan: Dict[int, List[int]] = {}
 
         # Model path mapping
-        llm_models_root = os.environ.get('LLM_MODELS_ROOT', '/home/scratch.trt_llm_data/llm-models')
+        llm_models_root = os.environ.get(
+            'LLM_MODELS_ROOT', '/home/scratch.trt_llm_data/llm-models')
         self.model_paths = {
             "70B-FP4":
             f"{llm_models_root}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
@@ -54,15 +56,13 @@ class BenchmarkRunner:
             f"{llm_models_root}/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
             "Scout-FP8":
             f"{llm_models_root}/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
-            "R1-FP8":
-            f"{llm_models_root}/DeepSeek-R1/DeepSeek-R1",
-            "R1-FP4":
-            f"{llm_models_root}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
+            "R1-FP8": f"{llm_models_root}/DeepSeek-R1/DeepSeek-R1",
+            "R1-FP4": f"{llm_models_root}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
         }
 
         self.hf_model_paths = {
-            "70B-FP4":  "meta-llama/Meta-Llama-3.3-70B-Instruct-FP4",
-            "70B-FP8":  "meta-llama/Meta-Llama-3.3-70B-Instruct-FP8",
+            "70B-FP4": "meta-llama/Meta-Llama-3.3-70B-Instruct-FP4",
+            "70B-FP8": "meta-llama/Meta-Llama-3.3-70B-Instruct-FP8",
             "Scout-FP4": "meta-llama/Llama-4-Scout-17B-16E-Instruct-FP4",
             "Scout-FP8": "meta-llama/Llama-4-Scout-17B-16E-Instruct-FP8",
             "R1-FP8": "deepseek-ai/DeepSeek-R1",
@@ -79,7 +79,7 @@ class BenchmarkRunner:
 
         # Change to output directory
         os.chdir(self.output_folder)
-        
+
         # Track test case information for reproduction script generation
         self.test_case_infos: List[Dict[str, Any]] = []
 
@@ -258,10 +258,11 @@ class BenchmarkRunner:
         for test_case_id in test_cases_to_remove:
             del self.execution_plan[test_case_id]
 
-    def initialize_test_case_infos(self, test_cases: List[Dict[str, Any]]) -> None:
+    def initialize_test_case_infos(self, test_cases: List[Dict[str,
+                                                               Any]]) -> None:
         """Initialize test case information for all test cases in execution plan with 'Success' status"""
         self.test_case_infos.clear()
-        
+
         for test_case in test_cases:
             test_case_id = test_case['id']
             # Only initialize test cases that are in the execution plan
@@ -273,8 +274,10 @@ class BenchmarkRunner:
                     'gpu_info': self.gpu_info
                 }
                 self.test_case_infos.append(test_case_info)
-        
-        print(f"Initialized {len(self.test_case_infos)} test case infos (only those in execution plan)")
+
+        print(
+            f"Initialized {len(self.test_case_infos)} test case infos (only those in execution plan)"
+        )
 
     def print_execution_plan(self, test_cases: List[Dict[str, Any]]) -> None:
         """Print which test cases and concurrencies will be executed"""
@@ -354,8 +357,7 @@ class BenchmarkRunner:
 
         return "\n".join(config_lines)
 
-    def wait_for_server(self,
-                        server_pid: int,
+    def wait_for_server(self, server_pid: int,
                         server_log_filename: str) -> bool:
         """Wait for server to be ready"""
         print("Waiting for trtllm-serve to be ready...")
@@ -596,30 +598,48 @@ class BenchmarkRunner:
         retry_count = 0
         while retry_count < max_retries:
             retry_count += 1
-            print(f"Attempt {retry_count}/{max_retries} for test case {test_case_id} ({model_label})")
-            
+            print(
+                f"Attempt {retry_count}/{max_retries} for test case {test_case_id} ({model_label})"
+            )
+
             try:
                 success = self._run_test_case_attempt(test_case)
                 if success:
-                    print(f"Test case {test_case_id} ({model_label}) completed successfully on attempt {retry_count}")
+                    print(
+                        f"Test case {test_case_id} ({model_label}) completed successfully on attempt {retry_count}"
+                    )
                     return
                 else:
-                    print(f"Test case {test_case_id} ({model_label}) failed on attempt {retry_count}")
+                    print(
+                        f"Test case {test_case_id} ({model_label}) failed on attempt {retry_count}"
+                    )
                     if retry_count < max_retries:
                         print(f"Retrying in 5 seconds...")
                         time.sleep(5)
                     else:
-                        print(f"Test case {test_case_id} ({model_label}) failed after {max_retries} attempts. Skipping.")
-                        self.update_failed_test_case(test_case, f"Failed after {max_retries} attempts - all retries exhausted")
+                        print(
+                            f"Test case {test_case_id} ({model_label}) failed after {max_retries} attempts. Skipping."
+                        )
+                        self.update_failed_test_case(
+                            test_case,
+                            f"Failed after {max_retries} attempts - all retries exhausted"
+                        )
                         return
             except Exception as e:
-                print(f"Test case {test_case_id} ({model_label}) encountered exception on attempt {retry_count}: {e}")
+                print(
+                    f"Test case {test_case_id} ({model_label}) encountered exception on attempt {retry_count}: {e}"
+                )
                 if retry_count < max_retries:
                     print(f"Retrying in 5 seconds...")
                     time.sleep(5)
                 else:
-                    print(f"Test case {test_case_id} ({model_label}) failed after {max_retries} attempts due to exceptions. Skipping.")
-                    self.update_failed_test_case(test_case, f"Failed after {max_retries} attempts due to exception: {e} - all retries exhausted")
+                    print(
+                        f"Test case {test_case_id} ({model_label}) failed after {max_retries} attempts due to exceptions. Skipping."
+                    )
+                    self.update_failed_test_case(
+                        test_case,
+                        f"Failed after {max_retries} attempts due to exception: {e} - all retries exhausted"
+                    )
                     return
 
     def _run_test_case_attempt(self, test_case: Dict[str, Any]) -> bool:
@@ -640,7 +660,9 @@ class BenchmarkRunner:
                 MODEL = f"--model {hf_model_path}"
                 print(f"Local path not found, using HF model: {hf_model_path}")
             else:
-                print(f"Error: Neither local path nor HF model path found for {model_label}")
+                print(
+                    f"Error: Neither local path nor HF model path found for {model_label}"
+                )
                 return False
 
         # Generate extra-llm-api-config.yml
@@ -700,7 +722,8 @@ class BenchmarkRunner:
 
             # Run benchmarks based on execution plan
             for concurrency_index in self.execution_plan[test_case_id]:
-                concurrency, iteration = test_case['concurrency_iterations'][concurrency_index]
+                concurrency, iteration = test_case['concurrency_iterations'][
+                    concurrency_index]
                 should_continue = self.run_benchmark(test_case, concurrency,
                                                      iteration, model_path,
                                                      server_log_filename)
@@ -728,32 +751,38 @@ class BenchmarkRunner:
                     subprocess.run(f"kill -9 {server_process.pid}",
                                    shell=True,
                                    check=False)
-                    subprocess.run(f"wait {server_process.pid} 2>/dev/null || true",
-                                   shell=True,
-                                   check=False)
+                    subprocess.run(
+                        f"wait {server_process.pid} 2>/dev/null || true",
+                        shell=True,
+                        check=False)
                     subprocess.run(f"rm -rf ~/.triton/cache || true",
                                    shell=True,
-                                   check=False)     
+                                   check=False)
                     subprocess.run(f"rm -rf ~/.cache/flashinfer/ || true",
                                    shell=True,
-                                   check=False)       
+                                   check=False)
                 except Exception as e:
                     print(f"Warning: Error during server cleanup: {e}")
 
                 time.sleep(5)  # Give it time to clean up resources
                 print(f"Server cleanup completed for {model_label}")
 
-    def update_failed_test_case(self, test_case: Dict[str, Any], failure_reason: str) -> None:
+    def update_failed_test_case(self, test_case: Dict[str, Any],
+                                failure_reason: str) -> None:
         """Update test case info with failure reason"""
         # Find the existing test case info and update its failure reason
         for test_case_info in self.test_case_infos:
             if test_case_info['test_case']['id'] == test_case['id']:
                 test_case_info['failure_reason'] = failure_reason
-                print(f"Updated test case {test_case['id']} ({test_case['model']}) with failure reason: {failure_reason}")
+                print(
+                    f"Updated test case {test_case['id']} ({test_case['model']}) with failure reason: {failure_reason}"
+                )
                 return
-        
+
         # If not found, this shouldn't happen, but add it as a fallback
-        print(f"Warning: Test case {test_case['id']} not found in test_case_infos, adding it")
+        print(
+            f"Warning: Test case {test_case['id']} not found in test_case_infos, adding it"
+        )
         failed_info = {
             'test_case': test_case.copy(),
             'failure_reason': failure_reason,
@@ -762,19 +791,20 @@ class BenchmarkRunner:
         }
         self.test_case_infos.append(failed_info)
 
-
-    def generate_reproduction_script(self, test_case_info: Dict[str, Any]) -> str:
+    def generate_reproduction_script(self, test_case_info: Dict[str,
+                                                                Any]) -> str:
         """Generate a shell script to reproduce a test case"""
         test_case = test_case_info['test_case']
         test_case_id = test_case['id']
         model_label = test_case['model']
-        failure_reason = "Run Successfully" if test_case_info['failure_reason'] == "Success" else f"Failure Reason: {test_case_info['failure_reason']}"
+        failure_reason = "Run Successfully" if test_case_info[
+            'failure_reason'] == "Success" else f"Failure Reason: {test_case_info['failure_reason']}"
         node_name = test_case_info['node_name']
-        gpu_info = test_case_info['gpu_info']
-        
+        test_case_info['gpu_info']
+
         # Get model path
         model_path = self.model_paths.get(model_label)
-        
+
         script_content = f"""#!/bin/bash
 # Reproduction script for test case {test_case_id} ({model_label})
 # Node: {node_name}
@@ -800,15 +830,15 @@ set -e
 wait_for_server() {{
     local max_attempts={max_attempts}
     local attempt=1
-    
+
     echo "Waiting for trtllm-serve to be ready..."
-    
+
     while [ $attempt -le $max_attempts ]; do
         if ! kill -0 $SERVER_PID 2>/dev/null; then
             echo "Error: Server process has died"
             return 1
         fi
-        
+
         # Check for runtime errors in server log
         if grep -q "RuntimeError\\|runtime error\\|CUDA error\\|illegal memory access\\|terminate called" "$SERVER_LOG" 2>/dev/null; then
             echo "RuntimeError detected in server log: $SERVER_LOG"
@@ -817,18 +847,18 @@ wait_for_server() {{
             wait $SERVER_PID 2>/dev/null || true
             return 1
         fi
-        
+
         # Try to connect to server
         if curl -s "http://localhost:8000/v1/models" > /dev/null 2>&1; then
             echo "Server is ready! HTTP status: 200"
             return 0
         fi
-        
+
         echo "Attempt $attempt/$max_attempts: Server not ready yet, waiting..."
         sleep 10
         attempt=$((attempt + 1))
     done
-    
+
     echo "Error: Server did not become ready after $max_attempts attempts"
     return 1
 }}
@@ -886,9 +916,10 @@ echo "Server is ready, starting benchmarks..."
 """
         # Add benchmark commands for each concurrency
         for concurrency_index in self.execution_plan.get(test_case_id, []):
-            concurrency, iteration = test_case['concurrency_iterations'][concurrency_index]
+            concurrency, iteration = test_case['concurrency_iterations'][
+                concurrency_index]
             num_prompts = concurrency * iteration
-            
+
             script_content += f"""
 echo "Running benchmark with concurrency: {concurrency}, iteration: {iteration}, num-prompts: {num_prompts}"
 
@@ -917,13 +948,13 @@ fi
 
 echo "-----------------------------------------"
 """
-        
+
         script_content += f"""
 
 echo "All benchmarks completed successfully!"
 echo "Server will be automatically cleaned up on script exit"
 """
-        
+
         return script_content
 
     def generate_reproduction_scripts(self) -> None:
@@ -931,32 +962,36 @@ echo "Server will be automatically cleaned up on script exit"
         if not self.test_case_infos:
             print("No test cases to generate reproduction scripts for")
             return
-        
-        print(f"\nGenerating reproduction scripts for {len(self.test_case_infos)} test cases...")
-        
+
+        print(
+            f"\nGenerating reproduction scripts for {len(self.test_case_infos)} test cases..."
+        )
+
         generated_scripts = []
         for i, test_case_info in enumerate(self.test_case_infos, 1):
             try:
                 test_case = test_case_info['test_case']
                 test_case_id = test_case['id']
                 model_label = test_case['model']
-                
-                script_content = self.generate_reproduction_script(test_case_info)
+
+                script_content = self.generate_reproduction_script(
+                    test_case_info)
                 script_filename = f"reproduce.{model_label}.tp{test_case['tp']}.ep{test_case['ep']}.adp{test_case['enable_attention_dp']}.attn{test_case['attn_backend']}.moe{test_case['moe_backend']}.gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}.isl{test_case['isl']}.osl{test_case['osl']}.tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}.sh"
-                
+
                 with open(script_filename, 'w') as f:
                     f.write(script_content)
-                
+
                 # Make script executable
                 os.chmod(script_filename, 0o755)
-                
+
                 generated_scripts.append(script_filename)
                 print(f"Generated reproduction script: {script_filename}")
-                
-            except Exception as e:
-                print(f"Warning: Failed to generate reproduction script for test case {test_case_id}: {e}")
-                continue
 
+            except Exception as e:
+                print(
+                    f"Warning: Failed to generate reproduction script for test case {test_case_id}: {e}"
+                )
+                continue
 
     def run_benchmarks(self) -> None:
         """Main function to run all benchmarks from config file"""
@@ -1025,39 +1060,41 @@ echo "Server will be automatically cleaned up on script exit"
         print(f"Total runtime in seconds: {script_total_time:.2f}")
         print("=" * 80)
         print("All benchmarks completed!")
-        
+
         # Print summary of failed test cases
         if self.test_case_infos:
             print("\n" + "=" * 80)
             print("TEST CASES SUMMARY")
             print("=" * 80)
-            
+
             success_count = 0
             failed_count = 0
-            
+
             for i, test_case_info in enumerate(self.test_case_infos, 1):
                 test_case = test_case_info['test_case']
                 failure_reason = test_case_info['failure_reason']
                 status = "SUCCESS" if failure_reason == "Success" else "FAILED"
-                
-                print(f"{i}. Test Case {test_case['id']} ({test_case['model']}) - {status}")
+
+                print(
+                    f"{i}. Test Case {test_case['id']} ({test_case['model']}) - {status}"
+                )
                 if failure_reason != "Success":
                     print(f"   Failure Reason: {failure_reason}")
                 print(f"   Node: {test_case_info['node_name']}")
                 print()
-                
+
                 if failure_reason == "Success":
                     success_count += 1
                 else:
                     failed_count += 1
-            
+
             print(f"Total test cases: {len(self.test_case_infos)}")
             print(f"Successful: {success_count}")
             print(f"Failed: {failed_count}")
             print("=" * 80)
         else:
             print("\nNo test cases were executed!")
-        
+
         # Always generate reproduction scripts for all test cases
         if self.test_case_infos:
             self.generate_reproduction_scripts()

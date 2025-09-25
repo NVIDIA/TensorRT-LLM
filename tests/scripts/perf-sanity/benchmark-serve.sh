@@ -70,7 +70,7 @@ run_benchmark_and_parse() {
             else
                 echo 'No trtllm_dir specified or directory does not exist, running with default packages'
             fi
-            
+
             python3 ${bench_dir}/run_benchmark_serve.py --output_folder ${output_folder} --config_file ${bench_dir}/${config_file} --select ${select_pattern} --skip ${skip_pattern}
 
             echo 'Benchmarks completed. Generating CSV report...'

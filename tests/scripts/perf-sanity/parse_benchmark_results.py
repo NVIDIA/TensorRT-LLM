@@ -8,25 +8,24 @@ import pandas as pd
 import yaml
 
 
-
 def extract_config_from_log_filename(log_file):
     """
     Extract configuration from log filename using the naming pattern:
     serve.{model_label}.tp{tp}.ep{ep}.adp{enable_attention_dp}.attn{attn_backend}.moe{moe_backend}.gpu{free_gpu_mem_fraction}.batch{max_batch_size}.isl{isl}.osl{osl}.tokens{max_num_tokens}.moetokens{moe_max_num_tokens}.concurrency{concurrency}.iter{iteration}.log
     """
     filename = Path(log_file).name
-    
+
     # Define regex pattern to match the log filename format
     pattern = r'serve\.([^.]+)\.tp(\d+)\.ep(\d+)\.adp([^.]+)\.attn([^.]+)\.moe([^.]*)\.gpu([^.]+\.[^.]*)\.batch(\d+)\.isl(\d+)\.osl(\d+)\.tokens(\d+)\.moetokens([^.]*)\.concurrency(\d+)\.iter(\d+)\.log'
-    
+
     match = re.match(pattern, filename)
     if not match:
         print(f"Warning: Could not parse filename {filename}")
         return None
-    
+
     # Extract all groups from the match
     groups = match.groups()
-    
+
     try:
         model_label = groups[0]
         tp = int(groups[1])
@@ -42,7 +41,7 @@ def extract_config_from_log_filename(log_file):
         moe_max_num_tokens_str = groups[11]
         concurrency = int(groups[12])
         iteration = int(groups[13])
-        
+
         # Handle moe_max_num_tokens (could be "N/A", empty, or a number)
         moe_max_num_tokens = ""
         if moe_max_num_tokens_str and moe_max_num_tokens_str != "N/A":
@@ -52,13 +51,13 @@ def extract_config_from_log_filename(log_file):
                 moe_max_num_tokens = ""
         elif not moe_max_num_tokens_str:
             moe_max_num_tokens = ""
-        
+
         # Handle enable_attention_dp (convert string to boolean)
         enable_attention_dp_bool = enable_attention_dp_str.lower() == "true"
-        
+
         # Note: We don't have GPUs information in the filename, so we'll leave it empty
         # and let the caller handle this if needed
-        
+
         return {
             'model_name': model_label,
             'gpus': tp,
@@ -257,7 +256,7 @@ def match_log_to_test_case(log_config, test_case):
     if not log_config:
         return False
 
-    # Check if all key parameters match exactly    
+    # Check if all key parameters match exactly
     return (log_config['model_name'] == test_case['model_name']
             and log_config['tp'] == test_case['tp']
             and log_config['ep'] == test_case['ep']
