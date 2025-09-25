@@ -143,6 +143,8 @@ class DemoLLM(LLM):
         # prefetch model and load tokenizer
         self._prefetch_model()
         self._tokenizer = self._try_load_tokenizer()
+        self._hf_model_config = self._try_load_hf_model_config()
+        self._generation_config = self._try_load_generation_config()
         self.input_processor = self._create_input_processor()
 
         # construct demo executor + engine
