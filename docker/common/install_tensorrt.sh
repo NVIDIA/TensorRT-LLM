@@ -20,6 +20,15 @@ NVRTC_VER="13.0.48-1"
 CUDA_RUNTIME="13.0.48-1"
 CUDA_DRIVER_VERSION="580.65.06-1.el8"
 
+# For CUDA 12.9
+CUDA_VER_12_9="12.9"
+CUDNN_VER_12_9="9.10.2.21-1"
+NCCL_VER_12_9="2.27.5-1+cuda12.9"
+CUBLAS_VER_12_9="12.9.1.4-1"
+NVRTC_VER_12_9="12.9.86-1"
+CUDA_RUNTIME_12_9="12.9.79-1"
+CUDA_DRIVER_VERSION_12_9="575.57.08-1.el8"
+
 for i in "$@"; do
     case $i in
         --TRT_VER=?*) TRT_VER="${i#*=}";;
@@ -33,6 +42,18 @@ for i in "$@"; do
 done
 
 NVCC_VERSION_OUTPUT=$(nvcc --version)
+
+if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) == ${CUDA_VER_12_9} ]]; then
+    CUDA_VER="${CUDA_VER_12_9}"
+    CUDNN_VER="${CUDNN_VER_12_9}"
+    NCCL_VER="${NCCL_VER_12_9}"
+    CUBLAS_VER="${CUBLAS_VER_12_9}"
+    NVRTC_VER="${NVRTC_VER_12_9}"
+    CUDA_RUNTIME="${CUDA_RUNTIME_12_9}"
+    CUDA_DRIVER_VERSION="${CUDA_DRIVER_VERSION_12_9}"
+fi
+CUDA_MAJOR_VER="${CUDA_VER%%.*}"
+
 if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_VER} ]]; then
   echo "The version of pre-installed CUDA is not equal to ${CUDA_VER}."
 fi
@@ -65,9 +86,9 @@ install_ubuntu_requirements() {
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
     apt-get install -y --no-install-recommends \
-        libcudnn9-cuda-13=${CUDNN_VER} \
-        libcudnn9-dev-cuda-13=${CUDNN_VER} \
-        libcudnn9-headers-cuda-13=${CUDNN_VER} \
+        libcudnn9-cuda-${CUDA_MAJOR_VER}=${CUDNN_VER} \
+        libcudnn9-dev-cuda-${CUDA_MAJOR_VER}=${CUDNN_VER} \
+        libcudnn9-headers-cuda-${CUDA_MAJOR_VER}=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
         libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
@@ -91,7 +112,7 @@ install_rockylinux_requirements() {
         "libnccl-devel-${NCCL_VER}.${ARCH1}" \
         "cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}" \
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
-        "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
+        "cuda-toolkit-${CUDA_MAJOR_VER}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
@@ -107,7 +128,7 @@ install_rockylinux_requirements() {
         libnccl-devel-${NCCL_VER}.${ARCH1}.rpm \
         cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm \
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
-        cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
+        cuda-toolkit-${CUDA_MAJOR_VER}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
         libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
         libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
