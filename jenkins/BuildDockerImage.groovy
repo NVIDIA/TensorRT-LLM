@@ -305,9 +305,9 @@ def buildImage(config, imageKeyToTag)
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
 
-        if (target == "rockylinux8" || target == "rockylinux8_12_9") {
-            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        }
+        // if (target == "rockylinux8" || target == "rockylinux8_12_9") {
+        //     BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        // }
         if (target == "rockylinux8_12_9") {
             TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG_12_9=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
@@ -408,21 +408,21 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
     def release_action = params.action
     def buildConfigs = [
-        "Build trtllm release (x86_64)": [
-            target: "trtllm",
-            action: release_action,
-            customTag: LLM_BRANCH_TAG + "-x86_64",
-            build_wheel: true,
-            dockerfileStage: "release",
-        ],
-        "Build trtllm release (SBSA)": [
-            target: "trtllm",
-            action: release_action,
-            customTag: LLM_BRANCH_TAG + "-sbsa",
-            build_wheel: true,
-            arch: "arm64",
-            dockerfileStage: "release",
-        ],
+        // "Build trtllm release (x86_64)": [
+        //     target: "trtllm",
+        //     action: release_action,
+        //     customTag: LLM_BRANCH_TAG + "-x86_64",
+        //     build_wheel: true,
+        //     dockerfileStage: "release",
+        // ],
+        // "Build trtllm release (SBSA)": [
+        //     target: "trtllm",
+        //     action: release_action,
+        //     customTag: LLM_BRANCH_TAG + "-sbsa",
+        //     build_wheel: true,
+        //     arch: "arm64",
+        //     dockerfileStage: "release",
+        // ],
         "Build CI image (x86_64 tritondevel)": [:],
         "Build CI image (SBSA tritondevel)": [
             arch: "arm64",
@@ -437,10 +437,10 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build CI image for CUDA12.9 (x86_64 tritondevel)": [:],
-        "Build CI image for CUDA12.9 (SBSA tritondevel)": [
-            arch: "arm64",
-        ],
+        // "Build CI image for CUDA12.9 (x86_64 tritondevel)": [:],
+        // "Build CI image for CUDA12.9 (SBSA tritondevel)": [
+        //     arch: "arm64",
+        // ],
         "Build CI image for CUDA12.9 (RockyLinux8 Python310)": [
             target: "rockylinux8_12_9",
             args: "PYTHON_VERSION=3.10.12",
@@ -451,29 +451,29 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build NGC devel and release (x86_64)": [
-            target: "ngc-release",
-            action: release_action,
-            args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
-            build_wheel: true,
-            dependent: [
-                target: "ngc-devel",
-                dockerfileStage: "devel",
-            ],
-            dockerfileStage: "release",
-        ],
-        "Build NGC devel and release (SBSA)": [
-            target: "ngc-release",
-            action: release_action,
-            args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
-            arch: "arm64",
-            build_wheel: true,
-            dependent: [
-                target: "ngc-devel",
-                dockerfileStage: "devel",
-            ],
-            dockerfileStage: "release",
-        ],
+        // "Build NGC devel and release (x86_64)": [
+        //     target: "ngc-release",
+        //     action: release_action,
+        //     args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
+        //     build_wheel: true,
+        //     dependent: [
+        //         target: "ngc-devel",
+        //         dockerfileStage: "devel",
+        //     ],
+        //     dockerfileStage: "release",
+        // ],
+        // "Build NGC devel and release (SBSA)": [
+        //     target: "ngc-release",
+        //     action: release_action,
+        //     args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
+        //     arch: "arm64",
+        //     build_wheel: true,
+        //     dependent: [
+        //         target: "ngc-devel",
+        //         dockerfileStage: "devel",
+        //     ],
+        //     dockerfileStage: "release",
+        // ],
     ]
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
