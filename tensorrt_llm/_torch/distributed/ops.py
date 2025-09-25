@@ -78,16 +78,18 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * dtype.itemsize,
                                      buffer_size_bytes or 0)
-        # If not scaling, use the initial buffer size
-        if buffer_size_bytes is None:
-            buffer_size_bytes = init_buffer_size_bytes
+        # Creating the workspace if it doesn't exist
+        if mapping not in allreduce_mnnvl_workspaces:
+            # Use the predefined buffer size if no buffer size is provided
+            buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
                 logger.debug(
                     f"[MNNVL] Creating workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} with {buffer_size_bytes} bytes"
                 )
 
         else:
-            req_buffer_size_bytes = buffer_size_bytes
+            # Safeguard against when buffer_size_bytes is None
+            req_buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
             buffer_size_bytes = math.ceil(buffer_size_bytes /
                                           (8 * 1024 * 1024)) * (8 * 1024 * 1024)
