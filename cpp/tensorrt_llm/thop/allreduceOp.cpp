@@ -1201,7 +1201,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
 
     // FIXME: Find a better heuristic
-    if (num_tokens * hidden_dim * allreduce_params.nranks * input.itemsize() <= 128 * 1024 * 8)
+    if (num_tokens * hidden_dim * allreduce_params.nranks * input.itemsize() <= 64 * 1024 * 8)
     {
         tensorrt_llm::kernels::mnnvl::oneshot_allreduce_fusion_op(allreduce_params);
     }

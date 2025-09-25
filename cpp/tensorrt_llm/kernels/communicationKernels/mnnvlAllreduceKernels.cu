@@ -31,6 +31,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/lamportUtils.cuh"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 
 namespace tensorrt_llm::kernels::mnnvl
 {
@@ -96,8 +97,8 @@ inline __device__ float4 loadPackedVolatile<float4>(void const* ptr)
 {
     float4 return_value;
     asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-        : "=f"(return_value.x), "=f"(return_value.y), "=f"(return_value.z), "=f"(return_value.w)
-        : "l"(ptr));
+                 : "=f"(return_value.x), "=f"(return_value.y), "=f"(return_value.z), "=f"(return_value.w)
+                 : "l"(ptr));
     return return_value;
 }
 
@@ -117,50 +118,85 @@ inline __device__ void copy_f4(T_IN* dst, T_IN const* src)
     __pipeline_memcpy_async(dst4, src4, sizeof(float4));
 }
 
-// global constexpr is not recognized in device code, so we have to use a macro here
 #define WARP_SIZE 32U
+#define LOG2_WARP_SIZE 5U
+#define LANE_ID_MASK 0x1f
 
-// These two warpreduce functions are slightly different with the version in reduceKernelUtils as we dynamically extract
-// the mask to support different warp sizes
 template <typename T>
-inline __device__ T warpReduceSum(T val)
+inline __device__ T warpReduceSumPartial(T val)
 {
-    // Get the actual number of active threads in this warp
-    int warp_size = std::min(WARP_SIZE, blockDim.x - (threadIdx.x & ~(WARP_SIZE - 1)));
-    unsigned int mask = (1U << warp_size) - 1;
+    int lane_id = threadIdx.x & LANE_ID_MASK;
+    // We make sure only the last warp will call this function
+    int warp_size = blockDim.x - (threadIdx.x & ~(WARP_SIZE - 1));
+    unsigned int active_mask = (1U << warp_size) - 1;
 
 #pragma unroll
-    for (uint32_t offset = 16; offset > 0; offset >>= 1)
+    for (int mask = 16; mask > 0; mask >>= 1)
     {
-        if (offset < warp_size)
-        {
-            val = tensorrt_llm::common::add(val, __shfl_xor_sync(mask, val, offset, WARP_SIZE));
-        }
+        int target_lane = lane_id ^ mask;
+        auto tmp = __shfl_xor_sync(active_mask, val, mask, WARP_SIZE);
+        val += target_lane < warp_size ? tmp : 0;
     }
     return val;
 }
 
-template <typename T>
-inline __device__ T blockReduceSum(T val)
+// SYNC:
+//  - True: share the sume across all threads
+//  - False: only thread 0 get the sum; Other thread's value is undefined.
+template <typename T, bool SYNC = false>
+inline __device__ T blockReduceSumPartial(T val)
 {
-    __shared__ T smem[WARP_SIZE];
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int warp_num = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; // Ceiling division to include partial warps
+    __shared__ T smem[WARP_SIZE + 1];
+    int lane_id = threadIdx.x & LANE_ID_MASK;
+    int warp_id = threadIdx.x >> LOG2_WARP_SIZE;
+    int warp_num = (blockDim.x + WARP_SIZE - 1) >> LOG2_WARP_SIZE; // Ceiling division to include partial warps
 
-    val = warpReduceSum(val);
+    val = (warp_id == warp_num - 1) ? warpReduceSumPartial(val) : tensorrt_llm::common::warpReduceSum(val);
     if (lane_id == 0)
     {
         smem[warp_id] = val;
     }
     __syncthreads();
-    val = lane_id < warp_num ? smem[lane_id] : 0.F;
-    val = warpReduceSum(val);
 
+    if (warp_id == 0)
+    {
+        val = (lane_id < warp_num) ? smem[lane_id] : (T) 0.f;
+        // Need to consider the corner case where we only have one warp and it is partial
+        val = (warp_num == 1) ? warpReduceSumPartial(val) : tensorrt_llm::common::warpReduceSum(val);
+
+        if constexpr (SYNC)
+        {
+            if (lane_id == 0)
+            {
+                smem[warp_id] = val;
+            }
+        }
+    }
+    if constexpr (SYNC)
+    {
+        __syncthreads();
+        val = smem[0];
+    }
     return val;
 }
 
+template <typename T, bool SYNC = false>
+inline __device__ T blockReduceSum(T val)
+{
+    bool has_partial_warp = (blockDim.x & LANE_ID_MASK) != 0;
+    if (has_partial_warp)
+    {
+        return blockReduceSumPartial<T, SYNC>(val);
+    }
+    else
+    {
+        return tensorrt_llm::common::blockReduceSum<T>(val);
+    }
+}
+
 #undef WARP_SIZE
+#undef LOG2_WARP_SIZE
+#undef LANE_ID_MASK
 
 // We have to define this again since the one in mathUtils.h is shadowed by the one from cudaUtils.h, which is a
 // host-only function!
@@ -188,29 +224,24 @@ inline std::tuple<int, int, int> adjust_grid_config(int num_tokens, int dim, int
     int threads_needed = divUp(dim, elts_per_thread);
     int loads_per_thread = 1;
 
-    // First scale the block_size to the problem size
-    if (cluster_size * block_size < threads_needed)
+    block_size = divUp(threads_needed, cluster_size);
+    if (USE_CGA)
     {
-        block_size = divUp(threads_needed, cluster_size);
-    }
-
-    // Reduce cluster_size if total threads exceed what's needed
-    while (block_size * cluster_size > threads_needed && cluster_size > 1)
-    {
-        cluster_size = cluster_size >> 1; // Reduce by power of 2
-        block_size = divUp(threads_needed, cluster_size);
-    }
-
-    // If we have too few CTAs, trying to use CGA to increase occupancy
-    if constexpr (USE_CGA)
-    {
-        int sm_count = getMultiProcessorCount();
-        if (cluster_size * num_tokens < sm_count && cluster_size < 8 && block_size > 128)
+        while (threads_needed % cluster_size != 0 && cluster_size > 1)
         {
-            // We prefer to use 128 threads per CTA to avoid wave quantization issue
-            // Derive the cluster_size from that
-            block_size = 128;
-            cluster_size = divUp(threads_needed, block_size);
+            cluster_size /= 2;
+        }
+        block_size = divUp(threads_needed, cluster_size);
+        while (block_size < 128 && cluster_size >= 2)
+        {
+            block_size *= 2;
+            cluster_size /= 2;
+        }
+        int sm_count = getMultiProcessorCount();
+        while (num_tokens * cluster_size > sm_count && cluster_size > 1 && block_size <= 512)
+        {
+            block_size *= 2;
+            cluster_size /= 2;
         }
     }
 
@@ -249,7 +280,6 @@ inline std::tuple<int, int, int> adjust_grid_config(int num_tokens, int dim, int
 using detail::PackedVec;
 using detail::loadPacked;
 using detail::loadPackedVolatile;
-using detail::warpReduceSum;
 using detail::blockReduceSum;
 using detail::divUp;
 using detail::copy_f4;
@@ -387,9 +417,9 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
         for (int i = 0; i < ELTS_PER_THREAD; i++)
         {
             // FIXME: Use float square if accuracy issue
-            thread_sum += cuda_cast<float, T>(packed_accum.elements[i] * packed_accum.elements[i]);
+            thread_sum += cuda_cast<float, T>(packed_accum.elements[i]) * cuda_cast<float, T>(packed_accum.elements[i]);
         }
-        float token_sum = blockReduceSum(thread_sum);
+        float token_sum = blockReduceSum<float, false>(thread_sum);
 #ifdef SUPPORT_CGA
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
@@ -803,7 +833,8 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
 
     __pipeline_wait_prior(0);
 
-    float cluster_sum = blockReduceSum(thread_sum);
+    // Sum is only used in thread 0!
+    float cluster_sum = blockReduceSum<float, false>(thread_sum);
 
     float rcp_rms;
     __shared__ float shared_val;
@@ -829,17 +860,14 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
             }
             cluster.sync();
         }
-        if (threadIdx.x == 0)
-        {
-            shared_val = rsqrtf(cluster_sum / dim + epsilon);
-        }
-        __syncthreads();
-        rcp_rms = shared_val;
     }
-    else
+
+    if (threadIdx.x == 0)
     {
-        rcp_rms = rsqrtf(cluster_sum / dim + epsilon);
+        shared_val = rsqrtf(cluster_sum / dim + epsilon);
     }
+    __syncthreads();
+    rcp_rms = shared_val;
 
 #pragma unroll
     for (int i = 0; i < LOADS_PER_THREAD; i++)

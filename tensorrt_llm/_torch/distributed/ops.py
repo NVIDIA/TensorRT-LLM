@@ -69,6 +69,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
         int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
         mapping.tp_rank)
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+    use_fabric_handle = force_mn or mapping.is_multi_node()
 
     allreduce_mnnvl_workspaces = getattr(
         _thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}")
@@ -102,7 +103,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
             mapping.tp_rank,
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.local_rank,
-            True,  # mnNvlink; This Ops could support single-node through nvls as well but we currently only use it for MNNVL
+            use_fabric_handle,  # mnNvlink; This Ops could support single-node through nvls as well but we currently only use it for MNNVL
         )
 
         # We use per FP32 element in the buffer for lamport sync
@@ -363,15 +364,16 @@ class MNNVLAllReduce(nn.Module):
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
         # This should match the heuristic in allreduceOp.cpp
-        # is_one_shot = num_tokens * hidden_dim * group_size * dtype.itemsize <= 128 * 1024 * 8
-        # if is_one_shot:
-        #     # For one-shot, each rank needs to store num_tokens * group_size tokens
-        #     return num_tokens * hidden_dim * group_size * dtype.itemsize
-        # else:
-        # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
-        # 2 Stage is required for the two-shot allreduce.
-        return 2 * math.ceil(
-            num_tokens / group_size) * group_size * hidden_dim * dtype.itemsize
+        is_one_shot = num_tokens * hidden_dim * group_size * dtype.itemsize <= 64 * 1024 * 8
+        if is_one_shot:
+            # For one-shot, each rank needs to store num_tokens * group_size tokens
+            return num_tokens * hidden_dim * group_size * dtype.itemsize
+        else:
+            # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
+            # 2 Stage is required for the two-shot allreduce.
+            return 2 * math.ceil(
+                num_tokens /
+                group_size) * group_size * hidden_dim * dtype.itemsize
 
     def forward(
         self,
