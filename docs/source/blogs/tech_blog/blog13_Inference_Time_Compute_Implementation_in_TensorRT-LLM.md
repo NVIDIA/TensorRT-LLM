@@ -56,7 +56,7 @@ Provides sufficient concurrency to achieve good performance while ease of use. C
 
 This is the call sequence diagram of `Scaffolding`:
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
 </div>
 <p align="center"><sub><em>Figure 1. Scaffolding Sequence</em></sub></p>
 
@@ -191,7 +191,7 @@ Dynasor-CoT
 is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT) inference. This chapter discusses how inference-time compute methods can be smoothly integrated into the TRT-LLM Scaffolding framework, using Dynasor-CoT as an example.
 
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_demo.gif" alt="Dynasor Demo" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_demo.gif" alt="Dynasor Demo" width="900px">
 </div>
 <p align="center"><sub><em>Figure 2. Demo of DeepSeek-R1-Distill-Qwen-7B achieving a 5.74x speedup compared to the baseline when using Dynasor-CoT on MATH500</em></sub></p>
 
@@ -202,7 +202,7 @@ LLM reasoning is highly token-inefficient, often requiring far more tokens to ac
 For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, Deepseek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
 
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_hesitation.png" alt="Motivation" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_hesitation.png" alt="Motivation" width="900px">
 </div>
 <p align="center"><sub><em>Figure 2. An example answer from reasoning model (Deepseek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
 
@@ -213,7 +213,7 @@ More specifically, a probe is an extra generation request with an eliciting prom
 
 
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_pressure_testing.png" alt="Dynasor Demo" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_pressure_testing.png" alt="Dynasor Demo" width="900px">
 </div>
 <p align="center"><sub><em>Figure 3. DeepSeek-R1's performance on AMC23 and AIME24 at varying token budgets. (Left) Standard reasoning with late answer outputs. (Right) Early answer extraction using the Probe-In-The-Middle technique, demonstrating equivalent accuracy with a 50% token reduction. The greener regions in the right panels suggest the model knows the answers much earlier than it reveals in standard reasoning.</em></sub></p>
 
@@ -229,7 +229,7 @@ Figure 4 provides an illustration:
 * **Case 3**: The model generates special tokens such as "wait" or "hmm," signaling hesitation; generation continues.
 
 <div align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_illustration.jpg" alt="Dynasor Illustration" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_illustration.jpg" alt="Dynasor Illustration" width="900px">
 </div>
 <p align="center"><sub><em>Figure 4. Illustration of Dynasor-CoT. Case 1: early exit due to consistent early-stage results. Case 2: continue generation due to inconsistent early-stage results. Case 3: responses containing hesitation words (e.g., wait) are discarded.</em></sub></p>
 
