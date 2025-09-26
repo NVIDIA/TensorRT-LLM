@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm import logger
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
