@@ -52,8 +52,6 @@ transforms:
   # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
   optimize_rope:
     stage: pattern_matcher
-  quantize_int4_from_graph:
-    stage: pattern_matcher
   quantize_int4_linear_from_config:
     stage: pattern_matcher
   quantize_fp8_linear_from_config:
