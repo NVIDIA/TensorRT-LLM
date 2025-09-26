@@ -474,6 +474,24 @@ def _(
                              dtype=output_dtype)
 
 
+# cuBLASLt FP4 GEMM - using Python fake tensor registration only
+# The actual implementation is in C++, we just provide fake tensor support
+@torch.library.register_fake("trtllm::cublas_fp4_scaled_mm")
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Fake tensor implementation for cuBLASLt FP4 GEMM."""
+    # Output shape: [M, N] where M = mat_a.size(0), N = mat_b.size(0)
+    output_size = [mat_a.size(0), mat_b.size(0)]
+    return mat_a.new_empty(output_size, dtype=out_dtype)
+
+
 class FP8BatchedGemmRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = None
