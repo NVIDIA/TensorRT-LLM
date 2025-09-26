@@ -49,6 +49,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             attn_backend="flashinfer",
             compile_backend="torch-opt",
+            free_mem_ratio=0.0001,
         ),
         get_small_model_config_pytest_param(
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
