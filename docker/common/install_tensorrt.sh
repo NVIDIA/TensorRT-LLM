@@ -21,6 +21,7 @@ CUDA_RUNTIME="13.0.48-1"
 CUDA_DRIVER_VERSION="580.65.06-1.el8"
 
 # For CUDA 12.9
+TRT_VER_12_9="10.11.0.33"
 CUDA_VER_12_9="12.9"
 CUDNN_VER_12_9="9.10.2.21-1"
 NCCL_VER_12_9="2.27.5-1+cuda12.9"
@@ -44,6 +45,7 @@ done
 NVCC_VERSION_OUTPUT=$(nvcc --version)
 
 if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) == ${CUDA_VER_12_9} ]]; then
+    TRT_VER="${TRT_VER_12_9}"
     CUDA_VER="${CUDA_VER_12_9}"
     CUDNN_VER="${CUDNN_VER_12_9}"
     NCCL_VER="${NCCL_VER_12_9}"
