@@ -51,7 +51,7 @@ class Qwen3Attention(QKNormRoPEAttention):
 
         # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
         # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
+        disable_deep_gemm = False
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -88,7 +88,7 @@ class Qwen3DecoderLayer(DecoderLayer):
 
         # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
         # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
+        disable_deep_gemm = False
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,

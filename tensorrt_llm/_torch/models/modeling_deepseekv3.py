@@ -40,14 +40,12 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -1528,26 +1526,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader.load_weights(weights)
 
     def post_load_weights(self):
-        all_named_modules = dict(self.model.named_modules())
-        for name, module in tqdm(all_named_modules.items(),
-                                 desc="Post loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
-                continue
-            else:
-                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and is_sm_100f() and hasattr(module, "weight_scale"):
-                    weight, weight_scale = resmooth_to_fp8_e8m0(
-                        module.weight, module.weight_scale)
-                    transfromed_scale = transform_sf_into_required_layout(
-                        weight_scale,
-                        mn=weight.shape[0],
-                        k=weight.shape[1],
-                        recipe=(1, 128, 128),
-                        is_sfa=False)
-                    module.weight = nn.Parameter(weight, requires_grad=False)
-                    module.weight_scale = nn.Parameter(transfromed_scale,
-                                                       requires_grad=False)
-
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
