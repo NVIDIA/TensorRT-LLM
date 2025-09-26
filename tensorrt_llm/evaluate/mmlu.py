@@ -219,7 +219,7 @@ class MMLU(Evaluator):
                                                  include_answer=False)
                 prompt = train_prompt + prompt_end
                 label = test_df.iloc[i, test_df.shape[1] - 1]
-                yield prompt, {"temperature": 0}, label, subject
+                yield prompt, None, label, subject
 
     def compute_score(self, outputs: List[RequestOutput], references: List[str],
                       subjects: List[str]) -> float:
