@@ -14,13 +14,13 @@ This feature is a prototype and under active development. MPI remains the defaul
 ## Quick Start
 To use Ray orchestrator, you need to first install Ray.
 ```shell
-pip install ray[default]
+cd examples/ray_orchestrator
+pip install -r requirements.txt
 ```
 
 Run a simple `TP=2` example with a Hugging Face model:
 
 ```shell
-cd examples/ray_orchestrator
 python llm_inference_distributed_ray.py
 ```
 
