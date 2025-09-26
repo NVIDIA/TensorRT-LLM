@@ -440,13 +440,13 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        // "Build CI image for CUDA12.9 (x86_64 tritondevel)": [
-        //     target: "tritondevel_12_9",
-        // ],
-        // "Build CI image for CUDA12.9 (SBSA tritondevel)": [
-        //     target: "tritondevel_12_9",
-        //     arch: "arm64",
-        // ],
+        "Build CI image for CUDA12.9 (x86_64 tritondevel)": [
+            target: "tritondevel_12_9",
+        ],
+        "Build CI image for CUDA12.9 (SBSA tritondevel)": [
+            target: "tritondevel_12_9",
+            arch: "arm64",
+        ],
         "Build CI image for CUDA12.9 (RockyLinux8 Python310)": [
             target: "rockylinux8_12_9",
             args: "PYTHON_VERSION=3.10.12",
