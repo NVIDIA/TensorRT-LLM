@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import IntEnum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 
-class ServerRole(Enum):
+class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
@@ -41,6 +41,21 @@ class RouterConfig():
 @dataclass
 class ConditionalDisaggConfig():
     max_local_prefill_length: int = 0
+
+
+@dataclass
+class MinimalInstances:
+    context_servers: int = 1
+    generation_servers: int = 1
+
+
+@dataclass
+class DisaggClusterConfig:
+    cluster_uri: str
+    cluster_name: str = ""
+    minimal_instances: Optional[MinimalInstances] = None
+    heartbeat_interval: int = 5
+    inactive_timeout: int = 10
 
 
 @dataclass
