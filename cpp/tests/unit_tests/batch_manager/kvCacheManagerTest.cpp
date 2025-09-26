@@ -3464,6 +3464,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
 TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
 {
     auto const blockSize = 16384;
+    auto constexpr windowSize = 2;
 
     auto bufferManager = tensorrt_llm::runtime::BufferManager(std::make_shared<tr::CudaStream>());
     auto transferManager = KVCacheTransferManager(bufferManager);
@@ -3481,8 +3482,8 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
         tr::bufferCast<float>(*pool.secondaryPtr)[i] = 1;
     }
 
-    auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
-    auto secondaryBlock = std::make_shared<KVCacheBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true));
+    auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false), windowSize);
+    auto secondaryBlock = std::make_shared<KVCacheBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true), windowSize);
 
     transferManager.offload(primaryBlock, secondaryBlock, {pool});
     primaryBlock->swapMemoryPoolBlockOffset(secondaryBlock);

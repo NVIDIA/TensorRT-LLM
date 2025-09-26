@@ -225,7 +225,7 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     return seed;
 }
 
-KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
+KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx, SizeType32 windowSize)
     : mBlockId(blockId)
     , mMemoryPoolBlockIndex{blockIdx}
     , mRefCount(0)
@@ -237,6 +237,7 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mExpirationTime{std::nullopt}
     , mHash{0}
     , mLookupNode{nullptr}
+    , mWindowSize{windowSize}
 {
 }
 
@@ -383,22 +384,21 @@ bool KVCacheBlock::isFull() const
     return mIsFull;
 }
 
-void KVCacheBlock::setLookupNode(LookupNodePtr lookupNode, SizeType32 windowSize)
+void KVCacheBlock::setLookupNode(LookupNodePtr lookupNode, BlockPtr block)
 {
     if (lookupNode != nullptr)
     {
+	TLLM_CHECK_WITH_INFO(getBlockId() == block->getBlockId(), "blockIds differ");
         mLookupNode = lookupNode;
-        mWindowSize = windowSize;
-        lookupNode->setBlock(windowSize, std::shared_ptr<KVCacheBlock>(this));
+        lookupNode->setBlock(mWindowSize, block);
     }
     else
     {
         if (mLookupNode != nullptr)
         {
-            mLookupNode->setBlock(windowSize, nullptr);
+            mLookupNode->setBlock(mWindowSize, nullptr);
         }
         mLookupNode = nullptr;
-        mWindowSize = 0;
     }
 }
 
@@ -420,7 +420,8 @@ std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmReq
     auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
         ? llmRequest.getUniqueTokens(beamIdx)
         : *(llmRequest.getEncoderUniqueTokens().value());
-    auto usefulInputLength = (inputLength <= 0) ? static_cast<SizeType32>(uniqueTokens.size()) - inputLength : inputLength;
+    auto usefulInputLength = (inputLength <= 0) ? static_cast<SizeType32>(uniqueTokens.size()) + inputLength : inputLength;
+    usefulInputLength = std::max(0, usefulInputLength);
 
     // Ignore last token because it can't be recovered
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usefulInputLength, mTokensPerBlock, allowPartiallyFilledBlock);
@@ -497,6 +498,8 @@ KVCachePromptLookupNode::KVCachePromptLookupNode(BlockKey const& blockKey, bool 
     : mBlockKey{blockKey}
     , mIsFull{isFull}
     , mPrevNode{nullptr}
+    , mNextNodes{}
+    , mBlocks{}
 {
 }
 
@@ -576,12 +579,32 @@ std::tuple<bool, SizeType32, LookupNodePtr> KVCachePromptLookupNode::findMatchin
 
 void KVCachePromptLookupNode::setBlock(SizeType32 windowSize, BlockPtr block)
 {
-    mBlocks[windowSize] = block;
+    if (block == nullptr)
+    {
+	auto blockItr = mBlocks.find(windowSize);
+	if (blockItr != mBlocks.end())
+	{
+	    auto block = blockItr->second;
+	    mBlocks.erase(blockItr);
+	}
+    }
+    else
+    {
+        mBlocks.emplace(std::make_pair(windowSize, block));
+    }
 }
 
 BlockPtr KVCachePromptLookupNode::getBlock(SizeType32 windowSize) const
 {
-    return mBlocks.at(windowSize);
+    auto blockItr = mBlocks.find(windowSize);
+    if (blockItr != mBlocks.end())
+    {
+	return blockItr->second;
+    }
+    else
+    {
+	return nullptr;
+    }
 }
 
 bool KVCachePromptLookupNode::isFull() const
@@ -721,7 +744,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mBufferManager{std::move(stream)}
     , mSchedulingNumFreeBlocks{0}
     , mTokensPerBlock{tokensPerBlock}
-    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0})}
+    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0}, windowSize)}
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mTransferManager{std::make_shared<KVCacheTransferManager>(mBufferManager)}
@@ -783,12 +806,12 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     mAllBlocksById.reserve(blocksInPrimaryPool + blocksInSecondaryPool);
     for (KVCacheBlock::IdType blockId = 0; blockId < blocksInPrimaryPool; ++blockId)
     {
-        mAllBlocksById.emplace_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}));
+        mAllBlocksById.emplace_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}, windowSize));
     }
     for (KVCacheBlock::IdType blockId = 0; blockId < blocksInSecondaryPool; ++blockId)
     {
         mAllBlocksById.emplace_back(
-            std::make_shared<KVCacheBlock>(blocksInPrimaryPool + blockId, tk::KVCacheIndex{blockId, true}));
+            std::make_shared<KVCacheBlock>(blocksInPrimaryPool + blockId, tk::KVCacheIndex{blockId, true}, windowSize));
     }
     mAllocatedBlocksPerSeq.reserve(maxNumSequences);
 
@@ -968,6 +991,8 @@ BlockPtr WindowBlockManager::getFreeBlock(
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
+    // remove block from free queue
+    mEvictionPolicy->claimBlock(block);
     // Offloading is an option only when these conditions are met:
     // 1. Block contains state (evidenced by presence of tokens)
     // 2. Eviction policy indicated block can be offloaded
@@ -976,8 +1001,6 @@ BlockPtr WindowBlockManager::getFreeBlock(
     if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
         && mOnboardBlocks)
     {
-        // If we're swapping a block to secondary memory, maintain the prior priority values.
-        mEvictionPolicy->claimBlock(block);
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
         mTransferManager->offload(block, offloadBlock, mPools);
@@ -1125,12 +1148,13 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
     auto nodeItr = matchedPromptNodes.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
-        auto [partialMatch, numMatched, matchingNode] = *nodeItr;
+        auto [partialMatch, numMatched, matchingNode] = nodeItr != matchedPromptNodes.end() ? *(nodeItr++) : std::make_tuple(false,0,nullptr);
         auto matchingBlock = matchingNode != nullptr ? matchingNode->getBlock(mWindowSize) : nullptr;
         if (matchingBlock != nullptr)
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
+	    auto prevNumMatchedTokens = numMatchedTokens;
             numMatchedTokens += numMatched > 0 ? numMatched : matchingNode->getUniqueTokens().size();
             if (perBlockRetentions[bi].retentionPriority.has_value()
                 && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
@@ -1142,7 +1166,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
             }
             if (partialMatch && matchingBlock->hasRefs())
             {
-                // Somebody else is using block, copy reusable tokens
+                // Somebody else is using partially filled block, copy reusable tokens
                 auto newBlock = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs());
                 mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched);
                 // TODO: (optional) Send out event
@@ -1153,10 +1177,16 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
             else
             {
                 // Recover block and reuse
-                matchingNode->setBlock(mWindowSize, nullptr);
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
+		if (partialMatch)
+		{
+		    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched partially filled block %d", mLogPrefix.c_str(), matchingBlockId);
+		}
+		else
+		{
+                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
+		}
             }
             onboardBlock(matchingBlock);
             addBlockToAllBeams(matchingBlock, sequence);
@@ -1233,7 +1263,7 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
 {
     // Lookup prompt nodes once for all window block managers
     // TODO: Should this be inputLength - 1, or should caller do the subtraction? Leaning towards caller doing subtraction
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength, true, mEnablePartialReuse, false);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength - 1, true, mEnablePartialReuse, false);
     // Find kv cache blocks to reuse for each window manager
     mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedPromptNodes);
 }
@@ -1397,12 +1427,14 @@ void WindowBlockManager::storeBlocks(
         if (matchedBlock == nullptr)
         {
             auto prevNode = matchedNode->getPrevNode();
+	    TLLM_CHECK_WITH_INFO(prevNode != nullptr, "prevNode cannot be nullptr");
             auto prevBlock = prevNode != nullptr ? prevNode->getBlock(mWindowSize) : nullptr;
-            auto blockKey = matchedNode->getBlockKey();
-            block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+	    //TLLM_CHECK_WITH_INFO(prevBlock != nullptr, "prevBlock cannot be nullptr");
+	    TLLM_LOG_DEBUG("%s::storeBlocks - Storing block %d with prevBlock %d", mLogPrefix.c_str(), bid, prevBlock != nullptr ? prevBlock->getBlockId() : -999);
+	    block->setBlockKey(matchedNode->getBlockKey(), matchedNode->isFull());
             block->setPrevBlockInSeq(prevBlock);
             block->setHash(); // TODO: Why this is necessary? Can it be replaced with hash from matchedNode?
-            block->setLookupNode(matchedNode, mWindowSize);
+            block->setLookupNode(matchedNode, block);
             matchedNode->setBlock(mWindowSize, block);
             storedBlocks.push_back(block);
         }

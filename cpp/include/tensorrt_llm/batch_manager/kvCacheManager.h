@@ -291,7 +291,7 @@ public:
 
     static constexpr IdType kCachedBlocksRootId = -1;
 
-    explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
+    explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx, SizeType32 windowSize);
 
     void startScheduling();
 
@@ -349,7 +349,7 @@ public:
     size_t getHash() const;
 
     // set lookup node using this block
-    void setLookupNode(LookupNodePtr node, int windowSize);
+    void setLookupNode(LookupNodePtr node, BlockPtr block);
 
     // get lookup node using this block. Can be nullptr
     [[nodiscard]] LookupNodePtr getLookupNode() const;

@@ -129,8 +129,6 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
-    block->setLookupNode(nullptr, 0); // detach from search structure
-
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
@@ -171,6 +169,7 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
 
+    // Detach block from free queue
     if (mFreeBlockIterators[id] != std::nullopt)
     {
         mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
@@ -179,13 +178,18 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
 
     mFreeBlockIterators[id] = std::nullopt;
 
+    // Explicitly set priority, if provided
     if (priority.has_value())
     {
         block->setPriority(*priority);
     }
 
+    // Detach block from expiring heap (processing of time limited retention priority)
     mExpiringBlockHeap.erase(block);
     block->setDurationMs(durationMs);
+
+    // Detach block from search structure
+    block->setLookupNode(nullptr, nullptr);
 }
 
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const

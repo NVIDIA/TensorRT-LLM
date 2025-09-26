@@ -41,18 +41,19 @@ class LRUPolicyTest : public ::testing::Test
 public:
     void SetUp() override
     {
+	auto constexpr windowSize = 2;
         policy = std::make_shared<MockLRUPolicy>();
         std::vector<BlockPtr> allBlocksById;
 
         for (KVCacheBlock::IdType blockId = 0; blockId < NUM_PRIMARY_BLOCKS; ++blockId)
         {
-            allBlocksById.push_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}));
+            allBlocksById.push_back(std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{blockId, false}, windowSize));
         }
 
         for (KVCacheBlock::IdType blockId = 0; blockId < NUM_SECONDARY_BLOCKS; ++blockId)
         {
             allBlocksById.push_back(
-                std::make_shared<KVCacheBlock>(NUM_PRIMARY_BLOCKS + blockId, tk::KVCacheIndex{blockId, true}));
+                std::make_shared<KVCacheBlock>(NUM_PRIMARY_BLOCKS + blockId, tk::KVCacheIndex{blockId, true}, windowSize));
         }
         policy->initialize(allBlocksById, {NUM_PRIMARY_BLOCKS, NUM_SECONDARY_BLOCKS}, std::nullopt);
     }
