@@ -140,8 +140,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<Duration> globalSteadyClockOffset = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
@@ -1261,7 +1260,7 @@ public:
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = getCurrentSteadyClock();
+            mPerfMetrics.timingMetrics.firstScheduledTime = getSteadyClockNow();
         }
     }
 
@@ -1677,7 +1676,7 @@ public:
         {
             return false;
         }
-        auto const currentTime = getCurrentSteadyClock();
+        auto const currentTime = getSteadyClockNow();
         auto const elapsed = (std::chrono::duration_cast<Duration>(currentTime - mStartTime));
         TLLM_LOG_DEBUG("Checked timeOut for request %ld with allotted Time %ld after time %ld and got %d", mRequestId,
             mAllottedTimeMs->count(), elapsed.count(), (elapsed >= mAllottedTimeMs));
@@ -1794,7 +1793,7 @@ public:
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
             TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
-                std::chrono::duration<float>(getCurrentSteadyClock() - mStartTime).count());
+                std::chrono::duration<float>(getSteadyClockNow() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
@@ -1832,10 +1831,9 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
-        auto const currentTokenTime = getCurrentSteadyClock();
-
         if (!mPerfMetrics.firstIter)
         {
+            auto const currentTokenTime = getSteadyClockNow();
             mPerfMetrics.firstIter = iter;
             mPerfMetrics.timingMetrics.firstTokenTime = currentTokenTime;
         }
@@ -1844,6 +1842,7 @@ public:
 
         if (isFinished())
         {
+            auto const currentTokenTime = getSteadyClockNow();
             mPerfMetrics.lastIter = iter;
             mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
@@ -2047,8 +2046,9 @@ protected:
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
 
-    // The offset between local steady clock and glabol steady clock (at rank 0)
+    // The offset between local steady clock and global steady clock (at rank 0)
     std::optional<Duration> mGlobalSteadyClockOffset;
+
 private:
     void initialize(
         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
@@ -2145,9 +2145,9 @@ private:
 
         if (mReturnPerfMetrics)
         {
-            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getCurrentSteadyClock());
+            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getSteadyClockNow());
         }
-        mStartTime = getCurrentSteadyClock();
+        mStartTime = getSteadyClockNow();
     }
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
@@ -2176,15 +2176,22 @@ private:
         return tensor;
     }
 
-    TimePoint maybeToGlobalSteadyClock(TimePoint const & time_point) const {
-        if (mGlobalSteadyClockOffset.has_value()) {
+    TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point) const
+    {
+        if (mGlobalSteadyClockOffset.has_value())
+        {
             return time_point + *mGlobalSteadyClockOffset;
-        } else {
+        }
+        else
+        {
             return time_point;
         }
     }
 
-    TimePoint getCurrentSteadyClock() const {
+    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // time point
+    TimePoint getSteadyClockNow() const
+    {
         const TimePoint time_point = std::chrono::steady_clock::now();
 
         return maybeToGlobalSteadyClock(time_point);
@@ -2245,7 +2252,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt, std::optional<Duration> globalSteadyClockOffset = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<Duration> globalSteadyClockOffset = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),

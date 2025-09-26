@@ -167,7 +167,7 @@ class PyExecutor:
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
         self.dist = dist
-        self.monotonic_ts_offset = self._get_monotonic_ts_offset()
+        self.global_steady_clock_offset = self._get_global_steady_clock_offset()
 
         self.peft_cache_config = peft_cache_config
 
@@ -264,7 +264,7 @@ class PyExecutor:
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
-            monotonic_ts_offset = self.monotonic_ts_offset
+            global_steady_clock_offset=self.global_steady_clock_offset,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -367,14 +367,20 @@ class PyExecutor:
                 self.worker_thread.start()
                 self.worker_started = True
 
-    def _get_monotonic_ts_offset(self):
+    def _get_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
+
+        # Sync all ranks
         self.dist.barrier()
+        # Immediately take the local steady clock timestamp
         local_timestamp = time.monotonic()
-        timestamps = self.dist.allgather(local_timestamp)
+        all_rank_timestamps = self.dist.allgather(local_timestamp)
         if self.global_rank == 0:
-            logger.info(f"monotonic_ts_offsets for each rank: {[local_timestamp - ts for ts in timestamps]}")
-        return timestamps[0] - local_timestamp
+            logger.info(
+                f"global_steady_clock_offset at each rank: {[local_timestamp - ts for ts in all_rank_timestamps]}"
+            )
+        # Compute the steady clock offset between rank 0 and current rank
+        return all_rank_timestamps[0] - local_timestamp
 
     def __enter__(self):
         return self
@@ -1969,6 +1975,7 @@ class PyExecutor:
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
+            # Skip active requests that are not scheduled
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.model_engine.iter_counter)
 

@@ -10,10 +10,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, List, Optional, Union
+from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
+                    Optional, Union)
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
@@ -106,6 +107,8 @@ class OpenAIServer:
         self.metrics_collector = None
         self.perf_metrics = None
         self.perf_metrics_lock = None
+        # The steady clock offset (in seconds) between this server and the disagg server
+        self.disagg_server_steady_clock_offset = 0
         if self.llm.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
@@ -163,7 +166,7 @@ class OpenAIServer:
         @self.app.middleware("http")
         async def add_process_time_header(raw_request: Request, call_next):
             start_time = time.monotonic()
-            raw_request.state.server_start_ts = start_time
+            raw_request.state.server_arrival_time = start_time
             response = await call_next(raw_request)
             return response
 
@@ -215,7 +218,9 @@ class OpenAIServer:
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
         self.app.add_api_route("/perf_metrics", self.get_perf_metrics, methods=["GET"])
-        self.app.add_api_route("/perf_ts_offset", self.get_perf_ts_offset, methods=["GET"])
+        self.app.add_api_route("/steady_clock_offset", self.get_steady_clock_offset, methods=["GET"])
+        # Called by the disagg server to set the disagg_server_steady_clock_offset
+        self.app.add_api_route("/steady_clock_offset", self.set_steady_clock_offset, methods=["POST"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
@@ -315,7 +320,12 @@ class OpenAIServer:
             stats.append(stat)
         return JSONResponse(content=stats)
 
-    async def get_perf_ts_offset(self) -> JSONResponse:
+    async def set_steady_clock_offset(self, offset: Annotated[float, Body(embed=True)]) -> Response:
+        self.disagg_server_steady_clock_offset = offset
+        logger.info(f"The steady clock offset between local and disagg server: {offset} second")
+        return Response(status_code=200)
+
+    async def get_steady_clock_offset(self) -> JSONResponse:
         receive_ts = time.monotonic()
         await asyncio.sleep(0.2)
         transmit_ts = time.monotonic()
@@ -338,12 +348,12 @@ class OpenAIServer:
                 # exclude metrics.iter since it is only meaningful when the request is not finished
             }
             metrics_json["timing_metrics"] = {
-                "server_start_ts": metrics_dict.pop("server_start_ts", None),
-                "arrival_time": timing_metrics.arrival_time.total_seconds(),
-                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
-                "first_token_time": timing_metrics.first_token_time.total_seconds(),
-                "server_first_token_ts":metrics_dict.pop("server_first_token_ts", None),
-                "last_token_time": timing_metrics.last_token_time.total_seconds(),
+                "server_arrival_time": metrics_dict.pop("server_arrival_time", None) + self.disagg_server_steady_clock_offset,
+                "arrival_time": timing_metrics.arrival_time.total_seconds() + self.disagg_server_steady_clock_offset,
+                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds() + self.disagg_server_steady_clock_offset,
+                "first_token_time": timing_metrics.first_token_time.total_seconds() + self.disagg_server_steady_clock_offset,
+                "server_first_token_time":metrics_dict.pop("server_first_token_time", None) + self.disagg_server_steady_clock_offset,
+                "last_token_time": timing_metrics.last_token_time.total_seconds() + self.disagg_server_steady_clock_offset,
             }
             metrics_json["kv_cache_metrics"] = {
                 "num_total_allocated_blocks": kv_cache_metrics.num_total_allocated_blocks,
@@ -355,8 +365,8 @@ class OpenAIServer:
                 metrics_json["timing_metrics"].update({
                     # TODO: move to kv_cache_metrics
                     "kv_cache_size": timing_metrics.kv_cache_size,
-                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds(),
-                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds(),
+                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds() + self.disagg_server_steady_clock_offset,
+                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds() + self.disagg_server_steady_clock_offset,
                 })
             if speculative_decoding.total_draft_tokens > 0:
                 metrics_json["speculative_decoding"] = {
@@ -389,8 +399,8 @@ class OpenAIServer:
                 "perf_metrics": res.outputs[0].request_perf_metrics
             }
             if raw_request:
-                item["server_start_ts"] = getattr(raw_request.state, "server_start_ts", None)
-                item["server_first_token_ts"] = getattr(raw_request.state, "server_first_token_ts", None)
+                item["server_arrival_time"] = getattr(raw_request.state, "server_arrival_time", None)
+                item["server_first_token_time"] = getattr(raw_request.state, "server_first_token_time", None)
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
             if self.perf_metrics is not None:
@@ -603,7 +613,7 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            raw_request.state.server_first_token_ts = time.monotonic()
+            raw_request.state.server_first_token_time = time.monotonic()
             await self._extract_metrics(response, raw_request)
             return pp_result
 
@@ -669,7 +679,7 @@ class OpenAIServer:
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
             first_response = await anext(generator)
-            raw_request.state.server_first_token_ts = time.monotonic()
+            raw_request.state.server_first_token_time = time.monotonic()
             yield first_response
             async for output in generator:
                 yield output
