@@ -75,6 +75,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: deprecated
+      orchestrator_type:
+        annotation: Optional[Literal['ray']]
+        default: null
+        status: prototype
       build_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
         default: null

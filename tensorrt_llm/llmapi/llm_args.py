@@ -2369,6 +2369,13 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    orchestrator_type: Optional[Literal["ray"]] = Field(
+        default=None,
+        description=
+        "The orchestrator type to use. Options: 'ray'. Defaults to None, which uses MPI.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 

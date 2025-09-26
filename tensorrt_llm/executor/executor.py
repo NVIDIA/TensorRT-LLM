@@ -7,8 +7,8 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
-                    Union)
+from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+                    Optional, Union)
 
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -102,6 +102,9 @@ class GenerationExecutor(ABC):
         self._is_llm_executor = is_llm_executor
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
+
+    def use_ray_queue(self) -> bool:
+        return False
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -356,6 +359,23 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     @staticmethod
+    def _create_ray_executor(
+            worker_kwargs: Dict,
+            model_world_size: int,
+            postproc_worker_config: PostprocWorkerConfig,
+            is_llm_executor: bool,
+            tp_size: int,
+            kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+        from .ray_executor import RayExecutor
+
+        return RayExecutor(worker_kwargs,
+                           model_world_size=model_world_size,
+                           postproc_worker_config=postproc_worker_config,
+                           is_llm_executor=is_llm_executor,
+                           tp_size=tp_size,
+                           kv_connector_config=kv_connector_config)
+
+    @staticmethod
     def create(
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -372,6 +392,7 @@ class GenerationExecutor(ABC):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        **args,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -405,6 +426,20 @@ class GenerationExecutor(ABC):
 
         if lora_config:
             worker_kwargs["lora_config"] = lora_config
+
+        orchestrator_type = None if not isinstance(
+            llm_args, TorchLlmArgs) else llm_args.orchestrator_type
+        if orchestrator_type == "ray":
+            return GenerationExecutor._create_ray_executor(
+                worker_kwargs,
+                model_world_size,
+                postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                tp_size=args.get("tp_size", 1),
+                kv_connector_config=kv_connector_config)
+        elif orchestrator_type is not None:
+            raise ValueError(
+                f"Unsupported orchestrator_type: {orchestrator_type}")
 
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)

@@ -41,9 +41,6 @@ __all__ = [
 
 class GenerationExecutorWorker(BaseWorker):
 
-    class WorkerExit(GeneratorExit):
-        pass
-
     def __init__(
         self,
         engine: Union[Path, Engine],
@@ -247,10 +244,6 @@ class GenerationExecutorWorker(BaseWorker):
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
-
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        self.shutdown()
-        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
 
 
 @print_traceback_on_error
