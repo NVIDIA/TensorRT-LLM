@@ -10,7 +10,7 @@ CUDA_VER="13.0.0_580.65.06"
 # For CUDA 12.9
 CUDA_VER_12_9="12.9.1_575.57.08"
 NVCC_VERSION_OUTPUT=$(nvcc --version)
-if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) == ${CUDA_VER_12_9%%.*_*} ]]; then
+if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) == ${CUDA_VER_12_9%.*_*} ]]; then
     CUDA_VER="${CUDA_VER_12_9}"
 fi
 
