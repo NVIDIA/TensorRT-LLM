@@ -1802,7 +1802,7 @@ class PyExecutor:
                 request for request in self.active_requests
                 if request not in requests
             ]
-        self._enqueue_responses(error_responses.items())
+        self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
             self._terminate_request(request)
 
