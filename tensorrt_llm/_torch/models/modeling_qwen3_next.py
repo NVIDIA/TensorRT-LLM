@@ -20,6 +20,8 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
@@ -471,10 +473,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 final_hidden_states, all_reduce_params=all_reduce_params)
 
         return final_hidden_states.view(orig_shape)
-
-
-import triton
-import triton.language as tl
 
 
 @triton.jit
