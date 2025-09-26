@@ -561,13 +561,13 @@ class Llama4DecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
-                if self.next_attn is not None and (self.is_nvfp4
-                                                   or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
-                        self.next_attn.qkv_proj, 'input_scale') else None
-                else:
-                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                if not (self.next_attn is not None and (self.is_nvfp4
+                                                   or self.is_fp8_quant)) \
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
+                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                else:
+                    scale = self.next_attn.qkv_proj.input_scale
 
                 # TODO: MIN_LATENCY_MODE is hardcoded to False
                 if cutlass_min_latency_mode:
@@ -771,13 +771,14 @@ class LlamaDecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
-                if self.next_attn is not None and (self.is_nvfp4
-                                                   or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
-                        self.next_attn.qkv_proj, 'input_scale') else None
-                else:
-                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+                if not (self.next_attn is not None and (self.is_nvfp4
+                                                   or self.is_fp8_quant)) \
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
+                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                else:
+                    scale = self.next_attn.qkv_proj.input_scale
 
                 all_reduce_output = self.all_reduce(
                     hidden_states,
