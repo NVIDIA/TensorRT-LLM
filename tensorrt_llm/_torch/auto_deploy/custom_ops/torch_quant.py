@@ -4,6 +4,7 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
+    unpack_uint8_to_int4_weight_2d,
 )
 
 # FP4 tables (E2M1)
@@ -278,40 +279,6 @@ def torch_fake_quant_nvfp4_linear(
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
 
 
-def _unpack_uint8_to_int4_weight_2d(
-    packed_weight: torch.Tensor, weights_scaling_factor: torch.Tensor
-) -> torch.Tensor:
-    """
-    Reverse of `modelopt.torch.export.quant_utils.pack_int4_in_uint8` for the 2D case.
-    Args:
-      packed_weight: (out_dim//2, in_dim), uint8
-      weights_scaling_factor: (out_dim, in_dim//block_size)  [used for shape/block inference]
-    Returns:
-      int8 weights in [-8,7], shape (out_dim, in_dim)
-    """
-    assert packed_weight.dim() == 2
-    assert packed_weight.dtype == torch.uint8
-
-    out_half, in_dim = packed_weight.shape
-    out_dim = out_half * 2
-    block_size = in_dim // weights_scaling_factor.shape[-1]
-    assert in_dim % block_size == 0
-
-    # inverse of: reshaped = int8_tensor.T.reshape(in_dim, out_dim//2, 2)
-    pw = packed_weight.T.contiguous()  # (in_dim, out_dim//2)
-
-    low = (pw & 0x0F).to(torch.int16)
-    high = ((pw >> 4) & 0x0F).to(torch.int16)
-
-    low = torch.where(low >= 8, low - 16, low).to(torch.int8)
-    high = torch.where(high >= 8, high - 16, high).to(torch.int8)
-
-    rebuilt = torch.stack([low, high], dim=-1)  # (in_dim, out_dim//2, 2)
-    int8_T = rebuilt.reshape(in_dim, out_dim)  # (in_dim, out_dim)
-    int8_W = int8_T.T.contiguous()  # (out_dim, in_dim)
-    return int8_W
-
-
 @torch.library.custom_op("auto_deploy::torch_fake_quant_int4_linear", mutates_args=())
 def torch_fake_quant_int4_linear(
     input: torch.Tensor,  # [..., K]
@@ -327,7 +294,7 @@ def torch_fake_quant_int4_linear(
     pre_quant_scale = input_scale[0].to(dtype=input.dtype)
     x_scaled = torch.mul(input, pre_quant_scale)
 
-    q_int4 = _unpack_uint8_to_int4_weight_2d(weight_quantized, weight_scale[0])  # (N,K), int8
+    q_int4 = unpack_uint8_to_int4_weight_2d(weight_quantized, weight_scale[0])  # (N,K), int8
     amax_2d = (weight_scale[0] * 7.0).to(input.dtype)  # (N, K//128)
 
     scale_blocks = (7.0 / amax_2d).to(torch.float32)  # (N, K//128)
