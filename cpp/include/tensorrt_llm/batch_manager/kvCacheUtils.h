@@ -45,7 +45,7 @@ public:
     {
         auto const windowSize = firstWindowSize(cacheManager);
         // Find the last block in the reuse tree for the provided full sequence of block keys
-        auto lastBlock = *cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
+        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
         // TODO: handle the case where the last block is not found
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
         int32_t const numBlocksToCollect = indexFromEnd + 1;

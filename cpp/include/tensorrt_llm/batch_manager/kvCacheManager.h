@@ -821,8 +821,7 @@ public:
         return mIsSWA;
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey);
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
     //! \brief Unpin blocks by starting from a block id and walking prev pointers.
     void unpinBlocksById(KVCacheBlock::IdType blockId);
@@ -1194,7 +1193,7 @@ public:
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, SizeType32 windowSize)
     {
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
@@ -1491,7 +1490,7 @@ public:
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
-    [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
 
@@ -1794,7 +1793,7 @@ public:
         mBlockManager.flushIterationEvents();
     }
 
-    std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);

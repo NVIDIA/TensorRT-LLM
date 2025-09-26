@@ -639,9 +639,8 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     inputTokens->pop_back();
     BlockKey fullKey{*inputTokens};
     auto const foundFull = kvCacheManager.findBlocksInReuseTreeByBlockKey(fullKey, maxAttentionWindow);
-    ASSERT_TRUE(foundFull.has_value());
-    ASSERT_NE(foundFull.value(), nullptr);
-    auto const& lastBlock = foundFull.value();
+    ASSERT_NE(foundFull, nullptr);
+    auto const& lastBlock = foundFull;
 
     // Check the chain back to previous blocks
     auto const prev2 = lastBlock->getPrevBlock();

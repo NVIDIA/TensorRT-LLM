@@ -1096,8 +1096,7 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByBlockKey(
-    BlockKey const& blockKey)
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
 {
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto blockedUniqueTokens
@@ -1118,7 +1117,7 @@ std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReu
 
         if (matchingBlock == nullptr)
         {
-            return std::nullopt;
+            return nullptr;
         }
 
         searchRoot = std::move(matchingBlock);
