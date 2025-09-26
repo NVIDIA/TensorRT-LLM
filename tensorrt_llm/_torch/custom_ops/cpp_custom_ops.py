@@ -516,7 +516,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
-        # C++ checks imply: input [M, K], weight [N, K], bias [N]
+        # input [M, K], weight [N, K], bias [N]
         # Output should be [M, N]
         m = input.shape[0]
         n = weight.shape[0]
