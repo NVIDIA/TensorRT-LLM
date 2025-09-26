@@ -1,5 +1,6 @@
 import os
 import signal
+import socket
 import subprocess
 import time
 import unittest
@@ -7,6 +8,17 @@ import unittest
 import etcd3
 
 from tensorrt_llm.serve.metadata_server import EtcdDictionary
+
+
+def wait_for_port(host, port, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError(f"Timeout waiting for {host}:{port}")
 
 
 def start_etcd_server():
@@ -21,7 +33,6 @@ def start_etcd_server():
         preexec_fn=os.setsid)  # This makes it run in a new process group
 
     # Wait a bit for etcd to start
-    time.sleep(5)
 
     return process
 
@@ -44,6 +55,8 @@ class TestEtcdDictionary(unittest.TestCase):
         # Setup etcd connection parameters
         self.host = "localhost"
         self.port = 2379
+
+        wait_for_port(self.host, self.port)
 
         # Create a clean etcd client for test setup/teardown
         self.cleanup_client = etcd3.client(host=self.host, port=self.port)
