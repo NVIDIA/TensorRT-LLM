@@ -13,49 +13,59 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
+#ifndef TRTLLM_MNNVL_ALLREDUCE_KERNELS_H
+#define TRTLLM_MNNVL_ALLREDUCE_KERNELS_H
 
 #include <NvInferRuntime.h>
-#include <array>
-#include <cstddef>
 #include <cstdint>
 
 namespace tensorrt_llm::kernels::mnnvl
 
 {
 
-enum MNNVLTwoShotStage : uint8_t
-{
-    SCATTER = 0,
-    BROADCAST = 1,
-    NUM_STAGES = 2,
-};
-
+/**
+ * \brief Parameters for MNNVL (Multi-Node NVLink) AllReduce fusion operations.
+ *
+ * \note This struct is used by both oneshotAllreduceFusionOp() and twoshotAllreduceFusionOp()
+ *
+ * \see oneshotAllreduceFusionOp
+ * \see twoshotAllreduceFusionOp
+ */
 struct AllReduceFusionParams
 {
-    // Environmental/Aux data
-    int nranks;
-    int rank;
-    nvinfer1::DataType dtype;
-    int num_tokens;
-    int token_dim;
-    void** buffer_ptrs_dev;
-    void* buffer_ptr_local;
-    void* multicast_ptr;
-    uint32_t* buffer_flags;
-    bool rmsnorm_fusion;
+    //! \name Environmental and Auxiliary Data
+    //! @{
 
-    // Input and output data
-    void const* input;
-    void const* residual_in;
-    void const* gamma;
-    double epsilon;
+    int nRanks;               //!< Total number of participating ranks in the AllReduce operation
+    int rank;                 //!< Current rank ID
+    nvinfer1::DataType dType; //!< Data type of the tensors (e.g., FP16, BF16, FP32)
+    int numTokens;            //!< Number of tokens in the input tensor
+    int tokenDim;             //!< Hidden Dimension
+    void** bufferPtrsDev;     //!< Unicast Device pointers to communication buffers for each rank
+    void* bufferPtrLocal;     //!< Local buffer pointer for temporary storage (i.e., bufferPtrsDev[rank])
+    void* multicastPtr;       //!< Multicast buffer pointer.
+    uint32_t* bufferFlags;    //!< Synchronization flags for coordinating communication phases
+    bool rmsNormFusion;       //!< Whether to fuse RMS normalization with the AllReduce operation
 
-    void* residual_out;
-    void* output;
-    cudaStream_t stream;
+    //! @}
+
+    //! \name Input and Output Data
+    //! @{
+
+    void const* input;      //!< Input tensor to be reduced across all ranks
+    void const* residualIn; //!< Residual input tensor for skip connections (used when rmsnormFusion=true)
+    void const* gamma;      //!< Gamma parameters for RMS normalization (used when rmsnormFusion=true)
+    double epsilon;         //!< Epsilon value for RMS normalization numerical stability (used when rmsnormFusion=true)
+
+    void* residualOut;      //!< Output tensor for residual connection result (used when rmsnormFusion=true)
+    void* output;           //!< Final output tensor containing the AllReduce result
+    cudaStream_t stream;    //!< CUDA stream for asynchronous kernel execution
+
+    //! @}
 };
 
-void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params);
-void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params);
+void oneshotAllreduceFusionOp(AllReduceFusionParams const& params);
+void twoshotAllreduceFusionOp(AllReduceFusionParams const& params);
 } // namespace tensorrt_llm::kernels::mnnvl
+
+#endif // TRTLLM_MNNVL_ALLREDUCE_KERNELS_H

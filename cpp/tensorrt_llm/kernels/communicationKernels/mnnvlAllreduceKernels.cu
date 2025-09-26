@@ -14,14 +14,12 @@
  * limitations under the License.
  */
 #include "mnnvlAllreduceKernels.h"
-#include <array>
 #include <cooperative_groups.h>
 #include <cstddef>
 #include <cstdint>
 #include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
-#include <nvml.h>
 #include <tuple>
 #include <type_traits>
 
@@ -95,47 +93,47 @@ inline __device__ PackedType loadPackedVolatile(void const* ptr)
 template <>
 inline __device__ float4 loadPackedVolatile<float4>(void const* ptr)
 {
-    float4 return_value;
+    float4 returnValue;
     asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-                 : "=f"(return_value.x), "=f"(return_value.y), "=f"(return_value.z), "=f"(return_value.w)
+                 : "=f"(returnValue.x), "=f"(returnValue.y), "=f"(returnValue.z), "=f"(returnValue.w)
                  : "l"(ptr));
-    return return_value;
+    return returnValue;
 }
 
 template <>
 inline __device__ float2 loadPackedVolatile<float2>(void const* ptr)
 {
-    float2 return_value;
-    asm volatile("ld.volatile.global.v2.f32 {%0, %1}, [%2];\n" : "=f"(return_value.x), "=f"(return_value.y) : "l"(ptr));
-    return return_value;
+    float2 returnValue;
+    asm volatile("ld.volatile.global.v2.f32 {%0, %1}, [%2];\n" : "=f"(returnValue.x), "=f"(returnValue.y) : "l"(ptr));
+    return returnValue;
 }
 
 template <typename T_IN>
-inline __device__ void copy_f4(T_IN* dst, T_IN const* src)
+inline __device__ void copyF4(T_IN* dst, T_IN const* src)
 {
     float4* dst4 = reinterpret_cast<float4*>(dst);
     float4 const* src4 = reinterpret_cast<float4 const*>(src);
     __pipeline_memcpy_async(dst4, src4, sizeof(float4));
 }
 
-#define WARP_SIZE 32U
-#define LOG2_WARP_SIZE 5U
-#define LANE_ID_MASK 0x1f
+uint32_t constexpr kWARP_SIZE = 32U;
+uint32_t constexpr kLOG2_WARP_SIZE = 5U;
+uint32_t constexpr kLANE_ID_MASK = 0x1f;
 
 template <typename T>
 inline __device__ T warpReduceSumPartial(T val)
 {
-    int lane_id = threadIdx.x & LANE_ID_MASK;
+    int laneId = threadIdx.x & kLANE_ID_MASK;
     // We make sure only the last warp will call this function
-    int warp_size = blockDim.x - (threadIdx.x & ~(WARP_SIZE - 1));
-    unsigned int active_mask = (1U << warp_size) - 1;
+    int warpSize = blockDim.x - (threadIdx.x & ~(kWARP_SIZE - 1));
+    unsigned int active_mask = (1U << warpSize) - 1;
 
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
     {
-        int target_lane = lane_id ^ mask;
-        auto tmp = __shfl_xor_sync(active_mask, val, mask, WARP_SIZE);
-        val += target_lane < warp_size ? tmp : 0;
+        int targetLane = laneId ^ mask;
+        auto tmp = __shfl_xor_sync(active_mask, val, mask, kWARP_SIZE);
+        val += targetLane < warpSize ? tmp : 0;
     }
     return val;
 }
@@ -146,29 +144,29 @@ inline __device__ T warpReduceSumPartial(T val)
 template <typename T, bool SYNC = false>
 inline __device__ T blockReduceSumPartial(T val)
 {
-    __shared__ T smem[WARP_SIZE + 1];
-    int lane_id = threadIdx.x & LANE_ID_MASK;
-    int warp_id = threadIdx.x >> LOG2_WARP_SIZE;
-    int warp_num = (blockDim.x + WARP_SIZE - 1) >> LOG2_WARP_SIZE; // Ceiling division to include partial warps
+    __shared__ T smem[kWARP_SIZE + 1];
+    int laneId = threadIdx.x & kLANE_ID_MASK;
+    int warpId = threadIdx.x >> kLOG2_WARP_SIZE;
+    int warpNum = (blockDim.x + kWARP_SIZE - 1) >> kLOG2_WARP_SIZE; // Ceiling division to include partial warps
 
-    val = (warp_id == warp_num - 1) ? warpReduceSumPartial(val) : tensorrt_llm::common::warpReduceSum(val);
-    if (lane_id == 0)
+    val = (warpId == warpNum - 1) ? warpReduceSumPartial(val) : tensorrt_llm::common::warpReduceSum(val);
+    if (laneId == 0)
     {
-        smem[warp_id] = val;
+        smem[warpId] = val;
     }
     __syncthreads();
 
-    if (warp_id == 0)
+    if (warpId == 0)
     {
-        val = (lane_id < warp_num) ? smem[lane_id] : (T) 0.f;
+        val = (laneId < warpNum) ? smem[laneId] : (T) 0.f;
         // Need to consider the corner case where we only have one warp and it is partial
-        val = (warp_num == 1) ? warpReduceSumPartial(val) : tensorrt_llm::common::warpReduceSum(val);
+        val = (warpNum == 1) ? warpReduceSumPartial(val) : tensorrt_llm::common::warpReduceSum(val);
 
         if constexpr (SYNC)
         {
-            if (lane_id == 0)
+            if (laneId == 0)
             {
-                smem[warp_id] = val;
+                smem[warpId] = val;
             }
         }
     }
@@ -183,8 +181,8 @@ inline __device__ T blockReduceSumPartial(T val)
 template <typename T, bool SYNC = false>
 inline __device__ T blockReduceSum(T val)
 {
-    bool has_partial_warp = (blockDim.x & LANE_ID_MASK) != 0;
-    if (has_partial_warp)
+    bool hasPartialWarp = (blockDim.x & kLANE_ID_MASK) != 0;
+    if (hasPartialWarp)
     {
         return blockReduceSumPartial<T, SYNC>(val);
     }
@@ -193,10 +191,6 @@ inline __device__ T blockReduceSum(T val)
         return tensorrt_llm::common::blockReduceSum<T>(val);
     }
 }
-
-#undef WARP_SIZE
-#undef LOG2_WARP_SIZE
-#undef LANE_ID_MASK
 
 // We have to define this again since the one in mathUtils.h is shadowed by the one from cudaUtils.h, which is a
 // host-only function!
@@ -215,44 +209,44 @@ inline __device__ __host__ T divUp(T m, T n)
 // 3. Trying to scale up use multiple loads or CGA
 // 4. The block_size is adjusted to be the minimum value that satisfies the above conditions
 template <bool USE_CGA = false>
-inline std::tuple<int, int, int> adjust_grid_config(int num_tokens, int dim, int elts_per_thread)
+std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread)
 {
     // Start with preferred block_size and cluster_size
-    int cluster_size = USE_CGA ? 8 : 1;
-    int block_size = 128;
+    int clusterSize = USE_CGA ? 8 : 1;
+    int blockSize = 128;
     // ========================== Adjust the grid configuration ==========================
-    int threads_needed = divUp(dim, elts_per_thread);
-    int loads_per_thread = 1;
+    int threadsNeeded = divUp(dim, eltsPerThread);
+    int loadsPerThread = 1;
 
-    block_size = divUp(threads_needed, cluster_size);
+    blockSize = divUp(threadsNeeded, clusterSize);
     if (USE_CGA)
     {
-        while (threads_needed % cluster_size != 0 && cluster_size > 1)
+        while (threadsNeeded % clusterSize != 0 && clusterSize > 1)
         {
-            cluster_size /= 2;
+            clusterSize /= 2;
         }
-        block_size = divUp(threads_needed, cluster_size);
-        while (block_size < 128 && cluster_size >= 2)
+        blockSize = divUp(threadsNeeded, clusterSize);
+        while (blockSize < 128 && clusterSize >= 2)
         {
-            block_size *= 2;
-            cluster_size /= 2;
+            blockSize *= 2;
+            clusterSize /= 2;
         }
-        int sm_count = getMultiProcessorCount();
-        while (num_tokens * cluster_size > sm_count && cluster_size > 1 && block_size <= 512)
+        int smCount = getMultiProcessorCount();
+        while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512)
         {
-            block_size *= 2;
-            cluster_size /= 2;
+            blockSize *= 2;
+            clusterSize /= 2;
         }
     }
 
     // Trying to scale up use multiple loads or CGA
-    while (block_size > 1024)
+    while (blockSize > 1024)
     {
         if constexpr (USE_CGA)
         {
-            if (cluster_size < 8)
+            if (clusterSize < 8)
             {
-                cluster_size = cluster_size << 1;
+                clusterSize = clusterSize << 1;
             }
             else
             {
@@ -261,18 +255,18 @@ inline std::tuple<int, int, int> adjust_grid_config(int num_tokens, int dim, int
         }
         else
         {
-            if (loads_per_thread < 8)
+            if (loadsPerThread < 8)
             {
-                loads_per_thread += 1;
+                loadsPerThread += 1;
             }
             else
             {
                 break;
             }
         }
-        block_size = divUp(threads_needed, cluster_size * loads_per_thread);
+        blockSize = divUp(threadsNeeded, clusterSize * loadsPerThread);
     }
-    return {block_size, cluster_size, loads_per_thread};
+    return {blockSize, clusterSize, loadsPerThread};
 }
 
 } // namespace detail
@@ -282,85 +276,83 @@ using detail::loadPacked;
 using detail::loadPackedVolatile;
 using detail::blockReduceSum;
 using detail::divUp;
-using detail::copy_f4;
+using detail::copyF4;
 
 // Use another macro to enhance readability
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 #define SUPPORT_CGA
 #endif
 
-template <uint8_t WORLD_SIZE, typename T, bool RESNORM_FUSION = false, typename PackedType = float4>
-__global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* output_ptr, T* prenormed_ptr,
-    T const* shard_ptr, T const* residual_in_ptr, T const* gamma_ptr, T** input_ptrs, T* mcast_ptr,
-    int const num_tokens, int const token_dim, float epsilon, int const rank, uint32_t* buffer_flags)
+template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, typename PackedType = float4>
+__global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPtr, T* prenormedPtr, T const* shardPtr,
+    T const* residualInPtr, T const* gammaPtr, T** inputPtrs, T* mcastPtr, int const numTokens, int const tokenDim,
+    float epsilon, int const rank, uint32_t* bufferFlags)
 {
-    constexpr int ELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
-    constexpr int LAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
-    constexpr uint32_t ELT_SIZE = sizeof(T);
-#ifdef SUPPORT_CGA
+    constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
+    constexpr int kLAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
+    constexpr uint32_t kELT_SIZE = sizeof(T);
+#if defined(SUPPORT_CGA)
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
-    cg::grid_group grid = cg::this_grid();
-    int packed_idx = cluster.thread_rank();
+    int packedIdx = cluster.thread_rank();
     int token = blockIdx.x;
-    int thread_offset = token * token_dim + packed_idx * ELTS_PER_THREAD;
+    int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 #else
-    int packed_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
     // Offset w.r.t. the input shard
-    int thread_offset = token * token_dim + packed_idx * ELTS_PER_THREAD;
-    int clear_token_stride = gridDim.x;
+    int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 #endif
 
     cudaGridDependencySynchronize();
 
 // We only use 1 stage for the oneshot allreduce
-#ifdef SUPPORT_CGA
-    LamportFlags<PackedType, true> flag(buffer_flags, 1);
+#if defined(SUPPORT_CGA)
+    LamportFlags<PackedType, true> flag(bufferFlags, 1);
 #else
-    LamportFlags<PackedType, false> flag(buffer_flags, 1);
+    LamportFlags<PackedType, false> flag(bufferFlags, 1);
 #endif
-    T* stage_ptr_mcast = reinterpret_cast<T*>(flag.getCurLamportBuf(mcast_ptr, 0));
-    T* stage_ptr_local = reinterpret_cast<T*>(flag.getCurLamportBuf(input_ptrs[rank], 0));
+    T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(mcastPtr, 0));
+    T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], 0));
 
-    if (packed_idx * ELTS_PER_THREAD >= token_dim)
+    if (packedIdx * kELTS_PER_THREAD >= tokenDim)
     {
-        flag.clearDirtyLamportBuf(input_ptrs[rank], -1);
+        flag.clearDirtyLamportBuf(inputPtrs[rank], -1);
         return;
     }
 
     // ==================== Broadcast tokens to each rank =============================
     PackedVec<PackedType, T> val;
-    val.packed = loadPacked<PackedType>(&shard_ptr[thread_offset]);
+    val.packed = loadPacked<PackedType>(&shardPtr[threadOffset]);
 #pragma unroll
-    for (int i = 0; i < ELTS_PER_THREAD; i++)
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
     {
         if (isNegZero(val.elements[i]))
             val.elements[i] = cuda_cast<T, float>(0.f);
     }
 
-    reinterpret_cast<PackedType*>(&stage_ptr_mcast[token * token_dim * WORLD_SIZE + rank * token_dim])[packed_idx]
+    reinterpret_cast<PackedType*>(&stagePtrMcast[token * tokenDim * WorldSize + rank * tokenDim])[packedIdx]
         = val.packed;
 
-    flag.cta_arrive();
+    flag.ctaArrive();
     // ======================= Lamport Sync and clear the output buffer from previous iteration
     // =============================
-    flag.clearDirtyLamportBuf(input_ptrs[rank], -1);
+    flag.clearDirtyLamportBuf(inputPtrs[rank], -1);
 
-    PackedVec<PackedType, float> values_lamport[WORLD_SIZE];
+    PackedVec<PackedType, float> valuesLamport[WorldSize];
     while (1)
     {
         bool valid = true;
 #pragma unroll
-        for (int r = 0; r < WORLD_SIZE; r++)
+        for (int r = 0; r < WorldSize; r++)
         {
-            values_lamport[r].packed = loadPackedVolatile<PackedType>(
-                &stage_ptr_local[token * token_dim * WORLD_SIZE + r * token_dim + packed_idx * ELTS_PER_THREAD]);
+            valuesLamport[r].packed = loadPackedVolatile<PackedType>(
+                &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim + packedIdx * kELTS_PER_THREAD]);
 
 #pragma unroll
-            for (int i = 0; i < LAMPORT_ELTS_PER_PACKED; i++)
+            for (int i = 0; i < kLAMPORT_ELTS_PER_PACKED; i++)
             {
-                valid &= !isNegZero(values_lamport[r].elements[i]);
+                valid &= !isNegZero(valuesLamport[r].elements[i]);
             }
         }
         if (valid)
@@ -369,54 +361,54 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
         }
     }
 
-    auto values = reinterpret_cast<PackedVec<PackedType, T>*>(values_lamport);
+    auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
     // ======================= Reduction =============================
-    float accum[ELTS_PER_THREAD];
-    PackedVec<PackedType, T> packed_accum;
+    float accum[kELTS_PER_THREAD];
+    PackedVec<PackedType, T> packedAccum;
 
 #pragma unroll
-    for (int i = 0; i < ELTS_PER_THREAD; i++)
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
     {
         accum[i] = cuda_cast<float, T>(values[0].elements[i]);
     }
 
 #pragma unroll
-    for (int r = 1; r < WORLD_SIZE; r++)
+    for (int r = 1; r < WorldSize; r++)
     {
 #pragma unroll
-        for (int i = 0; i < ELTS_PER_THREAD; i++)
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
             accum[i] += cuda_cast<float, T>(values[r].elements[i]);
         }
     }
 
 #pragma unroll
-    for (int i = 0; i < ELTS_PER_THREAD; i++)
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
     {
-        packed_accum.elements[i] = cuda_cast<T, float>(accum[i]);
+        packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
     }
     cudaTriggerProgrammaticLaunchCompletion();
-    if constexpr (RESNORM_FUSION)
+    if constexpr (RMSNormFusion)
     {
         // =============================== Residual ===============================
-        PackedVec<PackedType, T> residual_in;
-        residual_in.packed = *reinterpret_cast<PackedType const*>(&residual_in_ptr[thread_offset]);
-        packed_accum += residual_in;
-        *reinterpret_cast<PackedType*>(&prenormed_ptr[thread_offset]) = packed_accum.packed;
+        PackedVec<PackedType, T> residualIn;
+        residualIn.packed = *reinterpret_cast<PackedType const*>(&residualInPtr[threadOffset]);
+        packedAccum += residualIn;
+        *reinterpret_cast<PackedType*>(&prenormedPtr[threadOffset]) = packedAccum.packed;
         // =============================== Rmsnorm ================================
         PackedVec<PackedType, T> gamma;
-        gamma.packed = *reinterpret_cast<PackedType const*>(&gamma_ptr[packed_idx * ELTS_PER_THREAD]);
+        gamma.packed = *reinterpret_cast<PackedType const*>(&gammaPtr[packedIdx * kELTS_PER_THREAD]);
 
-        float thread_sum = 0.F;
-        __shared__ float shared_val; // Temporary variable to share the sum within block
+        float threadSum = 0.F;
+        __shared__ float sharedVal; // Temporary variable to share the sum within block
 #pragma unroll
-        for (int i = 0; i < ELTS_PER_THREAD; i++)
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
             // FIXME: Use float square if accuracy issue
-            thread_sum += cuda_cast<float, T>(packed_accum.elements[i] * packed_accum.elements[i]);
+            threadSum += cuda_cast<float, T>(packedAccum.elements[i] * packedAccum.elements[i]);
         }
-        float token_sum = blockReduceSum<float, false>(thread_sum);
-#ifdef SUPPORT_CGA
+        float tokenSum = blockReduceSum<float, false>(threadSum);
+#if defined(SUPPORT_CGA)
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
@@ -424,15 +416,15 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
             // Need to reduce over the entire cluster
             if (threadIdx.x == 0)
             {
-                shared_val = token_sum;
-                token_sum = 0.f;
+                sharedVal = tokenSum;
+                tokenSum = 0.F;
             }
             cluster.sync();
             if (threadIdx.x == 0)
             {
                 for (int i = 0; i < cluster.num_blocks(); ++i)
                 {
-                    token_sum += *cluster.map_shared_rank(&shared_val, i);
+                    tokenSum += *cluster.map_shared_rank(&sharedVal, i);
                 }
             }
             cluster.sync();
@@ -440,68 +432,63 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
 #endif
         if (threadIdx.x == 0)
         {
-            shared_val = rsqrtf(token_sum / token_dim + epsilon);
+            sharedVal = rsqrtf(tokenSum / tokenDim + epsilon);
         }
         __syncthreads();
 #pragma unroll
-        for (int i = 0; i < ELTS_PER_THREAD; i++)
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
-            packed_accum.elements[i] = cuda_cast<T, float>(
-                cuda_cast<float, T>(packed_accum.elements[i]) * shared_val * cuda_cast<float, T>(gamma.elements[i]));
+            packedAccum.elements[i] = cuda_cast<T, float>(
+                cuda_cast<float, T>(packedAccum.elements[i]) * sharedVal * cuda_cast<float, T>(gamma.elements[i]));
         }
     }
-    reinterpret_cast<PackedType*>(&output_ptr[thread_offset])[0] = packed_accum.packed;
-    flag.wait_and_update({static_cast<uint32_t>(num_tokens * token_dim * WORLD_SIZE * ELT_SIZE), 0, 0, 0});
+    reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
+    flag.waitAndUpdate({static_cast<uint32_t>(numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
 }
 
-using detail::adjust_grid_config;
+using detail::adjustGridConfig;
 
-void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
+void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
-    int const num_tokens = params.num_tokens;
-    int const token_dim = params.token_dim;
-    int const elts_per_thread = sizeof(float4) / getDTypeSize(params.dtype);
+    int const numTokens = params.numTokens;
+    int const tokenDim = params.tokenDim;
+    int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
 
-#ifdef SUPPORT_CGA
-    auto [block_size, cluster_size, loads_per_thread]
-        = adjust_grid_config<true>(num_tokens, token_dim, elts_per_thread);
+#if defined(SUPPORT_CGA)
+    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread);
 #else
-    auto [block_size, cluster_size, loads_per_thread]
-        = adjust_grid_config<false>(num_tokens, token_dim, elts_per_thread);
+    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<false>(numTokens, tokenDim, eltsPerThread);
 #endif
-    dim3 grid(num_tokens, cluster_size, 1);
+    dim3 grid(numTokens, clusterSize, 1);
 
-    TLLM_CHECK_WITH_INFO(block_size <= 1024 && loads_per_thread == 1,
-        "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", token_dim,
-#ifdef SUPPORT_CGA
-        1024 * 8 * elts_per_thread);
+    TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
+        "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim,
+#if defined(SUPPORT_CGA)
+        1024 * 8 * eltsPerThread);
 #else
-        1024 * elts_per_thread);
+        1024 * eltsPerThread);
 #endif
 
     TLLM_LOG_DEBUG(
         "[MNNVL AllReduceOneShot] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: %d, "
         "loads_per_thread: %d, "
         "threads_needed: %d",
-        num_tokens, cluster_size, block_size, cluster_size, loads_per_thread, divUp(token_dim, elts_per_thread));
+        numTokens, clusterSize, blockSize, clusterSize, loadsPerThread, divUp(tokenDim, eltsPerThread));
 
     cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
-#ifdef SUPPORT_CGA
+#if defined(SUPPORT_CGA)
     attrs[1].id = cudaLaunchAttributeClusterDimension;
     attrs[1].val.clusterDim.x = 1;
-    attrs[1].val.clusterDim.y = cluster_size;
+    attrs[1].val.clusterDim.y = clusterSize;
     attrs[1].val.clusterDim.z = 1;
 #endif
 
-    cudaLaunchConfig_t config{
-        .gridDim = grid,
-        .blockDim = block_size,
-        .dynamicSmemBytes = 0,
-        .stream = params.stream,
-        .attrs = attrs,
-#ifdef SUPPORT_CGA
+    cudaLaunchConfig_t config
+    {
+        .gridDim = grid, .blockDim = blockSize, .dynamicSmemBytes = 0, .stream = params.stream, .attrs = attrs,
+#if defined(SUPPORT_CGA)
         .numAttrs = 2,
 #else
         .numAttrs = 1,
@@ -509,11 +496,11 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
     };
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM)                                                                \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshot_allreduce_fusion_kernel<WORLD_SIZE, T, RMSNORM>, output,      \
-        residual_out, input, residual_in, gamma, uc_ptrs, mc_ptr, num_tokens, token_dim,                               \
-        static_cast<float>(params.epsilon), params.rank, params.buffer_flags));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM>, output,         \
+        residualOut, input, residualIn, gamma, ucPtrs, mcPtr, numTokens, tokenDim, static_cast<float>(params.epsilon), \
+        params.rank, params.bufferFlags));
 #define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                       \
-    if (params.rmsnorm_fusion)                                                                                         \
+    if (params.rmsNormFusion)                                                                                          \
     {                                                                                                                  \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, true);                                                                  \
     }                                                                                                                  \
@@ -522,18 +509,18 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, false);                                                                 \
     }
     // C++17 compatible alternative using a template function
-    auto dispatch_impl = [&](auto* type_ptr) -> bool
+    auto dispatchImpl = [&](auto* type_ptr) -> bool
     {
         using T = std::remove_pointer_t<decltype(type_ptr)>;
-        T** uc_ptrs = reinterpret_cast<T**>(params.buffer_ptrs_dev);
-        T* mc_ptr = reinterpret_cast<T*>(params.multicast_ptr);
+        T** ucPtrs = reinterpret_cast<T**>(params.bufferPtrsDev);
+        T* mcPtr = reinterpret_cast<T*>(params.multicastPtr);
         T* output = reinterpret_cast<T*>(params.output);
-        T* residual_out = reinterpret_cast<T*>(params.residual_out);
+        T* residualOut = reinterpret_cast<T*>(params.residualOut);
         T const* input = reinterpret_cast<T const*>(params.input);
-        T const* residual_in = reinterpret_cast<T const*>(params.residual_in);
+        T const* residualIn = reinterpret_cast<T const*>(params.residualIn);
         T const* gamma = reinterpret_cast<T const*>(params.gamma);
 
-        switch (params.nranks)
+        switch (params.nRanks)
         {
             // FIXME: Do we need other world sizes?
         case 2: DISPATCH_ALLREDUCE_KERNEL(2, T); return true;
@@ -547,45 +534,52 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
     };
 #undef LAUNCH_ALLREDUCE_KERNEL
 #undef DISPATCH_ALLREDUCE_KERNEL
-    bool launched = (params.dtype == nvinfer1::DataType::kBF16 && dispatch_impl((__nv_bfloat16*) nullptr))
-        || (params.dtype == nvinfer1::DataType::kFLOAT && dispatch_impl((float*) nullptr))
-        || (params.dtype == nvinfer1::DataType::kHALF && dispatch_impl((__nv_half*) nullptr));
+    bool launched = (params.dType == nvinfer1::DataType::kBF16 && dispatchImpl((__nv_bfloat16*) nullptr))
+        || (params.dType == nvinfer1::DataType::kFLOAT && dispatchImpl((float*) nullptr))
+        || (params.dType == nvinfer1::DataType::kHALF && dispatchImpl((__nv_half*) nullptr));
     if (!launched)
     {
         TLLM_CHECK_WITH_INFO(false, "Failed to dispatch MNNVL AllReduceOneShot kernel.");
     }
 }
 
-template <uint8_t WORLD_SIZE, typename T, typename PackedType = float4>
-__global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T const* shard_ptr, T** input_ptrs,
-    T* mcast_ptr, uint32_t const num_tokens, uint32_t const token_dim, uint32_t const rank, uint32_t* buffer_flags,
+enum MNNVLTwoShotStage : uint8_t
+{
+    SCATTER = 0,
+    BROADCAST = 1,
+    NUM_STAGES = 2,
+};
+
+template <uint8_t WorldSize, typename T, typename PackedType = float4>
+__global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T const* shardPtr, T** inputPtrs,
+    T* mcastPtr, uint32_t const numTokens, uint32_t const tokenDim, uint32_t const rank, uint32_t* bufferFlags,
     bool const wait_for_results)
 {
-    constexpr int ELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
-    constexpr int LAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
-    constexpr uint32_t ELT_SIZE = sizeof(T);
+    constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
+    constexpr int kLAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
+    constexpr uint32_t kELT_SIZE = sizeof(T);
 
-    int packed_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
     // Offset w.r.t. the input shard
-    int thread_offset = token * token_dim + packed_idx * ELTS_PER_THREAD;
+    int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 
-    int dest_rank = token % WORLD_SIZE;
-    int dest_token_offset = token / WORLD_SIZE;
+    int destRank = token % WorldSize;
+    int destTokenOffset = token / WorldSize;
 
     cudaGridDependencySynchronize();
 
-    LamportFlags<PackedType> flag(buffer_flags, NUM_STAGES);
+    LamportFlags<PackedType, false> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
 
-    T* scatter_buf_local = reinterpret_cast<T*>(flag.getCurLamportBuf(input_ptrs[rank], SCATTER));
-    T* scatter_buf_dest = reinterpret_cast<T*>(flag.getCurLamportBuf(input_ptrs[dest_rank], SCATTER));
-    T* broadcast_buf_w = reinterpret_cast<T*>(flag.getCurLamportBuf(mcast_ptr, BROADCAST));
-    T* broadcast_buf_r = reinterpret_cast<T*>(flag.getCurLamportBuf(input_ptrs[rank], BROADCAST));
+    T* scatterBufLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::SCATTER));
+    T* scatterBufDest = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[destRank], MNNVLTwoShotStage::SCATTER));
+    T* broadcastBufW = reinterpret_cast<T*>(flag.getCurLamportBuf(mcastPtr, MNNVLTwoShotStage::BROADCAST));
+    T* broadcastBufR = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::BROADCAST));
 
     // Make sure the clear function is called before OOB thread exits
-    if (packed_idx * ELTS_PER_THREAD >= token_dim)
+    if (packedIdx * kELTS_PER_THREAD >= tokenDim)
     {
-        flag.clearDirtyLamportBuf(input_ptrs[rank], -1);
+        flag.clearDirtyLamportBuf(inputPtrs[rank], -1);
         return;
     }
 
@@ -593,9 +587,9 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
 
     // Load vectorized data
     PackedVec<PackedType, T> val;
-    val.packed = loadPacked<PackedType>(&shard_ptr[thread_offset]);
+    val.packed = loadPacked<PackedType>(&shardPtr[threadOffset]);
 #pragma unroll
-    for (int i = 0; i < ELTS_PER_THREAD; i++)
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
     {
         if (isNegZero(val.elements[i]))
         {
@@ -604,36 +598,34 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
     }
 
     // Store vectorized data
-    reinterpret_cast<PackedType*>(
-        &scatter_buf_dest[dest_token_offset * token_dim * WORLD_SIZE + rank * token_dim])[packed_idx]
+    reinterpret_cast<PackedType*>(&scatterBufDest[destTokenOffset * tokenDim * WorldSize + rank * tokenDim])[packedIdx]
         = val.packed;
 
-    flag.clearDirtyLamportBuf(input_ptrs[rank], SCATTER);
+    flag.clearDirtyLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::SCATTER);
 
     // =============================== Reduction and Broadcast ===============================
 
-    if ((token % WORLD_SIZE) == rank)
+    if ((token % WorldSize) == rank)
     {
-        int local_token = token / WORLD_SIZE;
-        float accum[ELTS_PER_THREAD] = {0.F};
+        int localToken = token / WorldSize;
+        float accum[kELTS_PER_THREAD] = {0.F};
 
         // Use float as we only check each float value for validity
-        PackedVec<PackedType, float> values_lamport[WORLD_SIZE];
+        PackedVec<PackedType, float> valuesLamport[WorldSize];
         while (1)
         {
             bool valid = true;
 #pragma unroll
-            for (int r = 0; r < WORLD_SIZE; r++)
+            for (int r = 0; r < WorldSize; r++)
             {
-                values_lamport[r].packed
-                    = loadPackedVolatile<PackedType>(&scatter_buf_local[local_token * token_dim * WORLD_SIZE
-                        + r * token_dim + packed_idx * ELTS_PER_THREAD]);
+                valuesLamport[r].packed = loadPackedVolatile<PackedType>(
+                    &scatterBufLocal[localToken * tokenDim * WorldSize + r * tokenDim + packedIdx * kELTS_PER_THREAD]);
 
                 // Check validity across all elements
 #pragma unroll
-                for (int i = 0; i < LAMPORT_ELTS_PER_PACKED; i++)
+                for (int i = 0; i < kLAMPORT_ELTS_PER_PACKED; i++)
                 {
-                    valid &= !isNegZero(values_lamport[r].elements[i]);
+                    valid &= !isNegZero(valuesLamport[r].elements[i]);
                 }
             }
             if (valid)
@@ -643,51 +635,51 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
         }
 
         // Now we view it as the value for reduction
-        auto values = reinterpret_cast<PackedVec<PackedType, T>*>(values_lamport);
+        auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
 #pragma unroll
-        for (int r = 0; r < WORLD_SIZE; r++)
+        for (int r = 0; r < WorldSize; r++)
         {
 
 #pragma unroll
-            for (int i = 0; i < ELTS_PER_THREAD; i++)
+            for (int i = 0; i < kELTS_PER_THREAD; i++)
             {
                 accum[i] += cuda_cast<float, T>(values[r].elements[i]);
             }
         }
 
         // Store vectorized result
-        PackedVec<PackedType, T> packed_accum;
+        PackedVec<PackedType, T> packedAccum;
 #pragma unroll
-        for (int i = 0; i < ELTS_PER_THREAD; i++)
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
-            packed_accum.elements[i] = cuda_cast<T, float>(accum[i]);
+            packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
         }
-        reinterpret_cast<PackedType*>(&broadcast_buf_w[token * token_dim])[packed_idx] = packed_accum.packed;
+        reinterpret_cast<PackedType*>(&broadcastBufW[token * tokenDim])[packedIdx] = packedAccum.packed;
     }
     cudaTriggerProgrammaticLaunchCompletion();
-    flag.clearDirtyLamportBuf(input_ptrs[rank], BROADCAST);
+    flag.clearDirtyLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::BROADCAST);
 
     // Optionally wait for results if the next layer isn't doing the Lamport check
     if (wait_for_results)
     {
         // Update the atomic counter to indicate the block has read the offsets
-        flag.cta_arrive();
+        flag.ctaArrive();
 
-        PackedVec<PackedType, float> val_lamport;
-        val_lamport.packed = loadPackedVolatile<PackedType>(&broadcast_buf_r[thread_offset]);
-        while (isNegZero(val_lamport.elements[0]))
+        PackedVec<PackedType, float> valLamport;
+        valLamport.packed = loadPackedVolatile<PackedType>(&broadcastBufR[threadOffset]);
+        while (isNegZero(valLamport.elements[0]))
         {
-            val_lamport.packed = loadPackedVolatile<PackedType>(&broadcast_buf_r[thread_offset]);
+            valLamport.packed = loadPackedVolatile<PackedType>(&broadcastBufR[threadOffset]);
         }
-        if (output_ptr)
+        if (outputPtr)
         {
-            reinterpret_cast<PackedType*>(&output_ptr[thread_offset])[0] = val_lamport.packed;
+            reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = valLamport.packed;
         }
 
         // Update the buffer flags
-        flag.wait_and_update({static_cast<uint32_t>(divUp<uint32_t>(num_tokens, WORLD_SIZE) * WORLD_SIZE * token_dim
-                                  * ELT_SIZE),                        // Clear Size for scatter stage
-            static_cast<uint32_t>(num_tokens * token_dim * ELT_SIZE), // Clear Size for broadcast stage
+        flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, WorldSize) * WorldSize * tokenDim
+                                * kELT_SIZE),                        // Clear Size for scatter stage
+            static_cast<uint32_t>(numTokens * tokenDim * kELT_SIZE), // Clear Size for broadcast stage
             0, 0});
         // If not wait for results, we will rely on the following kernel to update the buffer
     }
@@ -699,98 +691,98 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
 //      1. Use CGA if supported. It expands the hidden dimension to 8k x 8 = 64k.
 //      2. Set loads_per_thread >1. Which can be used if CGA is not supported. Note that this will be limited by the
 //      shared memory size and register count.
-template <typename T_IN, typename T_OUT, bool USE_CGA = false, int LOADS_PER_THREAD = 1>
-__global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residual, T_OUT* output_norm,
-    T_IN* buffer_input, T_IN const* gamma, float epsilon, T_IN const* residual, uint32_t num_tokens, uint32_t dim,
-    uint32_t world_size, uint32_t* buffer_flags)
+template <typename T_IN, typename T_OUT, bool USE_CGA = false, int LoadsPerThread = 1>
+__global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OUT* outputNorm, T_IN* bufferInput,
+    T_IN const* gamma, float epsilon, T_IN const* residual, uint32_t numTokens, uint32_t dim, uint32_t worldSize,
+    uint32_t* bufferFlags)
 {
-    // FIXME: Support different types if we'd like to fuse quantization in the future
     static_assert(std::is_same_v<T_IN, T_OUT>, "T_IN and T_OUT must be the same type");
-    static int const ELTS_PER_LOAD = sizeof(float4) / sizeof(T_IN);
+    static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T_IN);
 
     uint32_t const token = blockIdx.x;
-    uint32_t const block_size = blockDim.x;
-    uint32_t const thread_offset = threadIdx.x;
+    uint32_t const blockSize = blockDim.x;
+    uint32_t const threadOffset = threadIdx.x;
 
-    uint32_t num_threads = block_size;
-    uint32_t cluster_size = 1;
-    uint32_t block_offset = 0;
+    uint32_t numThreads = blockSize;
+    uint32_t clusterSize = 1;
+    uint32_t blockOffset = 0;
     if constexpr (USE_CGA)
     {
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
-        num_threads = cluster.num_threads();
-        cluster_size = cluster.num_blocks();
-        block_offset = cluster.block_rank();
+        numThreads = cluster.num_threads();
+        clusterSize = cluster.num_blocks();
+        blockOffset = cluster.block_rank();
     }
-    uint32_t const dim_padded = divUp(dim, ELTS_PER_LOAD * num_threads) * ELTS_PER_LOAD * num_threads;
-    uint32_t const elems_per_thread = dim_padded / num_threads;
-    uint32_t const load_stride = block_size;
+    uint32_t const dimPadded = divUp(dim, kELTS_PER_LOAD * numThreads) * kELTS_PER_LOAD * numThreads;
+    uint32_t const elemsPerThread = dimPadded / numThreads;
+    uint32_t const loadStride = blockSize;
 
     extern __shared__ uint8_t smem[];
-    float r_input[LOADS_PER_THREAD * ELTS_PER_LOAD];
-    uint32_t offsets[LOADS_PER_THREAD * ELTS_PER_LOAD];
+    float rInput[LoadsPerThread * kELTS_PER_LOAD];
+    uint32_t offsets[LoadsPerThread * kELTS_PER_LOAD];
 
-    uint32_t const smem_buffer_size = block_size * elems_per_thread * sizeof(T_IN);
-    T_IN* sh_input = (T_IN*) &smem[0];
-    T_IN* sh_residual = (T_IN*) &smem[smem_buffer_size];
-    T_IN* sh_gamma = (T_IN*) &smem[2 * smem_buffer_size];
+    uint32_t const smemBufferSize = blockSize * elemsPerThread * sizeof(T_IN);
+    T_IN* smemInput = (T_IN*) &smem[0];
+    T_IN* smemResidual = (T_IN*) &smem[smemBufferSize];
+    T_IN* smemGamma = (T_IN*) &smem[2 * smemBufferSize];
 
-    LamportFlags<float4, USE_CGA> flag(buffer_flags, NUM_STAGES);
-    T_IN* input = reinterpret_cast<T_IN*>(flag.getCurLamportBuf(reinterpret_cast<void*>(buffer_input), BROADCAST));
+    LamportFlags<float4, USE_CGA> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    T_IN* input = reinterpret_cast<T_IN*>(
+        flag.getCurLamportBuf(reinterpret_cast<void*>(bufferInput), MNNVLTwoShotStage::BROADCAST));
 
     cudaTriggerProgrammaticLaunchCompletion();
 
     // The offset that current thread should load from. Note that the hidden dimension is split by CGA size and each
     // block loads a contiguous chunk;
     // The size of chunk that each block processes
-    uint32_t const block_chunk_size = divUp(dim, cluster_size * ELTS_PER_LOAD) * ELTS_PER_LOAD;
-    uint32_t const block_load_offset = token * dim + block_offset * block_chunk_size;
+    uint32_t const blockChunkSize = divUp(dim, clusterSize * kELTS_PER_LOAD) * kELTS_PER_LOAD;
+    uint32_t const blockLoadOffset = token * dim + blockOffset * blockChunkSize;
 
 #pragma unroll
-    for (uint32_t i = 0; i < LOADS_PER_THREAD; i++)
+    for (uint32_t i = 0; i < LoadsPerThread; i++)
     {
         // Each block load a contiguous chunk of tokens
-        uint32_t const thread_load_offset = (i * load_stride + thread_offset) * ELTS_PER_LOAD;
-        offsets[i] = block_load_offset + thread_load_offset;
+        uint32_t const threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+        offsets[i] = blockLoadOffset + threadLoadOffset;
     }
 
 #pragma unroll
-    for (uint32_t i = 0; i < LOADS_PER_THREAD; i++)
+    for (uint32_t i = 0; i < LoadsPerThread; i++)
     {
-        uint32_t const thread_load_offset = (i * load_stride + thread_offset) * ELTS_PER_LOAD;
-        if (block_offset * block_chunk_size + thread_load_offset < dim)
+        uint32_t const threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+        if (blockOffset * blockChunkSize + threadLoadOffset < dim)
         {
-            copy_f4(&sh_residual[thread_load_offset], &residual[block_load_offset + thread_load_offset]);
+            copyF4(&smemResidual[threadLoadOffset], &residual[blockLoadOffset + threadLoadOffset]);
         }
     }
     __pipeline_commit();
 #pragma unroll
-    for (uint32_t i = 0; i < LOADS_PER_THREAD; i++)
+    for (uint32_t i = 0; i < LoadsPerThread; i++)
     {
-        uint32_t const thread_load_offset = (i * load_stride + thread_offset) * ELTS_PER_LOAD;
-        if (block_offset * block_chunk_size + thread_load_offset < dim)
+        uint32_t const threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+        if (blockOffset * blockChunkSize + threadLoadOffset < dim)
         {
-            copy_f4(&sh_gamma[thread_load_offset], &gamma[block_offset * block_chunk_size + thread_load_offset]);
+            copyF4(&smemGamma[threadLoadOffset], &gamma[blockOffset * blockChunkSize + threadLoadOffset]);
         }
     }
     __pipeline_commit();
 
-    flag.cta_arrive();
+    flag.ctaArrive();
     bool valid = false;
     // ACQBLK if not lamport
     while (!valid)
     {
         valid = true;
 #pragma unroll
-        for (uint32_t i = 0; i < LOADS_PER_THREAD; i++)
+        for (uint32_t i = 0; i < LoadsPerThread; i++)
         {
-            uint32_t thread_load_offset = (i * load_stride + thread_offset) * ELTS_PER_LOAD;
+            uint32_t threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
 
-            if (block_offset * block_chunk_size + thread_load_offset < dim)
+            if (blockOffset * blockChunkSize + threadLoadOffset < dim)
             {
 
-                float4* dst4 = reinterpret_cast<float4*>(&sh_input[thread_load_offset]);
+                float4* dst4 = reinterpret_cast<float4*>(&smemInput[threadLoadOffset]);
                 float4 const* src4 = reinterpret_cast<float4 const*>(&input[offsets[i]]);
 
                 float4 value = loadPackedVolatile<float4>(src4);
@@ -804,36 +796,35 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
     __pipeline_wait_prior(1);
     __syncthreads();
 
-    float thread_sum = 0.f;
+    float threadSum = 0.f;
 #pragma unroll
-    for (int i = 0; i < LOADS_PER_THREAD; i++)
+    for (int i = 0; i < LoadsPerThread; i++)
     {
-        int thread_load_offset = (i * load_stride + thread_offset) * ELTS_PER_LOAD;
-        if (block_offset * block_chunk_size + thread_load_offset < dim)
+        int threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+        if (blockOffset * blockChunkSize + threadLoadOffset < dim)
         {
-            PackedVec<float4, T_IN> inp{.packed = loadPacked<float4>(&sh_input[thread_load_offset])};
-            PackedVec<float4, T_IN> res{.packed = loadPacked<float4>(&sh_residual[thread_load_offset])};
+            PackedVec<float4, T_IN> inp{.packed = loadPacked<float4>(&smemInput[threadLoadOffset])};
+            PackedVec<float4, T_IN> res{.packed = loadPacked<float4>(&smemResidual[threadLoadOffset])};
 
             PackedVec<float4, T_IN> inp_plus_res = inp + res;
 #pragma unroll
-            for (int j = 0; j < ELTS_PER_LOAD; j++)
+            for (int j = 0; j < kELTS_PER_LOAD; j++)
             {
-                r_input[i * ELTS_PER_LOAD + j] = cuda_cast<float, T_IN>(inp_plus_res.elements[j]);
-                thread_sum += cuda_cast<float, T_IN>(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
+                rInput[i * kELTS_PER_LOAD + j] = cuda_cast<float, T_IN>(inp_plus_res.elements[j]);
+                threadSum += cuda_cast<float, T_IN>(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
             }
 
-            *reinterpret_cast<float4*>(&input_plus_residual[block_load_offset + thread_load_offset])
-                = inp_plus_res.packed;
+            *reinterpret_cast<float4*>(&outputPreNorm[blockLoadOffset + threadLoadOffset]) = inp_plus_res.packed;
         }
     }
 
     __pipeline_wait_prior(0);
 
     // Sum is only used in thread 0!
-    float cluster_sum = blockReduceSum<float, false>(thread_sum);
+    float clusterSum = blockReduceSum<float, false>(threadSum);
 
-    float rcp_rms;
-    __shared__ float shared_val;
+    float rcpRms;
+    __shared__ float sharedVal;
     if constexpr (USE_CGA)
     {
         namespace cg = cooperative_groups;
@@ -843,15 +834,15 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
             // Need to reduce over the entire cluster
             if (threadIdx.x == 0)
             {
-                shared_val = cluster_sum;
-                cluster_sum = 0.f;
+                sharedVal = clusterSum;
+                clusterSum = 0.F;
             }
             cluster.sync();
             if (threadIdx.x == 0)
             {
-                for (int i = 0; i < cluster_size; ++i)
+                for (int i = 0; i < clusterSize; ++i)
                 {
-                    cluster_sum += *cluster.map_shared_rank(&shared_val, i);
+                    clusterSum += *cluster.map_shared_rank(&sharedVal, i);
                 }
             }
             cluster.sync();
@@ -860,79 +851,77 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
 
     if (threadIdx.x == 0)
     {
-        shared_val = rsqrtf(cluster_sum / dim + epsilon);
+        sharedVal = rsqrtf(clusterSum / dim + epsilon);
     }
     __syncthreads();
-    rcp_rms = shared_val;
+    rcpRms = sharedVal;
 
 #pragma unroll
-    for (int i = 0; i < LOADS_PER_THREAD; i++)
+    for (int i = 0; i < LoadsPerThread; i++)
     {
         PackedVec<float4, T_OUT> r_out;
-        uint32_t thread_load_offset = (i * load_stride + thread_offset) * ELTS_PER_LOAD;
-        if (block_offset * block_chunk_size + thread_load_offset < dim)
+        uint32_t threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+        if (blockOffset * blockChunkSize + threadLoadOffset < dim)
         {
-            PackedVec<float4, T_IN> gamma = {.packed = loadPacked<float4>(&sh_gamma[thread_load_offset])};
+            PackedVec<float4, T_IN> gamma = {.packed = loadPacked<float4>(&smemGamma[threadLoadOffset])};
 
 #pragma unroll
-            for (uint32_t j = 0; j < ELTS_PER_LOAD; j++)
+            for (uint32_t j = 0; j < kELTS_PER_LOAD; j++)
             {
                 r_out.elements[j]
-                    = cuda_cast<T_OUT, float>(cuda_cast<float, T_IN>(gamma.elements[j]) * r_input[j] * rcp_rms);
+                    = cuda_cast<T_OUT, float>(cuda_cast<float, T_IN>(gamma.elements[j]) * rInput[j] * rcpRms);
             }
 
-            *reinterpret_cast<float4*>(&output_norm[block_load_offset + thread_load_offset]) = r_out.packed;
+            *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = r_out.packed;
         }
     }
-    constexpr int ELTS_SIZE = sizeof(T_IN);
+    constexpr int kELTS_SIZE = sizeof(T_IN);
 
     // Update the buffer pointers
-    // FIXME: We round num_tokens to 64 to avoid passing in the world size into this kernel; Check this when we need
-    // world size >64
-    flag.wait_and_update({static_cast<uint32_t>(divUp<uint32_t>(num_tokens, world_size) * world_size * dim * ELTS_SIZE),
-        static_cast<uint32_t>(num_tokens * dim * ELTS_SIZE), 0, 0});
+    flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, worldSize) * worldSize * dim * kELTS_SIZE),
+        static_cast<uint32_t>(numTokens * dim * kELTS_SIZE), 0, 0});
 }
 
-void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
+void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
-    int const num_tokens = params.num_tokens;
-    int const token_dim = params.token_dim;
-    int const num_elts_per_thread = sizeof(float4) / getDTypeSize(params.dtype);
-    TLLM_CHECK_WITH_INFO(token_dim % num_elts_per_thread == 0,
-        "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d", num_elts_per_thread);
+    int const numTokens = params.numTokens;
+    int const tokenDim = params.tokenDim;
+    int const numEltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
+    TLLM_CHECK_WITH_INFO(tokenDim % numEltsPerThread == 0, "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d",
+        numEltsPerThread);
 
-    int const ar_num_threads = divUp(token_dim, num_elts_per_thread);
-    int const ar_num_blocks_per_token = divUp(ar_num_threads, 128);
+    int const arNumThreads = divUp(tokenDim, numEltsPerThread);
+    int const arNumBlocksPerToken = divUp(arNumThreads, 128);
 
-    dim3 ar_grid(num_tokens, ar_num_blocks_per_token);
+    dim3 arGrid(numTokens, arNumBlocksPerToken);
 
-    cudaLaunchAttribute ar_attrs[1];
-    ar_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    ar_attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    cudaLaunchAttribute arAttrs[1];
+    arAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    arAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
-    cudaLaunchConfig_t ar_config{
-        .gridDim = ar_grid,
+    cudaLaunchConfig_t arConfig{
+        .gridDim = arGrid,
         .blockDim = 128,
         .dynamicSmemBytes = 0,
         .stream = params.stream,
-        .attrs = ar_attrs,
+        .attrs = arAttrs,
         .numAttrs = 1,
     };
 
-    TLLM_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128", num_tokens,
-        ar_num_blocks_per_token);
+    TLLM_LOG_DEBUG(
+        "[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128", numTokens, arNumBlocksPerToken);
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                         \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&ar_config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, output, input, uc_ptrs,   \
-        mcast_ptr, num_tokens, token_dim, params.rank, params.buffer_flags, (!params.rmsnorm_fusion)));
-    auto dispatch_ar = [&](auto* type_ptr) -> bool
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&arConfig, &twoshotAllreduceKernel<WORLD_SIZE, T>, output, input, ucPtrs,       \
+        mcastPtr, numTokens, tokenDim, params.rank, params.bufferFlags, (!params.rmsNormFusion)));
+    auto dispatchAR = [&](auto* type_ptr) -> bool
     {
         using T = std::remove_pointer_t<decltype(type_ptr)>;
-        T** uc_ptrs = reinterpret_cast<T**>(params.buffer_ptrs_dev);
-        T* mcast_ptr = reinterpret_cast<T*>(params.multicast_ptr);
+        T** ucPtrs = reinterpret_cast<T**>(params.bufferPtrsDev);
+        T* mcastPtr = reinterpret_cast<T*>(params.multicastPtr);
         T* output = reinterpret_cast<T*>(params.output);
         T const* input = reinterpret_cast<T const*>(params.input);
-        switch (params.nranks)
+        switch (params.nRanks)
         {
         case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;
         case 4: LAUNCH_ALLREDUCE_KERNEL(4, T); return true;
@@ -946,84 +935,82 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
 
 #undef LAUNCH_ALLREDUCE_KERNEL
 
-    bool launched = (params.dtype == nvinfer1::DataType::kFLOAT && dispatch_ar((float*) nullptr))
-        || (params.dtype == nvinfer1::DataType::kBF16 && dispatch_ar((__nv_bfloat16*) nullptr))
-        || (params.dtype == nvinfer1::DataType::kHALF && dispatch_ar((__nv_half*) nullptr));
+    bool launched = (params.dType == nvinfer1::DataType::kFLOAT && dispatchAR((float*) nullptr))
+        || (params.dType == nvinfer1::DataType::kBF16 && dispatchAR((__nv_bfloat16*) nullptr))
+        || (params.dType == nvinfer1::DataType::kHALF && dispatchAR((__nv_half*) nullptr));
     if (!launched)
     {
-        TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch twoshot_allreduce kernel.");
+        TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch twoshotAllreduce kernel.");
     }
     // Launch the rmsnorm lamport kernel if fusion is enabled
-    if (params.rmsnorm_fusion)
+    if (params.rmsNormFusion)
     {
 #ifdef SUPPORT_CGA
-        auto grid_config = adjust_grid_config<true>(num_tokens, token_dim, num_elts_per_thread);
+        auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread);
 #else
-        auto grid_config = adjust_grid_config<false>(num_tokens, token_dim, num_elts_per_thread);
+        auto gridConfig = adjustGridConfig<false>(numTokens, tokenDim, numEltsPerThread);
 #endif
-        int rn_block_size = std::get<0>(grid_config);
-        int rn_cluster_size = std::get<1>(grid_config);
-        int rn_loads_per_thread = std::get<2>(grid_config);
+        int rnBlockSize = std::get<0>(gridConfig);
+        int rnClusterSize = std::get<1>(gridConfig);
+        int rnLoadsPerThread = std::get<2>(gridConfig);
 
-        int rn_num_threads = rn_cluster_size * rn_block_size;
-        dim3 rn_grid(num_tokens, rn_cluster_size, 1);
-        cudaLaunchConfig_t rn_config;
-        cudaLaunchAttribute rn_attrs[2];
-        rn_config.stream = params.stream;
-        rn_config.gridDim = rn_grid;
-        rn_config.blockDim = rn_block_size;
-        rn_config.attrs = rn_attrs;
-        rn_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        rn_attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+        int rnNumThreads = rnClusterSize * rnBlockSize;
+        dim3 rnGrid(numTokens, rnClusterSize, 1);
+        cudaLaunchConfig_t rnConfig;
+        cudaLaunchAttribute rnAttrs[2];
+        rnConfig.stream = params.stream;
+        rnConfig.gridDim = rnGrid;
+        rnConfig.blockDim = rnBlockSize;
+        rnConfig.attrs = rnAttrs;
+        rnAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        rnAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 #ifndef DISABLE_CGA
-        rn_attrs[1].id = cudaLaunchAttributeClusterDimension;
-        rn_attrs[1].val.clusterDim.x = 1;
-        rn_attrs[1].val.clusterDim.y = rn_cluster_size;
-        rn_attrs[1].val.clusterDim.z = 1;
-        rn_config.numAttrs = 2;
+        rnAttrs[1].id = cudaLaunchAttributeClusterDimension;
+        rnAttrs[1].val.clusterDim.x = 1;
+        rnAttrs[1].val.clusterDim.y = rnClusterSize;
+        rnAttrs[1].val.clusterDim.z = 1;
+        rnConfig.numAttrs = 2;
 #else
-        rn_config.numAttrs = 1;
+        rnConfig.numAttrs = 1;
 #endif
 
-        bool const rn_use_cga = rn_cluster_size > 1;
-        int const dim_padded
-            = divUp(token_dim, num_elts_per_thread * rn_num_threads) * num_elts_per_thread * rn_num_threads;
-        int const iters = dim_padded / rn_num_threads;
-        assert(rn_loads_per_thread == iters / num_elts_per_thread);
-        size_t const shmem_size = 3 * rn_block_size * iters * getDTypeSize(params.dtype);
+        bool const rnUseCGA = rnClusterSize > 1;
+        int const dimPadded = divUp(tokenDim, numEltsPerThread * rnNumThreads) * numEltsPerThread * rnNumThreads;
+        int const iters = dimPadded / rnNumThreads;
+
+        size_t const smemSize = 3 * rnBlockSize * iters * getDTypeSize(params.dType);
 
         TLLM_LOG_DEBUG(
             "[MNNVL AllReduceTwoShotRMSNorm] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: %d, "
             "loads_per_thread: %d, "
             "threads_needed: %d",
-            num_tokens, rn_cluster_size, rn_block_size, rn_cluster_size, rn_loads_per_thread,
-            divUp(token_dim, num_elts_per_thread));
+            numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread, divUp(tokenDim, numEltsPerThread));
 
 #define RUN_RMSNORM_KERNEL(T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD)                                                     \
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,                     \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));                                                     \
-    rn_config.dynamicSmemBytes = shmem_size;                                                                           \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&rn_config, &rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,           \
-        residual_out, output, buffer_input, gamma, static_cast<float>(params.epsilon), residual_in, num_tokens,        \
-        token_dim, params.nranks, params.buffer_flags));
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsNormLamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,                      \
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));                                                       \
+    rnConfig.dynamicSmemBytes = smemSize;                                                                              \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,             \
+        residualOut, output, bufferInput, gamma, static_cast<float>(params.epsilon), residualIn, numTokens, tokenDim,  \
+        params.nRanks, params.bufferFlags));
 
         // C++ 17 does not support capturing structured bindings
-        auto dispatch_rn = [&, rn_loads_per_thread](auto* type_ptr)
+        auto dispatchRN = [&, rnLoadsPerThread](auto* type_ptr)
         {
             using T_IN = std::remove_pointer_t<decltype(type_ptr)>;
             using T_OUT = T_IN;
-            T_OUT* residual_out = reinterpret_cast<T_OUT*>(params.residual_out);
+            T_OUT* residualOut = reinterpret_cast<T_OUT*>(params.residualOut);
             T_OUT* output = reinterpret_cast<T_OUT*>(params.output);
-            T_IN* buffer_input = reinterpret_cast<T_IN*>(params.buffer_ptr_local);
+            T_IN* bufferInput = reinterpret_cast<T_IN*>(params.bufferPtrLocal);
             T_IN const* gamma = reinterpret_cast<T_IN const*>(params.gamma);
-            T_IN const* residual_in = reinterpret_cast<T_IN const*>(params.residual_in);
-            if (rn_use_cga)
+            T_IN const* residualIn = reinterpret_cast<T_IN const*>(params.residualIn);
+            if (rnUseCGA)
             {
                 RUN_RMSNORM_KERNEL(T_IN, T_OUT, true, 1);
             }
             else
             {
-                switch (rn_loads_per_thread)
+                switch (rnLoadsPerThread)
                 {
                 case 1: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 1); break;
                 case 2: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 2); break;
@@ -1039,9 +1026,9 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
             return true;
         };
 
-        launched = (params.dtype == nvinfer1::DataType::kFLOAT && dispatch_rn((float*) nullptr))
-            || (params.dtype == nvinfer1::DataType::kBF16 && dispatch_rn((__nv_bfloat16*) nullptr))
-            || (params.dtype == nvinfer1::DataType::kHALF && dispatch_rn((__nv_half*) nullptr));
+        launched = (params.dType == nvinfer1::DataType::kFLOAT && dispatchRN((float*) nullptr))
+            || (params.dType == nvinfer1::DataType::kBF16 && dispatchRN((__nv_bfloat16*) nullptr))
+            || (params.dType == nvinfer1::DataType::kHALF && dispatchRN((__nv_half*) nullptr));
         if (!launched)
         {
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch rmsnorm lamport kernel.");
@@ -1049,10 +1036,5 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
 #undef RUN_RMSNORM_KERNEL
     }
 }
-
-// Avoid polluting the global namespace
-#ifdef SUPPORT_CGA
-#undef SUPPORT_CGA
-#endif
 
 } // namespace tensorrt_llm::kernels::mnnvl

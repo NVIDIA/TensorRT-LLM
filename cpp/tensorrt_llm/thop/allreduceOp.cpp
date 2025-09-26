@@ -1160,27 +1160,27 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
 
-    auto const elts_per_load = sizeof(float4) / input.itemsize();
-    auto const hidden_dim = input.size(1);
-    auto const num_tokens = input.size(0);
-    TORCH_CHECK(hidden_dim % elts_per_load == 0,
-        "[mnnvlFusionAllReduce] Hidden dimension must be divisible by " + std::to_string(elts_per_load) + ", got "
-            + std::to_string(hidden_dim));
+    auto const eltsPerThread = sizeof(float4) / input.itemsize();
+    auto const hiddenDim = input.size(1);
+    auto const numTokens = input.size(0);
+    TORCH_CHECK(hiddenDim % eltsPerThread == 0,
+        "[mnnvlFusionAllReduce] Hidden dimension must be divisible by " + std::to_string(eltsPerThread) + ", got "
+            + std::to_string(hiddenDim));
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     torch::Tensor output = torch::empty_like(input);
-    torch::Tensor residual_out;
+    torch::Tensor residualOut;
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
-    allreduce_params.nranks = mcast_mem->getWorldSize();
+    allreduce_params.nRanks = mcast_mem->getWorldSize();
     allreduce_params.rank = mcast_mem->getRank();
-    allreduce_params.dtype = dtype;
-    allreduce_params.num_tokens = num_tokens;
-    allreduce_params.token_dim = hidden_dim;
-    allreduce_params.buffer_ptrs_dev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
-    allreduce_params.buffer_ptr_local = comm_buffer.mutable_data_ptr();
-    allreduce_params.multicast_ptr = mcast_mem->getMulticastPtr();
-    allreduce_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+    allreduce_params.dType = dtype;
+    allreduce_params.numTokens = numTokens;
+    allreduce_params.tokenDim = hiddenDim;
+    allreduce_params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.bufferPtrLocal = comm_buffer.mutable_data_ptr();
+    allreduce_params.multicastPtr = mcast_mem->getMulticastPtr();
+    allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
     allreduce_params.output = output.mutable_data_ptr();
 
@@ -1188,29 +1188,38 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
             "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for rmsnorm fusion");
+        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
 
-        allreduce_params.residual_in = residual_in.value().const_data_ptr();
+        allreduce_params.residualIn = residual_in.value().const_data_ptr();
         allreduce_params.gamma = gamma.value().const_data_ptr();
         allreduce_params.epsilon = static_cast<float>(epsilon.value());
-        allreduce_params.rmsnorm_fusion = true;
+        allreduce_params.rmsNormFusion = true;
 
-        residual_out = torch::empty_like(residual_in.value());
-        allreduce_params.residual_out = residual_out.mutable_data_ptr();
+        residualOut = torch::empty_like(residual_in.value());
+        allreduce_params.residualOut = residualOut.mutable_data_ptr();
+    }
+    else
+    {
+        allreduce_params.rmsNormFusion = false;
     }
 
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
 
-    // FIXME: Find a better heuristic
-    if (num_tokens * hidden_dim * allreduce_params.nranks * input.itemsize() <= 64 * 1024 * 8)
+    // Threshold to switch between one-shot and two-shot allreduce kernel
+    // Empirical value, MSG size * World size
+    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8;
+
+    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
-        tensorrt_llm::kernels::mnnvl::oneshot_allreduce_fusion_op(allreduce_params);
+        tensorrt_llm::kernels::mnnvl::oneshotAllreduceFusionOp(allreduce_params);
     }
     else
     {
-        tensorrt_llm::kernels::mnnvl::twoshot_allreduce_fusion_op(allreduce_params);
+        tensorrt_llm::kernels::mnnvl::twoshotAllreduceFusionOp(allreduce_params);
     }
 
-    return {output, residual_out};
+    return {output, residualOut};
 }
 
 } // namespace torch_ext
