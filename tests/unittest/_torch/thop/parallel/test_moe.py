@@ -19,6 +19,7 @@ from typing import Tuple
 
 import pytest
 import torch
+import torch._inductor.config
 import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -1061,7 +1062,7 @@ class TestMoeFp4:
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
                       routing_info):
-
+        assert torch._inductor.config.compile_threads == 1
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
                               intermediate_size,
