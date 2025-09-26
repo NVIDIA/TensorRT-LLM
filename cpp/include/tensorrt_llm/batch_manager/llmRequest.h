@@ -84,6 +84,7 @@ class GenericLlmRequest
 
 public:
     using SizeType32 = runtime::SizeType32;
+    using SizeType64 = runtime::SizeType64;
     using TokenIdType = runtime::TokenIdType;
     using RequestIdType = std::uint64_t;
     using LoraTaskIdType = runtime::LoraTaskIdType;
@@ -139,7 +140,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<SizeType64> taskId = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -197,6 +199,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mTaskId(taskId.value_or(0))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -1873,6 +1876,11 @@ public:
         return mUseDraftModel;
     }
 
+    [[nodiscard]] SizeType64 getTaskId() const
+    {
+        return mTaskId;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -2053,6 +2061,8 @@ protected:
 
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
+
+    SizeType64 mTaskId;
 
 private:
     void initialize(
@@ -2236,7 +2246,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<SizeType64> taskId = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2267,7 +2278,7 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime)
+            arrivalTime, taskId)
     {
     }
 

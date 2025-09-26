@@ -8,6 +8,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .task import GenerationTask, Task, TaskStatus
 
@@ -182,20 +183,25 @@ class TRTLLMWorker(Worker):
             top_k=task.top_k,
             return_context_logits=task.return_context_logits,
             logprobs=task.num_logprobs)
-        return sampling_params
+        scheduling_params = SchedulingParams(task_id=task.task_id)
+        return sampling_params, scheduling_params
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
-        sampling_params = self.convert_task_params(task)
+        sampling_params, scheduling_params = self.convert_task_params(task)
 
         # If the task is streaming, we will return result directly for
         # async iteration outside. Otherwise, we will wait.
         if task.streaming:
-            result = self.llm.generate_async(task.input_str,
-                                             sampling_params=sampling_params,
-                                             streaming=True)
+            result = self.llm.generate_async(
+                task.input_str,
+                sampling_params=sampling_params,
+                scheduling_params=scheduling_params,
+                streaming=True)
         else:
             result = await self.llm.generate_async(
-                task.input_str, sampling_params=sampling_params)
+                task.input_str,
+                sampling_params=sampling_params,
+                scheduling_params=scheduling_params)
         task.result = result
 
         # TODO: error handle

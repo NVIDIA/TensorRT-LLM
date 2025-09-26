@@ -13,3 +13,4 @@ class SchedulingParams:
 
     attention_dp_rank: Optional[int] = None
     attention_dp_relax: Optional[bool] = None
+    task_id: Optional[int] = None

@@ -271,6 +271,21 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         }
     }
 
+    std::stable_sort(pendingRequests.begin(), pendingRequests.end(),
+        [](std::shared_ptr<LlmRequest> const& a, std::shared_ptr<LlmRequest> const& b)
+        { return a->getTaskId() < b->getTaskId(); });
+    std::stable_sort(pendingDisGenInitRequests.begin(), pendingDisGenInitRequests.end(),
+        [](std::shared_ptr<LlmRequest> const& a, std::shared_ptr<LlmRequest> const& b)
+        { return a->getTaskId() < b->getTaskId(); });
+    if (!pendingRequests.empty())
+    {
+        std::cout << "pendingRequests task_id: ";
+        for (auto const& req : pendingRequests)
+        {
+            std::cout << req->getTaskId() << " ";
+        }
+        std::cout << std::endl;
+    }
     // If StaticBatchScheduling == true check if we can add pending requests only when no requests are active.
     // Otherwise, add just check that we can add pending requests.
     if (!StaticBatchScheduling || scheduledRequests.size() == 0)

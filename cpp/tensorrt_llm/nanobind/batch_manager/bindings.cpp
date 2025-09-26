@@ -252,137 +252,143 @@ void initBindings(nb::module_& m)
         .def_prop_rw("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
         .def_prop_ro("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
         .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
+    .def_rw("task_id", &GenLlmReq::mTaskId)
 
-    nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
-        .def(
-            "__init__",
-            [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
-                runtime::SamplingConfig sampling_config, bool is_streaming,
-                std::optional<tb::LlmRequest::SizeType32> end_id, std::optional<tb::LlmRequest::SizeType32> pad_id,
-                std::optional<at::Tensor> embedding_bias, std::optional<at::Tensor> bad_words_list,
-                std::optional<at::Tensor> stop_words_list,
-                std::optional<std::vector<tb::LlmRequest::SizeType32>> position_ids,
-                std::optional<at::Tensor> prompt_embedding_table,
-                std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
-                std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
-                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
-                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_lengths,
-                std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
-                std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
-                std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
-                std::optional<at::Tensor> lora_config,
-                std::optional<executor::LookaheadDecodingConfig> lookahead_config,
-                std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
-                bool return_context_logits, bool return_generation_logits,
-                std::optional<tb::LlmRequest::VecTokens> draft_tokens, std::optional<at::Tensor> draft_logits,
-                bool exclude_input_from_output,
-                std::optional<tb::LlmRequest::LogitsPostProcessor> logits_post_processor,
-                bool apply_logits_post_processor_batched, std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens,
-                bool return_encoder_output, std::optional<tb::LlmRequest::RequestIdType> client_id,
-                executor::PriorityType priority, std::optional<at::Tensor> encoder_input_features,
-                std::optional<tb::LlmRequest::SizeType32> encoder_output_length,
-                std::optional<at::Tensor> cross_attention_mask, tb::LlmRequestType llm_request_type,
-                std::optional<tb::LlmRequest::VecTokenExtraIds> input_token_extra_ids,
-                tb::LlmRequest::SizeType32 num_return_sequences, std::optional<executor::EagleConfig> eagle_config,
-                std::optional<at::Tensor> skip_cross_attn_blocks, bool return_perf_metrics,
-                std::optional<executor::GuidedDecodingParams> guided_decoding_params,
-                std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
-                std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
-                std::optional<executor::ContextPhaseParams> context_phase_params,
-                std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
-                std::optional<tb::LlmRequest::TimePoint> arrival_time)
-            {
-                auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
+        nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
+            .def(
+                "__init__",
+                [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
+                    tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                    runtime::SamplingConfig sampling_config, bool is_streaming,
+                    std::optional<tb::LlmRequest::SizeType32> end_id, std::optional<tb::LlmRequest::SizeType32> pad_id,
+                    std::optional<at::Tensor> embedding_bias, std::optional<at::Tensor> bad_words_list,
+                    std::optional<at::Tensor> stop_words_list,
+                    std::optional<std::vector<tb::LlmRequest::SizeType32>> position_ids,
+                    std::optional<at::Tensor> prompt_embedding_table,
+                    std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
+                    std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
+                    std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
+                    std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_lengths,
+                    std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
+                    std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
+                    std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
+                    std::optional<at::Tensor> lora_config,
+                    std::optional<executor::LookaheadDecodingConfig> lookahead_config,
+                    std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
+                    bool return_context_logits, bool return_generation_logits,
+                    std::optional<tb::LlmRequest::VecTokens> draft_tokens, std::optional<at::Tensor> draft_logits,
+                    bool exclude_input_from_output,
+                    std::optional<tb::LlmRequest::LogitsPostProcessor> logits_post_processor,
+                    bool apply_logits_post_processor_batched,
+                    std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens, bool return_encoder_output,
+                    std::optional<tb::LlmRequest::RequestIdType> client_id, executor::PriorityType priority,
+                    std::optional<at::Tensor> encoder_input_features,
+                    std::optional<tb::LlmRequest::SizeType32> encoder_output_length,
+                    std::optional<at::Tensor> cross_attention_mask, tb::LlmRequestType llm_request_type,
+                    std::optional<tb::LlmRequest::VecTokenExtraIds> input_token_extra_ids,
+                    tb::LlmRequest::SizeType32 num_return_sequences, std::optional<executor::EagleConfig> eagle_config,
+                    std::optional<at::Tensor> skip_cross_attn_blocks, bool return_perf_metrics,
+                    std::optional<executor::GuidedDecodingParams> guided_decoding_params,
+                    std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
+                    std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
+                    std::optional<executor::ContextPhaseParams> context_phase_params,
+                    std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
+                    std::optional<tb::LlmRequest::TimePoint> arrival_time,
+                    std::optional<tb::LlmRequest::SizeType64> task_id)
                 {
-                    std::optional<tb::LlmRequest::TensorPtr> tensorPtr = std::nullopt;
-                    if (atTensor)
+                    auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                     {
-                        tensorPtr = tr::TorchView::of(atTensor.value());
-                        if (unsqueeze)
+                        std::optional<tb::LlmRequest::TensorPtr> tensorPtr = std::nullopt;
+                        if (atTensor)
                         {
-                            (*tensorPtr)->unsqueeze(0);
+                            tensorPtr = tr::TorchView::of(atTensor.value());
+                            if (unsqueeze)
+                            {
+                                (*tensorPtr)->unsqueeze(0);
+                            }
                         }
-                    }
-                    return tensorPtr;
-                };
+                        return tensorPtr;
+                    };
 
-                auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias, true);
-                auto bad_words_list_tensor_ptr = makeOptionalTensor(bad_words_list, true);
-                auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list, true);
-                auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
-                auto multimodal_embedding_tensor_ptr = makeOptionalTensor(multimodal_embedding);
-                auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
-                auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
-                auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
-                auto draft_logits_tensor_ptr = makeOptionalTensor(draft_logits);
-                auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
-                auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
-                auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
+                    auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias, true);
+                    auto bad_words_list_tensor_ptr = makeOptionalTensor(bad_words_list, true);
+                    auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list, true);
+                    auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
+                    auto multimodal_embedding_tensor_ptr = makeOptionalTensor(multimodal_embedding);
+                    auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
+                    auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
+                    auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
+                    auto draft_logits_tensor_ptr = makeOptionalTensor(draft_logits);
+                    auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
+                    auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
+                    auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
-                    position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
-                    multimodal_positions, multimodal_lengths, multimodal_embedding_tensor_ptr,
-                    mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
-                    lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
-                    return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
-                    exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
-                    encoder_input_tokens, return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
-                    encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
-                    num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
-                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
-                    arrival_time};
-            },
-            nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
-            nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
-            nb::arg("embedding_bias") = std::nullopt, nb::arg("bad_words_list") = std::nullopt,
-            nb::arg("stop_words_list") = std::nullopt, nb::arg("position_ids") = std::nullopt,
-            nb::arg("prompt_embedding_table") = std::nullopt, nb::arg("prompt_vocab_size") = std::nullopt,
-            nb::arg("multimodal_hashes") = std::nullopt, nb::arg("multimodal_positions") = std::nullopt,
-            nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
-            nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
-            nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
-            nb::arg("lora_config") = std::nullopt, nb::arg("lookahead_config") = std::nullopt,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
-            nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
-            nb::arg("draft_tokens") = std::nullopt, nb::arg("draft_logits") = std::nullopt,
-            nb::arg("exclude_input_from_output") = false, nb::arg("logits_post_processor") = std::nullopt,
-            nb::arg("apply_logits_post_processor_batched") = false, nb::arg("encoder_input_tokens") = std::nullopt,
-            nb::arg("return_encoder_output") = false, nb::arg("client_id") = std::nullopt,
-            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_features") = std::nullopt,
-            nb::arg("encoder_output_len") = std::nullopt, nb::arg("cross_attention_mask") = std::nullopt,
-            nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-            nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("num_return_sequences") = 1,
-            nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
-            nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
-            nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
-            nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
-            nb::arg("arrival_time") = std::nullopt)
-        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
-        .def(nb::init<tb::LlmRequest const&>())
-        .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
-            nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
-            nb::arg("enable_kv_cache_reuse") = false)
-        .def("create_response", &tb::LlmRequest::createResponse, nb::arg("use_fast_logits") = false,
-            nb::arg("mpi_world_rank") = 0)
-        .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
-        .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
-            nb::arg("mpi_world_rank") = 0)
-        .def("create_serialized_result",
-            [](tb::LlmRequest& self, bool use_fast_logits = false, int mpi_world_rank = 0)
-            {
-                std::vector<char> serialized_result;
-                bool is_final = false;
-                self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
-                return std::make_tuple(nb::bytes(serialized_result.data(), serialized_result.size()), is_final);
-            })
-        .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, nb::arg("manager"))
-        .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, nb::arg("manager"))
-        .def("finish_by_reason", &tb::LlmRequest::finishByReason, nb::arg("finish_reason"))
-        .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
-        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
-        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
+                    new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
+                        end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr,
+                        stop_words_list_tensor_ptr, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size,
+                        multimodal_hashes, multimodal_positions, multimodal_lengths, multimodal_embedding_tensor_ptr,
+                        mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
+                        lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
+                        return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
+                        exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
+                        encoder_input_tokens, return_encoder_output, client_id, priority,
+                        encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
+                        llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
+                        skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
+                        language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id, arrival_time,
+                        task_id};
+                },
+                nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
+                nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
+                nb::arg("embedding_bias") = std::nullopt, nb::arg("bad_words_list") = std::nullopt,
+                nb::arg("stop_words_list") = std::nullopt, nb::arg("position_ids") = std::nullopt,
+                nb::arg("prompt_embedding_table") = std::nullopt, nb::arg("prompt_vocab_size") = std::nullopt,
+                nb::arg("multimodal_hashes") = std::nullopt, nb::arg("multimodal_positions") = std::nullopt,
+                nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
+                nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
+                nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
+                nb::arg("lora_config") = std::nullopt, nb::arg("lookahead_config") = std::nullopt,
+                nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
+                nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
+                nb::arg("draft_tokens") = std::nullopt, nb::arg("draft_logits") = std::nullopt,
+                nb::arg("exclude_input_from_output") = false, nb::arg("logits_post_processor") = std::nullopt,
+                nb::arg("apply_logits_post_processor_batched") = false, nb::arg("encoder_input_tokens") = std::nullopt,
+                nb::arg("return_encoder_output") = false, nb::arg("client_id") = std::nullopt,
+                nb::arg("priority") = executor::Request::kDefaultPriority,
+                nb::arg("encoder_input_features") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
+                nb::arg("cross_attention_mask") = std::nullopt,
+                nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+                nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("num_return_sequences") = 1,
+                nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
+                nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
+                nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
+                nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
+                nb::arg("arrival_time") = std::nullopt, nb::arg("task_id") = std::nullopt)
+            .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
+            .def(nb::init<tb::LlmRequest const&>())
+            .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
+                nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
+                nb::arg("enable_kv_cache_reuse") = false)
+            .def("create_response", &tb::LlmRequest::createResponse, nb::arg("use_fast_logits") = false,
+                nb::arg("mpi_world_rank") = 0)
+            .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
+            .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
+                nb::arg("mpi_world_rank") = 0)
+            .def("create_serialized_result",
+                [](tb::LlmRequest& self, bool use_fast_logits = false, int mpi_world_rank = 0)
+                {
+                    std::vector<char> serialized_result;
+                    bool is_final = false;
+                    self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
+                    return std::make_tuple(nb::bytes(serialized_result.data(), serialized_result.size()), is_final);
+                })
+            .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu,
+                nb::arg("manager"))
+            .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, nb::arg("manager"))
+            .def("finish_by_reason", &tb::LlmRequest::finishByReason, nb::arg("finish_reason"))
+            .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
+            .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
+            .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
 
     nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),

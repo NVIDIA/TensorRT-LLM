@@ -57,6 +57,9 @@ class GenerationTask(Task):
     top_k: Optional[int] = None
     return_context_logits: Optional[bool] = False
 
+    # scheduling params
+    task_id: Optional[int] = None
+
     # suggest to use Controller.WorkerTag
     # anyway, users need to ensure that the value of the worker_tag can be found in the scaffoldingLlm's workers map
     worker_tag: Union[str, "Controller.WorkerTag"] = None
@@ -104,11 +107,12 @@ class GenerationTask(Task):
         return self._result.context_logits if self._result else None
 
     @staticmethod
-    def create_from_prompt(prompt: str) -> "GenerationTask":
+    def create_from_prompt(prompt: str, task_id: int) -> "GenerationTask":
         task = GenerationTask()
         task.input_str = prompt
         task.skip_tokenizer = False
         task.skip_detokenizer = False
+        task.task_id = task_id
         return task
 
     def create_scaffolding_output(self) -> GenerationResult:

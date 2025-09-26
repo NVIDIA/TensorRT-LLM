@@ -1,4 +1,6 @@
 import copy
+import os
+import threading
 from abc import ABC
 from enum import Enum
 from typing import Any, List, Mapping, Tuple
@@ -11,6 +13,33 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
 from tensorrt_llm.scaffolding.task import GenerationTask, Task
 
+ENABLE_TASK_AWARE_SCHEDULER = os.getenv("ENABLE_TASK_AWARE_SCHEDULER",
+                                        "0") == "1"
+
+
+class TaskIdGenerator:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._counter = 0
+        return cls._instance
+
+    def get(self) -> int:
+        if ENABLE_TASK_AWARE_SCHEDULER:
+            with self._lock:
+                self._counter += 1
+                return self._counter
+        else:
+            return 0
+
+
+_task_id_generator = TaskIdGenerator()
+
 
 class Controller(ABC):
 
@@ -21,7 +50,8 @@ class Controller(ABC):
         return copy.deepcopy(self)
 
     def generate(self, prompt: str, **kwargs) -> GenerationResult:
-        task = GenerationTask.create_from_prompt(prompt)
+        task = GenerationTask.create_from_prompt(
+            prompt, task_id=_task_id_generator.get())
 
         yield from self.process([task], **kwargs)
 
@@ -163,7 +193,8 @@ class PRMController(NativeRewardController):
                 messages, tokenize=False, add_generation_prompt=False)
 
             # TODO: support input_ids as model input, avoid doing it again in worker
-            reward_task = GenerationTask.create_from_prompt(processed_prompt)
+            reward_task = GenerationTask.create_from_prompt(
+                processed_prompt, task_id=task.task_id)
             reward_task.worker_tag = self.WorkerTag.REWARD
 
             # TODO: pack this logic
