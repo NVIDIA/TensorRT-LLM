@@ -513,3 +513,11 @@ def _register_fake():
             input_list[i].new_empty((num_ranks, ) + i.shape)
             for i in range(0, len(input_list), num_ranks)
         ]
+
+    @torch.library.register_fake("trtllm::tinygemm2")
+    def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+        # input [M, K], weight [N, K], bias [N]
+        # Output should be [M, N]
+        m = input.shape[0]
+        n = weight.shape[0]
+        return input.new_empty((m, n), dtype=input.dtype)
