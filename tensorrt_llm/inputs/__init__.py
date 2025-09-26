@@ -1,4 +1,5 @@
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
+from .evs import compute_retained_tokens_count, compute_retention_mask
 from .multimodal import MultimodalInput
 from .registry import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
                        ExtraProcessedInputs, InputProcessor,
@@ -50,4 +51,6 @@ __all__ = [
     "load_image",
     "load_video",
     "get_cache_salt_id",
+    "compute_retained_tokens_count",
+    "compute_retention_mask",
 ]

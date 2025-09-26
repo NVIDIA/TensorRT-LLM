@@ -14,7 +14,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
-                       register_input_processor)
+                       compute_retention_mask, register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -23,6 +23,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
+
+VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
@@ -48,6 +50,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         self.num_image_token = int((self.image_size // self.patch_size)**2 *
                                    (config.downsample_ratio**2))
         self.downsample_ratio = config.downsample_ratio
+        self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
         self.ps_version = config.ps_version  # Pixel shuffle version.
 
         # Construct the vision projection.
@@ -118,6 +121,47 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
+    def apply_evs(
+            self, mm_embedding: List[torch.Tensor],
+            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        """Apply EVS to the multimodal embedding."""
+        if VIDEO_PRUNING_RATIO <= 0:
+            return mm_embedding
+
+        modality_types = [
+            multimodal_param.multimodal_data['modality_type']
+            for multimodal_param in multimodal_params
+        ]
+        video_size_list = [
+            multimodal_param.multimodal_data['video_size']
+            for multimodal_param in multimodal_params
+        ]
+        mm_embedding_evs = []
+        # Iterate over batch.
+        for modality_type, mm_embed, video_sizes in zip(modality_types,
+                                                        mm_embedding,
+                                                        video_size_list):
+            if modality_type == "video":
+                # Iterate over each video in the batch.
+                start_idx, mm_embed_list = 0, []
+                for video_size in video_sizes:
+                    partial_mm_embed = mm_embed[start_idx:start_idx +
+                                                video_size[0]]
+                    retention_mask = compute_retention_mask(
+                        video_embeds=partial_mm_embed,
+                        video_size=video_size,
+                        spatial_merge_size=self.spatial_merge_size,
+                        q=VIDEO_PRUNING_RATIO,
+                        flatten_output=False,
+                    ).flatten(start_dim=1)
+                    start_idx += video_size[0]
+                    partial_mm_embed = partial_mm_embed[retention_mask]
+                    mm_embed_list.append(partial_mm_embed)
+                mm_embedding_evs.append(torch.cat(mm_embed_list, dim=0))
+            else:
+                mm_embedding_evs.append(mm_embed)
+        return mm_embedding_evs
+
     def forward(self, multimodal_params: List[MultimodalParams]):
         mm_embedding = []
         # Batch data.
@@ -138,6 +182,9 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         mm_embedding = torch.split(batched_image_embeds,
                                    batched_num_patches,
                                    dim=0)
+
+        mm_embedding = self.apply_evs(mm_embedding, multimodal_params)
+
         mm_embedding = [
             m.reshape(-1, self.llm_hidden_size) for m in mm_embedding
         ]
@@ -273,7 +320,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                                               return_tensors="pt")
             return input_ids[0].to(torch.int32).tolist(), {}
 
+        modality_type = None
         if images is not None:
+            modality_type = "image"
             # Processing for multimodal data.
             processed_images = self.processor(images=images,
                                               return_tensors='pt').to(
@@ -291,9 +340,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                 image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
                 processed_query += image_repl + part
         elif videos is not None:
+            modality_type = "video"
             num_videos = len(videos)
             num_patches_list = []
             pixel_values_list = []
+            video_size_list = []
             parts = text_prompt.split(self.video_context_token)
             if len(parts) - 1 != num_videos:
                 raise ValueError(
@@ -306,20 +357,36 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                 processed_images = self.processor(images=video,
                                                   return_tensors='pt').to(
                                                       self.device)
+                t, _, h, w = processed_images['pixel_values'].shape
                 num_patches_list.append(processed_images['num_patches'])
                 pixel_values_list.append(processed_images['pixel_values'])
+                video_size_list.append([t, h, w])
 
                 # Processing the text prompt.
                 processed_query += parts[video_index]
-                for num_patches in processed_images['num_patches']:
+                total_num_patches = sum(processed_images['num_patches'])
+                desired_num_tokens = int(self.num_image_token *
+                                         total_num_patches *
+                                         (1.0 - VIDEO_PRUNING_RATIO))
+                existing_num_tokens = 0
+                for num_patches in processed_images['num_patches'][:-1]:
                     feature_size = num_patches * self.num_image_token
+                    feature_size = int(feature_size *
+                                       (1.0 - VIDEO_PRUNING_RATIO))
+                    existing_num_tokens += feature_size
                     image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
                     processed_query += image_repl
+                # Special handling for the last patch of image tokens.
+                image_repl = self.img_start_token + self.img_context_token * (
+                    desired_num_tokens -
+                    existing_num_tokens) + self.img_end_token
+                processed_query += image_repl
             processed_query += parts[num_videos]
             processed_images['num_patches'] = torch.tensor(
                 [sum(num_patches) for num_patches in num_patches_list])
             processed_images['pixel_values'] = torch.cat(pixel_values_list,
                                                          dim=0)
+            processed_images['video_size'] = video_size_list
 
         input_ids = self.tokenizer.encode(processed_query,
                                           add_special_tokens=False,
@@ -331,6 +398,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             self.dtype)
         multimodal_data['num_patches'] = processed_images['num_patches'].sum(
             dim=0, keepdim=True)
+        multimodal_data['modality_type'] = modality_type
+        multimodal_data['video_size'] = processed_images[
+            'video_size'] if modality_type == "video" else None
         return input_ids[0].to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
