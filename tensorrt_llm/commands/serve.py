@@ -183,7 +183,7 @@ def launch_server(host: str,
                           metadata_server_cfg=metadata_server_cfg)
 
     # Optionally disable GC (default: not disabled)
-    if int(os.getenv("TRTLLM_SERVER_DISABLE_GC", "0")):
+    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
         gc.disable()
 
     asyncio.run(server(host, port))
@@ -522,7 +522,7 @@ def disaggregated(config_file: Optional[str],
     #   increment, and observed that `count0` (obtained by `gc.get_count()`)
     #   increases by fewer than 1,000 after every 200,000 requests, while the
     #   maximum value of `count0` exceeded 3,000,000 during the test.
-    if int(os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1")):
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))

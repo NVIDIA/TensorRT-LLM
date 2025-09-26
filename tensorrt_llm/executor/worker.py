@@ -415,7 +415,7 @@ def worker_main(
         return
 
     # Optionally disable GC (default: not disabled)
-    if int(os.getenv("TRTLLM_WORKER_DISABLE_GC", "0")):
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()
 
     with worker:
