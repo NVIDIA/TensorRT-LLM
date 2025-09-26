@@ -4,11 +4,16 @@ import torch.nn.functional as F
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    fp4_global_scale,
+    pack_int4_in_uint8,
+    unpack_uint8_to_int4_weight_2d,
+)
 
 torch.manual_seed(0)
 
 SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
+INT4_BLOCK_SIZE = 128
 
 
 @pytest.mark.parametrize("bias", [torch.rand(32).to("cuda") * 10, None])
@@ -194,3 +199,102 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
 
     assert out_unified.shape == out_fused.shape
     torch.testing.assert_close(out_unified, out_fused, rtol=1e-3, atol=5e-3)
+
+
+def test_int4awq_unpack_roundtrip():
+    """Pack (via provided pack_int4_in_uint8) -> Unpack should exactly recover the signed INT4 grid."""
+    device = "cuda"
+    dtype = torch.float32
+
+    N, K = 64, 256
+    assert K % INT4_BLOCK_SIZE == 0 and N % 2 == 0
+
+    W = (torch.randn(N, K, device=device, dtype=dtype) * 2.0).contiguous()
+
+    # Per-block amax along K -> shape (N, K//INT4_BLOCK_SIZE)
+    Wv = W.view(N, K // INT4_BLOCK_SIZE, INT4_BLOCK_SIZE)
+    amax_blocks = Wv.abs().amax(dim=-1).to(torch.float32)  # (N, K//128)
+
+    # The packer expects weights_scaling_factor with shape (N, K//INT4_BLOCK_SIZE)
+    # and quantizes as: round(W / factor).clamp(-8,7)
+    weights_scaling_factor = (amax_blocks / 7.0).to(torch.float32)
+
+    # Build the exact expected INT4 integers ([-8, 7]) the packer produces
+    col_idx = torch.arange(K, device=device)
+    block_idx = col_idx // INT4_BLOCK_SIZE  # (K,)
+    scale_full = weights_scaling_factor[:, block_idx]  # (N, K)
+    q_ref = torch.round(W / (scale_full + 1e-12)).clamp(-8, 7).to(torch.int8)
+
+    # Pack with the provided function, then unpack with the UUT
+    packed = pack_int4_in_uint8(W, weights_scaling_factor)  # (N//2, K), uint8
+    assert packed.dtype == torch.uint8 and packed.shape == (N // 2, K)
+
+    q_unpacked = unpack_uint8_to_int4_weight_2d(packed, weights_scaling_factor)
+    assert q_unpacked.dtype == torch.int8 and q_unpacked.shape == (N, K)
+
+    # Integer path should be exact
+    torch.testing.assert_close(q_unpacked, q_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bias_opt", [None, "with_bias"])
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+def test_fake_quant_int4_linear_matches_fp_reference(bias_opt, input_dtype):
+    """Use provided pack_int4_in_uint8 with weights_scaling_factor=amax/7.
+    Compare op output to a separately-computed dequant reference, and sanity-check vs FP32.
+    """
+    device = "cuda"
+    torch.cuda.manual_seed(0)
+
+    B, K, N = 3, 512, 128
+    assert K % INT4_BLOCK_SIZE == 0 and N % 2 == 0
+
+    x = torch.randn(B, K, device=device, dtype=input_dtype)
+    W = torch.randn(N, K, device=device, dtype=torch.float32) * 1.5
+
+    Wv = W.view(N, K // INT4_BLOCK_SIZE, INT4_BLOCK_SIZE)
+    amax_blocks = Wv.abs().amax(dim=-1).to(torch.float32)  # (N, K//128)
+    weights_scaling_factor = (amax_blocks / 7.0).to(torch.float32)
+
+    packed = pack_int4_in_uint8(W, weights_scaling_factor)  # (N//2, K), uint8
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (N // 2, K)
+
+    bias = None
+    if bias_opt == "with_bias":
+        bias = (torch.randn(N, device=device, dtype=input_dtype) * 0.1).contiguous()
+
+    s_in = torch.tensor(1.0, device=device, dtype=input_dtype)
+    out_int4 = torch.ops.auto_deploy.torch_fake_quant_int4_linear(
+        x,  # [..., K]
+        packed,  # [N//2, K], uint8
+        bias,  # [N] or None
+        [s_in],  # input_scale: [pre_quant_scale]
+        [weights_scaling_factor],  # weight_scale: [amax/7]
+        [],  # input_zp
+        [],  # weight_zp
+    )
+
+    # a separate FP reference path that mirrors the op
+    q_unpacked = unpack_uint8_to_int4_weight_2d(packed, weights_scaling_factor).to(
+        torch.float32
+    )  # (N, K)
+
+    # Mirror op’s casting order: amax_2d cast to input dtype before compute scale_blocks
+    amax_2d = (weights_scaling_factor * 7.0).to(x.dtype)  # (N, K//128)
+    scale_blocks = (7.0 / (amax_2d + 1e-12)).to(torch.float32)  # (N, K//128)
+    scale_full = scale_blocks.repeat_interleave(INT4_BLOCK_SIZE, dim=1)  # (N, K)
+
+    # Dequant + same linear op as the op
+    w_deq = (q_unpacked / scale_full).to(x.dtype)
+    x_scaled = (x * s_in).to(x.dtype)
+    out_ref_deq = torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, bias)
+
+    torch.testing.assert_close(out_int4, out_ref_deq, rtol=1e-5, atol=1e-5)
+    # Sanity: closeness vs original FP32 weights (quantization error budget)
+    out_fp32 = torch.nn.functional.linear(
+        x.to(torch.float32),
+        W,
+        bias.to(torch.float32) if bias is not None else None,
+    ).to(out_int4.dtype)
+    cos = F.cosine_similarity(out_fp32.reshape(-1), out_int4.reshape(-1), dim=0)
+    assert cos > 0.98
