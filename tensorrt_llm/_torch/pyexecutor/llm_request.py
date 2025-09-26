@@ -312,6 +312,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_draft: bool = False,
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
+            is_first_draft: bool = False,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -368,6 +369,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.use_draft_model = is_draft
         self._cached_tokens = 0
         self._cached_tokens_set = False
+        # Whether the request is for the first forward of the draft model.
+        self.py_is_first_draft = is_first_draft
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
