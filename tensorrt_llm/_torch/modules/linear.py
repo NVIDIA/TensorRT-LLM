@@ -20,10 +20,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
-from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
@@ -619,26 +616,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                # TODO (@lmin): replace with cute_dsl gemm
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
-            else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
-        else:
-            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(
+            act_input_fp8, module.weight, act_input_sf, module.weight_scale)
 
         if bias is not None:
             output = output + bias
@@ -716,23 +696,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         fused_scale = torch.cat([left_scale, right_scale], dim=0)
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
-
-    def post_load_weights(self, module: Linear):
-        super().post_load_weights(module)
-        if is_sm_100f():
-            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
-                                                        module.weight_scale)
-            transfromed_scale = transform_sf_into_required_layout(
-                weight_scale,
-                mn=weight.shape[0],
-                k=weight.shape[1],
-                recipe=(1, 128, 128),
-                is_sfa=False)
-            module.weight = nn.Parameter(weight, requires_grad=False)
-            module.weight_scale = nn.Parameter(
-                transfromed_scale,
-                requires_grad=False,
-            )
 
 
 class NVFP4LinearMethod(LinearMethodBase):
