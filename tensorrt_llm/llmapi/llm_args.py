@@ -359,6 +359,8 @@ class DecodingBaseConfig(StrictBaseModel):
 
     load_format: Optional[str] = None
 
+    # If set, drafting is allowed to use chain drafter.
+    allow_chain_drafter: bool = True
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
