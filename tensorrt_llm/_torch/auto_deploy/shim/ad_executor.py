@@ -155,7 +155,7 @@ class ADEngine(ModelEngine):
         self.model = get_inference_model(self.cache_seq_interface)
 
         # start fresh with fixed seed
-        torch.manual_seed(1234)
+        torch.manual_seed(42)
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
