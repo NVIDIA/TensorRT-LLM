@@ -19,7 +19,6 @@ class WorkerInfo:
     host: str = ""
     port: int = 0
     role: ServerRole = ServerRole.CONTEXT
-    status: str = ""
 
 
 def get_worker_key_prefix(cluster_name: str):
@@ -105,20 +104,17 @@ class ClusterManager:
         worker_events = []
         for event in events:
             try:
-                print(
-                    f"Processing event: {event.event_type} for key: {event.storage_item.key} value {event.storage_item.value}"
-                )
                 worker_info = self._parse_worker_info(event)
                 worker_events.append((worker_info, event.event_type))
             except Exception as e:
                 logger.error(
-                    f"Error parsing worker info: {event.storage_item.value}, error: {e}"
+                    f"Failed to parse worker info: {event.storage_item.value}, error: {e}"
                 )
                 continue
         return worker_events
 
     def _log_cluster_status(self, worker_info: WorkerInfo, change_event: str):
-        logger.error(
+        logger.info(
             f"Worker {worker_info.worker_id} becomes {change_event}, current context worker: {self.current_ctx_worker_num}/{self._minimal_ctx_worker_num}, current generation worker: {self.current_gen_worker_num}/{self._minimal_gen_worker_num}"
         )
 
@@ -138,7 +134,7 @@ class ClusterManager:
         else:
             raise ValueError(f"Worker {worker_id} is unknown")
 
-    def _parse_worker_info(self, event: WatchEvent) -> Tuple[WorkerInfo, bool]:
+    def _parse_worker_info(self, event: WatchEvent) -> WorkerInfo:
         # parse the worker info from the event, if it's a delete event, pop the corresponding worker from the current workers
         # if it's a set event, parse the worker info from the value and add it to the current workers
         # return the worker info and whether to notify the event
@@ -162,6 +158,7 @@ class ClusterManager:
                 logger.error(
                     f"Failed to parse set event: {event.storage_item.key}: {event.storage_item.value}, error: {e}"
                 )
+                # Generate a dummy worker info with id only, router should be able to ignore it
                 worker_info = WorkerInfo(worker_id=event.storage_item.key)
         else:
             raise ValueError(f"Invalid event type: {event.event_type}")
@@ -192,6 +189,11 @@ class ClusterWorker:
         self._last_heartbeat = 0
         self._worker_id = f"{role.name}-{host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
 
+    def __del__(self):
+        if asyncio.get_event_loop():
+            asyncio.run_coroutine_threadsafe(self.deregister_worker(),
+                                             asyncio.get_event_loop())
+
     @property
     def worker_id(self) -> str:
         return self._worker_id
@@ -201,8 +203,7 @@ class ClusterWorker:
         return WorkerInfo(worker_id=self._worker_id,
                           role=self._role,
                           host=self._host,
-                          port=self._port,
-                          status="")
+                          port=self._port)
 
     @property
     def worker_key(self) -> str:
@@ -230,8 +231,8 @@ class ClusterWorker:
                 logger.warning(
                     f"Worker {self.worker_info.worker_id} registration failed, retry in {retry_interval} seconds"
                 )
-                await asyncio.sleep(max(10, retry_interval))
-                return await self.register_worker(validator, retry_interval + 1)
+                await asyncio.sleep(retry_interval)
+                return await self.register_worker(validator, retry_interval)
         else:
             logger.info(
                 f"Worker {self.worker_info.worker_id} registration successful")
@@ -248,8 +249,9 @@ class ClusterWorker:
 
     async def deregister_worker(self):
         self._stop = True
-        self._heartbeat_task.cancel()
-        self._heartbeat_task = None
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         await self._cluster_storage.stop()
         success = await self._cluster_storage.delete(self.worker_key)
         if not success:

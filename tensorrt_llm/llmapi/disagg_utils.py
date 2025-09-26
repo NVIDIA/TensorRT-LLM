@@ -44,6 +44,21 @@ class ConditionalDisaggConfig():
 
 
 @dataclass
+class MinimalInstances:
+    context_servers: int = 1
+    generation_servers: int = 1
+
+
+@dataclass
+class DisaggClusterConfig:
+    cluster_uri: str
+    cluster_name: str = ""
+    minimal_instances: Optional[MinimalInstances] = None
+    heartbeat_interval: int = 5
+    inactive_timeout: int = 10
+
+
+@dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
     hostname: str = "localhost"

@@ -99,18 +99,12 @@ class ClusterStorage(abc.ABC):
 def create_cluster_storage(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http"):
         return HttpClusterStorageServer(cluster_uri, cluster_name, **kwargs)
-    elif cluster_uri.startswith("etcd"):
-        from tensorrt_llm.serve.cluster_storage_etcd import Etcd3ClusterStorage
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
 def create_cluster_storage_client(cluster_uri, cluster_name):
     if cluster_uri.startswith("http"):
         return HttpClusterStorageClient(cluster_uri, cluster_name)
-    elif cluster_uri.startswith("etcd"):
-        from tensorrt_llm.serve.cluster_storage_etcd import Etcd3ClusterStorage
-        return Etcd3ClusterStorage(cluster_uri, cluster_name)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -356,7 +350,7 @@ class HttpClusterStorageClient(ClusterStorage):
                          keys_only: bool = False) -> Dict[str, str]:
         return await self._get("get_prefix",
                                key_prefix=key_prefix,
-                               keys_only=keys_only)
+                               keys_only=int(keys_only))
 
     async def delete(self, key: str) -> bool:
         try:
