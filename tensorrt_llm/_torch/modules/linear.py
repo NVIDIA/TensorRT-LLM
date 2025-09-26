@@ -21,7 +21,6 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
@@ -617,26 +616,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                # TODO (@lmin): replace with cute_dsl gemm
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
-            else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
-        else:
-            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(
+            act_input_fp8, module.weight, act_input_sf, module.weight_scale)
 
         if bias is not None:
             output = output + bias
