@@ -126,6 +126,10 @@ class Eagle3SpecMetadata(SpecMetadata):
                                           self.num_layers - 4)
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
+            if self.layers_to_capture[0] == -1:
+                self.layers_to_capture = self.layers_to_capture[1:] + [
+                    self.layers_to_capture.pop(0)
+                ]
         self.num_capture_layers = len(self.layers_to_capture)
 
         # Initialize to 0 to avoid reading uninitialized memory during warmup
