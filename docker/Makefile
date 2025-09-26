@@ -201,10 +201,10 @@ rockylinux8_%: BASE_TAG = 13.0.0-devel-rockylinux8
 rockylinux8_12_9_%: STAGE = tritondevel
 rockylinux8_12_9_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 rockylinux8_12_9_%: BASE_TAG = 12.9.1-devel-rockylinux8
-rockylinux8_12_9_%: TRITON_BASE_TAG=25.06-py3
+rockylinux8_12_9_%: TRITON_BASE_TAG=$(shell grep '^ARG TRITON_BASE_TAG_12_9=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 
-tritondevel_12_9_%: BASE_TAG=25.06-py3
-tritondevel_12_9_%: TRITON_BASE_TAG=25.06-py3
+tritondevel_12_9_%: BASE_TAG=$(shell grep '^ARG BASE_TAG_12_9=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+tritondevel_12_9_%: TRITON_BASE_TAG=$(shell grep '^ARG TRITON_BASE_TAG_12_9=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
