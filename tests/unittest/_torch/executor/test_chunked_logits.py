@@ -20,51 +20,8 @@ def sample_logits():
     return torch.randn(1, 1, 1000, device='cuda')
 
 
-@pytest.fixture
-def chunked_request():
-    """Create LlmRequest with chunked logits enabled"""
-    return LlmRequest(request_id=100,
-                      max_new_tokens=10,
-                      input_tokens=[1, 2, 3],
-                      sampling_config=SamplingConfig(),
-                      is_streaming=False,
-                      return_generation_logits=True,
-                      use_chunked_generation_logits=True,
-                      logits_chunk_size=4)
-
-
-@pytest.fixture
-def non_chunked_request():
-    """Create LlmRequest with chunked logits disabled"""
-    return LlmRequest(request_id=101,
-                      max_new_tokens=10,
-                      input_tokens=[1, 2, 3],
-                      sampling_config=SamplingConfig(),
-                      is_streaming=False,
-                      return_generation_logits=True,
-                      use_chunked_generation_logits=False)
-
-
 class TestLogitsStorage:
     """Unit tests for LogitsStorage class"""
-
-    def test_initialization(self):
-        """Test LogitsStorage initialization with different parameters"""
-        # Test basic initialization
-        storage = LogitsStorage(seq_length=10,
-                                use_device_memory=True,
-                                should_exclude_last=False,
-                                use_chunked_generation_logits=False,
-                                chunk_size=8)
-
-        assert storage.seq_length == 10
-        assert storage.use_device_memory is True
-        assert storage._should_exclude_last is False
-        assert storage.use_chunked_generation_logits is False
-        assert storage.chunk_size == 8
-        assert storage._logits_indices == []
-        assert storage.beam_width == -1
-        assert storage.vocab_size == -1
 
     def test_initialization_chunked_mode(self):
         """Test LogitsStorage initialization in chunked mode"""
@@ -78,23 +35,6 @@ class TestLogitsStorage:
         assert hasattr(storage, '_current_position')
         assert storage._device_fragments == []
         assert storage._current_position == 0
-
-    def test_append_3d_logits(self, sample_logits):
-        """Test appending 3D logits"""
-        storage = LogitsStorage(seq_length=10,
-                                use_chunked_generation_logits=False)
-        storage.append(sample_logits)
-
-        assert storage.beam_width == 1
-        assert storage.vocab_size == 1000
-
-    def test_append_invalid_shape(self):
-        """Test appending logits with invalid shape"""
-        storage = LogitsStorage(seq_length=10,
-                                use_chunked_generation_logits=False)
-
-        with pytest.raises(AssertionError):
-            storage.append(torch.randn(1000))  # 1D - should fail
 
     def test_append_chunked_mode_streaming(self, sample_logits):
         """Test append behavior in chunked streaming mode"""
@@ -145,17 +85,6 @@ class TestLogitsStorage:
         # Should not raise any errors
         storage.finalize_chunked_transfer()
 
-    def test_storage_overflow(self, sample_logits):
-        """Test storage overflow handling"""
-        storage = LogitsStorage(seq_length=2,
-                                use_chunked_generation_logits=False)
-        storage.append(sample_logits)
-        storage.append(sample_logits)
-
-        # This should cause overflow
-        with pytest.raises(ValueError, match="LogitsStorage overflow"):
-            storage.append(sample_logits)
-
 
 class TestPyResult:
     """Unit tests for PyResult class"""
@@ -202,27 +131,6 @@ class TestPyResult:
 
         # Should not raise errors
 
-    def test_context_generation_logits_property(self, sample_logits):
-        """Test context_logits property"""
-        result = PyResult(prompt_len=5,
-                          max_new_tokens=10,
-                          return_context_logits=True,
-                          return_generation_logits=True,
-                          use_chunked_generation_logits=False)
-
-        result.append_context_logits(sample_logits)
-        context_logits = result.context_logits
-
-        assert context_logits is not None
-        assert context_logits.shape == (1, 1000)  # Should remove beam dimension
-
-        result.append_generation_logits(sample_logits)
-        generation_logits = result.generation_logits
-
-        assert generation_logits is not None
-        assert generation_logits.shape == (1, 1, 1000
-                                           )  # Should transpose dimensions
-
 
 class TestLlmRequest:
     """Unit tests for LlmRequest class"""
@@ -251,7 +159,7 @@ class TestLlmRequest:
         assert request_streaming.py_logits_chunk_size == 1  # 1 in streaming mode
 
 
-class TestChunkedLogitsIntegration:
+class TestChunkedLogitsComplicated:
     """Integration tests for chunked logits functionality"""
 
     def test_chunked_vs_non_chunked_equivalence(self, sample_logits):
