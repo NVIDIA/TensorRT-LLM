@@ -86,18 +86,15 @@ class Buffers:
         if pin_memory:
             if pinned_buffer is not None:
                 return view_to(pinned_buffer.buffer, dtype, tensor_shape)
-            else:
-                buffer = select_buffer_with_more_elements(
-                    pinned_buffer, free_buffer)
-                if buffer is not None:
-                    buffer.pin_memory = True
-                    return view_to(buffer.buffer, dtype, tensor_shape)
+            elif free_buffer is not None:
+                free_buffer.pin_memory = True
+                return view_to(free_buffer.buffer, dtype, tensor_shape)
 
         if buffer_name in self.buffers:
             candidate_buffers = self.buffers.get(buffer_name, [])
             remove_idx = []
             for idx, buffer in enumerate(candidate_buffers):
-                if buffer.pin_memory == False:
+                if not buffer.pin_memory:
                     remove_idx.append(idx)
 
             for idx in remove_idx[::-1]:

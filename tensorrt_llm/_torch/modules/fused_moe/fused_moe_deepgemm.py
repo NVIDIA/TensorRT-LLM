@@ -367,7 +367,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     """
 
     # To reuse pytorch memory segments allocated during graph capture.
-    buffer = get_memory_buffer()
+    buffers = get_memory_buffer()
 
     def __init__(
         self,
@@ -421,12 +421,12 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = DeepGemmFusedMoE.buffer.get_buffer(
+        workspace_0 = DeepGemmFusedMoE.buffers.get_buffer(
             (num_experts * m_max * fp8_dim, ),
             dtype=torch.float8_e4m3fn,
             buffer_name='workspace_0',
             pin_memory=capture_graph)
-        workspace_1 = DeepGemmFusedMoE.buffer.get_buffer(
+        workspace_1 = DeepGemmFusedMoE.buffers.get_buffer(
             (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
             buffer_name='workspace_1',
@@ -437,7 +437,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
 
-        workspace_sf = DeepGemmFusedMoE.buffer.get_buffer(
+        workspace_sf = DeepGemmFusedMoE.buffers.get_buffer(
             (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
             buffer_name='workspace_sf',
