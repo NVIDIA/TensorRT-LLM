@@ -507,8 +507,25 @@ public:
             throw std::invalid_argument("Invalid combination of options");
         }
 
-        int32_t const numCtasTile
+        if (batchM)
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
+        }
+        else
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
+        }
+
+        int32_t numCtasTile
             = batchM ? gemm::divUp(options.mN, options.mTileN) : gemm::divUp(options.mM, options.mTileM);
+        if (batchM)
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimY);
+        }
+        else
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimX);
+        }
         int32_t const numCtasInner = options.mNumSlicesForSplitK;
         return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
     }
@@ -792,7 +809,9 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         cuModuleUnload(cuModule);
     }
 #else
-    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);
+    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid,
+        /* cluster */ {},
+        /* instanceId */ config.mInstanceIdx);
 #endif
 
     return 0;
