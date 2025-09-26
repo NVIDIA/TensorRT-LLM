@@ -3,7 +3,6 @@ import asyncio
 import os
 import re
 import signal
-import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -54,6 +53,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.serve.responses_utils import ConversationHistoryStore
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     process_streaming_events as responses_api_process_streaming_events
 from tensorrt_llm.serve.responses_utils import \
@@ -165,8 +165,7 @@ class OpenAIServer:
 
         @self.app.middleware("http")
         async def add_process_time_header(raw_request: Request, call_next):
-            start_time = time.monotonic()
-            raw_request.state.server_arrival_time = start_time
+            raw_request.state.server_arrival_time = get_steady_clock_now_in_seconds()
             response = await call_next(raw_request)
             return response
 
@@ -326,9 +325,9 @@ class OpenAIServer:
         return Response(status_code=200)
 
     async def get_steady_clock_offset(self) -> JSONResponse:
-        receive_ts = time.monotonic()
+        receive_ts = get_steady_clock_now_in_seconds()
         await asyncio.sleep(0.2)
-        transmit_ts = time.monotonic()
+        transmit_ts = get_steady_clock_now_in_seconds()
         return JSONResponse(content={"receive_ts": receive_ts, "transmit_ts": transmit_ts})
 
     async def get_perf_metrics(self) -> JSONResponse:
@@ -347,12 +346,18 @@ class OpenAIServer:
                 "last_iter": metrics.last_iter,
                 # exclude metrics.iter since it is only meaningful when the request is not finished
             }
+            server_arrival_time = metrics_dict.pop("server_arrival_time", None)
+            if server_arrival_time is not None:
+                server_arrival_time += self.disagg_server_steady_clock_offset
+            server_first_token_time = metrics_dict.pop("server_first_token_time", None)
+            if server_first_token_time is not None:
+                server_first_token_time += self.disagg_server_steady_clock_offset
             metrics_json["timing_metrics"] = {
-                "server_arrival_time": metrics_dict.pop("server_arrival_time", None) + self.disagg_server_steady_clock_offset,
+                "server_arrival_time": server_arrival_time,
                 "arrival_time": timing_metrics.arrival_time.total_seconds() + self.disagg_server_steady_clock_offset,
                 "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds() + self.disagg_server_steady_clock_offset,
                 "first_token_time": timing_metrics.first_token_time.total_seconds() + self.disagg_server_steady_clock_offset,
-                "server_first_token_time":metrics_dict.pop("server_first_token_time", None) + self.disagg_server_steady_clock_offset,
+                "server_first_token_time": server_first_token_time,
                 "last_token_time": timing_metrics.last_token_time.total_seconds() + self.disagg_server_steady_clock_offset,
             }
             metrics_json["kv_cache_metrics"] = {
@@ -387,7 +392,7 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
-    async def _extract_metrics(self, res: RequestOutput, raw_request: Optional[Request] = None):
+    async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
         if self.metrics_collector:
@@ -421,12 +426,15 @@ class OpenAIServer:
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                yield first_response
                 async for res in promise:
                     pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                    await self._extract_metrics(res)
                     for pp_res in pp_results:
                         yield pp_res
                 yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
             except:
                 logger.error(traceback.format_exc())
@@ -444,7 +452,8 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
-            await self._extract_metrics(promise)
+            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+            await self._extract_metrics(promise, raw_request)
             return chat_response
 
         try:
@@ -613,7 +622,7 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            raw_request.state.server_first_token_time = time.monotonic()
+            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
             await self._extract_metrics(response, raw_request)
             return pp_result
 
@@ -651,9 +660,9 @@ class OpenAIServer:
                         pp_result = post_processor(output, args)
                     else:
                         pp_result = output.outputs[0]._postprocess_result
-                    await self._extract_metrics(output, raw_request)
                     for pp_res in pp_result:
                         yield pp_res
+                await self._extract_metrics(output, raw_request)
             except:
                 logger.error(traceback.format_exc())
                 raise
@@ -679,7 +688,7 @@ class OpenAIServer:
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
             first_response = await anext(generator)
-            raw_request.state.server_first_token_time = time.monotonic()
+            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
             yield first_response
             async for output in generator:
                 yield output

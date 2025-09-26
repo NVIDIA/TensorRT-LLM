@@ -144,8 +144,11 @@ class PostprocWorker:
             # Left the result_handler determine the final output dtype.
             # NOTE: This will change the CompletionOutput._postprocess_result
             metrics_dict = record.metrics_dict
-            perf_metrics = record.outputs[0].request_perf_metrics
-            disaggregated_params = record.outputs[0].disaggregated_params
+            perf_metrics = None
+            disaggregated_params = None
+            if record.outputs:
+                perf_metrics = record.outputs[0].request_perf_metrics
+                disaggregated_params = record.outputs[0].disaggregated_params
             if postproc_params := record.postproc_params:
                 result_handler, args = postproc_params.post_processor, postproc_params.postproc_args
                 args.tokenizer = self._tokenizer
@@ -180,15 +183,17 @@ class PostprocWorker:
             client_id = inp.rsp.client_id
             is_final = inp.rsp.result.is_final if is_llm_response(
                 inp.rsp) else True
-            res, metrics, perf_metrics, disaggregated_params = await self._handle_input(inp)
+            res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
+                inp)
             batch.append(
-                PostprocWorker.Output(client_id=client_id,
-                                      res=res,
-                                      is_final=is_final,
-                                      metrics=metrics,
-                                      request_perf_metrics=perf_metrics,
-                                      disaggregated_params=disaggregated_params,
-                                      ))
+                PostprocWorker.Output(
+                    client_id=client_id,
+                    res=res,
+                    is_final=is_final,
+                    metrics=metrics,
+                    request_perf_metrics=perf_metrics,
+                    disaggregated_params=disaggregated_params,
+                ))
             if is_final:
                 self._records.pop(client_id)
 

@@ -44,8 +44,7 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, is_disaggregated: bool,
-                 global_steady_clock_offset: float):
+                 batch_wait_timeout_ms: float, is_disaggregated: bool):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -61,7 +60,6 @@ class ExecutorRequestQueue:
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
-        self.global_steady_clock_offset = global_steady_clock_offset
 
         # State tracking
         self.num_fetch_requests = 0
@@ -613,9 +611,6 @@ class ExecutorRequestQueue:
         else:
             req_with_children = []
             for req_item in new_requests:
-                if self.global_steady_clock_offset:
-                    req_item.request.py_global_steady_clock_offset = self.global_steady_clock_offset
-
                 req = executor_request_to_llm_request(
                     req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
