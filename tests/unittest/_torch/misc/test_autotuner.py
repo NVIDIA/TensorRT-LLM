@@ -1,3 +1,5 @@
+import os
+import tempfile
 from typing import Dict, List
 
 import torch
@@ -262,13 +264,13 @@ def test_multiple_runners_different_attributes():
 
         # Verify different cache keys are generated
         shapes = (x.shape, w.shape)
-        cache_key_0 = tuner._get_cache_key(
+        cache_key_0 = tuner.profiling_cache.get_cache_key(
             custom_op="test_multiple_runners",
             input_shapes=shapes,
             runner=runner_0,
             tuning_config=tuning_config,
         )
-        cache_key_1 = tuner._get_cache_key(
+        cache_key_1 = tuner.profiling_cache.get_cache_key(
             custom_op="test_multiple_runners",
             input_shapes=shapes,
             runner=runner_1,
@@ -297,16 +299,25 @@ def test_multiple_dynamic_shapes_cache():
 
     # Do tuning with a sample input
     x = torch.randn(3, 64)
-    with autotune():
+    temp_dir = tempfile.TemporaryDirectory()
+    with autotune(cache_path=os.path.join(temp_dir.name,
+                                          "test_multiple_dynamic_shapes.json")):
         tuner = AutoTuner.get()
         runner, tactic = tuner.choose_one("test_multiple_dynamic_shapes",
                                           runners, tuning_config, [x, w])
 
+    cache_entries = tuner.profiling_cache.get_specific_custom_op(
+        "test_multiple_dynamic_shapes")
+    assert len(cache_entries) == 12, \
+        f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
     # Verify cache size - should have 12 entries (3x4 combinations)
-    cache_entries = [
-        k for k in tuner.profiling_cache.keys()
-        if k[0] == "test_multiple_dynamic_shapes"
-    ]
+    # We also test the cache serialization and deserialization here.
+    AutoTuner.get().profiling_cache.clear()
+    AutoTuner.get().profiling_cache.load_cache(
+        os.path.join(temp_dir.name, "test_multiple_dynamic_shapes.rank0.json"))
+    cache_entries = tuner.profiling_cache.get_specific_custom_op(
+        "test_multiple_dynamic_shapes")
+
     assert len(cache_entries) == 12, \
         f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
 
