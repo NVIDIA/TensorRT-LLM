@@ -149,7 +149,8 @@ class SequenceInfo:
         self._num_pages = max(
             self.max_batch_size,
             (self.max_num_tokens) // self.page_size  # floored number of pages
-            + (self.max_num_tokens % self.page_size > 0) * self.max_batch_size,  # +1 per sequence
+            + (self.max_num_tokens / self.max_batch_size % self.page_size > 0)  # check for overflow
+            * self.max_batch_size,  # +1 page per sequence if overflow is required
         )
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
