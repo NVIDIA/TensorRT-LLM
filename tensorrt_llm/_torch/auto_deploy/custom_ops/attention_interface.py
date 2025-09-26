@@ -19,6 +19,7 @@ from torch.export import Dim
 from torch.fx import Node
 
 from ...._utils import nvtx_range
+from ..utils.logger import ad_logger
 
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 DynamicShapeCallback = Callable[[], DynamicShape]
@@ -71,6 +72,8 @@ class SequenceInfo:
     - pages_per_seq: [ps_0, ps_1, ..., ps_{b-1}] where ps_i is the number of pages allocated for
       sequence i. Note that, for example, cache_loc[p_0:p_1] will correspond to the pages associated
       with sequence 1 in the batch.
+    - slot_idx: [s_0, s_1, ..., s_{b-1}]
+      Corresponds to the slot index of each sequence in the batch.
 
     ################################################################################################
 
@@ -122,21 +125,27 @@ class SequenceInfo:
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1
 
-        if max_num_tokens is None or max_num_tokens < 1:
-            self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
-        else:
-            self.max_num_tokens = max_num_tokens
+        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len_adjusted,
+        # we use the provided max_num_tokens. If max_num_tokens provided is more, we still use
+        # max_batch_size * max_seq_len_adjusted since the extra tokens cannot be used.
+        self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
+        if max_num_tokens is not None and max_num_tokens > 0:
+            self.max_num_tokens = min(self.max_num_tokens, max_num_tokens)
 
-        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
-        # we use the provided max_num_tokens to calculate the number of pages
-        total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
         # Num pages can not be less than max_batch_size.
         self._num_pages = max(
             self.max_batch_size,
-            (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
+            (self.max_num_tokens) // self.page_size  # floored number of pages
+            + (self.max_num_tokens % self.page_size > 0) * self.max_batch_size,  # +1 per sequence
         )
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
+
+        # log parameters
+        ad_logger.info(
+            f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.page_size=}, "
+            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}"
+        )
 
         # indicator if extra args are activated that are needed for cached attention backends
         self._is_cached_attn = False
@@ -157,6 +166,7 @@ class SequenceInfo:
             "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
             "cache_loc": torch.empty(self.num_pages, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
+            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
         }
@@ -165,7 +175,8 @@ class SequenceInfo:
         }
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
-        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq")
+        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        self._cached_constants = ("page_size",)
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
@@ -289,7 +300,7 @@ class SequenceInfo:
         ``insert_cached_attention`` to extract the constant arguments and add them to the
         ``prepare_metadata`` node/op.
         """
-        return (self.page_size,)
+        return tuple(getattr(self, k) for k in self._cached_constants)
 
     @property
     def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
@@ -304,6 +315,7 @@ class SequenceInfo:
             if self.max_batch_size > 1:
                 bs_seq_len_shape[0] = Dim("batch_size", max=self.max_batch_size)
             bs_seq_len_shape[1] = Dim("seq_len", max=self.max_seq_len)
+            # bs_seq_len_shape[1] = Dim.AUTO
             self._dynamic_shapes = {k: bs_seq_len_shape for k in self._uncached_arg_names}
             # cached args are static
             self._dynamic_shapes.update({k: {} for k in self._cached_arg_names})
@@ -515,11 +527,15 @@ class SequenceInfo:
         cache_loc = list(range(sum(pages_per_seq)))
         page_assignments = self._get_page_assignments(cache_loc, pages_per_seq)
 
+        # vanilla slot indices
+        slot_idx = list(range(len(input_ids)))
+
         self.nest_sequences(
             input_ids,
             position_ids,  # will be auto-inferred if None
             input_pos=0,  # no cache history
             page_assignments=page_assignments,  # vanilla page assignments
+            slot_idx=slot_idx,  # vanilla slot indices
             **extra_args,
         )
 
@@ -572,6 +588,12 @@ class SequenceInfo:
             # pin the memory on the host
             tnsr_host = torch.tensor(tnsr_like, dtype=tnsr_device.dtype, pin_memory=True)
 
+            # check for available space
+            assert tnsr_device.numel() >= tnsr_host.numel(), (
+                f"device tensor {name} is too small, available: {tnsr_device.numel()}, "
+                f"required: {tnsr_host.numel()}"
+            )
+
             # reset/copy to the device in a non-blocking fashion
             if reset:
                 tnsr_device.zero_()
@@ -600,6 +622,7 @@ class SequenceInfo:
         position_ids: Optional[Sequence[Sequence[int]]] = None,
         input_pos: Optional[Union[Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
+        slot_idx: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -609,6 +632,7 @@ class SequenceInfo:
             position_ids: List of sequences of position_ids for each token.
             input_pos: Absolute starting position in the cache for each sequence.
             page_assignments: List of sequences of page assignments for each sequence.
+            slot_idx: List of slot indices for each sequence.
             extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly.
@@ -632,8 +656,12 @@ class SequenceInfo:
             cache_loc, pages_per_seq = self._get_cache_locations_and_pages_per_sequence(
                 page_assignments
             )
-            self._store_arg("cache_loc", cache_loc)
-            self._store_arg("pages_per_seq", pages_per_seq)
+            self._store_arg("cache_loc", cache_loc, reset=True)
+            self._store_arg("pages_per_seq", pages_per_seq, reset=True)
+
+        # check for updated slot_idx
+        if slot_idx is not None:
+            self._store_arg("slot_idx", slot_idx)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
@@ -736,6 +764,7 @@ class PrepareMetadataCallable(Protocol):
         input_pos: torch.Tensor,
         cache_loc: torch.Tensor,
         pages_per_seq: torch.Tensor,
+        slot_idx: torch.Tensor,
         page_size: int,
     ) -> List[torch.Tensor]: ...
 
@@ -821,6 +850,9 @@ class AttentionDescriptor(ABC):
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,
             cache_loc: torch.Tensor,
+            pages_per_seq: torch.Tensor,
+            slot_idx: torch.Tensor,
+            page_size: int,
         ) -> List[torch.Tensor]: ...
         ```
         The metadata should contain all necessary global information required for the underlying

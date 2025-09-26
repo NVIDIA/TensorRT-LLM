@@ -446,6 +446,25 @@ _SMALL_MODEL_CONFIGS = {
             "vision_config": {"num_hidden_layers": 2},
         },
     },
+    "ibm-ai-platform/Bamba-9B-v2": {
+        "llm_models_subdir": "NO_SUBDIR",  # no synced to llm_models_root at the moment
+        "model_kwargs": {
+            "torch_dtype": "bfloat16",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "mamba_chunk_size": 64,
+            "mamba_d_conv": 2,
+            "mamba_d_head": 16,
+            "mamba_d_state": 64,
+            "mamba_expand": 1,
+            "mamba_n_groups": 1,
+            "mamba_n_heads": 4,
+            "model_type": "bamba",
+            "num_hidden_layers": 10,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
 }
 
 
