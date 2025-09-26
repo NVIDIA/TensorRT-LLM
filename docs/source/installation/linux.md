@@ -16,7 +16,7 @@
    # Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform
    pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-   sudo apt-get -y install libopenmpi-dev
+   sudo apt-get -y install libopenmpi-dev libzmq3-dev
    ```
 
    PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell GPUs and SBSA platform. On prior GPUs or Linux x86_64 platform, this extra installation is not required.
