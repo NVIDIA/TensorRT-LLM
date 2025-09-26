@@ -105,9 +105,6 @@ class ClusterManager:
         worker_events = []
         for event in events:
             try:
-                print(
-                    f"Processing event: {event.event_type} for key: {event.storage_item.key} value {event.storage_item.value}"
-                )
                 worker_info = self._parse_worker_info(event)
                 worker_events.append((worker_info, event.event_type))
             except Exception as e:
@@ -192,6 +189,11 @@ class ClusterWorker:
         self._last_heartbeat = 0
         self._worker_id = f"{role.name}-{host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
 
+    def __del__(self):
+        if asyncio.get_event_loop():
+            asyncio.run_coroutine_threadsafe(self.deregister_worker(),
+                                             asyncio.get_event_loop())
+
     @property
     def worker_id(self) -> str:
         return self._worker_id
@@ -230,8 +232,8 @@ class ClusterWorker:
                 logger.warning(
                     f"Worker {self.worker_info.worker_id} registration failed, retry in {retry_interval} seconds"
                 )
-                await asyncio.sleep(max(10, retry_interval))
-                return await self.register_worker(validator, retry_interval + 1)
+                await asyncio.sleep(retry_interval)
+                return await self.register_worker(validator, retry_interval)
         else:
             logger.info(
                 f"Worker {self.worker_info.worker_id} registration successful")
@@ -248,8 +250,9 @@ class ClusterWorker:
 
     async def deregister_worker(self):
         self._stop = True
-        self._heartbeat_task.cancel()
-        self._heartbeat_task = None
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         await self._cluster_storage.stop()
         success = await self._cluster_storage.delete(self.worker_key)
         if not success:
