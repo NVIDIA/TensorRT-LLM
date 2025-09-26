@@ -352,4 +352,4 @@ full:L40S/accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8 SK
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5541494)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2] SKIP (https://nvbugs/5543035)
 unittest/_torch/multi_gpu_modeling/test_llama3.py::test_llama_3_3 SKIP (https://nvbugs/5536131)
-accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype SKIP (https://nvbugs/5542928)
+full:A100/accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype SKIP (https://nvbugs/5542878)
