@@ -2,7 +2,6 @@
 
 import os
 import re
-import types
 from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -73,19 +72,6 @@ class AutoModelFactory(ModelFactory):
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
         """Get the AutoModel class for calling from_pretrained and from_config."""
 
-    @staticmethod
-    @abstractmethod
-    def _strict_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
-        """A strict (args-only) forward method for the model that precisely defines the signature.
-
-        The function should contain input_ids and position_ids as positional arguments at a
-        minimum. Other arguments can be added as needed and must follow the correct order.
-        """
-
-    def _set_strict_forward(self, model: nn.Module):
-        """Set the strict (args-only) forward method for the model."""
-        model.forward = types.MethodType(self._strict_forward, model)
-
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(AutoModelFactory):
@@ -131,16 +117,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
         return AutoModelForCausalLM
-
-    @staticmethod
-    def _strict_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
-        """A strict (args-only) forward pass for the model to functionalize the args.
-
-        This follows the standard function signature as expected by factory.py. We do _not_ use the
-        model.forward method directly to create the patch. Instead we use the type of the model to
-        get the forward method to keep the patch composable with other forward patches.
-        """
-        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -541,28 +517,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         if self.tokenizer is None:
             return None
         return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
-
-    # TODO: in theory the signature could be auto-derived but it would probably require some hefty
-    # meta-programming to progmatically generate the functions and signature from something like the
-    # example inputs. And even with that we would still need to figure out how to automatically
-    # infer the dynamic shapes for the extra inputs.
-    # Alternatively, we could try to directly use the HF forward again but I am not sure whether
-    # this will trigger some kind of kwarg-handling inside the graph which I would want to avoid.
-    @staticmethod
-    def _strict_forward(
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-    ):
-        """A strict (args-only) forward pass for the model to functionalize the args.
-
-        It adds pixel_values as a positional argument as expected by most
-        AutoModelForImageTextToText in addition to the required input_ids and position_ids.
-        """
-        return type(model).forward(
-            model, input_ids=input_ids, position_ids=position_ids, pixel_values=pixel_values
-        )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         """Return a dictionary of example inputs for the model."""

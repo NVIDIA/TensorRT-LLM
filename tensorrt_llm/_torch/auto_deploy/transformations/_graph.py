@@ -246,7 +246,7 @@ def run_shape_prop(
 def add_graph_input(
     gm: GraphModule,
     name: str,
-    add_kwargs: bool = False,
+    add_kwargs: bool = True,
     val: Union[Optional[torch.Tensor], _NoValType] = _NO_VAL,
     dynamic_shape=None,
 ) -> Node:
