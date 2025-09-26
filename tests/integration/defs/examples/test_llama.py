@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 from copy import deepcopy
+from pathlib import Path
 
 import defs.ci_profiler
 import pytest
@@ -61,6 +62,20 @@ INPUT_TEXT_1 = "After Washington had returned to Williamsburg, " + \
                "what did Washington do? Answer:"
 
 INPUT_TEXT_2 = "Born in north-east France, Soyer trained as a"
+
+
+@pytest.fixture
+def clear_flashinfer_cache():
+    """Clear flashinfer cache directory before test execution"""
+    flashinfer_cache_path = Path.home() / ".cache" / "flashinfer"
+    if flashinfer_cache_path.exists():
+        shutil.rmtree(flashinfer_cache_path)
+        print(f"Cleared flashinfer cache: {flashinfer_cache_path}")
+    yield
+    # Cleanup after test if needed
+    if flashinfer_cache_path.exists():
+        shutil.rmtree(flashinfer_cache_path)
+        print(f"Cleaned up flashinfer cache after test: {flashinfer_cache_path}")
 
 
 @pytest.mark.parametrize("num_beams", [5, 7],
@@ -2964,7 +2979,7 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
                                                 llama_model_root, llm_venv,
                                                 engine_dir, cmodel_dir,
                                                 llm_datasets_root,
-                                                dataset_name):
+                                                dataset_name, clear_flashinfer_cache):
     "Build & run llama-3-8B-1048k on long context ppl."
     if dataset_name == "SlimPajama-6B" and get_device_memory() < 50000:
         pytest.skip("GPU memory is insufficient.")
