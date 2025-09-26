@@ -56,14 +56,12 @@ class OpenAIDisaggServer:
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
             # record corresponding keys of context and generation servers for perf metrics
-            # (ctx_server, gen_server, ctx_request_id, server_start_ts, server_first_token_ts)
+            # (ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_ts)
             self.perf_metrics_keys = deque(maxlen=self.perf_metrics_max_requests)
             self.perf_metrics_keys_lock = asyncio.Lock()
             # server_url -> {ctx_request_id: perf_metrics}
             self.server_perf_metrics: dict[str, dict[int, dict]] = {}
 
-            # server_url -> the perf metric timestamp offset between the disagg server and worker server
-            self.server_perf_ts_offsets: dict[str, float] = {}
         else:
             self.perf_metrics_keys = None
             self.perf_metrics_keys_lock = None
@@ -109,7 +107,7 @@ class OpenAIDisaggServer:
             await self.wait_for_servers_ready(server_start_timeout_secs)
 
             if self.perf_metrics_max_requests > 0:
-                await self.query_perf_ts_offsets(self.session)
+                await self.set_steady_clock_offsets(self.session)
 
             if self.metadata_server:
                 logger.info("Starting server monitoring via metadata service")
@@ -142,7 +140,7 @@ class OpenAIDisaggServer:
         @self.app.middleware("http")
         async def add_process_time_header(raw_request: Request, call_next):
             start_time = time.monotonic()
-            raw_request.state.server_start_ts = start_time
+            raw_request.state.server_arrival_time = start_time
             response = await call_next(raw_request)
             return response
 
@@ -201,7 +199,7 @@ class OpenAIDisaggServer:
 
     async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int, raw_request: Request):
         async with self.perf_metrics_keys_lock:
-            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id, raw_request.state.server_start_ts, raw_request.state.server_first_token_ts))
+            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id, raw_request.state.server_arrival_time, raw_request.state.server_first_token_ts))
 
     async def perf_metrics(self) -> JSONResponse:
         if self.perf_metrics_keys is None:
@@ -238,27 +236,23 @@ class OpenAIDisaggServer:
                 raise exc
 
             remain_keys = []
-            for ctx_server, gen_server, ctx_request_id, server_start_ts, server_first_token_ts in self.perf_metrics_keys:
+            for ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_ts in self.perf_metrics_keys:
                 gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
                 if gen_perf_metrics is None:
                     # generation not finished
-                    remain_keys.append((ctx_server, gen_server, ctx_request_id, server_start_ts, server_first_token_ts))
+                    remain_keys.append((ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_ts))
                     continue
                 ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
                 return_metrics.append({
                     "ctx_server": ctx_server,
                     "gen_server": gen_server,
-                    "disagg_server_start_ts": server_start_ts,
+                    "disagg_server_arrival_time": server_arrival_time,
                     "disagg_server_first_token_ts": server_first_token_ts,
                     "ctx_perf_metrics": ctx_perf_metrics,
                     "gen_perf_metrics": gen_perf_metrics})
             self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
 
-        response = {
-            "server_perf_timestamp_offsets": self.server_perf_ts_offsets,
-            "perf_metrics": return_metrics
-        }
-        return JSONResponse(content=response)
+        return JSONResponse(content=return_metrics)
 
 
     async def openai_completion(self, req: CompletionRequest, raw_request: Request) -> Response:
@@ -513,28 +507,35 @@ class OpenAIDisaggServer:
     async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
         return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
 
-    async def query_perf_ts_offsets(self, session: aiohttp.ClientSession):
-        async def query_perf_ts_offset(server_url: str) -> Optional[float]:
+    async def set_steady_clock_offsets(self, session: aiohttp.ClientSession):
+        STEADY_CLOCK_OFFSET_ENDPOINT = "/steady_clock_offset"
+        async def query_steady_clock_offset(server_url: str) -> Optional[float]:
             try:
                 originate_ts = time.monotonic()
-                async with session.get(server_url + '/perf_ts_offset') as response:
+                async with session.get(server_url + STEADY_CLOCK_OFFSET_ENDPOINT) as response:
                     destination_ts = time.monotonic()
                     if response.status == 200:
                         response = await response.json()
+                        # Compute the steady clock timestamp difference using the NTP clock synchronization algorithm. https://en.wikipedia.org/wiki/Network_Time_Protocol#Clock_synchronization_algorithm
                         receive_ts = response['receive_ts']
                         transmit_ts = response['transmit_ts']
                         delay = (destination_ts - originate_ts) - (transmit_ts - receive_ts)
-                        offset = - ((receive_ts - originate_ts) + (transmit_ts - destination_ts)) / 2
+                        offset = ((receive_ts - originate_ts) + (transmit_ts - destination_ts)) / 2
                         return delay, offset
                     else:
                         return None, None
             except Exception:
                 return None
+        async def set_steady_clock_offset(server_url: str, offset: float) -> Optional[float]:
+            payload = {"offset": offset}
+            async with session.post(server_url + STEADY_CLOCK_OFFSET_ENDPOINT, json=payload) as response:
+                if response.status != 200:
+                    logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
         for server_url in self.ctx_servers + self.gen_servers:
-            delay, offset = await query_perf_ts_offset(server_url)
-            self.server_perf_ts_offsets[server_url] = offset
+            delay, offset = await query_steady_clock_offset(server_url)
             logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second')
-        logger.info(f"Server perf metrics timestamp offsets: {self.server_perf_ts_offsets}")
+            # Negate the offset so that worker servers can adjust their steady block by adding the new offset
+            await set_steady_clock_offset(server_url, -offset)
 
     @classmethod
     async def check_server_ready(cls, session: aiohttp.ClientSession, server_url: str) -> bool:
