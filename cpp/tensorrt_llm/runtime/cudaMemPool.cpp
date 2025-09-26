@@ -26,8 +26,7 @@
 namespace tensorrt_llm::runtime
 {
 
-CudaMemPool::CudaMemPool(cudaMemPool_t pool, int device)
-    : mDevice{device}
+CudaMemPool::CudaMemPool(cudaMemPool_t pool)
 {
     TLLM_CHECK_WITH_INFO(pool != nullptr, "Pointer to cudaMemPool cannot be nullptr.");
     mPool = PoolPtr{pool, Deleter{}};
@@ -93,7 +92,7 @@ std::shared_ptr<CudaMemPool> createPrimaryDevicePool(int deviceId)
     auto maxThreshold = std::numeric_limits<std::uint64_t>::max();
     TLLM_CUDA_CHECK(cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &maxThreshold));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_shared<CudaMemPool>(memPool, deviceId);
+    return std::make_shared<CudaMemPool>(memPool);
 }
 
 /// @brief The maximum number of devices per node this feature supports. Increase when/if this value becomes too small.

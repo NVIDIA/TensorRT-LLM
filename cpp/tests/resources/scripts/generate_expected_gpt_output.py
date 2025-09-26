@@ -17,17 +17,15 @@
 import argparse
 from pathlib import Path
 
+# isort: off
 import run
-from build_engines_utils import init_model_spec_module
-
-init_model_spec_module()
+# isort: on
 
 import os
 import shutil
 
-import model_spec
-
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec, QuantMethod
 
 
 def get_model_data_dir():
@@ -39,7 +37,7 @@ def get_model_data_dir():
 def generate_output(engine: str,
                     num_beams: int,
                     input_name: str,
-                    model_spec_obj: model_spec.ModelSpec,
+                    model_spec_obj: ModelSpec,
                     max_output_len: int = 8,
                     output_logits: bool = False,
                     output_cum_log_probs: bool = False,
@@ -67,24 +65,22 @@ def generate_output(engine: str,
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
-    output_logits_npy = None
-    if output_logits:
-        logits_file = base_output_name + '_logits.npy'
-        output_logits_npy = str(output_dir / logits_file)
-
-    results_file = str(output_dir / (base_output_name + '.npy'))
-    results_csv = str(output_dir / (base_output_name + '.csv'))
-
     args_list = [
-        '--engine_dir',
-        str(engine_dir), '--input_file',
-        str(input_file), '--tokenizer_dir',
-        str(models_dir / model), '--output_npy', results_file, '--output_csv',
-        results_csv, '--max_output_len',
-        str(max_output_len), '--num_beams',
-        str(num_beams), '--output_logits_npy',
-        str(output_logits_npy), '--use_py_session'
+        f'--engine_dir={engine_dir}',
+        f'--input_file={input_file}',
+        f'--tokenizer_dir={models_dir / model}',
+        f'--output_npy={output_dir / (base_output_name + ".npy")}',
+        f'--output_csv={output_dir / (base_output_name + ".csv")}',
+        f'--max_output_len={max_output_len}',
+        f'--num_beams={num_beams}',
+        '--use_py_session',
     ]
+
+    if output_logits:
+        args_list.extend([
+            f'--output_logits_npy={output_dir / (base_output_name + "_logits.npy")}',
+            '--output_generation_logits',
+        ])
 
     # Generate context_fmha_fp32_acc enabled results for GptExecutorTest.GenerationLogitsEarlyStop
     if model_spec_obj.get_enable_context_fmha_fp32_acc():
@@ -92,14 +88,12 @@ def generate_output(engine: str,
 
     if output_cum_log_probs:
         args_list.extend([
-            '--output_cum_log_probs_npy',
-            f'{output_dir / model_spec_obj.get_cum_log_probs_file()}'
+            f'--output_cum_log_probs_npy={output_dir / model_spec_obj.get_cum_log_probs_file()}'
         ])
 
     if output_log_probs:
         args_list.extend([
-            '--output_log_probs_npy',
-            f'{output_dir / model_spec_obj.get_log_probs_file()}'
+            f'--output_log_probs_npy={output_dir / model_spec_obj.get_log_probs_file()}'
         ])
 
     args = run.parse_arguments(args_list)
@@ -110,38 +104,10 @@ def generate_outputs(num_beams):
     input_name = 'input_tokens.npy'
     input_name_long = 'input_tokens_long.npy'
 
-    print('Generating GPT2 FP32 outputs')
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.FLOAT)
-    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
-    if num_beams == 1:
-        generate_output(engine=model_spec_obj.get_model_path(),
-                        num_beams=num_beams,
-                        input_name=input_name,
-                        model_spec_obj=model_spec_obj)
-    model_spec_obj.use_gpt_plugin()
-    generate_output(engine=model_spec_obj.get_model_path(),
-                    num_beams=num_beams,
-                    input_name=input_name,
-                    model_spec_obj=model_spec_obj)
-
     print('Generating GPT2 FP16 outputs')
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
-    if num_beams == 1:
-        generate_output(engine=model_spec_obj.get_model_path(),
-                        num_beams=num_beams,
-                        input_name=input_name,
-                        model_spec_obj=model_spec_obj)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    generate_output(engine=model_spec_obj.get_model_path(),
-                    num_beams=num_beams,
-                    input_name=input_name,
-                    model_spec_obj=model_spec_obj)
     model_spec_obj.use_packed_input()
-    generate_output(engine=model_spec_obj.get_model_path(),
-                    num_beams=num_beams,
-                    input_name=input_name,
-                    model_spec_obj=model_spec_obj)
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.gather_logits()
     generate_output(engine=model_spec_obj.get_model_path(),
@@ -161,7 +127,7 @@ def generate_outputs(num_beams):
                     output_log_probs=True,
                     output_cum_log_probs=True)
 
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
@@ -188,7 +154,7 @@ def generate_outputs(num_beams):
                     output_logits=False,
                     max_output_len=128)
 
-    model_spec_obj = model_spec.ModelSpec(input_name_long, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name_long, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
@@ -198,11 +164,11 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj,
                     output_logits=False)
 
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
-    model_spec_obj.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
+    model_spec_obj.set_quant_method(QuantMethod.SMOOTH_QUANT)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,

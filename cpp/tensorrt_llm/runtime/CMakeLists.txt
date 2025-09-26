@@ -15,8 +15,9 @@
 include(FetchContent)
 
 set(SRCS
+    utils/mpiUtils.cpp
     utils/numpyUtils.cpp
-    utils/sessionUtils.cpp
+    utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
@@ -31,27 +32,31 @@ set(SRCS
     loraModule.cpp
     loraCache.cpp
     decodingOutput.cpp
-    generationConfig.cpp
+    decoderState.cpp
     gptDecoder.cpp
     gptDecoderBatched.cpp
     gptJsonConfig.cpp
-    gptSession.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
+    ipcSocket.cpp
+    ipcNvlsMemory.cu
+    mcastDeviceMemory.cpp
     memoryCounters.cpp
+    moeLoadBalancer/gdrwrap.cpp
+    moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
+    moeLoadBalancer/moeLoadBalancer.cpp
+    moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
-    runtimeBuffers.cpp
     runtimeKernels.cu
-    rnnStateBuffers.cpp
-    statefulGptDecoder.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
+    tllmStreamReaders.cpp
     tllmLogger.cpp
-    transformerBuffers.cpp
     workerPool.cpp
-    worldConfig.cpp)
+    worldConfig.cpp
+    virtualMemory.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
@@ -60,7 +65,7 @@ if(NOT WIN32)
   #
   # Ignore overloaded-virtual warning. We intentionally change parameters of
   # some methods in derived class.
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-overloaded-virtual")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
   if(WARNING_IS_ERROR)
     message(STATUS "Treating warnings as errors in GCC compilation")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
@@ -73,9 +78,36 @@ endif()
 add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(runtime_src 89)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
+target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB})
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
+endif()
+
+if(NOT WIN32)
+  find_package(libnuma QUIET CONFIG)
+
+  if(NOT libnuma_FOUND)
+    message(
+      STATUS "libnuma not found via Conan, falling back to system libnuma")
+    find_path(NUMA_INCLUDE_DIR numa.h)
+    find_library(NUMA_LIBRARY numa)
+
+    if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
+      add_library(libnuma::libnuma UNKNOWN IMPORTED)
+      set_target_properties(
+        libnuma::libnuma
+        PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
+                   INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
+    else()
+      message(FATAL_ERROR "NUMA library not found, please install libnuma-dev")
+    endif()
+  else()
+    message(STATUS "libnuma found.")
+  endif()
+  target_link_libraries(runtime_src PUBLIC libnuma::libnuma)
+  target_link_options(runtime_src PUBLIC ${CONAN_LIBNUMA_LINK_OPTIONS})
 endif()

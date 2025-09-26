@@ -1,0 +1,12 @@
+bigcode/santacoder:
+  - accuracy: 31.688
+bigcode/starcoder2-3b:
+  - accuracy: 30.339
+bigcode/starcoder2-15b:
+  - quant_algo: W8A8_SQ_PER_CHANNEL
+    accuracy: 24.209
+nvidia/Minitron-4B-Base:
+  - accuracy: 33.058
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 34.159

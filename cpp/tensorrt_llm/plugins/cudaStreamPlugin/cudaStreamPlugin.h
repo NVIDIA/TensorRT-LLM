@@ -174,10 +174,9 @@ public:
         tensorrt_llm::runtime::utils::stallStream(name, mStream, delay);
     }
 
-    static char const* getResourceKey(int const stream_id)
+    static std::string getResourceKey(int const stream_id)
     {
-        std::string keyString = "side_stream_" + std::to_string(stream_id);
-        return keyString.c_str();
+        return "side_stream_" + std::to_string(stream_id);
     }
 
 private:

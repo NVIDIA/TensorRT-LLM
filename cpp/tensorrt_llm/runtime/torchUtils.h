@@ -53,7 +53,8 @@ public:
     static ITensor::Shape shape(at::IntArrayRef const& sizes)
     {
         TLLM_CHECK(sizes.size() <= ITensor::Shape::MAX_DIMS);
-        ITensor::Shape shape{static_cast<runtime::SizeType32>(sizes.size())};
+        ITensor::Shape shape;
+        shape.nbDims = static_cast<runtime::SizeType32>(sizes.size());
         using dimType = std::remove_reference_t<decltype(shape.d[0])>;
         for (std::size_t i = 0; i < sizes.size(); ++i)
         {
@@ -108,6 +109,7 @@ public:
         case at::ScalarType::Bool: return IBuffer::DataType::kBOOL;
         case at::ScalarType::Float8_e4m3fn: return IBuffer::DataType::kFP8;
         case at::ScalarType::BFloat16: return IBuffer::DataType::kBF16;
+        case at::ScalarType::QUInt4x2: return IBuffer::DataType::kINT4;
         default: TLLM_THROW("unsupported data type");
         }
     }

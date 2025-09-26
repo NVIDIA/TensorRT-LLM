@@ -101,8 +101,8 @@ class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
     GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
-        float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+        int num_kv_heads_origin, int head_size, int unidirectional, float q_scaling, float attn_logit_softcapping_scale,
+        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
@@ -115,12 +115,12 @@ public:
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
-        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool has_full_attention_mask = false,
+        bool use_paged_context_fmha = true, bool use_fp8_context_fmha = true, bool has_full_attention_mask = false,
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false, int cp_size = 1, int cp_rank = 0,
-        std::set<int32_t> cp_group = {});
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool fuse_fp4_quant = false, bool skip_attn = false,
+        int cp_size = 1, int cp_rank = 0, std::set<int32_t> cp_group = {});
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -172,11 +172,6 @@ public:
     void serialize(void* buffer) const noexcept override;
 
 private:
-    template <typename T, typename AttentionOutT>
-    kernels::mlaParams<T> enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
-        nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream);
-
     template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
         nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
@@ -207,6 +202,7 @@ private:
         KV_CACHE_QUANTIZATION_SCALE,
         KV_CACHE_DEQUANTIZATION_SCALE,
         ATTENTION_OUTPUT_QUANTIZATION_SCALE,
+        ATTENTION_OUTPUT_SF_SCALE,
         ROTARY_INV_FREQ,
         ROTARY_COS_SIN,
         ALIBI_SLOPES,
@@ -226,9 +222,9 @@ private:
         MROPE_POSITION_DELTAS,
         HOST_RUNTIME_PERF_KNOBS,
         HOST_CONTEXT_PROGRESS,
-        MLA_FUSED_Q_PROJ_TENSOR,
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
+        MLA_K_B_PROJ_TRANS_TENSOR,
         SKIP_ATTN,
         LOGN_SCALING,
         ENUM_SIZE, // Used to count the number of IdxEntry, must put in last

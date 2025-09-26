@@ -21,16 +21,16 @@ import platform as _pf
 import sys as _sys
 import typing as _tp
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def get_ckpt_without_quatization(model_dir, output_dir):
-    build_args = [_sys.executable, "examples/gptj/convert_checkpoint.py"] + [
+    build_args = [
+        _sys.executable, "examples/models/contrib/gpt/convert_checkpoint.py"
+    ] + [
         '--model_dir={}'.format(model_dir),
         '--output_dir={}'.format(output_dir),
     ]
@@ -132,7 +132,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         #     str(_pl.Path(model_cache) / 'fp8-quantized-modelopt' / 'gptj_tp1_rank0.npz')
         fp8_ckpt_path = engine_dir / 'fp8' / tp_pp_cp_dir
         get_ckpt_with_modelopt_quant(hf_dir, fp8_ckpt_path, model_cache)
-        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FP8)
+        model_spec_obj = ModelSpec(input_file, _tb.DataType.FP8)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_packed_input()
@@ -148,7 +148,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         fp16_ckpt_path = engine_dir / 'fp16' / tp_pp_cp_dir
         get_ckpt_without_quatization(hf_dir, fp16_ckpt_path)
         print("\nBuilding fp16-plugin engine")
-        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+        model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
 

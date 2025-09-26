@@ -19,6 +19,7 @@
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <limits>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -28,7 +29,10 @@ namespace tensorrt_llm::kernels
 
 constexpr size_t WARP_SIZE = 32;
 constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
-constexpr size_t MAX_RANKS_PER_NODE = 8;
+// Use max modules to avoid overflow and ABA problem when the block num changes for barrier_flag
+// Not a perfect solution, but it has large chance that it is correct
+constexpr size_t MAX_ALL_REDUCE_MODULES = std::numeric_limits<uint32_t>::max() / 6 * 6;
+constexpr size_t MAX_RANKS_PER_NODE = 16;
 constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 
 namespace reduce_fusion::details
@@ -46,10 +50,14 @@ static constexpr int kLamportHiddenSizeThreshold = 256;
 enum class AllReduceStrategyType : int8_t
 {
     NCCL = 0,
-    ONESHOT = 1,
-    TWOSHOT = 2,
-    UB = 3,
-    AUTO = 4,
+    MIN_LATENCY = 1,
+    UB = 2,
+    AUTO = 3,
+    ONESHOT = 4,
+    TWOSHOT = 5,
+    LOWPRECISION = 6,
+    MNNVL = 7,
+    NCCL_SYMMETRIC = 8,
 };
 
 enum class AllReduceStrategyConfig : int8_t
@@ -64,7 +72,39 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM = 1,
     LAST_PROCESS_FOR_UB = 2,
     RESIDUAL_RMS_PREPOST_NORM = 3,
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
 };
+
+inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
+{
+    switch (op)
+    {
+    case AllReduceFusionOp::NONE: os << "NONE"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM: os << "RESIDUAL_RMS_NORM"; break;
+    case AllReduceFusionOp::LAST_PROCESS_FOR_UB: os << "LAST_PROCESS_FOR_UB"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM: os << "RESIDUAL_RMS_PREPOST_NORM"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: os << "RESIDUAL_RMS_NORM_QUANT_FP8"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: os << "RESIDUAL_RMS_NORM_QUANT_NVFP4"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: os << "RESIDUAL_RMS_NORM_OUT_QUANT_FP8"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: os << "RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4"; break;
+    case AllReduceFusionOp::MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM:
+        os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
+        break;
+    default: os << "UNKNOWN"; break;
+    }
+    return os;
+}
+
+inline std::string toString(AllReduceFusionOp op)
+{
+    std::ostringstream oss;
+    oss << op;
+    return oss.str();
+}
 
 struct AllReduceFusionParams
 {
@@ -99,10 +139,11 @@ struct AllReduceParams
     size_t rank_offset;
     size_t ranks_per_node;
     size_t local_rank;
-    uint32_t barrier_flag;
+    uint32_t* barrier_flag_ptr;
+    uint32_t* barrier_flag_counter_ptr;
     uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
     uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
-    void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
+    void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 2];
     void* local_output_buffer_ptr;
     void const* local_input_buffer_ptr;
 
@@ -121,5 +162,10 @@ void residualRmsNorm(
     kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
 
 void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
+
+namespace reduce_fusion
+{
+bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size);
+}
 
 } // namespace tensorrt_llm::kernels

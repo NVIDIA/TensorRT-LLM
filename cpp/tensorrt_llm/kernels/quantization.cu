@@ -17,8 +17,10 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 #include <float.h>
 
@@ -28,66 +30,6 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-
-__global__ void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4, float const* scalePtr)
-{
-    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
-    {
-        float const scale = __ldg(scalePtr);
-        char4 tmp;
-        float4 const floatTmp = __ldg(src + idx);
-        tmp.x = cuda_cast<int8_t>(floatTmp.x * scale);
-        tmp.y = cuda_cast<int8_t>(floatTmp.y * scale);
-        tmp.z = cuda_cast<int8_t>(floatTmp.z * scale);
-        tmp.w = cuda_cast<int8_t>(floatTmp.w * scale);
-        dst[idx] = tmp;
-    }
-}
-
-__global__ void quantizedKernel(char4* dst, half2 const* src, int64_t const sizeDiv4, float const* scalePtr)
-{
-    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
-    {
-        float const scale = __ldg(scalePtr);
-        char4 tmp;
-        int srcId = idx << 1;
-
-        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
-
-        half2 const half2Tmp = reinterpret_cast<half2 const&>(h2.x);
-        half2 const half2Tmp2 = reinterpret_cast<half2 const&>(h2.y);
-
-        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.x) * scale);
-        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.y) * scale);
-        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp2.x) * scale);
-        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp2.y) * scale);
-        dst[idx] = tmp;
-    }
-}
-
-#ifdef ENABLE_BF16
-__global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, int64_t const sizeDiv4, float const* scalePtr)
-{
-    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
-    {
-        float const scale = __ldg(scalePtr);
-        char4 tmp;
-        int srcId = idx << 1;
-
-        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
-
-        __nv_bfloat162 const bfloat162Tmp = reinterpret_cast<__nv_bfloat162 const&>(h2.x);
-        __nv_bfloat162 const bfloat162Tmp2 = reinterpret_cast<__nv_bfloat162 const&>(h2.y);
-
-        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.x) * scale);
-        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.y) * scale);
-        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.x) * scale);
-        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.y) * scale);
-
-        dst[idx] = tmp;
-    }
-}
-#endif
 
 template <typename T>
 void invokeQuantization(
@@ -127,185 +69,6 @@ template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T, int NUM_ELTS>
-struct DstVec
-{
-    static_assert("not implemented.");
-};
-
-template <>
-struct DstVec<float2, 2>
-{
-    using Type = uint32_t;
-};
-
-template <>
-struct DstVec<half2, 4>
-{
-    using Type = uint2;
-};
-
-#ifdef ENABLE_BF16
-
-template <>
-struct DstVec<__nv_bfloat162, 4>
-{
-    using Type = uint2;
-};
-
-#endif // ENABLE_BF16
-
-template <typename T>
-struct DstVec<T, 4>
-{
-    static_assert(sizeof(T) == 4, "not implemented.");
-    using Type = uint32_t;
-};
-
-template <typename T>
-struct DstVec<T, 8>
-{
-    static_assert(sizeof(T) == 2, "not implemented.");
-    using Type = uint2;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Helper function of getting the absMax of all elements in the vector after clamping.
-// Pack two elements in order to use possible hmax2 instructions.
-template <typename T>
-inline __device__ void clampAndAbsMax(T& localMax, uint4& vec, T const clampMin, T const clampMax)
-{
-    static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
-
-#pragma unroll
-    for (int i = 0; i < NUM_ELTS; ++i)
-    {
-        T& val = reinterpret_cast<T*>(&vec)[i];
-        val = cuda_clamp(val, clampMin, clampMax);
-        localMax = cuda_max(localMax, cuda_abs(val));
-    }
-}
-
-// Helper function of quantizing the vector and storing it to global memory.
-// Pack two elements in order to use fast convert instructions.
-template <typename T, typename QuantT, bool USE_SMEM>
-inline __device__ void quantizeAndStore(
-    QuantT* dstPtr, uint4 vec, T const clampMin, T const clampMax, float const scaleOrigQuant)
-{
-    static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
-
-    using DstVecType = typename DstVec<T, NUM_ELTS>::Type;
-    DstVecType dstVec;
-#pragma unroll
-    for (int i = 0; i < NUM_ELTS; ++i)
-    {
-        T val = reinterpret_cast<T*>(&vec)[i];
-        // Values loaded from smem has already been clamped.
-        if constexpr (!USE_SMEM)
-        {
-            val = cuda_clamp(val, clampMin, clampMax);
-        }
-        float2 val2 = cuda_cast<float2>(val);
-        val2.x *= scaleOrigQuant;
-        val2.y *= scaleOrigQuant;
-        QuantT quantVal = cuda_cast<QuantT>(val2);
-        reinterpret_cast<QuantT*>(&dstVec)[i] = quantVal;
-    }
-    // Store to destination buffer.
-    *reinterpret_cast<DstVecType*>(dstPtr) = dstVec;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T, typename QuantT, bool USE_SMEM>
-__global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const numRows, int64_t const numCols,
-    float const* clampPtr, float* scalePtr, float* sumPtr, bool hasFp8MinScaling)
-{
-    // Smem buffer.
-    extern __shared__ uint4 smemBuffer[];
-
-    // The clamping minimum / maximum values.
-    T const clampMin = cuda_cast<T>(clampPtr ? clampPtr[0] : -FLT_MAX);
-    T const clampMax = cuda_cast<T>(clampPtr ? clampPtr[1] : FLT_MAX);
-
-    // Pack two elements in order to use higher through instructions.
-    using T2 = typename packed_as<T, 2>::type;
-    using QuantT2 = typename packed_as<QuantT, 2>::type;
-    T2 const clampMin2 = cuda_cast<T2, T>(clampMin);
-    T2 const clampMax2 = cuda_cast<T2, T>(clampMax);
-
-    // The quantized data type's maximum value (upper-bound).
-    static constexpr float MAX_QUANT_VAL = QuantTypeStaticVals<QuantT>::MAX_VAL;
-    // The minimum scaling factor (lower-bound).
-    static constexpr float MIN_SCALING_FACTOR = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR;
-    static constexpr float MIN_SCALING_FACTOR_RCP = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR_RCP;
-
-    // The number of elements in the packed uint4 vec.
-    static constexpr int NUM_ELTS_PER_VEC = sizeof(uint4) / sizeof(T);
-    static constexpr int NUM_ELTS2_PER_VEC = sizeof(uint4) / sizeof(T2);
-
-    // The number of vectors in the column.
-    int const numColVecs = numCols / NUM_ELTS_PER_VEC;
-    // The vector pointers for src.
-    uint4 const* srcVec = reinterpret_cast<uint4 const*>(src) + blockIdx.x * numColVecs;
-    // The pointer for dst.
-    QuantT* dstRow = dst + blockIdx.x * numCols;
-    // T const* srcRow = src + blockIdx.x * numCols;
-
-    T2 localMax2 = cuda_cast<T2, T>(T(1e-6f));
-    float2 localSum2 = {0.f, 0.f};
-
-    for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
-    {
-        uint4 vec = srcVec[i];
-
-#pragma unroll
-        for (int j = 0; j < NUM_ELTS2_PER_VEC; ++j)
-        {
-            T2& val2 = reinterpret_cast<T2*>(&vec)[j];
-            val2 = cuda_clamp(val2, clampMin2, clampMax2);
-            localMax2 = cuda_max(localMax2, cuda_abs(val2));
-            // TODO: template the version that requires sum to avoid dynamic branching.
-            if (sumPtr != nullptr)
-            {
-                localSum2.x += cuda_cast<float>(val2.x);
-                localSum2.y += cuda_cast<float>(val2.y);
-            }
-        }
-        // Avoid reloading from global memory.
-        if constexpr (USE_SMEM)
-        {
-            smemBuffer[i] = vec;
-        }
-    }
-    float const rowMax = blockAllReduceMax(cuda_cast<float>(cuda_max<T, T2>(localMax2)));
-    if (threadIdx.x == 0)
-    {
-        scalePtr[blockIdx.x]
-            = hasFp8MinScaling ? cuda_max(rowMax / MAX_QUANT_VAL, MIN_SCALING_FACTOR) : (rowMax / MAX_QUANT_VAL);
-    }
-
-    if (sumPtr != nullptr)
-    {
-        float rowSum[1] = {cuda_sum<float>(localSum2)};
-        blockReduceSumV2<float, 1>(rowSum);
-        if (threadIdx.x == 0)
-        {
-            sumPtr[blockIdx.x] = rowSum[0];
-        }
-    }
-
-    float const scaleOrigQuant
-        = hasFp8MinScaling ? fminf(MAX_QUANT_VAL / rowMax, MIN_SCALING_FACTOR_RCP) : MAX_QUANT_VAL / rowMax;
-    for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
-    {
-        uint4 vec = USE_SMEM ? smemBuffer[i] : srcVec[i];
-        QuantT2* dstPtr = reinterpret_cast<QuantT2*>(dstRow + i * NUM_ELTS_PER_VEC);
-        quantizeAndStore<T2, QuantT2, USE_SMEM>(dstPtr, vec, clampMin2, clampMax2, scaleOrigQuant);
-    }
-}
 
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
 template <typename T, typename QuantT>
@@ -363,6 +126,306 @@ INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(half, __nv_fp8_e4m3);
 #ifdef ENABLE_BF16
 INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// FP4 Quantization
+
+template <typename T, int SF_VEC_SIZE>
+void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale, int64_t* output, int32_t* SFOuput,
+    bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
+{
+#ifdef ENABLE_FP8
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        // Grid, Block size.
+        // Each thread converts 16 values.
+        dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
+        // Get number of blocks per SM (assume we can fully utilize the SM).
+        int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+        // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
+        int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
+        dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+
+        // Launch the cvt kernel.
+        auto* kernel_instance = useUE8M0
+            ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, true>
+            : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, false>;
+        kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOuput), layout);
+    }
+    else
+#endif
+    {
+        // Grid, Block size.
+        // Each thread converts 8 values.
+        dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
+        // Get number of blocks per SM (assume we can fully utilize the SM).
+        int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+        // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
+        int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
+        dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+
+        // Launch the cvt kernel.
+        auto* kernel_instance = useUE8M0
+            ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, true>
+            : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, false>;
+        cudaLaunchConfig_t config;
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOuput), layout);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// MXFP8 Quantization
+
+template <typename T>
+void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
+    QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
+{
+    // Fixed SF_VEC_SIZE as 32
+    static constexpr int SF_VEC_SIZE = 32;
+
+    // Grid, Block size.
+    // Each thread converts 8 values.
+    dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+    // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
+    int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
+    dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+
+    // Launch the cvt kernel.
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config,
+        quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true>, b, m, n, padded_n,
+        input, nullptr, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput), layout);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__global__ void block_scale_interleave_kernel(int numBatches, int numRows, int numRowsPadded, int numCols,
+    int numColsPadded, uint8_t const* SFIn, uint8_t* SFOutput)
+{
+    for (int rowIdx = blockIdx.x; rowIdx < numRowsPadded; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numBatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numColsPadded; colIdx += blockDim.x)
+            {
+                uint8_t sf = 0;
+                if (rowIdx < numRows && colIdx < numCols)
+                {
+                    int64_t inOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
+                    sf = SFIn[inOffset];
+                }
+
+                std::optional<int> batchIdxOpt = batchIdx;
+                std::optional<int> numRowsOpt = numRows;
+
+                // Without batching, the math in get_sf_out_offset is the same as
+                // int const numSfTilesK = (numCols + 4 - 1) / 4;
+                // int const tileOffset = ((mi / 128) * numSfTilesK + ki / 4) * 512;
+                // int const dstIdx = tileOffset + (mi % 32) * 16 + ((mi % 128) / 32) * 4 + ki % 4;
+                auto dstIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols);
+                SFOutput[dstIdx] = sf;
+            }
+        }
+    }
+}
+
+__global__ void block_scale_interleave_reverse_kernel(
+    int numBatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput)
+{
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numBatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x)
+            {
+                std::optional<int> batchIdxOpt = batchIdx;
+                std::optional<int> numRowsOpt = numRows;
+
+                // Get the swizzled input index using the same swizzling pattern
+                auto srcIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols);
+                auto sf = SFIn[srcIdx];
+
+                // Output goes to linear layout
+                int64_t outOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
+                SFOutput[outOffset] = sf;
+            }
+        }
+    }
+}
+
+// This is intended for weight loading, so m and n are large, b <= 256
+void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn, uint8_t* SFOutput,
+    int multiProcessorCount, cudaStream_t stream)
+{
+    // Each thread reads 1 int8 value
+    dim3 block(std::min(n_padded, 1024));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = std::max(1u, 4096u / block.x);
+    dim3 grid(std::min(m_padded, multiProcessorCount * numBlocksPerSM));
+
+    block_scale_interleave_kernel<<<grid, block, 0, stream>>>(b, m, m_padded, n, n_padded, SFIn, SFOutput);
+}
+
+// This is intended for weight loading, so m and n are large, b <= 256
+void invokeBlockScaleInterleaveReverse(
+    int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream)
+{
+    // Each thread reads 1 int8 value
+    dim3 block(std::min(n, 1024));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = std::max(1u, 4096u / block.x);
+    dim3 grid(std::min(m, multiProcessorCount * numBlocksPerSM));
+
+    block_scale_interleave_reverse_kernel<<<grid, block, 0, stream>>>(b, m, n, SFIn, SFOutput);
+}
+
+template <typename T>
+struct VecTypeImpl
+{
+    using type = T;
+};
+
+template <>
+struct VecTypeImpl<half>
+{
+    using type = half2;
+};
+
+template <>
+struct VecTypeImpl<__nv_bfloat16>
+{
+    using type = __nv_bfloat162;
+};
+
+template <typename T>
+using VecType = typename VecTypeImpl<T>::type;
+
+template <typename T>
+__device__ float getMaxAbs(float4& vec)
+{
+    auto absMaxVec = cuda_abs(reinterpret_cast<VecType<T>*>(&vec)[0]);
+    for (int i = 1; i < 4; ++i)
+    {
+        absMaxVec = cuda_max(absMaxVec, cuda_abs(reinterpret_cast<VecType<T>*>(&vec)[i]));
+    }
+    float absMaxVal;
+    if constexpr (sizeof(T) == 4)
+    {
+        absMaxVal = static_cast<float>(absMaxVec);
+    }
+    else
+    {
+        absMaxVal = static_cast<float>(cuda_max(absMaxVec.x, absMaxVec.y));
+    }
+    tensorrt_llm::common::blockReduceMaxV2<float, 1>(&absMaxVal);
+    return absMaxVal;
+}
+
+template <typename T>
+__global__ void computePerTokenGlobalScaleForFP4QuantizationKernel(
+    int b, int m, int n, T const* input, int const* tokensPerBatch, float* globalScale)
+{
+    static constexpr int ElemsPerVec = 16 / sizeof(T);
+    int batchIdx = blockIdx.x;
+    int realTokensNum = (tokensPerBatch == nullptr) ? m : tokensPerBatch[batchIdx];
+    input += batchIdx * m * n;
+    globalScale += batchIdx * m;
+    for (int tokenIdx = blockIdx.y; tokenIdx < realTokensNum; tokenIdx += gridDim.y)
+    {
+        float perTokenMaxAbsVal = 0.f;
+        for (int vecIdx = threadIdx.x; vecIdx < n / ElemsPerVec; vecIdx += blockDim.x)
+        {
+            float4 vec = reinterpret_cast<float4 const*>(input + tokenIdx * n)[vecIdx];
+            float maxAbsVal = getMaxAbs<T>(vec);
+            perTokenMaxAbsVal = cuda_max(perTokenMaxAbsVal, maxAbsVal);
+        }
+        float globalScaleVal = 448.f * 6.f / perTokenMaxAbsVal;
+        if (threadIdx.x == 0)
+        {
+            globalScale[tokenIdx] = globalScaleVal;
+        }
+    }
+}
+
+template <typename T>
+void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* input, int const* tokensPerBatch,
+    float* globalScale, int multiProcessorCount, cudaStream_t stream)
+{
+
+    static constexpr int ElemsPerVec = 16 / sizeof(T);
+    TLLM_CHECK(n % (ElemsPerVec * 32) == 0 and b > 0);
+    dim3 block(std::min(n / ElemsPerVec, 1024));
+    dim3 grid(b, std::max(1, std::min(m, multiProcessorCount / b)));
+
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, computePerTokenGlobalScaleForFP4QuantizationKernel<T>, b, m, n, input, tokensPerBatch, globalScale));
+}
+
+// Instantiate the function.
+template void invokeFP4Quantization<half, 16>(int b, int m, int n, half const* input, float const* SFScale,
+    int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
+    cudaStream_t stream);
+template void invokeFP4Quantization<half, 32>(int b, int m, int n, half const* input, float const* SFScale,
+    int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
+    cudaStream_t stream);
+template void invokeMxFP8Quantization<half>(int b, int m, int n, int padded_n, half const* input, int64_t* output,
+    int32_t* SFOuput, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream);
+template void computePerTokenGlobalScaleForFP4Quantization<half>(int b, int m, int n, half const* input,
+    int const* tokensPerBatch, float* globalScale, int multiProcessorCount, cudaStream_t stream);
+#ifdef ENABLE_BF16
+template void invokeFP4Quantization<__nv_bfloat16, 16>(int b, int m, int n, __nv_bfloat16 const* input,
+    float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
+    int multiProcessorCount, cudaStream_t stream);
+template void invokeFP4Quantization<__nv_bfloat16, 32>(int b, int m, int n, __nv_bfloat16 const* input,
+    float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
+    int multiProcessorCount, cudaStream_t stream);
+template void invokeMxFP8Quantization<__nv_bfloat16>(int b, int m, int n, int padded_n, __nv_bfloat16 const* input,
+    int64_t* output, int32_t* SFOuput, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream);
+template void computePerTokenGlobalScaleForFP4Quantization<__nv_bfloat16>(int b, int m, int n,
+    __nv_bfloat16 const* input, int const* tokensPerBatch, float* globalScale, int multiProcessorCount,
+    cudaStream_t stream);
+#endif
+
+#ifdef ENABLE_FP8
+template void invokeFP4Quantization<__nv_fp8_e4m3, 16>(int b, int m, int n, __nv_fp8_e4m3 const* input,
+    float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
+    int multiProcessorCount, cudaStream_t stream);
+template void invokeFP4Quantization<__nv_fp8_e4m3, 32>(int b, int m, int n, __nv_fp8_e4m3 const* input,
+    float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
+    int multiProcessorCount, cudaStream_t stream);
 #endif
 
 } // namespace kernels

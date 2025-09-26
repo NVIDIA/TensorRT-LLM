@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 #include "allgatherPlugin.h"
-#include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <nccl.h>
 
@@ -48,7 +48,7 @@ AllgatherPlugin::AllgatherPlugin(void const* data, size_t length)
     }
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -159,7 +159,7 @@ void AllgatherPlugin::serialize(void* buffer) const noexcept
     {
         write(d, *it);
     }
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void AllgatherPlugin::destroy() noexcept
@@ -174,8 +174,8 @@ AllgatherPluginCreator::AllgatherPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -199,7 +199,7 @@ IPluginV2* AllgatherPluginCreator::createPlugin(char const* name, PluginFieldCol
 {
     PluginField const* fields = fc->fields;
     std::set<int> group;
-    nvinfer1::DataType type;
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

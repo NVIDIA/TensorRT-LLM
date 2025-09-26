@@ -17,11 +17,11 @@
 #pragma once
 
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <cstddef>
@@ -70,7 +70,7 @@ public:
         // [1], on cpu
         TensorPtr useSpecDecoding;
 
-        void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
+        void create(SizeType32 maxNumSequences, runtime::BufferManager const& manager,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
     };
 
@@ -116,15 +116,15 @@ public:
 
 public:
     ExplicitDraftTokensBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
-        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-        executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime);
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
     void reshape(SizeType32 numCtxSequences, SizeType32 numGenSequences, runtime::ModelConfig const& modelConfig);
 
     void setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSequences, runtime::ITensor const& requestTypes,
         ITensor const& seqSlots, ExplicitDraftTokensBuffers::Inputs const& decoderBuffers,
-        ITensor const& contextPositionIds, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig) const;
+        ITensor const& contextPositionIds, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig, runtime::BufferManager const& manager,
+        runtime::CudaStream const& stream) const;
 
     void insertInputTensors(
         TensorMap& inputBuffers, TensorMap& outputBuffers, runtime::WorldConfig const& worldConfig) const;

@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 struct ncclComm;

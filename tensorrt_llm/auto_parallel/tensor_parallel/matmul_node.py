@@ -399,7 +399,7 @@ class MatrixMultiply(Node):
         in1_parition_dict = self._recover_bcast_partition_dict(
             batch_partition_dict, in1_data)
         out_partition_dict = {batch_dim: mesh_dim}
-        # TODO:[KDuan] Double check if MatrixMultiplication's output has bcast in dim
+        # TODO: Double check if MatrixMultiplication's output has bcast in dim
         dim_partition_dict_mapping = {
             "input0": in0_parition_dict,
             "input1": in1_parition_dict,

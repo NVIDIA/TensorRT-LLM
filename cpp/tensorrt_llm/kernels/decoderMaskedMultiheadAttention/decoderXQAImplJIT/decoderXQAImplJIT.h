@@ -19,12 +19,16 @@
 #include "compileEngine.h"
 #include "cubinObjRegistry.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
+#include "tensorrt_llm/plugins/common/plugin.h"
 #include <unordered_set>
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
+
+class DecoderXQARunnerResource;
 
 class DecoderXQAImplJIT : public DecoderXQAImpl
 {
@@ -34,6 +38,8 @@ public:
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) override;
     void prepare(XQAParams const& xqaParams) override;
 
+    ~DecoderXQAImplJIT() override = default;
+
 protected:
     void runWithKVLinearBuffer(
         XQAParams const& xqaParams, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream) override;
@@ -42,6 +48,10 @@ protected:
 
 private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
+    std::shared_ptr<DecoderXQARunnerResource> mResource;
+
+    //! Whether DecoderXQAImplJIT needs to compile 2 sets (tilesize = 16, 32) kernels for spec-dec
+    bool needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const;
 
     //! Whether DecoderXQAImplJIT supports xqaParams.
     bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
@@ -52,7 +62,7 @@ private:
 
     template <typename T, typename KVCacheBuffer>
     void runImpl(XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer, int multiprocessor_count,
-        cudaStream_t const& stream);
+        cudaStream_t const& stream) const;
 
     template <typename KVCacheBuffer>
     void runDispatchKVCacheBuffer(

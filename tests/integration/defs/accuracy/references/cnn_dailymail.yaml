@@ -1,0 +1,375 @@
+google/gemma-3-1b-it:
+  - accuracy: 19.0
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 20.699
+google/gemma-3-27b-it:
+  - accuracy: 28.90
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.90
+gpt2:
+  - accuracy: 18.408
+  - quant_algo: W8A16
+    accuracy: 18.408
+  - quant_algo: W4A16
+    accuracy: 15.251
+  - kv_cache_quant_algo: INT8
+    accuracy: 18.208
+  - quant_algo: W8A8_SQ_PER_TENSOR_PLUGIN
+    accuracy: 18.377
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 18.408
+  - extra_acc_spec: beam_width=4
+    accuracy: 24.933
+  - extra_acc_spec: beam_width=256
+    num_samples: 32
+    accuracy: 29.422
+  - extra_acc_spec: beam_width=8;beam_width_array=[2,3,4,5]
+    num_samples: 32
+    accuracy: 26.994
+gpt2-medium:
+  - accuracy: 22.730
+  - quant_algo: FP8
+    accuracy: 22.249
+gpt-next:
+  - accuracy: 25.516
+microsoft/phi-2:
+  - accuracy: 31.255
+microsoft/Phi-3-mini-4k-instruct:
+  - accuracy: 33.147
+microsoft/Phi-3-mini-128k-instruct:
+  - accuracy: 31.331
+microsoft/Phi-3-small-8k-instruct:
+  - accuracy: 26.994
+microsoft/Phi-3-small-128k-instruct:
+  - accuracy: 27.208
+microsoft/Phi-3.5-mini-instruct:
+  - accuracy: 31.354
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 32.921
+  - quant_algo: FP8
+    accuracy: 32.823
+bigcode/starcoder2-7b:
+  - accuracy: 26.611
+  - quant_algo: FP8
+    accuracy: 26.611
+mistralai/Codestral-22B-v0.1:
+  - accuracy: 30.316
+  - quant_algo: FP8
+    accuracy: 30.316
+state-spaces/mamba-130m-hf:
+  - accuracy: 19.470
+lmsys/vicuna-7b-v1.3:
+  - spec_dec_algo: Lookahead
+    accuracy: 33.427
+  - dtype: float16
+    spec_dec_algo: Medusa
+    accuracy: 33.419
+  - spec_dec_algo: Eagle
+    accuracy: 27.832
+llama-7b-hf:
+  - accuracy: 30.457
+  - quant_algo: W4A16_GPTQ
+    accuracy: 28.844
+  - extra_acc_spec: beam_width=5
+    accuracy: 33.611
+  - extra_acc_spec: streamingllm
+    accuracy: 30.351
+meta-llama/Llama-2-7b-hf:
+  - accuracy: 28.960
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 28.227
+  - quant_algo: W8A8_SQ_PER_CHANNEL
+    accuracy: 30.000
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 28.726
+  - quant_algo: W4A16_AWQ
+    accuracy: 29.144
+  - quant_algo: W4A16_GPTQ
+    accuracy: 27.999
+TinyLlama/TinyLlama-1.1B-Chat-v1.0:
+  - accuracy: 28.328
+  - dtype: float32
+    accuracy: 28.082
+  - quant_algo: W8A16
+    accuracy: 28.003
+  - quant_algo: W8A16
+    kv_cache_quant_algo: INT8
+    accuracy: 27.089
+  - quant_algo: W4A16
+    accuracy: 25.194
+  - quant_algo: W4A16
+    kv_cache_quant_algo: INT8
+    accuracy: 23.987
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.882
+  - extra_acc_spec: pp_size=4
+    accuracy: 15.123
+meta-llama/Meta-Llama-3-8B-Instruct:
+  - accuracy: 34.957
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 34.737
+  - quant_algo: W8A16_GPTQ
+    accuracy: 34.858
+meta-llama/Llama-3.1-8B:
+  - accuracy: 24.360
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 25.004
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 25.469
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 24.359
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    accuracy: 24.814
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    extra_acc_spec: meta_recipe
+    accuracy: 24.922
+  - quant_algo: MIXED_PRECISION
+    extra_acc_spec: autoq_format=int4_awq,fp8,w4a8_awq;auto_quantize_bits=5.8
+    accuracy: 22.721
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 33.640
+  - spec_dec_algo: Eagle
+    accuracy: 33.640
+  - extra_acc_spec: logprobs=2
+    accuracy: 30.522
+  - quant_algo: FP8
+    accuracy: 33.841
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 33.757
+  - dtype: float16
+    spec_dec_algo: Medusa
+    accuracy: 33.663
+  - quant_algo: FP8
+    extra_acc_spec: temperature=0.8,top_p=0.95
+    accuracy: 28.631
+  - extra_acc_spec: beam_width=2
+    accuracy: 31.223
+  - quant_algo: FP8
+    extra_acc_spec: beam_width=2
+    accuracy: 31.201
+meta-llama/Llama-3.2-1B:
+  - accuracy: 27.427
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 27.931
+  - quant_algo: W8A8_SQ_PER_CHANNEL
+    accuracy: 25.631
+  - quant_algo: W4A16_AWQ
+    accuracy: 25.028
+  - quant_algo: W4A16_AWQ
+    kv_cache_quant_algo: INT8
+    accuracy: 24.354
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.029
+  - quant_algo: FP8
+    accuracy: 27.029
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    accuracy: 27.257
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    extra_acc_spec: meta_recipe
+    accuracy: 27.614
+  - extra_acc_spec: max_attention_window_size=960
+    accuracy: 27.259
+  - extra_acc_spec: max_attention_window_size=960;beam_width=4
+    accuracy: 0
+meta-llama/Llama-3.2-3B:
+  - accuracy: 25.495
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 33.629
+meta-llama/Llama-3.3-70B-Instruct:
+  - quant_algo: FP8
+    spec_dec_algo: Eagle
+    accuracy: 33.244
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 34.383
+  - quant_algo: FP8
+    accuracy: 34.927
+mistralai/Mistral-7B-v0.1:
+  - accuracy: 25.741
+  - extra_acc_spec: beam_width=4
+    accuracy: 28.368
+  - extra_acc_spec: beam_width=2
+    accuracy: 27.663
+  - extra_acc_spec: beam_width=1
+    accuracy: 25.604
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 24.806
+  - quant_algo: FP8
+    accuracy: 25.180
+  - quant_algo: W4A16_AWQ
+    accuracy: 24.806
+mistralai/Mistral-7B-Instruct-v0.3:
+  - quant_algo: W4A16
+    accuracy: 31.372
+  - quant_algo: W4A16_AWQ
+    accuracy: 31.457
+  - quant_algo: W4A8_AWQ
+    accuracy: 31.201
+mistralai/Mistral-Small-3.1-24B-Instruct-2503:
+  - accuracy: 29.20
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.0
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 28.906
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 24.0
+nvidia/Mistral-NeMo-Minitron-8B-Instruct:
+  - quant_algo: FP8
+    accuracy: 32.553
+mistralai/Mixtral-8x7B-v0.1:
+  - accuracy: 28.810
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 29.733
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.109
+  - quant_algo: W4A16
+    accuracy: 23.229
+  - quant_algo: W4A16_AWQ
+    accuracy: 23.229
+  - quant_algo: W8A16
+    accuracy: 27.624
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 27.979
+mistralai/Mixtral-8x7B-Instruct-v0.1:
+  - quant_algo: W4A16_AWQ
+    accuracy: 28.810
+mistralai/Mixtral-8x22B-v0.1:
+  - quant_algo: FP8
+    accuracy: 25.519
+  - quant_algo: W8A16
+    accuracy: 27.427
+google/gemma-2b:
+  - accuracy: 23.194
+  - quant_algo: W8A16
+    accuracy: 23.323
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 22.288
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 23.520
+  - quant_algo: W4A16_AWQ
+    accuracy: 23.415
+google/gemma-7b:
+  - accuracy: 23.420
+  - quant_algo: W8A16
+    accuracy: 23.099
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 21.507
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 19.357
+  - quant_algo: W4A16_AWQ
+    accuracy: 20.283
+google/gemma-2-9b-it:
+  - accuracy: 29.519
+  - quant_algo: W8A16
+    accuracy: 29.679
+  - quant_algo: W4A16
+    accuracy: 29.536
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 26.670
+Qwen/Qwen-7B-Chat:
+  - accuracy: 35.311
+  - quant_algo: W8A16
+    accuracy: 35.310
+  - quant_algo: W4A16_GPTQ
+    accuracy: 34.859
+Qwen/Qwen1.5-MoE-A2.7B-Chat:
+  - accuracy: 32.148
+  - quant_algo: W8A16
+    accuracy: 0
+Qwen/Qwen2-0.5B-Instruct:
+  - accuracy: 30.698
+  - quant_algo: W8A16
+    accuracy: 30.930
+  - quant_algo: FP8
+    accuracy: 31.140
+Qwen/Qwen2-1.5B:
+  - accuracy: 32.58
+Qwen/Qwen2-7B-Instruct:
+  - accuracy: 36.148
+  - quant_algo: W8A16
+    accuracy: 35.996
+  - quant_algo: W4A16_AWQ
+    accuracy: 35.865
+  - quant_algo: FP8
+    accuracy: 36.421
+Qwen/Qwen2-57B-A14B:
+  - accuracy: 35.415
+Qwen/Qwen2.5-0.5B-Instruct:
+  - accuracy: 31.543
+  - quant_algo: FP8
+    accuracy: 32.168
+Qwen/Qwen2.5-1.5B-Instruct:
+  - accuracy: 31.655
+  - quant_algo: W8A16
+    accuracy: 31.515
+  - quant_algo: FP8
+    accuracy: 31.560
+Qwen/Qwen2.5-7B-Instruct:
+  - accuracy: 33.014
+  - quant_algo: FP8
+    accuracy: 33.248
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 33.248
+Qwen/QwQ-32B:
+  - accuracy: 30.358
+nvidia/Nemotron-Mini-4B-Instruct:
+  - quant_algo: FP8
+    accuracy: 25.247
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 25.72
+nemotron-nas/Llama-3_1-Nemotron-51B-Instruct:
+  - accuracy: 35.672
+deepseek-ai/DeepSeek-V3-Lite:
+  - accuracy: 26.465
+  - quant_algo: NVFP4
+    accuracy: 26.629
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 26.103
+  - spec_dec_algo: MTP
+    accuracy: 26.479
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 26.230
+deepseek-ai/DeepSeek-R1:
+  - quant_algo: NVFP4
+    accuracy: 28.706
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 28.706
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 28.706
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 28.706
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 28.706
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 28.706
+Qwen3/Qwen3-8B:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 30
+  - accuracy: 30
+nvidia/Llama-3_3-Nemotron-Super-49B-v1:
+  - accuracy: 34.003

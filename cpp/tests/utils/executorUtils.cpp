@@ -1,5 +1,6 @@
 #include "executorUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <exception>
 #include <future>
 
@@ -17,17 +18,19 @@ tensorrt_llm::testing::runThroughRequests(executor::Executor& executor, std::vec
                 while (remainingRequests > 0)
                 {
                     auto const responses = executor.awaitResponses();
-                    for (auto&& response : responses)
+                    for (auto const& response : responses)
                     {
                         auto const requestId = response.getRequestId();
                         if (response.hasError())
                         {
+                            TLLM_LOG_ERROR("Error response received for request: %lu", requestId);
                             TLLM_THROW(response.getErrorMsg());
                         }
                         auto const isFinal = response.hasError() || response.getResult().isFinal;
-                        accumulatedResponses[response.getRequestId()].emplace_back(response);
+                        accumulatedResponses[requestId].emplace_back(response);
                         if (isFinal)
                         {
+                            TLLM_LOG_DEBUG("Final response received for request: %lu", requestId);
                             --remainingRequests;
                         }
                     }
@@ -37,6 +40,7 @@ tensorrt_llm::testing::runThroughRequests(executor::Executor& executor, std::vec
             }
             catch (std::exception const& e)
             {
+                TLLM_LOG_EXCEPTION(e);
                 return e;
             }
         });

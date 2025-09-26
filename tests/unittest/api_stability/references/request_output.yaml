@@ -1,0 +1,23 @@
+methods:
+  __init__:
+    parameters: {}
+    return_annotation: None
+  abort:
+    parameters: {}
+    return_annotation: None
+  aborted:
+    parameters: {}
+    return_annotation: bool
+  clear_logprob_params:
+    parameters: {}
+    return_annotation: None
+  record_stats:
+    parameters:
+      output:
+        annotation: tensorrt_llm.executor.result.CompletionOutput
+        default: inspect._empty
+      stats:
+        annotation: Optional[dict[str, float]]
+        default: None
+    return_annotation: None
+properties: {}

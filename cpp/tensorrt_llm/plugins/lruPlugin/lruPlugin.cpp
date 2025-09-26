@@ -41,8 +41,6 @@ lruPlugin::lruPlugin(int dim, int block_size, nvinfer1::DataType type, bool remo
     , mFuseGateEnabled(fuseGateEnabled)
     , mGateBiasEnabled(gateBiasEnabled)
 {
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
 }
@@ -61,7 +59,6 @@ lruPlugin::lruPlugin(void const* data, size_t length)
     read(d, mFuseGateEnabled);
     read(d, mGateBiasEnabled);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
 }
@@ -214,7 +211,7 @@ int lruPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
     {
         invokeRGLRUUpdate<T>(lru_params, stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -298,7 +295,7 @@ void lruPlugin::serialize(void* buffer) const noexcept
     write(d, mYBiasEnabled);
     write(d, mFuseGateEnabled);
     write(d, mGateBiasEnabled);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void lruPlugin::destroy() noexcept
@@ -312,15 +309,15 @@ lruPluginCreator::lruPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("dim", nullptr, PluginFieldType::kINT32, 16));
-    mPluginAttributes.emplace_back(PluginField("block_size", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("y_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("y_bias_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("fuse_gate_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("gate_bias_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("dim", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("block_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("y_enabled", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("y_bias_enabled", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("fuse_gate_enabled", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("gate_bias_enabled", nullptr, PluginFieldType::kINT8));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -343,9 +340,15 @@ PluginFieldCollection const* lruPluginCreator::getFieldNames() noexcept
 IPluginV2* lruPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int dim, block_size;
-    bool removePadding, pagedState, yEnabled, yBiasEnabled, fuseGateEnabled, gateBiasEnabled;
-    nvinfer1::DataType type;
+    int dim{};
+    int block_size{};
+    bool removePadding{};
+    bool pagedState{};
+    bool yEnabled{};
+    bool yBiasEnabled{};
+    bool fuseGateEnabled{};
+    bool gateBiasEnabled{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

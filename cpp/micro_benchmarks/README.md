@@ -11,6 +11,9 @@ To build add the `--micro_benchmark` flag to `build_wheel.py` or pass `-DBUILD_M
 
 ### Mixture Of Experts Backend Benchmark
 
+> [!CAUTION]
+> Disclaimer this benchmark is intended for developers to help evaluating the impact of new optimisations. This benchmark does not meet the same quality standards as other parts of TRT-LLM. Please use with caution
+
 Target `mixtureOfExpertsBackendBenchmark`
 
 This benchmark covers the backend used by the `MixtureOfExperts` plugin. It allows you to benchmark different MOE

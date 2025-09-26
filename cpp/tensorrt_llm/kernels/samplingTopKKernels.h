@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -111,6 +112,13 @@ struct TopKSamplingKernelParams
     bool logitsHasProbs{false};
     //! flag to return all selected TopK results
     bool returnAllSelectedTokens{false};
+    //! flag to set strict TopP boundary.
+    //! If true, when randNum <=0.0f, the selection is completed, even if K draft tokens are not reached.
+    //! If false, when randNum <=0.0f, the selection will continue until it reaches K tokens.
+    bool strictTopPBoundary{true};
+
+    //! flag to return all selected TopK results per request.
+    bool const* returnAllSelectedTokensPerSlot{nullptr};
 
     //! output buffer [maxBatchSize], optional.
     //! Store the multinomial sampled target token id in TopK/TopP sampled tokens when returnAllSelectedTokens==True.
@@ -154,9 +162,8 @@ struct TopKSamplingKernelParams
         }
 
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
-
-        TLLM_CHECK(0 < maxTopP && maxTopP <= 1.f);
-        TLLM_CHECK(0 <= maxTopK && maxTopK <= TOP_K_MAX);
+        TLLM_CHECK_WITH_INFO(0 < maxTopP && maxTopP <= 1.f, "maxTopP (%f) is out of range", maxTopP);
+        TLLM_CHECK_WITH_INFO(0 <= maxTopK && maxTopK <= TOP_K_MAX, "maxTopK (%d) is out of range", maxTopK);
         TLLM_CHECK((skipOutputIdCurrentStep && outputIdCurrentStep && returnAllSelectedTokens)
             || (skipOutputIdCurrentStep == nullptr && outputIdCurrentStep == nullptr));
     }

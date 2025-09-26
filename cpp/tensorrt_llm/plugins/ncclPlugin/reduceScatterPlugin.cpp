@@ -48,7 +48,7 @@ ReduceScatterPlugin::ReduceScatterPlugin(void const* data, size_t length)
     }
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -158,7 +158,7 @@ void ReduceScatterPlugin::serialize(void* buffer) const noexcept
     {
         write(d, *it);
     }
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void ReduceScatterPlugin::destroy() noexcept
@@ -173,8 +173,8 @@ ReduceScatterPluginCreator::ReduceScatterPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -198,7 +198,7 @@ IPluginV2* ReduceScatterPluginCreator::createPlugin(char const* name, PluginFiel
 {
     PluginField const* fields = fc->fields;
     std::set<int> group;
-    nvinfer1::DataType type;
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

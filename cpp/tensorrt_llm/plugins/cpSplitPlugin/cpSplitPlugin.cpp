@@ -215,7 +215,9 @@ int32_t CpSplitPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t* hInputs = new int[inputDesc[IdxEntry::INPUT_IDS].dims.d[0]];
     int32_t* hOutputs = new int[inputDesc[IdxEntry::INPUT_IDS].dims.d[0]];
     int32_t* hOutputJoinIdx = new int[inputDesc[IdxEntry::INPUT_IDS].dims.d[0]];
-    cudaMemcpy(hInputs, inputIds, sizeof(int32_t) * inputDesc[IdxEntry::INPUT_IDS].dims.d[0], cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(
+        hInputs, inputIds, sizeof(int32_t) * inputDesc[IdxEntry::INPUT_IDS].dims.d[0], cudaMemcpyDeviceToHost, stream);
+    sync_check_cuda_error(stream);
 
     int32_t inputIdx = 0;
     int32_t outputIdx = 0;
@@ -277,10 +279,10 @@ int32_t CpSplitPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             break;
         }
     }
-    cudaMemcpy(outputIds, hOutputs, sizeof(int32_t) * hOutputLength, cudaMemcpyHostToDevice);
-    cudaMemcpy(outputLength, &hOutputLength, sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(outputJoinIdx, hOutputJoinIdx, sizeof(int32_t) * tokenNum, cudaMemcpyHostToDevice);
-    sync_check_cuda_error();
+    cudaMemcpyAsync(outputIds, hOutputs, sizeof(int32_t) * hOutputLength, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(outputLength, &hOutputLength, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(outputJoinIdx, hOutputJoinIdx, sizeof(int32_t) * tokenNum, cudaMemcpyHostToDevice, stream);
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -298,8 +300,8 @@ CpSplitPluginCreator::CpSplitPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -323,8 +325,8 @@ nvinfer1::IPluginV3* CpSplitPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
     PluginField const* fields = fc->fields;
-    int cp_size;
-    int cp_rank;
+    int cp_size{};
+    int cp_rank{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

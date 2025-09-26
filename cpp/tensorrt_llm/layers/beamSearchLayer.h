@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -29,12 +30,13 @@ class BeamSearchLayer : public BaseLayer
     using Base = BaseLayer;
 
 public:
-    BeamSearchLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
+    BeamSearchLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    // Functions called after runtime data atrrives
+    // Functions called before input data arrives
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
-    // Functions called after runtime data atrrives
+    // Functions called after input data arrives
     void setup(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth, TensorConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
@@ -43,7 +45,7 @@ public:
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
 private:
-    // Functions called before runtime data atrrives
+    // Functions called before input data arrives
     void allocateBuffer();
     void configureBeamSearchLayer();
 
@@ -56,13 +58,18 @@ private:
     size_t mVPart{0};                         // Count of parts the beamed-logProbs will be divided into, useless in V2
     size_t mWorkspaceSize{0};                 // Total workspace size for Beam Search kernels
     bool mV2{false};                          // Whether to use V2 Beam Search kernels
+    bool mVBWS{false};                        // Whether to use Variable-Beam-Width-Search
 
-    TensorPtr mBeamSearchDiversityRateDevice; // [batchSize], in device memory.
-    TensorPtr mLengthPenaltyDevice;           // [batchSize], in device memory.
-    TensorPtr mEarlyStoppingDevice;           // [batchSize], in device memory.
-    TensorPtr mBeamSearchDiversityRateHost;   // [batchSize], in pinned host memory.
-    TensorPtr mLengthPenaltyHost;             // [batchSize], in pinned host memory.
-    TensorPtr mEarlyStoppingHost;             // [batchSize], in pinned host memory.
+    TensorPtr mBeamSearchDiversityRateHost;   // [batchSize] cpu
+    TensorPtr mBeamSearchDiversityRateDevice; // [batchSize] gpu
+    TensorPtr mLengthPenaltyHost;             // [batchSize] cpu
+    TensorPtr mLengthPenaltyDevice;           // [batchSize] gpu
+    TensorPtr mEarlyStoppingHost;             // [batchSize] cpu
+    TensorPtr mEarlyStoppingDevice;           // [batchSize] gpu
+    TensorPtr mBeamWidthArrayHost;            // [batchSize, kMaxBeamWidthArrayLength] cpu
+    TensorPtr mBeamWidthArrayDevice;          // [batchSize, kMaxBeamWidthArrayLength] gpu
+    TensorPtr mBeamWidthIn;                   // [batchSize] cpu, the beamWidth of last forward computation
+    TensorPtr mBeamWidthOut;                  // [batchSize] cpu, the beamWidth of next forward computation
 };
 
 } // namespace tensorrt_llm::layers

@@ -16,7 +16,6 @@
 #pragma once
 #include "cubinObj.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
-#include <nvrtc.h>
 #include <string>
 #include <vector>
 

@@ -1,9 +1,9 @@
-.. TensorRT-LLM documentation master file, created by
+.. TensorRT LLM documentation master file, created by
    sphinx-quickstart on Wed Sep 20 08:35:21 2023.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome to TensorRT-LLM's Documentation!
+Welcome to TensorRT LLM's Documentation!
 ========================================
 
 .. toctree::
@@ -13,136 +13,105 @@ Welcome to TensorRT-LLM's Documentation!
 
    overview.md
    quick-start-guide.md
-   key-features.md
-   release-notes.md
+   installation/index.rst
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: Installation
-   :name: Installation
+   :caption: Deployment Guide
+   :name: Deployment Guide
 
-   .. installation/overview.md
+   examples/llm_api_examples.rst
+   examples/trtllm_serve_examples
+   examples/dynamo_k8s_example.rst
+   deployment-guide/index.rst
 
-   installation/linux.md
-   installation/build-from-source-linux.md
-   installation/windows.md
-   installation/build-from-source-windows.md
-   installation/grace-hopper.md
+.. toctree::
+   :maxdepth: 2
+   :caption: Models
+   :name: Models
+
+   models/supported-models.md
+   models/adding-new-model.md
+
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: LLM API
-   :hidden:
-   :glob:
+   :caption: CLI Reference
+   :name: CLI Reference
 
-   llm-api/*
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: LLM API Examples
-   :hidden:
-
-   llm-api-examples/index.rst
-   llm-api-examples/customization.md
-   llm-api-examples/llm_api_examples
+   commands/trtllm-bench
+   commands/trtllm-eval
+   commands/trtllm-serve/index
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: Model Definition API
-   :hidden:
+   :caption: API Reference
 
-   python-api/tensorrt_llm.layers.rst
-   python-api/tensorrt_llm.functional.rst
-   python-api/tensorrt_llm.models.rst
-   python-api/tensorrt_llm.plugin.rst
-   python-api/tensorrt_llm.quantization.rst
-   python-api/tensorrt_llm.runtime.rst
+   llm-api/index.md
+   llm-api/reference.rst
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: C++ API
-   :hidden:
+   :caption: Features
 
-   _cpp_gen/executor.rst
-   _cpp_gen/runtime.rst
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Command-Line Reference
-   :hidden:
-
-   commands/trtllm-build.rst
-   commands/trtllm-serve.rst
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Architecture
-   :name: Architecture
-
-   architecture/overview.md
-   architecture/core-concepts.md
-   architecture/checkpoint.md
-   architecture/workflow.md
-   architecture/add-model.md
+   features/feature-combination-matrix.md
+   features/attention.md
+   features/disagg-serving.md
+   features/kvcache.md
+   features/long-sequence.md
+   features/lora.md
+   features/multi-modality.md
+   features/overlap-scheduler.md
+   features/paged-attention-ifb-scheduler.md
+   features/parallel-strategy.md
+   features/quantization.md
+   features/sampling.md
+   features/speculative-decoding.md
+   features/checkpoint-loading.md
+   features/auto_deploy/auto-deploy.md
 
 .. toctree::
    :maxdepth: 2
-   :caption: Advanced
-   :name: Advanced
+   :caption: Developer Guide
 
-   advanced/gpt-attention.md
-   advanced/gpt-runtime.md
-   advanced/executor.md
-   advanced/graph-rewriting.md
-   advanced/inference-request.md
-   advanced/lora.md
-   advanced/expert-parallelism.md
-   advanced/kv-cache-reuse.md
-   advanced/speculative-decoding.md
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Performance
-   :name: Performance
-
-   performance/perf-overview.md
-   Benchmarking <performance/perf-benchmarking.md>
-   Best Practices <performance/perf-best-practices.md>
-   performance/perf-analysis.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Reference
-   :name: Reference
-
-   reference/troubleshooting.md
-   reference/support-matrix.md
-
-   .. reference/upgrading.md
-
-   reference/precision.md
-   reference/memory.md
+   developer-guide/overview.md
+   developer-guide/perf-analysis.md
+   developer-guide/perf-benchmarking.md
+   developer-guide/ci-overview.md
+   developer-guide/dev-containers.md
+   developer-guide/api-change.md
 
 
 .. toctree::
    :maxdepth: 2
    :caption: Blogs
+   :glob:
+
+   blogs/tech_blog/*
+   blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md
+   blogs/H200launch.md
+   blogs/XQA-kernel.md
+   blogs/H100vsA100.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Quick Links
+
+   Releases <https://github.com/NVIDIA/TensorRT-LLM/releases>
+   Github Code <https://github.com/NVIDIA/TensorRT-LLM>
+   Roadmap <https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap>
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Use TensorRT Engine
    :hidden:
 
-   blogs/H100vsA100.md
-   blogs/H200launch.md
-   blogs/Falcon180B-H200.md
-   blogs/quantization-in-TRT-LLM.md
-   blogs/XQA-kernel.md
-
+   legacy/tensorrt_quickstart.md
 
 Indices and tables
 ==================

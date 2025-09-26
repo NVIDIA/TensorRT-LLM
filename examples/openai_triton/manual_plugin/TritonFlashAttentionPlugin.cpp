@@ -86,7 +86,7 @@ TritonFlashAttentionPlugin::TritonFlashAttentionPlugin(void const* data, size_t 
     readArg(d, mHeadSize);
     readArg(d, mSoftmaxScale);
     readArg(d, mType);
-    assert(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -262,7 +262,7 @@ void TritonFlashAttentionPlugin::serialize(void* buffer) const noexcept
     writeArg(d, mHeadSize);
     writeArg(d, mSoftmaxScale);
     writeArg(d, mType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void TritonFlashAttentionPlugin::destroy() noexcept
@@ -287,10 +287,10 @@ TritonFlashAttentionPluginCreator::TritonFlashAttentionPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("softmax_scale", nullptr, PluginFieldType::kFLOAT32, 1.0f));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("softmax_scale", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

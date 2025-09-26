@@ -46,6 +46,7 @@ class Tensor;
 
 using TensorPtr = std::shared_ptr<Tensor>;
 using SizeType32 = std::int32_t;
+using SizeType64 = std::int64_t;
 using FloatType = float;
 using TokenIdType = std::int32_t;
 using VecTokens = std::vector<TokenIdType>;
@@ -57,6 +58,7 @@ using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using MillisecondsType = std::chrono::milliseconds;
+using CacheSaltIDType = std::uint64_t;
 using LogitsPostProcessor
     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
@@ -294,6 +296,24 @@ struct InflightBatchingStats
     float avgNumDecodedTokensPerIter;
 };
 
+/// @brief Struct that holds speculative decoding stats
+struct SpecDecodingStats
+{
+    /// @brief Total number of proposed draft tokens for all requests
+    SizeType64 numDraftTokens;
+    /// @brief Total number of accepted draft tokens for all requests
+    SizeType64 numAcceptedTokens;
+    /// @brief Number of requests with at least one draft token in batch
+    SizeType64 numRequestsWithDraftTokens;
+    /// @brief Acceptance length, defined as average number of tokens produced per step for all requests with at least
+    /// one draft token
+    double acceptanceLength;
+    /// @brief Iteration latency for draft token generation only (ms)
+    double iterLatencyMS;
+    /// @brief Draft overhead, defined as iterLatencyMS (specdec) / iterLatencyMS (total)
+    double draftOverhead;
+};
+
 /// @brief Struct that holds the stats of a single iteration
 struct IterationStats
 {
@@ -341,6 +361,8 @@ struct IterationStats
     std::optional<StaticBatchingStats> staticBatchingStats;
     /// @brief Stats specific to inflight batching
     std::optional<InflightBatchingStats> inflightBatchingStats;
+    /// @brief Stats specific to speculative decoding
+    std::optional<SpecDecodingStats> specDecodingStats;
 };
 
 /// @brief Enum class that represents the state of a request
@@ -364,6 +386,8 @@ struct DisServingRequestStats
 {
     /// @brief The total time spent on transferring KV cache from context phase to generation phase (ms)
     double kvCacheTransferMS;
+    /// @brief The total size of KV cache transferred from context phase to generation phase (bytes)
+    size_t kvCacheSize;
 };
 
 /// @brief Struct that holds the stats of a single request
@@ -395,7 +419,7 @@ struct RequestStats
     /// @brief Number of missed blocks per request
     SizeType32 missedBlocksPerRequest;
     /// @brief KV Cache Hit Rate per request, defined as reusedBlocks / (reusedBlocks + missedBlocks)
-    SizeType32 kvCacheHitRatePerRequest;
+    FloatType kvCacheHitRatePerRequest;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration
@@ -426,6 +450,8 @@ struct RequestPerfMetrics
         TimePoint kvCacheTransferStart;
         /// @brief End time of the KV cache transfer for disaggregated serving
         TimePoint kvCacheTransferEnd;
+        /// @brief KV Cache size transfer for disaggregated serving
+        mutable size_t kvCacheSize = 0;
     };
 
     struct KvCacheMetrics
@@ -439,11 +465,22 @@ struct RequestPerfMetrics
         /// @brief Number of missed blocks
         SizeType32 numMissedBlocks{0};
         /// @brief KV Cache Hit Rate, defined as reusedBlocks / (reusedBlocks + missedBlocks)
-        SizeType32 kvCacheHitRate{0};
+        FloatType kvCacheHitRate{0.f};
+    };
+
+    struct SpeculativeDecodingMetrics
+    {
+        /// @brief Token acceptance rate for speculative decoding requests
+        FloatType acceptanceRate{0.f};
+        /// @brief Total number of accepted draft tokens
+        SizeType32 totalAcceptedDraftTokens{0};
+        /// @brief Total number of draft tokens used in the request
+        SizeType32 totalDraftTokens{0};
     };
 
     TimingMetrics timingMetrics;
     KvCacheMetrics kvCacheMetrics;
+    SpeculativeDecodingMetrics speculativeDecoding;
 
     /// @brief First iteration where the request was processed
     std::optional<IterationType> firstIter;
@@ -484,6 +521,14 @@ enum class FinishReason
     kCANCELLED = 5
 };
 
+//! \brief Enum describing the transfer mode for KV cache.
+enum class KvCacheTransferMode
+{
+    DRAM = 0,                 //!< Copy to/from CPU memory (original approach).
+    GDS = 1,                  //!< Attempt GPUDirect Storage (cuFile).
+    POSIX_DEBUG_FALLBACK = 2, //!< Force a POSIX read/write for debugging.
+};
+
 /// @brief mode of the decoder
 class DecodingMode
 {
@@ -497,47 +542,47 @@ public:
 
     static auto constexpr TopK()
     {
-        return DecodingMode{kTopK | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kTopK | kUsePenalties | kUseBanTokens | kUseStandardStopCriteria | kUseMinP};
     }
 
     static auto constexpr TopP()
     {
-        return DecodingMode{kTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kTopP | kUsePenalties | kUseBanTokens | kUseStandardStopCriteria | kUseMinP};
     }
 
     static auto constexpr TopKTopP()
     {
-        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kUseStandardStopCriteria | kUseMinP};
     }
 
     static auto constexpr BeamSearch()
     {
-        return DecodingMode{kBeamSearch | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kBeamSearch | kUsePenalties | kUseBanTokens | kUseStandardStopCriteria};
     }
 
     static auto constexpr Medusa()
     {
-        return DecodingMode{kMedusa | kUseMinLength | kStandardStopCriteria | kUseExplicitEosStop};
+        return DecodingMode{kMedusa | kUseMinLength | kUseStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr Lookahead()
     {
-        return DecodingMode{kLookahead | kUseMinLength | kStandardStopCriteria | kUseExplicitEosStop};
+        return DecodingMode{kLookahead | kUseMinLength | kUseStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr ExplicitDraftTokens()
     {
-        return DecodingMode{kExplicitDraftTokens | kStandardStopCriteria | kUseExplicitEosStop};
+        return DecodingMode{kExplicitDraftTokens | kUseStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr ExternalDraftTokens()
     {
-        return DecodingMode{kExternalDraftTokens | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kExternalDraftTokens | kUsePenalties | kUseBanTokens | kUseStandardStopCriteria};
     }
 
     static auto constexpr Eagle()
     {
-        return DecodingMode{kEagle | kStandardStopCriteria | kUseExplicitEosStop};
+        return DecodingMode{kEagle | kUseStandardStopCriteria | kUseExplicitEosStop};
     }
 
     auto constexpr useTemperature(bool useTemp)
@@ -609,6 +654,18 @@ public:
     auto constexpr useExplicitEosStop(bool explicitEosStop)
     {
         mState = setBitTo(kUseExplicitEosStop, explicitEosStop);
+        return *this;
+    }
+
+    auto constexpr useMinP(bool useMinP)
+    {
+        mState = setBitTo(kUseMinP, useMinP);
+        return *this;
+    }
+
+    auto constexpr useVariableBeamWidthSearch(bool useVariableBeamWidthSearch)
+    {
+        mState = setBitTo(kUseVariableBeamWidthSearch, useVariableBeamWidthSearch);
         return *this;
     }
 
@@ -734,7 +791,17 @@ public:
 
     bool constexpr isUseStopCriteria() const
     {
-        return anyBitSet(kStandardStopCriteria | kUseExplicitEosStop);
+        return anyBitSet(kUseStandardStopCriteria | kUseExplicitEosStop);
+    }
+
+    bool constexpr isUseMinP() const
+    {
+        return anyBitSet(kUseMinP);
+    }
+
+    bool constexpr isUseVariableBeamWidthSearch() const
+    {
+        return anyBitSet(kUseVariableBeamWidthSearch);
     }
 
     using UnderlyingType = uint32_t;
@@ -754,8 +821,42 @@ public:
         return mState;
     }
 
+    [[nodiscard]] constexpr char const* getName() const
+    {
+        if (isTopKorTopP())
+        {
+            return "TopKorTopP";
+        }
+        if (isBeamSearch())
+        {
+            return "BeamSearch";
+        }
+        if (isMedusa())
+        {
+            return "Medusa";
+        }
+        if (isLookahead())
+        {
+            return "Lookahead";
+        }
+        if (isExplicitDraftTokens())
+        {
+            return "ExplicitDraftTokens";
+        }
+        if (isExternalDraftTokens())
+        {
+            return "ExternalDraftTokens";
+        }
+        if (isEagle())
+        {
+            return "Eagle";
+        }
+        return "Unknown";
+    }
+
 private:
-    // No mode specified. Config will be determined from the beam width of the first request at runtime
+    static SizeType32 constexpr kNumFlags{12};
+    // Config will be determined from the beam width of the first request at runtime if no mode specified.
     // TopKTopP if beamWidth == 1, BeamSearch otherwise
     static UnderlyingType constexpr kUseRepetitionPenalties{1u << 0};
     static UnderlyingType constexpr kUseFrequencyPenalties{1u << 1};
@@ -767,12 +868,15 @@ private:
     static UnderlyingType constexpr kUseMaxLengthStop{1u << 7};
     static UnderlyingType constexpr kUseExplicitEosStop{1u << 8};
     static UnderlyingType constexpr kUseNoRepeatNgramSize{1u << 9};
-    static UnderlyingType constexpr kStandardStopCriteria{kUseStopWords | kUseMaxLengthStop};
+    static UnderlyingType constexpr kUseMinP{1u << 10};
+    static UnderlyingType constexpr kUseVariableBeamWidthSearch{1u << 11};
+
+    static UnderlyingType constexpr kUseStandardStopCriteria{kUseStopWords | kUseMaxLengthStop};
     static UnderlyingType constexpr kUseOccurrencePenalties{
         kUseRepetitionPenalties | kUseFrequencyPenalties | kUsePresencePenalties};
     static UnderlyingType constexpr kUsePenalties{kUseOccurrencePenalties | kUseTemperature | kUseMinLength};
     static UnderlyingType constexpr kUseBanTokens{kUseNoRepeatNgramSize | kUseBanWords};
-    static SizeType32 constexpr kNumFlags{10};
+
     static UnderlyingType constexpr kAuto{1u << (kNumFlags + 0)};
     static UnderlyingType constexpr kTopK{1u << (kNumFlags + 1)};
     static UnderlyingType constexpr kTopP{1u << (kNumFlags + 2)};
@@ -782,6 +886,7 @@ private:
     static UnderlyingType constexpr kExplicitDraftTokens{1u << (kNumFlags + 6)};
     static UnderlyingType constexpr kExternalDraftTokens{1u << (kNumFlags + 7)};
     static UnderlyingType constexpr kEagle{1u << (kNumFlags + 8)};
+
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
 
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
@@ -802,12 +907,11 @@ private:
     UnderlyingType mState{};
 };
 
-static_assert(DecodingMode::Auto().isAuto());
 static_assert(!DecodingMode::Auto().isUseBanWords());
 static_assert(!DecodingMode::Auto().isUseOccurrencePenalty());
 static_assert(!DecodingMode::Auto().isUseStopCriteria());
-static_assert(!DecodingMode::Auto().isTopK());
-static_assert(!DecodingMode::Auto().isTopP());
+static_assert(DecodingMode::Auto().isAuto());
+static_assert(!DecodingMode::Auto().isTopKorTopP());
 static_assert(!DecodingMode::Auto().isBeamSearch());
 static_assert(!DecodingMode::Auto().isMedusa());
 static_assert(!DecodingMode::Auto().isLookahead());
@@ -815,8 +919,6 @@ static_assert(!DecodingMode::Auto().isExplicitDraftTokens());
 static_assert(!DecodingMode::Auto().isExternalDraftTokens());
 static_assert(!DecodingMode::Auto().isEagle());
 
-static_assert(DecodingMode::TopK().isTopK());
-static_assert(DecodingMode::TopK().isTopKorTopP());
 static_assert(DecodingMode::TopK().isUseBanWords());
 static_assert(DecodingMode::TopK().isUseOccurrencePenalty());
 static_assert(DecodingMode::TopK().isUseStopCriteria());
@@ -828,8 +930,10 @@ static_assert(!DecodingMode::TopK()
                    .useFrequencyPenalty(false)
                    .isUseOccurrencePenalty());
 static_assert(!DecodingMode::TopK().isAuto());
-static_assert(!DecodingMode::TopK().isTopKandTopP());
+static_assert(DecodingMode::TopK().isTopK());
 static_assert(!DecodingMode::TopK().isTopP());
+static_assert(DecodingMode::TopK().isTopKorTopP());
+static_assert(!DecodingMode::TopK().isTopKandTopP());
 static_assert(!DecodingMode::TopK().isBeamSearch());
 static_assert(!DecodingMode::TopK().isMedusa());
 static_assert(!DecodingMode::TopK().isLookahead());
@@ -837,28 +941,29 @@ static_assert(!DecodingMode::TopK().isExplicitDraftTokens());
 static_assert(!DecodingMode::TopK().isExternalDraftTokens());
 static_assert(!DecodingMode::TopK().isEagle());
 
-static_assert(DecodingMode::TopP().isTopP());
-static_assert(DecodingMode::TopP().isTopKorTopP());
 static_assert(DecodingMode::TopP().isUseBanWords());
 static_assert(DecodingMode::TopP().isUseOccurrencePenalty());
 static_assert(DecodingMode::TopP().isUseStopCriteria());
 static_assert(!DecodingMode::TopP().isAuto());
-static_assert(!DecodingMode::TopP().isTopKandTopP());
 static_assert(!DecodingMode::TopP().isTopK());
+static_assert(DecodingMode::TopP().isTopP());
+static_assert(DecodingMode::TopP().isTopKorTopP());
+static_assert(!DecodingMode::TopP().isTopKandTopP());
 static_assert(!DecodingMode::TopP().isBeamSearch());
 static_assert(!DecodingMode::TopP().isMedusa());
 static_assert(!DecodingMode::TopP().isLookahead());
 static_assert(!DecodingMode::TopP().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopP().isExternalDraftTokens());
 static_assert(!DecodingMode::TopP().isEagle());
 
-static_assert(DecodingMode::TopKTopP().isTopK());
-static_assert(DecodingMode::TopKTopP().isTopP());
-static_assert(DecodingMode::TopKTopP().isTopKorTopP());
-static_assert(DecodingMode::TopKTopP().isTopKandTopP());
 static_assert(DecodingMode::TopKTopP().isUseBanWords());
 static_assert(DecodingMode::TopKTopP().isUseOccurrencePenalty());
 static_assert(DecodingMode::TopKTopP().isUseStopCriteria());
 static_assert(!DecodingMode::TopKTopP().isAuto());
+static_assert(DecodingMode::TopKTopP().isTopK());
+static_assert(DecodingMode::TopKTopP().isTopP());
+static_assert(DecodingMode::TopKTopP().isTopKorTopP());
+static_assert(DecodingMode::TopKTopP().isTopKandTopP());
 static_assert(!DecodingMode::TopKTopP().isBeamSearch());
 static_assert(!DecodingMode::TopKTopP().isMedusa());
 static_assert(!DecodingMode::TopKTopP().isLookahead());
@@ -866,86 +971,72 @@ static_assert(!DecodingMode::TopKTopP().isExplicitDraftTokens());
 static_assert(!DecodingMode::TopKTopP().isExternalDraftTokens());
 static_assert(!DecodingMode::TopKTopP().isEagle());
 
-static_assert(DecodingMode::BeamSearch().isBeamSearch());
 static_assert(DecodingMode::BeamSearch().isUseStopCriteria());
 static_assert(!DecodingMode::BeamSearch().isAuto());
 static_assert(!DecodingMode::BeamSearch().isTopKorTopP());
+static_assert(DecodingMode::BeamSearch().isBeamSearch());
 static_assert(!DecodingMode::BeamSearch().isMedusa());
 static_assert(!DecodingMode::BeamSearch().isLookahead());
 static_assert(!DecodingMode::BeamSearch().isExplicitDraftTokens());
 static_assert(!DecodingMode::BeamSearch().isExternalDraftTokens());
 static_assert(!DecodingMode::BeamSearch().isEagle());
 
-static_assert(!DecodingMode::Medusa().isAuto());
-static_assert(!DecodingMode::Medusa().isTopK());
-static_assert(!DecodingMode::Medusa().isTopKorTopP());
-static_assert(!DecodingMode::Medusa().isTopKandTopP());
-static_assert(!DecodingMode::Medusa().isTopP());
-static_assert(!DecodingMode::Medusa().isBeamSearch());
-static_assert(!DecodingMode::Medusa().isLookahead());
 static_assert(!DecodingMode::Medusa().isUseBanWords());
 static_assert(!DecodingMode::Medusa().isUseOccurrencePenalty());
 static_assert(!DecodingMode::Medusa().isExplicitDraftTokens());
 static_assert(DecodingMode::Medusa().isUseStopCriteria());
 static_assert(DecodingMode::Medusa().isUsePenalty());
 static_assert(DecodingMode::Medusa().isUseMinLength());
+static_assert(!DecodingMode::Medusa().isAuto());
+static_assert(!DecodingMode::Medusa().isTopKorTopP());
+static_assert(!DecodingMode::Medusa().isBeamSearch());
 static_assert(DecodingMode::Medusa().isMedusa());
+static_assert(!DecodingMode::Medusa().isLookahead());
+static_assert(!DecodingMode::Medusa().isExplicitDraftTokens());
 static_assert(!DecodingMode::Medusa().isExternalDraftTokens());
 static_assert(!DecodingMode::Medusa().isEagle());
 
-static_assert(!DecodingMode::Lookahead().isAuto());
-static_assert(!DecodingMode::Lookahead().isTopK());
-static_assert(!DecodingMode::Lookahead().isTopKorTopP());
-static_assert(!DecodingMode::Lookahead().isTopKandTopP());
-static_assert(!DecodingMode::Lookahead().isTopP());
-static_assert(!DecodingMode::Lookahead().isBeamSearch());
-static_assert(!DecodingMode::Lookahead().isMedusa());
-static_assert(!DecodingMode::Lookahead().isExplicitDraftTokens());
 static_assert(DecodingMode::Lookahead().isUseStopCriteria());
 static_assert(DecodingMode::Lookahead().isUseStopWords());
 static_assert(DecodingMode::Lookahead().isUseExplicitEosStop());
+static_assert(!DecodingMode::Lookahead().isAuto());
+static_assert(!DecodingMode::Lookahead().isTopKorTopP());
+static_assert(!DecodingMode::Lookahead().isBeamSearch());
+static_assert(!DecodingMode::Lookahead().isMedusa());
 static_assert(DecodingMode::Lookahead().isLookahead());
+static_assert(!DecodingMode::Lookahead().isExplicitDraftTokens());
 static_assert(!DecodingMode::Lookahead().isExternalDraftTokens());
 static_assert(!DecodingMode::Lookahead().isEagle());
 
-static_assert(!DecodingMode::ExplicitDraftTokens().isAuto());
-static_assert(!DecodingMode::ExplicitDraftTokens().isTopK());
-static_assert(!DecodingMode::ExplicitDraftTokens().isTopKorTopP());
-static_assert(!DecodingMode::ExplicitDraftTokens().isTopKandTopP());
-static_assert(!DecodingMode::ExplicitDraftTokens().isTopP());
-static_assert(!DecodingMode::ExplicitDraftTokens().isBeamSearch());
-static_assert(!DecodingMode::ExplicitDraftTokens().isMedusa());
-static_assert(!DecodingMode::ExplicitDraftTokens().isLookahead());
 static_assert(!DecodingMode::ExplicitDraftTokens().isUsePenalty());
 static_assert(DecodingMode::ExplicitDraftTokens().isUseStopCriteria());
 static_assert(!DecodingMode::ExplicitDraftTokens().isUseBanWords());
+static_assert(!DecodingMode::ExplicitDraftTokens().isAuto());
+static_assert(!DecodingMode::ExplicitDraftTokens().isTopKorTopP());
+static_assert(!DecodingMode::ExplicitDraftTokens().isBeamSearch());
+static_assert(!DecodingMode::ExplicitDraftTokens().isMedusa());
+static_assert(!DecodingMode::ExplicitDraftTokens().isLookahead());
 static_assert(DecodingMode::ExplicitDraftTokens().isExplicitDraftTokens());
 static_assert(!DecodingMode::ExplicitDraftTokens().isExternalDraftTokens());
 static_assert(!DecodingMode::ExplicitDraftTokens().isEagle());
 
-static_assert(!DecodingMode::ExternalDraftTokens().isTopK());
-static_assert(!DecodingMode::ExternalDraftTokens().isTopP());
-static_assert(!DecodingMode::ExternalDraftTokens().isTopKorTopP());
-static_assert(!DecodingMode::ExternalDraftTokens().isTopKandTopP());
 static_assert(DecodingMode::ExternalDraftTokens().isUseBanWords());
 static_assert(DecodingMode::ExternalDraftTokens().isUseOccurrencePenalty());
 static_assert(DecodingMode::ExternalDraftTokens().isUseStopCriteria());
 static_assert(!DecodingMode::ExternalDraftTokens().isAuto());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopKorTopP());
 static_assert(!DecodingMode::ExternalDraftTokens().isBeamSearch());
 static_assert(!DecodingMode::ExternalDraftTokens().isMedusa());
 static_assert(!DecodingMode::ExternalDraftTokens().isLookahead());
 static_assert(!DecodingMode::ExternalDraftTokens().isExplicitDraftTokens());
-static_assert(!DecodingMode::ExternalDraftTokens().isEagle());
 static_assert(DecodingMode::ExternalDraftTokens().isExternalDraftTokens());
+static_assert(!DecodingMode::ExternalDraftTokens().isEagle());
 
-static_assert(!DecodingMode::Eagle().isTopK());
-static_assert(!DecodingMode::Eagle().isTopP());
-static_assert(!DecodingMode::Eagle().isTopKorTopP());
-static_assert(!DecodingMode::Eagle().isTopKandTopP());
 static_assert(!DecodingMode::Eagle().isUseBanWords());
 static_assert(!DecodingMode::Eagle().isUseOccurrencePenalty());
 static_assert(DecodingMode::Eagle().isUseStopCriteria());
 static_assert(!DecodingMode::Eagle().isAuto());
+static_assert(!DecodingMode::Eagle().isTopKorTopP());
 static_assert(!DecodingMode::Eagle().isBeamSearch());
 static_assert(!DecodingMode::Eagle().isMedusa());
 static_assert(!DecodingMode::Eagle().isLookahead());

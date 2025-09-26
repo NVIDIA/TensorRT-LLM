@@ -83,7 +83,7 @@ void invokeAssembleTargetLogitsOffsets(T const** logitsPtrs, SizeType32* decodin
     assembleTargetLogitsOffsets<T, BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(
         logitsPtrs, decodingTokens, logits, draftDecodingTokens, batchSize, maxDecodingTokens, vocabSizePadded);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeAssembleTargetLogitsOffsets(float const** logitsPtrs, SizeType32* decodingTokens,
@@ -504,7 +504,7 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
     BlockScan(tempStorage.scan).ExclusiveSum(numNextLogits, outputLastIndicesBase);
     // Sync because tempStorage is reused.
     __syncthreads();
-    auto const maxGenLength = BlockReduce(tempStorage.reduce).Reduce(nextDraftLen, cub::Max());
+    auto const maxGenLength = BlockReduce(tempStorage.reduce).Reduce(nextDraftLen, cuda::maximum());
 
     // Thread 0 has the result.
     if (bid == 0)
@@ -696,6 +696,10 @@ __global__ void getPackedMaskFromPath(SizeType32* __restrict__ packedMask, SizeT
     // The request Id that this block process
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = batchSlots[batchIdx];
+    // Considering that the Eagle-2 tree is dynamically changing,
+    // we need the logits of the newly expanded nodes instead of treating them as leaves.
+    // This value is use to distinguish non-leaf nodes for Eagle-2
+    auto const nonLeafSignal = maxDecodingTokens + 1;
 
     if (batchSlot < 0)
     {
@@ -728,8 +732,10 @@ __global__ void getPackedMaskFromPath(SizeType32* __restrict__ packedMask, SizeT
         {
             auto const pathOffset = tix * maxPathLen;
             auto const toIndex = curPath[pathOffset + ti];
-            if (toIndex == -1)
+            if (toIndex == -1 || toIndex == nonLeafSignal)
             {
+                // nonLeafSignal is just an auxiliary value and has no practical meaning.
+                // There is no need to calculate a mask for this.
                 break;
             }
             adjacencyMatrix[toIndex * maxDecodingTokens + (maxDecodingTokens - 1 - toIndex)] = '1';
@@ -770,7 +776,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
         buildLeafMask<<<grid, BLOCK_SIZE, 0, params.stream>>>(
             params.isLeafMask, params.nextPaths, params.maxDecodingTokens, params.maxPathLen);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 
     // Select all no-leaf ending paths for given level idx.
@@ -788,7 +794,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
             params.parentNonLeafInLevelOffset, params.nonLeavesInLevelOffsets, params.isLeafMask, params.nextPaths,
             params.levelIdx, params.maxDecodingTokens, params.maxPathLen);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 
     // Use selected tokens and prepare data for gen iteration of EagleNet.
@@ -803,7 +809,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
             params.parentNonLeafInLevelOffset, params.levelIdx, params.batchSize, params.maxPathLen,
             params.maxDecodingTokens, params.maxNonLeavesPerLayer);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 
     {
@@ -814,7 +820,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
             params.maxGenerationLength, params.selectedMasks, params.maxDecodingTokens - 1,
             params.specDecodingPackedMasks);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 }
 
@@ -858,7 +864,7 @@ void invokeAssembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits, run
     assembleDraftLogitsOffsets<T><<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(logitsPtrs, logits,
         outputIdsPtrs, outputIds, skipDecode, numValidLogits, batchSize, maxDecodingDraftTokens, vocabSizePadded);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeAssembleDraftLogitsOffsets(float const** logitsPtrs, float const* logits,
@@ -876,7 +882,7 @@ namespace
 
 // Extract the number of successors for each node from path
 __global__ void extractNumSuccessorsFromPath(SizeType32 const* paths, SizeType32* numSuccessorsForEachNode,
-    SizeType32 layerId, SizeType32 batchSize, SizeType32 maxDecodingTokens, SizeType32 maxPathLen)
+    SizeType32 layerId, SizeType32 maxDecodingTokens, SizeType32 maxPathLen)
 {
     // paths: shape [batchSize, maxDecodingTokens, maxPathLen]
     // numSuccessorsForEachNode: shape [batchSize, maxDecodingTokens]
@@ -1010,9 +1016,9 @@ void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeT
     // Each thread block corresponds to a request.
     // The shared memory in a block is the adjacency matrix for this request's path
     extractNumSuccessorsFromPath<<<batchSize, BLOCK_SIZE, dynamicSmemSize, stream>>>(
-        paths, numSuccessorsForEachNode, layerId, batchSize, maxDecodingTokens, maxPathLen);
+        paths, numSuccessorsForEachNode, layerId, maxDecodingTokens, maxPathLen);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_CHECK_WITH_INFO(
         batchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", BLOCK_SIZE);
@@ -1024,10 +1030,11 @@ void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeT
 
 namespace
 {
-__global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 const* topKs,
+__global__ void copyOutputTokensIds(TokenIdType const* const* tmpOutputIdsPtrs, SizeType32 const* topKs,
     SizeType32 const* topKOffset, TokenIdType const* pluginInputDraftIdsPtrs, SizeType32 const* pluginInputDraftLens,
     SizeType32 const* numValidLogits, TokenIdType* pluginOutputDraftIdsPtrs, SizeType32* pluginOutputDraftLens,
-    SizeType32 layerId, SizeType32 batchSize, SizeType32 maxDecodingDraftTokens)
+    SizeType32 layerId, SizeType32 batchSize, SizeType32 maxDecodingDraftTokens, SizeType32 const* inputPaths,
+    SizeType32* outputPaths, SizeType32 maxPathLen)
 {
     // tmpOutputIdsPtrs: shape [numInputLogits][maxDecodingDraftTokens]
     // topKs: shape [numInputLogits]
@@ -1036,6 +1043,8 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
     // pluginInputDraftLens: shape [batchSize]
     // pluginOutputDraftIdsPtrs: shape [batchSize][maxDecodingDraftTokens]
     // pluginOutputDraftLens: shape [batchSize]
+    // inputPaths: shape [batchSize][maxDecodingTokens][maxPathLen]
+    // outputPaths: shape [batchSize][maxDecodingTokens][maxPathLen]
 
     auto const tix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     if (tix < batchSize)
@@ -1070,24 +1079,34 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
 
         // Update the output draft token length of this request
         pluginOutputDraftLens[tix] = curLen;
+
+        // Copy paths from input to output
+        auto const maxDecodingTokens = maxDecodingDraftTokens + 1;
+        auto inputPathsPtr = inputPaths + tix * maxDecodingTokens * maxPathLen;
+        auto outputPathsPtr = outputPaths + tix * maxDecodingTokens * maxPathLen;
+        for (SizeType32 ii = 0; ii < maxDecodingTokens * maxPathLen; ii++)
+        {
+            outputPathsPtr[ii] = inputPathsPtr[ii];
+        }
     }
 }
 
 } // namespace
 
 // Copy output draft token ids from temporary buffer to plugin output buffer, also update the draft token length
-void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
+void invokeCopyOutputTokensIds(runtime::TokenIdType const* const* tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
     runtime::SizeType32 const* topKOffset, runtime::TokenIdType const* pluginInputDraftIdsPtrs,
     runtime::SizeType32 const* pluginInputDraftLens, runtime::SizeType32 const* numValidLogits,
     runtime::TokenIdType* pluginOutputDraftIdsPtrs, runtime::SizeType32* pluginOutputDraftLens,
     runtime::SizeType32 layerId, runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingDraftTokens,
+    runtime::SizeType32 const* inputPaths, runtime::SizeType32* outputPaths, runtime::SizeType32 maxPathLen,
     cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
 
     copyOutputTokensIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(tmpOutputIdsPtrs, topKs, topKOffset,
         pluginInputDraftIdsPtrs, pluginInputDraftLens, numValidLogits, pluginOutputDraftIdsPtrs, pluginOutputDraftLens,
-        layerId, batchSize, maxDecodingDraftTokens);
+        layerId, batchSize, maxDecodingDraftTokens, inputPaths, outputPaths, maxPathLen);
 }
 
 namespace
@@ -1308,7 +1327,7 @@ void invokeUnpackEagleData(UnpackEagleDataParams const& params, cudaStream_t str
     SizeType32 constexpr BLOCK_SIZE = 128;
     unpackEagleData<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1334,7 +1353,7 @@ void invokeFillContextEagleData(FillContextEagleParams const& params, cudaStream
     SizeType32 constexpr BLOCK_SIZE = 128;
     fillContextEagleData<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 void invokeGetPackedMaskFromPath(int32_t* specDecodingPackedMasks, SizeType32 const* batchSlots,
@@ -1347,67 +1366,64 @@ void invokeGetPackedMaskFromPath(int32_t* specDecodingPackedMasks, SizeType32 co
     getPackedMaskFromPath<<<grid, block, shmSize, stream>>>(
         specDecodingPackedMasks, batchSlots, nextDraftPaths, maxDecodingTokens, maxPathLen);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
 {
 template <int BLOCK_SIZE>
-__global__ void augmentBatchSlotsKernel(SizeType32* augmentedSeqSlots, SizeType32* augmentedBatchSlots,
-    SizeType32 const* chunkedContextNextTokens, SizeType32 const* lastDraftLens, SizeType32 const* seqSlots,
-    SizeType32 const* batchSlots, SizeType32 actualBatchSize)
+__global__ void augmentBatchSlotsKernel(SizeType32* augmentedSeqSlots, SizeType32 const* chunkedContextNextTokens,
+    SizeType32 const* lastDraftLens, SizeType32 const* seqSlots, SizeType32 engineBatchSize)
 {
-    typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
-    __shared__ typename BlockScan::TempStorage tempStorage;
-
     auto const batchIdx = static_cast<SizeType32>(threadIdx.x);
-    auto const valid = batchIdx < actualBatchSize;
+    auto const valid = batchIdx < engineBatchSize;
 
-    bool needDecoding{false};
     if (valid)
     {
         auto const draftLen = lastDraftLens[batchIdx];
-        needDecoding = (draftLen == 0 && chunkedContextNextTokens[batchIdx] == -1) || (draftLen > 0);
-    }
-
-    SizeType32 originalIndex{0};
-    BlockScan(tempStorage).ExclusiveSum(needDecoding, originalIndex);
-
-    if (needDecoding)
-    {
-        augmentedSeqSlots[batchIdx] = seqSlots[batchIdx];
-        augmentedBatchSlots[batchIdx] = batchSlots[originalIndex];
-    }
-    else if (valid)
-    {
-        augmentedSeqSlots[batchIdx] = -1;
-        augmentedBatchSlots[batchIdx] = -1;
+        auto const needDecoding = (draftLen == 0 && chunkedContextNextTokens[batchIdx] == -1) || (draftLen > 0);
+        augmentedSeqSlots[batchIdx] = needDecoding ? seqSlots[batchIdx] : -1;
     }
 }
 } // namespace
 
-void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, SizeType32* augmentedBatchSlots,
-    runtime::SizeType32 const* chunkedContextNextTokens, runtime::SizeType32 const* lastDraftLens,
-    SizeType32 const* seqSlots, SizeType32 const* batchSlots, SizeType32 actualBatchSize, SizeType32 batchSize,
-    cudaStream_t stream)
+void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, runtime::SizeType32 const* chunkedContextNextTokens,
+    runtime::SizeType32 const* lastDraftLens, SizeType32 const* seqSlots, SizeType32 engineBatchSize,
+    SizeType32 batchSize, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
     TLLM_CHECK_WITH_INFO(
-        actualBatchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
-    augmentBatchSlotsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(augmentedSeqSlots, augmentedBatchSlots,
-        chunkedContextNextTokens, lastDraftLens, seqSlots, batchSlots, actualBatchSize);
+        engineBatchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
+    augmentBatchSlotsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(
+        augmentedSeqSlots, chunkedContextNextTokens, lastDraftLens, seqSlots, engineBatchSize);
 }
 
 namespace
 {
-__global__ void setTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 numInputLogits, SizeType32 batchSize,
-    SizeType32* topKs, SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK)
+__global__ void setTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 batchSize, SizeType32* topKs,
+    SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK, SizeType32 const* numValidLogits)
 {
     // topKs: shape [numInputLogits]
     // topKOffset: shape [batchSize]
 
+#ifdef TLLM_DEBUG_MODE
+    // Check the value
+    if (layerIdx == 0 && !(batchSize == numValidLogits[0]))
+    {
+        printf("When layerIdx == 0, batchsize(%d) should be the same as numValidLogits(%d)\n", batchSize,
+            numValidLogits[0]);
+        asm volatile("brkpt;\n");
+    }
+    else if (layerIdx > 0 && !(batchSize * dynamicTreeMaxTopK == numValidLogits[0]))
+    {
+        printf("When layerIdx > 0, batchsize(%d) * dynamicTreeMaxTopK(%d) should be the same as numValidLogits(%d)\n",
+            batchSize, dynamicTreeMaxTopK, numValidLogits[0]);
+        asm volatile("brkpt;\n");
+    }
+#endif // TLLM_DEBUG_MODE
+
     auto const tix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (tix < numInputLogits)
+    if (tix < numValidLogits[0])
     {
         // Set topKs
         // In Eagle-2, all logits have the same topK
@@ -1423,20 +1439,21 @@ __global__ void setTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 n
 } // namespace
 
 void invokeSetTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 batchSize, SizeType32 numInputLogits,
-    SizeType32* topKs, SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK, cudaStream_t stream)
+    SizeType32* topKs, SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK, SizeType32 const* numValidLogits,
+    cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     setTopKsFromDyanmicTreeMaxTopK<<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
-        layerIdx, numInputLogits, batchSize, topKs, topKOffset, dynamicTreeMaxTopK);
+        layerIdx, batchSize, topKs, topKOffset, dynamicTreeMaxTopK, numValidLogits);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
 {
 __global__ void copyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleLayers,
     SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32* topKOffset, TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
+    TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
     TokenIdType const* pluginInputAllLayersDraftTokenIds,
     TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
     TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
@@ -1509,8 +1526,8 @@ __global__ void copyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumE
                     = firstTopKOutputIdsPtr[ii * maxDecodingDraftTokens + jj];
 
                 // Update the predecessor of this draft tokens
-                pluginOutputAllLayersDraftTokenIdsPredecessorPtr[startOffset] = pluginInputCurrentExpandIndicesPtr[ii];
-
+                pluginOutputAllLayersDraftTokenIdsPredecessorPtr[startOffset]
+                    = layerIdx == 0 ? 0 : pluginInputCurrentExpandIndicesPtr[ii];
                 startOffset++;
             }
         }
@@ -1520,21 +1537,21 @@ __global__ void copyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumE
 } // namespace
 
 void invokeCopyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleLayers,
-    SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 numInputLogits,
-    SizeType32 const dynamicTreeMaxTopK, SizeType32* topKOffset, TokenIdType const* pluginInputCurrentExpandIndices,
-    float const* pluginInputAllLayersScores, TokenIdType const* pluginInputAllLayersDraftTokenIds,
+    SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
+    TokenIdType const* pluginInputAllLayersDraftTokenIds,
     TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
     TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
     float* firstTopKOutputLogProbs, TokenIdType* firstTopKOutputIds, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     copyScoresAndDraftTokenIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, mNumEagleLayers,
-        maxDecodingDraftTokens, batchSize, dynamicTreeMaxTopK, topKOffset, pluginInputCurrentExpandIndices,
+        maxDecodingDraftTokens, batchSize, dynamicTreeMaxTopK, pluginInputCurrentExpandIndices,
         pluginInputAllLayersScores, pluginInputAllLayersDraftTokenIds, pluginInputAllLayersDraftTokenIdsPredecessor,
         pluginOutputAllLayersScores, pluginOutputAllLayersDraftTokenIds, pluginOutputAllLayersDraftTokenIdsPredecessor,
         firstTopKOutputLogProbs, firstTopKOutputIds);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1578,17 +1595,14 @@ __global__ void updateScores(SizeType32 batchSize, SizeType32 const dynamicTreeM
 
 } // namespace
 
-void invokeUpdateScores(SizeType32 batchSize, SizeType32 numInputLogits, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, float* curLogProbs, float const* prevLayerScores, cudaStream_t stream)
+void invokeUpdateScores(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens,
+    float* curLogProbs, float const* prevLayerScores, cudaStream_t stream)
 {
-    // Only mLayerIdx > 0 will execute this function
-    TLLM_CHECK(batchSize * dynamicTreeMaxTopK == numInputLogits);
-
     SizeType32 constexpr BLOCK_SIZE = 128;
     updateScores<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
         batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, curLogProbs, prevLayerScores);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1621,7 +1635,7 @@ void invokeAssembleSecondTopKSamplingInputs(SizeType32 batchSize, SizeType32 con
         dynamicTreeMaxTopK, maxDecodingDraftTokens, firstTopKOutputLogProbs, secondTopKInputScoresPtrs,
         secondTopKOutputIdsFlatten, secondTopKOutputIdsPtrs);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 // The outputIds are almost ascending
@@ -1676,6 +1690,10 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
 
     auto const maxDecodingDraftTokens = maxDecodingTokens - 1;
     auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    // Considering that the Eagle-2 tree is dynamically changing,
+    // we need the logits of the newly expanded nodes instead of treating them as leaves.
+    // This value is use to distinguish non-leaf nodes for Eagle-2.
+    auto const nonLeafSignal = maxDecodingTokens + 1;
 
     if (bix < batchSize)
     {
@@ -1697,6 +1715,9 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
             {
                 newPathsPtr[ii * maxPathLen + 0] = 0;
                 newPathsPtr[ii * maxPathLen + 1] = ii + 1;
+                // Append nonLeafSignal
+                newPathsPtr[ii * maxPathLen + 2] = nonLeafSignal;
+
                 // When layerIdx == 0, only expand 'dynamicTreeMaxTopK' draft tokens
                 // We '+1' here because we take the root node into consideration
                 pluginOutputNextExpandIndicesPtr[ii] = ii + 1;
@@ -1709,7 +1730,7 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
             for (SizeType32 ii = 0; ii < maxDecodingTokens; ++ii)
             {
                 // Check the first value of each paths
-                if (prevPathPtr[ii * maxDecodingTokens] != -1)
+                if (prevPathPtr[ii * maxPathLen + 0] != -1)
                 {
                     prevLayerNumPaths++;
                 }
@@ -1763,9 +1784,11 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
                 // The correct 'ancestorPathIdxInPrevPaths' must be:
                 // 1) ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex: continue to expand this path
                 // 2) ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex:
-                //       2.1)  ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1: expand a new path, next to the
-                //       previous one. 2.2) ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1: there are multiple
-                //       path that do not have leaf at this layer, but we need to include as well.
+                //       2.1) ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1: expand a new path,
+                //            next to the previous one.
+                //       2.2) ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1: there are multiple
+                //            path that do not have leaf at this layer, but we need to include as well.
+#ifdef TLLM_DEBUG_MODE
                 if (ancestorPathIdxInPrevPaths == -1 || ancestorPathIdxInPrevPaths < usedPrevLayerPathsIndex)
                 {
                     // Throw error when can not find ancestor's path.
@@ -1777,7 +1800,9 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
                         bix, ancestorIndex, layerIdx - 1, usedPrevLayerPathsIndex, ancestorPathIdxInPrevPaths);
                     asm volatile("brkpt;\n");
                 }
-                else if (ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1)
+#endif // TLLM_DEBUG_MODE
+
+                if (ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1)
                 {
                     // Expand a new path, just behind the previous one.
                     usedPrevLayerPathsIndex++;
@@ -1790,7 +1815,12 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
                     {
                         // Insert the paths that do not have leaf in this layer
                         usedPrevLayerPathsIndex++;
-                        for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                        // We do not need to copy the whole paths (i.e., maxPathLen) that do not expand in this layer.
+                        // We only need to copy top 'layerIdx + 1' value for these path.
+                        // The paths that do not expand will have 'layerIdx + 1' valid steps at most.
+                        // '+1' is for the root node.
+                        // This prevents us from copying nonLeafSignal as well.
+                        for (SizeType32 jj = 0; jj <= layerIdx; jj++)
                         {
                             newPathsPtr[numNewPath * maxPathLen + jj]
                                 = prevPathPtr[usedPrevLayerPathsIndex * maxPathLen + jj];
@@ -1809,6 +1839,12 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
                 }
                 // Add this layer's new draft token
                 newPathsPtr[numNewPath * maxPathLen + layerIdx + 1] = newIndex;
+                // Append the nonLeafSignal
+                // 'layerIdx + 1 + 1' is always small than maxPathLen,
+                // because the last layer of EagleNet will not execute the logic here.
+                // Example: numEagleNets = 4, maxPathLen = 5, layerIdx [0, 3]
+                // The layerIdx range that will execute this logic is [1, 2]
+                newPathsPtr[numNewPath * maxPathLen + layerIdx + 1 + 1] = nonLeafSignal;
                 numNewPath++;
             }
 
@@ -1816,7 +1852,7 @@ __global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32
             while (usedPrevLayerPathsIndex < prevLayerNumPaths)
             {
                 usedPrevLayerPathsIndex++;
-                for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                for (SizeType32 jj = 0; jj <= layerIdx; jj++)
                 {
                     newPathsPtr[numNewPath * maxPathLen + jj] = prevPathPtr[usedPrevLayerPathsIndex * maxPathLen + jj];
                 }
@@ -1837,14 +1873,14 @@ void invokeUpdatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32 dyna
     updatePath<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, batchSize, dynamicTreeMaxTopK,
         maxDecodingTokens, maxPathLen, prevPaths, newPaths, secondTopKOutputIdsPtrs, pluginOutputNextExpandIndices);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
 {
 
 __global__ void updateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 batchSize,
-    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType** curDraftIds,
+    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType const* const* curDraftIds,
     TokenIdType const* pluginInputDraftIds, SizeType32 const* pluginInputDraftLens, TokenIdType* pluginOutputDraftIds,
     SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores)
 {
@@ -1902,7 +1938,7 @@ __global__ void updateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeTy
 } // namespace
 
 void invokeUpdateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 batchSize,
-    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType** curDraftIds,
+    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType const* const* curDraftIds,
     TokenIdType const* pluginInputDraftIds, SizeType32 const* pluginInputDraftLens, TokenIdType* pluginOutputDraftIds,
     SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores,
     cudaStream_t stream)
@@ -1912,14 +1948,14 @@ void invokeUpdateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 
         dynamicTreeMaxTopK, maxDecodingDraftTokens, curDraftIds, pluginInputDraftIds, pluginInputDraftLens,
         pluginOutputDraftIds, pluginOutputDraftLens, curLayerScores, pluginOutputCurrentScores);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
 {
 __global__ void extractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs, TokenIdType** secondTopKOutputIdsPtrs,
-    TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs)
+    SizeType32 maxDecodingDraftTokens, float const* const* secondTopKInputScoresPtrs,
+    TokenIdType* const* secondTopKOutputIdsPtrs, TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs)
 {
     // secondTopKInputScoresPtrs: shape [batchSize][dynamicTreeMaxTopK * maxDecodingDraftTokens]
     // secondTopKOutputIdsPtrs: shape [batchSize][maxDecodingDraftTokens]
@@ -1952,23 +1988,25 @@ __global__ void extractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeTyp
 } // namespace
 
 void invokeExtractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs, TokenIdType** secondTopKOutputIdsPtrs,
-    TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs, cudaStream_t stream)
+    SizeType32 maxDecodingDraftTokens, float const* const* secondTopKInputScoresPtrs,
+    TokenIdType* const* secondTopKOutputIdsPtrs, TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs,
+    cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     extractScoresAndRealDraftTokensIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
         dynamicTreeMaxTopK, maxDecodingDraftTokens, secondTopKInputScoresPtrs, secondTopKOutputIdsPtrs,
         firstTopKOutputIds, secondTopKOutputLogProbs);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
 {
 
-__global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, float* pluginOutputAllLayersScores,
-    float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds, TokenIdType** thirdTopKOutputIdsPtrs)
+__global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens,
+    SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree, SizeType32* thirdTopKs,
+    float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds,
+    TokenIdType** thirdTopKOutputIdsPtrs)
 {
     // pluginOutputAllLayersScores: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
     // thirdTopKInputScoresPtrs: [batchSize]
@@ -1981,22 +2019,23 @@ __global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32
         thirdTopKInputScoresPtrs[bix]
             = pluginOutputAllLayersScores + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
         thirdTopKOutputIdsPtrs[bix] = thirdTopKOutputIds + bix * maxDecodingDraftTokens;
+        thirdTopKs[bix] = maxNodesOnFinalTree;
     }
 }
 
 } // namespace
 
-void invokeAssembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, float* pluginOutputAllLayersScores,
-    float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds, TokenIdType** thirdTopKOutputIdsPtrs,
-    cudaStream_t stream)
+void invokeAssembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens,
+    SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree, SizeType32* thirdTopKs,
+    float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds,
+    TokenIdType** thirdTopKOutputIdsPtrs, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
     assembleThridTopKSamplingInputs<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
-        dynamicTreeMaxTopK, maxDecodingDraftTokens, mNumEagleLayers, pluginOutputAllLayersScores,
+        maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKs, pluginOutputAllLayersScores,
         thirdTopKInputScoresPtrs, thirdTopKOutputIds, thirdTopKOutputIdsPtrs);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -2017,12 +2056,13 @@ __device__ SizeType32 findIndexInPaths(
 
 __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
     SizeType32 maxDecodingDraftTokens, SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 mNumEagleLayers,
-    TokenIdType** thirdTopKOutputIdsPtrs, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
-    SizeType32* finalOutputPaths)
+    SizeType32 const maxNodesOnFinalTree, TokenIdType* const* thirdTopKOutputIdsPtrs,
+    TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor, SizeType32* finalOutputPaths)
 {
     // thirdTopKOutputIdsPtrs: shape [batchSize], each element points to a [maxDecodingDraftTokens] buffer
-    // pluginOutputAllLayersDraftTokenIdsPredecessor: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x
-    // maxDecodingDraftTokens] finalOutputPaths: [batchSize, maxDecodingTokens, maxPathLen]
+    // pluginOutputAllLayersDraftTokenIdsPredecessor:
+    // [batchSize, mNumEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens]
+    // finalOutputPaths: [batchSize, maxDecodingTokens, maxPathLen]
 
     auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
 
@@ -2064,13 +2104,13 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
         auto finalOutputPathsPtr = finalOutputPaths + bix * maxDecodingTokens * maxPathLen;
 
         // Sort the output draft token indices in ascending order
-        insertionSortOutputIds(thirdTopKOutputIdsPtr, maxDecodingDraftTokens);
+        insertionSortOutputIds(thirdTopKOutputIdsPtr, maxNodesOnFinalTree);
 
         // Init the root node
         SizeType32* rooPathPtr = tempSmemPtr[0];
         SizeType32 curLayerSmemPtrIndex = 0;
         rooPathPtr[0] = 0;
-        SizeType32 curLayerNumPaths = 1; // The number of this layer's path
+        SizeType32 curLayerNumPaths = 1; // The path number of this layer
         curIndexMap[0] = 0;
 
         SizeType32 curTopKIndex = 0; // The index of the thirdTopKOutputIdsPtr
@@ -2085,11 +2125,11 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
             SizeType32* curLayerPathsPtr = tempSmemPtr[curLayerSmemPtrIndex]; // Point to this layer's path buffer
             curLayerNumPaths = 0; // Reset the number of path of current layer
 
-            SizeType32 usedPrevLayerPathsIndex
-                = -1; // Record the index of path that had been used to expand in this layer
+            // Record the index of path that had been used to expand in this layer
+            SizeType32 usedPrevLayerPathsIndex = -1;
 
-            // The index boundary of this layer. The 'index' is the output index after top-maxDecodingDraftTokens
-            // sampling.
+            // The index boundary of this layer.
+            // The 'index' is the output index after top-maxDecodingDraftTokens sampling.
             SizeType32 curLayerStartIndex
                 = li == 0 ? 0 : (li - 1) * dynamicTreeMaxTopK * dynamicTreeMaxTopK + dynamicTreeMaxTopK;
             SizeType32 curLayerEndIndex = li == 0 ? curLayerStartIndex + dynamicTreeMaxTopK
@@ -2113,6 +2153,7 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
                 SizeType32 ancestorPathIdxInPrevPaths = findAncestorPathIndex(
                     prevLayerPathsPtr, ancestorIdxInPath, li - 1, maxDecodingTokens, maxPathLen);
 
+#ifdef TLLM_DEBUG_MODE
                 if (ancestorPathIdxInPrevPaths == -1)
                 {
                     printf(
@@ -2121,10 +2162,11 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
                         "usedPrevLayerPathsIndex: %d, ancestorPathIdxInPrevPaths: %d\n",
                         bix, ancestorIdxAmongAllDraftTokens, ancestorIdxInPath, li - 1, usedPrevLayerPathsIndex,
                         ancestorPathIdxInPrevPaths);
-
                     asm volatile("brkpt;\n");
                 }
-                else if (ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1)
+#endif // TLLM_DEBUG_MODE
+
+                if (ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1)
                 {
                     usedPrevLayerPathsIndex++;
                 }
@@ -2161,7 +2203,7 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
 
                 // Point to next top-maxDecodingDraftTokens node
                 curTopKIndex++;
-                if (curTopKIndex >= maxDecodingDraftTokens)
+                if (curTopKIndex >= maxNodesOnFinalTree)
                 {
                     break;
                 }
@@ -2180,27 +2222,28 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
                 curLayerNumPaths++;
             }
 
-            if (curTopKIndex >= maxDecodingDraftTokens)
+            if (curTopKIndex >= maxNodesOnFinalTree)
             {
                 break;
             }
         } // Finish all the layers
 
-        if (curTopKIndex != maxDecodingDraftTokens)
+#ifdef TLLM_DEBUG_MODE
+        if (curTopKIndex != maxNodesOnFinalTree)
         {
             printf(
                 "Throw error from reconstructFinalPath kernel: curTopKIndex(%d) is not the same as "
-                "maxDecodingDraftTokens(%d)",
-                curTopKIndex, maxDecodingDraftTokens);
+                "maxNodesOnFinalTree - 1(%d - 1)",
+                curTopKIndex, maxNodesOnFinalTree - 1);
             asm volatile("brkpt;\n");
         }
+#endif // TLLM_DEBUG_MODE
 
         // Copy the final paths from shared memory to global memory
         SizeType32* smemPathsPtr = tempSmemPtr[curLayerSmemPtrIndex];
         for (SizeType32 ii = 0; ii < maxDecodingTokens * maxPathLen; ii++)
         {
             finalOutputPathsPtr[ii] = smemPathsPtr[ii];
-            ;
         }
     }
 }
@@ -2209,8 +2252,8 @@ __global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dyna
 
 void invokeReconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
     SizeType32 maxDecodingDraftTokens, SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 mNumEagleLayers,
-    TokenIdType** thirdTopKOutputIdsPtrs, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
-    SizeType32* newPaths, cudaStream_t stream)
+    SizeType32 const maxNodesOnFinalTree, TokenIdType* const* thirdTopKOutputIdsPtrs,
+    TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor, SizeType32* newPaths, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 32;
     // Use ping-pong temporary buffers to update path
@@ -2224,16 +2267,16 @@ void invokeReconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTr
     SizeType32 smemSize = pingPongBufferSize + indexMapSize;
 
     reconstructFinalPath<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, smemSize, stream>>>(batchSize, dynamicTreeMaxTopK,
-        maxDecodingDraftTokens, maxDecodingTokens, maxPathLen, mNumEagleLayers, thirdTopKOutputIdsPtrs,
-        pluginOutputAllLayersDraftTokenIdsPredecessor, newPaths);
+        maxDecodingDraftTokens, maxDecodingTokens, maxPathLen, mNumEagleLayers, maxNodesOnFinalTree,
+        thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIdsPredecessor, newPaths);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
 {
-__global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, TokenIdType** thirdTopKOutputIdsPtrs,
+__global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens,
+    SizeType32 mNumEagleLayers, SizeType32 const maxNodesOnFinalTree, TokenIdType const* const* thirdTopKOutputIdsPtrs,
     TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputDraftTokenIds,
     SizeType32* pluginOutputDraftLens)
 {
@@ -2251,31 +2294,31 @@ __global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dyna
             + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
         auto pluginOutputDraftTokenIdsPtr = pluginOutputDraftTokenIds + bix * maxDecodingDraftTokens;
 
-        for (SizeType32 ii = 0; ii < maxDecodingDraftTokens; ++ii)
+        for (SizeType32 ii = 0; ii < maxNodesOnFinalTree; ++ii)
         {
             SizeType32 selectedNodeIndex = thirdTopKOutputIdsPtr[ii];
             TokenIdType realDraftTokenId = pluginOutputAllLayersDraftTokenIdsPtr[selectedNodeIndex];
             pluginOutputDraftTokenIdsPtr[ii] = realDraftTokenId;
         }
 
-        // Update draft length
-        pluginOutputDraftLens[bix] = maxDecodingDraftTokens;
+        // Update draft length according to the 'maxNodesOnFinalTree'
+        pluginOutputDraftLens[bix] = maxNodesOnFinalTree;
     }
 }
 
 } // namespace
 
-void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
-    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, TokenIdType** thirdTopKOutputIdsPtrs,
+void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers,
+    SizeType32 const maxNodesOnFinalTree, TokenIdType const* const* thirdTopKOutputIdsPtrs,
     TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputDraftTokenIds,
     SizeType32* pluginOutputDraftLens, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 128;
-    copyFinalDraftTokens<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize, dynamicTreeMaxTopK,
-        maxDecodingDraftTokens, mNumEagleLayers, thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds,
+    copyFinalDraftTokens<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize, maxDecodingDraftTokens,
+        mNumEagleLayers, maxNodesOnFinalTree, thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds,
         pluginOutputDraftTokenIds, pluginOutputDraftLens);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

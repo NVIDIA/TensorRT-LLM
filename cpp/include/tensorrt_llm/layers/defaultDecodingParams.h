@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <limits>
+#include <random>
 #include <string>
 #include <unordered_map>
 
@@ -58,6 +59,14 @@ public:
     [[nodiscard]] __host__ __device__ static constexpr uint64_t getSeed()
     {
         return 0;
+    }
+
+    [[nodiscard]] static uint64_t generateRandomSeed()
+    {
+        static std::mt19937_64 rng(0);
+        static std::uniform_int_distribution<uint64_t> dist(
+            std::numeric_limits<uint64_t>::min(), std::numeric_limits<uint64_t>::max());
+        return dist(rng);
     }
 
     [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getTopK()
@@ -113,6 +122,16 @@ public:
     [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getNoRepeatNgramSize()
     {
         return 1 << 30;
+    }
+
+    [[nodiscard]] __host__ __device__ static constexpr float getMinP()
+    {
+        return 0.0f;
+    }
+
+    [[nodiscard]] static std::vector<runtime::SizeType32> getBeamWidthArray()
+    {
+        return std::vector<runtime::SizeType32>{1};
     }
 };
 } // namespace layers

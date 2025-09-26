@@ -73,10 +73,15 @@ enum class RotaryScalingType : int8_t
 
 struct BlockSparseParams
 {
-    int block_size;
-    int homo_head_pattern;
-    int num_local_blocks; // Sliding window blocks
-    int vertical_stride;
+    int block_size = 1;
+    int homo_head_pattern = 0;
+    int num_local_blocks = 0; // Sliding window blocks
+    int vertical_stride = 0;
+
+    auto data() const
+    {
+        return std::make_tuple(block_size, homo_head_pattern, num_local_blocks, vertical_stride);
+    }
 
     __device__ bool computeMask(
         int row_idx, int col_idx, int q_seq_length, int kv_seq_length, int num_heads, int head_idx) const
@@ -112,6 +117,8 @@ struct BuildDecoderInfoParams
     // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
     // [numTokens].
     int* paddingOffsets;
+    // The batch_idx and token_idx_in_seq for each token. Shape: [numTokens].
+    int2* tokensInfo;
     // The number of padded tokens in the corresponding padded tensor before the current token, for Encoder. Shape:
     // [numTokens].
     int* encoderPaddingOffsets;
@@ -136,8 +143,11 @@ struct BuildDecoderInfoParams
     uint32_t* fmhaTileCounter;
 
     // Scales for fmha only.
-    // The scale to dequant Qkv input.
+    // The scale to dequant Q/Kv input.
     float const* dequantScaleQkv;
+    // Whether to use separate scales for Q/K/V.
+    bool separateQkvScales;
+
     // The scale to quant O output.
     float const* quantScaleO;
     // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
@@ -160,6 +170,8 @@ struct BuildDecoderInfoParams
     int sinkTokenLength;
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
+    // Remove padding or not.
+    bool removePadding;
     // The type of attention.
     AttentionMaskType attentionMaskType;
     // Params for block sparse pattern
@@ -177,6 +189,36 @@ struct BuildDecoderInfoParams
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
 
+    bool isBuildDecoderInfoKernelNeeded()
+    {
+        if (!removePadding)
+        {
+            return true;
+        }
+        if (maxQSeqLength > 1 && batchSize > 1)
+        {
+            return true;
+        }
+        if (rotaryScalingType == RotaryScalingType::kDYNAMIC)
+        {
+            return true;
+        }
+        if (rotaryScalingType != RotaryScalingType::kNONE && rotaryEmbeddingInvFreqCache == nullptr)
+        {
+            return true;
+        }
+        if (attentionMask != nullptr)
+        {
+            return true;
+        }
+        if (fmhaTileCounter != nullptr || fmhaBmm1Scale != nullptr || fmhaBmm2Scale != nullptr)
+        {
+            return true;
+        }
+        // Other cases don't need to call buildDecoderInfo kernel.
+        return false;
+    }
+
     std::string toString() const
     {
         std::stringstream ss;
@@ -192,6 +234,10 @@ struct BuildDecoderInfoParams
         ss << "paddingOffsets: "
            << *(runtime::ITensor::wrap(
                   (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
+           << std::endl;
+        ss << "tokensInfo: "
+           << *(runtime::ITensor::wrap(
+                  (void*) tokensInfo, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({numTokens * 2})))
            << std::endl;
         if (encoderPaddingOffsets != nullptr)
         {
@@ -210,6 +256,7 @@ struct BuildDecoderInfoParams
         ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
         ss << "sinkTokenLength: " << sinkTokenLength << std::endl;
         ss << "numTokens: " << numTokens << std::endl;
+        ss << "removePadding: " << removePadding << std::endl;
         ss << "attentionMaskType: " << static_cast<int>(attentionMaskType) << std::endl;
         ss << "rotaryEmbeddingScale: " << rotaryEmbeddingScale << std::endl;
         ss << "rotaryEmbeddingBase: " << rotaryEmbeddingBase << std::endl;

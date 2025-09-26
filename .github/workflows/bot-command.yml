@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A workflow to display bot command help information
+name: Bot-Command
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+jobs:
+  Bot-command-check:
+    name: Bot command check
+    if: |
+      startsWith(github.event.comment.body, '/bot') &&
+      !(startsWith(github.event.comment.body, '/bot run') ||
+      startsWith(github.event.comment.body, '/bot skip --comment') ||
+      startsWith(github.event.comment.body, '/bot reuse-pipeline') ||
+      startsWith(github.event.comment.body, '/bot kill'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add bot help comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const helpMessage = "" +
+            "## GitHub Bot Help\n\n" +
+            "`/bot [-h] ['run', 'kill', 'skip', 'reuse-pipeline'] ...`\n\n" +
+            "Provide a user friendly way for developers to interact with a Jenkins server.\n\n" +
+            "Run `/bot [-h|--help]` to print this help message.\n\n" +
+            "See details below for each supported subcommand.\n\n" +
+            "<details>\n\n" +
+            "`run  [--reuse-test (optional)pipeline-id --disable-fail-fast --skip-test --stage-list \"A10-PyTorch-1, xxx\" --gpu-type \"A30, H100_PCIe\" --test-backend \"pytorch, cpp\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\" --detailed-log --debug(experimental)]`\n\n" +
+            "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
+            "`--reuse-test (optional)pipeline-id ` *(OPTIONAL)* : Allow the new pipeline to reuse build artifacts and skip successful test stages from a specified pipeline or the last pipeline if no pipeline-id is indicated. If the Git commit ID has changed, this option will be always ignored. The DEFAULT behavior of the bot is to reuse build artifacts and successful test results from the last pipeline.\n\n" +
+            "`--disable-reuse-test ` *(OPTIONAL)* : Explicitly prevent the pipeline from reusing build artifacts and skipping successful test stages from a previous pipeline. Ensure that all builds and tests are run regardless of previous successes.\n\n" +
+            "`--disable-fail-fast ` *(OPTIONAL)* : Disable fail fast on build/tests/infra failures.\n\n" +
+            "`--skip-test ` *(OPTIONAL)* : Skip all test stages, but still run build stages, package stages and sanity check stages. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--stage-list \"A10-PyTorch-1, xxx\"` *(OPTIONAL)* : Only run the specified test stages. Examples: \"A10-PyTorch-1, xxx\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--test-backend \"pytorch, cpp\"` *(OPTIONAL)* : Skip test stages which don't match the specified backends. Only support [pytorch, cpp, tensorrt, triton]. Examples: \"pytorch, cpp\" (does not run test stages with tensorrt or triton backend). Note: Does **NOT** update GitHub pipeline status.\n\n" +
+            "`--only-multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--disable-multi-gpu-test ` *(OPTIONAL)* : Disable the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests in addition to running L0 pre-merge pipeline.\n\n" +
+            "`--post-merge ` *(OPTIONAL)* : Run the L0 post-merge pipeline instead of the ordinary L0 pre-merge pipeline.\n\n" +
+            "`--extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\".\n\n" +
+            "`--detailed-log ` *(OPTIONAL)* : Enable flushing out all logs to the Jenkins console. This will significantly increase the log volume and may slow down the job.\n\n" +
+            "`--debug ` *(OPTIONAL)* : **Experimental feature**. Enable access to the CI container for debugging purpose. Note: Specify exactly one stage in the `stage-list` parameter to access the appropriate container environment. Note: Does **NOT** update GitHub check status.\n\n" +
+            "### kill\n\n" +
+            "`kill  `\n\n" +
+            "Kill all running builds associated with pull request.\n\n" +
+            "### skip\n\n" +
+            "`skip --comment COMMENT `\n\n" +
+            "Skip testing for latest commit on pull request. `--comment \"Reason for skipping build/test\"` is required. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
+            "### reuse-pipeline\n\n" +
+            "`reuse-pipeline `\n\n" +
+            "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the pull request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
+            "</details>";
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: helpMessage
+            });

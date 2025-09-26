@@ -43,7 +43,7 @@ static bool triton_kernels_loaded = false;
     {% for arg in params -%}
     read(d, [[arg.name]]);
     {% endfor %}
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 
@@ -195,7 +195,7 @@ void [[ plugin_name ]]::serialize(void* buffer) const noexcept
     {% for arg in params -%}
     write(d, [[arg.name]]);
     {% endfor %}
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 
 }
 
@@ -223,7 +223,7 @@ const char* [[ plugin_name ]]::getPluginNamespace() const noexcept
     mPluginAttributes.clear();
 
     {% for arg in params %}
-    mPluginAttributes.emplace_back(PluginField("[[arg.name]]", nullptr, PluginFieldType::[[arg.dtype.dtype.to('trt_plugin')]], 0));
+    mPluginAttributes.emplace_back(PluginField("[[arg.name]]", nullptr, PluginFieldType::[[arg.dtype.dtype.to('trt_plugin')]]));
     {% endfor %}
 
     mFC.nbFields = mPluginAttributes.size();

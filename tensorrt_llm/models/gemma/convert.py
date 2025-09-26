@@ -317,6 +317,10 @@ class HfParser:
              None),  # merged with above
             (r"model.layers.(\d+).self_attn.o_proj.weight",
              r"layers.\1.attention.dense.weight"),
+            (r"model.layers.(\d+).self_attn.q_norm.weight",
+             r"layers.\1.attention.q_layernorm.weight"),
+            (r"model.layers.(\d+).self_attn.k_norm.weight",
+             r"layers.\1.attention.k_layernorm.weight"),
             (r"model.layers.(\d+).mlp.gate_proj.weight",
              r"layers.\1.mlp.fc.weight"),
             (r"model.layers.(\d+).mlp.up_proj.weight",
@@ -795,6 +799,8 @@ def load_gemma_weights(
                 "pre_feedforward_layernorm",
                 "post_feedforward_layernorm",
                 "model.norm.weight",
+                "q_norm.weight",
+                "k_norm.weight",
         )):
             param = param + 1.0  # upcasted to float32 in case of bfloat16
             add_trt_llm_weight(weights, trt_llm_name, param,
@@ -844,7 +850,7 @@ def non_modelopt_quantize_if_needed(
     quant_cfg = trt_llm_config.quantization
 
     kv_cache_is_int8 = quant_cfg.kv_cache_quant_algo == QuantAlgo.INT8
-    use_smooth_quant = quant_cfg.use_plugin_sq
+    use_smooth_quant = quant_cfg._use_plugin_sq
 
     if use_smooth_quant or kv_cache_is_int8:
         qkv_para = {}

@@ -46,7 +46,7 @@ DecoderXQARunner::DecoderXQARunner(
 {
     mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    // TODO(minwei): needs both impls because medusa kernels haven't been migrated to JIT yet (which should be).
+    // TODO: needs both impls because medusa kernels haven't been migrated to JIT yet (which should be).
     // mJITImpl/mPrecompiledImpl assignments must be the last lines of this constructor. DecoderXQAImpl::create() relies
     // on *this being fully initialized.
     mJITImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kJIT);
@@ -72,54 +72,37 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-size_t DecoderXQARunner::getWorkspaceSize(int max_num_tokens)
-{
-    // buffer for RoPE / output quantization.
-    constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
-    size_t workspace_size = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens, 128); // rope
-    // output conversion.
-    workspace_size = roundUp<size_t>(workspace_size + kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens, 128);
-    if (mMultiBlockMode)
-    {
-        int workspaces[4];
-        uint32_t const nbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
-        uint32_t const nbSeq = nbSubSeq / 2;
-        int group_size = mNumHeads / mNumKVHeads;
-        workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
-        workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
-        workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum
-        int32_t const multi_block_workspace_alignment
-            = roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mHeadSize, 128);
-        workspaces[3] = multi_block_workspace_alignment * nbSubSeq;
-        workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
-            + roundUp(workspaces[0], multi_block_workspace_alignment)
-            + roundUp(workspaces[1], multi_block_workspace_alignment)
-            + roundUp(workspaces[2], multi_block_workspace_alignment)
-            + roundUp(workspaces[3], multi_block_workspace_alignment)
-            + multi_block_workspace_alignment; // extra space reserved for alignment
-    }
-    return workspace_size;
-}
-
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams, bool for_configure_plugin)
 {
-    if (xqaParams.multi_query_tokens)
-    {
-        // Use precompiled cubin for medusa, because medusa cubins are generated from a different CUDA source file than
-        // non-medusa.
-        return mPrecompiledImpl.get();
-    }
+    int const smVersion = tensorrt_llm::common::getSMVersion();
 
     std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
-
     if (envEnableXQAJIT.has_value())
     {
         return envEnableXQAJIT.value() ? mJITImpl.get() : mPrecompiledImpl.get();
     }
     else
     {
-        // If no env var set, default to JIT impl.
-        return mJITImpl.get();
+        if (xqaParams.multi_query_tokens)
+        {
+            // Some multi_query kernels are not ported to JIT yet.
+            auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+            // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
+            // now.
+            bool const supportedByHopperXqa
+                = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && grpSize <= 64);
+            bool const supportedBySm120Mla = (smVersion == 120 && xqaParams.isMLA()
+                && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
+            bool const supportedByAmpereXqa = (!xqaParams.isMLA() && (64 % grpSize == 0));
+
+            return (supportedByHopperXqa || supportedBySm120Mla || supportedByAmpereXqa) ? mJITImpl.get()
+                                                                                         : mPrecompiledImpl.get();
+        }
+        else
+        {
+            // regular decoding kernels uses JIT by default
+            return mJITImpl.get();
+        }
     }
 }
 
@@ -140,10 +123,19 @@ void DecoderXQARunner::run(
     return getImplFromXQAParams(xqa_params, false)->run(xqa_params, kv_cache_buffer, stream);
 }
 
-DecoderXQARunner::Resource* DecoderXQARunner::getResourceGlobal()
+std::shared_ptr<DecoderXQARunnerResource> DecoderXQARunner::getResourceGlobal()
 {
-    static DecoderXQARunner::Resource sResource;
-    return &sResource;
+    static std::mutex sMutex;
+    static std::weak_ptr<DecoderXQARunnerResource> sResource;
+    std::lock_guard<std::mutex> lock(sMutex);
+    auto ret = sResource.lock();
+    if (ret != nullptr)
+    {
+        return ret;
+    }
+    ret = std::make_shared<DecoderXQARunnerResource>();
+    sResource = ret;
+    return ret;
 }
 
 template void DecoderXQARunner::run(
@@ -152,17 +144,17 @@ template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
 
 //// DecoderXQARunner::Resource
-DecoderXQARunner::Resource::Resource()
+DecoderXQARunnerResource::DecoderXQARunnerResource()
     : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>())
 {
 }
 
-DecoderXQARunner::Resource::Resource(DecoderXQARunner::Resource const& other)
+DecoderXQARunnerResource::DecoderXQARunnerResource(DecoderXQARunnerResource const& other)
     : mCubinObjRegistry(other.mCubinObjRegistry->clone())
 {
 }
 
-DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunner::Resource const& other)
+DecoderXQARunnerResource& DecoderXQARunnerResource::operator=(DecoderXQARunnerResource const& other)
 {
     if (this == &other)
     {
@@ -172,17 +164,17 @@ DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunn
     return *this;
 }
 
-DecoderXQARunner::Resource::Resource(void const* buffer, size_t buffer_size)
+DecoderXQARunnerResource::DecoderXQARunnerResource(void const* buffer, size_t buffer_size)
     : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>(buffer, buffer_size))
 {
 }
 
-size_t DecoderXQARunner::Resource::getSerializationSize() const noexcept
+size_t DecoderXQARunnerResource::getSerializationSize() const noexcept
 {
     return mCubinObjRegistry->getSerializationSize();
 }
 
-void DecoderXQARunner::Resource::serialize(void* buffer, size_t buffer_size) const noexcept
+void DecoderXQARunnerResource::serialize(void* buffer, size_t buffer_size) const noexcept
 {
     mCubinObjRegistry->serialize(buffer, buffer_size);
 }

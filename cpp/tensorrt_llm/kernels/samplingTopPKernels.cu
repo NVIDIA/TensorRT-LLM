@@ -62,7 +62,7 @@ void invokeTopPInitialize(TokenIdType* topPIdValBuf, SizeType32* topPOffsetBuf, 
     SizeType32 batchSize, SizeType32 vocabSize, cudaStream_t stream)
 {
     // vocabSize: the column number of logits_buffer for top_p sampling
-    // TODO(nkorobov): launch based on available resources
+    // TODO: launch based on available resources
     topPInitialize<<<32, 512, 0, stream>>>(topPIdValBuf, topPOffsetBuf, beginTopPOffsetBuf, batchSize, vocabSize);
 }
 
@@ -202,8 +202,8 @@ __global__ void topPSsampling(T const* sortedProbs, TokenIdType const* sortedIdV
     FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, SizeType32 const* beginOffsetBuf,
     SizeType32 const* offsetBuf, SizeType32 vocabSize, curandState_t* curandState, float const* randomVals,
     float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize, bool const* skipDecode,
-    SizeType32 const* batchSlots, bool returnAllSelectedTokens, SizeType32 maxSeqLen, TokenIdType* outputIdCurrentStep,
-    bool const* skipOutputIdCurrentStep)
+    SizeType32 const* batchSlots, bool returnAllSelectedTokensFlag, bool const* returnAllSelectedTokensPerSlot,
+    SizeType32 maxSeqLen, TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -241,6 +241,9 @@ __global__ void topPSsampling(T const* sortedProbs, TokenIdType const* sortedIdV
     auto const probThreshold = topPs[batchSlot];
     auto const currentStep = sequenceLength == nullptr ? 0 : sequenceLength[batchSlot];
     auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
+    auto const returnAllSelectedTokens = returnAllSelectedTokensPerSlot != nullptr
+        ? returnAllSelectedTokensPerSlot[batchSlot]
+        : returnAllSelectedTokensFlag;
     bool const sampleTokenInSelected = returnAllSelectedTokens && outputIdCurrentStep && curandState
         && skipOutputIdCurrentStep && !skipOutputIdCurrentStep[batchSlot];
 
@@ -413,7 +416,7 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     auto beginOffsetBuf = static_cast<SizeType32*>(alignedPointers[5]);
 
     invokeTopPInitialize(idVals, offsetBuf, beginOffsetBuf, params.batchSize, params.vocabSizePadded, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     SizeType32 constexpr BLOCK_SIZE = 256;
     // Performs Top K=1 search.
@@ -421,7 +424,7 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     topPBeamTopKKernel<T, BLOCK_SIZE><<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params.probs, sortedIdVals,
         sortedProbs, params.finishedInput, params.vocabSizePadded, offsetBuf, beginOffsetBuf, params.topPs,
         params.skipDecode, params.batchSlots);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     // Sort tokens by probability in descending order
     auto cubWorkspaceSize = workspaceSizes[0];
@@ -439,9 +442,9 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
         params.outputIds, params.outputIdsPtrs, params.sequenceLength, params.finishedInput, params.finishedOutput,
         params.cumLogProbs, params.outputLogProbs, beginOffsetBuf, offsetBuf + 1, params.vocabSizePadded,
         params.curandState, params.randomVals, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode,
-        params.batchSlots, params.returnAllSelectedTokens, params.maxSeqLen, params.outputIdCurrentStep,
-        params.skipOutputIdCurrentStep);
-    sync_check_cuda_error();
+        params.batchSlots, params.returnAllSelectedTokens, params.returnAllSelectedTokensPerSlot, params.maxSeqLen,
+        params.outputIdCurrentStep, params.skipOutputIdCurrentStep);
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

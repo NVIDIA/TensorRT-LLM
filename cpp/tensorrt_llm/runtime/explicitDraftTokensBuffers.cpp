@@ -27,11 +27,9 @@ namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 namespace tensorrt_llm::runtime
 {
 
-void ExplicitDraftTokensBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const& runtime,
+void ExplicitDraftTokensBuffers::Inputs::create(SizeType32 maxNumSequences, BufferManager const& manager,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
-    auto const& manager = runtime.getBufferManager();
-
     auto const& speculativeDecodingModule = modelConfig.getSpeculativeDecodingModule();
     auto const maxNumPaths = speculativeDecodingModule.getMaxNumPaths();
     auto const maxDraftPathLen = speculativeDecodingModule.getMaxDraftPathLen();
@@ -63,8 +61,7 @@ void ExplicitDraftTokensBuffers::Inputs::create(SizeType32 maxNumSequences, Tllm
 
 ExplicitDraftTokensBuffers::ExplicitDraftTokensBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, executor::DecodingConfig const& decodingConfig,
-    runtime::TllmRuntime const& runtime)
+    runtime::WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Explicit draft tokens does not support beam search");
@@ -266,13 +263,10 @@ void ExplicitDraftTokensBuffers::setFromInputs(SizeType32 numCtxSequences, SizeT
 
 void ExplicitDraftTokensBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSequences,
     ITensor const& requestTypes, ITensor const& seqSlots, ExplicitDraftTokensBuffers::Inputs const& draftBuffers,
-    ITensor const& contextPositionIds, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig) const
+    ITensor const& contextPositionIds, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+    runtime::BufferManager const& manager, runtime::CudaStream const& stream) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const& manager = runtime.getBufferManager();
-    auto const& stream = runtime.getStream();
 
     auto const explicitDraftTokensModule = std::dynamic_pointer_cast<runtime::ExplicitDraftTokensModule const>(
         modelConfig.getSpeculativeDecodingModulePtr());

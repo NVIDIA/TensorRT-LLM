@@ -17,11 +17,7 @@
 #pragma once
 
 #include "lookaheadPoolManager.h"
-#include "tensorrt_llm/layers/baseLayer.h"
-#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
-#include <curand_kernel.h>
-#include <tuple>
 
 namespace tensorrt_llm::layers
 {
@@ -134,10 +130,6 @@ private:
     runtime::SizeType32 mRuntimeMaxDraftPathLen{0};
     //! in prefilling mode when mFilling < mN-1.
     runtime::SizeType32 mFilling;
-
-    //! @brief record the current golden token for debugging.
-    runtime::TokenIdType mCurrentToken;
-    runtime::SizeType32 mId;
 };
 
 } // namespace tensorrt_llm::layers

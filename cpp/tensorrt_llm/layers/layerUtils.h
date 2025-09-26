@@ -17,6 +17,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -24,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -41,15 +43,16 @@ struct FillBuffers
     using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
 
     template <typename T>
-    void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, BufferPtr hostBuffer,
-        BufferPtr deviceBuffer, BufferConstPtr batchSlots, std::pair<float, float> const& limits,
+    void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, BufferPtr const& hostBuffer,
+        BufferPtr const& deviceBuffer, BufferConstPtr const& batchSlots, std::pair<float, float> const& limits,
         std::string const& name) const
     {
-        auto hostBufferRange = runtime::BufferRange<T>(*hostBuffer);
-        for (size_t bi = 0; bi < batchSize; ++bi)
+        // Specialize for `beamWidthArray` and `beamSearchSteps`
+        bool constexpr isVector = std::is_same_v<T, std::vector<runtime::SizeType32>>;
+        for (runtime::SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            auto value = defaultValue;
-            auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
+            T value = defaultValue;
+            runtime::SizeType32 const batchSlot = runtime::bufferCast<runtime::SizeType32 const>(*batchSlots)[bi];
             if (optParam)
             {
                 if (optParam->size() == 1)
@@ -58,28 +61,42 @@ struct FillBuffers
                 }
                 else
                 {
-                    TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
-                    value = optParam.value()[bi];
+                    TLLM_CHECK_WITH_INFO(
+                        optParam->size() == static_cast<size_t>(batchSize), "Argument vector size mismatch.");
+                    value = optParam->at(bi);
                 }
             }
-            TLLM_CHECK_WITH_INFO(limits.first < static_cast<float>(value) && static_cast<float>(value) <= limits.second,
-                "%s param (%f) is out of limits (%f, %f]", name.c_str(), static_cast<float>(value), limits.first,
-                limits.second);
-            hostBufferRange[batchSlot] = value;
+            if constexpr (isVector) // Fill vector (beam width array)
+            {
+                size_t constexpr maxLength = tensorrt_llm::kernels::kMaxBeamWidthArrayLength;
+                auto hostBufferRange = runtime::BufferRange<typename T::value_type>(*hostBuffer);
+                for (int i = 0; i < value.size(); ++i)
+                {
+                    TLLM_CHECK_WITH_INFO(
+                        limits.first < static_cast<float>(value[i]) && static_cast<float>(value[i]) <= limits.second,
+                        "%s param (%f) is out of limits (%f, %f]", name.c_str(), static_cast<float>(value[i]),
+                        limits.first, limits.second);
+                    hostBufferRange[batchSlot * maxLength + i] = value[i];
+                }
+                for (int i = 0; i < maxLength - value.size(); ++i)
+                {
+                    hostBufferRange[batchSlot * maxLength + value.size() + i] = value[value.size() - 1];
+                }
+            }
+            else // Fill scalar
+            {
+                TLLM_CHECK_WITH_INFO(
+                    limits.first < static_cast<float>(value) && static_cast<float>(value) <= limits.second,
+                    "%s param (%f) is out of limits (%f, %f]", name.c_str(), static_cast<float>(value), limits.first,
+                    limits.second);
+                auto hostBufferRange = runtime::BufferRange<T>(*hostBuffer);
+                hostBufferRange[batchSlot] = value;
+            }
         }
 
-        if (batchSlots)
-        {
-            auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, maxBatchSize);
-            auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, maxBatchSize);
-            mBufferManager->copy(*hostSlice, *deviceSlice);
-        }
-        else
-        {
-            auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, batchSize);
-            auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, batchSize);
-            mBufferManager->copy(*hostSlice, *deviceSlice);
-        }
+        auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, maxBatchSize);
+        auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, maxBatchSize);
+        mBufferManager->copy(*hostSlice, *deviceSlice);
     }
 
     runtime::SizeType32 batchSize;
@@ -137,7 +154,7 @@ inline DecoderDomain getLocalDecoderDomain(
 }
 
 template <typename... T>
-runtime::SizeType32 expandMatchElements(runtime::SizeType32 expandSize, std::vector<T>&... vector)
+size_t expandMatchElements(size_t expandSize, std::vector<T>&... vector)
 {
     std::array vectorSizes{vector.size()...};
 

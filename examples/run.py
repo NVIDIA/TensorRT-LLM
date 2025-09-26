@@ -23,9 +23,9 @@ from typing import List, Optional
 import numpy as np
 import torch
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-                   add_common_args, load_tokenizer, prepare_enc_dec_inputs,
-                   read_model_name, supports_inflight_batching,
-                   throttle_generator)
+                   add_common_args, get_beam_width_array, load_tokenizer,
+                   prepare_enc_dec_inputs, read_model_name,
+                   supports_inflight_batching, throttle_generator)
 
 import tensorrt_llm
 import tensorrt_llm.profiler
@@ -35,7 +35,7 @@ from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
 
 
 def parse_arguments(args=None):
@@ -83,6 +83,10 @@ def parse_arguments(args=None):
                         type=str,
                         help='Numpy file where the tokenized output is stored.',
                         default=None)
+    parser.add_argument('--output_generation_logits',
+                        default=False,
+                        action='store_true',
+                        help="Enable gathering generation logits.")
     parser.add_argument(
         '--output_logits_npy',
         type=str,
@@ -102,6 +106,14 @@ def parse_arguments(args=None):
         default=False,
         action='store_true',
         help="Run several 10 iterations to profile the inference latencies.")
+    parser.add_argument(
+        '--fail_fast_on_attention_window_too_large',
+        action='store_true',
+        default=False,
+        help=
+        'Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.'
+    )
+
     parser = add_common_args(parser)
 
     return parser.parse_args(args=args)
@@ -146,6 +158,7 @@ def parse_input(tokenizer,
             for row in inputs:
                 input_ids = row[row != pad_id]
                 batch_input_ids.append(input_ids[-max_input_length:])
+
         elif input_file.endswith('.txt'):
             with open(input_file, 'r', encoding='utf-8',
                       errors='replace') as txt_file:
@@ -161,8 +174,7 @@ def parse_input(tokenizer,
 
     if num_prepend_vtokens:
         assert len(num_prepend_vtokens) == len(batch_input_ids)
-        base_vocab_size = tokenizer.vocab_size - len(
-            tokenizer.special_tokens_map.get('additional_special_tokens', []))
+        base_vocab_size = tokenizer.vocab_size
         for i, length in enumerate(num_prepend_vtokens):
             batch_input_ids[i] = list(
                 range(base_vocab_size,
@@ -227,7 +239,7 @@ def print_output(tokenizer,
     batch_size = len(input_lengths)
     num_return_sequences = num_output_sents // batch_size
 
-    if output_csv is None and output_npy is None:
+    if output_csv is None and output_npy is None and tokenizer is not None:
         for i in range(batch_size * num_return_sequences):
             batch_idx = i // num_return_sequences
             seq_idx = i % num_return_sequences
@@ -314,7 +326,7 @@ def main(args):
     if is_enc_dec:
         logger.warning(
             "This path is an encoder-decoder model. Using different handling.")
-        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
+        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/models/core/enc_dec/run.py instead."
 
     model_name, model_version = read_model_name(
         args.engine_dir if not is_enc_dec else os.path.
@@ -386,6 +398,12 @@ def main(args):
         x.size(0) for x in (encoder_input_features or encoder_input_ids)
     ] if is_enc_dec else None
 
+    if args.beam_width_array is not None:
+        logger.info("Enable Variable-Beam-Width-Search (VBWS)")
+        assert not args.use_py_session, "`--use_py_session` is not supported in VBWS."
+        args.beam_width_array, args.num_beams = get_beam_width_array(
+            args.beam_width_array)
+
     if not args.use_py_session and not supports_inflight_batching(
             os.path.join(args.engine_dir, "decoder") if is_enc_dec else args.
             engine_dir):
@@ -419,17 +437,17 @@ def main(args):
 
     logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    if args.draft_target_model_config is not None or args.prompt_lookup_config is not None:
-        # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD)
-        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/prompt_lookup/run_dtm_pld.py`
+    if args.draft_target_model_config is not None or args.ngram_config is not None:
+        # Speculative-Decoding of Draft-Target-Model (DTM) and NGram
+        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/ngram/run_dtm_ngram.py`
         assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
         assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
         assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
         assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
 
-        outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
-                              pad_id, stop_words_list, bad_words_list,
-                              tokenizer.vocab_size)
+        outputs = run_dtm_ngram(batch_input_ids, args, runtime_rank, end_id,
+                                pad_id, stop_words_list, bad_words_list,
+                                len(tokenizer))
         if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
             outputs, runner = list(outputs)[0]
 
@@ -443,19 +461,30 @@ def main(args):
             lora_ckpt_source=args.lora_ckpt_source,
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+            fail_fast_on_attention_window_too_large=args.
+            fail_fast_on_attention_window_too_large,
         )
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
-        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None:
-            args.eagle_choices = ast.literal_eval(args.eagle_choices)
+        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None or args.eagle_use_dynamic_tree:
             assert args.num_beams == 1, "Eagle should use num_beams == 1"
             assert not args.use_py_session, "Eagle does not support py session"
-            runner_kwargs.update(eagle_choices=args.eagle_choices)
-            runner_kwargs.update(
-                eagle_posterior_threshold=args.eagle_posterior_threshold)
+            if args.eagle_choices is not None and not args.eagle_use_dynamic_tree:
+                args.eagle_choices = ast.literal_eval(args.eagle_choices)
+                runner_kwargs.update(eagle_choices=args.eagle_choices)
+            if args.eagle_posterior_threshold is not None:
+                runner_kwargs.update(
+                    eagle_posterior_threshold=args.eagle_posterior_threshold)
+            if args.eagle_use_dynamic_tree:
+                runner_kwargs.update(
+                    eagle_use_dynamic_tree=args.eagle_use_dynamic_tree)
+                assert args.eagle_dynamic_tree_max_top_k is not None and args.eagle_dynamic_tree_max_top_k > 0
+                runner_kwargs.update(eagle_dynamic_tree_max_top_k=args.
+                                     eagle_dynamic_tree_max_top_k)
         if args.lookahead_config is not None:
             args.lookahead_config = ast.literal_eval(args.lookahead_config)
             assert len(
@@ -479,9 +508,11 @@ def main(args):
                 if is_enc_dec else None,
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
-                cuda_graph_mode=args.cuda_graph_mode)
-        runner_kwargs.update(
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+                cuda_graph_mode=args.cuda_graph_mode,
+                gather_generation_logits=args.output_generation_logits,
+                use_variable_beam_width_search=(args.beam_width_array
+                                                is not None),
+            )
         runner = runner_cls.from_dir(**runner_kwargs)
 
         with torch.no_grad():
@@ -505,9 +536,11 @@ def main(args):
                 num_return_sequences=args.num_return_sequences,
                 length_penalty=args.length_penalty,
                 early_stopping=args.early_stopping,
+                beam_width_array=args.beam_width_array,
                 repetition_penalty=args.repetition_penalty,
                 presence_penalty=args.presence_penalty,
                 frequency_penalty=args.frequency_penalty,
+                min_p=args.min_p,
                 stop_words_list=stop_words_list,
                 bad_words_list=bad_words_list,
                 output_cum_log_probs=(args.output_cum_log_probs_npy != None),
@@ -518,12 +551,16 @@ def main(args):
                 prompt_tasks=args.prompt_tasks,
                 streaming=args.streaming,
                 output_sequence_lengths=True,
+                output_generation_logits=args.output_generation_logits,
                 no_repeat_ngram_size=args.no_repeat_ngram_size,
                 return_dict=True,
                 medusa_choices=args.medusa_choices,
                 eagle_choices=args.eagle_choices,
                 return_all_generated_tokens=args.return_all_generated_tokens,
-                input_token_extra_ids=input_token_extra_ids)
+                input_token_extra_ids=input_token_extra_ids,
+                fail_fast_on_attention_window_too_large=args.
+                fail_fast_on_attention_window_too_large,
+                language_adapter_uids=args.language_task_uids)
             torch.cuda.synchronize()
 
     # Receive output, print to screen or save to file
@@ -560,7 +597,7 @@ def main(args):
             log_probs = None
             if runner.gather_context_logits:
                 context_logits = outputs['context_logits']
-            if runner.gather_generation_logits:
+            if runner.gather_generation_logits or args.output_generation_logits:
                 generation_logits = outputs['generation_logits']
             if args.output_cum_log_probs_npy is not None:
                 cum_log_probs = outputs['cum_log_probs']
@@ -598,9 +635,11 @@ def main(args):
                     num_beams=args.num_beams,
                     length_penalty=args.length_penalty,
                     early_stopping=args.early_stopping,
+                    beam_width_array=args.beam_width_array,
                     repetition_penalty=args.repetition_penalty,
                     presence_penalty=args.presence_penalty,
                     frequency_penalty=args.frequency_penalty,
+                    min_p=args.min_p,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
                     output_cum_log_probs=(args.output_cum_log_probs_npy
@@ -634,6 +673,7 @@ def main(args):
                     num_beams=args.num_beams,
                     length_penalty=args.length_penalty,
                     early_stopping=args.early_stopping,
+                    beam_width_array=args.beam_width_array,
                     repetition_penalty=args.repetition_penalty,
                     presence_penalty=args.presence_penalty,
                     frequency_penalty=args.frequency_penalty,
@@ -651,7 +691,9 @@ def main(args):
                     return_dict=True,
                     return_all_generated_tokens=args.
                     return_all_generated_tokens,
-                    input_token_extra_ids=input_token_extra_ids)
+                    input_token_extra_ids=input_token_extra_ids,
+                    fail_fast_on_attention_window_too_large=args.
+                    fail_fast_on_attention_window_too_large)
                 torch.cuda.synchronize()
         tensorrt_llm.profiler.stop("tmp")
 

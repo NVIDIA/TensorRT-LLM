@@ -213,8 +213,9 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
     if (hasMinLength)
     {
         __syncthreads();
-        // Min length
-        if ((threadIdx.x == 0) && (currentStep - inputLen < minLength))
+        // If current generation length is too short, make sure EOS doesn't have high probability.
+        // This check is not needed when endId is already -1 as generation won't stop on EOS anyway.
+        if ((threadIdx.x == 0) && (currentStep - inputLen < minLength) && endIds[batchSlot] > -1)
         {
             outLogitsPtr[endIds[batchSlot]] = MASK_VAL;
         }

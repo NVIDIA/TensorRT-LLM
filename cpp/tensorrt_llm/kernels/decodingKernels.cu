@@ -15,11 +15,10 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingKernels.h"
+
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
@@ -303,7 +302,7 @@ void invokeGatherTree(gatherTreeParam param)
         block.x = 1024;
     }
     gatherTree<<<grid, block, 0, param.stream>>>(param);
-    sync_check_cuda_error();
+    sync_check_cuda_error(param.stream);
 
     if (param.beamWidth > 1)
     {
@@ -458,7 +457,6 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     }
     else
     {
-        // TODO, wili: use CUB to sort for large nCBA
         for (int i = 0; i < nBM; ++i)
         {
             float maxScore = -FLT_MAX;
@@ -523,15 +521,11 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
 void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s %s start", __FILE__, __PRETTY_FUNCTION__);
-
     int const nBM = bh.nBeamWidth;
     int const nThread = min(roundUp(nBM * 2, 32), 1024);
     size_t const nByteSharedMemory = (sizeof(int) + sizeof(float)) * nBM * 2;
     finalizeKernel<<<bh.nBatchSize, nThread, nByteSharedMemory, stream>>>(bh);
-    sync_check_cuda_error();
-
-    TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
+    sync_check_cuda_error(stream);
 }
 
 __global__ void copyBeamHypotheses(CopyBeamHypothesesStruct copyStruct)
@@ -721,10 +715,14 @@ void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, 
 namespace runtime::kernels
 {
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
-void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput, BufferManager const& manager,
-    SamplingConfig const& samplingConfig)
+void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const& stream = cudaStream.get();
+    BufferManager manager{std::make_shared<CudaStream>(stream)};
+
     auto& finalOutputIds = *decodingOutput.gatheredIds;
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
     auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
@@ -744,12 +742,10 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
         common::fmtstr("Decoder seq length size (" FMT_DIM ") is too large for final seq length (" FMT_DIM ")",
             decodingOutputIdsShape.d[2], maxSeqLength));
 
-    auto const& stream = manager.getStream().get();
-
     // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
     tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize, beamWidth, maxSeqLength, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     std::vector<float> lengthPenaltyVec;
     auto lengthPenaltyPtr = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
@@ -798,10 +794,10 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
 
     // This is where transpose is done
     tensorrt_llm::kernels::invokeInsertUnfinishedPath(bh, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     tensorrt_llm::kernels::invokeFinalize(bh, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

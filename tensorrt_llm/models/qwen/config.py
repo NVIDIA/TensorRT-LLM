@@ -32,6 +32,8 @@ class QWenConfig(PretrainedConfig):
                  use_logn_attn: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
                  num_labels: int = 1,
+                 mlp_only_layers: Optional[list] = None,
+                 decoder_sparse_step: int = 1,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -40,6 +42,8 @@ class QWenConfig(PretrainedConfig):
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
         self.num_labels = num_labels
         self.use_logn_attn = use_logn_attn
+        self.mlp_only_layers = mlp_only_layers or []
+        self.decoder_sparse_step = decoder_sparse_step
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -64,6 +68,8 @@ class QWenConfig(PretrainedConfig):
         output[
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
         output['use_logn_attn'] = self.use_logn_attn
+        output['mlp_only_layers'] = self.mlp_only_layers
+        output['decoder_sparse_step'] = self.decoder_sparse_step
         output['moe'] = self.moe.to_dict()
         return output
 
@@ -99,18 +105,29 @@ class QWenConfig(PretrainedConfig):
         if qwen_type == 'llava_onevision':
             hf_config = hf_config.text_config
             qwen_type = f'{hf_config.model_type}_llava_onevision'
+        # Qwen2-Audio
+        if qwen_type == 'qwen2_audio':
+            hf_config = hf_config.text_config
+            hf_config.architectures = ['Qwen2ForCausalLM']
 
         valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
-                       'qwen2_vl')
+                       'qwen2_vl', 'qwen2_audio', 'qwen3', 'qwen3_moe')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
-        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        head_dim = getattr(
+            hf_config, "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads)
         head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = getattr(hf_config, "hidden_act", "silu")
-        if qwen_type == "qwen2_moe":
+        if qwen_type in ("qwen2_moe", "qwen3_moe"):
             hidden_act = "swiglu"
-        attn_bias = True  # All existing Qwen models have attn bias
+
+        # Qwen3 models have no attention bias, while legacy models have bias
+        if qwen_type in ('qwen3', 'qwen3_moe'):
+            attn_bias = False  # Qwen3 models have no attn bias
+        else:
+            attn_bias = True  # Legacy Qwen models have attn bias
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
         seq_length = getattr(hf_config, "seq_length", 8192)
         use_logn_attn = getattr(hf_config, "use_logn_attn", False)
@@ -133,6 +150,11 @@ class QWenConfig(PretrainedConfig):
         moe_shared_expert_intermediate_size = getattr(
             hf_config, "shared_expert_intermediate_size", 0)
         moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
+
+        # Add support for mlp_only_layers and decoder_sparse_step (Qwen3 MoE)
+        mlp_only_layers = getattr(hf_config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1)
+
         moe_config = MoeConfig(num_experts=moe_num_experts,
                                top_k=moe_top_k,
                                normalization_mode=moe_normalization_mode)
@@ -148,6 +170,7 @@ class QWenConfig(PretrainedConfig):
                 hf_config, 'rotary_dim',
                 int(hf_config.hidden_size / hf_config.num_attention_heads *
                     rotary_embedding_percentage))
+            rotary_scaling['type'] = 'mrope'
         else:
             pe_type = 'rope_gpt_neox'
             rotary_embedding_dim = None
@@ -177,6 +200,8 @@ class QWenConfig(PretrainedConfig):
             moe_intermediate_size=moe_intermediate_size,
             moe_shared_expert_intermediate_size=
             moe_shared_expert_intermediate_size,
+            mlp_only_layers=mlp_only_layers,
+            decoder_sparse_step=decoder_sparse_step,
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,

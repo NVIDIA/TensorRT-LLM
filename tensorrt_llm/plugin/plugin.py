@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import ctypes
+import os
 import platform
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields
@@ -25,7 +26,10 @@ from typing import List, Optional, Tuple
 import tensorrt as trt
 
 from .._ipc_utils import IpcMemory, can_access_peer
-from ..bindings.internal.runtime import lamport_initialize_all
+from .._utils import get_sm_version
+from ..bindings.internal.runtime import (lamport_initialize,
+                                         lamport_initialize_all,
+                                         max_workspace_size_lowprecision)
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -49,7 +53,7 @@ def _load_plugin_lib():
         handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         handle.initTrtLlmPlugins.restype = ctypes.c_bool
     except AttributeError as err:
-        raise ImportError('TensorRT-LLM Plugin is unavailable') from err
+        raise ImportError('TensorRT LLM Plugin is unavailable') from err
 
     try:
         assert handle.initTrtLlmPlugins(
@@ -81,9 +85,10 @@ DEFAULT_PLUGIN_DTYPE_OPTIONS = [
 PLUGIN_DTYPE_OPTIONS_MAP = {
     "gemm_swiglu_plugin": ["fp8", None],
     "gemm_plugin":
-    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None],
+    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4", None],
     "low_latency_gemm_plugin": ["fp8", None],
     "low_latency_gemm_swiglu_plugin": ["fp8", None],
+    "gemm_allreduce_plugin": ["float16", "bfloat16", None]
 }
 
 
@@ -174,6 +179,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "Note: it's only affective for non-quantized gemm operations (except FP8)."
             "Note: For FP8, it also requires same calibration in checkpoint."
         })
+    _explicitly_disable_gemm_plugin: bool = False
     _gemm_swiglu_plugin: Optional[str] = field(
         default=None,
         init=False,
@@ -216,6 +222,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _lora_plugin: Optional[str] = field(default=None,
                                         init=False,
                                         metadata={"help": "Enable LoRA."})
+    _dora_plugin: bool = field(default=False,
+                               init=False,
+                               metadata={"help": "Enable DoRA."})
     _weight_only_groupwise_quant_matmul_plugin: Optional[str] = field(
         default=None,
         init=False,
@@ -294,6 +303,11 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios."
         })
 
+    _gemm_allreduce_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={"help": "The GEMM + AllReduce kernel fusion plugin."})
+
     # Features
     _context_fmha: bool = field(
         default=True,
@@ -326,6 +340,14 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "help":
             "Pack different tokens together, which reduces both the amount of computations and memory consumption."
         })
+    _norm_quant_fusion: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Fuse the LayerNorm and quantization kernels into a single kernel, "
+            "resulting in improved end-to-end performance."
+        })
     _reduce_fusion: bool = field(
         default=False,
         init=False,
@@ -345,25 +367,31 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "is currently only supported for the FP8 LLAMA model."
         })
     _tokens_per_block: int = field(
-        default=64,
+        default=32,
         init=False,
         metadata={
             "help":
             "Define how many tokens are contained in each paged kv cache block."
         })
     _use_paged_context_fmha: bool = field(
-        default=False,
+        default=True,
         init=False,
         metadata={
             "help":
             "Allow advanced features like KV cache reuse and chunked context."
         })
     _use_fp8_context_fmha: bool = field(
-        default=False,
+        default=True,
         init=False,
         metadata={
             "help":
             "When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA"
+        })
+    _fuse_fp4_quant: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help": "Whether to fuse FP4 quantization into attention kernel."
         })
     _multiple_profiles: bool = field(
         default=False,
@@ -394,7 +422,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
         init=False,
         metadata={
             "help":
-            "Enable TensorRT-LLM managed weights to speed up engine building process."
+            "Enable TensorRT LLM managed weights to speed up engine building process."
         })
     _use_fused_mlp: bool = field(
         default=True,
@@ -435,7 +463,15 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     @classmethod
     def from_arguments(cls, args: argparse.Namespace):
-        return cls.from_dict(vars(args))
+        args = vars(args)
+        obj = cls.from_dict(args)
+
+        # We want to know if the user explicitly disabled the gemm_plugin
+        # because nvfp4 gemm uses plugin by default currently
+        if 'gemm_plugin' in args and args['gemm_plugin'] == 'disable':
+            obj._explicitly_disable_gemm_plugin = True
+
+        return obj
 
     def to_dict(self):
         config = asdict(self)
@@ -459,6 +495,23 @@ class PluginConfig(metaclass=PluginConfigMeta):
                 setattr(self, field_name, None)
             elif field.type == bool or field_name == 'paged_kv_cache':
                 setattr(self, field_name, False)
+
+    def validate(self):
+        unsupported_plugins = {
+            # bert_attention_plugin is handled within BertAttention
+            100: [
+                'gemm_swiglu_plugin', 'fp8_rowwise_gemm_plugin',
+                'low_latency_gemm_plugin', 'low_latency_gemm_swiglu_plugin',
+                'bert_context_fmha_fp32_acc'
+            ]
+        }
+        sm = get_sm_version()
+        if sm in unsupported_plugins:
+            for plugin in unsupported_plugins[sm]:
+                val = getattr(self, plugin, None)
+                if val is not None and val != False:
+                    raise NotImplementedError(
+                        f"{plugin}={val} is not supported on SM {sm}.")
 
     @property
     def context_fmha_type(self):
@@ -501,7 +554,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
         self.fp8_rowwise_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
-        # self.layernorm_quantization_plugin = dtype
+        self.layernorm_quantization_plugin = dtype
         self.quantize_per_token_plugin = True
         self.quantize_tensor_plugin = True
         return self
@@ -511,7 +564,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
         self.context_fmha_type = context_fmha_type
         return self
 
-    def enable_paged_kv_cache(self, tokens_per_block: int = 64):
+    def enable_paged_kv_cache(self, tokens_per_block: int = 32):
         self.paged_kv_cache = True
         self.tokens_per_block = tokens_per_block
         return self
@@ -519,6 +572,14 @@ class PluginConfig(metaclass=PluginConfigMeta):
     def set_nccl_plugin(self, dtype: str = "auto"):
         self.nccl_plugin = dtype
         init_all_reduce_helper()
+        return self
+
+    def set_lora_plugin(self, dtype: str = None):
+        self.lora_plugin = dtype
+        return self
+
+    def set_dora_plugin(self, enable: bool = False):
+        self.dora_plugin = enable
         return self
 
 
@@ -532,11 +593,13 @@ cli_plugin_args = [
     "gemm_swiglu_plugin",
     "fp8_rowwise_gemm_plugin",
     "lora_plugin",
+    "dora_plugin",
     "moe_plugin",
     "mamba_conv1d_plugin",
     "nccl_plugin",
     "low_latency_gemm_plugin",
     "low_latency_gemm_swiglu_plugin",
+    "gemm_allreduce_plugin",
 
     # Features
     "context_fmha",
@@ -545,9 +608,11 @@ cli_plugin_args = [
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_fp8_context_fmha",
+    "fuse_fp4_quant",
     "multiple_profiles",
     "paged_state",
     "streamingllm",
+    "norm_quant_fusion",
     "reduce_fusion",
     "user_buffer",
     "use_fused_mlp",
@@ -570,10 +635,14 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
             plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
             if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
                 plugin_dtype_options = PLUGIN_DTYPE_OPTIONS_MAP[field_name]
+            if field_name == "gemm_plugin":
+                default = field.default
+            else:
+                default = field.default if field.default else "disable"
             parser.add_argument(
                 "--" + field_name,
                 type=str,
-                default=field.default if field.default else "disable",
+                default=default,
                 choices=[x if x else "disable" for x in plugin_dtype_options],
                 help=help_message)
         elif field.type == bool:
@@ -589,6 +658,11 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
                                 default=field.default,
                                 help=help_message)
     return parser
+
+
+def force_all_reduce_deterministic():
+    return os.getenv("FORCE_DETERMINISTIC", "0") == "1" or os.getenv(
+        "FORCE_ALL_REDUCE_DETERMINISTIC", "0") == "1"
 
 
 class CustomAllReduceHelper:
@@ -607,7 +681,7 @@ class CustomAllReduceHelper:
               Then, each instance of allreduce will reference that tensor automatically.
     """
     POINTERS_PER_RANK = 7
-    POINTERS_OF_COUNTER = 2
+    POINTERS_OF_COUNTER = 3
 
     def __init__(self) -> None:
         self.workspace: Optional[Tensor] = None
@@ -631,19 +705,96 @@ class CustomAllReduceHelper:
         )
 
     @staticmethod
-    def max_workspace_size_auto(tp_size: int) -> int:
+    def max_workspace_size_auto(tp_size: int,
+                                support_deterministic=True) -> int:
+        if force_all_reduce_deterministic() and support_deterministic:
+            workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
+                                       "1000000000")
+            return int(workspace_size)
         if tp_size <= 2:
             return 16_000_000
         return 8_000_000
 
     @staticmethod
+    def max_workspace_size_lowprecision(tp_size: int) -> int:
+        return max_workspace_size_lowprecision(tp_size)
+
+    @staticmethod
+    def initialize_lowprecision_buffers(workspace: "torch.tensor",
+                                        tp_size: int) -> None:
+        import torch
+        return torch.ops.trtllm.initialize_static_lowprecision_buffers(
+            workspace, tp_size)
+
+    @staticmethod
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
+
+        # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
+        force_deterministic = force_all_reduce_deterministic()
         is_p2p_supported = can_access_peer(mapping)
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
+        ipc_buffers_size = size if force_deterministic else size * mapping.tp_size
+        ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size,
                                      is_p2p_supported)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,
+        ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size,
+                                     is_p2p_supported)
+        ipc_barriers_in = IpcMemory(
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2 *
+            mapping.tp_size, is_p2p_supported)
+        ipc_barriers_out = IpcMemory(
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2 *
+            mapping.tp_size, is_p2p_supported)
+        lamport_buffers_size = 1 if force_deterministic else size * mapping.tp_size
+        lamport_buffers_0 = IpcMemory(mapping, lamport_buffers_size,
+                                      is_p2p_supported)
+        lamport_buffers_1 = IpcMemory(mapping, lamport_buffers_size,
+                                      is_p2p_supported)
+        lamport_buffers_2 = IpcMemory(mapping, lamport_buffers_size,
+                                      is_p2p_supported)
+        # TODO: it seems we may need to initialize lamport buffers for all tp groups
+        # just like its cpp counterpart (AllReduceBuffers::AllReduceBuffers()) does.
+        if is_p2p_supported:
+            lamport_initialize_all(
+                lamport_buffers_0.local_ptr,
+                lamport_buffers_1.local_ptr,
+                lamport_buffers_2.local_ptr,
+                lamport_buffers_size,
+            )
+        buffers = [
+            ipc_buffers_ping,
+            ipc_buffers_pong,
+            ipc_barriers_in,
+            ipc_barriers_out,
+            lamport_buffers_0,
+            lamport_buffers_1,
+            lamport_buffers_2,
+            # Start from 1 since 0 represents released state for barrier at the beginning of the all_reduce.
+            # The last element is the barrier flag counter.
+            torch.tensor([1, 1, 0], dtype=torch.int64, device="cuda")
+        ]
+
+        return buffers, torch.tensor(
+            ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() +
+            lamport_buffers_0.serialize() + lamport_buffers_1.serialize() +
+            lamport_buffers_2.serialize() + [buffers[-1].data_ptr()] +
+            [buffers[-1][1:].data_ptr()] + [buffers[-1][2:].data_ptr()],
+            dtype=torch.int64,
+            device="cpu")
+
+    @staticmethod
+    def allocate_lowprecision_workspace(
+            mapping: Mapping,
+            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+        import torch
+
+        # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
+        is_p2p_supported = can_access_peer(mapping)
+        ipc_buffers_size = size
+        ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size,
+                                     is_p2p_supported)
+        ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size,
                                      is_p2p_supported)
         ipc_barriers_in = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
@@ -651,34 +802,46 @@ class CustomAllReduceHelper:
         ipc_barriers_out = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
             is_p2p_supported)
-        lamport_buffers_0 = IpcMemory(mapping, size * mapping.tp_size,
-                                      is_p2p_supported)
-        lamport_buffers_1 = IpcMemory(mapping, size * mapping.tp_size,
-                                      is_p2p_supported)
-        lamport_buffers_2 = IpcMemory(mapping, size * mapping.tp_size,
-                                      is_p2p_supported)
-        rank = mapping.rank
-        tp_rank = mapping.tp_rank
-        if rank == tp_rank and is_p2p_supported:
-            lamport_initialize_all(
-                lamport_buffers_0.local_ptr,
-                lamport_buffers_1.local_ptr,
-                lamport_buffers_2.local_ptr,
-                size * mapping.tp_size,
-            )
         buffers = [
             ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
-            ipc_barriers_out, lamport_buffers_0, lamport_buffers_1,
-            lamport_buffers_2
+            ipc_barriers_out
         ]
 
         return buffers, torch.tensor(
             ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
-            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() +
-            lamport_buffers_0.serialize() + lamport_buffers_1.serialize() +
-            lamport_buffers_2.serialize() + [0] + [0],
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() + [0] +
+            [0],
             dtype=torch.int64,
             device="cpu")
+
+    @staticmethod
+    def allocate_allreduce_fusion_workspace(
+            mapping: Mapping,
+            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+        import torch
+        is_p2p_supported = can_access_peer(mapping)
+        ipc_buffers_size = size * mapping.tp_size
+        ipc_buffers = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
+        ipc_barriers = IpcMemory(mapping, 256 * mapping.tp_size,
+                                 is_p2p_supported)
+        lamport_buffers_size = size * mapping.tp_size
+        lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
+                                    is_p2p_supported)
+        if is_p2p_supported:
+            lamport_initialize(
+                lamport_buffers.local_ptr,
+                3 * lamport_buffers_size,
+            )
+        flag_buffer = torch.tensor([0, 0, 0, lamport_buffers_size, 0],
+                                   dtype=torch.int,
+                                   device="cuda")
+        buffers = [ipc_buffers, ipc_barriers, lamport_buffers, flag_buffer]
+
+        return buffers, torch.tensor(
+            ipc_buffers.serialize() + ipc_barriers.serialize() +
+            lamport_buffers.serialize() + [flag_buffer.data_ptr()],
+            dtype=torch.int64,
+            device="cuda")
 
 
 custom_all_reduce_helper = None

@@ -15,37 +15,29 @@
  * limitations under the License.
  */
 
-#include "cxxopts.hpp"
-#include "tensorrt_llm/batch_manager/GptManager.h"
-#include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/disaggServerUtil.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
-#include "tensorrt_llm/runtime/utils/numpyUtils.h"
-#include "tensorrt_llm/runtime/worldConfig.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "utils/utils.h"
-#include <algorithm>
+
+#include "cxxopts.hpp"
+#include <nlohmann/json.hpp>
+
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
-#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -55,9 +47,7 @@ using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::benchmark;
 using namespace tensorrt_llm::executor::disagg_executor;
-namespace tc = tensorrt_llm::common;
 namespace texec = tensorrt_llm::executor;
-namespace mpi = tensorrt_llm::mpi;
 namespace trt = nvinfer1;
 
 namespace
@@ -92,6 +82,7 @@ public:
         mContextReqQueuingLatency.mDataTimes.clear();
         mGenReqQueuingLatency.mDataTimes.clear();
         mGenReqKvCacheTransferLatency.mDataTimes.clear();
+        mKvCacheThroughput.mDataTps.clear();
     }
 
     void finalize()
@@ -115,6 +106,11 @@ public:
     {
         mGenReqKvCacheTransferLatency.mDataTimes.insert(
             mGenReqKvCacheTransferLatency.mDataTimes.end(), latencies.begin(), latencies.end());
+    }
+
+    void recordKvCacheThroughput(std::vector<float> const& throughputs)
+    {
+        mKvCacheThroughput.mDataTps.insert(mKvCacheThroughput.mDataTps.end(), throughputs.begin(), throughputs.end());
     }
 
     void recordContextStart(SizeType32 inputLength, SizeType32 maxNewTokens, uint64_t requestId,
@@ -318,8 +314,15 @@ public:
 
             if (!mGenT2TLatency.mDataTimes.empty())
             {
-
                 mGenT2TLatency.calculate();
+                std::vector<float> userTokensPerSecond;
+                userTokensPerSecond.reserve(mGenT2TLatency.mDataTimes.size());
+                for (auto const& latency : mGenT2TLatency.mDataTimes)
+                {
+                    userTokensPerSecond.push_back(1000.F / latency);
+                }
+                mAvgUserTokensPerSecond = std::accumulate(userTokensPerSecond.begin(), userTokensPerSecond.end(), 0.F)
+                    / userTokensPerSecond.size();
             }
             if (!mGenExcludeFirstIterT2TLatency.mDataTimes.empty())
             {
@@ -336,6 +339,7 @@ public:
         if (mCalculateKVCacheTransferTime)
         {
             mGenReqKvCacheTransferLatency.calculate();
+            mKvCacheThroughput.calculate();
         }
     }
 
@@ -348,6 +352,10 @@ public:
         printf("[BENCHMARK] total_latency(ms) %.2f\n", mTotalLatency);
         printf("[BENCHMARK] seq_throughput(seq/sec) %.2f\n", mSeqThroughput);
         printf("[BENCHMARK] token_throughput(token/sec) %.2f\n", mTokenThroughput);
+        if (mStreaming)
+        {
+            printf("[BENCHMARK] user_tokens_per_second(tokens/sec/user) %.2f\n", mAvgUserTokensPerSecond);
+        }
         printf("[BENCHMARK] avg_acceptance_rate(tokens/decoding steps) %.2f\n\n", mAcceptanceRate);
 
         mSeqLatency.report();
@@ -367,6 +375,7 @@ public:
         if (mCalculateKVCacheTransferTime)
         {
             mGenReqKvCacheTransferLatency.report();
+            mKvCacheThroughput.report();
         }
     }
 
@@ -396,12 +405,16 @@ public:
                 auto excludeFirstIterIngterHeader = mGenExcludeFirstIterT2TLatency.genHeaders();
                 headers.insert(headers.end(), std::make_move_iterator(excludeFirstIterIngterHeader.begin()),
                     std::make_move_iterator(excludeFirstIterIngterHeader.end()));
+                headers.push_back("avg_user_tokens_per_second(tokens/sec/user)");
             }
             if (mCalculateKVCacheTransferTime)
             {
                 auto genReqKVCacheTransferHeader = mGenReqKvCacheTransferLatency.genHeaders();
                 headers.insert(headers.end(), std::make_move_iterator(genReqKVCacheTransferHeader.begin()),
                     std::make_move_iterator(genReqKVCacheTransferHeader.end()));
+                auto kvCacheTpHeader = mKvCacheThroughput.genHeaders();
+                headers.insert(headers.end(), std::make_move_iterator(kvCacheTpHeader.begin()),
+                    std::make_move_iterator(kvCacheTpHeader.end()));
             }
 
             std::ofstream outputFile(mOpCsvFile);
@@ -421,11 +434,11 @@ public:
                 {
 
                     outputFile << "," << mGenFirstTokenLatency << "," << mGenT2TLatency << ","
-                               << mGenExcludeFirstIterT2TLatency;
+                               << mGenExcludeFirstIterT2TLatency << "," << mAvgUserTokensPerSecond;
                 }
                 if (mCalculateKVCacheTransferTime)
                 {
-                    outputFile << "," << mGenReqKvCacheTransferLatency;
+                    outputFile << "," << mGenReqKvCacheTransferLatency << "," << mKvCacheThroughput;
                 }
 
                 outputFile << "\n";
@@ -488,6 +501,8 @@ private:
     RecordTimeMetric mGenReqQueuingLatency{"gen_req_queueing_latency"};
     RecordTimeMetric mGenReqKvCacheTransferLatency{"gen_req_kv_cache_transfer_latency"};
 
+    RecordBwMetric mKvCacheThroughput{"gen_req_kv_cache_transfer_throughput"};
+
     float mTokenThroughput{};
     float mAcceptanceRate{};
 
@@ -499,6 +514,7 @@ private:
     bool mOutputHasInput;
     bool mCalculateKVCacheTransferTime;
     bool mCalculateQueueTime;
+    float mAvgUserTokensPerSecond{};
 };
 
 texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const& beamWidth,
@@ -518,12 +534,16 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // embeddingBias
             std::nullopt,    // speculativeDecoding
             std::nullopt,    // pTuning
+            std::nullopt,    // multimodalInput
+            std::nullopt,    // multimodalEmbedding
             std::nullopt,    // mRopeConfig
             loraConfig,      // loraConfig
             lookaheadConfig, // lookaheadConfig
             std::nullopt,    // kvCacheRetentionConfig
             std::nullopt,    // logitsPostProcessorName
-            encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
+            std::nullopt,    // logitsPostProcessor
+            encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
+            std::nullopt);   // cacheSaltID
     request.setRequestType(tensorrt_llm::executor::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
     return request;
 }
@@ -617,6 +637,8 @@ public:
                                                                                 : texec::DecodingMode::Auto(),
                     benchmarkParams.executorLookaheadConfig, benchmarkParams.medusaChoices));
             executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
+            executorConfig.setCacheTransceiverConfig(
+                texec::CacheTransceiverConfig(texec::CacheTransceiverConfig::BackendType::DEFAULT));
             constexpr int maxIterationsForRequestStats = 1000;
             if (mEnableCollectKvCacheTransferTime)
             {
@@ -855,24 +877,31 @@ public:
 
             if (mEnableCollectKvCacheTransferTime)
             {
-
                 for (std::size_t i = 0; i < generationRequestStatsPerIteration.size(); i++)
                 {
                     auto const& stats = generationRequestStatsPerIteration.at(i);
                     for (auto const& stat : stats)
                     {
                         std::vector<float> kvCacheTransferMs;
+                        std::vector<float> kvCacheThroughput;
                         for (auto const& requestStat : stat.requestStats)
                         {
                             if (requestStat.stage == tensorrt_llm::executor::RequestStage::kGENERATION_COMPLETE)
                             {
                                 kvCacheTransferMs.push_back(
                                     static_cast<float>(requestStat.disServingStats->kvCacheTransferMS));
+                                kvCacheThroughput.push_back(static_cast<float>(requestStat.disServingStats->kvCacheSize)
+                                    * 8 / (static_cast<float>(requestStat.disServingStats->kvCacheTransferMS) / 1000)
+                                    / 1e9f);
                             }
                         }
                         if (kvCacheTransferMs.size() > 0)
                         {
                             mRecorder->recordKvCacheTransferLatency(kvCacheTransferMs);
+                        }
+                        if (kvCacheThroughput.size() > 0)
+                        {
+                            mRecorder->recordKvCacheThroughput(kvCacheThroughput);
                         }
                         if (mLogIterationData)
                         {
@@ -1117,7 +1146,7 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
 int main(int argc, char* argv[])
 
 {
-    cxxopts::Options options("TensorRT-LLm DisaggServer Benchmark");
+    cxxopts::Options options("TensorRT LLM DisaggServer Benchmark");
     options.add_options()("h,help", "Print usage");
     options.add_options()("context_engine_dirs", "Directories that store context engines,separator is a ,",
         cxxopts::value<std::vector<std::string>>());

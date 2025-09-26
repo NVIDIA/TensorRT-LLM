@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <c10/cuda/CUDAFunctions.h>
+#include <cstdint>
 
 namespace th = torch;
 
@@ -47,7 +48,7 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const maxBatchSize, size_t const maxB
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto const currentDeviceId = c10::cuda::current_device();
-    auto cudaStreamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>(stream, currentDeviceId);
+    auto cudaStreamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>(stream, currentDeviceId, false);
     auto bufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(cudaStreamPtr);
 
     mFinishedSum = bufferManager->pinnedPool(
@@ -65,13 +66,12 @@ namespace
 template <typename T>
 void safeInsert(th::optional<th::Tensor>& tensor, std::optional<std::vector<T>>& arg)
 {
-    using valueType = T;
     if (tensor.has_value())
     {
-        auto ptr = get_ptr<valueType>(tensor.value());
         auto shape = convert_shape(tensor.value());
         size_t const size = tensorrt_llm::runtime::ITensor::volume(shape);
-        arg = std::vector<valueType>(ptr, ptr + size);
+        auto ptr = get_ptr<T>(tensor.value());
+        arg = std::vector<T>(ptr, ptr + size);
     }
 }
 
@@ -124,7 +124,8 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
     th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
-    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> min_p_opt, bool output_log_probs,
+    bool cum_log_probs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     mBeamWidth = beam_width;
@@ -137,9 +138,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     safeInsert(presence_penalty_opt, penaltyParams->presencePenalty);
     safeInsert(frequency_penalty_opt, penaltyParams->frequencyPenalty);
     safeInsert(min_length_opt, penaltyParams->minLength);
-
     safeInsert(no_repeat_ngram_size_opt, banWordsParams->noRepeatNgramSize);
-
     if (beam_width == 1)
     {
         auto decodingParams = std::make_shared<tl::SamplingSetupParams>();
@@ -148,6 +147,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
         safeInsert(top_p_decay_opt, decodingParams->topPDecay);
         safeInsert(top_p_min_opt, decodingParams->topPMin);
         safeInsert(top_p_reset_ids_opt, decodingParams->topPResetIds);
+        safeInsert(min_p_opt, decodingParams->runtimeMinP);
         decodingParams->outputLogProbs = std::vector<bool>({output_log_probs});
         decodingParams->cumLogProbs = std::vector<bool>({cum_log_probs});
         safeInsert(random_seed_opt, decodingParams->randomSeed);
@@ -236,7 +236,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     {
         outputParams = std::make_shared<tl::BaseDecodingOutputs>(outputIdsConverted);
     }
-    outputParams->newTokens = std::move(convert_tensor<tr::TokenIdType>(newTokens));
+    outputParams->newTokens = convert_tensor<tr::TokenIdType>(newTokens);
     safeUpdate<tk::FinishedState::UnderlyingType>(finishedInput, forwardParams->finished);
     safeUpdate<tk::FinishedState::UnderlyingType>(finishedOutput, outputParams->finished);
     safeUpdate<tr::SizeType32>(sequenceLengthsOpt, outputParams->sequenceLength);
@@ -261,7 +261,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     {
         auto outputsBeamSearch = std::dynamic_pointer_cast<tl::BeamSearchOutputs>(outputParams);
         TLLM_CHECK_WITH_INFO(tgtCacheIndirectionOpt.has_value(), "tgtCacheIndirection must be set for beam search");
-        outputsBeamSearch->tgtCacheIndirection = std::move(convert_tensor<int>(tgtCacheIndirectionOpt.value()));
+        outputsBeamSearch->tgtCacheIndirection = convert_tensor<int>(tgtCacheIndirectionOpt.value());
         if (useBeamHyps)
         {
             // Additional parameters for beam search
@@ -282,7 +282,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     if (finishedSumHost)
     {
         TLLM_CUDA_CHECK(::cudaStreamSynchronize(mDynamicDecodeLayer->getStream()));
-        tr::SizeType32 numRealFinished = 0;
+        uint32_t numRealFinished = 0;
         for (int32_t bi = 0; bi < localBatchSize; ++bi)
         {
             numRealFinished += finishedSumHost[bi];
@@ -332,8 +332,8 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     th::optional<th::Tensor> lengthPenaltyOpt, th::optional<th::Tensor> earlyStoppingOpt,
     th::optional<th::Tensor> beamSearchDiversityRateOpt, th::optional<th::Tensor> randomSeedOpt,
     th::optional<th::Tensor> topPDecayOpt, th::optional<th::Tensor> topPMinOpt,
-    th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt, bool outputLogProbs,
-    bool cumLogProbs)
+    th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt,
+    th::optional<th::Tensor> minPOpt, bool outputLogProbs, bool cumLogProbs)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     // TODO: add parameters "normalizeLogProbs" and "topKMedusaHeads"
@@ -346,17 +346,18 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     CHECK_OPTIONAL_CPU_INPUT(minLengthOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(lengthPenaltyOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(earlyStoppingOpt, torch::kInt32);
-    CHECK_OPTIONAL_CPU_INPUT(noRepeatNgramSizeOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(beamSearchDiversityRateOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(randomSeedOpt, torch::kInt64);
     CHECK_OPTIONAL_INPUT(topPDecayOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPMinOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPResetIdsOpt, torch::kInt32);
+    CHECK_OPTIONAL_CPU_INPUT(noRepeatNgramSizeOpt, torch::kInt32);
+    CHECK_OPTIONAL_CPU_INPUT(minPOpt, torch::kFloat);
 
     dynamicDecode_->setup(static_cast<tr::SizeType32>(batchSize), static_cast<tr::SizeType32>(beamWidth),
         runtimeTopKOpt, runtimeTopPOpt, temperatureOpt, repetitionPenaltyOpt, presencePenaltyOpt, frequencyPenaltyOpt,
         minLengthOpt, lengthPenaltyOpt, earlyStoppingOpt, beamSearchDiversityRateOpt, randomSeedOpt, topPDecayOpt,
-        topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, outputLogProbs, cumLogProbs);
+        topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, minPOpt, outputLogProbs, cumLogProbs);
 }
 
 th::Tensor DynamicDecodeOp::forward(

@@ -35,7 +35,7 @@ QuantizeTensorPlugin::QuantizeTensorPlugin(void const* data, size_t length)
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -134,7 +134,7 @@ int QuantizeTensorPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             stream, mProp.maxGridSize[0]);
     }
 #endif
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -182,7 +182,7 @@ size_t QuantizeTensorPlugin::getSerializationSize() const noexcept
 void QuantizeTensorPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void QuantizeTensorPlugin::destroy() noexcept

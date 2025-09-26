@@ -24,12 +24,15 @@ import torch
 from datasets import load_dataset
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
-from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, load_tokenizer,
-                   read_model_name, supports_inflight_batching)
+from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, get_beam_width_array,
+                   load_tokenizer, read_model_name, supports_inflight_batching)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm._utils import mpi_broadcast, str_dtype_to_torch
+from tensorrt_llm.builder import EngineConfig
+from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
+from tensorrt_llm.layers import MropeParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.qwen.utils import make_context
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -38,16 +41,63 @@ from tensorrt_llm.tools.ppl import ppl
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
+
+
+def ensemble_mrope_params(batch_input_ids, max_position_embeddings,
+                          rotary_embedding_dim, theta):
+    mrope_params = MropeParams()
+    batch_size = len(batch_input_ids)
+
+    _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+        num_pos=max_position_embeddings,
+        dim=rotary_embedding_dim,
+        theta=1000000.0,
+        scale_type=RotaryScalingType.mrope,
+    )
+    rotary_cos_sin = torch.tensor(rotary_cos_sin).to(batch_input_ids[0].device)
+    rotary_cos_sin = rotary_cos_sin.reshape(max_position_embeddings,
+                                            int(rotary_embedding_dim / 2), 2)
+
+    cos_ori = rotary_cos_sin[:, :, 0]
+    sin_ori = rotary_cos_sin[:, :, 1]
+
+    mrope_position_ids_padding = torch.zeros(
+        (batch_size, max_position_embeddings), dtype=torch.int32)
+    for i in range(batch_size):
+        seq_len = batch_input_ids[i].shape[-1]
+        mrope_position_ids_padding[i, :seq_len] = torch.arange(
+            seq_len, device=batch_input_ids[i].device)
+
+    cos = cos_ori[mrope_position_ids_padding].unsqueeze(-1)
+    sin = sin_ori[mrope_position_ids_padding].unsqueeze(-1)
+
+    mrope_params.mrope_rotary_cos_sin = torch.concatenate(
+        (cos, sin), axis=-1).reshape(batch_size, -1)
+    mrope_params.mrope_position_deltas = torch.zeros(
+        [batch_size, 1], device=batch_input_ids[0].device)
+
+    return mrope_params
 
 
 def main(args):
+    is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+    if is_integration_test:
+        logger.info(
+            "Running in integration test mode - will only run one batch and skip accuracy checks"
+        )
+        logger.info(
+            "Setting max_ite=1 and check_accuracy=False for integration test")
+        args.max_ite = 1
+        args.check_accuracy = False
+
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
     test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
     test_trt_llm = args.test_trt_llm
-    model_name, model_version = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(
+        args.engine_dir if not test_hf else args.hf_model_dir, test_hf)
     if args.hf_model_dir is None:
         logger.warning(
             "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -110,7 +160,9 @@ def main(args):
     dataset = load_dataset(dataset_name,
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
-                           split=dataset_split)
+                           split=dataset_split,
+                           trust_remote_code=True)
+    dataset = dataset.shuffle(args.random_seed)
 
     max_batch_size = args.batch_size
 
@@ -142,6 +194,11 @@ def main(args):
         bad_words_list = tensorrt_llm.runtime.decode_words_list(
             args.bad_words, tokenizer)
 
+    if args.beam_width_array is not None:
+        logger.info("Use Variable-Beam-Width-Search")
+        args.beam_width_array, args.num_beams = get_beam_width_array(
+            args.beam_width_array)
+
     num_beams = args.num_beams
     num_return_sequences = args.num_return_sequences
     num_sequences = args.num_return_sequences or num_beams
@@ -150,6 +207,7 @@ def main(args):
     temperature = args.temperature
     length_penalty = args.length_penalty
     early_stopping = args.early_stopping
+    beam_width_array = args.beam_width_array
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
@@ -168,7 +226,6 @@ def main(args):
                 f.write(f'Model path: {args.hf_model_dir}\n')
                 f.write(f'Tokenizer path: {args.tokenizer_dir}\n')
 
-    # TODO: Add random_seed flag in gptj
     rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
         args.rouge_dir) else "rouge"
     metric_tensorrt_llm = [
@@ -244,22 +301,34 @@ def main(args):
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens,
                                           min_input_length=min_input_length)
-        batch_size = len(batch_input_ids)
-        if batch_size == 0:
+        # Generate mrope params for qwen model
+        engine_config = EngineConfig.from_json_file(
+            f"{args.engine_dir}/config.json")
+        pretrain_config = engine_config.pretrained_config
+        mrope_params = None
+        if 'qwen' in model_name.lower():
+            mrope_params = ensemble_mrope_params(
+                batch_input_ids,
+                max_position_embeddings=pretrain_config.max_position_embeddings,
+                rotary_embedding_dim=pretrain_config.rotary_embedding_dim,
+                theta=pretrain_config.rotary_base,
+            )
+
+        if batch_size == 0 or len(batch_input_ids) == 0:
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
-        if args.prompt_lookup_config is not None:
-            # Speculative decoding of Prompt-Lookup-Decoding (PLD)
-            outputs = run_dtm_pld(batch_input_ids,
-                                  args,
-                                  runtime_rank,
-                                  end_id,
-                                  pad_id,
-                                  stop_words_list,
-                                  bad_words_list,
-                                  tokenizer.vocab_size,
-                                  target_runner=runner)
+        if args.ngram_config is not None:
+            # Speculative decoding of NGram
+            outputs = run_dtm_ngram(batch_input_ids,
+                                    args,
+                                    runtime_rank,
+                                    end_id,
+                                    pad_id,
+                                    stop_words_list,
+                                    bad_words_list,
+                                    tokenizer.vocab_size,
+                                    target_runner=runner)
             if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
                 outputs, runner = list(outputs)[0]
         else:  # Normal run
@@ -280,16 +349,19 @@ def main(args):
                     num_return_sequences=num_return_sequences,
                     length_penalty=length_penalty,
                     early_stopping=early_stopping,
+                    beam_width_array=beam_width_array,
                     repetition_penalty=repetition_penalty,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                     lora_uids=args.lora_task_uids,
                     lookahead_config=args.lookahead_config,
                     output_sequence_lengths=True,
+                    output_generation_logits=eval_ppl,
                     return_dict=True,
                     random_seed=random_seed,
                     medusa_choices=args.medusa_choices,
-                    eagle_choices=args.eagle_choices)
+                    eagle_choices=args.eagle_choices,
+                    mrope_params=mrope_params)
                 torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
@@ -331,7 +403,7 @@ def main(args):
                         ],
                                                 dim=0)
                         curr_ppl = ppl(curr_logits, curr_ids)
-                        logger.debug(f"TensorRT-LLM PPL: {curr_ppl:.3f} | "
+                        logger.debug(f"TensorRT LLM PPL: {curr_ppl:.3f} | "
                                      f"Generation length: {curr_gen_len}")
                         ppls[batch_idx].append(curr_ppl)
             return output_beams_list, output_ids_list, ppls, lengths_info
@@ -471,37 +543,13 @@ def main(args):
             f"Using {'Python' if args.use_py_session else 'C++'} session")
 
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-        runner_kwargs = dict(engine_dir=args.engine_dir,
-                             rank=runtime_rank,
-                             debug_mode=args.debug_mode,
-                             gpu_weights_percent=args.gpu_weights_percent)
-        if args.medusa_choices is not None:
-            args.medusa_choices = ast.literal_eval(args.medusa_choices)
-            assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
-            assert args.num_beams == 1, "Medusa should use num_beams == 1"
-            runner_kwargs.update(medusa_choices=args.medusa_choices)
-        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None:
-            args.eagle_choices = ast.literal_eval(args.eagle_choices)
-            assert args.num_beams == 1, "Eagle should use num_beams == 1"
-            runner_kwargs.update(eagle_choices=args.eagle_choices)
-            runner_kwargs.update(
-                eagle_posterior_threshold=args.eagle_posterior_threshold)
-        if args.lookahead_config is not None:
-            args.lookahead_config = ast.literal_eval(args.lookahead_config)
-            assert len(
-                args.lookahead_config
-            ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
-            runner_kwargs.update(lookahead_config=args.lookahead_config)
-        if args.prompt_lookup_config is not None:
-            assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
-            assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
-            assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
-            prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
-                args.prompt_lookup_config)
-            args.max_output_len = output_len  # Specialization for PLD
-            runner_kwargs.update(is_orchestrator_mode=True,
-                                 device_ids=target_device_list)
-
+        runner_kwargs = dict(
+            engine_dir=args.engine_dir,
+            rank=runtime_rank,
+            debug_mode=args.debug_mode,
+            gpu_weights_percent=args.gpu_weights_percent,
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
         if not args.use_py_session:
             runner_kwargs.update(
                 lora_dir=args.lora_dir,
@@ -518,16 +566,51 @@ def main(args):
                 kv_cache_free_gpu_memory_fraction,
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
-                cuda_graph_mode=args.cuda_graph_mode)
-        runner_kwargs.update(
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
-        if args.prompt_lookup_config is not None:
-            # Specialization for PLD since many call of `generate()` is needed
-            runner_kwargs.update(max_input_len=test_token_num +
-                                 prompt_lookup_num_tokens + output_len)
+                cuda_graph_mode=args.cuda_graph_mode,
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage,
+            )
+
+        if args.medusa_choices is not None:
+            args.medusa_choices = ast.literal_eval(args.medusa_choices)
+            assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
+            assert args.num_beams == 1, "Medusa should use num_beams == 1"
+            runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None or args.eagle_use_dynamic_tree:
+            assert args.num_beams == 1, "Eagle should use num_beams == 1"
+            if args.eagle_choices is not None and not args.eagle_use_dynamic_tree:
+                args.eagle_choices = ast.literal_eval(args.eagle_choices)
+                runner_kwargs.update(eagle_choices=args.eagle_choices)
+            if args.eagle_posterior_threshold is not None:
+                runner_kwargs.update(
+                    eagle_posterior_threshold=args.eagle_posterior_threshold)
+            if args.eagle_use_dynamic_tree:
+                runner_kwargs.update(
+                    eagle_use_dynamic_tree=args.eagle_use_dynamic_tree)
+                assert args.eagle_dynamic_tree_max_top_k is not None and args.eagle_dynamic_tree_max_top_k > 0
+                runner_kwargs.update(eagle_dynamic_tree_max_top_k=args.
+                                     eagle_dynamic_tree_max_top_k)
+        if args.lookahead_config is not None:
+            args.lookahead_config = ast.literal_eval(args.lookahead_config)
+            assert len(
+                args.lookahead_config
+            ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
+            runner_kwargs.update(lookahead_config=args.lookahead_config)
+        if args.ngram_config is not None:
+            assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
+            assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
+            assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
+            max_draft_len, _, target_device_list = ast.literal_eval(
+                args.ngram_config)
+            args.max_output_len = output_len  # Specialization for NGram
+            runner_kwargs.update(is_orchestrator_mode=True,
+                                 device_ids=target_device_list,
+                                 max_input_len=test_token_num + max_draft_len +
+                                 output_len)
+
         runner = runner_cls.from_dir(**runner_kwargs)
-        assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
-            "PPL evaluation requires engine built with gather_all_token_logits enabled"
+        assert not (args.eval_ppl and not runner.gather_context_logits), \
+            "PPL evaluation requires engine built with gather_context_logits enabled"
 
         datapoint = dataset[0:1]
         output, *_ = eval_trt_llm(datapoint,
@@ -539,10 +622,10 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("TensorRT-LLM Generated : ")
-            logger.info(f" Input : {datapoint[dataset_input_key]}")
-            logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
-            logger.info(f"\n Output : {output}")
+            logger.info("TensorRT LLM Generated: ")
+            logger.info(f" Input: {datapoint[dataset_input_key]}")
+            logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
+            logger.info(f"\n Output: {output}")
             logger.info(
                 "---------------------------------------------------------")
 
@@ -599,9 +682,9 @@ def main(args):
                                 )
 
                 logger.debug('-' * 100)
-                logger.debug(f"Input : {datapoint[dataset_input_key]}")
-                logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
-                logger.debug(f"Reference : {datapoint[dataset_output_key]}")
+                logger.debug(f"Input: {datapoint[dataset_input_key]}")
+                logger.debug(f'TensorRT LLM Output: {output_tensorrt_llm}')
+                logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
             ite_count += 1
@@ -656,10 +739,10 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("HF Generated : ")
-            logger.info(f" Input : {datapoint[dataset_input_key]}")
-            logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
-            logger.info(f"\n Output : {output}")
+            logger.info("HF Generated: ")
+            logger.info(f" Input: {datapoint[dataset_input_key]}")
+            logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
+            logger.info(f"\n Output: {output}")
             logger.info(
                 "---------------------------------------------------------")
 
@@ -712,9 +795,9 @@ def main(args):
                                 )
 
                 logger.debug('-' * 100)
-                logger.debug(f"Input : {datapoint[dataset_input_key]}")
+                logger.debug(f"Input: {datapoint[dataset_input_key]}")
                 logger.debug(f'HF Output: {output_hf}')
-                logger.debug(f"Reference : {datapoint[dataset_output_key]}")
+                logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
             ite_count += 1
@@ -724,34 +807,52 @@ def main(args):
         if test_trt_llm:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
-                f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
+                f'TensorRT LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
             )
 
             logger.info(
-                f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
+                f'TensorRT LLM (total output tokens: {total_output_token_count_trt_llm})'
             )
             logger.info(
-                f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
+                f'TensorRT LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
             )
             for beam_idx in range(num_sequences):
-                logger.info(f"TensorRT-LLM beam {beam_idx} result")
+                logger.info(f"TensorRT LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
-                    computed_metrics_tensorrt_llm = metric_tensorrt_llm[
-                        beam_idx].compute()
-                    for key in computed_metrics_tensorrt_llm.keys():
-                        logger.info(
-                            f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
-                        )
+                    if args.estimate_accuracy_std_dev:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute(use_aggregator=False)
+                        computed_std_dev_tensorrt_llm = {
+                            key: np.std(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        computed_metrics_tensorrt_llm = {
+                            key: np.mean(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key}: {computed_metrics_tensorrt_llm[key]*100} ({computed_std_dev_tensorrt_llm[key]*100})"
+                            )
+                    else:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute()
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key}: {computed_metrics_tensorrt_llm[key]*100}"
+                            )
                     if args.check_accuracy and beam_idx == 0:
-                        assert computed_metrics_tensorrt_llm[
-                            'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
+                        rouge1 = computed_metrics_tensorrt_llm['rouge1'] * 100
+                        assert rouge1 > args.tensorrt_llm_rouge1_threshold, f"[FAILED] rouge1 ({rouge1}) is smaller than threshold ({args.tensorrt_llm_rouge1_threshold})."
                 if args.eval_ppl:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
                     )
                     if args.check_accuracy and beam_idx == 0:
                         avg_ppl = np.mean(ppls_trt_llm[beam_idx])
-                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})"
+                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})."
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
@@ -769,7 +870,7 @@ def main(args):
                 computed_metrics_hf = metric_hf[beam_idx].compute()
                 if args.eval_task != "eval_context_ppl":
                     for key in computed_metrics_hf.keys():
-                        logger.info(f'  {key} : {computed_metrics_hf[key]*100}')
+                        logger.info(f'  {key}: {computed_metrics_hf[key]*100}')
                 if args.eval_ppl and args.batch_size == 1:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_hf[beam_idx])}")
@@ -788,6 +889,7 @@ if __name__ == '__main__':
                             'eval_context_ppl'
                         ])
     parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--estimate_accuracy_std_dev', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
                         default=15.0)
@@ -821,7 +923,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help="Directory where to save output sentences. 'trtllm.out' for "
-        "TensorRT-LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
+        "TensorRT LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
         "save outputs.")
     parser.add_argument(
         '--rouge_dir',
@@ -830,6 +932,10 @@ if __name__ == '__main__':
         help=
         "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
     )
+    parser.add_argument("--use_gpu_direct_storage",
+                        default=False,
+                        action="store_true",
+                        help="Use GPUDirect Storage (GDS) to load the engine")
     parser = add_common_args(parser)
     args = parser.parse_args()
 

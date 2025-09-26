@@ -186,7 +186,7 @@ class ResnetBlock2D(Module):
             self.nonlinearity = silu
 
         self.upsample = self.downsample = None
-        #TODO (guomingz) add the fir kernel supporting.
+        #TODO add the fir kernel supporting.
         if self.up:
             if kernel == "sde_vp":
                 self.upsample = partial(interpolate,

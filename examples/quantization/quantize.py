@@ -5,9 +5,8 @@ import torch.multiprocessing as mp
 from tensorrt_llm.quantization import (quantize_and_export,
                                        quantize_nemo_and_export)
 
-mp.set_start_method("spawn", force=True)
-
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir",
                         help="Specify where the HuggingFace model is",
@@ -27,6 +26,12 @@ if __name__ == "__main__":
         "The device to run calibration; effective for HuggingFace model only.",
         default='cuda',
         choices=['cuda', 'cpu'])
+    parser.add_argument(
+        "--device_map",
+        help="How to map the model on the devices",
+        default="auto",
+        choices=["auto", "sequential", "cpu", "gpu"],
+    )
     parser.add_argument(
         '--calib_dataset',
         type=str,
@@ -63,7 +68,9 @@ if __name__ == "__main__":
         help="Quantization format.",
         default="full_prec",
         choices=[
+            "nvfp4",
             "fp8",
+            "fp8_pc_pt",
             "int8_sq",
             "int4_awq",
             "w4a8_awq",
@@ -104,6 +111,9 @@ if __name__ == "__main__":
                         help="KV Cache dtype.",
                         default=None,
                         choices=["int8", "fp8", None])
+    parser.add_argument("--quantize_lm_head",
+                        action='store_true',
+                        default=False)
     # Medusa
     parser.add_argument('--num_medusa_heads', type=int, default=4)
     parser.add_argument('--num_medusa_layers', type=int, default=1)
@@ -171,7 +181,9 @@ if __name__ == "__main__":
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
             quant_medusa_head=args.quant_medusa_head,
-            auto_quantize_bits=args.auto_quantize_bits)
+            auto_quantize_bits=args.auto_quantize_bits,
+            device_map=args.device_map,
+            quantize_lm_head=args.quantize_lm_head)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

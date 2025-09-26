@@ -1,0 +1,71 @@
+name: "preprocessing"
+backend: "python"
+max_batch_size: 1024
+input [
+    {
+        name: "QUERY"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+    },
+    {
+        name: "BAD_WORDS_DICT"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+    },
+    {
+        name: "STOP_WORDS_DICT"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+    },
+    {
+        name: "REQUEST_OUTPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    }
+]
+output [
+    {
+        name: "INPUT_ID"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    },
+    {
+        name: "REQUEST_INPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    {
+        name: "BAD_WORDS_IDS"
+        data_type: TYPE_INT32
+        dims: [ 2, -1 ]
+    },
+    {
+        name: "STOP_WORDS_IDS"
+        data_type: TYPE_INT32
+        dims: [ 2, -1 ]
+    },
+    {
+        name: "REQUEST_OUTPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    },
+    {
+        name: "PROMPT_LEARNING_TASK_NAME_IDS"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    }
+]
+
+parameters {
+  key: "tokenizer_dir"
+  value: {
+    string_value: "${tokenizer_dir}"
+  }
+}
+
+instance_group [
+    {
+        count: 1
+        kind: KIND_CPU
+    }
+]

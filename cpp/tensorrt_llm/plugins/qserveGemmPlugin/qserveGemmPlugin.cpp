@@ -64,7 +64,7 @@ QServeGemmPlugin::QServeGemmPlugin(void const* data, size_t length)
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -76,13 +76,6 @@ void QServeGemmPlugin::init(nvinfer1::DataType dtype, int groupSize)
     mGroupSize = groupSize;
     mType = dtype;
     mRunner = std::make_shared<QServeGemmRunner>();
-
-    int arch = tensorrt_llm::common::getSMVersion();
-
-    if (arch < 80)
-    {
-        TLLM_THROW("QServe W4A8 is unsupported on pre-Ampere (sm<80) architectures!");
-    }
 }
 
 // IPluginV2DynamicExt Methods
@@ -318,7 +311,7 @@ void QServeGemmPlugin::serialize(void* buffer) const noexcept
     write(d, mGroupSize);
     write(d, mDims);
 
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void QServeGemmPlugin::destroy() noexcept
@@ -335,8 +328,8 @@ QServeGemmPluginCreator::QServeGemmPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.push_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.push_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.push_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.push_back(PluginField("group_size", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -363,7 +356,7 @@ IPluginV2* QServeGemmPluginCreator::createPlugin(char const* name, PluginFieldCo
     PluginField const* fields = fc->fields;
 
     // bool perTokenScaling, perChannelScaling;
-    DataType dtype;
+    DataType dtype{};
     int group_size = -1;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)

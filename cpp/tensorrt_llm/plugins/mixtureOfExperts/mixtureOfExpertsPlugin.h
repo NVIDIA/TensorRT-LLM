@@ -18,10 +18,15 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
+#include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
-#include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
@@ -34,19 +39,30 @@
 
 namespace tensorrt_llm::plugins
 {
+namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using MoeMinLatencyParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MoeMinLatencyParams;
+using MOEParallelismConfig = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::MOEParallelismConfig;
+using QuantParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::QuantParams;
+using MoeGemmId = CUTLASS_MOE_GEMM_NAMESPACE::MoeGemmId;
+using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using ActivationParams = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::ActivationParams;
+using TmaWarpSpecializedGroupedGemmInput = CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
+
 class MixtureOfExpertsGemmProfiler;
-using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
 using MixtureOfExpertsPluginProfilerPtr = std::shared_ptr<MixtureOfExpertsGemmProfiler>;
+using GroupwiseQuantAlgo = tensorrt_llm::common::GroupwiseQuantAlgo;
 
 struct GemmIDMoe
 {
     int gemm_idx;
     int num_experts{};
-    int moe_k{};
-    MOEParallelismConfig parallelism_config{};
+    int experts_per_token{};
+    kernels::MOEParallelismConfig parallelism_config{};
     int64_t hidden{};
     int64_t inter{};
-    tensorrt_llm::ActivationType actfn{};
+    int64_t group_size{};
+    ActivationType actfn{};
     nvinfer1::DataType dtype{};
     nvinfer1::DataType wdtype{};
     tensorrt_llm::common::QuantMode quant_mode;
@@ -54,19 +70,22 @@ struct GemmIDMoe
 
     bool operator==(GemmIDMoe const& id) const
     {
-        return id.gemm_idx == gemm_idx && id.num_experts == num_experts && id.moe_k == moe_k
+        return id.gemm_idx == gemm_idx && id.num_experts == num_experts && id.experts_per_token == experts_per_token
             && id.parallelism_config == parallelism_config && id.hidden == hidden && id.inter == inter
-            && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.quant_mode == quant_mode
-            && id.determinism_mode == determinism_mode;
+            && id.group_size == group_size && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype
+            && id.quant_mode == quant_mode && id.determinism_mode == determinism_mode;
     }
 
     friend std::ostream& operator<<(std::ostream& out, GemmIDMoe const& id)
     {
-        out << "gemm idx, experts, k, parallelism_config, hidden, inter, actfn, dtype, weight "
+        out << "gemm idx, experts, experts_per_token, parallelism_config, hidden, inter, group_size, actfn, dtype, "
+               "weight "
                "type, parallelism mode, determinism mode="
-            << id.gemm_idx << "," << id.num_experts << "," << id.moe_k << "," << id.parallelism_config << ","
-            << id.hidden << "," << id.inter << "," << static_cast<int>(id.actfn) << "," << static_cast<int>(id.dtype)
-            << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << "," << id.determinism_mode;
+
+            << id.gemm_idx << "," << id.num_experts << "," << id.experts_per_token << "," << id.parallelism_config
+            << "," << id.hidden << "," << id.inter << "," << id.group_size << "," << static_cast<int>(id.actfn) << ","
+            << static_cast<int>(id.dtype) << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << ","
+            << id.determinism_mode;
         return out;
     }
 };
@@ -78,13 +97,14 @@ struct GemmIDMoeHash
     {
         size_t hash = std::hash<int>{}(id.gemm_idx);
         hash ^= std::hash<int>{}(id.num_experts);
-        hash ^= std::hash<int>{}(id.moe_k);
+        hash ^= std::hash<int>{}(id.experts_per_token);
         hash ^= std::hash<int>{}(id.parallelism_config.tp_size);
         hash ^= std::hash<int>{}(id.parallelism_config.ep_size);
         hash ^= std::hash<int>{}(id.parallelism_config.tp_rank);
         hash ^= std::hash<int>{}(id.parallelism_config.ep_rank);
         hash ^= std::hash<int>{}(id.hidden);
         hash ^= std::hash<int>{}(id.inter);
+        hash ^= std::hash<int>{}(id.group_size);
         hash ^= std::hash<int>{}(static_cast<int>(id.actfn));
         hash ^= std::hash<int>{}(static_cast<int>(id.dtype));
         hash ^= std::hash<int>{}(static_cast<int>(id.wdtype));
@@ -96,19 +116,16 @@ struct GemmIDMoeHash
 class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-    using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
-    using MOEExpertScaleNormalizationMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode;
     using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
-    using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
-
+    using LoraImplPtr = std::shared_ptr<tensorrt_llm::kernels::LoraImpl>;
     MixtureOfExpertsPlugin() = delete;
-    MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int top_k, int expert_hidden_size,
-        int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
-        nvinfer1::DataType weight_type, nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode,
-        bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
-        MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
-        int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
-        nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank);
+    MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int experts_per_token,
+        int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
+        ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
+        nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_final_scales,
+        bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank, bool force_determinism, int side_stream_id,
+        MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
+        LoraPluginProfilerPtr lora_profiler, int max_low_rank);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
         LoraPluginProfilerPtr lora_profiler);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
@@ -155,19 +172,19 @@ private:
     friend class MixtureOfExpertsGemmProfiler;
     std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> mMOERunner{};
     int mNumExperts{};
-    int mK{};
+    int mExpertsPerToken{};
     int64_t mExpertHiddenSize{};
     int64_t mExpertInterSize{};
-    tensorrt_llm::ActivationType mActivationType;
+    int64_t mGroupwiseQuantAlgo{};
+    int64_t mGroupSize{};
+    ActivationType mActivationType;
     nvinfer1::DataType mType{};
     nvinfer1::DataType mWeightType{};
     nvinfer1::DataType mOutputType{};
     tensorrt_llm::common::QuantMode mQuantMode;
-    bool mUseFinished{};
+    bool mUseFinalScales{};
     bool mUseBias{};
     MOEParallelismConfig mParallelismConfig{};
-    MOEExpertScaleNormalizationMode mNormalizationMode{};
-    float mSparseMixerEpsilon = false;
 
     GemmDims mDims{};
     bool mUseDeterministicKernels = false;
@@ -211,10 +228,7 @@ private:
     struct WorkspaceInfo
     {
         void* workspace{};
-        void* scale_probs{};
-        void* fc2_output{};
         void* src_to_dest_map{};
-        void* selected_experts{};
         void* lora_workspace{};
         size_t size{};
     };
@@ -222,12 +236,13 @@ private:
     int64_t getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
     WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
-    kernels::MOEParallelismConfig getParallelismConfig() const;
-    kernels::QuantParams getQuantParams(void const* scale_1, void const* scale_2, void const* scale_3 = nullptr,
-        void const* scale_4 = nullptr, void const* scale_5 = nullptr) const;
+    MOEParallelismConfig getParallelismConfig() const;
+    QuantParams getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs,
+        int scale_1_idx = -1, int scale_2_idx = -1, int scale_3_idx = -1, int scale_4_idx = -1, int scale_5_idx = -1,
+        int scale_6_idx = -1, int scale_7_idx = -1, int scale_8_idx = -1) const;
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
-    kernels::LoraParams getLoraParams(
+    tensorrt_llm::kernels::LoraParams getLoraParams(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace);
 
     enum class RequestType : int32_t
@@ -244,19 +259,19 @@ private:
         return 0;
     }
 
-    constexpr static IndexType getRoutingTensorIndex()
-    {
-        return getInputTensorIndex() + 1;
-    }
-
     constexpr static IndexType getExpertWeights1Index()
     {
-        return getRoutingTensorIndex() + 1;
+        return getInputTensorIndex() + 1;
     }
 
     constexpr static IndexType getExpertWeights2Index()
     {
         return getExpertWeights1Index() + 1;
+    }
+
+    constexpr static IndexType getTokenSelectedExpertsIndex()
+    {
+        return getExpertWeights2Index() + 1;
     }
 
     // Conditional inputs, we only allocate a new index if actually used
@@ -265,9 +280,9 @@ private:
         return mUseBias;
     }
 
-    bool hasFinishedTensor() const
+    bool hasFinalScales() const
     {
-        return mUseFinished;
+        return mUseFinalScales;
     }
 
     bool hasExpertIntQuantScales() const
@@ -285,6 +300,31 @@ private:
         return hasExpertFp8QuantScales() && mOutputType == nvinfer1::DataType::kFP8;
     }
 
+    bool hasFP4QuantScales() const
+    {
+        return mQuantMode.hasNvfp4();
+    }
+
+    bool hasGroupwiseIntQuantScales() const
+    {
+        return mGroupwiseQuantAlgo > 0;
+    }
+
+    bool hasExpertWeightQuantZeros() const
+    {
+        return mGroupwiseQuantAlgo & GroupwiseQuantAlgo::ZERO;
+    }
+
+    bool hasExpertPrequantScales() const
+    {
+        return mGroupwiseQuantAlgo & GroupwiseQuantAlgo::PRE_QUANT_SCALE;
+    }
+
+    bool hasGroupwiseFp8Alpha() const
+    {
+        return mGroupwiseQuantAlgo & GroupwiseQuantAlgo::FP8_ALPHA;
+    }
+
     bool useSideStream() const
     {
         return mSideStreamId > 0;
@@ -300,9 +340,14 @@ private:
         return mUseLora && isGatedActivation(mActivationType);
     }
 
+    IndexType getTokenFinalScalesIndex() const
+    {
+        return getTokenSelectedExpertsIndex() + hasFinalScales();
+    }
+
     IndexType getExpertBias1Index() const
     {
-        return getExpertWeights2Index() + hasBias();
+        return getTokenFinalScalesIndex() + hasBias();
     }
 
     IndexType getExpertBias2Index() const
@@ -310,14 +355,12 @@ private:
         return getExpertBias1Index() + hasBias();
     }
 
-    IndexType getFinishedTensorIndex() const
-    {
-        return getExpertBias2Index() + hasFinishedTensor();
-    }
-
+    /*
+     * Weight-Only int quant scales
+     */
     IndexType getExpertIntQuantScale1Index() const
     {
-        return getFinishedTensorIndex() + hasExpertIntQuantScales();
+        return getExpertBias2Index() + hasExpertIntQuantScales();
     }
 
     IndexType getExpertIntQuantScale2Index() const
@@ -325,6 +368,9 @@ private:
         return getExpertIntQuantScale1Index() + hasExpertIntQuantScales();
     }
 
+    /*
+     * FP8 Quant Scales
+     */
     IndexType getExpertFP8Dequant1Index() const
     {
         return getExpertIntQuantScale2Index() + hasExpertFp8QuantScales();
@@ -350,9 +396,78 @@ private:
         return getExpertFP8QuantFinalIndex() + (hasExpertFp8QuantScales() && hasLora());
     }
 
+    /*
+     * FP4 Quant Scales
+     */
+    IndexType getFP4GlobalActSF1Index() const
+    {
+        return getInputFP8DequantIndex() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4WeightSF1Index() const
+    {
+        return getFP4GlobalActSF1Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4GlobalSF1Index() const
+    {
+        return getFP4WeightSF1Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4GlobalActSF2Index() const
+    {
+        return getFP4GlobalSF1Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4WeightSF2Index() const
+    {
+        return getFP4GlobalActSF2Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4GlobalSF2Index() const
+    {
+        return getFP4WeightSF2Index() + hasFP4QuantScales();
+    }
+
+    /*
+     * Groupwise Params
+     */
+    IndexType getExpertPrequantScales1Index() const
+    {
+        return getFP4GlobalSF2Index() + hasExpertPrequantScales();
+    }
+
+    IndexType getExpertPrequantScales2Index() const
+    {
+        return getExpertPrequantScales1Index() + hasExpertPrequantScales();
+    }
+
+    IndexType getExpertIntQuantZeros1Index() const
+    {
+        return getExpertPrequantScales2Index() + hasExpertWeightQuantZeros();
+    }
+
+    IndexType getExpertIntQuantZeros2Index() const
+    {
+        return getExpertIntQuantZeros1Index() + hasExpertWeightQuantZeros();
+    }
+
+    IndexType getExpertFp8Alpha1Index() const
+    {
+        return getExpertIntQuantZeros2Index() + hasGroupwiseFp8Alpha();
+    }
+
+    IndexType getExpertFp8Alpha2Index() const
+    {
+        return getExpertFp8Alpha1Index() + hasGroupwiseFp8Alpha();
+    }
+
+    /*
+     * LoRA params
+     */
     IndexType getLoraFC1WeightPtrsIndex() const
     {
-        return getInputFP8DequantIndex() + hasLora();
+        return getExpertFp8Alpha2Index() + hasLora();
     }
 
     IndexType getLoraFC1RanksIndex() const
@@ -432,9 +547,16 @@ private:
     /**
      * Get quantization dimension scaling factor
      */
-    int getWeightPackedElements() const
+    std::pair<int, int> getWeightPackedElements() const
     {
-        return mQuantMode.hasInt4Weights() ? 2 : 1;
+        if (mGroupwiseQuantAlgo == 0)
+        {
+            return {1, mQuantMode.hasInt4Weights() ? 2 : 1};
+        }
+        else
+        {
+            return {1, 4};
+        }
     }
 };
 
@@ -448,7 +570,7 @@ public:
         // NOTE: Do not access mPlugin here, since we are called from the constructor before all fields are init
     }
 
-    void setGemmToProfile(tensorrt_llm::kernels::GemmProfilerBackend::GemmToProfile gemm_to_profile)
+    void setGemmToProfile(kernels::GemmProfilerBackend::GemmToProfile gemm_to_profile)
     {
         // Just set the backend directly. This will just be reused in checkInit().
         backend.mGemmToProfile = gemm_to_profile;
@@ -476,7 +598,7 @@ protected:
     void checkInit();
 
     bool init_backend = false;
-    tensorrt_llm::kernels::GemmProfilerBackend backend{};
+    kernels::GemmProfilerBackend backend{};
 
 private:
     int mMaxProfileM = 0;

@@ -8,7 +8,7 @@ from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, MOE, Attention, AttentionMaskType,
                        BlockSparseAttnParams, ColumnLinear, Embedding,
                        LayerNorm, MoeConfig, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -110,6 +110,7 @@ class Phi3DecoderLayer(Module):
             rope_scaling_short_mscale=rope_scaling_short_mscale,
             rope_scaling_long_mscale=rope_scaling_long_mscale,
             original_max_position_embeddings=original_max_position_embeddings,
+            rotary_embedding_percentage=config.rotary_pct,
             block_sparse_params=block_sparse_attn_params)
 
         ClsMLP = MLP
@@ -250,12 +251,26 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
                                gather_output=True)
-        self.trtllm_modules_to_hf_modules = {
-            "attn_qkv": ["qkv_proj", "query_key_value"],
-            "attn_dense": ["o_proj", "dense"],
-            "mlp_h_to_4h": ["gate_up_proj", "up_proj"],
-            "mlp_4h_to_h": "down_proj",
-        }
+
+        if self.moe_variant:
+            self.trtllm_modules_to_hf_modules = {
+                "attn_q": "q_proj",
+                "attn_k": "k_proj",
+                "attn_v": "v_proj",
+                "attn_dense": "o_proj",
+                "moe_h_to_4h": "w1",
+                "moe_4h_to_h": "w2",
+                "moe_gate": "w3",
+                "moe_router": "gate",
+            }
+        else:
+            self.trtllm_modules_to_hf_modules = {
+                "attn_qkv": ["qkv_proj", "query_key_value"],
+                "attn_dense": ["o_proj", "dense"],
+                "mlp_h_to_4h": ["gate_up_proj", "up_proj"],
+                "mlp_4h_to_h": "down_proj",
+            }
+
         super().__init__(config, transformer, lm_head)
 
     @classmethod

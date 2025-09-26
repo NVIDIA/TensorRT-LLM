@@ -1,0 +1,29 @@
+methods:
+  __init__:
+    parameters:
+      index:
+        annotation: int
+        default: inspect._empty
+      text:
+        annotation: str
+        default: ''
+      token_ids:
+        annotation: Optional[List[int]]
+        default: []
+      finish_reason:
+        annotation: Optional[Literal['stop', 'length', 'timeout', 'cancelled']]
+        default: null
+      stop_reason:
+        annotation: Union[int, str, NoneType]
+        default: null
+      generation_logits:
+        annotation: Optional[torch.Tensor]
+        default: null
+      logprobs:
+        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]] | List[float]]
+        default: null
+      prompt_logprobs:
+        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]]]
+        default: null
+    return_annotation: None
+properties: {}

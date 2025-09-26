@@ -44,8 +44,8 @@ std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner,
 {
     switch (implType)
     {
-    case ImplType::kPrecompiled: return std::unique_ptr<DecoderXQAImpl>(new DecoderXQAImplPrecompiled(runner));
-    case ImplType::kJIT: return std::unique_ptr<DecoderXQAImpl>(new DecoderXQAImplJIT(runner));
+    case ImplType::kPrecompiled: return std::make_unique<DecoderXQAImplPrecompiled>(runner);
+    case ImplType::kJIT: return std::make_unique<DecoderXQAImplJIT>(runner);
     }
     // Shouldn't reach here.
     TLLM_THROW("Unknown DecoderXQAImpl::ImplType");

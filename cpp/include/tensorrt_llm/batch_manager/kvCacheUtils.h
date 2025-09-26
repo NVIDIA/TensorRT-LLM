@@ -21,6 +21,120 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+class BlockIterator;
+
+class BlockRange
+{
+public:
+    // C++20 std::default_sentinel_t equivalent
+    struct Sentinel
+    {
+    };
+
+    static BlockRange fromAllBlockIds(BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId,
+        SizeType32 beam = kFIRST_AND_ONLY_BEAM)
+    {
+        assert(kFIRST_AND_ONLY_BEAM == beam);
+        auto const windowSize = firstWindowSize(cacheManager);
+        auto const blockIds = cacheManager.getSequence(requestId).getCacheBlockIds(windowSize).at(kFIRST_AND_ONLY_BEAM);
+        return BlockRange(cacheManager, blockIds, requestId);
+    }
+
+    static BlockRange fromNewlyAllocatedBlockIds(
+        BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId)
+    {
+        auto const windowSize = firstWindowSize(cacheManager);
+        auto const blockIds = cacheManager.getNewlyAllocatedBlockIds(requestId, windowSize);
+        return BlockRange(cacheManager, blockIds, requestId);
+    }
+
+    BlockRange(runtime::ITensor::SharedPtr pool, std::vector<SizeType32> const& blockIds) // Only used in tests
+        : mManager{nullptr}
+        , mPool{std::move(pool)}
+        , mWindowSize{0}
+        , mRequestId{0}
+        , mBlockIds{blockIds}
+    {
+        TLLM_CHECK(mPool);
+    }
+
+    [[nodiscard]] BlockIterator begin() const;
+
+    [[nodiscard]] Sentinel end() const
+    {
+        return {};
+    }
+
+    [[nodiscard]] size_t size() const
+    {
+        return mBlockIds.size();
+    }
+
+    [[nodiscard]] std::vector<SizeType32> const& getBlockIds() const
+    {
+        return mBlockIds;
+    }
+
+    void setBlockIds(std::vector<SizeType32> blockIds)
+    {
+        mBlockIds = std::move(blockIds);
+    }
+
+    [[nodiscard]] std::vector<size_t> getBlockHashes() const
+    {
+        TLLM_CHECK(mManager);
+        std::vector<size_t> blockHashes;
+        blockHashes.reserve(mBlockIds.size());
+        auto& blockManager = mManager->getBlockManager();
+        for (auto id : mBlockIds)
+        {
+            blockHashes.emplace_back(blockManager.getBlockById(id, mWindowSize)->getHash());
+        }
+        return blockHashes;
+    }
+
+    void updatePoolIdx(SizeType32 poolIdx)
+    {
+        TLLM_CHECK(mManager);
+        mPool = mManager->getBlockManager().getPrimaryPool(poolIdx);
+        auto const newWindowSize = mManager->getBlockManager().getPoolWindowSize(poolIdx);
+        if (newWindowSize != mWindowSize)
+        {
+            mWindowSize = newWindowSize;
+            mBlockIds = mManager->getSequence(mRequestId).getCacheBlockIds(mWindowSize).at(kFIRST_AND_ONLY_BEAM);
+        }
+    }
+
+    friend class BlockIterator;
+
+private:
+    BlockRange(
+        BaseKVCacheManager const& cacheManager, std::vector<SizeType32> blockIds, LlmRequest::RequestIdType requestId)
+        : mManager(&cacheManager)
+        , mPool(cacheManager.getBlockManager().getPrimaryPool(kFIRST_POOL_INDEX))
+        , mWindowSize(firstWindowSize(cacheManager))
+        , mRequestId(requestId)
+        , mBlockIds(std::move(blockIds))
+    {
+    }
+
+    static SizeType32 firstWindowSize(BaseKVCacheManager const& cacheManager)
+    {
+        constexpr SizeType32 FIRST_POOL_IDX = 0;
+        return cacheManager.getBlockManager().getPoolWindowSize(FIRST_POOL_IDX);
+    }
+
+private:
+    BaseKVCacheManager const* mManager;
+    runtime::ITensor::SharedPtr mPool;
+    SizeType32 mWindowSize;
+    const LlmRequest::RequestIdType mRequestId;
+    std::vector<SizeType32> mBlockIds;
+
+    static constexpr SizeType32 kFIRST_AND_ONLY_BEAM = 0;
+    static constexpr SizeType32 kFIRST_POOL_INDEX = 0;
+};
+
 class BlockIterator
 {
 public:
@@ -30,13 +144,11 @@ public:
     using reference = value_type&;
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    BlockIterator(runtime::ITensor::SharedPtr blockPoolPtr, std::vector<SizeType32> blockIds, size_t idx)
-        : mPool{std::move(blockPoolPtr)}
-        , mBlockIds{std::move(blockIds)}
+    BlockIterator(BlockRange const* range, size_t idx)
+        : mRange{range}
         , mIdx{idx}
     {
-        TLLM_CHECK(mPool);
-        TLLM_CHECK(mIdx <= mBlockIds.size());
+        TLLM_CHECK(mIdx == 0 || mIdx < mRange->mBlockIds.size());
         update();
     }
 
@@ -60,8 +172,8 @@ public:
     BlockIterator operator++(int)
     {
         auto ret = *this;
-        ret.update();
         mIdx++;
+        update();
         return ret;
     }
 
@@ -72,10 +184,16 @@ public:
 
     [[nodiscard]] bool operator==(BlockIterator const& other) const
     {
-        return mIdx == other.mIdx && mPool.get() == other.mPool.get();
+        return mIdx == other.mIdx && mRange == other.mRange;
     }
 
-    [[nodiscard]] bool operator!=(BlockIterator const& other) const
+    [[nodiscard]] bool operator==(BlockRange::Sentinel other) const
+    {
+        return mIdx == mRange->mBlockIds.size();
+    }
+
+    template <class T>
+    [[nodiscard]] bool operator!=(T const& other) const
     {
         return !(*this == other);
     }
@@ -83,22 +201,20 @@ public:
 private:
     void update()
     {
-        if (mIdx < mBlockIds.size())
+        if (mIdx < mRange->mBlockIds.size())
         {
-            mCurrent = runtime::ITensor::slice(mPool, mBlockIds.at(mIdx), 1);
+            mCurrent = runtime::ITensor::slice(mRange->mPool, mRange->mBlockIds.at(mIdx), 1);
         }
     }
 
-    runtime::ITensor::SharedPtr mPool;
+    BlockRange const* mRange;
     runtime::ITensor::SharedPtr mCurrent;
-    const std::vector<SizeType32> mBlockIds;
     size_t mIdx;
 };
 
-[[nodiscard]] BlockIterator getBlockBeginIt(
-    BaseKVCacheManager const& cacheManager, LlmRequest const& request, SizeType32 beam, SizeType32 poolIdx);
-
-[[nodiscard]] BlockIterator getBlockEndIt(
-    BaseKVCacheManager const& cacheManager, LlmRequest const& request, SizeType32 beam, SizeType32 poolIdx);
+inline BlockIterator BlockRange::begin() const
+{
+    return {this, 0};
+}
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

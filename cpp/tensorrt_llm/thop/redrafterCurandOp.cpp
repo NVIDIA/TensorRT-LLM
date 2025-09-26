@@ -40,9 +40,9 @@ namespace torch_ext
 
 namespace
 {
-// Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] ExplicitDraftTokensLayer<T>::setup
+// Must be similar to ExplicitDraftTokensLayer<T>::setup
 void initializeDeviceCurandStates(
-    uint64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
+    int64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
 {
     auto* curandStatePtr = get_ptr<curandState_t>(curandState);
     tr::SizeType32* batchSlotsPtr = nullptr;
@@ -71,7 +71,7 @@ void initializeDeviceCurandStates(
         tk::invokeCurandInitialize(
             curandStatePtr, batchSlotsPtr, batchSize, tensorrt_llm::layers::DefaultDecodingParams::getSeed(), stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 } // namespace
 
@@ -158,7 +158,7 @@ void prepareRandomTensors(th::Tensor& curandState, // [maxBatchSize, 48], uint8_
 #endif // ENABLE_BF16
     default: throw std::runtime_error("Unsupported tensor type.");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace torch_ext

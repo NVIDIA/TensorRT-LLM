@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,18 +18,6 @@
 #pragma once
 #include <stddef.h>
 
-#ifdef _WIN32
-
-#if COMPILING_DLL
-#define DLLEXPORT __declspec(dllexport)
-#else
-#define DLLEXPORT __declspec(dllimport)
-#endif
-
-#else             // _WIN32
-#define DLLEXPORT // Nothing.
-#endif
-
 #if __cplusplus
 extern "C"
 {
@@ -40,8 +28,17 @@ extern "C"
         // sm >= 80
         TLLM_XQA_JIT_HMMA = 0,
         // sm == 90
-        TLLM_XQA_JIT_QGMMA = 1
+        TLLM_XQA_JIT_QGMMA = 1,
+        // sm == 120
+        TLLM_XQA_JIT_MLA = 2,
     } tllmXqaJitKernelType;
+
+    typedef enum
+    {
+        TLLM_XQA_JIT_ROPE_NONE = 0,
+        TLLM_XQA_JIT_ROPE_NEOX = 1,
+        TLLM_XQA_JIT_ROPE_GPTJ = 2
+    } tllmXqaJitRopeStyle;
 
     typedef struct
     {
@@ -54,6 +51,7 @@ extern "C"
         unsigned int beam_width;
         unsigned int tokens_per_block;
         bool multi_query_tokens;
+        unsigned int q_seq_len;
         bool paged_kv_cache;
 
         // Actual type: tensorrt_llm::kernels::Data_type
@@ -61,6 +59,13 @@ extern "C"
         int kv_cache_data_type;
 
         tllmXqaJitKernelType kernel_type;
+
+        bool fp8_output;
+        bool use_input_kv;
+        tllmXqaJitRopeStyle rope_style; // useful only when use_input_kv is true.
+
+        bool is_spec_dec_tree
+            = true; // useful only when multi_query_tokens, should be true unless using linear tree in spec-dec.
     } tllmXqaJitContext;
 
     // tllmXqaJitProgram is an opaque handle for a program.
@@ -74,18 +79,17 @@ extern "C"
     } tllmXqaJitStatus;
 
     // context must outlive prog.
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitCreateAndCompileProgram(
-        tllmXqaJitProgram* prog, tllmXqaJitContext const* context);
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitGetCUBINSize(tllmXqaJitProgram prog, size_t* cubinSizeRet);
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitGetCUBIN(tllmXqaJitProgram prog, char* cubin);
-    DLLEXPORT tllmXqaJitStatus tllmXqaJitDestroyProgram(tllmXqaJitProgram* prog);
+    tllmXqaJitStatus tllmXqaJitCreateAndCompileProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const* context);
+    tllmXqaJitStatus tllmXqaJitGetCUBINSize(tllmXqaJitProgram prog, size_t* cubinSizeRet);
+    tllmXqaJitStatus tllmXqaJitGetCUBIN(tllmXqaJitProgram prog, char* cubin);
+    tllmXqaJitStatus tllmXqaJitDestroyProgram(tllmXqaJitProgram* prog);
 
     // Returns the size of the error string associated with the last non-success tllmXqaJit function call (including the
     // trailing \0). Returns 0 if there is no such non-success function call.
-    DLLEXPORT size_t tllmXqaJitGetLastErrorStringSize();
+    size_t tllmXqaJitGetLastErrorStringSize();
     // Returns the error string.
     // Output can be nullptr if the returned value of tllmGetLastErrorStringSize() is 0.
-    DLLEXPORT void tllmXqaJitGetLastErrorString(char* output);
+    void tllmXqaJitGetLastErrorString(char* output);
 
 #if __cplusplus
 } // extern "C"

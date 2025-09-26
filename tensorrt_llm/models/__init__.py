@@ -20,6 +20,7 @@ from .bert.model import (BertForQuestionAnswering,
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
+from .clip.model import CLIPVisionTransformer
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
 from .commandr.model import CohereForCausalLM
@@ -32,7 +33,8 @@ from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
-from .gemma.config import GEMMA2_ARCHITECTURE, GEMMA_ARCHITECTURE, GemmaConfig
+from .gemma.config import (GEMMA2_ARCHITECTURE, GEMMA3_ARCHITECTURE,
+                           GEMMA_ARCHITECTURE, GemmaConfig)
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
 from .gpt.model import GPTForCausalLM, GPTModel
@@ -46,16 +48,20 @@ from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
 from .mllama.model import MLLaMAForCausalLM
+from .mmdit_sd3.model import SD3Transformer2DModel
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
+from .multimodal_encoders.config import LlavaNextVisionConfig
+from .multimodal_encoders.model import LlavaNextVisionWrapper
 from .nemotron_nas.model import DeciLMForCausalLM
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
-from .redrafter.model import ReDrafterForCausalLM
+from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
+from .stdit.model import STDiT3Model
 
 __all__ = [
     'BertModel',
@@ -66,7 +72,10 @@ __all__ = [
     'RobertaForSequenceClassification',
     'BloomModel',
     'BloomForCausalLM',
+    'CLIPVisionTransformer',
     'DiT',
+    'SD3Transformer2DModel',
+    'STDiT3',
     'DeepseekForCausalLM',
     'FalconConfig',
     'DeepseekV2ForCausalLM',
@@ -80,9 +89,12 @@ __all__ = [
     'LLaMAConfig',
     'LLaMAForCausalLM',
     'LLaMAModel',
+    'LlavaNextVisionWrapper',
+    'LlavaNextVisionConfig',
     'MedusaConfig',
     'MedusaForCausalLm',
-    'ReDrafterForCausalLM',
+    'ReDrafterForLLaMALM',
+    'ReDrafterForQWenLM',
     'GPTJConfig',
     'GPTJModel',
     'GPTJForCausalLM',
@@ -143,14 +155,19 @@ MODEL_MAP = {
     'Phi3VForCausalLM': Phi3ForCausalLM,
     'Phi3SmallForCausalLM': Phi3ForCausalLM,
     'PhiMoEForCausalLM': Phi3ForCausalLM,
+    'Phi4MMForCausalLM': Phi3ForCausalLM,
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
+    'MptForCausalLM': MPTForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
     'GLMModel': ChatGLMForCausalLM,
     'ChatGLMModel': ChatGLMForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
+    'ChatGLMForConditionalGeneration': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
+    'LlavaLlamaModel': LLaMAForCausalLM,
+    'LlavaNextForConditionalGeneration': LlavaNextVisionWrapper,
     'ExaoneForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,
@@ -158,19 +175,28 @@ MODEL_MAP = {
     'Grok1ModelForCausalLM': GrokForCausalLM,
     'InternLMForCausalLM': LLaMAForCausalLM,
     'InternLM2ForCausalLM': LLaMAForCausalLM,
+    'InternLMXComposer2ForCausalLM': LLaMAForCausalLM,
+    'GraniteForCausalLM': LLaMAForCausalLM,
+    'GraniteMoeForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
-    'ReDrafterForCausalLM': ReDrafterForCausalLM,
+    'MedusaLlamaForCausalLM': MedusaForCausalLm,
+    'ReDrafterForLLaMALM': ReDrafterForLLaMALM,
+    'ReDrafterForQWenLM': ReDrafterForQWenLM,
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'BaiChuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
     GEMMA_ARCHITECTURE: GemmaForCausalLM,
     GEMMA2_ARCHITECTURE: GemmaForCausalLM,
+    GEMMA3_ARCHITECTURE: GemmaForCausalLM,
     'QWenLMHeadModel': QWenForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
     'Qwen2ForCausalLM': QWenForCausalLM,
     'Qwen2MoeForCausalLM': QWenForCausalLM,
     'Qwen2ForSequenceClassification': QWenForCausalLM,
     'Qwen2VLForConditionalGeneration': QWenForCausalLM,
+    'Qwen2VLModel': QWenForCausalLM,
+    'Qwen3ForCausalLM': QWenForCausalLM,
+    'Qwen3MoeForCausalLM': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
@@ -178,6 +204,8 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'SD3Transformer2DModel': SD3Transformer2DModel,
+    'STDiT3': STDiT3Model,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,

@@ -17,6 +17,7 @@
 #include "cudaMemPool.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tllmBuffers.h"
 
 #include <cstring>
@@ -38,6 +39,10 @@ BufferManager::BufferManager(CudaStreamPtr stream, bool trimPool)
 
 BufferManager::IBufferPtr BufferManager::gpu(std::size_t size, nvinfer1::DataType type) const
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceBuffer>(size, type, std::move(vmAllocator));
+    }
     if (static_cast<bool>(mPool))
     {
         return std::make_unique<DeviceBuffer>(size, type, CudaAllocatorAsync{mStream, mPool});
@@ -48,6 +53,10 @@ BufferManager::IBufferPtr BufferManager::gpu(std::size_t size, nvinfer1::DataTyp
 
 BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::DataType type) const
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceTensor>(dims, type, std::move(vmAllocator));
+    }
     if (static_cast<bool>(mPool))
     {
         return std::make_unique<DeviceTensor>(dims, type, CudaAllocatorAsync{mStream, mPool});
@@ -58,11 +67,19 @@ BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::Data
 
 BufferManager::IBufferPtr BufferManager::gpuSync(std::size_t size, nvinfer1::DataType type)
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceBuffer>(size, type, std::move(vmAllocator));
+    }
     return std::make_unique<StaticDeviceBuffer>(size, type, CudaAllocator{});
 }
 
 BufferManager::ITensorPtr BufferManager::gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type)
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceTensor>(dims, type, std::move(vmAllocator));
+    }
     return std::make_unique<StaticDeviceTensor>(dims, type, CudaAllocator{});
 }
 
@@ -106,6 +123,11 @@ BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::
     return std::make_unique<UVMTensor>(dims, type);
 }
 
+BufferManager::ITensorPtr BufferManager::ipcNvls(std::set<int> ranks, nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<MulticastTensor>(dims, type, ranks);
+}
+
 void BufferManager::setZero(IBuffer& buffer) const
 {
     setMem(buffer, 0);
@@ -133,7 +155,8 @@ void BufferManager::copy(void const* src, IBuffer& dst, MemoryType srcType) cons
         }
         else
         {
-            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst.data(), src, dst.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+            TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
+                dst.data(), src, dst.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
         }
     }
 }
@@ -148,7 +171,8 @@ void BufferManager::copy(IBuffer const& src, void* dst, MemoryType dstType) cons
         }
         else
         {
-            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst, src.data(), src.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+            TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
+                dst, src.data(), src.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
         }
     }
 }

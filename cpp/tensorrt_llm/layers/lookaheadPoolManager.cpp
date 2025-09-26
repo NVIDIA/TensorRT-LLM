@@ -17,6 +17,7 @@
 #include "tensorrt_llm/layers/lookaheadPoolManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
+#include <cstddef>
 
 namespace tensorrt_llm::layers
 {
@@ -47,7 +48,7 @@ void LookaheadPoolManager::insertOne(Key key, TensorConstPtr const& ngram)
                 BufferRange<TokenIdType const> itemRange(*item);
                 return std::equal(ngramRange.begin(), ngramRange.end(), itemRange.begin());
             });
-        if (mGuessSetSize > 0 && search->second.size() >= mGuessSetSize)
+        if (mGuessSetSize > 0 && search->second.size() >= static_cast<size_t>(mGuessSetSize))
         {
             search->second.pop_front();
         }
@@ -81,7 +82,7 @@ std::list<LookaheadPoolManager::TensorConstPtr> LookaheadPoolManager::guess(Key 
     if (search != mTokenMap.end())
     {
         auto ngrams = search->second;
-        if (ngrams.size() > guessSize)
+        if (ngrams.size() > static_cast<size_t>(guessSize))
         {
             auto it = std::prev(ngrams.end(), guessSize);
             return std::list<TensorConstPtr>(it, ngrams.end());

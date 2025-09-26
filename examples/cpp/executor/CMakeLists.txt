@@ -13,19 +13,28 @@
 # License for the specific language governing permissions and limitations under
 # the License. cmake needs this line
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.27)
 
 set(TRTLLM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
-include(${TRTLLM_DIR}/cpp/cmake/modules/set_ifndef.cmake)
-include(${TRTLLM_DIR}/cpp/cmake/modules/find_library_create_target.cmake)
+list(APPEND CMAKE_MODULE_PATH "${TRTLLM_DIR}/cpp/cmake/modules")
+
 if(NOT TRTLLM_BUILD_DIR)
   set(TRTLLM_BUILD_DIR "${TRTLLM_DIR}/cpp/build")
 endif()
 set(TRTLLM_LIB_PATH "${TRTLLM_BUILD_DIR}/tensorrt_llm/libtensorrt_llm.so")
+if(NOT EXISTS ${TRTLLM_LIB_PATH})
+  message(FATAL_ERROR "Cannot find ${TRTLLM_LIB_PATH}")
+endif()
+
 set(TRTLLM_PLUGIN_PATH
     "${TRTLLM_BUILD_DIR}/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so"
 )
 set(TRTLLM_INCLUDE_DIR "${TRTLLM_DIR}/cpp/include")
+
+option(
+  ENABLE_MULTI_DEVICE
+  "Enable multi device/instance examples building (requires MPI headers/libs)"
+  ON)
 
 # Determine CXX11 ABI compatibility
 execute_process(
@@ -47,30 +56,24 @@ set(CMAKE_VERBOSE_MAKEFILE 1)
 # Define project name
 project(executorExamples)
 
-# Compile options
-set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++ -DENABLE_MULTI_DEVICE=1")
+# Compile options $<BOOL:${ENABLE_MULTI_DEVICE}> ?
+if(ENABLE_MULTI_DEVICE)
+  set(EMD 1)
+else()
+  set(EMD 0)
+endif()
+set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++ -DENABLE_MULTI_DEVICE=${EMD} ")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_BUILD_TYPE release)
 
-find_package(CUDAToolkit REQUIRED)
+find_package(CUDAToolkit REQUIRED COMPONENTS cuda_driver cudart_static nvml)
 message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
 # TRT dependencies
-set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
-set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set(TRT_LIB nvinfer)
-# On Windows major version is appended to nvinfer libs.
-if(WIN32)
-  set(TRT_LIB_NAME nvinfer_10)
-else()
-  set(TRT_LIB_NAME nvinfer)
-endif()
-find_library_create_target(${TRT_LIB} ${TRT_LIB_NAME} SHARED ${TRT_LIB_DIR})
-message(${TRT_INCLUDE_DIR})
-include_directories("${TRT_INCLUDE_DIR}")
+find_package(TensorRT 10 REQUIRED)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -131,19 +134,25 @@ target_link_libraries(executorExampleAdvanced nvinfer_plugin_tensorrt_llm
                       cxxopts::cxxopts)
 
 # MultiInstance
+if(ENABLE_MULTI_DEVICE)
+  find_package(MPI REQUIRED)
+  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
+  include_directories(${MPI_C_INCLUDE_DIRS})
 
-find_package(MPI REQUIRED)
-message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
-message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
-include_directories(${MPI_C_INCLUDE_DIRS})
+  add_executable(executorExampleAdvancedMultiInstances
+                 executorExampleAdvancedMultiInstances.cpp)
+  target_link_libraries(
+    executorExampleAdvancedMultiInstances nvinfer_plugin_tensorrt_llm
+    cxxopts::cxxopts ${MPI_C_LIBRARIES})
 
-add_executable(executorExampleAdvancedMultiInstances
-               executorExampleAdvancedMultiInstances.cpp)
-target_link_libraries(
-  executorExampleAdvancedMultiInstances nvinfer_plugin_tensorrt_llm
-  cxxopts::cxxopts ${MPI_C_LIBRARIES})
+  # FastLogits
+  add_executable(executorExampleFastLogits executorExampleFastLogits.cpp)
+  target_link_libraries(executorExampleFastLogits nvinfer_plugin_tensorrt_llm
+                        cxxopts::cxxopts ${MPI_C_LIBRARIES})
 
-# FastLogits
-add_executable(executorExampleFastLogits executorExampleFastLogits.cpp)
-target_link_libraries(executorExampleFastLogits nvinfer_plugin_tensorrt_llm
-                      cxxopts::cxxopts ${MPI_C_LIBRARIES})
+  add_executable(executorExampleDisaggregated executorExampleDisaggregated.cpp)
+  target_link_libraries(
+    executorExampleDisaggregated nvinfer_plugin_tensorrt_llm cxxopts::cxxopts
+    ${MPI_C_LIBRARIES})
+endif()

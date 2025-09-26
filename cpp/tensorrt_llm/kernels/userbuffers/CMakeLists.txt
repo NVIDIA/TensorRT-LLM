@@ -14,8 +14,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 #
-if(ENABLE_MULTI_DEVICE EQUAL 0)
-  add_library(userbuffers_src OBJECT ub_interface.cpp)
+if(NOT ENABLE_MULTI_DEVICE)
+  add_library(userbuffers_src OBJECT ub_interface.cpp userbuffersManager.cpp)
 else()
   file(GLOB_RECURSE SRC_CPP *.cpp)
   file(GLOB_RECURSE SRC_CU *.cu)
@@ -27,5 +27,6 @@ target_compile_options(userbuffers_src
 
 set_property(TARGET userbuffers_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET userbuffers_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(userbuffers_src 89)
 
 message(STATUS "UserBuffer ENABLE_MULTI_DEVICE is ${ENABLE_MULTI_DEVICE}")

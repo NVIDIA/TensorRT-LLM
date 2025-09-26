@@ -17,7 +17,7 @@
 
 #ifndef TRT_SELECTIVE_SCAN_PLUGIN_H
 #define TRT_SELECTIVE_SCAN_PLUGIN_H
-#include "tensorrt_llm/kernels/selectiveScan.h"
+#include "tensorrt_llm/kernels/selectiveScan/selectiveScan.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 

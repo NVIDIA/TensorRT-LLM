@@ -23,14 +23,10 @@ import typing
 from pathlib import Path
 from typing import Optional
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import shutil
-
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 resources_dir = Path(__file__).parent.resolve().parent
 model_dir = resources_dir / "models"
@@ -96,7 +92,10 @@ def build_engines(model_cache: typing.Optional[str] = None,
                   world_size: int = 1,
                   clean: Optional[bool] = False):
 
-    for model_name in ["chatglm-6b", "chatglm2-6b", "chatglm3-6b", "glm-10b"]:
+    for model_name in [
+            "chatglm-6b", "chatglm2-6b", "chatglm3-6b", "glm-10b", "glm-4-9b",
+            "chatglm3-6b-32k"
+    ]:
         is_chatglm_6b_or_glm_10b = model_name in ["chatglm-6b", "glm-10b"]
         if model_cache and (Path(model_cache) / model_name).is_dir():
             model_cache_dir = Path(model_cache) / model_name
@@ -136,17 +135,18 @@ def build_engines(model_cache: typing.Optional[str] = None,
             if ckpt_dir.is_dir():
                 shutil.rmtree(ckpt_dir, ignore_errors=True)
 
-        # Fix HF error in ChatGLM-6B, hope to remove this in the future
-        if model_name == "chatglm-6b":
+        # Fix HF error for ChatGLM-6B / GLM-4-9B / ChatGLM2-6B / ChatGLM3-6B-32K, hope to remove this in the future
+        if model_name in [
+                "chatglm-6b", "glm-4-9b", "chatglm2-6b", "chatglm3-6b-32k"
+        ]:
             shutil.copy(
-                chatglm_example_dir / "tokenization_chatglm.py",
+                chatglm_example_dir / f"{model_name}/tokenization_chatglm.py",
                 hf_dir,
             )
 
         convert_ckpt(hf_dir, ckpt_dir, world_size)
 
-        model_spec_obj = model_spec.ModelSpec('input_tokens.npy',
-                                              _tb.DataType.HALF)
+        model_spec_obj = ModelSpec('input_tokens.npy', _tb.DataType.HALF)
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
         model_spec_obj.use_gpt_plugin()
         engine_dir = Path(

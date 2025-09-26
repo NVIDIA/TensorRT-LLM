@@ -1,0 +1,649 @@
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+name: "ensemble"
+platform: "ensemble"
+max_batch_size: ${triton_max_batch_size}
+input [
+  {
+    name: "text_input"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "decoder_text_input"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "image_input"
+    data_type: TYPE_FP16
+    dims: [ -1, -1, -1, -1 ]
+    optional: true
+  },
+  {
+    name: "image_bytes_input"
+    data_type: TYPE_UINT8
+    dims: [ -1, -1, -1, -1 ]
+    optional: true
+  },
+  {
+    name: "image_url_input"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+    optional: true
+  },
+  # An arbitrary number of images for pixtral
+  {
+      name: "image_sizes_input"
+      data_type: TYPE_INT64
+      dims: [ -1, 2 ]
+      optional: true
+  },
+  {
+    name: "video_bytes_input"
+    data_type: TYPE_UINT8
+    dims: [ -1, -1, -1, -1 ]
+    optional: true
+  },
+  {
+    name: "max_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+   name: "bad_words"
+   data_type: TYPE_STRING
+   dims: [ -1 ]
+   optional: true
+  },
+  {
+   name: "stop_words"
+   data_type: TYPE_STRING
+   dims: [ -1 ]
+   optional: true
+  },
+  {
+    name: "end_id"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "pad_id"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "top_k"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "top_p"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "temperature"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "length_penalty"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "repetition_penalty"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "min_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "presence_penalty"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "frequency_penalty"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "seed"
+    data_type: TYPE_UINT64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "return_log_probs"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "return_context_logits"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "return_generation_logits"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "beam_width"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "stream"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "prompt_table_extra_id"
+    data_type: TYPE_UINT64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "embedding_bias_words"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+    optional: true
+  },
+  {
+    name: "embedding_bias_weights"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+    optional: true
+  }
+]
+output [
+  {
+    name: "text_output"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+  },
+  {
+    name: "cum_log_probs"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "output_log_probs"
+    data_type: TYPE_FP32
+    dims: [ -1, -1 ]
+  },
+  {
+    name: "context_logits"
+    data_type: ${logits_datatype}
+    dims: [ -1, -1 ]
+  },
+  {
+    name: "generation_logits"
+    data_type: ${logits_datatype}
+    dims: [ -1, -1, -1 ]
+  },
+  {
+    name: "batch_index"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "sequence_index"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }
+]
+ensemble_scheduling {
+  step [
+    {
+      model_name: "preprocessing"
+      model_version: -1
+      input_map {
+        key: "QUERY"
+        value: "text_input"
+      }
+      input_map {
+        key: "DECODER_QUERY"
+        value: "decoder_text_input"
+      }
+      input_map {
+        key: "IMAGE_BYTES"
+        value: "image_bytes_input"
+      }
+      input_map {
+        key: "IMAGE_URL"
+        value: "image_url_input"
+      }
+      input_map {
+        key: "IMAGE_SIZES"
+        value: "image_sizes_input"
+      }
+      input_map {
+        key: "VIDEO_BYTES"
+        value: "video_bytes_input"
+      }
+      input_map {
+        key: "REQUEST_OUTPUT_LEN"
+        value: "max_tokens"
+      }
+      input_map {
+        key: "BAD_WORDS_DICT"
+        value: "bad_words"
+      }
+      input_map {
+        key: "STOP_WORDS_DICT"
+        value: "stop_words"
+      }
+      input_map {
+        key: "EMBEDDING_BIAS_WORDS"
+        value: "embedding_bias_words"
+      }
+      input_map {
+        key: "EMBEDDING_BIAS_WEIGHTS"
+        value: "embedding_bias_weights"
+      }
+      input_map {
+        key: "END_ID"
+        value: "end_id"
+      }
+      input_map {
+        key: "PAD_ID"
+        value: "pad_id"
+      }
+      input_map {
+        key: "PROMPT_TABLE_EXTRA_ID"
+        value: "prompt_table_extra_id"
+      }
+      output_map {
+        key: "REQUEST_INPUT_LEN"
+        value: "_REQUEST_INPUT_LEN"
+      }
+      output_map {
+        key: "INPUT_ID"
+        value: "_INPUT_ID"
+      }
+      output_map {
+        key: "REQUEST_DECODER_INPUT_LEN"
+        value: "_REQUEST_DECODER_INPUT_LEN"
+      }
+      output_map {
+        key: "DECODER_INPUT_ID"
+        value: "_DECODER_INPUT_ID"
+      }
+      output_map {
+        key: "PIXEL_VALUES"
+        value: "_PIXEL_VALUES"
+      }
+      output_map {
+        key: "ASPECT_RATIO_IDS"
+        value: "_ASPECT_RATIO_IDS"
+      }
+      output_map {
+        key: "ASPECT_RATIO_MASK"
+        value: "_ASPECT_RATIO_MASK"
+      }
+      output_map {
+        key: "CROSS_ATTENTION_MASK"
+        value: "_CROSS_ATTENTION_MASK"
+      }
+      output_map {
+        key: "ATTENTION_MASK"
+        value: "_ATTENTION_MASK"
+      }
+      output_map {
+        key: "IMAGE_GRID_THW"
+        value: "_IMAGE_GRID_THW"
+      }
+      output_map {
+        key: "IMAGE_SIZES"
+        value: "_IMAGE_SIZES"
+      }
+      output_map {
+        key: "IS_VIDEO_INPUT"
+        value: "_IS_VIDEO_INPUT"
+      }
+      output_map {
+        key: "REQUEST_OUTPUT_LEN"
+        value: "_REQUEST_OUTPUT_LEN"
+      }
+      output_map {
+        key: "STOP_WORDS_IDS"
+        value: "_STOP_WORDS_IDS"
+      }
+      output_map {
+        key: "BAD_WORDS_IDS"
+        value: "_BAD_WORDS_IDS"
+      }
+      output_map {
+        key: "EMBEDDING_BIAS"
+        value: "_EMBEDDING_BIAS"
+      }
+      output_map {
+        key: "OUT_END_ID"
+        value: "_PREPROCESSOR_END_ID"
+      }
+      output_map {
+        key: "OUT_PAD_ID"
+        value: "_PREPROCESSOR_PAD_ID"
+      }
+      output_map {
+        key: "OUT_PROMPT_TABLE_EXTRA_IDS"
+        value: "_OUT_PROMPT_TABLE_EXTRA_IDS"
+      }
+      output_map {
+        key: "VISION_INPUT_ID"
+        value: "_VISION_INPUT_ID"
+      }
+    },
+    {
+      model_name: "multimodal_encoders"
+      model_version: -1
+      input_map {
+        key: "IMAGE"
+        value: "image_input"
+      }
+      input_map {
+        key: "pixel_values"
+        value: "_PIXEL_VALUES"
+      }
+      input_map {
+        key: "aspect_ratio_ids"
+        value: "_ASPECT_RATIO_IDS"
+      }
+      input_map {
+        key: "aspect_ratio_mask"
+        value: "_ASPECT_RATIO_MASK"
+      }
+      input_map {
+        key: "cross_attention_mask"
+        value: "_CROSS_ATTENTION_MASK"
+      }
+      input_map {
+        key: "attention_mask"
+        value: "_ATTENTION_MASK"
+      }
+      input_map {
+        key: "image_grid_thw"
+        value: "_IMAGE_GRID_THW"
+      }
+      input_map {
+       key: "max_tokens"
+       value: "_REQUEST_OUTPUT_LEN"
+      }
+      input_map {
+        key: "image_sizes"
+        value: "_IMAGE_SIZES"
+      }
+      input_map {
+        key: "vision_input_id"
+        value: "_VISION_INPUT_ID"
+      }
+      input_map {
+        key: "is_video_input"
+        value: "_IS_VIDEO_INPUT"
+      }
+      output_map {
+        key: "OUT_PROMPT_EMBEDDING_TABLE"
+        value: "out_prompt_embedding_table"
+      }
+      output_map {
+        key: "OUT_PROMPT_VOCAB_SIZE"
+        value: "out_prompt_vocab_size"
+      }
+      output_map {
+        key: "ENCODER_INPUT_FEATURES"
+        value: "encoder_input_features"
+      }
+      output_map {
+        key: "ENCODER_OUTPUT_LENGTHS"
+        value: "encoder_output_lengths"
+      }
+      output_map {
+        key: "CROSS_ATTENTION_MASK"
+        value: "cross_attention_mask"
+      }
+      output_map {
+        key: "SKIP_CROSS_ATTN_BLOCKS"
+        value: "skip_cross_attn_blocks"
+      }
+      output_map {
+        key: "MROPE_ROTARY_COS_SIN"
+        value: "mrope_rotary_cos_sin"
+      }
+      output_map {
+        key: "MROPE_POSITION_DELTAS"
+        value: "mrope_position_deltas"
+      }
+    },
+    {
+      model_name: "tensorrt_llm"
+      model_version: -1
+      input_map {
+        key: "input_ids"
+        value: "_INPUT_ID"
+      }
+      input_map {
+        key: "decoder_input_ids"
+        value: "_DECODER_INPUT_ID"
+      }
+      input_map {
+        key: "input_lengths"
+        value: "_REQUEST_INPUT_LEN"
+      }
+      input_map {
+        key: "decoder_input_lengths"
+        value: "_REQUEST_DECODER_INPUT_LEN"
+      }
+      input_map {
+        key: "request_output_len"
+        value: "_REQUEST_OUTPUT_LEN"
+      }
+      input_map {
+          key: "end_id"
+          value: "_PREPROCESSOR_END_ID"
+      }
+      input_map {
+          key: "pad_id"
+          value: "_PREPROCESSOR_PAD_ID"
+      }
+      input_map {
+          key: "embedding_bias"
+          value: "_EMBEDDING_BIAS"
+      }
+      input_map {
+          key: "runtime_top_k"
+          value: "top_k"
+      }
+      input_map {
+          key: "runtime_top_p"
+          value: "top_p"
+      }
+      input_map {
+          key: "temperature"
+          value: "temperature"
+      }
+      input_map {
+          key: "len_penalty"
+          value: "length_penalty"
+      }
+      input_map {
+          key: "repetition_penalty"
+          value: "repetition_penalty"
+      }
+      input_map {
+          key: "min_tokens"
+          value: "min_tokens"
+      }
+      input_map {
+          key: "presence_penalty"
+          value: "presence_penalty"
+      }
+      input_map {
+          key: "frequency_penalty"
+          value: "frequency_penalty"
+      }
+      input_map {
+          key: "seed"
+          value: "seed"
+      }
+      input_map {
+          key: "return_log_probs"
+          value: "return_log_probs"
+      }
+      input_map {
+          key: "return_context_logits"
+          value: "return_context_logits"
+      }
+      input_map {
+          key: "return_generation_logits"
+          value: "return_generation_logits"
+      }
+      input_map {
+          key: "beam_width"
+          value: "beam_width"
+      }
+      input_map {
+          key: "streaming"
+          value: "stream"
+      }
+      input_map {
+        key: "prompt_embedding_table"
+        value: "out_prompt_embedding_table"
+      }
+      input_map {
+        key: "prompt_vocab_size"
+        value: "out_prompt_vocab_size"
+      }
+      input_map {
+        key: "encoder_input_features"
+        value: "encoder_input_features"
+      }
+      input_map {
+        key: "encoder_output_lengths"
+        value: "encoder_output_lengths"
+      }
+      input_map {
+        key: "cross_attention_mask"
+        value: "cross_attention_mask"
+      }
+      input_map {
+        key: "stop_words_list"
+        value: "_STOP_WORDS_IDS"
+      }
+      input_map {
+        key: "bad_words_list"
+        value: "_BAD_WORDS_IDS"
+      }
+      input_map {
+        key: "prompt_table_extra_ids"
+        value: "_OUT_PROMPT_TABLE_EXTRA_IDS"
+      }
+      input_map {
+        key: "skip_cross_attn_blocks"
+        value: "skip_cross_attn_blocks"
+      }
+      input_map {
+        key: "mrope_rotary_cos_sin"
+        value: "mrope_rotary_cos_sin"
+      }
+      input_map {
+        key: "mrope_position_deltas"
+        value: "mrope_position_deltas"
+      }
+      output_map {
+        key: "output_ids"
+        value: "_TOKENS_BATCH"
+      }
+      output_map {
+        key: "sequence_length"
+        value: "_SEQUENCE_LENGTH"
+      },
+      output_map {
+        key: "cum_log_probs"
+        value: "cum_log_probs"
+      }
+      output_map {
+        key: "output_log_probs"
+        value: "output_log_probs"
+      },
+      output_map {
+        key: "context_logits"
+        value: "context_logits"
+      },
+      output_map {
+        key: "generation_logits"
+        value: "generation_logits"
+      },
+      output_map {
+        key: "batch_index"
+        value: "batch_index"
+      }
+      output_map {
+        key: "sequence_index"
+        value: "sequence_index"
+      }
+    },
+    {
+      model_name: "postprocessing"
+      model_version: -1
+      input_map {
+        key: "TOKENS_BATCH"
+        value: "_TOKENS_BATCH"
+      }
+      input_map {
+        key: "SEQUENCE_LENGTH"
+        value: "_SEQUENCE_LENGTH"
+      }
+      output_map {
+        key: "OUTPUT"
+        value: "text_output"
+      }
+    }
+  ]
+}

@@ -48,7 +48,7 @@ LookupPlugin::LookupPlugin(void const* data, size_t length)
     read(d, mRank);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -206,7 +206,7 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
                 output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
         }
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return 0;
 }
@@ -257,7 +257,7 @@ void LookupPlugin::serialize(void* buffer) const noexcept
     write(d, mType);
     write(d, mRank);
 
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void LookupPlugin::terminate() noexcept {}
@@ -268,8 +268,8 @@ LookupPluginCreator::LookupPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("rank", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("rank", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -292,8 +292,8 @@ PluginFieldCollection const* LookupPluginCreator::getFieldNames() noexcept
 IPluginV2* LookupPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
-    int rank;
+    nvinfer1::DataType type{};
+    int rank{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

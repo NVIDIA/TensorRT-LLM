@@ -1,0 +1,146 @@
+methods:
+  __init__:
+    parameters:
+      # General
+      n:
+        annotation: int
+        default: 1
+      best_of:
+        annotation: Optional[int]
+        default: null
+      use_beam_search:
+        annotation: bool
+        default: false
+      beam_search_diversity_rate:
+        annotation: Optional[float]
+        default: null
+      early_stopping:
+        annotation: Optional[int]
+        default: null
+      max_tokens:
+        annotation: int
+        default: 32
+      min_tokens:
+        annotation: Optional[int]
+        default: null
+      end_id:
+        annotation: Optional[int]
+        default: null
+      pad_id:
+        annotation: Optional[int]
+        default: null
+      # Sampling
+      seed:
+        annotation: Optional[int]
+        default: null
+      temperature:
+        annotation: Optional[float]
+        default: null
+      top_k:
+        annotation: Optional[int]
+        default: null
+      top_p:
+        annotation: Optional[float]
+        default: null
+      top_p_decay:
+        annotation: Optional[float]
+        default: null
+      top_p_min:
+        annotation: Optional[float]
+        default: null
+      top_p_reset_ids:
+        annotation: Optional[int]
+        default: null
+      min_p:
+        annotation: Optional[float]
+        default: null
+      # Panelities
+      repetition_penalty:
+        annotation: Optional[float]
+        default: null
+      presence_penalty:
+        annotation: Optional[float]
+        default: null
+      frequency_penalty:
+        annotation: Optional[float]
+        default: null
+      length_penalty:
+        annotation: Optional[float]
+        default: null
+      no_repeat_ngram_size:
+        annotation: Optional[int]
+        default: null
+      # Stop words and bad words
+      stop:
+        annotation: Union[List[str], str, NoneType]
+        default: null
+      stop_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+      include_stop_str_in_output:
+        annotation: bool
+        default: false
+      bad:
+        annotation: Union[List[str], str, NoneType]
+        default: null
+      bad_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+      # Logits processor and guided decoding
+      logits_processor:
+        annotation: Optional[Union[tensorrt_llm.sampling_params.LogitsProcessor,
+                             List[tensorrt_llm.sampling_params.LogitsProcessor]]]
+        default: None
+      apply_batched_logits_processor:
+        annotation: bool
+        default: false
+      guided_decoding:
+        annotation: Optional[tensorrt_llm.sampling_params.GuidedDecodingParams]
+        default: null
+      embedding_bias:
+        annotation: Optional[torch.Tensor]
+        default: null
+      # Speculative decoding
+      lookahead_config:
+        annotation: Optional[tensorrt_llm.bindings.executor.LookaheadDecodingConfig]
+        default: null
+      # Tokenizer behavior
+      ignore_eos:
+        annotation: bool
+        default: false
+      detokenize:
+        annotation: bool
+        default: true
+      add_special_tokens:
+        annotation: bool
+        default: true
+      truncate_prompt_tokens:
+        annotation: Optional[int]
+        default: null
+      skip_special_tokens:
+        annotation: bool
+        default: true
+      spaces_between_special_tokens:
+        annotation: bool
+        default: true
+      # Returning controls
+      logprobs:
+        annotation: Optional[int]
+        default: None
+      prompt_logprobs:
+        annotation: Optional[int]
+        default: None
+      return_context_logits:
+        annotation: bool
+        default: false
+      return_generation_logits:
+        annotation: bool
+        default: false
+      exclude_input_from_output:
+        annotation: bool
+        default: true
+      return_encoder_output:
+        annotation: bool
+        default: false
+    return_annotation: None
+properties: {}

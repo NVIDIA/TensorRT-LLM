@@ -88,4 +88,26 @@ int nextPowerOfTwo(int v)
     v |= v >> 16;
     return ++v;
 }
+
+cudaDataType_t convert_torch_dtype(torch::ScalarType dtype)
+{
+    switch (dtype)
+    {
+    case torch::kInt32: return CUDA_R_32I;
+    case torch::kFloat: return CUDA_R_32F;
+#ifdef ENABLE_BF16
+    case torch::kBFloat16: return CUDA_R_16BF;
+#endif
+    case torch::kHalf: return CUDA_R_16F;
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: return CUDA_R_8F_E4M3;
+    case torch::kFloat8_e5m2: return CUDA_R_8F_E5M2;
+#endif
+    case torch::kByte: return CUDA_R_8U;
+    case torch::kChar: return CUDA_R_8I;
+    case torch::kBool: return CUDA_R_8U;
+    default: TLLM_THROW("Unsupported torch dtype %s to convert", c10::toString(dtype));
+    }
+}
+
 } // namespace torch_ext

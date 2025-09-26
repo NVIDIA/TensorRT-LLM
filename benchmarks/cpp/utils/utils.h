@@ -157,7 +157,69 @@ struct RecordTimeMetric
     }
 };
 
+struct RecordBwMetric
+{
+
+    RecordBwMetric(std::string tag)
+        : mTag(std::move(tag))
+    {
+    }
+
+    std::string mTag;
+
+    std::vector<float> mDataTps;
+
+    float mAvg;
+    float mP99;
+    float mP95;
+    float mP90;
+    float mP50;
+    float mMax;
+    float mMin;
+
+    static float calcPercentile(std::vector<float> const& throughputs, int percentile)
+    {
+        int const index = static_cast<int>(std::ceil((percentile / 100.0) * throughputs.size())) - 1;
+        return throughputs[index];
+    }
+
+    void calculate()
+    {
+        TLLM_CHECK_WITH_INFO(mDataTps.size() > 0, "No data to calculate for tag:%s", mTag.c_str());
+        mAvg = std::accumulate(mDataTps.begin(), mDataTps.end(), 0.F) / mDataTps.size();
+
+        std::sort(mDataTps.begin(), mDataTps.end(), std::greater<float>());
+
+        mP99 = calcPercentile(mDataTps, 99);
+        mP90 = calcPercentile(mDataTps, 90);
+        mP50 = calcPercentile(mDataTps, 50);
+        mMax = mDataTps.front();
+        mMin = mDataTps.back();
+    }
+
+    void report() const
+    {
+
+        printf("[BENCHMARK] avg_%s(Gb/sec) %.8f\n", mTag.c_str(), mAvg);
+        printf("[BENCHMARK] max_%s(Gb/sec) %.8f\n", mTag.c_str(), mMax);
+        printf("[BENCHMARK] min_%s(Gb/sec) %.8f\n", mTag.c_str(), mMin);
+
+        printf("[BENCHMARK] p99_%s(Gb/sec) %.8f\n", mTag.c_str(), mP99);
+
+        printf("[BENCHMARK] p90_%s(Gb/sec) %.8f\n", mTag.c_str(), mP90);
+
+        printf("[BENCHMARK] p50_%s(Gb/sec) %.8f\n\n", mTag.c_str(), mP50);
+    }
+
+    std::vector<std::string> genHeaders() const
+    {
+        std::string tpTag = mTag + "(Gb/sec)";
+        return {"avg_" + tpTag, "max_" + tpTag, "min_" + tpTag, "p99" + tpTag, "p90" + tpTag, "p50" + tpTag};
+    }
+};
+
 std::ostream& operator<<(std::ostream& os, RecordTimeMetric const& metric);
+std::ostream& operator<<(std::ostream& os, RecordBwMetric const& metric);
 
 struct Sample
 {

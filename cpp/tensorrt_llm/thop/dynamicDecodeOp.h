@@ -27,6 +27,8 @@ namespace torch_ext
 class IFtDynamicDecode
 {
 public:
+    virtual ~IFtDynamicDecode() = default;
+
     virtual void setup(size_t const batch_size, size_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
@@ -35,7 +37,7 @@ public:
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        bool output_log_probs, bool cum_log_probs)
+        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs)
         = 0;
 
     virtual void forward(th::Tensor const& logits, int const step, int const max_input_length,
@@ -65,6 +67,8 @@ public:
     FtDynamicDecode(size_t const max_batch_size, size_t const max_beam_width, size_t const vocab_size,
         size_t const vocab_size_padded, int const tensor_para_size, int const pipeline_para_size);
 
+    ~FtDynamicDecode() override = default;
+
     void setup(size_t const batch_size, size_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
@@ -73,7 +77,7 @@ public:
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        bool output_log_probs, bool cum_log_probs) override;
+        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs) override;
 
     void forward(th::Tensor const& logits, int const step, int const max_input_length, int const max_attention_window,
         int const sink_token_length, uint64_t const ite, int const local_batch_size, th::Tensor end_id,
@@ -116,7 +120,7 @@ public:
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        bool output_log_probs, bool cum_log_probs);
+        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs);
 
     th::Tensor forward(th::Tensor const& logits, int64_t const step, int64_t const max_input_length,
         int64_t const max_attention_window, int64_t const sink_token_length, int64_t const ite,

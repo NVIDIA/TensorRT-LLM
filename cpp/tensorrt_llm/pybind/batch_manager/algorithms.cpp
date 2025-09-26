@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,19 +19,31 @@
 #include "tensorrt_llm/batch_manager/allocateKvCache.h"
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
+#include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
+#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/runtime/decoderState.h"
+#include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchView.h"
+
+#include <ATen/core/TensorBody.h>
 #include <pybind11/cast.h>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <torch/extension.h>
+
+#include <optional>
 
 namespace py = pybind11;
 
+namespace tr = tensorrt_llm::runtime;
 using namespace tensorrt_llm::batch_manager;
 
 void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::module_& m)
@@ -39,7 +51,7 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
     py::class_<CapacityScheduler>(m, CapacityScheduler::name)
         .def(py::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
             py::arg("max_num_requests"), py::arg("capacity_scheduler_policy"), py::arg("has_kv_cache_manager"),
-            py::arg("many_micro_batches") = false,
+            py::arg("two_step_lookahead") = false,
             py::arg_v("no_schedule_until_state", LlmRequestState::kCONTEXT_INIT, "LlmRequestState.CONTEXT_INIT"),
             py::arg_v("no_schedule_after_state", LlmRequestState::kGENERATION_COMPLETE,
                 "LlmRequestState.GENERATION_COMPLETE"))
@@ -74,8 +86,41 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
         .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
 
     py::class_<AllocateKvCache>(m, AllocateKvCache::name)
-        .def(py::init())
+        .def(py::init(), py::call_guard<py::gil_scoped_release>())
         .def("__call__", &AllocateKvCache::operator(), py::arg("kv_cache_manager"), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("model_config"), py::arg("cross_kv_cache_manager") = std::nullopt)
+            py::arg("generation_requests"), py::arg("model_config"), py::arg("cross_kv_cache_manager") = std::nullopt,
+            py::call_guard<py::gil_scoped_release>())
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
+
+    py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
+        .def(py::init())
+        .def("__call__", &LogitsPostProcessor::operator(), py::arg("decoder_input_buffers"),
+            py::arg("replicate_logits_post_processor"), py::arg("world_config"), py::arg("stream"),
+            py::arg("logits_post_processor_batched") = std::nullopt)
+        .def("name", [](LogitsPostProcessor const&) { return LogitsPostProcessor::name; });
+
+    py::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)
+        .def(py::init<bool, bool, bool>(), py::arg("speculative_decoding_fast_logits"),
+            py::arg("is_leader_in_orch_mode"), py::arg("is_normalize_log_probs"))
+        .def(
+            "__call__",
+            [](CreateNewDecoderRequests& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
+                executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
+                nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
+                runtime::decoder::DecoderState& decoderState, tensorrt_llm::runtime::CudaStream const& runtimeStream,
+                tensorrt_llm::runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
+                SizeType32 beamWidth)
+            {
+                OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt;
+                auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
+                    = self(modelConfig, worldConfig, decodingConfig, contextRequests, logitsType, inputBuffers,
+                        decoderState, runtimeStream, decoderStream, maxSequenceLength, beamWidth, medusaBuffers);
+
+                return std::tuple{runtime::Torch::tensor(batchSlots), std::move(samplingConfigs),
+                    std::move(lookaheadPrompt), std::move(lookaheadAlgoConfigs)};
+            },
+            py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
+            py::arg("logits_type"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
+            py::arg("runtime_stream"), py::arg("decoder_stream"), py::arg("max_sequence_length"), py::arg("beam_width"))
+        .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 }

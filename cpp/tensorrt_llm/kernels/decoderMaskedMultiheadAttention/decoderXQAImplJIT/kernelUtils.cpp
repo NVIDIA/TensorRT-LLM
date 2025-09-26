@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include <list>
 
 namespace tensorrt_llm
 {
@@ -25,19 +28,11 @@ namespace jit
 namespace
 {
 
-template <typename T>
-bool contains(std::initializer_list<T> const& c, T const& v)
-{
-    return std::find(c.begin(), c.end(), v) != c.end();
-}
+using tensorrt_llm::common::contains;
 
 bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
 {
     if (xqaParams.unidirectional != 1)
-    {
-        return false;
-    }
-    if (xqaParams.q_scaling != 1.0f)
     {
         return false;
     }
@@ -49,10 +44,6 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         return false;
     }
-    if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
-    {
-        return false;
-    }
     if (xqaParams.position_shift_enabled || xqaParams.sink_token_length > 0)
     {
         return false;
@@ -61,7 +52,8 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         return false;
     }
-    bool is_vanilla_mha = xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads;
+    bool const is_vanilla_mha = !xqaParams.multi_query_tokens
+        && (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads);
     if (is_vanilla_mha && xqaParams.beam_width == 1)
     {
         // Do not use XQA kernel for vanilla MHA case for performance reasons.
@@ -69,31 +61,20 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     }
     if (is_vanilla_mha && xqaParams.head_size <= 128)
     {
-        // TODO(yaoy): remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
+        // TODO: remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
         return false;
     }
     if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,
-                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE},
+                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE,
+                      PositionEmbeddingType::kLEARNED_ABSOLUTE, PositionEmbeddingType::kYARN},
             xqaParams.position_embedding_type))
     {
         return false;
     }
-    if (!forConfigurePlugin)
+    if (xqaParams.chunked_attention_size != INT_MAX)
     {
-        // Inference time checks.
-        if (xqaParams.host_past_key_value_lengths == nullptr)
-        {
-            return false;
-        }
-        for (int i = 0; i < xqaParams.batch_size; ++i)
-        {
-            // Only checks for non-medusa case, because medusa may not accept all tokens in host_past_key_value_lengths.
-            if (!xqaParams.multi_query_tokens
-                && xqaParams.host_past_key_value_lengths[i] + 1 > xqaParams.max_attention_window_size)
-            {
-                return false;
-            }
-        }
+        // TODO: chunked attention is not supported yet.
+        return false;
     }
     return true;
 }
@@ -131,7 +112,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.paged_kv_cache && !contains({16, 32, 64, 128}, xqaParams.tokens_per_block))
+    if (xqaParams.paged_kv_cache && !contains({8, 16, 32, 64, 128}, xqaParams.tokens_per_block))
     {
         return false;
     }
@@ -160,6 +141,19 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     {
         return false;
     }
+    if (!forConfigurePlugin)
+    {
+        // Inference time checks.
+        if (xqaParams.host_past_key_value_lengths == nullptr)
+        {
+            return false;
+        }
+        if (!xqaParams.multi_query_tokens && xqaParams.beam_width != 1
+            && xqaParams.max_past_kv_length + 1 > xqaParams.cyclic_attention_window_size)
+        {
+            return false;
+        }
+    }
     if (xqaParams.head_size % 16 != 0 || xqaParams.head_size < 16 || xqaParams.head_size > 256)
     {
         return false;
@@ -170,6 +164,39 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
         return false;
     }
     if (xqaParams.paged_kv_cache && !contains({16, 32, 64, 128}, xqaParams.tokens_per_block))
+    {
+        return false;
+    }
+    return true;
+}
+
+bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
+{
+    if (!supportConfigCommon(xqaParams, forConfigurePlugin))
+    {
+        return false;
+    }
+    if (SM != kSM_120)
+    {
+        return false;
+    }
+    if (xqaParams.data_type != DATA_TYPE_E4M3)
+    {
+        return false;
+    }
+    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    {
+        return false;
+    }
+    if (xqaParams.beam_width != 1)
+    {
+        return false;
+    }
+    if (!xqaParams.isMLA())
+    {
+        return false;
+    }
+    if (xqaParams.paged_kv_cache && !contains({8, 16, 32, 64, 128}, xqaParams.tokens_per_block))
     {
         return false;
     }

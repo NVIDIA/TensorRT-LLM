@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_template.h"
+#include "moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 template class MoeGemmRunner<half, uint8_t, half>;
 }

@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -25,6 +24,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include "utils/utils.h"
@@ -201,7 +201,7 @@ public:
     {
         TLLM_CHECK_WITH_INFO(mRequestBenchInfos.find(requestId) == mRequestBenchInfos.end(),
             "Request %lu already exists in record before start, please report a bug to developers.", requestId);
-        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, start);
     }
 
@@ -217,7 +217,7 @@ public:
             outputLength = std::max(static_cast<int32_t>(beam.size()), outputLength);
         }
 
-        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId].outputLength += outputLength;
 
         if (!mRequestBenchInfos[requestId].firstTokenSeen)
@@ -250,7 +250,7 @@ public:
                     int inputSeqLen = mRequestBenchInfos[requestId].inputLength;
                     outSeqLen -= inputSeqLen;
                 }
-                const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+                std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
                 mRequestBenchInfos[requestId].outputLength = outSeqLen;
                 mRequestBenchInfos[requestId].decodingIter = response.getResult().decodingIter;
 
@@ -264,7 +264,7 @@ public:
             }
         }
 
-        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId].end = end;
         mRequestBenchInfos[requestId].hasError = response.hasError();
     }
@@ -304,6 +304,7 @@ public:
         std::vector<float> reqLatencies;
         std::vector<float> ftLatencies;
         std::vector<float> genT2TLatencies;
+        std::vector<float> userTokensPerSecond;
 
         int totalOutputTokens{0};
         int totalDecodingIter{0};
@@ -324,6 +325,10 @@ public:
                     if (reqInfo.second.avgGenT2TLatency)
                     {
                         genT2TLatencies.push_back(reqInfo.second.avgGenT2TLatency.value());
+                    }
+                    if (reqInfo.second.avgGenT2TLatency.value() > 0)
+                    {
+                        userTokensPerSecond.push_back(1000.F / reqInfo.second.avgGenT2TLatency.value());
                     }
                 }
                 ++mNumSamples;
@@ -377,6 +382,18 @@ public:
                 mMinGenT2TLatency = genT2TLatencies.front();
             }
 
+            if (!userTokensPerSecond.empty())
+            {
+                mAvgUserTokensPerSecond = std::accumulate(userTokensPerSecond.begin(), userTokensPerSecond.end(), 0.F)
+                    / userTokensPerSecond.size();
+                std::sort(userTokensPerSecond.begin(), userTokensPerSecond.end());
+                mP99UserTokensPerSecond = calcPercentile(userTokensPerSecond, 99);
+                mP90UserTokensPerSecond = calcPercentile(userTokensPerSecond, 90);
+                mP50UserTokensPerSecond = calcPercentile(userTokensPerSecond, 50);
+                mMaxUserTokensPerSecond = userTokensPerSecond.back();
+                mMinUserTokensPerSecond = userTokensPerSecond.front();
+            }
+
             mAvgReqQueueingLatency
                 = std::accumulate(mRequestsQueueingLatencies.begin(), mRequestsQueueingLatencies.end(), 0.F)
                 / mRequestsQueueingLatencies.size();
@@ -423,6 +440,13 @@ public:
             printf("[BENCHMARK] p90_inter_token_latency(ms) %.2f\n", mP90GenT2TLatency);
             printf("[BENCHMARK] p50_inter_token_latency(ms) %.2f\n\n", mP50GenT2TLatency);
 
+            printf("[BENCHMARK] avg_user_tokens_per_second(tokens/sec/user) %.2f\n", mAvgUserTokensPerSecond);
+            printf("[BENCHMARK] max_user_tokens_per_second(tokens/sec/user) %.2f\n", mMaxUserTokensPerSecond);
+            printf("[BENCHMARK] min_user_tokens_per_second(tokens/sec/user) %.2f\n", mMinUserTokensPerSecond);
+            printf("[BENCHMARK] p99_user_tokens_per_second(tokens/sec/user) %.2f\n", mP99UserTokensPerSecond);
+            printf("[BENCHMARK] p90_user_tokens_per_second(tokens/sec/user) %.2f\n", mP90UserTokensPerSecond);
+            printf("[BENCHMARK] p50_user_tokens_per_second(tokens/sec/user) %.2f\n\n", mP50UserTokensPerSecond);
+
             printf("[BENCHMARK] avg_request_queueing_latency(ms) %.2f\n", mAvgReqQueueingLatency);
             printf("[BENCHMARK] max_request_queueing_latency(ms) %.2f\n", mMaxReqQueueingLatency);
             printf("[BENCHMARK] min_request_queueing_latency(ms) %.2f\n", mMinReqQueueingLatency);
@@ -443,11 +467,26 @@ public:
 
             if (mStreaming)
             {
-                std::vector<std::string> streamingHeaders
-                    = {"avg_time_to_first_token(ms)", "max_time_to_first_token(ms)", "min_time_to_first_token(ms)",
-                        "p99_time_to_first_token(ms)", "p90_time_to_first_token(ms)", "p50_time_to_first_token(ms)",
-                        "avg_inter_token_latency(ms)", "max_inter_token_latency(ms)", "min_inter_token_latency(ms)",
-                        "p99_inter_token_latency(ms)", "p90_inter_token_latency(ms)", "p50_inter_token_latency(ms)"};
+                std::vector<std::string> streamingHeaders = {
+                    "avg_time_to_first_token(ms)",
+                    "max_time_to_first_token(ms)",
+                    "min_time_to_first_token(ms)",
+                    "p99_time_to_first_token(ms)",
+                    "p90_time_to_first_token(ms)",
+                    "p50_time_to_first_token(ms)",
+                    "avg_inter_token_latency(ms)",
+                    "max_inter_token_latency(ms)",
+                    "min_inter_token_latency(ms)",
+                    "p99_inter_token_latency(ms)",
+                    "p90_inter_token_latency(ms)",
+                    "p50_inter_token_latency(ms)",
+                    "avg_user_tokens_per_second(tokens/sec/user)",
+                    "max_user_tokens_per_second(tokens/sec/user)",
+                    "min_user_tokens_per_second(tokens/sec/user)",
+                    "p99_user_tokens_per_second(tokens/sec/user)",
+                    "p90_user_tokens_per_second(tokens/sec/user)",
+                    "p50_user_tokens_per_second(tokens/sec/user)",
+                };
 
                 headers.insert(headers.end(), streamingHeaders.begin(), streamingHeaders.end());
             }
@@ -470,7 +509,10 @@ public:
                     outputFile << "," << mAvgFtLatency << "," << mMaxFtLatency << "," << mMinFtLatency << ","
                                << mP99FtLatency << "," << mP90FtLatency << "," << mP50FtLatency << ","
                                << mAvgGenT2TLatency << "," << mMaxGenT2TLatency << "," << mMinGenT2TLatency << ","
-                               << mP99GenT2TLatency << "," << mP90GenT2TLatency << "," << mP50GenT2TLatency;
+                               << mP99GenT2TLatency << "," << mP90GenT2TLatency << "," << mP50GenT2TLatency << ","
+                               << mAvgUserTokensPerSecond << "," << mMaxUserTokensPerSecond << ","
+                               << mMinUserTokensPerSecond << "," << mP99UserTokensPerSecond << ","
+                               << mP90UserTokensPerSecond << "," << mP50UserTokensPerSecond << ",";
                 }
 
                 outputFile << "\n";
@@ -524,6 +566,7 @@ private:
     float mSeqThroughput{};
     float mAvgSeqLatency{};
     float mAvgGenT2TLatency{};
+    float mAvgUserTokensPerSecond{};
     float mAvgFtLatency{};
     float mTokenThroughput{};
     float mAcceptanceRate{};
@@ -542,6 +585,11 @@ private:
     float mP50GenT2TLatency{};
     float mMaxGenT2TLatency{};
     float mMinGenT2TLatency{};
+    float mP99UserTokensPerSecond{};
+    float mP90UserTokensPerSecond{};
+    float mP50UserTokensPerSecond{};
+    float mMaxUserTokensPerSecond{};
+    float mMinUserTokensPerSecond{};
     float mAvgReqQueueingLatency{};
     float mP99ReqQueueingLatency{};
     float mP90ReqQueueingLatency{};
@@ -591,6 +639,7 @@ public:
             benchmarkParams.cudaGraphCacheSize);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
+        executorConfig.setEnableTrtOverlap(benchmarkParams.enableTrtOverlap);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
         executorConfig.setPeftCacheConfig(peftCacheConfig);
         executorConfig.setBatchingType(batchingType);
@@ -780,12 +829,16 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // embeddingBias
         std::nullopt,    // speculativeDecoding
         std::nullopt,    // pTuning
+        std::nullopt,    // multimodalInput
+        std::nullopt,    // multimodalEmbedding
         std::nullopt,    // mRopeConfig
         loraConfig,      // loraConfig
         lookaheadConfig, // lookaheadConfig
         std::nullopt,    // kvCacheRetentionConfig
         std::nullopt,    // logitsPostProcessorName
-        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
+        std::nullopt,    // logitsPostProcessor
+        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
+        std::nullopt);   // cacheSaltID
 }
 
 void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngineDir,
@@ -1003,7 +1056,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
 int main(int argc, char* argv[])
 {
     cxxopts::Options options(
-        "TensorRT-LLM BatchManager Benchmark", "TensorRT-LLM BatchManager Benchmark for GPT and GPT-like models.");
+        "TensorRT LLM BatchManager Benchmark", "TensorRT LLM BatchManager Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
     options.add_options()("engine_dir, decoder_engine_dir", "Directory that store the engines of decoder models.",
         cxxopts::value<std::string>());
@@ -1054,7 +1107,7 @@ int main(int argc, char* argv[])
         "Operate in streaming mode. Note: it reflects time-to-first-token and inter-token-latency",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()(
-        "enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>()->default_value("false"));
+        "enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "enable_chunked_context", "Whether to enable context chunking.", cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
@@ -1096,6 +1149,11 @@ int main(int argc, char* argv[])
         "Minimum token probability threshold for typical acceptance. Enables typical acceptance in Eagle",
         cxxopts::value<float>());
     options.add_options()("temperature", "Sampling temperature for each request", cxxopts::value<float>());
+    options.add_options()(
+        "eagle_use_dynamic_tree", "Whether to use Eagle-2", cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("eagle_dynamic_tree_max_top_k",
+        "The max topK for dynamic tree, also the number of draft tokens that will expand for each node",
+        cxxopts::value<SizeType32>());
 
     options.add_options()("multi_block_mode",
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel",
@@ -1106,6 +1164,7 @@ int main(int argc, char* argv[])
         "Specify how many cuda graphs are cached in the runtime. Larger cache gives better perf, but consumes more GPU "
         "memory.",
         cxxopts::value<SizeType32>()->default_value("0"));
+    options.add_options()("enable_trt_overlap", "Enable TRT Overlap", cxxopts::value<bool>()->default_value("false"));
 
     options.add_options()("enable_context_fmha_fp32_acc", "Enable FMHA runner FP32 accumulation",
         cxxopts::value<bool>()->default_value("false"));
@@ -1305,7 +1364,8 @@ int main(int argc, char* argv[])
         benchmarkParams.medusaChoices = parseVectorOfVectors(result["medusa_choices"].as<std::string>());
     }
     // Argument: Eagle choices for the Eagle speculative decoding.
-    if (result.count("eagle_choices") || result.count("eagle_posterior_threshold"))
+    if (result.count("eagle_choices") || result.count("eagle_posterior_threshold")
+        || result.count("eagle_use_dynamic_tree") || result.count("eagle_dynamic_tree_max_top_k"))
     {
         std::optional<float> posteriorThreshold;
         if (result.count("eagle_posterior_threshold"))
@@ -1317,7 +1377,18 @@ int main(int argc, char* argv[])
         {
             choices = parseVectorOfVectors(result["eagle_choices"].as<std::string>());
         }
-        benchmarkParams.eagleConfig = texec::EagleConfig(choices, !posteriorThreshold.has_value(), posteriorThreshold);
+        bool eagleUseDynamicTree = false;
+        if (result.count("eagle_use_dynamic_tree"))
+        {
+            eagleUseDynamicTree = result["eagle_use_dynamic_tree"].as<bool>();
+        }
+        std::optional<SizeType32> eagleDynamicTreeMaxTopK;
+        if (result.count("eagle_dynamic_tree_max_top_k"))
+        {
+            eagleDynamicTreeMaxTopK = result["eagle_dynamic_tree_max_top_k"].as<SizeType32>();
+        }
+        benchmarkParams.eagleConfig = texec::EagleConfig(
+            choices, !posteriorThreshold.has_value(), posteriorThreshold, eagleUseDynamicTree, eagleDynamicTreeMaxTopK);
     }
     if (result.count("temperature"))
     {
@@ -1346,6 +1417,9 @@ int main(int argc, char* argv[])
 
     // Argument: cuda_graph_cache_size
     benchmarkParams.cudaGraphCacheSize = result["cuda_graph_cache_size"].as<SizeType32>();
+
+    // Argument: enable_trt_overlap
+    benchmarkParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

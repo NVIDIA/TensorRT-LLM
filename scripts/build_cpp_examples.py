@@ -21,17 +21,14 @@ def working_directory(path: PathLike):
 
 
 def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
-                       loglevel: int) -> None:
+                       enable_multi_device: str, loglevel: int) -> None:
     logging.basicConfig(level=loglevel,
                         format='%(asctime)s - %(levelname)s - %(message)s')
     # Convert input paths to pathlib.Path objects
     build_dir = Path(build_dir)
     trt_dir = Path(trt_dir)
-    trt_include_dir = trt_dir / "include"
-    trt_lib_dir = trt_dir / "lib"
 
-    assert trt_include_dir.is_dir()
-    assert trt_lib_dir.is_dir()
+    assert trt_dir.is_dir()
 
     def cmake_parse(path: PathLike) -> str:
         return str(path).replace("\\", "/")
@@ -49,9 +46,13 @@ def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
         # Run CMake with the specified TensorRT directories
         generator = ["-GNinja"] if platform.system() == "Windows" else []
         generate_command = [
-            'cmake', '-S', '..', '-B', '.',
-            f'-DTRT_LIB_DIR={cmake_parse(trt_lib_dir)}',
-            f'-DTRT_INCLUDE_DIR={cmake_parse(trt_include_dir)}'
+            'cmake',
+            '-S',
+            '..',
+            '-B',
+            '.',
+            f'-DTensorRT_ROOT={cmake_parse(trt_dir)}',
+            f'-DENABLE_MULTI_DEVICE={enable_multi_device}',
         ] + generator
         logging.info(f"Executing {generate_command}")
         subprocess.run(generate_command, check=True)
@@ -70,6 +71,9 @@ if __name__ == '__main__':
     parser.add_argument('--trt-dir',
                         default='/usr/local/tensorrt',
                         help='TensorRT directory path')
+    parser.add_argument('--enable-multi-device',
+                        default='ON',
+                        help='Enable multi device support (requires MPI)')
     parser.add_argument('-v',
                         '--verbose',
                         help="verbose",

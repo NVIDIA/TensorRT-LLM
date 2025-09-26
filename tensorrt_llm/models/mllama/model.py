@@ -32,9 +32,9 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  ColumnLinear, Embedding, FusedGatedMLP,
                                  GatedMLP, GroupNorm, KeyValueCacheParams,
                                  LayerNorm, LoraParams, RmsNorm)
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules,
-                                       use_lora)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules,
+                                      use_lora)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 from tensorrt_llm.models.modeling_utils import PretrainedModel, QuantConfig
@@ -90,7 +90,6 @@ class CrossAttentionTransformerBlock(Module):
             use_implicit_relative_attention=False,
             rotary_embedding_base=None,
             rotary_embedding_scaling=None,
-            layer_idx_in_cache_pool=None,
             quant_mode=QuantMode(0),
     ):
         super().__init__()
@@ -125,7 +124,6 @@ class CrossAttentionTransformerBlock(Module):
             skip_cross_kv=skip_cross_kv,
             qk_layernorm=True,
             layernorm_type=layernorm_type,
-            layer_idx_in_cache_pool=layer_idx_in_cache_pool,
             quant_mode=quant_mode,
         )
 
@@ -215,7 +213,6 @@ class CrossAttentionTransformerBlock(Module):
 
         if use_cache:
             attention_output, presents_cross = attention_output
-        attention_output = attention_output * full_text_row_masked_out_mask  # TODO(bhsueh) should move this mask into attention?
         if ADD_DEBUG_TENSOR:
             attention_output.mark_output(
                 f'{self.local_layer_idx:2d}/3.1: cross_attention_output',
@@ -252,6 +249,8 @@ class CrossAttentionTransformerBlock(Module):
             mlp_conditional = Conditional(skip_cross_attn_blocks)
             skip_case = mlp_conditional.add_input(hidden_states)
             hidden_states = mlp_conditional.add_input(hidden_states)
+
+        attention_output = attention_output * full_text_row_masked_out_mask  # TODO should move this mask into attention?
 
         residual = hidden_states * self.residual_scaling
 
@@ -322,7 +321,6 @@ class TransformerBlock(Module):
             use_implicit_relative_attention=False,
             rotary_embedding_base=None,
             rotary_embedding_scaling=None,
-            layer_idx_in_cache_pool=None,
             quant_mode=QuantMode(0),
     ):
         super().__init__()
@@ -356,7 +354,6 @@ class TransformerBlock(Module):
             use_implicit_relative_attention=use_implicit_relative_attention,
             rotary_embedding_base=rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
-            layer_idx_in_cache_pool=layer_idx_in_cache_pool,
             quant_mode=quant_mode,
         )
 
@@ -557,18 +554,9 @@ class MLLaMAModel(Module):
             }
             if layer_idx in self.cross_attention_layers:
                 assert layers_range[0] == 0, "not support PP now"
-                _layers.append(
-                    CrossAttentionTransformerBlock(
-                        **args,
-                        layer_idx_in_cache_pool=self.config.
-                        num_kv_heads_per_cross_attn_layer[:local_layer_idx].
-                        count(num_kv_heads)))
+                _layers.append(CrossAttentionTransformerBlock(**args))
             else:
-                _layers.append(
-                    TransformerBlock(**args,
-                                     layer_idx_in_cache_pool=self.config.
-                                     num_kv_heads_per_layer[:local_layer_idx].
-                                     count(num_kv_heads)))
+                _layers.append(TransformerBlock(**args))
 
         self.layers = ModuleList(_layers)
 
@@ -624,11 +612,27 @@ class MLLaMAModel(Module):
             trt.ReduceOperation.MAX,
             dim=-1,
             keepdim=True)
+        if ADD_DEBUG_TENSOR:
+            full_text_row_masked_out_mask.mark_output(
+                "full_text_row_masked_out_mask",
+                full_text_row_masked_out_mask.dtype)
+
         cross_attention_mask_type = attention_mask_params.cross_attention_mask.dtype
         attention_mask_params.cross_attention_mask = (
             attention_mask_params.cross_attention_mask.cast(
                 full_text_row_masked_out_mask.dtype) *
             full_text_row_masked_out_mask).cast(cross_attention_mask_type)
+
+        invert_mask = 1.0 - attention_mask_params.cross_attention_mask.cast(
+            hidden_states.dtype)
+        invert_full_text_row_masked_out_mask = 1.0 - full_text_row_masked_out_mask
+        final_mask = invert_mask - invert_full_text_row_masked_out_mask
+        attention_mask_params.cross_attention_mask = final_mask.cast(
+            cross_attention_mask_type)
+        if ADD_DEBUG_TENSOR:
+            attention_mask_params.cross_attention_mask.mark_output(
+                "attention_mask_params.cross_attention_mask",
+                attention_mask_params.cross_attention_mask.dtype)
 
         if use_cache:
             presents = []
@@ -719,6 +723,7 @@ class MLLaMAModel(Module):
 
 # TODO try to inherit the DecoderModelForCausalLM
 class MLLaMAForCausalLM(PretrainedModel):
+    config_class = MLLaMAConfig
 
     def __init__(self, config: MLLaMAConfig):
         super().__init__(config)
@@ -803,7 +808,6 @@ class MLLaMAForCausalLM(PretrainedModel):
             hidden_states, presents = hidden_states
 
         if self.mapping.is_last_pp_rank():
-            pass
             # [bs, seq, hidden_size] or [num_tokens, hidden_size] -> [bs, hidden_size]
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
@@ -1088,7 +1092,7 @@ class MLLaMAForCausalLM(PretrainedModel):
             dim_range=OrderedDict([
                 ('decoder_num_tokens_2',
                  [decoder_num_tokens_range
-                  ]),  # TODO (bhsueh) should use same name as input_ids
+                  ]),  # TODO should use same name as input_ids
                 ('encoder_input_len_2', [encoder_input_len_range]),
             ]),
         )
@@ -1168,9 +1172,10 @@ class MLLaMAForCausalLM(PretrainedModel):
                     lora_weight_pointer = Tensor(
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
-                        shape=[-1, 2],
+                        shape=[-1, 3],
                         dim_range=OrderedDict([('batch_size_beam_width',
-                                                [bb_range]), ('in_out', [2])]))
+                                                [bb_range]),
+                                               ('in_out_scales', [3])]))
                     lora_weight_pointer_dict.update({
                         f'{lora_module}_lora_weights_pointers':
                         lora_weight_pointer
@@ -1239,8 +1244,8 @@ class MLLaMAForCausalLM(PretrainedModel):
 
                     past_key_value.append(kv)
 
-                if i in self.fusion_schedule:
-                    xa_layer_id = self.fusion_schedule.index(
+                if i in self.transformer.cross_attention_layers:
+                    xa_layer_id = self.transformer.cross_attention_layers.index(
                         i) + layers_range[-1]
                     cross_kv_dim_range = OrderedDict([
                         ('batch_size_beam_width', [bb_range]),
@@ -1319,9 +1324,11 @@ class MLLaMAForCausalLM(PretrainedModel):
                 host_kv_cache_pool_mapping = Tensor(
                     name=f"host_kv_cache_pool_mapping",
                     dtype=trt.int32,
-                    shape=[num_pp_layers],
+                    # 2: (Index of pool, Index of layer within pool)
+                    shape=[num_pp_layers, 2],
                     dim_range=OrderedDict([
                         ('pools_mapping', [num_pp_layers]),
+                        ('layer_cache_pool_locator', [2]),
                     ]))
 
                 # paged blocks for cross kv
@@ -1358,9 +1365,11 @@ class MLLaMAForCausalLM(PretrainedModel):
                 host_cross_kv_cache_pool_mapping = Tensor(
                     name=f"host_cross_kv_cache_pool_mapping",
                     dtype=trt.int32,
-                    shape=[num_pp_layers],
+                    # 2: (Index of pool, Index of layer within pool)
+                    shape=[num_pp_layers, 2],
                     dim_range=OrderedDict([
                         ('pools_mapping', [num_pp_layers]),
+                        ('layer_cache_pool_locator', [2]),
                     ]))
 
                 for i in layers_range:

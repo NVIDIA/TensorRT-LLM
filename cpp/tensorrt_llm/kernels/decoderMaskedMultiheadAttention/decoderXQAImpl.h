@@ -37,7 +37,7 @@ class DecoderXQARunner;
 class DecoderXQAImpl
 {
 public:
-    // TODO(minwei): shouldUse()/prepare() should be templated with KVCacheBuffer.
+    // TODO: shouldUse()/prepare() should be templated with KVCacheBuffer.
     // Whether it is beneficial to use this XQA codepath.
     //
     // forConfigurePlugin: whether this method is called in configure plugin phase.
@@ -58,6 +58,8 @@ public:
     // Needs runner pointer for accessing resources in DecoderXQARunner class.
     static std::unique_ptr<DecoderXQAImpl> create(DecoderXQARunner* runner, ImplType implType);
 
+    virtual ~DecoderXQAImpl() = default;
+
 protected:
     DecoderXQAImpl(DecoderXQARunner* runner)
         : mRunner(runner)
@@ -77,7 +79,8 @@ protected:
 enum class XQAKernelType : int32_t
 {
     kAMPERE_WARP_SPECIALIZED = 0,
-    kHOPPER_WARP_SPECIALIZED = 1
+    kHOPPER_WARP_SPECIALIZED = 1,
+    kSM120_MLA = 2
 };
 
 } // namespace kernels

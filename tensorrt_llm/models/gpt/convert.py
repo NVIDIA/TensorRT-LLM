@@ -409,7 +409,7 @@ def load_weights_from_hf_model(hf_model,
     else:
         plugin_weight_only_quant_type = None
 
-    use_smooth_quant = config.quantization.use_plugin_sq
+    use_smooth_quant = config.quantization._use_plugin_sq
     per_channel = use_smooth_quant and 'PER_CHANNEL' in quant_algo
     per_token = use_smooth_quant and 'PER_TOKEN' in quant_algo
     int8_kv_cache = config.quantization.kv_cache_quant_algo == QuantAlgo.INT8
@@ -459,9 +459,9 @@ def load_weights_from_hf_model(hf_model,
                                            f'{prefix}.self_attn.k_proj', dtype)
             v_w, v_b = get_weight_and_bias(model_params,
                                            f'{prefix}.self_attn.v_proj', dtype)
-            qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
-            qkv_b = torch.cat([q_b, k_b, v_b],
-                              dim=0) if q_b is not None else None
+            qkv_w = torch.cat([q_w.cuda(), k_w.cuda(), v_w.cuda()], dim=0)
+            qkv_b = torch.cat([q_b.cuda(), k_b.cuda(),
+                               v_b.cuda()], dim=0) if q_b is not None else None
         elif gpt_variant == 'persimmon':
             qkv_w, qkv_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.query_key_value', dtype)
@@ -869,7 +869,7 @@ def quantize(hf_model_dir: str,
     assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
-    use_smooth_quant = quant_config.use_plugin_sq
+    use_smooth_quant = quant_config._use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"

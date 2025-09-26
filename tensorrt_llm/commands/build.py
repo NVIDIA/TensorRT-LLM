@@ -24,18 +24,36 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm._utils import (OMPI_COMM_TYPE_HOST, mpi_barrier, mpi_comm,
-                                 mpi_rank, mpi_world_size)
+from tensorrt_llm._utils import (local_mpi_rank, local_mpi_size, mpi_barrier,
+                                 mpi_comm, mpi_rank, mpi_world_size)
 from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
 from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+def enum_type(enum_class):
+
+    def parse_enum(value):
+        if isinstance(value, enum_class):
+            return value
+
+        if isinstance(value, str):
+            return enum_class.from_string(value)
+
+        valid_values = [e.name for e in enum_class]
+        raise argparse.ArgumentTypeError(
+            f"Invalid value '{value}' of type {type(value).__name__}. Expected one of {valid_values}"
+        )
+
+    return parse_enum
 
 
 def parse_arguments():
@@ -45,26 +63,26 @@ def parse_arguments():
         '--checkpoint_dir',
         type=str,
         default=None,
-        help="The directory path that contains TensorRT-LLM checkpoint.")
+        help="The directory path that contains TensorRT LLM checkpoint.")
     parser.add_argument(
         '--model_config',
         type=str,
         default=None,
-        help="The file path that saves TensorRT-LLM checkpoint config.")
+        help="The file path that saves TensorRT LLM checkpoint config.")
     parser.add_argument(
         '--build_config',
         type=str,
         default=None,
-        help="The file path that saves TensorRT-LLM build config.")
+        help="The file path that saves TensorRT LLM build config.")
     parser.add_argument(
         '--model_cls_file',
         type=str,
         default=None,
-        help="The file path that defines customized TensorRT-LLM model.")
+        help="The file path that defines customized TensorRT LLM model.")
     parser.add_argument('--model_cls_name',
                         type=str,
                         default=None,
-                        help="The customized TensorRT-LLM model class name.")
+                        help="The customized TensorRT LLM model class name.")
     parser.add_argument(
         '--output_dir',
         type=str,
@@ -131,7 +149,7 @@ def parse_arguments():
     parser.add_argument(
         '--kv_cache_type',
         default=argparse.SUPPRESS,
-        type=KVCacheType,
+        type=enum_type(KVCacheType),
         help=
         "Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed."
     )
@@ -203,10 +221,11 @@ def parse_arguments():
                         help="Enable debug output.")
     parser.add_argument(
         '--visualize_network',
-        default=BuildConfig.visualize_network,
-        action='store_true',
+        type=str,
+        default=None,
         help=
-        "Export TensorRT Networks to ONNX prior to Engine build for debugging.")
+        "The directory path to export TensorRT Network as ONNX prior to Engine build for debugging."
+    )
     parser.add_argument(
         '--dry_run',
         default=BuildConfig.dry_run,
@@ -331,19 +350,19 @@ def build_model(
         model_config.logits_dtype = logits_dtype
 
     architecture = model_config.architecture
-    assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
-        "StreamingLLM is only supported in the llama model."
+    assert not build_config.plugin_config.streamingllm, \
+        "StreamingLLM is no longer supported because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
     assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
         "PP reduce scatter is only supported in the mixtral model."
-    real_rank = rank
 
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
         assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
             "You must convert to full model with TP=1&&PP=1 to use auto parallel planner"
-        #TODO: TRTLLM-193 remove this after the new build API for autopp is done
-        rank = 0  # This is a WAR to construct a whole model and load all the weights before auto parallel
+        model_config.mapping.auto_parallel = True
+        model_config.mapping.world_size = build_config.auto_parallel_config.world_size
+        model_config.mapping.rank = rank
     else:
         assert rank < model_config.mapping.world_size
 
@@ -369,16 +388,9 @@ def build_model(
             lora_config.lora_target_modules = kwargs['lora_target_modules']
         build_config.lora_config = lora_config
 
-    # tells the low level build api to only build rank-th shard of the model
-    if build_config.auto_parallel_config.enabled:
-        model.config.mapping.rank = real_rank
-
     if is_checkpoint_pruned or kwargs.pop('strip_plan', False):
         build_config.use_strip_plan = True
     build_config.use_refit = kwargs.get('refit', False)
-
-    if dry_run:
-        return build_config
 
     return build(model, build_config)
 
@@ -444,9 +456,8 @@ def parallel_build(model_config: PretrainedConfig,
             assert len(exceptions
                        ) == 0, "Engine building failed, please check error log."
     else:
-        mpi_local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
-        mpi_local_rank = mpi_local_comm.Get_rank()
-        node_gpu_count = torch.cuda.device_count()
+        mpi_local_rank = local_mpi_rank()
+        node_gpu_count = local_mpi_size()
         exceptions = []
         for engine_rank in range(world_size):
             if engine_rank % mpi_world_size() != mpi_rank():
@@ -467,6 +478,12 @@ def parallel_build(model_config: PretrainedConfig,
 def main():
     parser = parse_arguments()
     args = parser.parse_args()
+
+    if hasattr(args, 'gather_generation_logits'):
+        logger.warning(
+            'Option --gather_generation_logits is deprecated, a build flag is not required anymore. Use --output_generation_logits at runtime instead.'
+        )
+
     if args.gather_all_token_logits:
         args.gather_context_logits = True
         args.gather_generation_logits = True
@@ -497,7 +514,7 @@ def main():
         )
 
     plugin_config = PluginConfig.from_arguments(args)
-
+    plugin_config.validate()
     if args.fast_build:
         plugin_config.manage_weights = True
 

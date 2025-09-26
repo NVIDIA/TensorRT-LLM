@@ -15,19 +15,15 @@
  */
 
 #include "tensorrt_llm/runtime/ipcUtils.h"
-
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
 
 namespace tensorrt_llm::runtime
-{
-
-namespace
 {
 
 bool canAccessPeer(WorldConfig const& worldConfig)
@@ -62,7 +58,6 @@ bool canAccessPeer(WorldConfig const& worldConfig)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return true;
 }
-} // namespace
 
 IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig, bool openIpc)
     : mTpRank(worldConfig.getTensorParallelRank())
@@ -79,7 +74,7 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // Note (jdebache): cudaIpcGet/OpenMemHandle does not work well with tiny allocations. The risk is that two small
+    // Note: cudaIpcGet/OpenMemHandle does not work well with tiny allocations. The risk is that two small
     // allocations will get 'packed' together, and that we will get the same IPC handle for both using
     // cudaIpcGetMemHandle. We then try to open this handle twice on the receiving end, resulting in an 'already mapped'
     // error. This manual alignment is a WAR for this behavior, until we move to using cuMemMap and OS handles to share
@@ -154,22 +149,26 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     {
         auto const tpSize = worldConfig.getTensorParallelism();
         mAllReduceCommPtrs = BufferManager::cpu(
-            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 2}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 3}), nvinfer1::DataType::kINT64);
     }
     else
     {
         auto const isP2pSupported = canAccessPeer(worldConfig);
 
         auto const tpSize = worldConfig.getTensorParallelism();
-        auto const bufferSize = tpSize
+        bool const forceDeterministic = common::getEnvForceDeterministicAllReduce();
+        // Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
+        auto const bufferSize = (forceDeterministic ? 1 : tpSize)
             * std::min(
                 static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
                 utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
         size_t realHiddenSize = tpSize * hiddenSize;
         // PUSH_MODE need TP_SIZE times the activation tensor size
-        auto const lamportBufferSize = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold
-            * realHiddenSize * sizeof(half);
-        auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
+        auto const lamportBufferSize = forceDeterministic
+            ? 1 // zero size is not allowed for IpcMemory::allocateIpcMemory.
+            : (tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * realHiddenSize
+                * sizeof(half));
+        auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2 * tpSize;
 
         for (auto size :
             {bufferSize, bufferSize, flagsSize, flagsSize, lamportBufferSize, lamportBufferSize, lamportBufferSize})
@@ -178,13 +177,15 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         }
 
         mAllReduceCommPtrs
-            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 2}),
+            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 3}),
                 nvinfer1::DataType::kINT64);
         auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
-        auto const CustomARFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
-        auto const LamportFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 2));
-        *CustomARFlagPtr = 0;
-        *LamportFlagPtr = 0;
+        // Start from 1 since 0 represents released state for barrier at the beginning of the all_reduce.
+        // The last element is the barrier flag counter.
+        mFlagPtrs = manager.copyFrom(std::vector<int64_t>{1, 1, 0}, ITensor::makeShape({3}), MemoryType::kGPU);
+        commPtrs[mIpcMemoryHandles.size() * tpSize] = mFlagPtrs->data();
+        commPtrs[mIpcMemoryHandles.size() * tpSize + 1] = mFlagPtrs->data(1);
+        commPtrs[mIpcMemoryHandles.size() * tpSize + 2] = mFlagPtrs->data(2);
 
         for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
         {

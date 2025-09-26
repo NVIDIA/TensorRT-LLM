@@ -83,7 +83,10 @@ struct TopPSamplingKernelParams
     runtime::SizeType32 vocabSizePadded{-1};
     runtime::SizeType32 maxSeqLen{-1};
 
+    //! flag to return all selected TopK results
     bool returnAllSelectedTokens{false};
+    //! flag to return all selected TopK results per request.
+    bool const* returnAllSelectedTokensPerSlot{nullptr};
 
     //! output buffer [maxBatchSize], optional.
     //! Store the multinomial sampled target token id in TopK/TopP sampled tokens when returnAllSelectedTokens==True.

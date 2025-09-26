@@ -64,11 +64,9 @@ public:
 private:
     enum class InputIdxEntry : int32_t
     {
-        // 13 inputs
+        // 12 inputs
         // [num_input_logits, vocab_size_padded]
         LOGITS = 0,
-        // [num_input_logits]
-        RAND_SAMPLE,
         // [batch_size, max_decoding_tokens, max_path_len]
         PATHS,
         // [1]

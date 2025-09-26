@@ -84,7 +84,6 @@ SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(
     : mPluginProfiler(pluginProfiler)
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
-    bool perChannelScaling = false, perTokenScaling = false;
     nvinfer1::DataType type;
     unsigned int quantMode;
     read(d, quantMode);
@@ -99,7 +98,7 @@ SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -325,7 +324,7 @@ void SmoothQuantGemmPlugin::serialize(void* buffer) const noexcept
     write(d, mDims);
 
     mPluginProfiler->serialize(d, mGemmId);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void SmoothQuantGemmPlugin::destroy() noexcept
@@ -345,9 +344,9 @@ SmoothQuantGemmPluginCreator::SmoothQuantGemmPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("has_per_channel_scaling", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("has_per_token_scaling", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("has_per_channel_scaling", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("has_per_token_scaling", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -370,8 +369,9 @@ PluginFieldCollection const* SmoothQuantGemmPluginCreator::getFieldNames() noexc
 IPluginV2* SmoothQuantGemmPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    bool perTokenScaling, perChannelScaling;
-    nvinfer1::DataType type;
+    bool perTokenScaling{};
+    bool perChannelScaling{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -397,7 +397,8 @@ IPluginV2* SmoothQuantGemmPluginCreator::createPlugin(char const* name, PluginFi
         // SmoothQuantGemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
         auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
-        QuantMode quantMode = QuantMode::fromDescription(true, true, perTokenScaling, perChannelScaling);
+        QuantMode quantMode = QuantMode::fromDescription(true, true, perTokenScaling, perChannelScaling, false, false,
+            false, false, false, false, false, false, false, false, false, false);
         auto* obj = new SmoothQuantGemmPlugin(quantMode, type, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

@@ -1,0 +1,57 @@
+// VSCode workspace settings for python-only tekit development /////////////////////////////////////
+{
+    // REQUIRES CUSTOMIZATION: modify according to your needs...! //////////////////////////////////
+    // Please also modify the .env file accordingly
+    "terminal.integrated.env.linux": {
+        "OMPI_MCA_opal_cuda_support": "true",
+        "LD_LIBRARY_PATH": "/lib/x86_64-linux-gnu:<PATH-TO-CONDA-ENV>/lib:${env:LD_LIBRARY_PATH}",
+    },
+    // STANDARD SETTINGS, DO NOT MODIFY ////////////////////////////////////////////////////////////
+    "python.envFile": "${workspaceFolder}/.vscode/.env",
+    "editor.rulers": [
+        100
+    ], // 100 for auto-formatter, 120 for hard limit in ruff
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit"
+        },
+    },
+    "python.testing.pytestEnabled": true,
+    // TODO: VSCode is going to support error-tolerant pytest discovery in the near future:
+    // https://code.visualstudio.com/updates/v1_81#_python
+    // When that happens, we can remove the --ignore-glob flag and the gpu tests will be skipped
+    "python.testing.pytestArgs": [
+        "./tests/unittest/_torch/auto_deploy",
+        "--no-cov",
+        "-n=auto",
+        "--dist=worksteal",
+    ],
+    "files.exclude": {
+        "build": true,
+    },
+    "files.watcherExclude": {
+        ".ipynb_checkpoints": true,
+        ".mypy_cache": true,
+        ".pytest_cache": true,
+        ".ruff_cache": true,
+        ".tox": true,
+        "**/__pycache__/**": true,
+        "**/*.pyc": true,
+        "**/runs": true,
+        "build": true
+    },
+    "[yaml]": {
+        "editor.defaultFormatter": "redhat.vscode-yaml",
+    },
+    "yaml.format.enable": false,
+    "yaml.format.printWidth": 150,
+    "yaml.format.bracketSpacing": false,
+    "yaml.customTags": [
+        "!reference sequence"
+    ],
+    // disable toml/json schema since we have custom fields
+    "evenBetterToml.schema.enabled": false,
+    "docker.languageserver.formatter.ignoreMultilineInstructions": true,
+}

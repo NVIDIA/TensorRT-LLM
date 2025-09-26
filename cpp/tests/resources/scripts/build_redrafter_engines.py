@@ -19,20 +19,27 @@ import pathlib as _pl
 import platform as _pf
 import sys as _sys
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def build_engine(base_model_dir: _pl.Path, drafter_model_dir: _pl.Path,
                  engine_dir: _pl.Path, *args):
 
+    base_ckpt_dir = f'{base_model_dir}-ckpt'
+    covert_cmd_base = [
+        _sys.executable, "examples/models/core/llama/convert_checkpoint.py"
+    ] + (['--model_dir', str(base_model_dir)] if base_model_dir else []) + [
+        '--output_dir', str(base_ckpt_dir), '--dtype=float16'
+    ] + list(args)
+
+    run_command(covert_cmd_base)
+
     covert_cmd = [
         _sys.executable, "examples/redrafter/convert_checkpoint.py"] + (
-        ['--model_dir', str(base_model_dir)] if base_model_dir else []) + [
+        ['--base_model_checkpoint_dir', str(base_ckpt_dir)] if base_model_dir else []) + [
             '--drafter_model_dir', str(drafter_model_dir), \
             '--output_dir', str(engine_dir), '--dtype=float16',
             '--redrafter_num_beams=5', '--redrafter_draft_len_per_beam=5'
@@ -96,7 +103,7 @@ def build_engines(model_cache: str):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj = ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "xqaParams.h"
@@ -66,37 +67,47 @@ struct XQAKernelRuntimeHashKey
     unsigned int tokens_per_page;
     bool paged_kv_cache;
     bool multi_query_tokens;
+    bool is_fp8_output;
+    std::optional<PositionEmbeddingType> position_embedding_type;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
         return kv_data_type == other.kv_data_type && head_size == other.head_size
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
-            && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache;
+            && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
+            && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type;
     }
 };
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams);
+uint32_t getKernelMTileSize(
+    uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportQGMMA, bool supportMLA);
+
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit, int SM);
 
 struct XQAKernelRuntimeHasher
 {
     size_t operator()(XQAKernelRuntimeHashKey const& s) const
     {
         size_t key = s.kv_data_type;
-        key <<= 16;
+        key <<= 16; // 16
         key ^= s.head_size;
-        key <<= 8;
+        key <<= 8;  // 24
         key ^= s.num_q_heads_per_kv;
-        key <<= 8;
+        key <<= 8;  // 32
         key ^= s.beam_size;
-        key <<= 6;
+        key <<= 6;  // 38
         key ^= s.m_tilesize;
-        key <<= 10;
+        key <<= 10; // 48
         key ^= s.tokens_per_page;
-        key <<= 1;
+        key <<= 1;  // 49
         key ^= s.paged_kv_cache;
-        key <<= 1;
+        key <<= 1;  // 50
         key ^= s.multi_query_tokens;
+        key <<= 1;  // 51
+        key ^= s.is_fp8_output;
+        key <<= 8;
+        key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
         return key;
     }
 };
@@ -204,14 +215,22 @@ template <typename KVCacheBuffer>
 struct XQALaunchParam
 {
     uint32_t num_k_heads;
+    uint32_t slidingWindowSize;
+    float qScale;
     void* output;
+    float const* rcpOutScale;
     void const* qkv;
+    float2 const* ropeCosSin;
     KVCache<KVCacheBuffer> kvCacheParams;
     std::optional<BeamSearchParams> beamSearchParams;
     uint32_t batch_size;
     float const* kv_scale_quant_orig = nullptr;
     int* cu_seq_lens = nullptr;
+    int* cu_kv_seq_lens = nullptr;
     float* rotary_inv_freq_buf = nullptr;
+    int2* tokens_info = nullptr;
+    float* bmm1_scale_ptr = nullptr;
+    float* bmm2_scale_ptr = nullptr;
     int32_t* semaphores = nullptr;
     void* scratch = nullptr;
 };
@@ -222,37 +241,63 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     XQAParams const& params, KVCacheBuffer kv_cache_buffer)
 {
     TLLM_CHECK_WITH_INFO(
-        params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
-    memset(&launchParams, 0, sizeof(XQALaunchParam<KVCacheBuffer>));
+        params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16 || params.data_type == DATA_TYPE_E4M3,
+        "Only fp16 or bf16 supported now.");
+    launchParams = {};
     launchParams.num_k_heads = params.num_kv_heads;
+    launchParams.slidingWindowSize = params.cyclic_attention_window_size;
+    launchParams.qScale = params.q_scaling;
     launchParams.output = static_cast<uint8_t*>(params.output);
+    launchParams.rcpOutScale = params.fp8_out_scale;
     launchParams.qkv = static_cast<uint8_t const*>(params.qkv);
+    launchParams.ropeCosSin = params.rotary_cos_sin;
     launchParams.batch_size = params.batch_size;
     launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
     launchParams.semaphores = params.semaphores;
 
-    // Workspace.
-    size_t offset = 0;
-    int8_t* workspace = reinterpret_cast<int8_t*>(params.workspaces);
-    inputScratch = workspace;
-    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
-        workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
-    if (hasOutputScratch)
-    {
-        launchParams.output = workspace;
-        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
-            workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
-    }
-    unsigned int batch_beam_size = params.batch_size * params.beam_width;
-    const size_t cu_seqlens_size = sizeof(int) * (batch_beam_size + 1);
-    const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;
-    launchParams.cu_seq_lens = reinterpret_cast<int*>(workspace);
-    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_seqlens_size);
-    launchParams.rotary_inv_freq_buf = reinterpret_cast<float*>(workspace);
+    // The workspace alignment.
     auto const multi_block_workspace_alignment = tensorrt_llm::common::roundUp(
         sizeof(half) * params.head_size * (params.num_q_heads / params.num_kv_heads) * params.beam_width, 128);
-    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
-        workspace, rotary_inv_freq_size, multi_block_workspace_alignment);
+
+    // Workspace.
+    int8_t* workspace = reinterpret_cast<int8_t*>(params.workspaces);
+    unsigned int batch_beam_size = params.batch_size * params.beam_width;
+    const size_t cu_seqlens_size = sizeof(int) * (batch_beam_size + 1);
+    const size_t cu_kv_seqlens_size = sizeof(int) * (batch_beam_size + 1);
+    const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;
+    const size_t tokens_info_size = sizeof(int2) * params.total_num_input_tokens;
+    launchParams.cu_seq_lens = reinterpret_cast<int*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_seqlens_size);
+    launchParams.cu_kv_seq_lens = reinterpret_cast<int*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_kv_seqlens_size);
+    launchParams.rotary_inv_freq_buf = reinterpret_cast<float*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, rotary_inv_freq_size);
+    launchParams.tokens_info = reinterpret_cast<int2*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, tokens_info_size);
+    // Only used for trtllm-gen kernels.
+    size_t const bmm1_scale_size = sizeof(float) * 2;
+    size_t const bmm2_scale_size = sizeof(float);
+    launchParams.bmm1_scale_ptr = reinterpret_cast<float*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm1_scale_size);
+    launchParams.bmm2_scale_ptr = reinterpret_cast<float*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm2_scale_size);
+    inputScratch = workspace;
+    if (hasOutputScratch)
+    {
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
+            workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
+        // Only used for output conversion.
+        launchParams.output = workspace;
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace,
+            2 * params.head_size * params.num_q_heads * params.total_num_input_tokens, multi_block_workspace_alignment);
+    }
+    else
+    {
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace,
+            2 * params.head_size * params.num_q_heads * params.total_num_input_tokens, multi_block_workspace_alignment);
+    }
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace,
+        2 * params.head_size * params.num_q_heads * params.total_num_input_tokens, multi_block_workspace_alignment);
     launchParams.scratch = reinterpret_cast<void*>(workspace);
 
     launchParams.kvCacheParams = KVCache<KVCacheBuffer>(kv_cache_buffer);
@@ -272,12 +317,12 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
 }
 
 template <typename T>
-std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, CUmodule hmod,
+std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, CUlibrary lib,
     char const* const name, bool required = false)
 {
     T* pVar = nullptr;
     size_t size = 0;
-    auto const error = driver->cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&pVar), &size, hmod, name);
+    auto const error = driver->cuLibraryGetGlobal(reinterpret_cast<CUdeviceptr*>(&pVar), &size, lib, name);
     T ret;
     switch (error)
     {
@@ -298,11 +343,16 @@ std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWr
 
 inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, int multiprocessor_count)
 {
+    auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
+    if (userSpecified.has_value())
+    {
+        return userSpecified.value();
+    }
     int multi_block_count = 1;
     int num_kv_heads = xqaParams.num_kv_heads;
-    int history_length = xqaParams.timestep;
+    int history_length = xqaParams.max_past_kv_length;
 
-    int32_t const maxNbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
+    int32_t const maxNbSubSeq = getXqaMaxNumSubSeq(xqaParams.isMLA());
 
     multi_block_count = history_length / kMinHistoryTokensPerBlock;
     // avoid using too many blocks for one sequence, otherwise the final reduction may dominate.
@@ -325,6 +375,96 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     TLLM_CHECK_WITH_INFO(multi_block_count >= 1, "MultiBlock count should be larger than 1");
     TLLM_CHECK_WITH_INFO(
         multi_block_count == 1 || batch_size * multi_block_count <= maxNbSubSeq, "Insufficient workspace");
+    return multi_block_count;
+}
+
+inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
+{
+    return 1; // disable multi-block for MLA kernel for now.
+}
+
+inline int computeMultiBlockCountSpecDecGMMA(
+    XQAParams const& xqaParams, int batch_size, int multiprocessor_count, int specDecBlocks)
+{
+    auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
+    if (userSpecified.has_value())
+    {
+        return userSpecified.value();
+    }
+    int multi_block_count = 1;
+
+    int num_kv_heads = xqaParams.num_kv_heads;
+    int history_length = xqaParams.max_past_kv_length;
+
+    // skip tuning for large BS or short ISL case.
+    if (batch_size > 32 || history_length < 2048)
+    {
+        return multi_block_count;
+    }
+
+    // gridDim = dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
+    int single_block_count = specDecBlocks * num_kv_heads * batch_size;
+    double wave_count = (double) single_block_count / (double) multiprocessor_count;
+
+    // Multi block tuning for low CTA: populating CTAs to at most 1 wave of SMs
+    if (wave_count < 1)
+    {
+        auto highestPowerof2 = [](int x)
+        {
+            x |= x >> 1;
+            x |= x >> 2;
+            x |= x >> 4;
+            x |= x >> 8;
+            x |= x >> 16;
+            return x ^ (x >> 1);
+        };
+
+        // calculate the maximum blocks to be populated at most 1 wave
+        multi_block_count = floor(multiprocessor_count / single_block_count);
+        // make multi_block_count a power of 2 for tuning convenience.
+        multi_block_count = highestPowerof2(multi_block_count);
+        // make multi_block_count at most 64 and at least 1.
+        multi_block_count = std::min(multi_block_count, 64);
+        multi_block_count = std::max(multi_block_count, 1);
+
+        // tune only when original CTA is too small, multi_block_count is too big, and history length < 2^16
+        // For Hopper, most cases there are 114, 132, 144 SMs. For H20 about 78.
+        // single_block_count = [1..8]
+        // multi_block_count = [16,32,64,128]
+        // history_length = [1024..65536]
+        if (single_block_count <= 8 && multi_block_count >= 16 && history_length < 65536)
+        {
+            if (history_length < 2048)
+            {
+                // for history length < 2048 and low CTA, scaling is not effective, so we set a hard limit to
+                // multi_block_count = 4
+                multi_block_count = std::min(multi_block_count, 4);
+            }
+            else if (history_length < 65536)
+            {
+                // at single_block == 8, multi_block_count can only be 16. (SM / 8 ~= 16)
+                // tune only 2048 <= kvlen < 8192
+                if (single_block_count == 8 && history_length <= 8192)
+                {
+                    multi_block_count >>= 1;
+                }
+                else
+                {
+                    auto getLog2 = [](int x) { return x ? 31 - __builtin_clz(x) : -1; };
+                    auto history_length_log2 = getLog2(history_length);
+                    // Adjust multi_block_count based on history length using formula:
+                    // shift_amount = 3 - (log2(history_length) - 10) / 2
+                    // This gives us:
+                    // - history_length in [2^11, 2^12): shift by 3
+                    // - history_length in [2^13, 2^14): shift by 2
+                    // - history_length in [2^15, 2^16): shift by 1
+                    multi_block_count >>= 3 - (history_length_log2 - 10) / 2;
+                }
+            }
+        }
+        TLLM_CHECK_WITH_INFO((multi_block_count * single_block_count) <= multiprocessor_count,
+            "The adjusted MultiBlock exceed number of SMs, adding additional wave may result to perf drop.");
+    }
     return multi_block_count;
 }
 

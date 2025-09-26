@@ -55,6 +55,7 @@ inline int32_t getWeightTypeMultiplier(WeightTypeId weightTypeId)
 
 using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
 using WeightOnlyGemmRunnerPtr = std::shared_ptr<WeightOnlyGemmRunner>;
+using KernelType = tensorrt_llm::kernels::weight_only::KernelType;
 
 class WeightOnlyQuantGemmPluginProfiler : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
                                               WeightOnlyGemmRunnerPtr, GemmIdCore, GemmIdCoreHash>
@@ -67,6 +68,12 @@ public:
         mWeightTypeId = weightId;
     }
 
+    void setCudaKernelType(KernelType cudaKernelType, int arch)
+    {
+        mCudaKernelType = cudaKernelType;
+        mArch = arch;
+    }
+
 protected:
     void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
 
@@ -74,8 +81,12 @@ protected:
 
     std::vector<Config> getTactics(int m, int n, int k) const override;
 
+    bool checkTactic(int m, int n, int k, Config const& tactic) const override;
+
 private:
     WeightTypeId mWeightTypeId;
+    KernelType mCudaKernelType;
+    int mArch;
 };
 
 class WeightOnlyQuantMatmulPlugin : public BasePlugin
@@ -132,10 +143,6 @@ private:
     bool mCudaKernelEnabled;
     tensorrt_llm::kernels::weight_only::KernelType mCudaKernelType;
     int mArch;
-
-    // When M is smaller than this value, we trigger a fast path
-    // I.e. a tailored kernel instead of cutlass.
-    static constexpr int SMALL_M_FAST_PATH = 5;
 
     GemmDims mDims{};
     GemmIdCore mGemmId{};

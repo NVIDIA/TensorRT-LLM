@@ -17,10 +17,10 @@
  */
 
 #include "lowLatencyGemmSwigluPlugin.h"
+#include "low_latency_gemm_swiglu.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/low_latency_gemm_swiglu.h"
 #include <NvInferRuntime.h>
 #include <NvInferRuntimeBase.h>
 #include <NvInferRuntimePlugin.h>
@@ -134,10 +134,10 @@ std::vector<LowLatencyGemmSwigluPluginProfiler::Config> LowLatencyGemmSwigluPlug
 
 LowLatencyGemmSwigluPlugin::LowLatencyGemmSwigluPlugin(nvinfer1::DataType type, float scale_output, float scale_d0,
     float scale_d1, PluginProfilerPtr const& pluginProfiler)
-    : mScaleOutput(scale_output)
+    : mPluginProfiler(pluginProfiler)
+    , mScaleOutput(scale_output)
     , mScaleD0(scale_d0)
     , mScaleD1(scale_d1)
-    , mPluginProfiler(pluginProfiler)
 {
     init(type);
 }
@@ -159,7 +159,7 @@ LowLatencyGemmSwigluPlugin::LowLatencyGemmSwigluPlugin(
     mPluginProfiler->deserialize(d, mDims, mGemmId);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -375,10 +375,10 @@ LowLatencyGemmSwigluPluginCreator::LowLatencyGemmSwigluPluginCreator()
 
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("scale_output", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("scale_d0", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("scale_d1", nullptr, PluginFieldType::kFLOAT32, 1.0));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("scale_output", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("scale_d0", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("scale_d1", nullptr, PluginFieldType::kFLOAT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -402,10 +402,10 @@ IPluginV2* LowLatencyGemmSwigluPluginCreator::createPlugin(char const* name, Plu
 {
     PluginField const* fields = fc->fields;
     TLLM_CHECK(fc->nbFields == 4);
-    nvinfer1::DataType type;
-    float scale_output;
-    float scale_d0;
-    float scale_d1;
+    nvinfer1::DataType type{};
+    float scale_output{};
+    float scale_d0{};
+    float scale_d1{};
     for (int i = 0; i < fc->nbFields; i++)
     {
         char const* attrName = fields[i].name;

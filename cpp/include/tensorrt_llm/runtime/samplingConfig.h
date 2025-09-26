@@ -21,6 +21,7 @@
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -72,9 +73,6 @@ private:
             return std::nullopt;
         }
     }
-
-    template <typename T>
-    using Vec = std::vector<T>;
 
     template <typename T>
     bool validateVec(std::string name, OptVec<T> const& vec, T min, std::optional<T> max = std::nullopt)
@@ -142,9 +140,23 @@ public:
             configs, [&configs](size_t ci) { return configs[ci].topK; }, layers::DefaultDecodingParams::getTopK());
         topP = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].topP; }, layers::DefaultDecodingParams::getTopP());
-        randomSeed = fuseValues<uint64_t>(
-            configs, [&configs](size_t ci) { return configs[ci].randomSeed; },
-            layers::DefaultDecodingParams::getSeed());
+
+        // Generate a random seed for each samplingConfig with randomSeed == std::nullopt
+        randomSeed = std::vector<uint64_t>(configs.size());
+        for (size_t ci = 0; ci < configs.size(); ++ci)
+        {
+            auto const& configValue = configs[ci].randomSeed;
+            if (configValue)
+            {
+                TLLM_CHECK(configValue->size() == 1);
+                randomSeed->at(ci) = configValue->front();
+            }
+            else
+            {
+                randomSeed->at(ci) = layers::DefaultDecodingParams::generateRandomSeed();
+            }
+        }
+
         topPDecay = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].topPDecay; },
             layers::DefaultDecodingParams::getTopPDecay());
@@ -170,13 +182,18 @@ public:
             configs, [&configs](size_t ci) { return configs[ci].outputLogProbs; }, false);
         cumLogProbs = fuseValues<bool>(
             configs, [&configs](size_t ci) { return configs[ci].cumLogProbs; }, false);
+        beamWidthArray = fuseValues<std::vector<SizeType32>>(
+            configs, [&configs](size_t ci) { return configs[ci].beamWidthArray; },
+            layers::DefaultDecodingParams::getBeamWidthArray());
         // Only used for tests.
         draftAcceptanceThreshold = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
+        minP = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].minP; }, layers::DefaultDecodingParams::getMinP());
     }
 
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
-        std::optional<executor::ExternalDraftTokensConfig> const& externalDraftTokensConfig)
+        std::optional<executor::ExternalDraftTokensConfig> const& externalDraftTokensConfig = std::nullopt)
         : beamWidth{samplingConfig.getBeamWidth()}
         , numReturnSequences(samplingConfig.getNumReturnSequences())
     {
@@ -184,14 +201,14 @@ public:
         if (externalDraftTokensConfig && externalDraftTokensConfig.value().getAcceptanceThreshold())
         {
             draftAcceptanceThreshold
-                = Vec<FloatType>{externalDraftTokensConfig.value().getAcceptanceThreshold().value()};
+                = std::vector<FloatType>{externalDraftTokensConfig.value().getAcceptanceThreshold().value()};
         }
 
 #define SET_FROM_OPTIONAL(varName, VarName, VarType)                                                                   \
                                                                                                                        \
     if (samplingConfig.get##VarName())                                                                                 \
     {                                                                                                                  \
-        varName = Vec<VarType>{samplingConfig.get##VarName().value()};                                                 \
+        varName = std::vector<VarType>{samplingConfig.get##VarName().value()};                                         \
     }
 
         SET_FROM_OPTIONAL(topK, TopK, SizeType32)
@@ -210,6 +227,8 @@ public:
         SET_FROM_OPTIONAL(lengthPenalty, LengthPenalty, FloatType)
         SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType32)
         SET_FROM_OPTIONAL(noRepeatNgramSize, NoRepeatNgramSize, SizeType32)
+        SET_FROM_OPTIONAL(minP, MinP, FloatType)
+        SET_FROM_OPTIONAL(beamWidthArray, BeamWidthArray, std::vector<SizeType32>)
 #undef SET_FROM_OPTIONAL
     }
 
@@ -248,15 +267,18 @@ public:
         valid &= validateVec("topK", topK, -1);
         valid &= validateVec("topP", topP, -fltEpsilon, {1.f});
         valid &= validateVec("topPMin", topPMin, 0.f, {1.f});
-        valid &= validateVec("topPDecay", topPDecay, 0.f, {1.f});
         valid &= validateVec("topPResetIds", topPResetIds, -1);
-
+        valid &= validateVec("topPDecay", topPDecay, 0.f, {1.f});
         valid &= validateVec("temperature", temperature, -fltEpsilon);
-        valid &= validateVec("repetitionPenalty", repetitionPenalty, 0.f);
         valid &= validateVec("minLength", minLength, -1);
-        valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
-
         valid &= validateVec("beamSearchDiversityRate", beamSearchDiversityRate, -fltEpsilon);
+        valid &= validateVec("repetitionPenalty", repetitionPenalty, 0.f);
+        // TODO: checking `lengthPenalty`leads to a failure in
+        // `test_openai_chat_example`, debug and re-enable it later.
+        // valid &= validateVec("lengthPenalty", lengthPenalty, 0.f);
+        valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
+        valid &= validateVec("minP", minP, -fltEpsilon, {1.f});
+        // TODO: check `beamWidthArray`
 
         // Detect greedy sampling and overwrite params.
         if (temperature)
@@ -313,37 +335,39 @@ public:
     SizeType32 beamWidth;
     std::optional<SizeType32> numReturnSequences;
 
-    // penalties
-    OptVec<FloatType> temperature;         // [1] or [batch_size] on cpu
-    OptVec<FloatType> originalTemperature; // [1] or [batch_size] on cpu
-    OptVec<SizeType32> minLength;          // [1] or [batch_size] on cpu
-    OptVec<FloatType> repetitionPenalty;   // [1] or [batch_size] on cpu
-    OptVec<FloatType> presencePenalty;     // [1] or [batch_size] on cpu
-    OptVec<FloatType> frequencyPenalty;    // [1] or [batch_size] on cpu
-    OptVec<SizeType32> noRepeatNgramSize;  // [1] or [batch_size] on cpu
+    // penalties, [1] for one request, [batchSize] for one batch, the same for other parameters below
+    OptVec<FloatType> temperature;         // [1] or [batchSize]
+    OptVec<FloatType> originalTemperature; // [1] or [batchSize]
+    OptVec<SizeType32> minLength;          // [1] or [batchSize]
+    OptVec<FloatType> repetitionPenalty;   // [1] or [batchSize]
+    OptVec<FloatType> presencePenalty;     // [1] or [batchSize]
+    OptVec<FloatType> frequencyPenalty;    // [1] or [batchSize]
+    OptVec<SizeType32> noRepeatNgramSize;  // [1] or [batchSize]
 
     // probs
     OptVec<bool> outputLogProbs;
     OptVec<bool> cumLogProbs;
 
     // sampling layers
-    OptVec<SizeType32> topK;          // [1] or [batch_size] on cpu
-    OptVec<FloatType> topP;           // [1] or [batch_size] on cpu
-    OptVec<uint64_t> randomSeed;      // [1] or [batch_size] on cpu
-    OptVec<FloatType> topPDecay;      // [batch_size], must between [0, 1]
-    OptVec<FloatType> topPMin;        // [batch_size], must between [0, 1]
-    OptVec<TokenIdType> topPResetIds; // [batch_size]
+    OptVec<SizeType32> topK;          // [1] or [batchSize]
+    OptVec<FloatType> topP;           // [1] or [batchSize]
+    OptVec<uint64_t> randomSeed;      // [1] or [batchSize]
+    OptVec<FloatType> topPDecay;      // [1] or [batchSize], between [0, 1]
+    OptVec<FloatType> topPMin;        // [1] or [batchSize], between [0, 1]
+    OptVec<TokenIdType> topPResetIds; // [1] or [batchSize]
+    OptVec<FloatType> minP;           // [1] or [batchSize]
 
     // beam search layer
-    OptVec<FloatType> beamSearchDiversityRate; // [1] or [batch_size]
-    OptVec<FloatType> lengthPenalty;           // [1] or [batch_size]
-    OptVec<SizeType32> earlyStopping;          // [1] or [batch_size]
+    OptVec<FloatType> beamSearchDiversityRate;      // [1] or [batchSize]
+    OptVec<FloatType> lengthPenalty;                // [1] or [batchSize]
+    OptVec<SizeType32> earlyStopping;               // [1] or [batchSize]
+    OptVec<std::vector<SizeType32>> beamWidthArray; // [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength]
 
     // speculative decoding, only the first value is used (in gptDecoderBatched.cpp)
-    OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batch_size]
+    OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batchSize]
 
     // medusa params
-    OptVec<std::vector<runtime::SizeType32>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
+    OptVec<std::vector<SizeType32>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
 
     std::optional<bool> normalizeLogProbs;
 
@@ -359,7 +383,7 @@ public:
             && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
             && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
             && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
-            && cumLogProbs == other.cumLogProbs;
+            && cumLogProbs == other.cumLogProbs && minP == other.minP && beamWidthArray == other.beamWidthArray;
     }
 
     SizeType32 getNumReturnBeams() const
@@ -369,6 +393,23 @@ public:
             return std::min(numReturnSequences.value(), beamWidth);
         }
         return beamWidth;
+    }
+
+    // Get the maximum beam width of a whole SamplingConfig
+    SizeType32 getMaxBeamWidth() const noexcept
+    {
+        SizeType32 maxBeamWidth = this->beamWidth; // For non-Variable-Beam-Width-Search
+        auto const& beamWidthArray = this->beamWidthArray;
+        if (beamWidthArray.has_value())
+        {
+            for (size_t indexSC = 0; indexSC < beamWidthArray->size(); ++indexSC)
+            {
+                auto const& array = beamWidthArray.value()[indexSC];
+                auto arrayMax = *std::max_element(array.begin(), array.end());
+                maxBeamWidth = std::max(maxBeamWidth, arrayMax);
+            }
+        }
+        return maxBeamWidth;
     }
 };
 

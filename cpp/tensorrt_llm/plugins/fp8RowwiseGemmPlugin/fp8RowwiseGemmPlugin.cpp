@@ -81,7 +81,7 @@ void Fp8RowwiseGemmPluginProfiler::runTactic(int m, int n, int k, Fp8RowwiseGemm
     // Run profiling
     mRunner->gemm(dTmp, aTmp, bTmp, nullptr, mQuantMode, m, n, k, scaleD0Tmp, scaleD1Tmp, tactic, workspaceTmp,
         wsSizeRunner, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 int Fp8RowwiseGemmPluginProfiler::getMaxProfileM() const
@@ -275,7 +275,7 @@ int Fp8RowwiseGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     mGemmRunner->gemm(outputs[0], inputs[0], inputs[1], nullptr, mQuantMode, m, n, k,
         reinterpret_cast<float const*>(inputs[2]), reinterpret_cast<float const*>(inputs[3]), *bestTactic,
         reinterpret_cast<char*>(workspace), wsSize, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return 0;
 }
@@ -347,9 +347,9 @@ Fp8RowwiseGemmPluginCreator::Fp8RowwiseGemmPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("has_per_channel_scaling", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("has_per_token_scaling", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("has_per_channel_scaling", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("has_per_token_scaling", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -373,23 +373,12 @@ IPluginV2* Fp8RowwiseGemmPluginCreator::createPlugin(char const* name, PluginFie
 {
     PluginField const* fields = fc->fields;
     TLLM_CHECK(fc->nbFields == 3);
-    bool perTokenScaling, perChannelScaling;
-    nvinfer1::DataType type;
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
         char const* attrName = fields[i].name;
-        if (!strcmp(attrName, "has_per_channel_scaling"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            perChannelScaling = static_cast<bool>(*(static_cast<int const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "has_per_token_scaling"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            perTokenScaling = static_cast<bool>(*(static_cast<int const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "type_id"))
+        if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
@@ -400,7 +389,7 @@ IPluginV2* Fp8RowwiseGemmPluginCreator::createPlugin(char const* name, PluginFie
         // Fp8RowwiseGemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
         auto pluginProfiler = mGemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
-        QuantMode quantMode = QuantMode::fromDescription();
+        QuantMode quantMode = QuantMode{};
         auto* obj = new Fp8RowwiseGemmPlugin(quantMode, type, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

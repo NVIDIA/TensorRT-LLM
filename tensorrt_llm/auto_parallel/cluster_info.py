@@ -1,12 +1,15 @@
 import copy
 import re
 from dataclasses import dataclass, field
-from importlib.metadata import version
 from typing import Dict, Tuple, Union
 
 import pynvml
 import torch
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 from tensorrt_llm._utils import DictConversion
 from tensorrt_llm.logger import logger
@@ -144,43 +147,36 @@ cluster_infos = {
             float32=74,
         ),
     ),
-    # from https://images.nvidia.cn/content/technologies/volta/pdf/volta-v100-datasheet-update-us-1165301-r5.pdf
-    "V100-PCIe-16GB":
+    # from https://nvdam.widen.net/s/nb5zzzsjdf/hpc-datasheet-sc23-h200-datasheet-3002446
+    "H200-SXM":
     ClusterInfo(
-        intra_node_bw_per_device=_bandwidths["PCIe-3"],
-        memory_bw=900,
-        memory_budget_per_device=16,
-        math_throughput=MathThroughput(float32=112),
+        inter_node_bw_per_device=50,
+        intra_node_bw_per_device=450,
+        memory_bw=4800,
+        memory_budget_per_device=141,
+        math_throughput=MathThroughput(
+            int8=3958,
+            fp8=3958,
+            float16=1979,
+            bfloat16=1979,
+            float32=67,
+        ),
     ),
-    "V100-PCIe-32GB":
+    "H200-NVL":
     ClusterInfo(
-        intra_node_bw_per_device=_bandwidths["PCIe-3"],
-        memory_bw=900,
-        memory_budget_per_device=32,
-        math_throughput=MathThroughput(float32=112),
+        inter_node_bw_per_device=50,
+        intra_node_bw_per_device=450,
+        memory_bw=4800,
+        memory_budget_per_device=141,
+        math_throughput=MathThroughput(
+            int8=3341,
+            fp8=3341,
+            float16=1671,
+            bfloat16=1671,
+            float32=60,
+        ),
     ),
-    "V100-SXM-16GB":
-    ClusterInfo(
-        intra_node_bw_per_device=150,
-        memory_bw=900,
-        memory_budget_per_device=16,
-        math_throughput=MathThroughput(float32=125),
-    ),
-    "V100-SXM-32GB":
-    ClusterInfo(
-        intra_node_bw_per_device=150,
-        memory_bw=900,
-        memory_budget_per_device=32,
-        math_throughput=MathThroughput(float32=125),
-    ),
-    "V100S-PCIe":
-    ClusterInfo(
-        intra_node_bw_per_device=_bandwidths["PCIe-3"],
-        memory_bw=1134,
-        memory_budget_per_device=32,
-        math_throughput=MathThroughput(float32=130),
-    ),
-    # from https://images.nvidia.cn/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
+    # from https://images.nvidia.com/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
     "A40":
     ClusterInfo(
         intra_node_bw_per_device=_bandwidths["PCIe-4"],
@@ -353,25 +349,17 @@ def infer_cluster_key() -> str:
             return "H100-SXM"
         else:
             return "H100-PCIe"
+    elif match("H200", device_name):
+        if is_sxm():
+            return "H200-SXM"
+        else:
+            return "H200-NVL"
     elif match("L40S", device_name):
         return "L40S"
     elif match("L40", device_name):
         return "L40"
     elif match("L4", device_name):
         return "L4"
-    elif match("V100S", device_name):
-        return "V100S-PCIe"
-    elif match("V100", device_name):
-        if is_sxm():
-            if is_32gb():
-                return "V100-SXM-32GB"
-            else:
-                return "V100-SXM-16GB"
-        else:
-            if is_32gb():
-                return "V100-PCIe-32GB"
-            else:
-                return "V100-PCIe-16GB"
     return None
 
 
@@ -430,11 +418,11 @@ def nvlink_version(version_enum: int) -> int:
     nvl_version_table = {
         1: 1,
         2: 2,
-        3: 2,
-        4: 2,
-        5: 3,
-        6: 3,
-        7: 4,
+        3: 2,  # 2.2
+        4: 3,
+        5: 3,  # 3.1
+        6: 4,
+        7: 5,
     }
     return nvl_version_table[version_enum]
 
@@ -445,6 +433,7 @@ def nvlink_bandwidth(nvlink_version: int) -> int:
         2: 150,
         3: 300,
         4: 450,
+        5: 900,
     }
     return nvl_bw_table[nvlink_version]
 
@@ -482,10 +471,7 @@ def infer_cluster_info() -> ClusterInfo:
             pynvml.NVML_CLOCK_MEM,
         )
         logger.info(f"Memory clock: {mem_clock} MHz")
-        if version("pynvml") < '11.5.0':
-            mem_bus_width = properties.memoryBusWidth
-        else:
-            mem_bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
         logger.info(f"Memory bus width: {mem_bus_width}")
         memory_bw = mem_bus_width * mem_clock * 2 // int(8e3)
         logger.info(f"Memory bandwidth: {memory_bw} GB/s")
@@ -502,16 +488,12 @@ def infer_cluster_info() -> ClusterInfo:
             nvl_version = nvlink_version(nvl_version_enum)
             logger.info(f"NVLink version: {nvl_version}")
             nvl_bw = nvlink_bandwidth(nvl_version)
-            logger.info(f"NVLink bandwidth: {nvl_bw} GB/s")
+            logger.info(f"NVLink bandwidth (unidirectional): {nvl_bw} GB/s")
             intra_node_bw = nvl_bw
             if nvl_version >= 4:
                 intra_node_sharp = True
         else:
-            if version("pynvml") < '11.5.0':
-                pcie_gen = pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle)
-                pcie_speed = (2**pcie_gen) * 1000
-            else:
-                pcie_speed = pynvml.nvmlDeviceGetPcieSpeed(handle)
+            pcie_speed = pynvml.nvmlDeviceGetPcieSpeed(handle)
             logger.info(f"PCIe speed: {pcie_speed} Mbps")
             pcie_link_width = pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle)
             logger.info(f"PCIe link width: {pcie_link_width}")

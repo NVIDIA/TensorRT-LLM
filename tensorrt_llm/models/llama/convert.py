@@ -504,7 +504,7 @@ def load_weights_from_hf_model(hf_model,
     use_gemm_woq_plugin = (not config.disable_weight_only_quant_plugin)
     use_fp8_rowwise = quant_algo in [QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN]
 
-    use_smooth_quant = config.quantization.use_plugin_sq
+    use_smooth_quant = config.quantization._use_plugin_sq
     per_channel = use_smooth_quant and 'PER_CHANNEL' in quant_algo
     per_token = use_smooth_quant and 'PER_TOKEN' in quant_algo
     int8_kv_cache = config.quantization.kv_cache_quant_algo == QuantAlgo.INT8
@@ -714,16 +714,31 @@ def load_weights_from_hf_model(hf_model,
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
-            for suffix in ["w1", "w2", "w3"]:
-                model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
-                            torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
-                                        for expert in rank_experts])
-            w3 = model_params[
-                f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
-            w2 = model_params[
-                f'model.layers.{l}.block_sparse_moe.experts.w2.weight']
-            w1 = model_params[
-                f'model.layers.{l}.block_sparse_moe.experts.w1.weight']
+            architecture = config.architecture.lower()
+            if "granite" not in architecture:
+                for suffix in ["w1", "w2", "w3"]:
+                    model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
+                                torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
+                                            for expert in rank_experts])
+                w3 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
+                w2 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.experts.w2.weight']
+                w1 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.experts.w1.weight']
+            else:
+                w2 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.output_linear.weight']
+                half_size = model_params[
+                    f'model.layers.{l}.block_sparse_moe.input_linear.weight'].shape[
+                        -2] // 2
+                w1, w3 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.input_linear.weight']\
+                        .split(half_size, dim=-2)
+                w1 = w1[rank_experts[0]:rank_experts[-1] + 1]
+                w2 = w2[rank_experts[0]:rank_experts[-1] + 1]
+                w3 = w3[rank_experts[0]:rank_experts[-1] + 1]
+
             if mapping.has_moe_tp():
                 w3 = split(w3, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
                 w2 = split(w2, mapping.moe_tp_size, mapping.moe_tp_rank, dim=2)
@@ -863,8 +878,15 @@ def load_weights_from_hf_model(hf_model,
                                                plugin_weight_only_quant_type,
                                                dtype, use_gemm_woq_plugin))
 
-            moe_experts_gate_weights = get_weight(
-                model_params, prefix + 'block_sparse_moe.gate', torch.float32)
+            architecture = config.architecture.lower()
+            if "granite" not in architecture:
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'block_sparse_moe.gate',
+                    torch.float32)
+            else:
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'block_sparse_moe.router.layer',
+                    torch.float32)
             weights.update(
                 get_tllm_linear_weight(
                     moe_experts_gate_weights,
@@ -1031,34 +1053,28 @@ def load_weights_from_hf_model(hf_model,
         convert_layer(l)
         release_gc()
 
-    v = get_weight(model_params,
-                   f'{model_prefix}.{param_name_map["vocab_embedding"]}', dtype)
-    if hf_model.config.tie_word_embeddings:
-        # lm_head.weight has the same weights as embedding
-        if mapping.is_last_pp_rank():
-            if config.vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = pad_vocab_size(config.vocab_size,
-                                                   mapping.tp_size)
-                pad_width = vocab_size_padded - config.vocab_size
-
-                v = torch.nn.functional.pad(v, (0, 0, 0, pad_width), 'constant',
-                                            0)
-            weights['lm_head.weight'] = split(v, mapping.tp_size,
-                                              mapping.tp_rank)
-
-    if config.use_parallel_embedding:
-        v = split_matrix_tp(v,
-                            mapping.tp_size,
-                            mapping.tp_rank,
-                            dim=config.embedding_sharding_dim)
+    vocab_embedding = get_weight(
+        model_params, f'{model_prefix}.{param_name_map["vocab_embedding"]}',
+        dtype)
 
     if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = v
-
-    lm_head_weights = get_weight(model_params, param_name_map["lm_head"], dtype)
+        if config.use_parallel_embedding:
+            weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
+                vocab_embedding,
+                mapping.tp_size,
+                mapping.tp_rank,
+                dim=config.embedding_sharding_dim)
+        else:
+            weights['transformer.vocab_embedding.weight'] = vocab_embedding
 
     if mapping.is_last_pp_rank():
+        if hf_model.config.tie_word_embeddings:
+            # lm_head.weight has the same weights as embedding
+            lm_head_weights = vocab_embedding.clone()
+        else:
+            lm_head_weights = get_weight(model_params,
+                                         param_name_map["lm_head"], dtype)
+
         if config.vocab_size % mapping.tp_size != 0:
             # padding
             vocab_size_padded = pad_vocab_size(config.vocab_size,
@@ -1101,7 +1117,7 @@ def quantize(hf_model_dir: str,
     assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
-    use_smooth_quant = quant_config.use_plugin_sq
+    use_smooth_quant = quant_config._use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
@@ -1583,7 +1599,8 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 f"Invalid TP dim {tp_dim} for weight {key}'s shape {tensor_shape}"
             )
         return res.to(torch_dtype).contiguous(
-        ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
+        ) if "block_sparse_moe.gate" not in key and "block_sparse_moe.router" not in key else res.to(
+            torch.float32)
 
     def load_and_set(target,
                      key,
@@ -1666,30 +1683,47 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                          prefix + param_name_map["mlp.fc"], 0)  # mlp.fc
 
         else:
-            weights[f'{tllm_prex}.mlp.router.weight'] = load(
-                prefix + 'block_sparse_moe.gate.weight')
+            architecture = config.architecture.lower()
+            if "granite" not in architecture:
+                weights[f'{tllm_prex}.mlp.router.weight'] = load(
+                    prefix + 'block_sparse_moe.gate.weight')
+            else:
+                weights[f'{tllm_prex}.mlp.router.weight'] = load(
+                    prefix + 'block_sparse_moe.router.layer.weight')
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
 
-            expert_weight_list = []
-            for suffix in range(3):
-                tp_dim = -1
-                if mapping.has_moe_tp():
-                    tp_dim = 1 if suffix == 1 else 0
-                expert_weight_list.append(
-                    torch.stack(
-                        list(
-                            load(
-                                prefix +
-                                f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
-                                tp_dim=tp_dim,
-                                is_expert_weights=True)
-                            for expert in rank_experts)))
+            if "granite" not in architecture:
+                expert_weight_list = []
+                for suffix in range(3):
+                    tp_dim = -1
+                    if mapping.has_moe_tp():
+                        tp_dim = 1 if suffix == 1 else 0
+                    expert_weight_list.append(
+                        torch.stack(
+                            list(
+                                load(
+                                    prefix +
+                                    f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
+                                    tp_dim=tp_dim,
+                                    is_expert_weights=True)
+                                for expert in rank_experts)))
 
-            w1 = expert_weight_list[0]
-            w2 = expert_weight_list[1]
-            w3 = expert_weight_list[2]
+                w1 = expert_weight_list[0]
+                w2 = expert_weight_list[1]
+                w3 = expert_weight_list[2]
+            else:
+                w2 = load(prefix + f'block_sparse_moe.output_linear.weight',
+                          is_expert_weights=True)  #TODO: correct this
+                w13 = load(prefix + f'block_sparse_moe.input_linear.weight',
+                           is_expert_weights=True)
+
+                half_size = w13.shape[-2] // 2
+                w1, w3 = w13.split(half_size, dim=-2)
+                w1 = w1[rank_experts[0]:rank_experts[-1] + 1]
+                w2 = w2[rank_experts[0]:rank_experts[-1] + 1]
+                w3 = w3[rank_experts[0]:rank_experts[-1] + 1]
 
             weights[f'{tllm_prex}.mlp.fc.weight'] = \
                 torch.concat([w3, w1], dim=-2).contiguous()
@@ -2180,7 +2214,7 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
         gathered = {}
         for k in ckpts[0]:
             d = 0
-            # TODO(bhsueh) not sure should we consider tok here.
+            # TODO not sure should we consider tok here.
             if any([n in k for n in ["wo", "w2"]]):
                 d = 1
             if "norm" in k or "rope" in k:  # no TP

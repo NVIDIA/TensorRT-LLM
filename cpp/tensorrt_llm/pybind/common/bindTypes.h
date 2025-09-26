@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -64,7 +69,26 @@ void bindSet(py::module& m, std::string const& name)
         .def("__len__", [](T const& lst) { return lst.size(); })
         .def("__contains__", [](T const& s, typename T::value_type x) { return s.find(x) != s.end(); })
         .def(
-            "__iter__", [](T& s) { return py::make_iterator(s.begin(), s.end()); }, py::keep_alive<0, 1>());
+            "__iter__", [](T& s) { return py::make_iterator(s.begin(), s.end()); }, py::keep_alive<0, 1>())
+        .def("__eq__", [](T const& s, T const& other) { return s == other; })
+        .def(py::pickle(
+            [](T const& s) { // __getstate__
+                /* Return a tuple that fully encodes the state of the object */
+                return py::make_tuple(std::vector<typename T::value_type>(s.begin(), s.end()));
+            },
+            [](py::tuple t) { // __setstate__
+                if (t.size() != 1)
+                    throw std::runtime_error("Invalid state!");
+                /* Create a new C++ instance */
+                T s;
+                /* Assign any additional state */
+                auto state_list = t[0].cast<std::vector<typename T::value_type>>();
+                for (auto& item : state_list)
+                {
+                    s.insert(item);
+                }
+                return s;
+            }));
 }
 
 } // namespace PybindUtils

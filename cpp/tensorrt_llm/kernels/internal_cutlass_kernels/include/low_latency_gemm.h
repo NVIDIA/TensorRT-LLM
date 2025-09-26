@@ -1,11 +1,12 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,7 +63,7 @@ struct LowLatencyCutlassGemmConfig
 inline std::ostream& operator<<(std::ostream& out, LowLatencyCutlassGemmConfig const& config)
 {
     // clang-format off
-    if (config.cutlass_gemm_config.is_sm90)
+    if (config.cutlass_gemm_config.is_tma_warp_specialized)
     {
         out << "tile_config_sm90_enum: " << int(config.cutlass_gemm_config.tile_config_sm90)
             << ", mainloop_schedule_enum: " << int(config.cutlass_gemm_config.mainloop_schedule)
@@ -71,7 +72,7 @@ inline std::ostream& operator<<(std::ostream& out, LowLatencyCutlassGemmConfig c
     }
     else
     {
-        out << "tile_config_enum: " << int(config.cutlass_gemm_config.tile_config)
+        out << "tile_config_enum: " << int(config.cutlass_gemm_config.tile_config_sm80)
             << ", split_k_style_enum: " << int(config.cutlass_gemm_config.split_k_style)
             << ", split_k_factor: " << config.cutlass_gemm_config.split_k_factor
             << ", stages: " << config.cutlass_gemm_config.stages;

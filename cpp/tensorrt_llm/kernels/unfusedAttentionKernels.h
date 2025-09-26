@@ -21,6 +21,10 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cuda_runtime_api.h>
 
+#ifdef ENABLE_FP4
+#include <cuda_fp4.h>
+#endif
+
 namespace tensorrt_llm
 {
 namespace kernels
@@ -59,7 +63,8 @@ enum class KvCacheDataType
 {
     BASE = 0,
     INT8,
-    FP8
+    FP8,
+    NVFP4
 };
 
 enum class RotaryPositionEmbeddingType
@@ -68,6 +73,31 @@ enum class RotaryPositionEmbeddingType
     GPTJ,
     GPT_NEOX,
 };
+
+inline void calGridSizeWithBestEfficiency(
+    dim3 const block, dim3& grid, int numNeededBlockX, int multiProcessorCount, int availableThreadsPerSm)
+{
+    int numThreadsPerBlock = block.x * block.y * block.z;
+    int numAvailableBlocksPerWave = int(availableThreadsPerSm / numThreadsPerBlock) * multiProcessorCount;
+    int numBatchBlocks = grid.y * grid.z;
+
+    // The best wave efficiency it can achieve with different number of blocks.
+    float bestEfficiency = 0.f;
+    int selectedBlockX = 0;
+    // Iterate over all possible number of blocks in the x dimension.
+    for (int blockX = 1; blockX <= numNeededBlockX; ++blockX)
+    {
+        float numWaves = float(blockX * numBatchBlocks) / numAvailableBlocksPerWave;
+        float efficiency = numWaves / std::ceil(numWaves);
+        if (efficiency > bestEfficiency)
+        {
+            bestEfficiency = efficiency;
+            selectedBlockX = blockX;
+        }
+    }
+    // Update grid.x.
+    grid.x = selectedBlockX;
+}
 
 template <typename T, typename KVCacheBuffer>
 struct QKVPreprocessingParams
@@ -85,10 +115,28 @@ struct QKVPreprocessingParams
     // the classes used for this template are either KVLinearBuffer, KVBlockArray
     // for more details, refer to kvCacheUtils.h
     KVCacheBuffer kv_cache_buffer{};
+    // Pool for FP4 KV cache block scales. Unused for other KV cache dtypes.
+    KVCacheBuffer kv_cache_block_scales_buffer{};
     T const* qkv_bias{nullptr};
+
+    // Fuse the computation of FMHA quantization scales into the preprocessing kernels.
+    // This can also be done in gptKernels.h if there is no preprocessing kernels.
+    // The scale to dequant Q/Kv input.
+    float const* qkv_scale_quant_orig{nullptr};
+    float const* qkv_scale_orig_quant{nullptr};
+    // The scale to quant O output.
+    float const* o_scale_orig_quant{nullptr};
+    // The scale after fmha bmm1.
+    float* fmha_bmm1_scale{nullptr};
+    // The scale after fmha bmm2.
+    float* fmha_bmm2_scale{nullptr};
+    // The fmha tile counter (used by hopper fmha kernels).
+    float* fmha_tile_counter{nullptr};
 
     // Logn scaling pointer, of shape {max_position_embedding_length}
     float const* logn_scaling{nullptr};
+    // The (batch_idx, token_idx_in_seq) int2 buffer of shape {num_tokens}.
+    int2 const* tokens_info{nullptr};
     // list of sequence lengths, of shape {batch_size + 1}
     int const* seq_lens{nullptr};
     // list sequence lengths for the cache, of shape {batch_size + 1}
@@ -106,7 +154,6 @@ struct QKVPreprocessingParams
     // the pre-computed RoPE factors. computed at model build time, stored in the engine
     // shape is {rotary_embedding_max_positions, rotary_embedding_dim}. eg (2048, 128)
     float2 const* rotary_coef_cache_buffer{nullptr};
-    float const* kvScaleOrigQuant{nullptr};
     int const* spec_decoding_position_offsets{nullptr};
 
     float2 const* mrope_rotary_cos_sin{nullptr};
@@ -125,6 +172,8 @@ struct QKVPreprocessingParams
     int kv_head_num{0};
     int qheads_per_kv_head{0};
     int size_per_head{0};
+    // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
+    float fmha_host_bmm1_scale{1.f};
     int rotary_embedding_dim{0};
     float rotary_embedding_base{0.};
     RotaryScalingType rotary_scale_type{};
@@ -136,6 +185,7 @@ struct QKVPreprocessingParams
     KvCacheDataType cache_type{};
     bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
+    bool generation_phase{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
@@ -163,7 +213,9 @@ struct QKVPreprocessingParams
         ss << "quantized_qkv_output: " << quantized_qkv_output << std::endl;
         ss << "q_output: " << q_output << std::endl;
         ss << "kv_cache_buffer: " << kv_cache_buffer.data << std::endl;
+        ss << "kv_cache_block_scales_buffer: " << kv_cache_block_scales_buffer.data << std::endl;
         ss << "qkv_bias: " << qkv_bias << std::endl;
+        ss << "tokens_info: " << tokens_info << std::endl;
         ss << "seq_lens: "
            << *(runtime::ITensor::wrap(
                   (void*) seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
@@ -183,7 +235,7 @@ struct QKVPreprocessingParams
            << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
                   runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
         ss << "rotary_coef_cache_buffer: " << rotary_coef_cache_buffer << std::endl;
-        ss << "kvScaleOrigQuant: " << kvScaleOrigQuant << std::endl;
+        ss << "qkv_scale_orig_quant: " << qkv_scale_orig_quant << std::endl;
         ss << "spec_decoding_position_offsets: " << spec_decoding_position_offsets << std::endl;
         ss << "batch_size: " << batch_size << std::endl;
         ss << "max_input_seq_len: " << max_input_seq_len << std::endl;
@@ -207,6 +259,7 @@ struct QKVPreprocessingParams
         ss << "cache_type: " << static_cast<int>(cache_type) << std::endl;
         ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
+        ss << "generation_phase: " << generation_phase << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
         return ss.str();
@@ -283,6 +336,23 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
         invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
     }
 #endif // ENABLE_FP8
+#ifdef ENABLE_FP4
+    else if (params.cache_type == KvCacheDataType::NVFP4)
+    {
+        TLLM_CHECK_WITH_INFO(params.kv_cache_block_scales_buffer.data != nullptr,
+            "Cannot append to FP4 KV cache without block scales pool");
+        if constexpr (std::is_same_v<T, float>)
+        {
+            // TODO: needs special quantization logic. The existing quantization functions
+            // are specially designed for 16 bit types.
+            TLLM_THROW("Cannot use FP4 KV cache with FP32 model.");
+        }
+        else
+        {
+            invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp4_e2m1, KVCacheBuffer>(params, stream);
+        }
+    }
+#endif
     else
     {
         invokeApplyBiasRopeUpdateKVCacheDispatch<T, T, KVCacheBuffer>(params, stream);
@@ -331,7 +401,7 @@ void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __res
 
 template <typename T>
 void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialLength, int64_t cpSize, int64_t partialQHeads,
-    int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
+    int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank, cudaStream_t stream);
 
 template <typename T>
 void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,

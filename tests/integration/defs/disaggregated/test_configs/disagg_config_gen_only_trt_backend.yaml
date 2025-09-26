@@ -1,0 +1,19 @@
+hostname: localhost
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+backend: "trt"
+context_servers:
+  num_instances: 0
+generation_servers:
+  num_instances: 2
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+    enable_block_reuse: False
+    enable_partial_reuse: False
+  cache_transceiver_config:
+    backend: DEFAULT
+  urls:
+      - "localhost:8002"
+      - "localhost:8003"

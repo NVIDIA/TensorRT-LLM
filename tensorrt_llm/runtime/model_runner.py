@@ -86,7 +86,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     dtype = builder_config['precision']
     tp_size = builder_config['tensor_parallel']
     pp_size = builder_config.get('pipeline_parallel', 1)
-    kv_cache_type = KVCacheType(builder_config.get('kv_cache_type'))
+    kv_cache_type = KVCacheType.from_string(builder_config.get('kv_cache_type'))
     world_size = tp_size * pp_size
     assert world_size == mpi_world_size(), \
         f'Engine world size ({tp_size} * {pp_size}) != Runtime world size ({mpi_world_size()})'
@@ -141,6 +141,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
 
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
+    gemm_allreduce_plugin = plugin_config['gemm_allreduce_plugin']
     mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
     remove_input_padding = plugin_config['remove_input_padding']
     paged_state = plugin_config['paged_state']
@@ -157,6 +158,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         hidden_size=hidden_size,
         head_size=head_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
+        gemm_allreduce_plugin=gemm_allreduce_plugin,
         mamba_conv1d_plugin=mamba_conv1d_plugin,
         remove_input_padding=remove_input_padding,
         model_name=model_name,
@@ -222,7 +224,26 @@ def _engine_config_to_model_config(engine_config: EngineConfig,
 
     # TODO(oargov): this is a hack, make it prettier!
     if hasattr(pretrained_config, "num_kv_heads_per_layer"):
-        num_kv_heads_per_layer = pretrained_config.num_kv_heads_per_layer
+        pp_rank = pretrained_config.mapping.pp_rank
+        pp_size = pretrained_config.mapping.pp_size
+        layers_per_pp_rank = pretrained_config.num_hidden_layers // pp_size
+        first_local_layer = layers_per_pp_rank * pp_rank
+        first_layer_next_rank = first_local_layer + layers_per_pp_rank
+        layer_types = getattr(pretrained_config, "layer_types", ["attention"])
+        num_attn_layers_lower_ranks = [
+            layer_types[layer_idx % len(layer_types)]
+            for layer_idx in range(first_local_layer)
+        ].count("attention")
+        num_local_attn_layers = [
+            layer_types[layer_idx % len(layer_types)]
+            for layer_idx in range(first_local_layer, first_layer_next_rank)
+        ].count("attention")
+        num_kv_heads_per_layer = pretrained_config.num_kv_heads_per_layer[
+            num_attn_layers_lower_ranks:num_attn_layers_lower_ranks +
+            num_local_attn_layers]
+        num_kv_heads_per_layer = [(nheads + tp_size - 1) // tp_size
+                                  for nheads in num_kv_heads_per_layer]
+
     elif hasattr(pretrained_config, "get_layer_num_kv_heads"):
         # each layer has a different number of kv heads
         attention_layers = [
@@ -254,6 +275,7 @@ def _engine_config_to_model_config(engine_config: EngineConfig,
         head_size=head_size,
         gpt_attention_plugin=bool(
             build_config.plugin_config.gpt_attention_plugin),
+        gemm_allreduce_plugin=build_config.plugin_config.gemm_allreduce_plugin,
         mamba_conv1d_plugin=bool(
             build_config.plugin_config.mamba_conv1d_plugin),
         remove_input_padding=build_config.plugin_config.remove_input_padding,
@@ -624,6 +646,7 @@ class ModelRunner(ModelRunnerMixin):
         gpu_weights_percent: float = 1,
         enable_context_fmha_fp32_acc: Optional[bool] = None,
         multi_block_mode: Optional[bool] = None,
+        fail_fast_on_attention_window_too_large: bool = False,
     ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
@@ -645,6 +668,9 @@ class ModelRunner(ModelRunnerMixin):
                 Stream to use.
             multi_block_mode (bool):
                 Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
+            fail_fast_on_attention_window_too_large (bool):
+                Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.
+                Note: This parameter is only applicable to C++ runtime (ModelRunnerCpp).
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
@@ -811,6 +837,7 @@ class ModelRunner(ModelRunnerMixin):
                  prompt_tasks: Optional[str] = None,
                  lora_uids: Optional[list] = None,
                  streaming: bool = False,
+                 output_generation_logits: bool = False,
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
                  medusa_choices: Optional[List[List[int]]] = None,
@@ -940,6 +967,7 @@ class ModelRunner(ModelRunnerMixin):
             stop_words_list=sampling_config.stop_words_list,
             bad_words_list=sampling_config.bad_words_list,
             output_sequence_lengths=sampling_config.output_sequence_lengths,
+            output_generation_logits=output_generation_logits,
             return_dict=sampling_config.return_dict,
             streaming=streaming,
             stopping_criteria=stopping_criteria,

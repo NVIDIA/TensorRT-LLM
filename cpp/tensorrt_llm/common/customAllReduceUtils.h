@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/envUtils.h"
 #include <cstddef>
 
 namespace tensorrt_llm::utils::customAllReduceUtils
@@ -26,6 +27,10 @@ constexpr size_t NUM_POINTERS_PER_RANK = 7;
 // WARNING: MUST BE KEPT IN SYNC with tensorrt_llm/plugin/plugin.py
 inline size_t getMaxRequiredWorkspaceSize(int worldSize) noexcept
 {
+    if (common::getEnvForceDeterministicAllReduce())
+    {
+        return common::getEnvAllReduceWorkspaceSize();
+    }
     if (worldSize <= 2)
     {
         return 16 * 1000 * 1000;

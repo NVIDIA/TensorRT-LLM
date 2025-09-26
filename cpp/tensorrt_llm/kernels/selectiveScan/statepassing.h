@@ -225,29 +225,26 @@ StatePassingKernelFunc getStatePassingKernel(int B_, int L_, int H_, int P_, int
     int Q = Q_;
     int C = div_up(L, Q);
 
-    int64_t compute = int64_t(numTokens_) * H * N * P;
+    // int64_t compute = int64_t(numTokens_) * H * N * P_;
 
     auto set = [&](int tileH, int warpH, StatePassingKernelFunc func)
     {
         auto sharedMem = 0;
 
-        *blockDims_ = dim3(H * N * P / tileH, 1, B);
+        *blockDims_ = dim3(H * N * P_ / tileH, 1, B);
         *threadDims_ = dim3(32, warpH);
         *sharedMem_ = sharedMem;
 
         return func;
     };
 
-    if (Q_ == 256)
+    if (Q == 256)
     {
-        if (compute >= (1LL << 0))
-            return set(512, 4, state_passing_kernel<256, 512, 4, Tp_>);
+        return set(512, 4, state_passing_kernel<256, 512, 4, Tp_>);
     }
-
-    if (Q_ == 128)
+    if (Q == 128)
     {
-        if (compute >= (1LL << 0))
-            return set(512, 4, state_passing_kernel<128, 512, 4, Tp_>);
+        return set(512, 4, state_passing_kernel<128, 512, 4, Tp_>);
     }
 
     return nullptr;

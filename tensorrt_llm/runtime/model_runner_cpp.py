@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import copy
+import os
+from os.path import join
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -24,8 +26,8 @@ from .._utils import mpi_broadcast
 from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
                         WorldConfig)
 from ..bindings import executor as trtllm
-from ..bindings.executor import (ExternalDraftTokensConfig, OrchestratorConfig,
-                                 ParallelConfig)
+from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
+                                 OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
 from ..layers import MropeParams
 from ..logger import logger
@@ -46,6 +48,15 @@ _bindings_dtype_to_torch_dtype_dict = {
 }
 
 SamplingConfigType = Union[SamplingConfig, trtllm.SamplingConfig]
+
+
+def _world_config_to_mapping(world_config: WorldConfig):
+    return Mapping(world_size=world_config.size,
+                   rank=world_config.rank,
+                   gpus_per_node=world_config.gpus_per_node,
+                   tp_size=world_config.tensor_parallelism,
+                   pp_size=world_config.pipeline_parallelism,
+                   cp_size=world_config.context_parallelism)
 
 
 class ModelRunnerCpp(ModelRunnerMixin):
@@ -69,12 +80,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.model_config = model_config
-        self.mapping = Mapping(world_size=world_config.size,
-                               rank=world_config.rank,
-                               gpus_per_node=world_config.gpus_per_node,
-                               tp_size=world_config.tensor_parallelism,
-                               pp_size=world_config.pipeline_parallelism,
-                               cp_size=world_config.context_parallelism)
+        self.mapping = _world_config_to_mapping(world_config)
         self.world_config = world_config
         self.use_kv_cache = use_kv_cache
         self.lora_manager = lora_manager
@@ -97,9 +103,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
         medusa_choices: list[list[int]] | None = None,
         eagle_choices: list[list[int]] | None = None,
         eagle_posterior_threshold: float | None = None,
+        eagle_use_dynamic_tree: bool = False,
+        eagle_dynamic_tree_max_top_k: Optional[int] = None,
         lookahead_config: list[int] | None = None,
         debug_mode: bool = False,
         lora_ckpt_source: str = "hf",
+        use_gpu_direct_storage: bool = False,
         gpu_weights_percent: float = 1,
         max_tokens_in_paged_kv_cache: int | None = None,
         kv_cache_enable_block_reuse: bool = False,
@@ -112,6 +121,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
         device_ids: List[int] | None = None,
         is_orchestrator_mode: bool = False,
         use_runtime_defaults: bool = True,
+        gather_generation_logits: bool = False,
+        use_variable_beam_width_search: bool = False,
+        mm_embedding_offloading: bool = False,
+        fail_fast_on_attention_window_too_large: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -156,6 +169,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             eagle_posterior_threshold float:
                 Minimum token probability threshold for typical acceptance.
                 Value different from None enables typical acceptance in Eagle.
+            eagle_use_dynamic_tree bool:
+                Whether to use Eagle-2, which is dynamic tree.
+            eagle_dynamic_tree_max_top_k int:
+                The maximum number of draft tokens to expand for each node in Eagle-2.
             lora_ckpt_source (str):
                 Source of checkpoint. Should be one of ['hf', 'nemo'].
             max_tokens_in_paged_kv_cache (int):
@@ -179,6 +196,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Device indices to run the Executor on.
             is_orchestrator_mode (bool):
                 The mode to run the model-runner, Leader mode by default.
+            gather_generation_logits (bool):
+                Enable gathering generation logits.
+            fail_fast_on_attention_window_too_large (bool):
+                Whether to fail fast if the attention window(s) are too large to fit even a single sequence in the KVCache.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
@@ -191,74 +212,41 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if cuda_graph_mode is not None:
             extended_runtime_perf_knob_config.cuda_graph_mode = cuda_graph_mode
 
+        model_config = None
+        is_multimodal = {'vision', 'llm'}.issubset({
+            name
+            for name in os.listdir(engine_dir)
+            if os.path.isdir(os.path.join(engine_dir, name))
+        })
+        encoder_path = None
+        decoder_path = None
+
         if is_enc_dec:
-            encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
+            if is_multimodal:
+                encoder_path = join(engine_dir, 'vision')
+                decoder_path = join(engine_dir, 'llm')
+            else:
+                encoder_path = join(engine_dir, 'encoder')
+                decoder_path = join(engine_dir, 'decoder')
+
+            encoder_config_path = Path(encoder_path) / "config.json"
             encoder_json_config = GptJsonConfig.parse_file(encoder_config_path)
             encoder_model_config = encoder_json_config.model_config
-            decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
+            decoder_config_path = Path(decoder_path) / "config.json"
             decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
             decoder_model_config = decoder_json_config.model_config
-            use_kv_cache = decoder_model_config.kv_cache_type != KVCacheType.DISABLED
 
-            if not use_kv_cache:
-                assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
+            json_config = decoder_json_config
+            model_config = decoder_model_config
+            engine_dir = decoder_path
 
-            if max_input_len is None:
+            if max_input_len is None and not is_multimodal:
                 max_input_len = encoder_model_config.max_input_len
+        else:
+            config_path = Path(engine_dir) / "config.json"
+            json_config = GptJsonConfig.parse_file(config_path)
+            model_config = json_config.model_config
 
-            max_seq_len = decoder_model_config.max_seq_len
-            # specifically set max_seq_len as decoder config. max_seq_len >= decoder_prefix_length + max_output_len.
-
-            if max_batch_size is None:
-                max_batch_size = decoder_model_config.max_batch_size
-            else:
-                assert max_batch_size <= decoder_model_config.max_batch_size
-
-            tp_size = decoder_json_config.tensor_parallelism
-            pp_size = decoder_json_config.pipeline_parallelism
-            cp_size = decoder_json_config.context_parallelism
-            gpus_per_node = decoder_json_config.gpus_per_node
-            world_config = WorldConfig.mpi(tensor_parallelism=tp_size,
-                                           pipeline_parallelism=pp_size,
-                                           context_parallelism=cp_size,
-                                           gpus_per_node=gpus_per_node)
-            assert rank == world_config.rank
-
-            profiler.start('load tensorrt_llm engine')
-
-            kv_cache_config = trtllm.KvCacheConfig(
-                free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-                cross_kv_cache_fraction=cross_kv_cache_fraction,
-                max_attention_window=max_attention_window_size,
-                sink_token_length=sink_token_length)
-
-            executor = trtllm.Executor(
-                Path(engine_dir) / "encoder",
-                Path(engine_dir) / "decoder", trtllm.ModelType.ENCODER_DECODER,
-                trtllm.ExecutorConfig(max_beam_width=max_beam_width,
-                                      kv_cache_config=kv_cache_config,
-                                      gpu_weights_percent=gpu_weights_percent,
-                                      extended_runtime_perf_knob_config=
-                                      extended_runtime_perf_knob_config))
-
-            profiler.stop('load tensorrt_llm engine')
-
-            loading_time = profiler.elapsed_time_in_sec(
-                "load tensorrt_llm engine")
-            logger.info(f'Load engine takes: {loading_time} sec')
-
-            return cls(executor,
-                       max_batch_size=max_batch_size,
-                       max_input_len=max_input_len,
-                       max_seq_len=max_seq_len,
-                       max_beam_width=max_beam_width,
-                       model_config=decoder_model_config,
-                       world_config=world_config,
-                       use_kv_cache=use_kv_cache)
-
-        config_path = Path(engine_dir) / "config.json"
-        json_config = GptJsonConfig.parse_file(config_path)
-        model_config = json_config.model_config
         use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
         if not model_config.use_cross_attention:
             assert cross_kv_cache_fraction is None, "cross_kv_cache_fraction should only be used with enc-dec models."
@@ -287,9 +275,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                        gpus_per_node=gpus_per_node)
         assert rank == world_config.rank
 
+        engine_config = EngineConfig.from_json_file(f"{engine_dir}/config.json")
         if model_config.use_lora_plugin and rank == 0:
-            engine_config = EngineConfig.from_json_file(
-                f"{engine_dir}/config.json")
             lora_manager = LoraManager()
             if lora_dir is None:
                 config_lora_dir = engine_config.build_config.lora_config.lora_dir
@@ -348,10 +335,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if multi_block_mode is not None:
                 multi_block_mode = False  # Medusa doesn't support multi-block mode.
 
-        if eagle_choices is not None or eagle_posterior_threshold is not None:
+        if eagle_choices is not None or eagle_posterior_threshold is not None or eagle_use_dynamic_tree:
             greedy_sampling = eagle_posterior_threshold is None
             decoding_config.eagle_config = trtllm.EagleConfig(
-                eagle_choices, greedy_sampling, eagle_posterior_threshold)
+                eagle_choices, greedy_sampling, eagle_posterior_threshold,
+                eagle_use_dynamic_tree, eagle_dynamic_tree_max_top_k)
             if multi_block_mode is not None:
                 logger.warning(
                     f'Multi block mode is not supported for EAGLE. Disabling it.'
@@ -363,17 +351,21 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
                 w, n, g)
 
+        if use_variable_beam_width_search:
+            decoding_config.decoding_mode = DecodingMode.BeamSearch(
+            ).useVariableBeamWidthSearch(True)
+
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
         else:
             assert max_batch_size <= model_config.max_batch_size
         if max_input_len is None:
             max_input_len = model_config.max_input_len
-        # NOTE{pengyunl}: remove assertion here for temp fix,
+        # NOTE: remove assertion here for temp fix,
         # model_config.max_input_len is not the upper bound of input length.
         # If runtime max_input_len is not properly set,
         # C++ runtime will throw an error when fetching new requests
-        if max_output_len is None:
+        if max_output_len is None or is_enc_dec:
             max_seq_len = model_config.max_seq_len
         else:
             max_seq_len = max_input_len + max_output_len
@@ -402,10 +394,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config=decoding_config,
             peft_cache_config=peft_cache_config,
             debug_config=debug_config,
-            gpu_weights_percent=gpu_weights_percent)
+            use_gpu_direct_storage=use_gpu_direct_storage,
+            gpu_weights_percent=gpu_weights_percent,
+            gather_generation_logits=gather_generation_logits,
+        )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
-
+        trtllm_config.mm_embedding_offloading = mm_embedding_offloading
+        trtllm_config.fail_fast_on_attention_window_too_large = fail_fast_on_attention_window_too_large
         if is_orchestrator_mode:
             communication_mode = trtllm.CommunicationMode.ORCHESTRATOR
             path = str(Path(__file__).parent.parent / 'bin' / 'executorWorker')
@@ -427,8 +423,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 logits_proc_config.processor_map = logits_processor_map
             trtllm_config.logits_post_processor_config = logits_proc_config
 
-        use_default_executor = True
-        if use_default_executor:
+        if is_enc_dec:
+            executor = trtllm.Executor(encoder_path, decoder_path,
+                                       trtllm.ModelType.ENCODER_DECODER,
+                                       trtllm_config)
+        else:
             executor = trtllm.Executor(Path(engine_dir),
                                        trtllm.ModelType.DECODER_ONLY,
                                        trtllm_config)
@@ -505,7 +504,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
     @property
     def num_layers(self) -> int:
         return self.model_config.num_layers(
-            self.world_config.pipeline_parallelism)
+            self.world_config.pipeline_parallelism,
+            self.world_config.pipeline_parallel_rank,
+        )
 
     @property
     def max_sequence_length(self) -> int:
@@ -552,12 +553,15 @@ class ModelRunnerCpp(ModelRunnerMixin):
             stop_words_list: list[list[int]] | None = None,
             return_dict: bool = False,
             output_sequence_lengths: bool = False,
+            output_generation_logits: bool = False,
             output_log_probs: bool = False,
             output_cum_log_probs: bool = False,
             prompt_table: Optional[Union[str, torch.Tensor]] = None,
             prompt_tasks: Optional[str] = None,
             input_token_extra_ids: List[List[int]] = None,
             return_all_generated_tokens: bool = False,
+            language_adapter_uids: Optional[List[int]] = None,
+            mm_embedding_offloading: bool = False,
             **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -628,12 +632,25 @@ class ModelRunnerCpp(ModelRunnerMixin):
             # Convert from old API of SamplingConfig
             # Note: Due to a Python3.10 bug one cannot use inspect on it currently
             accepted_parameters = [
-                "num_beams", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-                "top_p_decay", "temperature", "min_tokens",
-                "beam_search_diversity_rate", "repetition_penalty",
-                "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping", "no_repeat_ngram_size", "random_seed",
-                "num_return_sequences"
+                "num_beams",
+                "top_k",
+                "top_p",
+                "top_p_min",
+                "top_p_reset_ids",
+                "top_p_decay",
+                "temperature",
+                "min_tokens",
+                "beam_search_diversity_rate",
+                "repetition_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+                "length_penalty",
+                "early_stopping",
+                "no_repeat_ngram_size",
+                "random_seed",
+                "num_return_sequences",
+                "min_p",
+                "beam_width_array",
             ]
             rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
             sampling_params = {
@@ -646,6 +663,28 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if "top_p" in sampling_params and sampling_params["top_p"] == 0.0:
                 sampling_params["top_p"] = None
 
+            # TODO: improve usage of SamplingConfig. For example,
+            # construct SamplingConfig for each request, rather than one for the whole batch.
+            # Here we use beam width array for each request for Variable-Beam-Width-Search.
+            batch_size = len(batch_input_ids)
+            use_sampling_config_for_each_request = False
+            # Just placeholder for non-Variable-Beam-Width-Search
+            sampling_config_list = [None] * batch_size
+            if "beam_width_array" in sampling_params and sampling_params[
+                    "beam_width_array"] is not None and len(
+                        sampling_params["beam_width_array"]) == batch_size:
+                use_sampling_config_for_each_request = True
+                sp_copy = copy.deepcopy(sampling_params)
+                for i in range(batch_size):
+                    bwa = sampling_params["beam_width_array"][i]
+                    sp_copy["beam_width_array"] = bwa
+                    sp_copy["beam_width"] = max(bwa)
+                    sampling_config_list[i] = trtllm.SamplingConfig(**sp_copy)
+                # Just placeholder for Variable-Beam-Width-Search and for `self._check_inputs`
+                max_beam_width = max(sc.beam_width
+                                     for sc in sampling_config_list)
+                sampling_params["beam_width"] = max_beam_width
+                sampling_params["beam_width_array"] = [max_beam_width] * 8
             sampling_config = trtllm.SamplingConfig(**sampling_params)
         else:
             sampling_config = copy.deepcopy(sampling_config)
@@ -655,13 +694,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         output_config = trtllm.OutputConfig(
             return_context_logits=self.gather_context_logits,
-            return_generation_logits=self.gather_generation_logits,
+            return_generation_logits=self.gather_generation_logits
+            or output_generation_logits,
             return_log_probs=output_log_probs,
         )
 
         prompt_tuning_configs = self._prepare_ptuning_executor(
-            batch_input_ids_list, prompt_table, prompt_tasks,
-            input_token_extra_ids)
+            batch_input_ids_list,
+            prompt_table,
+            prompt_tasks,
+            input_token_extra_ids,
+            mm_embedding_offloading=mm_embedding_offloading)
         mrope_configs = self._prepare_mrope_executor(batch_input_ids_list,
                                                      mrope_params)
 
@@ -703,6 +746,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             external_draft_tokens_configs = [None] * len(batch_input_ids_list)
             is_draft_target_model = False
 
+        if language_adapter_uids is None:
+            language_adapter_uids = [None] * len(batch_input_ids_list)
+
         requests = [
             trtllm.Request(
                 input_token_ids=input_ids,
@@ -722,7 +768,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 stop_words=stop_words,
                 bad_words=bad_words,
-                sampling_config=sampling_config,
+                sampling_config=(sampling_config_each_request
+                                 if use_sampling_config_for_each_request else
+                                 sampling_config),
                 lookahead_config=request_lookahead_config,
                 streaming=streaming,
                 output_config=output_config,
@@ -733,13 +781,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 logits_post_processor_name=logits_post_processor_name,
                 external_draft_tokens_config=external_draft_tokens_config,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
+                language_adapter_uid=language_adapter_uid,
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
              mrope_config, lora_config, logits_post_processor_name,
-             external_draft_tokens_config) in enumerate(
+             external_draft_tokens_config, language_adapter_uid,
+             sampling_config_each_request) in enumerate(
                  zip(batch_input_ids_list, stop_words_list, bad_words_list,
                      prompt_tuning_configs, mrope_configs, lora_configs,
-                     logits_processor_names, external_draft_tokens_configs))
+                     logits_processor_names, external_draft_tokens_configs,
+                     language_adapter_uids, sampling_config_list))
         ]
 
         request_ids = self.session.enqueue_requests(requests)
@@ -749,11 +800,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 return_dict=return_dict,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
                 output_cum_log_probs=output_cum_log_probs,
                 batch_input_ids=batch_input_ids,
                 streaming=streaming,
-                max_new_tokens=max_new_tokens,
                 sampling_config=sampling_config,
                 is_draft_target_model=is_draft_target_model,
             )
@@ -763,13 +814,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 return_dict=return_dict,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
                 output_cum_log_probs=output_cum_log_probs,
                 batch_input_ids=batch_input_ids,
                 batch_input_ids_list=batch_input_ids_list,
                 streaming=streaming,
                 return_all_generated_tokens=return_all_generated_tokens,
-                max_new_tokens=max_new_tokens,
                 sampling_config=sampling_config,
                 is_draft_target_model=is_draft_target_model,
             )
@@ -786,14 +837,22 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return names_list
 
     def _prepare_ptuning_executor(self, batch_input_ids_list, prompt_table,
-                                  prompt_tasks, input_token_extra_ids):
+                                  prompt_tasks, input_token_extra_ids,
+                                  mm_embedding_offloading):
         if input_token_extra_ids:
             assert len(batch_input_ids_list) == len(input_token_extra_ids), \
                 f"Batch size of input_token_extra_ids ({len(input_token_extra_ids)}) must be the same as input batch size ({len(batch_input_ids_list)})"
         prompt_tuning_configs = len(batch_input_ids_list) * [None]
         if prompt_table is not None:
-            prompt_table_data = self._prepare_embedding_table(
-                prompt_table).cuda()
+            if mm_embedding_offloading:
+                # CUDA Stream Overlapping Requirements:
+                # 1. Both memory copy stream and kernel execution stream must be non-default streams
+                # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
+                prompt_table_data = self._prepare_embedding_table(
+                    prompt_table).pin_memory()
+            else:
+                prompt_table_data = self._prepare_embedding_table(
+                    prompt_table).cuda()
             if prompt_tasks is not None:
                 task_indices = [int(t) for t in prompt_tasks.split(',')]
                 assert len(task_indices) == len(batch_input_ids_list), \
@@ -815,6 +874,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 ]
         return prompt_tuning_configs
 
+    # TODO: add multimodal input for TRT engine backend
+
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
         if mrope != None:
@@ -823,14 +884,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 mrope_rotary_cos_sin,
                 torch.Tensor), "mrope_rotary_cos_sin should be torch.Tensor"
             mrope_rotary_cos_sin_data = mrope_rotary_cos_sin.to(
-                dtype=torch.float32).to(torch.device('cpu'))
+                dtype=torch.float32)
 
             mrope_position_deltas = mrope.mrope_position_deltas
             assert isinstance(
                 mrope_position_deltas,
                 torch.Tensor), "mrope_position_deltas should be torch.Tensor"
             mrope_position_deltas_data = mrope_position_deltas.to(
-                dtype=torch.int32).to(torch.device('cpu'))
+                dtype=torch.int32)
 
             mrope_configs = [
                 trtllm.MropeConfig(
@@ -865,11 +926,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         end_id,
         return_dict,
         output_sequence_lengths,
+        output_generation_logits,
         output_log_probs,
         output_cum_log_probs,
         batch_input_ids,
         streaming,
-        max_new_tokens: int,
         sampling_config: SamplingConfigType,
         is_draft_target_model: bool = False,
     ):
@@ -878,17 +939,22 @@ class ModelRunnerCpp(ModelRunnerMixin):
         output_ids = [[[] for _ in range(num_sequences)]
                       for _ in range(len(request_ids))]
 
-        multi_responses = self.session.await_responses(request_ids)
-        responses = [
-            response for responses in multi_responses for response in responses
-        ]
+        all_responses = []
+        finished_request_ids = set()
+        while finished_request_ids != set(request_ids):
+            responses = self.session.await_responses()
+            for response in responses:
+                if response.result.is_final:
+                    finished_request_ids.add(response.request_id)
+            all_responses.extend(responses)
 
         return self._fill_output(
-            responses=responses,
+            responses=all_responses,
             output_ids=output_ids,
             end_id=end_id,
             return_dict=return_dict,
             output_sequence_lengths=output_sequence_lengths,
+            output_generation_logits=output_generation_logits,
             output_log_probs=output_log_probs,
             output_cum_log_probs=output_cum_log_probs,
             batch_input_ids=batch_input_ids,
@@ -896,7 +962,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
             streaming=streaming,
             request_ids=request_ids,
             return_all_generated_tokens=False,
-            max_new_tokens=max_new_tokens,
             sampling_config=sampling_config,
             is_draft_target_model=is_draft_target_model,
         )
@@ -908,13 +973,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
         end_id,
         return_dict,
         output_sequence_lengths,
+        output_generation_logits,
         output_log_probs,
         output_cum_log_probs,
         batch_input_ids,
         batch_input_ids_list,
         streaming,
         return_all_generated_tokens,
-        max_new_tokens: int,
         sampling_config: SamplingConfigType,
         is_draft_target_model: bool = False,
     ):
@@ -938,6 +1003,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 return_dict=return_dict,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
                 output_cum_log_probs=output_cum_log_probs,
                 batch_input_ids=batch_input_ids,
@@ -945,7 +1011,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 streaming=streaming,
                 request_ids=request_ids,
                 return_all_generated_tokens=return_all_generated_tokens,
-                max_new_tokens=max_new_tokens,
                 sampling_config=sampling_config,
                 is_draft_target_model=is_draft_target_model,
             )
@@ -958,6 +1023,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         end_id,
         return_dict,
         output_sequence_lengths,
+        output_generation_logits,
         output_log_probs,
         output_cum_log_probs,
         batch_input_ids,
@@ -965,7 +1031,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
         streaming,
         request_ids,
         return_all_generated_tokens,
-        max_new_tokens: int,
         sampling_config: SamplingConfigType,
         is_draft_target_model: bool,
     ):
@@ -1045,7 +1110,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 assert context_logits is not None
                 outputs['context_logits'] = context_logits
 
-            if self.gather_generation_logits:
+            if self.gather_generation_logits or output_generation_logits:
                 gen_logits = None
                 if is_draft_target_model:
                     # Put the outputs in a list rather than a tensor since their

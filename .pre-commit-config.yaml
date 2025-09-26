@@ -1,50 +1,91 @@
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
 -   repo: https://github.com/pycqa/isort
     rev: 5.12.0
     hooks:
     -   id: isort
 -   repo: https://github.com/Lucas-C/pre-commit-hooks.git
-    rev: v1.1.13
+    rev: v1.5.5
     hooks:
     -   id: remove-crlf
--   repo:  https://github.com/google/yapf
+-   repo: https://github.com/google/yapf
     rev: v0.43.0
     hooks:
     -   id: yapf
+        exclude: ".*/auto_deploy/.*"
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.1.0
     hooks:
     -   id: check-added-large-files
         exclude: |
-            (?x)^(.*cubin.cpp)$
+            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
     -   id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
+        exclude: '\.(patch|md)$'
+    -   id: check-toml
+    -   id: mixed-line-ending
+        args: [--fix=lf]
+        files: ".*/auto_deploy/.*"
+    -   id: debug-statements
+        files: ".*/auto_deploy/.*"
+    -   id: check-json
+        files: ".*/auto_deploy/.*"
+        exclude: >
+          (?x)^(
+            .*\.vscode/.*\.json | # vscode files can take comments
+            .*\.devcontainer/.*\.json # devcontainer json files can take comments
+          )$
 -   repo: https://github.com/PyCQA/autoflake
-    rev: v1.6.1
+    rev: v2.3.1
     hooks:
     -   id: autoflake
-        args: ['--in-place', '--remove-all-unused-imports', '--remove-unused-variables']
+        additional_dependencies:
+        - tomli
+        args: ['--config', 'pyproject.toml']
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v16.0.0
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-            (?x)^(.*cubin.cpp$ | .*fmha_cubin.h)$
+            (?x)^(.*cubin.cpp$ | .*_cubin.h)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
     -   id: cmake-format
 -   repo: https://github.com/codespell-project/codespell
-    rev: v2.2.4
+    rev: v2.4.1
     hooks:
     -   id: codespell
-        args:
-        - --skip=".git,3rdparty"
-        - --exclude-file=examples/whisper/tokenizer.py
-        - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid,improbe
-        exclude: 'tests/llm-test-defs/turtle/test_input_files'
+        additional_dependencies:
+        - tomli
+        # add ignore words list
+        args: ["-L", "Mor,ans,thirdparty"]
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4
+    hooks:
+    -   id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        pass_filenames: false
+    -   id: ruff-format
+        pass_filenames: false
+-   repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+    -   id: mdformat
+        additional_dependencies:
+        - mdformat_frontmatter
+        files: ".*/auto_deploy/.*"
+-   repo: local
+    hooks:
+    -   id: DCO check
+        name: Checks the commit message for a developer certificate of origin signature
+        entry: ./scripts/dco_check.py
+        language: script
+        stages: [commit-msg]

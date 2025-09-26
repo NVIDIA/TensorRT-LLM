@@ -5,6 +5,7 @@ import weakref
 from enum import Enum
 from typing import Callable, List, Optional
 
+import tensorrt as trt
 import torch
 from safetensors import safe_open
 from tqdm import tqdm
@@ -25,7 +26,7 @@ class ModelWeightsFormat(Enum):
 
 
 class ModelWeightsLoader:
-    """Convert and load external checkpoint into a TensorRT-LLM model.
+    """Convert and load external checkpoint into a TensorRT LLM model.
 
     Attributes:
         model_dir                 : Model directory or in-memory torch model.
@@ -61,6 +62,7 @@ class ModelWeightsLoader:
             "input_layernorm": "input_layernorm",
             "post_layernorm": "post_attention_layernorm",
             "kv_cache_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
+            "kv_cache_rcp_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
         }
         self.tllm_to_externel_key_dict.update(customized_key_dict)
 
@@ -192,7 +194,11 @@ class ModelWeightsLoader:
         if key in self.shard_map:
             ptr_idx = self.shard_map[key]
         else:
-            return None
+            if "language_model." + key in self.shard_map:
+                key = "language_model." + key
+                ptr_idx = self.shard_map[key]
+            else:
+                return None
 
         if self.format == ModelWeightsFormat.SAFETENSORS:
             tensor = self.shards[ptr_idx].get_slice(key)
@@ -309,7 +315,7 @@ class ModelWeightsLoader:
                 weight_dict = {tllm_key: v}
 
         for k, v in weight_dict.items():
-            if not v.is_contiguous():
+            if v is not None and not v.is_contiguous():
                 weight_dict[k] = v.contiguous()
 
         return weight_dict
@@ -326,6 +332,8 @@ class ModelWeightsLoader:
                 for tllm_local_layer_idx, hf_global_layer_idx in enumerate(
                     pp_layers)
             })
+            if self.tllm_to_externel_key_dict['layers'] != 'layers':
+                del self.tllm_to_externel_key_dict['layers']
 
         # Share embedding; only applies to standard structure with lm_head and transformer.vocab_embedding
         if hasattr(self.model, 'lm_head') and hasattr(
@@ -353,8 +361,11 @@ class ModelWeightsLoader:
         for tllm_key, param in self.model.named_parameters():
             if param.is_buffer:
                 continue
+            if tllm_key.endswith('embed_positions_for_gpt_attention'):
+                continue
             w_shape = weights[tllm_key].shape
-            if w_shape != param.shape:
+            # WAR for 4bit datatype shape mismatch.
+            if w_shape != param.shape and param.dtype != trt.fp4:
                 logger.warning(
                     f'{tllm_key} has invalid shape {w_shape}. Expected {param.shape}.'
                 )

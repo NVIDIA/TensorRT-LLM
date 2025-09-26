@@ -83,7 +83,9 @@ private:
         //! [batch_size, max_decoding_tokens, max_path_len]
         PATHS,
         //! [1]
-        GREEDY_SAMPLING
+        GREEDY_SAMPLING,
+        //! [1]
+        USE_DYNAMIC_TREE
     };
 
     enum class OutputIdxEntry : int32_t

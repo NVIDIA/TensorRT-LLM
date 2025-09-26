@@ -76,15 +76,9 @@ class Parameter:
     def name(self):
         return self._name
 
-    # need_transpose is WAR for bug 4641821
-    def _create_managed_tensor(self, network, need_transpose=False) -> Tensor:
+    def _create_managed_tensor(self, network) -> Tensor:
         num = len(network._inputs)
-        name = f"managed_constant_{num}"
-        self._name = name
-        shape = self._shape
-        if need_transpose:
-            assert len(shape) == 2
-            shape = list(reversed(shape))
+        self._name = f"managed_constant_{num}"
 
         if self._value is None or (isinstance(self._value, np.ndarray)
                                    and not self._value.flags['C_CONTIGUOUS']):
@@ -92,34 +86,47 @@ class Parameter:
             self._value = np.empty(self._shape, trt_dtype_to_np(self._dtype))
             network._register_unfilled_weights(
                 # use updated self._shape here
-                name,
+                self._name,
                 self._value,
                 value_old)
-        return Tensor(name=name, dtype=self._dtype, shape=shape)
+        return Tensor(name=self._name, dtype=self._dtype, shape=self._shape)
 
-    def get_managed_tensor(self,
-                           network: Network,
-                           need_transpose=False) -> Tensor:
+    def get_managed_tensor(self, network: Network) -> Tensor:
         if self._network is None or self._network() != network:
             self._network = weakref.ref(network)
             self._tensor = network.get_parameter_tensor(self)
-            self.need_transpose = need_transpose
             if self._tensor is None:
-                self._tensor = self._create_managed_tensor(
-                    network, need_transpose)
+                self._tensor = self._create_managed_tensor(network)
                 network.set_parameter_tensor(self, self._tensor)
         return self._tensor
 
     def _create_constant_tensor(self) -> Tensor:
         if (self._value is not None and isinstance(self._value, np.ndarray)
                 and self._value.flags['C_CONTIGUOUS']):
-            return constant(self._value)
+            lower_type = None
+            lower_shape = None
+            # workaround for reinterpreted data type
+            dtype = self._value.dtype
+            if (self.dtype == trt.fp4 or self.dtype
+                    == trt.fp8) and (dtype == np.uint8 or dtype == np.int8
+                                     or dtype == np.int32 or dtype == np.int64):
+                lower_type = self.dtype
+                lower_shape = self.shape
 
+            self._value = constant(self._value, lower_type, lower_shape)
+            return self._value
         elif self._value is None or isinstance(self._value, np.ndarray):
-            shape = self._shape
-            dtype = trt_dtype_to_np(self._dtype)
+            if self._dtype == trt.fp4:
+                shape = list(self._shape)
+                assert shape[
+                    -1] % 16 == 0, "For FP4, the last dimension of the shape should be multiple of 16"
+                shape[-1] = shape[-1] // 16
+                dtype = np.int64
+            else:
+                shape = self._shape
+                dtype = trt_dtype_to_np(self._dtype)
             ndarray = np.empty(shape, dtype)
-            tensor = constant(ndarray)
+            tensor = constant(ndarray, self._dtype, self._shape)
             default_net()._register_unfilled_weights(tensor.producer.name,
                                                      ndarray, self._value)
             return tensor
@@ -159,8 +166,13 @@ class Parameter:
         else:
             v_range = 0.1
 
-        if dtype == trt.DataType.INT8:
-            upper = math.ceil(128 * v_range)
+        if dtype == trt.DataType.INT8 or dtype == trt.DataType.INT32 or dtype == trt.DataType.INT64:
+            range_map = {
+                trt.DataType.INT8: 128,
+                trt.DataType.INT32: 2**31,
+                trt.DataType.INT64: 2**63
+            }
+            upper = math.ceil(range_map[dtype] * v_range)
             value = torch.randint(-upper,
                                   upper, (shape),
                                   dtype=trt_dtype_to_torch(dtype),
@@ -201,13 +213,26 @@ class Parameter:
             # convert the scalar into a tensor which each dim is 1.
             v = v.reshape(self.shape)
 
-        assert v.shape == self.shape, \
-            f'The value updated is not the same shape as the original. ' \
-            f'Updated: {v.shape}, original: {self.shape}'
-        dtype = np_dtype_to_trt(v.dtype)
-        if self.dtype != dtype:
-            logger.warning(
-                f"Parameter was initialized as {self.dtype} but set to {dtype}")
+        if self.dtype == trt.fp4:
+            assert v.shape[:-1] == self.shape[:-1] and v.shape[-1] == self.shape[-1] // 2 // v.dtype.itemsize, \
+                f'For FP4, the shape of the value should be the same as the original shape, ' \
+                f'except the last dimension should be half of the original shape. ' \
+                f'Updated: {v.shape}, original: {self.shape}'
+        else:
+            assert v.shape == self.shape, \
+                f'The value updated is not the same shape as the original. ' \
+                f'Updated: {v.shape}, original: {self.shape}'
+        if (self.dtype == trt.fp4 or self.dtype
+                == trt.fp8) and (v.dtype == np.int8 or v.dtype == np.uint8
+                                 or v.dtype == np.int32 or v.dtype == np.int64):
+            pass
+        else:
+            dtype = np_dtype_to_trt(v.dtype)
+            if self.dtype != dtype:
+                logger.warning(
+                    f"Parameter was initialized as {self.dtype} but set to {dtype}"
+                )
+                self._dtype = dtype
         self._value = v
 
     def set_value_or_dummy(self, v: Union[np.ndarray, torch.Tensor]):
@@ -240,6 +265,9 @@ class Parameter:
     def _regularize_value(self, value):
         if isinstance(value, np.ndarray):
             return value
+
+        elif isinstance(value, torch.distributed.tensor.DTensor):
+            return value.to_local().cpu().numpy()
         elif isinstance(value, torch.Tensor):
             return torch_to_numpy(value)
         raise TypeError(

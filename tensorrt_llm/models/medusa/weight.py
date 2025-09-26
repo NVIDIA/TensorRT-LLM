@@ -49,28 +49,39 @@ def load_medusa_hf(medusa_path: str,
                    mapping=Mapping(),
                    dtype='float32',
                    use_weight_only=False,
-                   plugin_weight_only_quant_type=None):
+                   plugin_weight_only_quant_type=None,
+                   is_modelopt_ckpt=False):
     # logger.info("Loading Medusa heads' weights ...")
-    is_ckpt_safetensors = False
 
-    ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-    if not ckpt_file.exists():
-        ckpt_file = Path(medusa_path) / "medusa_lm_head.safetensors"
-        is_ckpt_safetensors = True
-
-    if is_ckpt_safetensors:
-        logger.info("Safetensors Found ...")
+    if is_modelopt_ckpt:
         from safetensors.torch import load_file
-        state_dict = load_file(ckpt_file)
+        state_dict = {}
+        for filename in sorted(Path(medusa_path).glob("*.safetensors")):
+            print(f"Loading the weights of Medusa heads from {filename}")
+            state_dict.update(load_file(filename))
     else:
-        state_dict = torch.load(ckpt_file, map_location="cpu")
+        is_ckpt_safetensors = False
+
+        ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
+        if not ckpt_file.exists():
+            ckpt_file = Path(medusa_path) / "medusa_lm_head.safetensors"
+            is_ckpt_safetensors = True
+
+        if is_ckpt_safetensors:
+            logger.info("Safetensors Found ...")
+            from safetensors.torch import load_file
+            state_dict = load_file(ckpt_file)
+        else:
+            state_dict = torch.load(ckpt_file, map_location="cpu")
 
     torch_dtype = str_dtype_to_torch(dtype)
     weights = {}
 
+    prefix = "medusa_heads." if is_modelopt_ckpt else ""
     for h in range(num_medusa_heads):
         for l in range(num_medusa_layers):
-            w = state_dict[f"{h}.{l}.linear.weight"].clone().to(torch_dtype)
+            w = state_dict[f"{prefix}{h}.{l}.linear.weight"].clone().to(
+                torch_dtype)
 
             split_v = split(w, mapping.tp_size, mapping.tp_rank)
             weights.update(
@@ -78,16 +89,32 @@ def load_medusa_hf(medusa_path: str,
                     split_v, f'medusa_heads.{h}.medusa_layers.{l}.linear.',
                     None, use_weight_only, plugin_weight_only_quant_type))
 
-            b = state_dict[f"{h}.{l}.linear.bias"].clone().to(torch_dtype)
+            b = state_dict[f"{prefix}{h}.{l}.linear.bias"].clone().to(
+                torch_dtype)
 
             weights['medusa_heads.{}.medusa_layers.{}.linear.bias'.format(
                 h, l)] = split(b, mapping.tp_size, mapping.tp_rank)
 
-        lm = state_dict[f"{h}.{num_medusa_layers}.weight"].clone().to(
+        lm = state_dict[f"{prefix}{h}.{num_medusa_layers}.weight"].clone().to(
             torch_dtype)  # LM Head
 
         weights['medusa_heads.{}.lm_head.weight'.format(h)] = split(
             lm, mapping.tp_size, mapping.tp_rank)
+
+        # scaling factors
+        if is_modelopt_ckpt:
+            scaling_dtype = str_dtype_to_torch("float32")
+            weights[f'medusa_heads.{h}.medusa_layers.{l}.linear.activation_scaling_factor'] = \
+                state_dict[f"{prefix}{h}.{l}.linear.input_scale"].clone().to(scaling_dtype)
+
+            weights[f'medusa_heads.{h}.medusa_layers.{l}.linear.weights_scaling_factor'] = \
+                state_dict[f"{prefix}{h}.{l}.linear.weight_scale"].clone().to(scaling_dtype)
+
+            weights['medusa_heads.{}.lm_head.activation_scaling_factor'.format(h)] = \
+                state_dict[f"{prefix}{h}.{num_medusa_layers}.input_scale"].clone().to(scaling_dtype)
+
+            weights['medusa_heads.{}.lm_head.weights_scaling_factor'.format(h)] = \
+                state_dict[f"{prefix}{h}.{num_medusa_layers}.weight_scale"].clone().to(scaling_dtype)
 
     return weights
 

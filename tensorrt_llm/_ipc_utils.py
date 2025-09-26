@@ -17,25 +17,39 @@ import struct
 import sys
 from typing import List, Tuple
 
-from cuda import cudart
-from cuda.cudart import cudaError_t
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cuda, cudart
 
 from ._utils import mpi_comm
 from .logger import logger
 from .mapping import Mapping
 
 
-def _raise_if_error(error: cudaError_t):
-    if error != cudaError_t.cudaSuccess:
-        raise RuntimeError(error)
+def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
+    if isinstance(error, cudart.cudaError_t):
+        if error != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"CUDA Runtime API error: {repr(error)}")
+    if isinstance(error, cuda.CUresult):
+        if error != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"CUDA Driver API error: {repr(error)}")
 
 
 def can_access_peer(mapping: Mapping) -> bool:
     src_node = mapping.local_rank
+
     for rank in mapping.tp_group:
         dest_node = mapping.get_local_rank(rank)
-        if mapping.get_node_rank(
-                rank) != mapping.node_rank or dest_node == src_node:
+
+        # Early exit if devices are on different nodes
+        if mapping.get_node_rank(rank) != mapping.node_rank:
+            logger.info(f"Detect inter-node TP between rank {mapping.rank} and rank {rank}")
+            return False
+
+        # Skip if same device
+        if dest_node == src_node:
             continue
 
         error, result = cudart.cudaDeviceCanAccessPeer(src_node, dest_node)
@@ -43,13 +57,14 @@ def can_access_peer(mapping: Mapping) -> bool:
 
         if result == 0:
             logger.info(
-                f"Cannot access peer device from {src_node} to {dest_node}")
+                f"cudaDeviceCanAccessPeer failed for device: {src_node} peerDevice: {dest_node}"
+            )
             return False
+
     return True
 
 
-class IpcMemory():
-
+class IpcMemory:
     # WARNING: Must in sync with FLAGS_SIZE in cpp/include/tensorrt_llm/runtime/ipcUtils.h
     # (Max all reduce blocks + 1) * sizeof(int)
     IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
@@ -58,8 +73,7 @@ class IpcMemory():
         self.mapping = mapping
         self.open_ipc = open_ipc and mapping.tp_size <= mapping.gpus_per_node
         if self.open_ipc:
-            self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(
-                self.mapping, size, True)
+            self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(self.mapping, size, True)
         else:
             self.peer_ptrs = [0] * mapping.tp_size
             self.local_ptr = 0
@@ -76,21 +90,30 @@ class IpcMemory():
         return array.array("Q", buffer).tolist()
 
     @staticmethod
-    def open_ipc_memory(mapping: Mapping,
-                        size: int,
-                        set_to_zero: bool = False) -> Tuple[List[int], int]:
-        """ Allocates a buffer with the given *size* on each GPU. Then, enables IPC communication between TP groups.
+    def open_ipc_memory(
+        mapping: Mapping, size: int, set_to_zero: bool = False
+    ) -> Tuple[List[int], int]:
+        """Allocates a buffer with the given *size* on each GPU. Then, enables IPC communication between TP groups.
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
-        comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
-            mapping.tp_rank)
 
-        error, local_ptr = cudart.cudaMalloc(size)
+        def align_size(size, alignment):
+            if (size % alignment) != 0:
+                size += alignment - (size % alignment)
+            return size
+
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+        )
+
+        # see allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for alignment reason
+        # 1 << 21 is 2MB
+        aligned_size = align_size(size, 1 << 21)
+        error, local_ptr = cudart.cudaMalloc(aligned_size)
         _raise_if_error(error)
         if set_to_zero:
-            _raise_if_error(cudart.cudaMemset(local_ptr, 0, size)[0])
+            _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
         _raise_if_error(error)
 
@@ -107,7 +130,8 @@ class IpcMemory():
                 peer_ptrs.append(local_ptr)
             else:
                 error, ptr = cudart.cudaIpcOpenMemHandle(
-                    handle, cudart.cudaIpcMemLazyEnablePeerAccess)
+                    handle, cudart.cudaIpcMemLazyEnablePeerAccess
+                )
                 _raise_if_error(error)
                 peer_ptrs.append(ptr)
 

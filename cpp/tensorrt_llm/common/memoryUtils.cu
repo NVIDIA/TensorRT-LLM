@@ -23,10 +23,68 @@
 #include <sys/stat.h>
 #include <unordered_map>
 
+#include <sanitizer/asan_interface.h>
+
 namespace tensorrt_llm
 {
 namespace common
 {
+
+#ifdef __has_feature
+#if __has_feature(address_sanitizer)
+#define TLLM_HAS_ASAN
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define TLLM_HAS_ASAN
+#endif
+
+cudaError_t cudaMemcpyAsyncSanitized(
+    void* dst, void const* src, size_t count, enum cudaMemcpyKind kind, cudaStream_t stream)
+{
+#if defined(TLLM_HAS_ASAN)
+    bool needASAN = false;
+    if (kind == cudaMemcpyDeviceToHost)
+    {
+        needASAN = true;
+    }
+    else if (kind == cudaMemcpyDefault)
+    {
+        auto const srcType = getPtrCudaMemoryType(src);
+        auto const dstType = getPtrCudaMemoryType(dst);
+        needASAN = srcType == cudaMemoryTypeDevice && dstType != cudaMemoryTypeDevice;
+    }
+
+    // Poison the memory area during async copy
+    if (needASAN)
+    {
+        ASAN_POISON_MEMORY_REGION(dst, count);
+    }
+
+    auto const result = cudaMemcpyAsync(dst, src, count, kind, stream);
+
+    if (result == cudaSuccess && needASAN)
+    {
+        struct ctxType
+        {
+            void* ptr;
+            size_t count;
+        };
+
+        auto const ctx = new ctxType{dst, count};
+        auto cb = [](cudaStream_t, cudaError_t, void* data)
+        {
+            auto const ctx = static_cast<ctxType*>(data);
+            ASAN_UNPOISON_MEMORY_REGION(ctx->ptr, ctx->count);
+            delete ctx;
+        };
+        TLLM_CUDA_CHECK(cudaStreamAddCallback(stream, cb, ctx, 0));
+    }
+
+    return result;
+#else
+    return cudaMemcpyAsync(dst, src, count, kind, stream);
+#endif
+}
 
 template <typename T>
 void deviceMalloc(T** ptr, size_t size, bool is_random_initialize)
@@ -43,6 +101,7 @@ template void deviceMalloc(half** ptr, size_t size, bool is_random_initialize);
 #ifdef ENABLE_BF16
 template void deviceMalloc(__nv_bfloat16** ptr, size_t size, bool is_random_initialize);
 #endif
+template void deviceMalloc(uint32_t** ptr, size_t size, bool is_random_initialize);
 template void deviceMalloc(uint16_t** ptr, size_t size, bool is_random_initialize);
 template void deviceMalloc(int** ptr, size_t size, bool is_random_initialize);
 template void deviceMalloc(bool** ptr, size_t size, bool is_random_initialize);
@@ -86,6 +145,7 @@ template void deviceFree(half*& ptr);
 template void deviceFree(__nv_bfloat16*& ptr);
 #endif
 template void deviceFree(unsigned short*& ptr);
+template void deviceFree(uint32_t*& ptr);
 template void deviceFree(int*& ptr);
 template void deviceFree(bool*& ptr);
 template void deviceFree(char*& ptr);
@@ -208,7 +268,7 @@ void cudaAutoCpy(T* tgt, T const* src, const size_t size, cudaStream_t stream)
 {
     if (stream != NULL)
     {
-        check_cuda_error(cudaMemcpyAsync(tgt, src, sizeof(T) * size, cudaMemcpyDefault, stream));
+        check_cuda_error(cudaMemcpyAsyncSanitized(tgt, src, sizeof(T) * size, cudaMemcpyDefault, stream));
     }
     else
     {
@@ -444,8 +504,6 @@ template int loadWeightFromBin(
 template int loadWeightFromBin(
     __nv_fp8_e4m3* ptr, std::vector<size_t> shape, std::string filename, TRTLLMCudaDataType model_file_type);
 #endif
-template int loadWeightFromBin(
-    int* ptr, std::vector<size_t> shape, std::string filename, TRTLLMCudaDataType model_file_type);
 
 template <typename T_IN, typename T_OUT>
 __global__ void cudaD2DcpyConvert(T_OUT* dst, const T_IN* src, const size_t size)

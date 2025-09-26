@@ -114,8 +114,8 @@ bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& 
 
 void CublasLtGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
-    size_t dataSize = typeSize(mType);
-    size_t outputDataSize = typeSize(mOutputType);
+    size_t dataSize = getDTypeSize(mType);
+    size_t outputDataSize = getDTypeSize(mOutputType);
 
     std::vector<size_t> workspaces = {
         maxM * k * dataSize,                   // A
@@ -149,10 +149,10 @@ GemmPlugin::GemmPlugin(int transA, int transB, int padLda, int padLdb, int padLd
     , mPadLdb(padLdb)
     , mPadLdc(padLdc)
     , mType(type)
+    , mOutputType(type)
     , mUseFp8(useFp8)
     , mAlpha(alpha)
     , mPluginProfiler(pluginProfiler)
-    , mOutputType(type)
 {
     init();
 }
@@ -179,22 +179,26 @@ GemmPlugin::GemmPlugin(void const* data, size_t length, GemmPlugin::PluginProfil
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
 
+thread_local CublasGemmWrapperPtr GemmPlugin::mCublasWrapper = nullptr;
+
 void GemmPlugin::init()
 {
-    mcublasHandle = getCublasHandle();
-    mcublasLtHandle = getCublasLtHandle();
-    mCublasWrapper = getCublasMMWrapper(mcublasHandle, mcublasLtHandle, nullptr, nullptr);
+    auto cublasHandle = getCublasHandle();
+    auto cublasLtHandle = getCublasLtHandle();
+    mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
 
     mPluginProfiler->setTranspose(mTransA, mTransB);
     mPluginProfiler->setOutputType(mOutputType);
     mPluginProfiler->setPadLd(mPadLda, mPadLdb, mPadLdc);
 
     mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB, mOutputType);
+
+    mArch = tensorrt_llm::common::getSMVersion();
 }
 
 void GemmPlugin::setGemmConfig()
@@ -349,9 +353,12 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     //     mat2 [K, N] (mTransB = False)
     // outputs
     //     mat [M, N]
-    mcublasHandle = getCublasHandle();
-    mcublasLtHandle = getCublasLtHandle();
-    mCublasWrapper = getCublasMMWrapper(mcublasHandle, mcublasLtHandle, nullptr, nullptr);
+    if (mCublasWrapper == nullptr)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
     setGemmConfig();
 
     int const nbDimsA = inputDesc[0].dims.nbDims;
@@ -382,21 +389,21 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     }
 
     bool cudaKernelFinished = false;
+    bool isArch90or100 = mArch >= 90 && mArch < 120;
     // TODO: sub tensor matmul is not supported in fp8 gemm cuda kernel
-    if (M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
+    if (!isArch90or100 && M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
     {
-        tensorrt_llm::common::QuantMode quantMode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
-            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
-            nvinfer1::DataType::kFP8, mOutputType);
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K,
+            CUDA_R_8F_E4M3, trtToCublasDtype(mOutputType));
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
-    else if (M <= 6 && N <= 128000 && !mUseFp8 && noPadDim && cudaKernelSupportType)
+    else if (!isArch90or100 && ((mArch < 90 && M <= 6) || (isArch90or100 && M <= 2)) && N <= 128000 && !mUseFp8
+        && noPadDim && cudaKernelSupportType)
     {
-        tensorrt_llm::common::QuantMode quantMode;
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
-            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
-            mType, mOutputType);
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K,
+            trtToCublasDtype(mType), trtToCublasDtype(mOutputType));
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
 
@@ -475,7 +482,7 @@ void GemmPlugin::serialize(void* buffer) const noexcept
     write(d, mOutputType);
     mPluginProfiler->serialize(d, mGemmId);
 
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void GemmPlugin::terminate() noexcept {}
@@ -486,13 +493,13 @@ GemmPluginCreator::GemmPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("padLda", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("padLdb", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("padLdc", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("use_fp8", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("padLda", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("padLdb", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("padLdc", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("use_fp8", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -515,10 +522,14 @@ PluginFieldCollection const* GemmPluginCreator::getFieldNames() noexcept
 IPluginV2* GemmPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int transA, transB, padLda, padLdb, padLdc;
-    nvinfer1::DataType type;
-    int useFp8;
-    float alpha = 1.f;
+    int transA{};
+    int transB{};
+    int padLda{};
+    int padLdb{};
+    int padLdc{};
+    nvinfer1::DataType type{};
+    int useFp8{};
+    float alpha = 1.F;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

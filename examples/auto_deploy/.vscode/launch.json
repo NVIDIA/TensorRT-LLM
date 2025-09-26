@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "build_and_run_ad.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "build_and_run_ad.py",
+            "args": [
+                "--model=meta-llama/Meta-Llama-3.1-8B-Instruct",
+                "--args.world-size=2",
+                "--args.runtime=demollm",
+                "--args.compile-backend=torch-simple",
+                "--args.attn-page-size=16",
+                "--args.attn-backend=flashinfer",
+                "--args.model-factory=AutoModelForCausalLM",
+                "--benchmark.enabled=false",
+                "--prompt.batch-size=2",
+                "--args.model-kwargs.num-hidden-layers=3",
+                "--args.model-kwargs.num-attention-heads=32",
+                "--prompt.sp-kwargs.max-tokens=128",
+                // "--yaml-extra=config.yaml", // uncomment to load a custom extra yaml config file
+                // "--dry-run", // uncomment to print the final config and return
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}/examples/auto_deploy"
+        },
+        {
+            "name": "Python: Debug Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "purpose": [
+                "debug-test",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+    ]
+}

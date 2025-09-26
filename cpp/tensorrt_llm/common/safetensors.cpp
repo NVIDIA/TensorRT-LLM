@@ -64,11 +64,11 @@ class SafeTensorArray : public INdArray
 public:
     SafeTensorArray(std::shared_ptr<std::ifstream> const& fs, std::string const& dtypeStr,
         std::vector<int64_t> const& shape, int64_t offsetBegin, int64_t offsetEnd)
-        : mFs(fs)
-        , mShape(shape)
+        : mShape(shape)
         , mDataType(convertDataTypeStrToEnum(dtypeStr))
         , mOffsetBegin(offsetBegin)
         , mOffsetEnd(offsetEnd)
+        , mFs(fs)
     {
     }
 

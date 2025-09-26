@@ -17,6 +17,21 @@
 file(GLOB SRCS *.cpp)
 file(GLOB CU_SRCS *.cu)
 
+if(NOT WIN32)
+  # additional warnings
+  #
+  # Ignore overloaded-virtual warning. We intentionally change parameters of
+  # some methods in derived class.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  if(WARNING_IS_ERROR)
+    message(STATUS "Treating warnings as errors in GCC compilation")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
+else() # Windows
+  # warning level 4
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
+endif()
+
 add_library(layers_src OBJECT ${SRCS} ${CU_SRCS})
 set_property(TARGET layers_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET layers_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

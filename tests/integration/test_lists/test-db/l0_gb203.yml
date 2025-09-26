@@ -1,0 +1,38 @@
+version: 0.0.1
+l0_gb203:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*gb203*'
+      - '*5080*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
+  # ------------- TRT tests ---------------
+  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
+  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
+  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
+  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
+  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
+  # - unittest/trt/quantization # https://nvbugs/5234573
+  # - unittest/trt/functional # https://nvbugs/5234573
+  - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b]
+  - examples/test_llama.py::test_llm_llama_v3_1_1node_single_gpu[llama-3.2-1b-disable_fp8]
+  - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int4-nb:1]
+  - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int8-nb:1]
+  - examples/test_llama.py::test_llm_llama_1gpu[llama-3.1-8b-instruct-hf-fp8-enable_fp8-float16-summarization-nb:1]
+  # - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora] # https://nvbugs/5234573
+  # - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2.5_1.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha_fp32_acc] # https://nvbugs/5234573
+  - llmapi/test_llm_examples.py::test_llmapi_quickstart
+  - llmapi/test_llm_examples.py::test_llmapi_example_inference
+  - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
+  - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
+  - llmapi/test_llm_examples.py::test_llmapi_example_multilora
+  - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
+  - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor

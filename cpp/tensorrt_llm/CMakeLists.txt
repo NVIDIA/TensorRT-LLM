@@ -22,23 +22,6 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
-if(ENABLE_MULTI_DEVICE)
-  find_package(MPI REQUIRED)
-  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
-  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
-  include_directories(${MPI_C_INCLUDE_DIRS})
-endif()
-
-if(NOT WIN32)
-  set(DECODER_SHARED_TARGET decoder_attention)
-endif()
-
-add_subdirectory(common)
-add_subdirectory(kernels)
-add_subdirectory(layers)
-add_subdirectory(runtime)
-add_subdirectory(executor_worker)
-
 set(TARGET_ARCH "unknown")
 
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
@@ -82,146 +65,72 @@ else() # Windows
   endif()
 endif()
 
-set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
-set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
-
-set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
-
-if(BUILD_BATCH_MANAGER)
-  add_subdirectory(batch_manager)
-else()
-  add_library(${BATCH_MANAGER_TARGET} STATIC IMPORTED)
-  if(NOT WIN32) # Linux
-    if(USE_CXX11_ABI)
-      set(BATCH_MANAGER_LIB_LOC
-          "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.a"
-      )
-    else()
-      set(BATCH_MANAGER_LIB_LOC
-          "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.pre_cxx11.a"
-      )
-    endif()
-  else() # Windows
-    set(BATCH_MANAGER_LIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/tensorrt_llm_batch_manager_static.lib"
-    )
-  endif()
-  set_property(TARGET ${BATCH_MANAGER_TARGET} PROPERTY IMPORTED_LOCATION
-                                                       ${BATCH_MANAGER_LIB_LOC})
-  file(SIZE ${BATCH_MANAGER_LIB_LOC} BATCH_MANAGER_LIB_SIZE)
-  if(BATCH_MANAGER_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The batch manager library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
-
-  add_library(${UCX_WRAPPER_TARGET} SHARED IMPORTED)
-  if(NOT WIN32) # Linux
-    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
-        "batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_ucx_wrapper.so"
-    )
-    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
-        "batch_manager/libtensorrt_llm_ucx_wrapper.so")
-  else()
-    set(UCX_WRAPPER_LIB_BINARY_REL_DIR "batch_manager/")
-    set(UCX_WRAPPER_DLL_NAME "tensorrt_llm_ucx_wrapper.dll")
-    set(UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper.lib")
-
-    set(UCX_WRAPPER_LIB_SOURCE_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${BATCH_MANAGER_TARGET_ARCH}/${UCX_WRAPPER_DLL_NAME}"
-    )
-    set(UCX_WRAPPER_LIB_BINARY_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_DLL_NAME}")
-    set(UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${BATCH_MANAGER_TARGET_ARCH}/${UCX_WRAPPER_LIB_NAME}"
-    )
-    set(UCX_WRAPPER_IMPLIB_BINARY_REL_LOC
-        "${UCX_WRAPPER_LIB_BINARY_REL_DIR}/${UCX_WRAPPER_LIB_NAME}")
-  endif()
-  set(UCX_WRAPPER_LIB_LOC
-      "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_LIB_SOURCE_REL_LOC}")
-  # Copy the .so to build directory, which is needed in build_wheel.py.
-  configure_file(${UCX_WRAPPER_LIB_SOURCE_REL_LOC}
-                 ${UCX_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
-  set_property(TARGET ${UCX_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
-                                                     ${UCX_WRAPPER_LIB_LOC})
-  if(WIN32)
-    set(UCX_WRAPPER_IMPLIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
-    configure_file(${UCX_WRAPPER_IMPLIB_SOURCE_REL_LOC}
-                   ${UCX_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
-    set_property(TARGET ${UCX_WRAPPER_TARGET}
-                 PROPERTY IMPORTED_IMPLIB ${UCX_WRAPPER_IMPLIB_LOC})
-  endif()
-
-  file(SIZE ${UCX_WRAPPER_LIB_LOC} UCX_WRAPPER_LIB_SIZE)
-  if(UCX_WRAPPER_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The ucx wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
+if(ENABLE_MULTI_DEVICE)
+  find_package(MPI REQUIRED)
+  message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+  message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
+  include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
-set(EXECUTOR_TARGET tensorrt_llm_executor_static)
-set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
-
-if(BUILD_EXECUTOR)
-  add_subdirectory(executor)
-else()
-  add_library(${EXECUTOR_TARGET} STATIC IMPORTED)
-  if(NOT WIN32) # Linux
-    if(USE_CXX11_ABI)
-      set(EXECUTOR_LIB_LOC
-          "${CMAKE_CURRENT_SOURCE_DIR}/executor/${EXECUTOR_TARGET_ARCH}/libtensorrt_llm_executor_static.a"
-      )
-    else()
-      set(EXECUTOR_LIB_LOC
-          "${CMAKE_CURRENT_SOURCE_DIR}/executor/${EXECUTOR_TARGET_ARCH}/libtensorrt_llm_executor_static.pre_cxx11.a"
-      )
-    endif()
-  else() # Windows
-    set(EXECUTOR_LIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/executor/${EXECUTOR_TARGET_ARCH}/tensorrt_llm_executor_static.lib"
-    )
-  endif()
-  set_property(TARGET ${EXECUTOR_TARGET} PROPERTY IMPORTED_LOCATION
-                                                  ${EXECUTOR_LIB_LOC})
-  file(SIZE ${EXECUTOR_LIB_LOC} EXECUTOR_LIB_SIZE)
-  if(EXECUTOR_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The executor library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
+if(ENABLE_NVSHMEM)
+  # Add hints for aarch64
+  find_package(NVSHMEM REQUIRED HINTS /usr/lib/sbsa-linux-gnu/cmake/nvshmem/)
+  include_directories(/usr/include/nvshmem/)
 endif()
 
+if(NOT WIN32)
+  set(DECODER_SHARED_TARGET_0 decoder_attention_0)
+  set(DECODER_SHARED_TARGET_1 decoder_attention_1)
+endif()
+
+# Build internal cutlass kernels as subproject
+if(INTERNAL_CUTLASS_KERNELS_PATH)
+  set(BUILD_INTERNAL_CUTLASS_KERNELS ON)
+  set(BUILD_NVRTC_WRAPPER ON)
+  if(NOT EXISTS ${INTERNAL_CUTLASS_KERNELS_PATH}/CMakeLists.txt
+     AND EXISTS ${INTERNAL_CUTLASS_KERNELS_PATH}/cpp/CMakeLists.txt)
+    set(INTERNAL_CUTLASS_KERNELS_PATH ${INTERNAL_CUTLASS_KERNELS_PATH}/cpp)
+  endif()
+
+  add_subdirectory(${INTERNAL_CUTLASS_KERNELS_PATH}
+                   ${PROJECT_BINARY_DIR}/internal_cutlass_kernels)
+endif()
+
+# Import internal cutlass kernels
 set(INTERNAL_CUTLASS_KERNELS_TARGET
     tensorrt_llm_internal_cutlass_kernels_static)
 set(INTERNAL_CUTLASS_KERNELS_TARGET_ARCH ${TARGET_ARCH})
-if(BUILD_INTERNAL_CUTLASS_KERNELS)
-  add_subdirectory(kernels/internal_cutlass_kernels)
-else()
+if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
   add_library(${INTERNAL_CUTLASS_KERNELS_TARGET} STATIC IMPORTED)
+  set(INTERNAL_CUTLASS_KERNELS_LIB_TARBALL
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/${INTERNAL_CUTLASS_KERNELS_TARGET}.tar.xz"
+  )
   if(NOT WIN32) # Linux
-    if(USE_CXX11_ABI)
-      set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
-          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/libtensorrt_llm_internal_cutlass_kernels_static.a"
-      )
-    else()
-      set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
-          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/libtensorrt_llm_internal_cutlass_kernels_static.pre_cxx11.a"
-      )
-    endif()
+    set(INTERNAL_CUTLASS_KERNELS_LIB_NAME
+        "lib${INTERNAL_CUTLASS_KERNELS_TARGET}.a")
   else() # Windows
-    set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/tensorrt_llm_internal_cutlass_kernels_static.lib"
-    )
+    set(INTERNAL_CUTLASS_KERNELS_LIB_NAME
+        "${INTERNAL_CUTLASS_KERNELS_TARGET}.lib")
   endif()
+  set(INTERNAL_CUTLASS_KERNELS_LIB_PATH
+      "${CMAKE_CURRENT_BINARY_DIR}/${INTERNAL_CUTLASS_KERNELS_LIB_NAME}")
+  add_custom_command(
+    OUTPUT ${INTERNAL_CUTLASS_KERNELS_LIB_PATH}
+    COMMAND ${CMAKE_COMMAND} -E tar xf ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
+    DEPENDS ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    VERBATIM)
+  add_custom_target(${INTERNAL_CUTLASS_KERNELS_TARGET}_helper
+                    DEPENDS ${INTERNAL_CUTLASS_KERNELS_LIB_PATH})
+  add_dependencies(${INTERNAL_CUTLASS_KERNELS_TARGET}
+                   ${INTERNAL_CUTLASS_KERNELS_TARGET}_helper)
   set_property(TARGET ${INTERNAL_CUTLASS_KERNELS_TARGET}
-               PROPERTY IMPORTED_LOCATION ${INTERNAL_CUTLASS_KERNELS_LIB_LOC})
-  file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_LOC}
+               PROPERTY IMPORTED_LOCATION ${INTERNAL_CUTLASS_KERNELS_LIB_PATH})
+  target_include_directories(
+    ${INTERNAL_CUTLASS_KERNELS_TARGET}
+    INTERFACE
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/include")
+  file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL}
        INTERNAL_CUTLASS_KERNELS_LIB_SIZE)
   if(INTERNAL_CUTLASS_KERNELS_LIB_SIZE LESS 1024)
     message(
@@ -231,154 +140,106 @@ else()
   endif()
 endif()
 
+add_subdirectory(common)
+add_subdirectory(kernels)
+add_subdirectory(layers)
+add_subdirectory(runtime)
+add_subdirectory(testing)
+add_subdirectory(executor_worker)
+
+if(ENABLE_CUFILE)
+  find_library(
+    CUFILE_LIBRARY cufile HINTS ${CUDAToolkit_LIBRARY_DIR}
+                                /usr/lib/${TARGET_ARCH} /usr/local/lib)
+  if(NOT CUFILE_LIBRARY)
+    # FATAL_ERROR if user explicitly requests with GDS if CUDA's libcufile.so is
+    # not found.
+    message(
+      FATAL_ERROR
+        "cuFile library not found. Set -DENABLE_CUFILE=OFF if cufile isn't required."
+    )
+  else()
+    message(STATUS "Linking with cufile: ${CUFILE_LIBRARY}")
+  endif()
+else()
+  message(STATUS "ENABLE_CUFILE=OFF, skipping GDS linkage.")
+endif()
+
+set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
+set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
+add_subdirectory(batch_manager)
+
+set(EXECUTOR_TARGET tensorrt_llm_executor_static)
+set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
+set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
+
+if(NIXL_ROOT)
+  set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+endif()
+
+add_subdirectory(executor)
+
 find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
-if(NOT WIN32)
-  if(USE_CXX11_ABI)
-    add_custom_command(
-      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
-      COMMAND nm -C $<TARGET_FILE:${BATCH_MANAGER_TARGET}> | grep -q
-              'std::__cxx11::'
-      DEPENDS ${BATCH_MANAGER_TARGET})
-  else()
-    add_custom_command(
-      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
-      COMMAND nm -C $<TARGET_FILE:${BATCH_MANAGER_TARGET}> | grep -qv
-              'std::__cxx11::'
-      DEPENDS ${BATCH_MANAGER_TARGET})
-  endif()
-  add_custom_target(check_symbol
-                    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol")
-else()
-  add_custom_target(check_symbol)
-endif()
-
-if(NOT WIN32)
-  if(USE_CXX11_ABI)
-    add_custom_command(
-      OUTPUT
-        "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
-      COMMAND nm -C $<TARGET_FILE:${INTERNAL_CUTLASS_KERNELS_TARGET}> | grep -q
-              'std::__cxx11::'
-      DEPENDS ${INTERNAL_CUTLASS_KERNELS_TARGET})
-  else()
-    add_custom_command(
-      OUTPUT
-        "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
-      COMMAND nm -C $<TARGET_FILE:${INTERNAL_CUTLASS_KERNELS_TARGET}> | grep -qv
-              'std::__cxx11::'
-      DEPENDS ${INTERNAL_CUTLASS_KERNELS_TARGET})
-  endif()
-  add_custom_target(
-    check_symbol_internal_cutlass_kernels
-    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
-  )
-else()
-  add_custom_target(check_symbol_internal_cutlass_kernels)
-endif()
-
-if(NOT WIN32)
-  if(USE_CXX11_ABI)
-    add_custom_command(
-      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_executor"
-      COMMAND nm -C $<TARGET_FILE:${EXECUTOR_TARGET}> | grep -q 'std::__cxx11::'
-      DEPENDS ${EXECUTOR_TARGET})
-  else()
-    add_custom_command(
-      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_executor"
-      COMMAND nm -C $<TARGET_FILE:${EXECUTOR_TARGET}> | grep -qv
-              'std::__cxx11::'
-      DEPENDS ${EXECUTOR_TARGET})
-  endif()
-  add_custom_target(
-    check_symbol_executor
-    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_executor")
-else()
-  add_custom_target(check_symbol_executor)
-endif()
-
-set(NVRTC_WRAPPER_TARGET tensorrt_llm_nvrtc_wrapper)
-set(NVRTC_WRAPPER_TARGET_ARCH ${TARGET_ARCH})
-
-if(BUILD_NVRTC_WRAPPER)
-  add_subdirectory(
-    kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper)
-else()
-  add_library(${NVRTC_WRAPPER_TARGET} SHARED IMPORTED)
-  if(NOT WIN32) # Linux
-    set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/${NVRTC_WRAPPER_TARGET_ARCH}/libtensorrt_llm_nvrtc_wrapper.so"
-    )
-    set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so"
-    )
-  else()
-    set(NVRTC_WRAPPER_LIB_BINARY_REL_DIR
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
-    )
-    set(NVRTC_WRAPPER_DLL_NAME "tensorrt_llm_nvrtc_wrapper.dll")
-    set(NVRTC_WRAPPER_LIB_NAME "tensorrt_llm_nvrtc_wrapper.lib")
-
-    set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_DLL_NAME}"
-    )
-    set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_DLL_NAME}")
-    set(NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_LIB_NAME}"
-    )
-    set(NVRTC_WRAPPER_IMPLIB_BINARY_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_LIB_NAME}")
-  endif()
-  set(NVRTC_WRAPPER_LIB_LOC
-      "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}")
-  # Copy the .so to build directory, which is needed in build_wheel.py.
-  configure_file(${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}
-                 ${NVRTC_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
-  set_property(TARGET ${NVRTC_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
-                                                       ${NVRTC_WRAPPER_LIB_LOC})
-  if(WIN32)
-    set(NVRTC_WRAPPER_IMPLIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
-    configure_file(${NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC}
-                   ${NVRTC_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
-    set_property(TARGET ${NVRTC_WRAPPER_TARGET}
-                 PROPERTY IMPORTED_IMPLIB ${NVRTC_WRAPPER_IMPLIB_LOC})
-  endif()
-
-  file(SIZE ${NVRTC_WRAPPER_LIB_LOC} NVRTC_WRAPPER_LIB_SIZE)
-  if(NVRTC_WRAPPER_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The nvrtc wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
-endif()
-
 set(TRTLLM_LINK_LIBS
+    ${CUDA_DRV_LIB}
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
+    ${CURAND_LIB}
     ${CMAKE_DL_LIBS}
     ${TRT_LIB}
     common_src
     kernels_src
+    flash_mla_src
     context_attention_src
     decoder_attention_src
+    trtllm_gen_fmha
+    trtllm_gen_fp8_block_scale_moe
+    trtllm_gen_gemm
+    trtllm_gen_gemm_gated_act
+    trtllm_gen_batched_gemm
     selective_scan_src
+    ws_layernorm_src
     fpA_intB_gemm_src
-    moe_gemm_src
+    # moe_gemm_src
     fb_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
     layers_src
     runtime_src
+    testing_src
     userbuffers_src
-    ${DECODER_SHARED_TARGET})
+    ${DECODER_SHARED_TARGET_0}
+    ${DECODER_SHARED_TARGET_1})
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} low_latency_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} fp4_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_FP4_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_MOE_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ar_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_ALLREDUCE_GEMM")
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
+endif()
+
+if(ENABLE_NVSHMEM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} nvshmem::nvshmem_host
+                       nvshmem::nvshmem_device)
 endif()
 
 if(NOT WIN32) # Unix-like compilers
@@ -400,53 +261,63 @@ set_target_properties(
   PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
-function(link_whole_archive TARGET LIBRARY_TO_LINK)
-  if(WIN32)
-    target_link_libraries(${TARGET} PUBLIC $<TARGET_FILE:${LIBRARY_TO_LINK}>)
-    set_target_properties(
-      ${TARGET} PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:${LIBRARY_TO_LINK}")
-  else()
-    # Assume everything else is like gcc
-    target_link_libraries(
-      ${TARGET} PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:${LIBRARY_TO_LINK}>
-                        "-Wl,--no-whole-archive")
-  endif()
-endfunction()
-
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
-link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
-link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
-link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
+if(ENABLE_CUFILE)
+  target_link_libraries(${SHARED_TARGET} PUBLIC ${CUFILE_LIBRARY})
+endif()
+
+target_link_libraries(
+  ${SHARED_TARGET}
+  PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
+          $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
+          $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
+          $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+
+# Link kernel_src and cutlass_src. static internal cutlass lib overridden.
+target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
 
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
-# Cyclic dependency of internal_cutlass_kernels on TRT-LLM
-target_link_libraries(${INTERNAL_CUTLASS_KERNELS_TARGET}
-                      INTERFACE ${SHARED_TARGET})
-# Cyclic dependency of UCX data transceiver on TRT-LLM
-target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
-add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 
-if(NOT WIN32)
-  set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
-                                                    "-Wl,-rpath='$ORIGIN'")
+# Cyclic dependency of UCX data transceiver on TRT-LLM
+if(TARGET ${UCX_WRAPPER_TARGET})
+  target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 endif()
 
-target_link_libraries(${SHARED_TARGET} PUBLIC ${NVRTC_WRAPPER_TARGET})
+if(TARGET ${NIXL_WRAPPER_TARGET})
+  target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
+endif()
 
-add_dependencies(${SHARED_TARGET} check_symbol)
-add_dependencies(${SHARED_TARGET} check_symbol_executor)
-add_dependencies(${SHARED_TARGET} check_symbol_internal_cutlass_kernels)
+if(NOT WIN32)
+  # Load libraries at $PREFIX/lib from
+  # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs
+  set_target_properties(${SHARED_TARGET}
+                        PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../../..")
+endif()
 
 if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
 
-if(BUILD_PYBIND)
+if(BINDING_TYPE STREQUAL "pybind")
   add_subdirectory(pybind)
+endif()
+
+if(BINDING_TYPE STREQUAL "nanobind")
+  add_subdirectory(nanobind)
+endif()
+
+if(BUILD_DEEP_EP)
+  add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_DEEP_GEMM)
+  add_subdirectory(deep_gemm)
 endif()
 
 add_subdirectory(plugins)

@@ -1,0 +1,6 @@
+# The overlap scheduler for context servers is currently disabled, as it is
+# not yet supported in disaggregated context server architectures.
+disable_overlap_scheduler: True
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 2048

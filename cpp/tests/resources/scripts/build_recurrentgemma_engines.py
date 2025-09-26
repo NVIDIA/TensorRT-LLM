@@ -21,18 +21,17 @@ import platform as _pf
 import sys as _sys
 import typing as _tp
 
-from build_engines_utils import init_model_spec_module, run_command, wincopy
-
-init_model_spec_module()
-import model_spec
+from build_engines_utils import run_command, wincopy
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
                  *args):
     convert_args = [
-        _sys.executable, "examples/recurrentgemma/convert_checkpoint.py"
+        _sys.executable,
+        "examples/models/core/recurrentgemma/convert_checkpoint.py"
     ] + (['--model_dir', str(weight_dir)] if weight_dir else []) + [
         '--output_dir',
         str(ckpt_dir),
@@ -113,7 +112,7 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                 env=_os.environ,
                 timeout=300)
     input_file = 'input_tokens.npy'
-    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_file, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
@@ -123,14 +122,6 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                  ckpt_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=enable', '--paged_state=enable')
-
-    # Restore transformers version
-    run_command([python_exe, "-m", "pip", "uninstall", "transformers", "-y"],
-                env=_os.environ,
-                timeout=300)
-    run_command([python_exe, "-m", "pip", "install", "transformers==4.38.2"],
-                env=_os.environ,
-                timeout=300)
 
     print("Done.")
 

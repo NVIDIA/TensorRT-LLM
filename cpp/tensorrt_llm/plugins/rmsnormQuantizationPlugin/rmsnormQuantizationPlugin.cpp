@@ -33,11 +33,11 @@ RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActi
     bool clampValEnabled, QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType)
     : mEps(eps)
     , mDynActScaling(dynamicActivationScaling)
-    , mSumPerToken(sumPerToken)
-    , mClampValEnabled{clampValEnabled}
-    , mQuantMode{quantMode}
     , mType(type)
     , mOutputType{outputType}
+    , mClampValEnabled{clampValEnabled}
+    , mQuantMode{quantMode}
+    , mSumPerToken(sumPerToken)
 {
     TLLM_CHECK_WITH_INFO(mOutputType == nvinfer1::DataType::kINT8 || mOutputType == nvinfer1::DataType::kFP8,
         "Only int8 or fp8 output type is allowed.");
@@ -58,7 +58,7 @@ RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(void const* data, size_t le
     read(d, mOutputType);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -259,7 +259,7 @@ int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     }
 #endif // ENABLE_FP8
 #endif // ENABLE_BF16
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -328,7 +328,7 @@ void RmsnormQuantizationPlugin::serialize(void* buffer) const noexcept
     write(d, mQuantMode);
     write(d, mType);
     write(d, mOutputType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void RmsnormQuantizationPlugin::destroy() noexcept
@@ -343,13 +343,13 @@ RmsnormQuantizationPluginCreator::RmsnormQuantizationPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1e-5f));
-    mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("sum_per_token", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("clamp_enabled", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("quant_mode", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("out_type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("sum_per_token", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("clamp_enabled", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("quant_mode", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("out_type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -372,13 +372,13 @@ PluginFieldCollection const* RmsnormQuantizationPluginCreator::getFieldNames() n
 IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType outputType;
+    nvinfer1::DataType outputType{};
     QuantMode quantMode;
     bool clampValEnabled = false;
-    float eps;
-    nvinfer1::DataType type;
-    bool dynamicActivationScaling;
-    bool sumPerToken;
+    float eps{};
+    nvinfer1::DataType type{};
+    bool dynamicActivationScaling{};
+    bool sumPerToken{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

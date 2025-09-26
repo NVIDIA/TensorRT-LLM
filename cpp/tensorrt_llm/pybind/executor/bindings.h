@@ -24,6 +24,6 @@ namespace tensorrt_llm::pybind::executor
 {
 
 // Register bindings for executor API.
-void InitBindings(pybind11::module_& m);
+void initBindings(pybind11::module_& m);
 
 } // namespace tensorrt_llm::pybind::executor

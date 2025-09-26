@@ -14,23 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 
+# isort: off
 import run
-from build_engines_utils import init_model_spec_module
-
-init_model_spec_module()
-import os
-
-import model_spec
+# isort: on
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def generate_output(engine: str,
                     num_beams: int,
                     input_name: str,
-                    model_spec_obj: model_spec.ModelSpec,
+                    model_spec_obj: ModelSpec,
                     max_output_len: int = 8,
                     output_logits: bool = False):
     tp_size = 1
@@ -75,7 +73,7 @@ def generate_output(engine: str,
 def generate_outputs(num_beams):
     print('Generating Mamba FP16 outputs')
     input_name = 'input_tokens.npy'
-    model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
+    model_spec_obj = ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
 
     generate_output(engine=model_spec_obj.get_model_path(),

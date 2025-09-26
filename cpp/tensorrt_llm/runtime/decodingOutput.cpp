@@ -19,7 +19,7 @@
 
 using namespace tensorrt_llm::runtime;
 
-void DecodingOutput::BeamHypotheses::empty(BufferManager& manager)
+void DecodingOutput::BeamHypotheses::empty(BufferManager const& manager)
 {
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
     auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
@@ -48,7 +48,7 @@ void DecodingOutput::BeamHypotheses::reshape(SizeType32 batchSize, SizeType32 be
     batchDones->reshape(ITensor::makeShape({batchSize}));
 }
 
-void DecodingOutput::BeamHypotheses::init(BufferManager& manager, TokenIdType endId)
+void DecodingOutput::BeamHypotheses::init(BufferManager const& manager, TokenIdType endId)
 {
     kernels::invokeFill(*outputIdsCBA, endId, manager.getStream());
     manager.setZero(*logProbsCBA);

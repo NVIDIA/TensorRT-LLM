@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
+#include <cstddef>
 #include <memory>
 #include <tuple>
 
@@ -107,7 +108,6 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
 
     auto lookaheadModule
         = std::dynamic_pointer_cast<LookaheadModule const>(decoderDomain.getSpeculativeDecodingModule());
-    auto const [maxW, maxN, maxG] = lookaheadModule->getExecutionConfig().get();
 
     auto const maxBatchSize = mDecoderDomain.getBatchSize();
     auto const maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
@@ -123,6 +123,7 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
 
     mSetupWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(
         std::make_pair(maxBatchShape1D, nvinfer1::DataType::kINT64));
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -132,13 +133,14 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<LookaheadSetupParams>(baseSetupParams);
 
     if (mCpuAlgo)
     {
         auto& algoConfigs = setupParams->algoConfigs;
-        TLLM_CHECK_WITH_INFO(algoConfigs.size() == 1 || algoConfigs.size() == batchSize,
+        TLLM_CHECK_WITH_INFO(algoConfigs.size() == 1 || algoConfigs.size() == static_cast<size_t>(batchSize),
             "Lookahead runtime configuration size should be either 1 or batchSize");
 
         for (auto bi = 0; bi < batchSize; bi++)
@@ -225,7 +227,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     TLLM_CHECK_WITH_INFO(inputs->batchSlots, "Batch slots must be provided for LookaheadDecoding");
     TLLM_CHECK_WITH_INFO(inputs->curTokensPerStep, "curTokensPerStep must be provided for LookaheadDecoding");
     TLLM_CHECK_WITH_INFO(outputs->sequenceLength, "sequenceLength must be provided for LookaheadDecoding");
-    TLLM_CHECK_WITH_INFO(inputs->logits, "logits must be provided for lookaheadDecoding");
+    TLLM_CHECK_WITH_INFO(inputs->logits, "logits must be provided for LookaheadDecoding");
     TLLM_CHECK_WITH_INFO(inputs->localBatchSize > 0, "batchSize must be");
 
     TopKSamplingKernelParams<T> params;
@@ -322,7 +324,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mBufferManager->getStream().synchronize();
 
     auto const batchSize = inputs->localBatchSize;
-    auto const beamIndex = 0;
 
     BufferRange<SizeType32 const> tokensPerStepRange(*mCpuAlgo->mTokensPerStep);
     BufferRange<TokenIdType> endIdsRange(*mCpuAlgo->mEndIds);
@@ -396,7 +397,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             *ITensor::slice(mCpuAlgo->mPositionIds, {gbi, 1}, nextDraftLengthsRange[gbi]));
 
         BufferRange<SizeType32> offsetRange(*ITensor::at(mCpuAlgo->mPositionOffsets, {gbi}));
-        for (auto i = 0; i < posIdsLocation.size(); i++)
+        for (size_t i = 0; i < posIdsLocation.size(); i++)
         {
             offsetRange[i] = posIdsLocation[i] - posIdsLocation[0];
         }
@@ -408,7 +409,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             D(accepted).values().c_str(), D(draft).values().c_str());
     }
 
-    SizeType32 pi = 0;
+    size_t pi = 0;
     numNewTokensCumSumRange[0] = 0;
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
@@ -421,7 +422,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
         }
     }
 
-    for (; pi < pathsOffsetBatchLocation.size(); pi++)
+    while (pi < pathsOffsetBatchLocation.size())
     {
         pathsOffsetBatchLocation[pi++] = 0;
     }

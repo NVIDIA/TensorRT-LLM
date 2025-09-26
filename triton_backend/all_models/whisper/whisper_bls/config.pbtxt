@@ -1,0 +1,73 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "whisper_bls"
+backend: "python"
+max_batch_size: ${triton_max_batch_size}
+
+model_transaction_policy {
+    decoupled: ${decoupled_mode}
+}
+
+parameters [
+  {
+   key: "n_mels",
+   value: {string_value:"${n_mels}"} # 128 dim for large-v3, 80 dim for large-v2
+  },
+  {
+  key: "engine_dir"
+  value: {string_value: "${engine_dir}"}
+  },
+  {
+  key: "zero_pad"
+  value: {string_value: "${zero_pad}"}
+  }
+]
+
+
+input [
+  {
+    name: "TEXT_PREFIX"
+    data_type: TYPE_STRING
+    dims: [1]
+  },
+  {
+    name: "WAV"
+    data_type: TYPE_FP32
+    dims: [-1]
+  },
+  {
+    name: "WAV_LENS"
+    data_type: TYPE_INT32
+    dims: [1]
+    optional: True
+  }
+]
+
+output [
+  {
+    name: "TRANSCRIPTS"
+    data_type: TYPE_STRING
+    dims: [1]
+  }
+]
+
+dynamic_batching {
+  }
+instance_group [
+    {
+      count: 8
+      kind: KIND_CPU
+    }
+  ]

@@ -88,7 +88,7 @@ private:
 class MaxUtilizationScheduler : public BaseCapacityScheduler
 {
 public:
-    MaxUtilizationScheduler(SizeType32 maxNumRequests, bool manyMicroBatches,
+    MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
@@ -97,15 +97,9 @@ public:
         RequestList const& activeRequests) const;
 
 private:
-    /// @return {fitsKvCache, fitsPeft}
-    std::pair<bool, bool> trySchedulingRequestMaxUtilization(kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<BasePeftCacheManager const> peftCacheManager, std::shared_ptr<LlmRequest> const& req,
-        RequestVector& scheduledRequests, SizeType32& numScheduledBlocks, SizeType32& numScheduledPeftPages,
-        std::unordered_set<uint64_t>& seenTaskIds) const;
-
     SizeType32 mMaxNumRequests;
-    /// @brief Boolean that indicates if multiple micro batches might be in flight
-    bool mManyMicroBatches;
+    /// @brief Boolean that indicates if two step lookahead is enabled
+    bool mTwoStepsLookAhead;
 };
 
 /// @brief Schedule requests using the GUARANTEED_NO_EVICT policy
@@ -152,7 +146,7 @@ public:
     constexpr static auto name{"CapacityScheduler"};
 
     explicit CapacityScheduler(SizeType32 maxNumRequests, executor::CapacitySchedulerPolicy capacitySchedulerPolicy,
-        bool hasKvCacheManager, std::optional<bool> manyMicroBatches = std::nullopt,
+        bool hasKvCacheManager, bool twoStepsLookAhead = false,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
@@ -165,9 +159,10 @@ public:
      * @param peftCacheManager Optional used in MaxUtilizationScheduler, GuaranteedNoEvictScheduler and
      * StaticBatchScheduler.
      * @param activeRequests
-     * @return std::tuple<RequestVector, RequestVector>, fittingRequests and pausedRequests respectively.
+     * @return std::tuple<RequestVector, RequestVector, RequestVector>, fittingRequests, fittingDisaggInitRequests and
+     * pausedRequests respectively.
      */
-    [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(RequestList const& activeRequests,
+    [[nodiscard]] std::tuple<RequestVector, RequestVector, RequestVector> operator()(RequestList const& activeRequests,
         OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;

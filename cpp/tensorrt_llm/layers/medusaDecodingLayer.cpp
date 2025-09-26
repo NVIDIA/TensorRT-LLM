@@ -105,6 +105,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(MedusaDecodingLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<MedusaSetupParams>(baseSetupParams);
 
@@ -142,7 +143,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
     auto prepareRuntimeTopK = [this, workspace](std::vector<SizeType32> const& runtimeTopK, SizeType32 batchSize,
                                   BufferConstPtr const& batchSlots, BufferPtr const& runtimeTopKDevice)
     {
-        TLLM_CHECK_WITH_INFO(runtimeTopK.size() == 1 || runtimeTopK.size() == batchSize,
+        TLLM_CHECK_WITH_INFO(runtimeTopK.size() == 1 || runtimeTopK.size() == static_cast<size_t>(batchSize),
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
         SizeType32* topKSetupPtr = nullptr;
         if (runtimeTopK.size() > 1)
@@ -156,7 +157,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
         invokeScatterDecodingParams(
             topKSetupPtr, runtimeTopK.front(), runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
 
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         auto const curMaxTopK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
         return curMaxTopK;
     };

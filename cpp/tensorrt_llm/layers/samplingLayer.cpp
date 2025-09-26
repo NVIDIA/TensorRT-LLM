@@ -18,6 +18,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
+#include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
 
@@ -78,6 +80,9 @@ void SamplingLayer<T>::allocateBuffer(SizeType32 batchSize)
 
     // host buffers.
     mSkipDecodeHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<bool>::value);
+
+    mRuntimeMinPHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
+    mRuntimeMinPDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
     TLLM_CHECK(mSkipDecodeHost != nullptr);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -89,6 +94,7 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(SamplingLayer_setup);
 
     auto setupParams = std::dynamic_pointer_cast<SamplingSetupParams>(baseSetupParams);
 
@@ -97,14 +103,14 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
 
     if (setupParams->outputLogProbs)
     {
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         mOutputLogProbs = std::any_of(setupParams->outputLogProbs->begin(), setupParams->outputLogProbs->end(),
             [this](bool outputLogProbs) { return this->mOutputLogProbs | outputLogProbs; });
     }
 
     if (setupParams->cumLogProbs)
     {
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         mCumLogProbs = std::any_of(setupParams->cumLogProbs->begin(), setupParams->cumLogProbs->end(),
             [this](bool cumLogProbs) { return this->mCumLogProbs | cumLogProbs; });
     }
@@ -112,6 +118,15 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     for (auto&& layer : mSamplingLayers)
     {
         layer->setup(batchSize, beamWidth, batchSlots, setupParams, workspace);
+    }
+
+    FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
+    bool const useMinP = mDecodingMode.isUseMinP() && setupParams->runtimeMinP.has_value();
+    mUseMinP |= useMinP;
+    if (mUseMinP)
+    {
+        fillBuffers(setupParams->runtimeMinP, DefaultDecodingParams::getMinP(), mRuntimeMinPHost, mRuntimeMinPDevice,
+            batchSlots, std::pair<float, float>(-1e-6f, 1.0f), "min_p");
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -127,6 +142,7 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
 
     auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 
+    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
     auto const batchSize = inputs->logits.value()->getDimension<0>();
 
     auto const* endIds = bufferCast<TokenIdType>(*inputs->endIds);
@@ -137,8 +153,15 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
 
     auto const skipTopP = !mDecodingMode.isTopP();
 
+    auto const* batchSlotsHostPtr = bufferCast<SizeType32>(*inputs->batchSlots);
+    auto minPs = mUseMinP
+            && !allOfBatchSlots(batchSlotsHostPtr, bufferCast<float>(*mRuntimeMinPHost),
+                localDecoderDomain.getBatchSize(), DefaultDecodingParams::getMinP())
+        ? mRuntimeMinPDevice
+        : nullptr;
+
     // Compute probabilities either for TopP or if cumLogProbs or outputLogProbs are specified
-    bool const skipSoftMax = skipTopP && !mOutputLogProbs && !mCumLogProbs;
+    bool const skipSoftMax = skipTopP && !mOutputLogProbs && !mCumLogProbs && minPs == nullptr;
 
     inputs->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
     inputs->probsComputed = !skipSoftMax;
@@ -164,9 +187,10 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
         biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
         biasSoftmaxParams.skipSoftMax = skipSoftMax;
         biasSoftmaxParams.batchSlotsLogits = false;
+        biasSoftmaxParams.minPs = bufferCastOrNull<float>(minPs);
         biasSoftmaxParams.checkParams();
         invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
-        sync_check_cuda_error();
+        sync_check_cuda_error(getStream());
     }
 
     for (auto&& layer : mSamplingLayers)

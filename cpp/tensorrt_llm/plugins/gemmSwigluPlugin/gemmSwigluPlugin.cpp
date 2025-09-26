@@ -108,11 +108,11 @@ std::vector<GemmSwigluPluginProfiler::Config> GemmSwigluPluginProfiler::getTacti
 GemmSwigluPlugin::GemmSwigluPlugin(QuantMode quantMode, nvinfer1::DataType type, bool hasBias, float scale_d0,
     float scale_d1, float scale_output, GemmSwigluPlugin::PluginProfilerPtr const& pluginProfiler)
     : mQuantMode(quantMode)
+    , mPluginProfiler(pluginProfiler)
     , mHasBias(hasBias)
     , mScaleD0(scale_d0)
     , mScaleD1(scale_d1)
     , mScaleOutput(scale_output)
-    , mPluginProfiler(pluginProfiler)
 {
     init(type);
 }
@@ -345,11 +345,11 @@ GemmSwigluPluginCreator::GemmSwigluPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("has_bias", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("scale_d0", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("scale_d1", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("scale_output", nullptr, PluginFieldType::kFLOAT32, 1.0));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("has_bias", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("scale_d0", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("scale_d1", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("scale_output", nullptr, PluginFieldType::kFLOAT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -373,11 +373,11 @@ IPluginV2* GemmSwigluPluginCreator::createPlugin(char const* name, PluginFieldCo
 {
     PluginField const* fields = fc->fields;
     TLLM_CHECK(fc->nbFields == 5);
-    nvinfer1::DataType type;
-    bool hasBias;
-    float scale_d0;
-    float scale_d1;
-    float scale_output;
+    nvinfer1::DataType type{};
+    bool hasBias{};
+    float scale_d0{};
+    float scale_d1{};
+    float scale_output{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -413,7 +413,7 @@ IPluginV2* GemmSwigluPluginCreator::createPlugin(char const* name, PluginFieldCo
         // GemmSwigluPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
         auto pluginProfiler = mGemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
-        QuantMode quantMode = QuantMode::fromDescription();
+        QuantMode quantMode = QuantMode{};
         auto* obj = new GemmSwigluPlugin(quantMode, type, hasBias, scale_d0, scale_d1, scale_output, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

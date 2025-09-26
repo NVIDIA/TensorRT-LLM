@@ -1,0 +1,144 @@
+methods:
+  __init__:
+    parameters:
+      # Explicit arguments
+      model:
+        annotation: Union[str, pathlib.Path]
+        default: inspect._empty
+      tokenizer:
+        annotation: Union[str, pathlib.Path, transformers.tokenization_utils_base.PreTrainedTokenizerBase,
+          tensorrt_llm.llmapi.tokenizer.TokenizerBase, NoneType]
+        default: null
+      tokenizer_mode:
+        annotation: Literal['auto', 'slow']
+        default: auto
+      skip_tokenizer_init:
+        annotation: bool
+        default: false
+      trust_remote_code:
+        annotation: bool
+        default: false
+      tensor_parallel_size:
+        annotation: int
+        default: 1
+      dtype:
+        annotation: str
+        default: auto
+      revision:
+        annotation: Optional[str]
+        default: null
+      tokenizer_revision:
+        annotation: Optional[str]
+        default: null
+      # Parallelism
+      pipeline_parallel_size:
+        annotation: int
+        default: 1
+      context_parallel_size:
+        annotation: int
+        default: 1
+      moe_tensor_parallel_size:
+        annotation: Optional[int]
+        default: null
+      moe_expert_parallel_size:
+        annotation: Optional[int]
+        default: null
+      # LoRA
+      enable_lora:
+        annotation: bool
+        default: false
+      lora_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
+        default: null
+      # Logits processor and guided decoding
+      batched_logits_processor:
+        annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
+        default: null
+      guided_decoding_backend:
+        annotation: Optional[Literal["xgrammar", "llguidance"]]
+        default: null
+      # Speculative decoding
+      speculative_config:
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig, tensorrt_llm.llmapi.llm_args.EagleDecodingConfig,tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig, tensorrt_llm.llmapi.llm_args.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig, tensorrt_llm.llmapi.llm_args.AutoDecodingConfig, NoneType]
+        default: null
+      # generation constraints
+      max_batch_size:
+        annotation: Optional[int]
+        default: null
+      max_input_len:
+        annotation: Optional[int]
+        default: null
+      max_seq_len:
+        annotation: Optional[int]
+        default: null
+      max_beam_width:
+        annotation: Optional[int]
+        default: null
+      max_num_tokens:
+        annotation: Optional[int]
+        default: null
+      # Misc
+      load_format:
+        annotation: Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]
+        default: 0
+      enable_tqdm:
+        annotation: bool
+        default: false
+      enable_chunked_prefill:
+        annotation: bool
+        default: false
+      kv_cache_config:
+        annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
+        default: null
+      stream_interval:
+        annotation: int
+        default: 1
+
+      kwargs:
+        annotation: Any
+        default: inspect._empty
+    return_annotation: None
+  generate:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        default: inspect._empty
+      sampling_params:
+        annotation: Union[tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams],
+          NoneType]
+        default: null
+      lora_request:
+        annotation: Union[tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest],
+          NoneType]
+        default: null
+      prompt_adapter_request:
+        annotation: Union[tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest],
+          NoneType]
+        default: null
+      use_tqdm:
+        annotation: bool
+        default: true
+    return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
+  generate_async:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
+        default: inspect._empty
+      sampling_params:
+        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
+        default: null
+      lora_request:
+        annotation: Optional[tensorrt_llm.executor.request.LoRARequest]
+        default: null
+      prompt_adapter_request:
+        annotation: Optional[tensorrt_llm.executor.request.PromptAdapterRequest]
+        default: null
+      streaming:
+        annotation: bool
+        default: false
+    return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+properties:
+  tokenizer:
+    annotation: Optional[tensorrt_llm.llmapi.tokenizer.TokenizerBase]
+    default: inspect._empty

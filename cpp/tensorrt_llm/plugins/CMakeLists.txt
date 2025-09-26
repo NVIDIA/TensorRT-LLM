@@ -29,12 +29,28 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --Wno-deprecated-declarations")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 997")
 
+if(NOT WIN32)
+  # additional warnings
+  #
+  # Ignore overloaded-virtual warning. We intentionally change parameters of
+  # some methods in derived class.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-overloaded-virtual")
+  if(WARNING_IS_ERROR)
+    message(STATUS "Treating warnings as errors in GCC compilation")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
+else() # Windows
+  # warning level 4
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
+endif()
+
 set(PLUGIN_SOURCES)
 set(PLUGIN_CU_SOURCES)
 
 set(PLUGIN_LISTS
     bertAttentionPlugin
     cpSplitPlugin
+    fusedLayernormPlugin
     gptAttentionCommon
     gptAttentionPlugin
     identityPlugin
@@ -42,14 +58,17 @@ set(PLUGIN_LISTS
     gemmSwigluPlugin
     fp8RowwiseGemmPlugin
     smoothQuantGemmPlugin
+    fp4GemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin
+    quantizeToFP4Plugin
     layernormQuantizationPlugin
     rmsnormQuantizationPlugin
     weightOnlyGroupwiseQuantMatmulPlugin
     weightOnlyQuantMatmulPlugin
     lookupPlugin
     loraPlugin
+    doraPlugin
     mixtureOfExperts
     selectiveScanPlugin
     mambaConv1dPlugin
@@ -60,7 +79,8 @@ set(PLUGIN_LISTS
     eaglePlugin
     lowLatencyGemmSwigluPlugin
     qserveGemmPlugin
-    cudaStreamPlugin)
+    cudaStreamPlugin
+    gemmAllReducePlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})
@@ -87,11 +107,29 @@ if(WIN32)
 endif()
 
 add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
+add_cuda_architectures(${PLUGIN_SHARED_TARGET} 89)
 
 target_include_directories(
   ${PLUGIN_SHARED_TARGET}
   PUBLIC ${CUDA_INSTALL_DIR}/include
+  PUBLIC
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   PRIVATE ${TARGET_DIR})
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_FP4_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(${PLUGIN_SHARED_TARGET}
@@ -130,12 +168,16 @@ target_link_libraries(
   ${PLUGIN_SHARED_TARGET}
   ${CUBLAS_LIB}
   ${CUBLASLT_LIB}
-  nvinfer
+  ${TRT_LIB}
   ${CUDA_DRV_LIB}
   ${CUDA_NVML_LIB}
   ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${SHARED_TARGET})
+
+if(WIN32)
+  target_link_libraries(${PLUGIN_SHARED_TARGET} context_attention_src)
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(${PLUGIN_SHARED_TARGET} ${MPI_C_LIBRARIES} ${NCCL_LIB})

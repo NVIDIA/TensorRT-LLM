@@ -28,7 +28,7 @@ namespace tensorrt_llm::runtime
 class CudaMemPool
 {
 public:
-    explicit CudaMemPool(cudaMemPool_t pool, int device);
+    explicit CudaMemPool(cudaMemPool_t pool);
 
     /// @brief Gets the amount of reserved memory in the memory pool stream, WITHOUT synchronizing.
     [[nodiscard]] std::size_t memoryPoolReserved() const;
@@ -65,7 +65,6 @@ private:
     using PoolPtr = std::unique_ptr<std::remove_pointer_t<cudaMemPool_t>, Deleter>;
 
     PoolPtr mPool;
-    int mDevice{-1};
 };
 
 } // namespace tensorrt_llm::runtime

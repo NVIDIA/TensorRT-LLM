@@ -171,9 +171,6 @@ std::vector<Tensor> symmetric_quantize_helper(
     const size_t bits_in_type = get_weight_quant_bits(ft_quant_type);
     const size_t bytes_per_out_col = num_cols * bits_in_type / 8;
 
-    const size_t input_mat_size = num_rows * num_cols;
-    const size_t quantized_mat_size = num_rows * bytes_per_out_col;
-
     std::vector<int64_t> quantized_weight_shape;
     std::vector<int64_t> scale_shape;
     if (weight.dim() == 2)
@@ -201,7 +198,7 @@ std::vector<Tensor> symmetric_quantize_helper(
     int8_t* unprocessed_quantized_weight_ptr = get_ptr<int8_t>(unprocessed_quantized_weight);
     int8_t* processed_quantized_weight_ptr = get_ptr<int8_t>(processed_quantized_weight);
 
-    // TODO(dastokes) This should be removed if Grouped GEMM is updated to not need interleaved input
+    // TODO This should be removed if Grouped GEMM is updated to not need interleaved input
     bool force_interleave = weight.dim() == 3;
 
     if (weight.scalar_type() == at::ScalarType::Float)
@@ -301,7 +298,7 @@ Tensor unpack_int4_packed_tensor_to_int8(Tensor weight)
     int8_t* packed_ptr = get_ptr<int8_t>(weight);
     int8_t* unpacked_ptr = get_ptr<int8_t>(unpacked_weight);
 
-    for (size_t packed_idx = 0; packed_idx < weight.numel(); ++packed_idx)
+    for (int64_t packed_idx = 0; packed_idx < weight.numel(); ++packed_idx)
     {
         int8_t packed_data = packed_ptr[packed_idx];
 
@@ -335,7 +332,7 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
     int8_t* unpacked_ptr = get_ptr<int8_t>(weight);
     int8_t* packed_ptr = get_ptr<int8_t>(packed_weight);
 
-    for (size_t packed_idx = 0; packed_idx < packed_weight.numel(); ++packed_idx)
+    for (int64_t packed_idx = 0; packed_idx < packed_weight.numel(); ++packed_idx)
     {
         int8_t packed_int4s = 0;
         int8_t elt_0 = unpacked_ptr[2 * packed_idx + 0];
@@ -350,6 +347,55 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
         packed_ptr[packed_idx] = packed_int4s;
     }
     return packed_weight;
+}
+
+Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_size)
+{
+    // weight (n, k / 2)
+    // scale (n, k / group_size)
+
+    CHECK_CPU(weight);
+    CHECK_CPU(scale);
+    CHECK_CONTIGUOUS(weight);
+    CHECK_CONTIGUOUS(scale);
+    TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
+    TORCH_CHECK(weight.dtype() == torch::kUInt8, "Weight must be a packed int8 tensor");
+    TORCH_CHECK(scale.dtype() == torch::kUInt8, "Scale must be a int8 tensor");
+
+    TORCH_CHECK(weight.size(0) == scale.size(0))
+    TORCH_CHECK(weight.size(1) * 2 == scale.size(1) * group_size)
+
+    uint8_t* weight_packed_ptr = get_ptr<uint8_t>(weight);
+    __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(get_ptr<uint8_t>(scale));
+
+    int const n = weight.size(0);
+    int const k = weight.size(1) * 2;
+
+    Tensor dequant_weight = torch::empty({n, k}, torch::dtype(torch::kFloat).device(torch::kCPU).requires_grad(false));
+    float* dequant_weight_ptr = get_ptr<float>(dequant_weight);
+
+    float fp4_lut[] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+
+    for (int packed_idx = 0; packed_idx < weight.numel(); ++packed_idx)
+    {
+        int8_t weight_packed_data = weight_packed_ptr[packed_idx];
+
+        uint8_t weight_low_ = weight_packed_data & 0xF;
+        uint8_t weight_high_ = (weight_packed_data & 0xF0) >> 4;
+
+        float weight_low = fp4_lut[weight_low_];
+        float weight_high = fp4_lut[weight_high_];
+
+        int scale_n_idx = packed_idx / (k / 2);
+        int scale_k_idx = ((packed_idx * 2) % k) / group_size;
+
+        float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale.size(1) + scale_k_idx]);
+
+        dequant_weight_ptr[2 * packed_idx] = weight_low * scale_;
+        dequant_weight_ptr[2 * packed_idx + 1] = weight_high * scale_;
+    }
+
+    return dequant_weight;
 }
 
 } // namespace torch_ext
@@ -383,3 +429,6 @@ static auto permute_B_rows_for_mixed_gemm
     = torch::RegisterOperators("trtllm::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
 
 static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_transpose", &torch_ext::subbyte_transpose);
+
+static auto mxfp4_dequantize_unswizzled
+    = torch::RegisterOperators("trtllm::mxfp4_dequantize_unswizzled", &torch_ext::mxfp4_dequantize_unswizzled);

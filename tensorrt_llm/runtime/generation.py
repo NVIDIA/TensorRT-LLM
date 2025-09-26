@@ -29,7 +29,10 @@ import numpy as np
 import torch
 import tensorrt as trt
 # isort: on
-from cuda import cudart
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
     MemoryPoolsAllocator
@@ -39,7 +42,8 @@ from tensorrt_llm.runtime.redrafter_utils import *
 
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType
+from ..bindings import KVCacheType, ipc_nvls_allocate, ipc_nvls_free
+from ..layers import LanguageAdapterConfig
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
@@ -219,8 +223,6 @@ class _Runtime(object):
         self.address = None
         self.device_memory_size = 0
         self.__prepare(mapping, engine_buffer)
-        if logger.level == "verbose":
-            self.__print_engine_info()
 
     def _serialize_engine(self) -> trt.IHostMemory:
         return self.engine.serialize()
@@ -280,6 +282,11 @@ class _Runtime(object):
         if not self.engine.streamable_weights_size:
             # engine does not have weight streaming enabled
             self.__prepare_execution_contexts()
+        else:
+            self.engine.weight_streaming_budget_v2 = 0  # avoid OOM when print engine info
+
+        if logger.level == "verbose":
+            self.__print_engine_info()
 
     def __prepare_execution_contexts(self):
         self.context_0 = None
@@ -334,8 +341,8 @@ class _Runtime(object):
         context = engine.create_execution_context(
             trt.ExecutionContextAllocationStrategy.USER_MANAGED)
         n_op = engine.num_optimization_profiles
-        mwn = 0  # Maximum Width of tensor Name
-        mws = 0  # Maximum Width of tensor Shape
+        max_name_width = 0  # Maximum Width of tensor Name
+        max_shape_width = 0  # Maximum Width of tensor Shape
         tensor_name_list = [
             engine.get_tensor_name(i) for i in range(engine.num_io_tensors)
         ]
@@ -344,7 +351,7 @@ class _Runtime(object):
         tid = {}  # Tensor Information Dictionary
         for name in tensor_name_list:
             item = dict()
-            mwn = max(mwn, len(name))
+            max_name_width = max(max_name_width, len(name))
             item["mode"] = 'I' if engine.get_tensor_mode(
                 name) == trt.TensorIOMode.INPUT else 'O'
             item["location"] = 'GPU' if engine.get_tensor_location(
@@ -359,7 +366,8 @@ class _Runtime(object):
                     else:
                         shape = engine.get_tensor_profile_value(k, name)
                     item["profile_list"][k].extend(shape)
-                    mws = max(mws, *[len(str(s)) for s in shape])
+                    max_shape_width = max(max_shape_width,
+                                          *[len(str(s)) for s in shape])
             tid[name] = item
         # Set input shape to get output shape
         for k in range(n_op):
@@ -380,32 +388,61 @@ class _Runtime(object):
 
         # Print information of engine input / output
         logger.debug("Information of engine input / output.")
-        logger.debug(f"{'='*(mwn + mws + 24)}")
-        logger.debug(f"{'Name':^{mwn}}|I/O|Location|DataType|{'Shape':^{mws}}|")
-        logger.debug(f"{'-'*(mwn + mws + 24)}")
+        logger.debug(f"{'='*(max_name_width + max_shape_width + 24)}")
+        logger.debug(
+            f"{'Name':^{max_name_width}}|I/O|Location|DataType|{'Shape':^{max_shape_width}}|"
+        )
+        logger.debug(f"{'-'*(max_name_width + max_shape_width + 24)}")
         for name in tensor_name_list:
             item = tid[name]
-            info = f"{name:<{mwn}}|{item['mode']:^3s}|{item['location']:^8s}|{item['data_type']:^8s}|"
-            info += f"{item['build_shape']:^{mws}}|"
+            info = f"{name:<{max_name_width}}|{item['mode']:^3s}|{item['location']:^8s}|{item['data_type']:^8s}|"
+            info += f"{item['build_shape']:^{max_shape_width}}|"
             logger.debug(info)
-        logger.debug(f"{'='*(mwn + mws + 24)}")
+        logger.debug(f"{'='*(max_name_width + max_shape_width + 24)}")
         # Print information of optimization profile
         logger.debug("Information of optimization profile.")
         for k in range(n_op):
             logger.debug(f"Optimization Profile {k}:")
-            logger.debug(f"{'='*(mwn + mws * 3 + 4)}")
+            logger.debug(f"{'='*(max_name_width + max_shape_width * 3 + 4)}")
             logger.debug(
-                f"{'Name':^{mwn}}|{'Min':^{mws}}|{'Opt':^{mws}}|{'Max':^{mws}}|"
+                f"{'Name':^{max_name_width}}|{'Min':^{max_shape_width}}|{'Opt':^{max_shape_width}}|{'Max':^{max_shape_width}}|"
             )
-            logger.debug(f"{'-'*(mwn + mws * 3 + 4)}")
+            logger.debug(f"{'-'*(max_name_width + max_shape_width * 3 + 4)}")
             for name in tensor_name_list:
                 item = tid[name]
-                info = f"{name:<{mwn}}|"
-                info += f"{str(item['profile_list'][k][0]):^{mws}}|"
-                info += f"{str(item['profile_list'][k][1]):^{mws}}|"
-                info += f"{str(item['profile_list'][k][2]):^{mws}}|"
+                info = f"{name:<{max_name_width}}|"
+                info += f"{str(item['profile_list'][k][0]):^{max_shape_width}}|"
+                info += f"{str(item['profile_list'][k][1]):^{max_shape_width}}|"
+                info += f"{str(item['profile_list'][k][2]):^{max_shape_width}}|"
                 logger.debug(info)
-            logger.debug(f"{'='*(mwn + mws * 3 + 4)}")
+            logger.debug(f"{'='*(max_name_width + max_shape_width * 3 + 4)}")
+
+    def print_context_info(self, context, context_index) -> None:
+        n_io = self.engine.num_io_tensors
+        max_name_width = 0  # Maximum Width of tensor Name
+        max_shape_width = 0  # Maximum Width of tensor Shape
+        tensorInfo = {}
+        for i in range(n_io):
+            name = self.engine.get_tensor_name(i)
+            b_input = self.engine.get_tensor_mode(
+                name) == trt.TensorIOMode.INPUT
+            shape = str(self.engine.get_tensor_shape(name))
+            tensorInfo[i] = [name, b_input, shape]
+            max_name_width = max(max_name_width, len(name))
+            max_shape_width = max(max_shape_width, len(shape))
+            # Shape input tensor is not used in TRT-LLM yet
+
+        logger.debug(f"Information of context input / output.")
+        logger.debug(f"Using Optimization Profile: {context_index}")
+        logger.debug(f"{'='*(max_name_width + max_shape_width + 6)}")
+        logger.debug(
+            f"{'Name':^{max_name_width}}|I/O|{'Shape':^{max_shape_width}}|")
+        logger.debug(f"{'-'*(max_name_width + max_shape_width + 6)}")
+        for i in range(n_io):
+            name, b_input, shape = tensorInfo[i]
+            info = f"{name:<{max_name_width}}|{'I' if b_input else 'O':^3s}|{shape:^{max_shape_width}}|"
+            logger.debug(info)
+        logger.debug(f"{'='*(max_name_width + max_shape_width + 6)}")
 
     def _set_shape(self, context: trt.IExecutionContext,
                    shape_dict: Dict[str, List[int]]):
@@ -577,6 +614,7 @@ class ModelConfig:
     num_kv_heads: int
     hidden_size: int
     gpt_attention_plugin: bool
+    gemm_allreduce_plugin: str = None
     remove_input_padding: bool = False
     model_name: str = ""
     kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS
@@ -584,7 +622,7 @@ class ModelConfig:
     head_size: int = None
     has_position_embedding: bool = True
     has_token_type_embedding: bool = False
-    tokens_per_block: int = 64
+    tokens_per_block: int = 32
     max_prompt_embedding_table_size: int = 0
     quant_mode: QuantMode = QuantMode(0)
     gather_context_logits: bool = False
@@ -612,6 +650,8 @@ class ModelConfig:
     num_kv_heads_per_layer: Optional[List[int]] = None
     num_kv_heads_per_cross_attn_layer: Optional[List[int]] = None
     skip_cross_attn_blocks: bool = False
+    # language adapter
+    language_adapter_config: Optional[LanguageAdapterConfig] = None
 
 
 @dataclass
@@ -637,6 +677,7 @@ class SamplingConfig:
     top_p_decay: Optional[torch.Tensor] = field(default=None)  # float
     top_p_min: Optional[torch.Tensor] = field(default=None)  # float
     top_p_reset_ids: Optional[torch.Tensor] = field(default=None)  # int
+    random_seed: Union[int, torch.Tensor] = field(default=None)
 
     length_penalty: Union[float, torch.Tensor] = field(default=1.0)
     early_stopping: Union[int, torch.Tensor] = field(default=1)
@@ -650,11 +691,11 @@ class SamplingConfig:
     # The real default value is set in dynamicDecodeOp.cpp when it's None
     beam_search_diversity_rate: Union[float, torch.Tensor] = field(init=False,
                                                                    default=0.0)
-    random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
     output_cum_log_probs: bool = field(init=False, default=False)
     output_log_probs: bool = field(init=False, default=False)
     no_repeat_ngram_size: Union[int, torch.Tensor] = field(init=False,
                                                            default=None)
+    min_p: Union[float, torch.Tensor] = field(default=0.0)
 
     def update(self, **kwargs):
         unused_kwargs = dict()
@@ -712,6 +753,19 @@ class RuntimeTensor:
         # this is useful when allocating a big KV cache tensor at the beginning and incremental seq length dim of TRT engine's input tensor
         self._shape = None
         self._torch_tensor = None
+        # Used when pointer specified
+        self._data_ptr = None
+        self._dtype = None
+
+    @staticmethod
+    def from_pointer(name: str, pointer, shape,
+                     str_dtype: str) -> 'RuntimeTensor':
+        t = RuntimeTensor()
+        t._name = name
+        t._data_ptr = pointer
+        t._shape = shape
+        t._dtype = str_dtype_to_torch(str_dtype)
+        return t
 
     @staticmethod
     def from_torch(
@@ -723,6 +777,8 @@ class RuntimeTensor:
         t._name = name
         # need to hold the torch tensor for memory life time
         t._torch_tensor = data.contiguous()
+        t._dtype = t._torch_tensor.dtype
+        t._data_ptr = t._torch_tensor.data_ptr()
         torch_shape = list(data.size())
         if override_shape is not None:
             t._shape = override_shape
@@ -740,6 +796,10 @@ class RuntimeTensor:
         return t
 
     def to_torch(self) -> torch.Tensor:
+        if self._torch_tensor is None:
+            raise RuntimeError(
+                'RuntimeTensor cannot be converted to torch tensor as constructed from pointer'
+            )
         return self._torch_tensor
 
     @property
@@ -748,7 +808,7 @@ class RuntimeTensor:
 
     @property
     def data(self):
-        return self._torch_tensor.data_ptr()
+        return self._data_ptr
 
     @property
     def name(self) -> str:
@@ -756,7 +816,7 @@ class RuntimeTensor:
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._torch_tensor.dtype
+        return self._dtype
 
 
 class GenerationSession(object):
@@ -858,7 +918,7 @@ class GenerationSession(object):
 
         if self.mapping.has_pp():
             self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-                self.mapping.tp_size, self.mapping.pp_size, self.mapping.rank)
+                self.mapping.world_size, self.mapping.rank)
 
         if self.mapping.is_last_pp_rank():
             self.decoder_logits_dtype = self._tensor_dtype('logits')
@@ -872,6 +932,7 @@ class GenerationSession(object):
                 self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
                 self.mapping.pp_size, self.decoder_logits_dtype)
 
+        expected_tensor_names = []
         if self.mapping.tp_size > 1:
             self.ipc_buffers, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
@@ -880,7 +941,6 @@ class GenerationSession(object):
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
-        expected_tensor_names = []
         if self.mapping.is_first_pp_rank():
             expected_tensor_names += ['input_ids']
         else:
@@ -1023,12 +1083,17 @@ class GenerationSession(object):
         if self.is_redrafter_mode:
             expected_tensor_names += get_redrafter_tensor_names()
 
+        # language adapter
+        if model_config.language_adapter_config:
+            expected_tensor_names += ['language_adapter_routings']
+
         found_tensor_names = [
             self.runtime.engine.get_tensor_name(i)
             for i in range(self.runtime.engine.num_io_tensors)
         ]
         for name in found_tensor_names:
-            if name.startswith("allreduce_ub_"):
+            if name.startswith("allreduce_ub_") or name.startswith(
+                    "gemm_allreduce"):
                 expected_tensor_names += [name]
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
@@ -1051,6 +1116,14 @@ class GenerationSession(object):
                 self.debug_tensors_to_save = self.debug_tensors
             logger.info(f"Debug tensors found: {self.debug_tensors}")
             logger.info(f"Debug tensors to save: {self.debug_tensors_to_save}")
+
+    def __del__(self):
+        try:
+            if self.use_gemm_allreduce_plugin:
+                assert self.gemm_allreduce_output_handle is not None
+                ipc_nvls_free(self.gemm_allreduce_output_handle)
+        except TypeError:
+            pass
 
     @property
     def context_mem_size(self) -> int:
@@ -1080,6 +1153,7 @@ class GenerationSession(object):
 
     @property
     def hidden_size(self):
+        # For linear layer in attention block
         return self._model_config.hidden_size
 
     @property
@@ -1188,6 +1262,14 @@ class GenerationSession(object):
     @property
     def use_lora_plugin(self):
         return self._model_config.lora_plugin
+
+    @property
+    def use_gemm_allreduce_plugin(self):
+        return bool(self._model_config.gemm_allreduce_plugin)
+
+    @property
+    def gemm_allreduce_plugin(self):
+        return self._model_config.gemm_allreduce_plugin
 
     @property
     def is_medusa_mode(self):
@@ -1403,16 +1485,41 @@ class GenerationSession(object):
         else:
             self.no_repeat_ngram_size = None
 
+        if isinstance(scfg.min_p, torch.Tensor):
+            assert scfg.min_p.dtype == torch.float32, f"scfg.min_p.dtype ({scfg.min_p.dtype}) must be torch.float32"
+            assert scfg.min_p.shape[
+                0] == batch_size, f"scfg.min_p.shape[0] ({scfg.min_p.shape[0]}) must equal to batch_size ({batch_size})"
+            self.min_p = scfg.min_p
+        elif scfg.min_p == 1.0:
+            self.min_p = None
+        else:
+            self.min_p = torch.full([batch_size],
+                                    scfg.min_p,
+                                    dtype=torch.float32)
+
         if self.mapping.is_last_pp_rank():
             self.dynamic_decoder.setup(
-                batch_size, scfg.num_beams, self.top_k, self.top_p,
-                self.temperature, self.repetition_penalty,
-                self.presence_penalty, self.frequency_penalty, self.min_length,
-                self.host_length_penalty, self.host_early_stopping,
-                self.beam_search_diversity_rate, self.random_seed,
-                self.top_p_decay, self.top_p_min, self.top_p_reset_ids,
-                self.no_repeat_ngram_size, scfg.output_log_probs,
-                scfg.num_beams > 1 or scfg.output_cum_log_probs)
+                batch_size,
+                scfg.num_beams,
+                self.top_k,
+                self.top_p,
+                self.temperature,
+                self.repetition_penalty,
+                self.presence_penalty,
+                self.frequency_penalty,
+                self.min_length,
+                self.host_length_penalty,
+                self.host_early_stopping,
+                self.beam_search_diversity_rate,
+                self.random_seed,
+                self.top_p_decay,
+                self.top_p_min,
+                self.top_p_reset_ids,
+                self.no_repeat_ngram_size,
+                self.min_p,
+                scfg.output_log_probs,
+                scfg.num_beams > 1 or scfg.output_cum_log_probs,
+            )
 
         assert scfg.end_id is not None, "end_id cannot be none"
         assert scfg.pad_id is not None, 'pad_id cannot be none'
@@ -1837,6 +1944,7 @@ class GenerationSession(object):
                         kv_cache_type, num_kv_heads_per_cross_attn_layer)
 
             elif self.has_attn_layers:
+
                 for i in range(self.first_layer, self.last_layer):
                     if self.layer_types[i] == 'attention':
                         cache_shape = (
@@ -1947,6 +2055,18 @@ class GenerationSession(object):
                     self._model_config.num_layers,
                 ))
 
+        if self.use_gemm_allreduce_plugin:
+            max_num_tokens = max(batch_size * beam_width,
+                                 batch_size * self.max_seq_length)
+            M = max_num_tokens
+            N = self.hidden_size
+            self.gemm_allreduce_output_size = M * N
+            itemsize = str_dtype_to_torch(self.gemm_allreduce_plugin).itemsize
+            alloc_bytes = self.gemm_allreduce_output_size * itemsize
+            self.gemm_allreduce_output_handle = ipc_nvls_allocate(
+                alloc_bytes, set(self.mapping.tp_group))
+            logger.debug(f'Allocated NVLS IPC memory: {alloc_bytes} bytes')
+
         if self.is_medusa_mode:
             self.buffer[
                 'spec_decoding_packed_mask'] = self.spec_decoding_packed_mask
@@ -2019,11 +2139,18 @@ class GenerationSession(object):
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
         skip_cross_attn_blocks: torch.Tensor = None,
+        language_adapter_routings: torch.Tensor = None,
     ) -> Dict[str, RuntimeTensor]:
         tensors = {}
 
         def sym(x, name):
             return RuntimeTensor.from_torch(name, x)
+
+        def add_tensor_from_pointer(pointer, name, shape, str_dtype):
+            return tensors.update({
+                name:
+                RuntimeTensor.from_pointer(name, pointer, shape, str_dtype)
+            })
 
         def add_tensor(x, name):
             return tensors.update({name: sym(x, name)})
@@ -2070,6 +2197,9 @@ class GenerationSession(object):
                 add_tensor(self.cross_kv_reuse, 'cross_kv_reuse')
             add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            if language_adapter_routings is not None:
+                add_tensor(language_adapter_routings,
+                           'language_adapter_routings')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
             if not self.use_gpt_attention_plugin:
@@ -2287,6 +2417,30 @@ class GenerationSession(object):
 
         if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
+            if self.use_gemm_allreduce_plugin:
+                found_tensor_names = [
+                    self.runtime.engine.get_tensor_name(i)
+                    for i in range(self.runtime.engine.num_io_tensors)
+                ]
+                for name in found_tensor_names:
+                    if name.startswith("gemm_allreduce_uc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.uc_ptr,
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_mc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.mc_ptr,
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_ipc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.get_ipc_ptrs(),
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
 
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
@@ -2338,9 +2492,16 @@ class GenerationSession(object):
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
         skip_cross_attn_blocks: torch.Tensor = None,
+        language_adapter_routings: torch.Tensor = None,
     ):
         torch.cuda.nvtx.range_push("_get_next_step_shape_buffer")
         tensors = {}  # Dict[str, RuntimeTensor]
+
+        def add_tensor_from_pointer(pointer, name, shape, str_dtype):
+            return tensors.update({
+                name:
+                RuntimeTensor.from_pointer(name, pointer, shape, str_dtype)
+            })
 
         def sym(x, name):
             return RuntimeTensor.from_torch(name, x)
@@ -2430,6 +2591,9 @@ class GenerationSession(object):
             add_tensor_with_shape(encoder_output, 'encoder_output',
                                   encoder_output_shape)
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            if language_adapter_routings is not None:
+                add_tensor(language_adapter_routings,
+                           'language_adapter_routings')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
             if not self.use_gpt_attention_plugin:
@@ -2627,6 +2791,30 @@ class GenerationSession(object):
 
         if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
+            if self.use_gemm_allreduce_plugin:
+                found_tensor_names = [
+                    self.runtime.engine.get_tensor_name(i)
+                    for i in range(self.runtime.engine.num_io_tensors)
+                ]
+                for name in found_tensor_names:
+                    if name.startswith("gemm_allreduce_uc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.uc_ptr,
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_mc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.mc_ptr,
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_ipc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.get_ipc_ptrs(),
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
 
         # Since we are using a ping-pong context design and the lora weight remains constant within the same request,
         # it is only necessary to set the lora weight for the first two steps.
@@ -3280,6 +3468,7 @@ class GenerationSession(object):
         encoder_input_lengths: torch.Tensor,
         stopping_criteria: StoppingCriteria,
         logits_processor: LogitsProcessor,
+        output_generation_logits: bool,
         **kwargs,
     ):
         if self.debug_mode:
@@ -3299,6 +3488,8 @@ class GenerationSession(object):
 
         position_ids_raw = kwargs.get('position_ids', None)
         skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
+        language_adapter_routings = kwargs.get('language_adapter_routings',
+                                               None)
         if step == 0:
             model_inputs = self._prepare_context_inputs(
                 batch_size=batch_size,
@@ -3360,6 +3551,7 @@ class GenerationSession(object):
                 host_runtime_perf_knobs=context_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
+                language_adapter_routings=language_adapter_routings,
             )
 
             context = self.runtime.ctx_context
@@ -3463,7 +3655,7 @@ class GenerationSession(object):
 
         generation_logits = None
         if self.mapping.is_last_pp_rank():
-            if self.gather_generation_logits:
+            if self.gather_generation_logits or output_generation_logits:
                 generation_logits = self.buffer['logits'].detach().clone()
 
         # Initialize sequence_lengths (no paddings) for the generation phase.
@@ -3577,7 +3769,7 @@ class GenerationSession(object):
                 host_runtime_perf_knobs=gen_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
-            )
+                language_adapter_routings=language_adapter_routings)
 
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
             # needs to pro-long the life time of the tensors inside the next_step_tensors array
@@ -3586,6 +3778,10 @@ class GenerationSession(object):
             torch.cuda.nvtx.range_push("_set_tensors")
             self.runtime._set_tensors(next_context, next_step_tensors)
             torch.cuda.nvtx.range_pop()
+
+            if logger.level == "verbose":
+                self.runtime.print_context_info(
+                    next_context, int(next_context == self.runtime.context_1))
 
             if self.cuda_graph_mode:
                 self._capture_cuda_graph_and_instantiate(
@@ -3740,6 +3936,7 @@ class GenerationSession(object):
                        stop_words_data,
                        bad_words_data,
                        output_sequence_lengths: bool = False,
+                       output_generation_logits: bool = False,
                        return_dict: bool = False,
                        encoder_output: torch.Tensor = None,
                        encoder_input_lengths: torch.Tensor = None,
@@ -3768,7 +3965,7 @@ class GenerationSession(object):
                         [batch_size, beam_width])
             if self.gather_context_logits:
                 outputs['context_logits'] = outputs_context_logits
-            if self.gather_generation_logits:
+            if self.gather_generation_logits or output_generation_logits:
                 outputs['generation_logits'] = outputs_generation_logits
             if self.is_medusa_mode or self.is_redrafter_mode:
                 outputs['steps_to_finish'] = num_steps
@@ -3843,6 +4040,7 @@ class GenerationSession(object):
                 encoder_input_lengths=encoder_input_lengths,
                 stopping_criteria=stopping_criteria,
                 logits_processor=logits_processor,
+                output_generation_logits=output_generation_logits,
                 **kwargs,
             )
             if step == 0:
@@ -3854,7 +4052,7 @@ class GenerationSession(object):
             if self.mapping.is_last_pp_rank():
                 if step == 0 and self.gather_context_logits:
                     outputs_context_logits = context_logits
-                if self.gather_generation_logits:
+                if self.gather_generation_logits or output_generation_logits:
                     outputs_generation_logits.append(generation_logits)
 
             if should_stop is not None and should_stop.item():
@@ -3878,7 +4076,7 @@ class GenerationSession(object):
                     outputs = {}
                     if self.gather_context_logits:
                         outputs['context_logits'] = outputs_context_logits
-                    if self.gather_generation_logits:
+                    if self.gather_generation_logits or output_generation_logits:
                         outputs['generation_logits'] = outputs_generation_logits
                     return outputs
                 else:
@@ -3899,7 +4097,7 @@ class GenerationSession(object):
             outputs = {}
             if self.gather_context_logits:
                 outputs['context_logits'] = outputs_context_logits
-            if self.gather_generation_logits:
+            if self.gather_generation_logits or output_generation_logits:
                 outputs['generation_logits'] = outputs_generation_logits
             return outputs
         else:
@@ -3925,6 +4123,7 @@ class GenerationSession(object):
                       stop_words_data,
                       bad_words_data,
                       output_sequence_lengths: bool = False,
+                      output_generation_logits: bool = False,
                       return_dict: bool = False,
                       encoder_output: torch.Tensor = None,
                       encoder_input_lengths: torch.Tensor = None,
@@ -3993,6 +4192,7 @@ class GenerationSession(object):
                 encoder_input_lengths=encoder_input_lengths,
                 stopping_criteria=stopping_criteria,
                 logits_processor=logits_processor,
+                output_generation_logits=output_generation_logits,
             )
             if step == 0:
                 outputs_context_logits = context_logits
@@ -4051,6 +4251,7 @@ class GenerationSession(object):
                bad_words_list=None,
                streaming: bool = False,
                output_sequence_lengths: bool = False,
+               output_generation_logits: bool = False,
                return_dict: bool = False,
                encoder_output: torch.Tensor = None,
                encoder_input_lengths: torch.Tensor = None,
@@ -4260,6 +4461,7 @@ class GenerationSession(object):
                 prompt_vocab_size=prompt_vocab_size,
                 ite=ite,
                 sequence_limit_lengths=sequence_limit_lengths,
+                output_generation_logits=output_generation_logits,
                 stop_words_data=stop_words_data,
                 bad_words_data=bad_words_data,
                 output_sequence_lengths=output_sequence_lengths,
@@ -4291,6 +4493,7 @@ class GenerationSession(object):
                 stop_words_data=stop_words_data,
                 bad_words_data=bad_words_data,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 return_dict=return_dict,
                 encoder_output=encoder_output,
                 encoder_input_lengths=encoder_input_lengths,

@@ -1,0 +1,74 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
+    // https://github.com/microsoft/vscode-dev-containers/tree/v0.245.2/containers/docker-existing-dockerfile
+    {
+      "name": "TRT-LLM Devcontainer",
+      "dockerComposeFile": [
+        "docker-compose.yml",
+        "docker-compose.override.yml"
+      ],
+      "service": "tensorrt_llm-dev",
+      "remoteUser": "ubuntu",
+      "containerEnv": {
+        "HF_TOKEN": "${localEnv:HF_TOKEN}",
+        "HF_HOME": "/huggingface",
+        "HISTFILE": "${containerWorkspaceFolder}/.cache/._bash_history"
+      },
+      "workspaceFolder": "/workspaces/tensorrt_llm",
+      "initializeCommand": "cd ${localWorkspaceFolder} && ./.devcontainer/make_env.py",
+      // Note: sourcing .profile is required since we use a local user and the python interpreter is
+      // global (/usr/bin/python). In this case, pip will default to a local user path which is not
+      // by default in the PATH. In interactive devcontainer shells, .profile is sourced by default.
+      "postCreateCommand": "mkdir -p $HOME/.local/bin && source $HOME/.profile && pip install -r requirements-dev.txt && pre-commit install --install-hooks",
+      "customizations": {
+        "vscode": {
+          "extensions": [
+            // CPP
+            "ms-vscode.cpptools",
+            "llvm-vs-code-extensions.vscode-clangd",
+            // "xaver.clang-format",
+            // Python
+            "ms-python.python",
+            "eeyore.yapf",
+            // AutoDeploy Linting and Formatting
+            "charliermarsh.ruff",
+            // Build Tools
+            // "ms-azuretools.vscode-docker",
+            // "ms-vscode.makefile-tools",
+            // "ms-vscode.cmake-tools",
+            // Git & Github
+            // "GitHub.vscode-pull-request-github"
+            "eamodio.gitlens",
+            // Docs
+            "ms-vscode.live-server"
+          ],
+          "settings": {
+            "C_Cpp.intelliSenseEngine": "disabled",
+            "[python]": {
+              "editor.defaultFormatter": "eeyore.yapf"
+            },
+            "[cpp]": {
+                "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+                // "editor.defaultFormatter": "xaver.clang-format",
+            },
+            // "clang-format.executable": "/usr/local/bin/clang-format",
+            "clangd.arguments": [
+              // "--compile-commands-dir=${workspaceFolder}/cpp/build_RelWithDebInfo"
+              "--compile-commands-dir=${workspaceFolder}/cpp/build"
+            ],
+            "python.defaultInterpreterPath": "/usr/bin/python"
+          }
+        }
+      },
+      "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+          "username": "ubuntu",
+          "installZsh": true,
+          "installOhMyZsh": true,
+          "configureZshAsDefaultShell": true,
+          "upgradePackages": false
+        },
+        "ghcr.io/devcontainers/features/git:1": {
+          "version": "latest"
+        }
+      }
+    }

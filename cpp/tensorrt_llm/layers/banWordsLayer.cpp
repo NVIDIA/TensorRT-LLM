@@ -16,6 +16,7 @@
  */
 
 #include "banWordsLayer.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/banBadWords.h"
 #include "tensorrt_llm/kernels/banRepeatNgram.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
@@ -61,6 +62,8 @@ void BanWordsLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BanWordsLayer_setup);
+
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
     auto const& banWordsParams = setupParams->banWordsParams;
     TLLM_CHECK_WITH_INFO(banWordsParams, "banWordsParams for setup is not set");
@@ -85,7 +88,7 @@ void BanWordsLayer<T>::banRepeatNGrams(TensorPtr const& logits, std::shared_ptr<
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (useNoRepeatNgramSize)
     {
-        // auto const maxStep = inputs->step; // TODO (bhsueh) Should we use step? but current inputs->step is always 0.
+        // auto const maxStep = inputs->step; // TODO Should we use step? but current inputs->step is always 0.
         auto const maxStep = maxSeqLen;
         // Temporary variables to store dereferenced inputs
         auto logitsPtr = bufferCast<T>(*logits);
@@ -138,6 +141,7 @@ void BanWordsLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BanWordsLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);

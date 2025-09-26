@@ -63,10 +63,8 @@ struct DefaultMma<bfloat16_t, LayoutA, kAlignmentA, bfloat16_t, LayoutB, kAlignm
 {
 
 private:
-    // Conversions only needed pre-ampere. This will trigger mma pipeline, so we convert before STS.
-    static constexpr bool arch_has_bf16_mma = ArchTag::kMinComputeCapability >= 80;
-    using MmaElementA = typename platform::conditional<arch_has_bf16_mma, bfloat16_t, half_t>::type;
-    using MmaElementB = typename platform::conditional<arch_has_bf16_mma, bfloat16_t, half_t>::type;
+    using MmaElementA = bfloat16_t;
+    using MmaElementB = bfloat16_t;
 
 public:
     // Define the MmaCore components
@@ -296,7 +294,7 @@ public:
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int4 weight
+/// Specialization for row-major output (OperatorClass TensorOp), bf16 activation & int4 weight
 template <
     /// Layout type for A matrix operand
     typename LayoutA,

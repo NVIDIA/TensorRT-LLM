@@ -20,11 +20,13 @@ import torch
 import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
-from .._utils import str_dtype_to_np, str_dtype_to_trt, trt_dtype_to_np
+from .._utils import (get_sm_version, str_dtype_to_np, str_dtype_to_trt,
+                      trt_dtype_to_np)
 from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
                           constant, flatten, layer_norm, matmul,
                           repeat_interleave, rms_norm, round, sum, view)
 from ..layers.linear import ColumnLinear
+from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .mode import QuantMode
 
@@ -261,7 +263,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
                                        scales: Tensor,
                                        zeros: Tensor,
                                        biases: Tensor,
-                                       alpha: Tensor,
+                                       alpha: Parameter,
                                        quant_algo: int,
                                        group_size: int,
                                        dtype: str = 'float16') -> Tensor:
@@ -273,7 +275,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
 
         if quant_algo & 8:
             # fp8_alpha
-            input = input * alpha
+            input = input * alpha.value
         if quant_algo & 4:
             # pre quant
             input = input * pre_quant_scale
@@ -299,13 +301,24 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
                                       np.array(group_size, dtype=np.int32),
                                       trt.PluginFieldType.INT32)
 
+        if alpha:
+            alpha.is_buffer = True
+            alpha_value = alpha.raw_value[0]
+        else:
+            alpha_value = 1.0
+
+        alpha_ = trt.PluginField("alpha", np.array(alpha_value,
+                                                   dtype=np.float32),
+                                 trt.PluginFieldType.FLOAT32)
+
         p_dtype = default_net(
         ).plugin_config.weight_only_groupwise_quant_matmul_plugin
         pf_type_ = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
 
-        pfc = trt.PluginFieldCollection([pf_type_, quant_algo_, group_size_])
+        pfc = trt.PluginFieldCollection(
+            [pf_type_, quant_algo_, group_size_, alpha_])
 
         matmul_plug = plg_creator.create_plugin("woq_groupwise_matmul", pfc)
 
@@ -318,7 +331,6 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
         BIAS = 1
         ZERO = 2
         PRE_QUANT_SCALE = 4
-        FP8_ALPHA = 8
 
         if quant_algo & PRE_QUANT_SCALE:
             plug_inputs += [pre_quant_scale.trt_tensor]
@@ -329,8 +341,6 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
             plug_inputs += [zeros.trt_tensor]
         if quant_algo & BIAS:
             plug_inputs += [biases.trt_tensor]
-        if quant_algo & FP8_ALPHA:
-            plug_inputs += [alpha.trt_tensor]
 
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
         _add_plugin_info(layer, plg_creator, "woq_groupwise_matmul", pfc)
@@ -364,6 +374,13 @@ def smooth_quant_layer_norm(input: Tensor,
             'LayernormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert plg_creator is not None
 
+        output_type = trt.PluginField("out_type_id",
+                                      np.array([int(trt.int8)], np.int32),
+                                      trt.PluginFieldType.INT32)
+        quant_mode = trt.PluginField(
+            "quant_mode",
+            np.array([int(QuantMode.use_smooth_quant(per_token=True))],
+                     np.int32), trt.PluginFieldType.INT32)
         eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
                               trt.PluginFieldType.FLOAT32)
         use_diff_of_squares = trt.PluginField(
@@ -379,8 +396,10 @@ def smooth_quant_layer_norm(input: Tensor,
         pf_type = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection(
-            [eps, use_diff_of_squares, dyn_act_scaling, pf_type])
+        pfc = trt.PluginFieldCollection([
+            eps, use_diff_of_squares, dyn_act_scaling, pf_type, output_type,
+            quant_mode
+        ])
         layernorm_plug = plg_creator.create_plugin("layernorm_quantized", pfc)
         normalized_shape = [normalized_shape] if isinstance(
             normalized_shape, int) else normalized_shape
@@ -595,6 +614,144 @@ def fp8_rowwise_rms_norm(input: Tensor,
                               layer), _create_tensor(layer.get_output(1), layer)
 
 
+def fp8_rowwise_layer_norm(input: Tensor,
+                           normalized_shape: Union[int, Tuple[int]],
+                           weight: Optional[Tensor] = None,
+                           bias: Optional[Tensor] = None,
+                           scale: Optional[Tensor] = None,
+                           clamp_val: Optional[Tensor] = None,
+                           eps: float = 1e-05,
+                           dynamic_act_scaling: bool = True) -> Tensor:
+    if not default_net().plugin_config.layernorm_quantization_plugin:
+        raise TypeError("Fp8 Rowwise Layer Norm is only supported with plugin")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'LayernormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+
+        output_type = trt.PluginField("out_type_id",
+                                      np.array([int(trt.fp8)], np.int32),
+                                      trt.PluginFieldType.INT32)
+        quant_mode = trt.PluginField(
+            "quant_mode",
+            np.array([int(QuantMode.from_description(use_fp8_rowwise=True))],
+                     np.int32), trt.PluginFieldType.INT32)
+        clamp_enabled = trt.PluginField(
+            "clamp_enabled", np.array([clamp_val is not None], np.int32),
+            trt.PluginFieldType.INT32)
+
+        eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
+                              trt.PluginFieldType.FLOAT32)
+
+        dyn_act_scaling = trt.PluginField(
+            "dyn_act_scaling", np.array([int(dynamic_act_scaling)], np.int32),
+            trt.PluginFieldType.INT32)
+        sum_per_token_pf = trt.PluginField("sum_per_token",
+                                           np.array([int(False)], np.int32),
+                                           trt.PluginFieldType.INT32)
+
+        p_dtype = default_net().plugin_config.layernorm_quantization_plugin
+        pf_type = trt.PluginField(
+            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+            trt.PluginFieldType.INT32)
+
+        pfc = trt.PluginFieldCollection([
+            eps, dyn_act_scaling, sum_per_token_pf, clamp_enabled, quant_mode,
+            pf_type, output_type
+        ])
+
+        layernorm_plug = plg_creator.create_plugin("layernorm_quantized", pfc)
+        normalized_shape = [normalized_shape] if isinstance(
+            normalized_shape, int) else normalized_shape
+        if weight is None:
+            weight = constant(
+                np.ones(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+        if bias is None:
+            bias = constant(
+                np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+        if scale is None:
+            scale = constant(np.ones((1, ), dtype=str_dtype_to_np(p_dtype)))
+
+        # Layer Norm Plugin only supports float32 scale
+        scale = cast(scale, "float32")
+        plug_inputs = [
+            input.trt_tensor, weight.trt_tensor, bias.trt_tensor,
+            scale.trt_tensor
+        ]
+        if clamp_val:
+            plug_inputs += [clamp_val.trt_tensor]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
+        if not default_net().strongly_typed:
+            layer.get_output(0).set_dynamic_range(-448, 448)
+        _add_plugin_info(layer, plg_creator, "layernorm_quantized", pfc)
+        if not dynamic_act_scaling:
+            return _create_tensor(layer.get_output(0), layer)
+
+        return _create_tensor(layer.get_output(0),
+                              layer), _create_tensor(layer.get_output(1), layer)
+
+
+def fused_layernorm(
+        input: Tensor,
+        normalized_shape: Union[int, Tuple[int]],
+        residual: Optional[Tensor] = None,
+        weight: Optional[Tensor] = None,
+        # beta: Optional[Tensor] = None,
+        # bias: Optional[Tensor] = None,
+        scale: Optional[Tensor] = None,
+        eps: float = 1e-05,
+        p_dtype: str = 'float16',
+        need_fp32_output: bool = False) -> Tensor:
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'FusedLayernorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+    eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
+                          trt.PluginFieldType.FLOAT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    need_fp32_output_value = need_fp32_output
+    need_fp32_output = trt.PluginField(
+        "need_fp32_output", np.array([int(need_fp32_output_value)], np.int32),
+        trt.PluginFieldType.INT32)
+    need_quantize_value = scale is not None
+    need_quantize = trt.PluginField(
+        "need_quantize", np.array([int(need_quantize_value)], np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection(
+        [eps, need_fp32_output, need_quantize, pf_type])
+    fused_layernorm_plug = plg_creator.create_plugin("fused_layernorm", pfc)
+    normalized_shape = [normalized_shape] if isinstance(
+        normalized_shape, int) else normalized_shape
+    if weight is None:
+        weight = constant(
+            np.ones(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    # if beta is None:
+    #     beta = constant(
+    #         np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    # if bias is None:
+    #     bias = constant(
+    #         np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    if need_quantize_value:
+        plug_inputs = [
+            input.trt_tensor, residual.trt_tensor, weight.trt_tensor,
+            scale.trt_tensor
+        ]
+    else:
+        plug_inputs = [
+            input.trt_tensor,
+            residual.trt_tensor,
+            weight.trt_tensor,
+        ]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, fused_layernorm_plug)
+    _add_plugin_info(layer, plg_creator, "fused_layernorm", pfc)
+    if not need_quantize_value:
+        return _create_tensor(layer.get_output(0),
+                              layer), _create_tensor(layer.get_output(1), layer)
+    return _create_tensor(layer.get_output(0), layer), _create_tensor(
+        layer.get_output(1), layer), _create_tensor(layer.get_output(2), layer)
+
+
 def quantize(input: Tensor,
              scale_factor: Tensor,
              dtype: str,
@@ -793,26 +950,122 @@ def symmetric_quantize_last_axis_of_batched_matrix(weight, quant_mode):
     return qweight, scale
 
 
-def preprocess_weights_for_mixed_gemm(weight, quant_mode):
-    original_shape = weight.shape
-    if quant_mode == torch.int8:
-        return weight.T.reshape(original_shape)
-    else:
-        weight = weight.view(torch.uint8)
-        weight_quint4x2 = torch.zeros(original_shape[0],
-                                      original_shape[1] * 2).char()
-        weight_quint4x2[:, ::2] = weight // 16
-        weight_quint4x2[:, 1::2] = weight % 16
-        weight_quint4x2 = weight_quint4x2.T
-        weight_quint4x2 = weight_quint4x2[:, ::2] + weight_quint4x2[:,
-                                                                    1::2] * 16
-        row_idx = [
-            i + (1 if i % 2 == 0 else -1)
-            for i in range(weight_quint4x2.shape[0])
+def preprocess_weights_for_mixed_gemm(
+        tensor: torch.Tensor,
+        quant_mode: torch.dtype,
+        act_dtype: torch.dtype,
+        sm_: int = -1,
+        do_weight_interleave: bool = True) -> torch.Tensor:
+    sm_ = sm_ if sm_ > 0 else get_sm_version()
+    if len(tensor.shape) == 2:
+        tensor = tensor.unsqueeze(0)
+    elif sm_ >= 90:
+        sm_ = 80
+    if sm_ > 90:
+        sm_ = 80
+
+    permutation_map = {
+        "16_8": [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15],
+        "16_4": [
+            0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12,
+            13, 20, 21, 28, 29, 6, 7, 14, 15, 22, 23, 30, 31
+        ],
+        "8_4": [
+            0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23, 8, 9, 10,
+            11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31
         ]
-        weight_quint4x2 = weight_quint4x2[row_idx, :]
-        return weight_quint4x2.reshape(original_shape[0],
-                                       original_shape[1] // 2)
+    }
+
+    # permute_B_rows_for_mixed_gemm
+    BITS_PER_ELT_A = 8 if act_dtype == torch.float8_e4m3fn else 16
+    BITS_PER_ELT_B = 4 if quant_mode == torch.quint4x2 else 8
+    MMA_SHAPE_N = 8
+    B_ROWS_PER_MMA = 8 * 16 // BITS_PER_ELT_B
+
+    num_experts = tensor.shape[0]
+    num_rows = tensor.shape[1]
+    num_cols = tensor.shape[2]
+
+    assert (sm_ >= 75)
+    assert (num_rows % B_ROWS_PER_MMA == 0)
+    assert (num_cols % MMA_SHAPE_N == 0)
+
+    if do_weight_interleave:
+        row_idx_list = [(row_idx // B_ROWS_PER_MMA) * B_ROWS_PER_MMA +
+                        permutation_map[f"{BITS_PER_ELT_A}_{BITS_PER_ELT_B}"][
+                            row_idx % B_ROWS_PER_MMA]
+                        for row_idx in range(num_rows)]
+        tensor = tensor[:, row_idx_list, :]
+
+    # subbyte_transpose
+    original_shape = tensor.shape
+    if BITS_PER_ELT_B == 4:
+        tensor = tensor.view(torch.uint8)
+        high_tensor = (tensor >> 4).permute(0, 2, 1).unsqueeze(2)
+        low_tensor = ((tensor << 4) >> 4).permute(0, 2, 1).unsqueeze(2)
+        new_tensor = torch.cat([low_tensor, high_tensor],
+                               dim=2).reshape(tensor.shape[0], -1,
+                                              tensor.shape[1])
+        new_tensor = new_tensor[:, :, 0::2] + new_tensor[:, :, 1::2] * 16
+        tensor = new_tensor.view(torch.int8).reshape(original_shape)
+    else:
+        tensor = tensor.permute(0, 2, 1).reshape(original_shape)
+
+    if do_weight_interleave:
+        # interleave_column_major_tensor
+        interleave = BITS_PER_ELT_A // BITS_PER_ELT_B
+        if interleave > 1 and sm_ < 90:
+            rows_per_tile = 128 * 8 // BITS_PER_ELT_A
+            elts_in_int32 = 32 // BITS_PER_ELT_B
+
+            assert (num_rows % elts_in_int32 == 0)
+            assert (num_rows % rows_per_tile == 0)
+
+            tensor = tensor.reshape(num_experts, -1, interleave,
+                                    num_rows // rows_per_tile,
+                                    rows_per_tile * 4 // elts_in_int32)
+            tensor = tensor.permute(0, 1, 3, 2, 4).reshape(original_shape)
+
+        # add_bias_and_interleave_quantized_tensor_inplace
+        if BITS_PER_ELT_B == 8:
+            tensor += -256 * (tensor > 127).byte() + 128
+            tensor = tensor.reshape(-1, 4)[:,
+                                           [0, 2, 1, 3]].reshape(tensor.shape)
+        elif BITS_PER_ELT_B == 4:
+            tensor = tensor.view(torch.uint8)
+            high_tensor = (tensor >> 4).unsqueeze(-1)
+            low_tensor = ((tensor << 4) >> 4).unsqueeze(-1)
+            new_tensor = torch.cat([low_tensor, high_tensor],
+                                   dim=-1).reshape(tensor.shape[0],
+                                                   tensor.shape[1], -1)
+            new_tensor = new_tensor.reshape(
+                -1, 8)[:, [0, 2, 4, 6, 1, 3, 5, 7]].reshape(new_tensor.shape)
+            new_tensor += -16 * (new_tensor > 7).byte() + 8
+            new_tensor = new_tensor[:, :, 0::2] + new_tensor[:, :, 1::2] * 16
+            tensor = new_tensor.view(torch.int8)
+        else:
+            raise NotImplementedError
+
+    return tensor.squeeze(0).contiguous()
+
+
+def get_weight_scale_interleave_factor(interleaved_dim: int,
+                                       group_size: int = 128) -> int:
+    # Calculate the weight_scale interleave factor for W4A8 groupwise MoE quant
+    # only Hopper w4a8 does interleave for weight scale, other arch or Hopper w4a16 default to 1
+    factor = 1
+    if get_sm_version() == 90:
+        if interleaved_dim % (4 * group_size) == 0:
+            factor = 4
+        elif interleaved_dim % (2 * group_size) == 0:
+            factor = 2
+        elif interleaved_dim % group_size == 0:
+            factor = 1
+        else:
+            raise NotImplementedError(
+                f"Interleaved dimension must be a multiple of group_size ({group_size}), received {interleaved_dim}."
+            )
+    return factor
 
 
 def validate_group_size(layer):
@@ -955,7 +1208,7 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
                 qweight = unpack_int32_into_int8(weights[0], True) - 8
             else:
                 qweight = unpack_int32_into_int8(weights.T)
-            qweight[qweight < 0] += 16
+            qweight -= (qweight >> 4) << 4
             qweight = qweight.view(torch.uint8)
         elif USE_INT8_WEIGHT and USE_GPTQ:
             # 8 bit quantization (only consider INT8 GPTQ here)
@@ -963,7 +1216,8 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
                 weights[0].T.contiguous().view(torch.uint8).T.contiguous() -
                 128).to(torch.int8)
         else:
-            warnings.warn("Unsupported quantization mode for weight.")
+            raise NotImplementedError(
+                "Unsupported quantization mode for weight.")
 
         if using_head_as_leading_dim:
             qweight = change_qkv_leading_dim(qweight, num_heads)
@@ -975,8 +1229,8 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
         if not USE_INT8_WEIGHT:
             qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
         weight_type = torch.int8 if USE_INT8_WEIGHT else torch.quint4x2
-        qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
-            qweight.contiguous(), weight_type, torch.float16).view(torch_dtype)
+        qweight = preprocess_weights_for_mixed_gemm(
+            qweight, weight_type, torch.float16).view(torch_dtype)
         results = {tllm_key: qweight}
 
         # scales and zeros for GPTQ and HF-AWQ
@@ -1044,10 +1298,11 @@ def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
             tllm_key.replace("weight", "per_channel_scale"): scales
         }
     else:
+        x = torch.cat(weights, dim=0).to(torch.float32)
         clamp_val = config.quantization.clamp_val
-        weights = torch.cat(weights, dim=0)
-        # activation range bound.
-        x = weights.to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+        if clamp_val is not None:
+            # activation range bound.
+            x = x.clamp(clamp_val[0], clamp_val[1])
         xmax = x.abs().max(-1, keepdim=True).values
         # minimum scaling factor.
         torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
@@ -1061,3 +1316,143 @@ def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
             tllm_key: processed_torch_weights,
             tllm_key.replace("weight", "per_channel_scale"): torch_weight_scales
         }
+
+
+def fp4_gemm(input: Tensor,
+             input_sf: Tensor,
+             weight: Tensor,
+             weight_sf: Tensor,
+             global_sf: Tensor,
+             output_dtype: str | trt.DataType,
+             scaling_vector_size: int = 16):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, input_dim] or [num_tokens, input_dim] for remove_input_padding, should be fp4
+        input_sf : Tensor (On GPU)
+            The input scaling factor tensor. Its shape is [batch_size, seq_len, input_dim / scaling_vector_size] or [num_tokens, input_dim / scaling_vector_size] for remove_input_padding, should be int32 (4 packed)
+        weight : Tensor (On GPU)
+            The weight tensor. Its shape is [output_dim, input_dim], should be fp4
+        weight_sf : Tensor (On GPU)
+            The weight scaling factor tensor. Its shape is [output_dim, input_dim / scaling_vector_size], should be fp8
+        global_sf : Tensor (On GPU)
+            The global scaling factor tensor. Its shape is [1,], should be float32, used as alpha of Gemm.
+        output_dtype: str
+            output data type
+        scaling_vector_size: int
+            scaling vector block size
+    '''
+    if isinstance(output_dtype, str):
+        output_dtype = str_dtype_to_trt(output_dtype)
+
+    fp4_gemm_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'Fp4Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert fp4_gemm_plg_creator is not None
+    sv_vec_size = trt.PluginField("sv_vec_size",
+                                  np.array(scaling_vector_size, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
+    output_dtype = trt.PluginField("output_type_id",
+                                   np.array([int(output_dtype)], np.int32),
+                                   trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([sv_vec_size, output_dtype])
+    fp4_gemm_plug = fp4_gemm_plg_creator.create_plugin("fp4_gemm", pfc)
+    plug_inputs = [input, input_sf, weight, weight_sf, global_sf]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, fp4_gemm_plug)
+    _add_plugin_info(layer, fp4_gemm_plg_creator, "fp4_gemm", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
+def quantize_to_fp4_tensor(input: Tensor, sf_scale: Tensor):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, input_dim] or [num_tokens, input_dim] for remove_input_padding, should be fp16
+        sf_scale : Tensor (On GPU)
+            The global per-tensor scaling factor. Its shape is [1,], should be float32.
+            used to scale SF from input range to fp8 range (448.f / (MaxVal of input / 6.f)).
+        output : Tensor (On GPU)
+            The output tensor. Its shape is [batch_size, seq_len, input_dim] or [num_tokens, input_dim] for remove_input_padding, should be FP4
+        output_sf : Tensor (On GPU)
+            The input scaling factor tensor. Its shape is [batch_size, seq_len, input_dim / scaling_vector_size] or [num_tokens, input_dim / scaling_vector_size] for remove_input_padding, should be FP8
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'QuantizeToFP4', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    pfc = trt.PluginFieldCollection([])
+    quantize_plug = plg_creator.create_plugin("quantize_to_fp4_plugin", pfc)
+
+    plug_inputs = [input.trt_tensor, sf_scale.trt_tensor]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
+    _add_plugin_info(layer, plg_creator, "quantize_to_fp4_plugin", pfc)
+
+    quantized = _create_tensor(layer.get_output(0), layer)
+    scales = _create_tensor(layer.get_output(1), layer)
+    return quantized, scales
+
+
+def dynamic_quantize(
+        x: Tensor,
+        double_scale: Tensor,
+        axis: int = -1,
+        block_size: int = 16,
+        data_qtype: trt.DataType = trt.fp4,
+        scale_qtype: trt.DataType = trt.fp8) -> Tuple[Tensor, Tensor]:
+    '''
+    Parameters:
+        x : Tensor (On GPU)
+            The input tensor.
+        double_scale : Tensor (On GPU)
+            The global per-tensor scaling factor. It should contain only 1 element.
+        axis : int
+            The axis to quantize. Default is -1 (the last axis).
+        block_size : int
+            The block size for quantization. Default is 16.
+        data_qtype : trt.DataType
+            The data type for quantized data. Default is FP4.
+        scale_qtype : trt.DataType
+            The data type for block scale. Default is FP8.
+    Returns:
+        A tuple of two tensors: quantized tensor and block scale tensor.
+    '''
+    if axis < 0:
+        axis = len(x.shape) + axis
+    dynq = default_trtnet().add_dynamic_quantize(x.trt_tensor, axis, block_size,
+                                                 data_qtype, scale_qtype)
+    dynq.set_input(1, double_scale.trt_tensor)
+    quantized = _create_tensor(dynq.get_output(0), dynq)
+    scale = _create_tensor(dynq.get_output(1), dynq)
+    return quantized, scale
+
+
+def block_double_dequantize(x: Tensor,
+                            scale: Tensor,
+                            double_scale: Tensor,
+                            dtype: trt.DataType | str = 'float16') -> Tensor:
+    '''
+    Parameters:
+        x : Tensor (On GPU)
+            The input tensor.
+        scale : Tensor (On GPU)
+            The block scale tensor.
+        double_scale : Tensor (On GPU)
+            The global per-tensor scaling factor. It should contain only 1 element.
+        dtype : trt.DataType | str
+            The data type for dequantized data. Default is float32.
+    Returns:
+        The dequantized tensor.
+    '''
+    if isinstance(dtype, str):
+        dtype = str_dtype_to_trt(dtype)
+    dequantize_scale_layer = default_trtnet().add_dequantize(
+        scale.trt_tensor, double_scale.trt_tensor, dtype)
+    scale = _create_tensor(dequantize_scale_layer.get_output(0),
+                           dequantize_scale_layer)
+
+    dequantize_data_layer = default_trtnet().add_dequantize(
+        x.trt_tensor, scale.trt_tensor, dtype)
+    dequantize_data = _create_tensor(dequantize_data_layer.get_output(0),
+                                     dequantize_data_layer)
+    return dequantize_data

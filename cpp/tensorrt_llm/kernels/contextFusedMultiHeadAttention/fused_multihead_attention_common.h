@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,9 +66,8 @@ enum class ContextAttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL,
-    // Causal mask + mask the beginning tokens based on sliding_window_size
-    // Only pay attention to [max(0, q_i - sliding_window_size), q_i]
-    SLIDING_WINDOW_CAUSAL,
+    // Causal mask + attend to the specific sliding window or chunk.
+    SLIDING_OR_CHUNKED_CAUSAL,
     // The custom mask input.
     CUSTOM_MASK
 };
@@ -82,17 +81,25 @@ enum class AttentionInputLayout
     // Q has contiguous [B, S, H, D] layout, while paged KV has [B, 2, Max_blocks_per_seq] layout
     // that contains paged block indices. The indices indicate the block offset to the pool ptr in
     // global memory
-    Q_PAGED_KV
+    Q_PAGED_KV,
+    // Q has contiguous [B, S, H, D] layout, while K has contiguous [B, S, H_kv, D] layout, and V has
+    // contiguous [B, S, H_kv, D_v] layout. Only used for context MLA now.
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct MHARunnerFixedParams
 {
-    // The FMHA data type.
+    // The FMHA input data type.
     Data_type dataType;
+    // The FMHA kv cache data type.
+    Data_type dataTypeKv;
+    // The FMHA data output type.
+    Data_type dataTypeOut;
+
     // Do we use fp32 accumulation ?
-    // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
+    // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
     // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
     bool forceFp32Acc;
     // The attention mask type.
@@ -105,10 +112,14 @@ struct MHARunnerFixedParams
     int numQHeads;
     // The number of Kv Heads.
     int numKvHeads;
+    // The number of tokens per kv cache block.
+    int numTokensPerBlock;
     // The head size.
     int headSize;
     // The head size of V.
     int headSizeV = 0;
+    // The head size of Q/K non-RoPE part, only used for MLA now.
+    int headSizeQkNope = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The attention logit softcapping scale.
@@ -117,53 +128,108 @@ struct MHARunnerFixedParams
     bool hasAlibi;
     // Scale the alibi bias or not ?
     bool scaleAlibi;
+    // save softmax stats?
+    bool saveSoftmax;
     // The tensor parallel size (alibi).
     int tpSize = 1;
     // The tensor parallel rank (alibi).
     int tpRank = 0;
+    // q tensor quant block size in sage attention
+    int sageBlockSizeQ = 0;
+    // k tensor quant block size in sage attention
+    int sageBlockSizeK = 0;
+    // v tensor quant block size in sage attention
+    int sageBlockSizeV = 0;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
     {
-        // Data type.
-        std::string output = "data_type = ";
-        switch (dataType)
-        {
-        case DATA_TYPE_FP16: output += forceFp32Acc ? "fp16_fp32" : "fp16"; break;
-        case DATA_TYPE_BF16: output += "bf16"; break;
-        case DATA_TYPE_E4M3: output += "e4m3"; break;
-        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
-        }
-        // Head size.
-        output += ", head_size = " + std::to_string(headSize);
-        output += ", head_size_V = " + std::to_string(headSizeV);
-        // Attention mask type.
-        output += ", attention_mask_type = ";
+        std::string output = "dataType = ";
+        output += data_type_to_string(dataType);
+
+        output += ", dataTypeKv = ";
+        output += data_type_to_string(dataTypeKv);
+
+        output += ", dataTypeOut = ";
+        output += data_type_to_string(dataTypeOut);
+
+        output += ", forceFp32Acc = " + std::string(forceFp32Acc ? "true" : "false");
+
+        output += ", attentionMaskType = ";
         switch (attentionMaskType)
         {
         case ContextAttentionMaskType::PADDING: output += "padding"; break;
         case ContextAttentionMaskType::CAUSAL: output += "causal"; break;
-        case ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL: output += "sliding_window_causal"; break;
+        case ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL: output += "sliding_or_chunked_causal"; break;
         case ContextAttentionMaskType::CUSTOM_MASK: output += "custom_mask"; break;
-        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        default: output += std::to_string(static_cast<int>(attentionMaskType)) + " (unknown)"; break;
         }
-        // Attention mask type.
-        output += ", attention_input_layout = ";
+
+        output += ", attentionInputLayout = ";
         switch (attentionInputLayout)
         {
         case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
-        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        case AttentionInputLayout::SEPARATE_Q_K_V: output += "separate_q_k_v"; break;
+        default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
-        // Alibi.
-        output += ", alibi = ";
-        output += (hasAlibi ? "true" : "false");
-        // Attention logit softcapping scale.
-        output += ", attn_logit_softcapping_scale = ";
-        output += (attnLogitSoftcappingScale != 0.f ? "true" : "false");
+
+        output += ", isSPadded = " + std::string(isSPadded ? "true" : "false");
+        output += ", numQHeads = " + std::to_string(numQHeads);
+        output += ", numKvHeads = " + std::to_string(numKvHeads);
+        output += ", numTokensPerBlock = " + std::to_string(numTokensPerBlock);
+        output += ", headSize = " + std::to_string(headSize);
+        output += ", headSizeV = " + std::to_string(headSizeV);
+        output += ", qScaling = " + std::to_string(qScaling);
+        output += ", attnLogitSoftcappingScale = " + std::to_string(attnLogitSoftcappingScale);
+        output += ", hasAlibi = " + std::string(hasAlibi ? "true" : "false");
+        output += ", scaleAlibi = " + std::string(scaleAlibi ? "true" : "false");
+        output += ", tpSize = " + std::to_string(tpSize);
+        output += ", tpRank = " + std::to_string(tpRank);
+        output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
+        output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
+        output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
 
         return output;
+    }
+
+    /**
+     * Set attention mask type from AttentionMaskType enum
+     * @param maskType The AttentionMaskType to use
+     * @return Reference to this object for method chaining
+     * @throws If the maskType cannot be mapped to ContextAttentionMaskType
+     */
+    MHARunnerFixedParams& setAttentionMaskType(std::int8_t maskType)
+    {
+        switch (maskType)
+        {
+        case 0: // tensorrt_llm::kernels::AttentionMaskType::PADDING
+            attentionMaskType = ContextAttentionMaskType::PADDING;
+            break;
+        case 1: // tensorrt_llm::kernels::AttentionMaskType::CAUSAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
+            attentionMaskType = ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL;
+            break;
+        // NOTE: For BIDIRECTIONAL, BIDIRECTIONALGLM, BLOCKSPARSE context phase, CAUSAL mask is used
+        case 3: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 4: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONALGLM
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 5: // tensorrt_llm::kernels::AttentionMaskType::BLOCKSPARSE
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 6: // tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK
+            attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
+            break;
+        default:
+            TLLM_THROW("AttentionMaskType %d cannot be mapped to ContextAttentionMaskType", static_cast<int>(maskType));
+        }
+        return *this;
     }
 };
 
@@ -173,12 +239,16 @@ struct MHARunnerParams
 {
     // The batch size.
     int b;
+    // The number of grouped heads.
+    int numGroupedHeads = 1;
     // The max q sequence length.
     int qSeqLen;
     // The max kv sequence length.
     int kvSeqLen;
     // The sliding window size.
     int slidingWindowSize;
+    // The chunked attention size.
+    int chunkedAttentionSize = INT_MAX;
     // The total number of Q sequence lengths in the batch.
     int totalQSeqLen;
     // The total number of KV sequence lengths in the batch.
@@ -191,14 +261,28 @@ struct MHARunnerParams
     void const* qPtr;
     // The contiguous Kv buffer ptr;
     void const* kvPtr;
+    // The K buffer ptr (for separate K input).
+    void const* kPtr;
+    // The V buffer ptr (for separate V input).
+    void const* vPtr;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
+    // The paged kv cache array for scaling factor.
+    KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
+    // The output scaling factor buffer ptr. (only used for FP4 output)
+    void* outputSfPtr;
+    // The softmax_status ptr for RingAttention.
+    void* softmaxStatsPtr;
+    // The attention sinks ptr.
+    float const* attentionSinksPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
     void const* cuQSeqLenPtr;
+    // The KV sequence lengths.
+    void const* kvSeqLenPtr;
     // The cumulative KV sequence lengths.
     void const* cuKvSeqLenPtr;
     // The cumulative packed mask rows.
@@ -209,9 +293,20 @@ struct MHARunnerParams
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm2Ptr;
+    // The device scale for O scaling factor.
+    float const* oSfScalePtr;
     // The cuda stream.
     cudaStream_t stream;
+    // Force using fp32 accumulation data type.
     bool forceFp32Acc = false;
+    // pointer to q, k, v scale tensor in sageattention
+    float* qScalePtr;
+    float* kScalePtr;
+    float* vScalePtr;
+    // q, k, v block size in sageattention
+    int qMaxNBlock;
+    int kMaxNBlock;
+    int vMaxNBlock;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -261,25 +356,35 @@ struct Fused_multihead_attention_params_v2
     void const* qkv_ptr;
     // The separate Q matrice.
     void const* q_ptr;
+    // The separate K matrice.
+    void const* k_ptr;
+    // The separate V matrice.
+    void const* v_ptr;
     // The separate KV matrice.
     void const* kv_ptr;
     // The separate paged kv cache.
     KVBlockArrayForContextFMHA paged_kv_cache;
     // The mask to implement drop-out.
     void const* packed_mask_ptr;
+    // The attention sinks.
+    float const* attention_sinks_ptr;
     // The O matrix (output).
     void* o_ptr;
+    // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
+    void* softmax_stats_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
-    // The stride between rows of the separate Q matrice.
+    // The stride between rows of Q.
     int64_t q_stride_in_bytes;
-    // The stride between rows of the separate KV matrice.
-    int64_t kv_stride_in_bytes;
+    // The stride between rows of K.
+    int64_t k_stride_in_bytes;
+    // The stride between rows of V.
+    int64_t v_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
     int64_t o_stride_in_bytes;
+    // The stride between rows of softmax_stats_ptr
+    int64_t softmax_stats_stride_in_bytes;
 
     // tma descriptors on device.
     // Either q in packed qkv [B, S, 3, H, D] of separate q layout [B, S, H, D].
@@ -288,7 +393,8 @@ struct Fused_multihead_attention_params_v2
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    cudaTmaDesc tma_desc_kv;
+    cudaTmaDesc tma_desc_k;
+    cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     cudaTmaDesc tma_desc_o;
 
@@ -298,9 +404,15 @@ struct Fused_multihead_attention_params_v2
 
     // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
     int b, h, h_kv, h_q_per_kv, s, d;
+    // The dimension of V. If unset, dv = d.
+    int dv = 0;
+    // The number of grouped heads.
+    int num_grouped_heads = 1;
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
+    // The chunked attention size in log2 (> 0 means chunked attention is used)
+    int log2_chunked_attention_size = 0;
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, softcapping_scale_bmm1, scale_softmax, scale_bmm2;
 
@@ -329,10 +441,17 @@ struct Fused_multihead_attention_params_v2
     // is input/output padded
     bool is_s_padded = false;
 
-    // The dimension of V.
-    int dv = 0;
-    // The stride of V. If unset, v_stride_in_bytes = kv_stride_in_bytes * dv / d
-    int64_t v_stride_in_bytes = 0;
+    // SageAttention parameters
+    struct SageAttention
+    {
+        struct Scales
+        {
+            // ceil(max_seqlen / block_size)
+            int max_nblock;
+            // The scale of each block, layout: (B, H, max_nblock)
+            float* scales;
+        } q, k, v;
+    } sage;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -346,7 +465,7 @@ struct Launch_params
     int total_q_seqlen = 0;
     // total kv sequence length.
     int total_kv_seqlen = 0;
-    // padded head size (new power of 2) for tma descriptors.
+    // padded head size for tma descriptors.
     int padded_d = 0;
     // flags to control small batch kernel choice
     // true: never unroll
@@ -383,6 +502,14 @@ struct Launch_params
     int device_l2_cache_size = 0;
     // total device memory (used by TMA loading of paged kv cache).
     size_t total_device_memory = 0;
+    // q tensor quant block size in sage attention
+    int sage_block_size_q = 0;
+    // k tensor quant block size in sage attention
+    int sage_block_size_k = 0;
+    // v tensor quant block size in sage attention
+    int sage_block_size_v = 0;
+    // if we use a kernel that supports returning softmax statistics
+    bool supportReturnSoftmaxStats;
 };
 
 } // namespace kernels

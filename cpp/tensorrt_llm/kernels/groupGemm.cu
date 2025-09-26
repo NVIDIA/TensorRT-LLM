@@ -167,7 +167,7 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     status = gemm.run(stream);
 
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to run CUTLASS Grouped GEMM kernel.");
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     std::free(host_workspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -226,7 +226,7 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
         }
         else if (minKN >= 1)
         {
-            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 1>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
         }
     }

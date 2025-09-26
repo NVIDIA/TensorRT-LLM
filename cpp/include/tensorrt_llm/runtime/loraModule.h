@@ -49,6 +49,7 @@ public:
         kMOE_GATE = 15,
         kMOE_ROUTER = 16,
         kMLP_ROUTER = 17,
+        kMLP_GATE_UP = 18,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
@@ -60,6 +61,7 @@ public:
         , mOutDimFirst(outDimFirst)
         , mInTpSplitDim(inTpSplitDim)
         , mOutTpSplitDim(outTpSplitDim)
+
     {
     }
 
@@ -71,9 +73,9 @@ public:
     explicit constexpr LoraModule(LoraModule const& o) = default;
     constexpr LoraModule& operator=(LoraModule const& o) = default;
 
-    [[nodiscard]] SizeType32 constexpr flattenedInOutSize(SizeType32 adapterSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr flattenedInOutSize(SizeType32 adapterSize, bool isDora) const noexcept
     {
-        return adapterSize * (mInDim + mOutDim);
+        return adapterSize * (mInDim + mOutDim) + (isDora ? mOutDim : 0);
     }
 
     [[nodiscard]] SizeType32 constexpr inSize(SizeType32 adapterSize) const noexcept
@@ -94,6 +96,11 @@ public:
     [[nodiscard]] SizeType32 constexpr localOutSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         return localOutAdapterSize(adapterSize, tpSize) * localOutDim(tpSize);
+    }
+
+    [[nodiscard]] SizeType32 constexpr localScalesSize(SizeType32 tpSize, bool isDora) const noexcept
+    {
+        return isDora ? localOutDim(tpSize) : 0;
     }
 
     [[nodiscard]] SizeType32 constexpr localInDim(SizeType32 tpSize) const noexcept
@@ -135,6 +142,12 @@ public:
     [[nodiscard]] SizeType32 constexpr localInOutSize(SizeType32 adapterSize, SizeType32 tpSize) const noexcept
     {
         return localInSize(adapterSize, tpSize) + localOutSize(adapterSize, tpSize);
+    }
+
+    [[nodiscard]] SizeType32 constexpr localTotalSize(
+        SizeType32 adapterSize, SizeType32 tpSize, bool isDora) const noexcept
+    {
+        return localInOutSize(adapterSize, tpSize) + localScalesSize(tpSize, isDora);
     }
 
     [[nodiscard]] SizeType32 constexpr value() const noexcept
@@ -219,6 +232,8 @@ public:
             return ModuleType::kMOE_ROUTER;
         else if (name == "mlp_router")
             return ModuleType::kMLP_ROUTER;
+        else if (name == "mlp_gate_up")
+            return ModuleType::kMLP_GATE_UP;
         else
             return ModuleType::kINVALID;
     }
@@ -245,6 +260,7 @@ public:
         case ModuleType::kMOE_GATE: return "moe_gate";
         case ModuleType::kMOE_ROUTER: return "moe_router";
         case ModuleType::kMLP_ROUTER: return "mlp_router";
+        case ModuleType::kMLP_GATE_UP: return "mlp_gate_up";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

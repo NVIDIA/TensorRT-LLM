@@ -18,6 +18,7 @@
 #include <string>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 
 namespace tensorrt_llm
 {
@@ -46,7 +47,7 @@ public:
 
     // Should be called at least once before calling launch().
     void initialize();
-    void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams);
+    void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const;
 
     // It is safe to call getSerializeSize()/serialize() before calling initialize().
     size_t getSerializationSize() const noexcept;
@@ -57,18 +58,30 @@ public:
         return mInitialized;
     }
 
+    [[nodiscard]] XQAKernelType getKernelType() const
+    {
+        return mKernelType;
+    }
+
 private:
+    [[nodiscard]] CUfunction kernel() const
+    {
+        return reinterpret_cast<CUfunction>(mKernel);
+    }
+
     static constexpr char const* kFuncName = "kernel_mha";
     static constexpr char const* kSmemName = "smemSize";
+    static constexpr char const* kKernelTypeName = "kernelType";
     // Constructors should populate mContent.
     std::string mContent;
 
     // Fields below are undefined prior to initialize() call.
     bool mInitialized;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
-    CUmodule mModule;
-    CUfunction mFunction;
+    CUlibrary mLibrary;
+    CUkernel mKernel;
     unsigned int mSharedMemBytes;
+    XQAKernelType mKernelType;
 };
 
 } // namespace jit

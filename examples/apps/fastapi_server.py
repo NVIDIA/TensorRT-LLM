@@ -1,6 +1,6 @@
 """
 NOTE: This FastAPI-based server is only an example for demonstrating the usage
-of TensorRT-LLM LLM API. It is not intended for production use.
+of TensorRT LLM LLM API. It is not intended for production use.
 For production, use the `trtllm-serve` command. The server exposes OpenAI compatible API endpoints.
 """
 
@@ -18,8 +18,9 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import CppExecutorError, RequestError
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -33,7 +34,7 @@ class LlmServer:
         async def lifespan(app: FastAPI):
             # terminate rank0 worker
             yield
-            self.llm._shutdown()
+            self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
         self.register_routes()

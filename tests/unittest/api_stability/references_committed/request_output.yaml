@@ -1,0 +1,32 @@
+methods:
+  aresult:
+    parameters: {}
+    return_annotation: tensorrt_llm.executor.result.GenerationResult
+  result:
+    parameters:
+      timeout:
+        annotation: Optional[float]
+        default: None
+    return_annotation: tensorrt_llm.executor.result.GenerationResult
+properties:
+  request_id:
+    annotation: int
+    default: inspect._empty
+  prompt:
+    annotation: Optional[str]
+    default: inspect._empty
+  prompt_token_ids:
+    annotation: List[int]
+    default: inspect._empty
+  outputs:
+    annotation: List[tensorrt_llm.executor.result.CompletionOutput]
+    default: inspect._empty
+  context_logits:
+    annotation: Optional[torch.Tensor]
+    default: inspect._empty
+  finished:
+    annotation: bool
+    default: inspect._empty
+  mm_embedding_handle:
+    annotation: Optional[Dict[str, Any]]
+    default: inspect._empty

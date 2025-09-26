@@ -1,0 +1,50 @@
+methods:
+  __init__:
+    parameters:
+      clamp_val:
+        annotation: Optional[List[float]]
+        default: null
+      exclude_modules:
+        annotation: Optional[List[str]]
+        default: null
+      group_size:
+        annotation: int
+        default: 128
+      has_zero_point:
+        annotation: bool
+        default: false
+      kv_cache_quant_algo:
+        annotation: Optional[tensorrt_llm.quantization.mode.QuantAlgo]
+        default: null
+      mamba_ssm_cache_dtype:
+        annotation: Optional[str]
+        default: null
+      pre_quant_scale:
+        annotation: bool
+        default: false
+      quant_algo:
+        annotation: Optional[tensorrt_llm.quantization.mode.QuantAlgo]
+        default: null
+      smoothquant_val:
+        annotation: float
+        default: 0.5
+      use_meta_recipe:
+        annotation: bool
+        default: false
+    return_annotation: None
+  from_dict:
+    parameters:
+      config:
+        annotation: dict
+        default: inspect._empty
+    return_annotation: tensorrt_llm.models.modeling_utils.QuantConfig
+  to_dict:
+    parameters: {}
+    return_annotation: dict
+  is_module_excluded_from_quantization:
+    parameters:
+      name:
+        annotation: str
+        default: inspect._empty
+    return_annotation: bool
+properties: {}

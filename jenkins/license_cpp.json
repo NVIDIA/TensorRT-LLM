@@ -1,0 +1,60 @@
+{
+    "filters": [
+        {
+            "include_re": "this is an example. every file with patch match 'include_re' should match the license by 'license_name'",
+            "exclude": {
+                "<filename1>": "exclude file here. you can add your own description",
+                "<filename2>": "<description>"
+            },
+            "license_name": "<nvidia/bsd/apache>"
+        },
+        {
+            "include_re": "^include/",
+            "license_name": "apache"
+        },
+        {
+            "include_re": "^tensorrt_llm/",
+            "exclude_re": [
+                "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
+                "^tensorrt_llm/kernels/internal_cutlass_kernels/src/"
+            ],
+            "license_name": "apache"
+        },
+        {
+            "include_re": "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
+            "license_name": "nvidia"
+        },
+        {
+            "include_re": "^tensorrt_llm/kernels/internal_cutlass_kernels/src/",
+            "license_name": "nvidia"
+        }
+    ],
+    "skip": {
+        "<filename>": "<description>",
+        "tensorrt_llm/deep_ep/strip_nvshmem_helper.py": "py",
+        "tensorrt_llm/kernels/selectiveScan/selectiveScan.h": "external",
+        "tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py": "py",
+        "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h": "dual license",
+        "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_template.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/flash_fwd_mla_bf16_sm90.cu": "dual license",
+        "tensorrt_llm/kernels/flashMLA/flash_fwd_mla_fp16_sm90.cu": "dual license",
+        "tensorrt_llm/kernels/flashMLA/flash_fwd_mla_fp8_sm90.cu": "dual license",
+        "tensorrt_llm/kernels/flashMLA/flash_fwd_mla_kernel.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/flash_fwd_mla_metadata.cu": "dual license",
+        "tensorrt_llm/kernels/flashMLA/flash_mla.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/named_barrier.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/softmax.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/static_switch.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/utils.h": "dual license",
+        "tensorrt_llm/kernels/flashMLA/fp8_transpose_v.h": "dual license",
+        "include/tensorrt_llm/deep_gemm/fp8_gemm.cuh": "dual license",
+        "include/tensorrt_llm/deep_gemm/mma_utils.cuh": "dual license",
+        "include/tensorrt_llm/deep_gemm/scheduler.cuh": "dual license",
+        "include/tensorrt_llm/deep_gemm/tma_utils.cuh": "dual license",
+        "include/tensorrt_llm/deep_gemm/utils.cuh": "dual license",
+        "tensorrt_llm/kernels/causalConv1d/causalConv1d.cu": "dual license",
+        "tensorrt_llm/kernels/causalConv1d/causalConv1d.h": "dual license",
+        "tensorrt_llm/thop/causalConv1dOp.cpp": "dual license",
+        "_": "don't remove, for trailing comma"
+    }
+}

@@ -1,0 +1,20 @@
+methods:
+  __init__:
+    parameters:
+      grammar:
+        annotation: Optional[str]
+        default: null
+      json:
+        annotation: Union[str, pydantic.main.BaseModel, dict, NoneType]
+        default: null
+      json_object:
+        annotation: bool
+        default: false
+      regex:
+        annotation: Optional[str]
+        default: null
+      structural_tag:
+        annotation: Optional[str]
+        default: null
+    return_annotation: None
+properties: {}

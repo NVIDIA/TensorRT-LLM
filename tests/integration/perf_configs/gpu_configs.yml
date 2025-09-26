@@ -1,0 +1,99 @@
+# Default clock settings on GPU cards. These values are Default Applications Clocks
+# which are queried from "nvidia-smi -q -d CLOCK" or "nvmlDeviceGetDefaultApplicationsClock()".
+# We observe these clocks are unlike to trigger power-throttle, and that's why we think these
+# values are good for testing performance regressions.
+
+GPUs:
+    A10:
+        sm_clk: 1005
+        mem_clk: 6251
+    A30:
+        sm_clk: 1200
+        mem_clk: 1215
+    A100 80GB PCIe:
+        sm_clk: 900
+        mem_clk: 1512
+    A100-PCIE-40GB:
+        sm_clk: 900
+        mem_clk: 1512
+    A100-PCIE-80GB:
+        sm_clk: 900
+        mem_clk: 1512
+    GA102 DVT:
+        sm_clk: 1000
+        mem_clk: 9000
+    GA100 DVT:
+        sm_clk: 900
+        mem_clk: 1215
+    H100 80GB HBM3:
+        sm_clk: 1005
+        mem_clk: 2619
+    H100 PCIe:
+        sm_clk: 1005
+        mem_clk: 1593
+    H100 NVL:
+        sm_clk: 1005
+        mem_clk: 1593
+    H20:
+        sm_clk: 1005
+        mem_clk: 2619
+    GH200 120GB:
+        sm_clk: 1500
+        mem_clk: 2619
+    GH200 480GB:
+        sm_clk: 1500
+        mem_clk: 2619
+    H200:
+        sm_clk: 1500
+        mem_clk: 3201
+    TITAN V:
+        sm_clk: 1200
+        mem_clk: 850
+    TITAN RTX:
+        sm_clk: 1200
+        mem_clk: 7001
+    Tesla P100-PCIE-16GB:
+        sm_clk: 1189
+        mem_clk: 715
+    Quadro P4000:
+        sm_clk: 1202
+        mem_clk: 3802
+    Tesla P40:
+        sm_clk: 1303
+        mem_clk: 3615
+    Tesla P4:
+        sm_clk: 885
+        mem_clk: 3003
+    Tesla T4:
+        sm_clk: 585
+        mem_clk: 5001
+    Tesla T4 FHHL:
+        sm_clk: 1125
+        mem_clk: 6401
+    Quadro RTX 6000:
+        sm_clk: 1440
+        mem_clk: 7001
+    Quadro RTX A6000:
+        sm_clk: 1440
+        mem_clk: 7001
+    e3550_t194a:
+        sm_clk: 1109
+        mem_clk: 1440
+    p3710-0010:
+        sm_clk: 1275
+        mem_clk: 3200
+    Tesla PG500-216:
+        sm_clk: 1230
+        mem_clk: 877
+    GeForce RTX 3090:
+        sm_clk: 2100
+        mem_clk: 9751
+    GeForce RTX 4090:
+        sm_clk: 3105
+        mem_clk: 10501
+    L40S:
+        sm_clk: 1500
+        mem_clk: 9000
+    L20:
+        sm_clk: 1500
+        mem_clk: 9001
