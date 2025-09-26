@@ -2,7 +2,7 @@ import math
 import os
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -477,11 +477,17 @@ def init_pp_comm(mapping):
     _pp_comm = PPComm(mapping)
 
 
-def pp_recv(tensor):
-    """Receive tensors from previous pp rank."""
-    _pp_comm.recv(tensor)
+@torch.library.custom_op("trtllm::pp_recv", mutates_args=("tensors", ))
+def pp_recv(tensors: List[torch.Tensor]) -> None:
+    """
+    Receive tensors from previous pp rank.
+    """
+    for tensor in tensors:
+        _pp_comm.recv(tensor)
 
 
-def pp_send(tensor):
+@torch.library.custom_op("trtllm::pp_send", mutates_args=("tensors", ))
+def pp_send(tensors: List[torch.Tensor]) -> None:
     """Send tensors to next pp rank."""
-    _pp_comm.send(tensor)
+    for tensor in tensors:
+        _pp_comm.send(tensor)

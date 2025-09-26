@@ -170,11 +170,12 @@ def forward_after_recv(forward_fn):
         residual=...,
         **kwargs,
     ):
-        pp_recv(hidden_states)
         if residual is not ...:
             if residual is None:
                 residual = torch.empty_like(hidden_states)
-            pp_recv(residual)
+            pp_recv([hidden_states, residual])
+        else:
+            pp_recv([hidden_states])
         return forward_fn(
             position_ids,
             hidden_states,
@@ -207,11 +208,10 @@ def forward_before_send(forward_fn):
         )
         if residual is not ...:
             hidden_states, residual = output
-            pp_send(hidden_states)
-            pp_send(residual)
+            pp_send([hidden_states, residual])
         else:
             hidden_states = output
-            pp_send(hidden_states)
+            pp_send([hidden_states])
         return output
 
     forward_before_send_fn.__wrapped_by_forward_before_send__ = True
