@@ -134,7 +134,7 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokensPerRank)
 //
 // Note: token_selected_experts is used for routing but is NOT automatically included as a payload.
 //       If you want to dispatch token_selected_experts, include it explicitly in inputPayloads.
-std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moeA2ADispatchOp(
+std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK, int64_t numExperts)
 {
@@ -327,31 +327,27 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
         // Update offset for next payload
         offset += payloadByteSizes[payload_idx];
     }
+    // Compute aligned offset after dispatch payloads for combine payload region
+    constexpr size_t CACHELINE_ALIGNMENT = 128;
+    int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(static_cast<size_t>(offset), CACHELINE_ALIGNMENT));
 
-    return std::make_tuple(std::move(recvBuffers), sendCounters, recvCounters, topkTargetRanks, topkSendIndices);
+    return std::make_tuple(std::move(recvBuffers), sendCounters, recvCounters, topkTargetRanks, topkSendIndices, combinePayloadOffset);
 }
 
 // MoE All-to-All Combine Operation
-// This operation pulls back and sums tokens that were dispatched to different expert ranks.
-// Each rank acts as a sender in dispatch stage, pulling back the processed results of tokens it originally sent.
+// Combine the per-rank expert outputs into the originating tokens' buffers on the local rank.
 //
-// Inputs:
-//   - payload: [ep_size, max_tokens_per_rank, elements_per_token] MoE-processed results (NOT on workspace)
-//              This contains the expert outputs for all tokens that were dispatched to this rank
-//   - workspace: [ep_size, size_per_rank] unified virtual memory workspace for synchronization
-//   - maxTokensPerRank: Maximum number of tokens that can be received per rank
-//   - epRank: Current expert parallel rank
-//   - epSize: Total expert parallel size
-//   - topK: Number of experts selected per token
-//
-// Returns:
-//   - output: [local_num_tokens, elements_per_token] combined/summed results
-//
-// Note: The payload is the receive buffer from MoE processing. It needs to be copied to
-// workspace before the combine kernel can gather results across ranks.
+// Two payload modes are supported:
+//   1) External payload tensor: 'payload' is a tensor with shape [ep_size, max_tokens_per_rank, elements_per_token]
+//      that is NOT backed by the shared workspace. In this mode, the op stages the current rank's
+//      slice into the workspace region at 'payloadRegionOffset' via the prepare kernel.
+//   2) Workspace-backed payload tensor: 'payload' is a view into the shared workspace. Set
+//      payloadInWorkspace=true to skip staging. The op will read directly from the workspace region
+//      at 'combinePayloadOffset'.
+// In both cases, the combine kernel reads from the workspace at 'combinePayloadOffset'.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tensor const& topkSendIndices,
-    torch::Tensor const& recvCounters, torch::Tensor const& payload,
-    torch::Tensor const& workspace, int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK)
+    torch::Tensor const& recvCounters, torch::Tensor const& payload, torch::Tensor const& workspace,
+    int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK, int64_t combinePayloadOffset, bool payloadInWorkspace)
 {
     using tensorrt_llm::kernels::moe_a2a::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_a2a::moe_a2a_combine_launch;
@@ -371,32 +367,27 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tenso
     
 
     CHECK_TH_CUDA(payload);
+    CHECK_CONTIGUOUS(payload);
     TORCH_CHECK(payload.dim() == 3, "payload must be a 3D tensor [ep_size, max_tokens_per_rank, elements_per_token]");
     TORCH_CHECK(payload.size(0) == epSize, "payload first dimension must equal epSize");
     TORCH_CHECK(payload.size(1) == maxTokensPerRank, "payload second dimension must equal maxTokensPerRank");
-
     int64_t elementsPerToken = payload.size(2);
     TORCH_CHECK(elementsPerToken > 0, "elementsPerToken must be positive");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
 
-    // Validate workspace
-    CHECK_TH_CUDA(workspace);
-    CHECK_TYPE(workspace, torch::kUInt8);
-    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
-    TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
-
     // Map torch dtype to nvinfer1::DataType
-    nvinfer1::DataType nvDtype;
-    if (payload.dtype() == torch::kFloat16)
+    nvinfer1::DataType nvDtype = nvinfer1::DataType::kFLOAT;
+    auto scalarType = payload.scalar_type();
+    if (scalarType == at::kHalf)
     {
         nvDtype = nvinfer1::DataType::kHALF;
     }
-    else if (payload.dtype() == torch::kBFloat16)
+    else if (scalarType == at::kBFloat16)
     {
         nvDtype = nvinfer1::DataType::kBF16;
     }
-    else if (payload.dtype() == torch::kFloat32)
+    else if (scalarType == at::kFloat)
     {
         nvDtype = nvinfer1::DataType::kFLOAT;
     }
@@ -405,25 +396,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tenso
         TORCH_CHECK(false, "Unsupported data type for payload");
     }
 
-    // Calculate auxiliary data offsets (only to compute payload pointer region)
-    MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxTokensPerRank);
-    
-    // Calculate workspace requirements
-    int elementSize = static_cast<int>(payload.dtype().itemsize());
-    int64_t bytesPerPayload = epSize * maxTokensPerRank * elementsPerToken * elementSize;
-    int64_t sizePerRank = workspace.size(1);
-    int64_t requiredSize = offsets.payload_data_offset + bytesPerPayload;
-    
-    TORCH_CHECK(sizePerRank >= requiredSize, 
-        "Workspace size per rank insufficient. Need at least ", requiredSize,
-        " bytes (", offsets.payload_data_offset, " for auxiliary data + ", bytesPerPayload, 
-        " for payload), but got ", sizePerRank);
-
-    // Get workspace base pointer
-    auto* workspace_ptr = workspace.data_ptr<uint8_t>();
-
-    // Prepare for combine: zero output and copy payload to workspace recv buffer
-    auto* current_rank_workspace = workspace_ptr + (epRank * workspace.stride(0));
+    // Compute per-rank slice size in bytes
+    int elementSize = static_cast<int>(payload.element_size());
     
     // Create output tensor (local on current rank), no need for initialization
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
@@ -444,28 +418,61 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tenso
     params.recv_counters = recvCounters.data_ptr<int>();
     params.stream = at::cuda::getCurrentCUDAStream();
 
-    // Set up completion flag pointers for all ranks (reuse from dispatch)
+    MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxTokensPerRank));
+    
+    // Validate workspace and set synchronization pointers
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) == epSize, "workspace must be [ep_size, size_per_rank]");
+    uint8_t* workspace_ptr = workspace.data_ptr<uint8_t>();
+    int64_t sizePerRank = workspace.size(1);
+    uint8_t* workspace_currank_base = workspace_ptr + epRank * workspace.stride(0);
+
+    
+
+    int64_t payloadSize = payload.numel() * payload.element_size();
+    // If user claims payload is in workspace, ensure payload tensor lies fully within this rank's workspace slice
+    if (payloadInWorkspace)
+    {
+        uint8_t* rank_end = workspace_currank_base + sizePerRank;
+        auto* payloadStart = static_cast<uint8_t const*>(payload.data_ptr());
+        auto* payloadEnd = payloadStart + payloadSize;
+        TORCH_CHECK(payloadStart >= workspace_currank_base && payloadEnd <= rank_end,
+            "payload_in_workspace is true but 'payload' falls outside this rank's workspace slice");
+        for(int src_rank = 0; src_rank < epSize; src_rank++)
+        {
+            params.recv_buffers[src_rank] = payload[src_rank].data_ptr();
+        }
+    }
+    else
+    {
+        TORCH_CHECK(combinePayloadOffset >= 0 && combinePayloadOffset + payloadSize <= sizePerRank,
+            "workspace does not contain enough space for the payload region for combine");
+
+        for (int src_rank = 0; src_rank < epSize; src_rank++)
+        {
+            params.recv_buffers[src_rank] = workspace_ptr + src_rank * workspace.stride(0) + combinePayloadOffset;
+        }
+    }
+
+    // completion flags for all ranks
     for (int rank = 0; rank < epSize; rank++)
     {
         uint8_t* rank_base = workspace_ptr + rank * workspace.stride(0);
         params.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
     }
-    params.flag_val = reinterpret_cast<uint32_t*>(current_rank_workspace + offsets.flag_val_offset);
-    
-    // Calculate and store recv buffer pointers
-    for (int target_rank = 0; target_rank < epSize; target_rank++)
+    params.flag_val = reinterpret_cast<uint32_t*>(workspace_ptr + epRank * workspace.stride(0) + offsets.flag_val_offset);
+
+
+    // If payload is not already in workspace, stage it into current rank's region
+    if (!payloadInWorkspace)
     {
-        // Each rank gets workspace[target_rank] - calculate base pointer
-        auto* target_workspace = workspace_ptr + (target_rank * workspace.stride(0));
-        
-        // Store receive buffer pointer for this rank (at payload_data_offset)
-        params.recv_buffers[target_rank] = target_workspace + offsets.payload_data_offset;
+        params.prepare_payload = payload.data_ptr();
     }
 
-    // Prepare combine: zero output and stage payload into current rank's workspace slot
-    params.prepare_payload = payload.data_ptr();
     moe_a2a_prepare_combine_launch(params);
 
+    
     // Launch the combine kernel
     moe_a2a_combine_launch(params);
     cudaError_t result = cudaGetLastError();
@@ -563,10 +570,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor workspace, int "
         "max_tokens_per_rank, "
-        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor[], Tensor, Tensor, Tensor, Tensor)");
+        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor[], Tensor, Tensor, Tensor, Tensor, int)");
     module.def(
-        "moe_a2a_combine(Tensor topk_target_ranks, Tensor topk_send_indices, Tensor recv_counters, Tensor payload, Tensor workspace, "
-        "int max_tokens_per_rank, int ep_rank, int ep_size, int top_k) -> Tensor");
+        "moe_a2a_combine(Tensor topk_target_ranks, Tensor topk_send_indices, Tensor recv_counters, Tensor payload, "
+        "Tensor workspace, int max_tokens_per_rank, int ep_rank, int ep_size, int top_k, int combine_payload_offset, bool payload_in_workspace) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
     module.def(

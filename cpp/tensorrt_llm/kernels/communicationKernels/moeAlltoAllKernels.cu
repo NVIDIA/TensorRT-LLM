@@ -27,7 +27,7 @@
  {
  
  #define ENABLE_DEBUG_PRINT 0
- #define DISABLE_SYNC_FOR_PROFILING 1
+ #define DISABLE_SYNC_FOR_PROFILING 0
  
  // Macros for concise launch-time specialization
  #define SWITCH_BOOL(flag, NAME, ...) \
@@ -645,13 +645,16 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
  __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uint8_t* payload_bytes, 
      int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, const int* recv_counters)
  {    
-     int slot_idx = ThreadingPolicy::token_idx();
- 
      if (blockIdx.x == 0 && threadIdx.x == 0)
      {
          // Increment flag_val for this combine round
          *flag_val_ptr = *flag_val_ptr + 1;
      }
+
+     if(payload_bytes == nullptr)
+         return;
+
+     int slot_idx = ThreadingPolicy::token_idx();
      
      int total_slots = ep_size * max_tokens_per_rank;
      if (slot_idx >= total_slots)

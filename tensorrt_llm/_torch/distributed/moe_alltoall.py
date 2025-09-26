@@ -132,7 +132,7 @@ class MoeAlltoAll:
         if self._state == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
 
-        recv_buffers, send_counters, recv_counters, topk_target_ranks, topk_send_indices = torch.ops.trtllm.moe_a2a_dispatch(
+        recv_buffers, send_counters, recv_counters, topk_target_ranks, topk_send_indices, combine_payload_offset = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -147,6 +147,7 @@ class MoeAlltoAll:
         self.recv_counters = recv_counters
         self.topk_target_ranks = topk_target_ranks
         self.topk_send_indices = topk_send_indices
+        self.combine_payload_offset = int(combine_payload_offset)
 
         if invalid_token_expert_id is not None:
             assert expert_id_payload_index is not None, "expert_id_payload_index must be provided if invalid_token_expert_id is not None"
@@ -160,12 +161,13 @@ class MoeAlltoAll:
 
         return recv_buffers
         
-    def combine(self, payload):
+    def combine(self, payload, payload_in_workspace: bool = False):
         """
         Perform MoE all-to-all combine operation.
         
         Args:
             payload: [ep_size, max_tokens_per_rank, num_elements_per_token] tensor to combine. The dtype must be float32, bfloat16 or float16.
+            payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
             
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
@@ -181,11 +183,14 @@ class MoeAlltoAll:
                                                    self.max_num_tokens_per_rank,
                                                    self.ep_rank,
                                                    self.ep_size,
-                                                   self.top_k)
+                                                   self.top_k,
+                                                   int(self.combine_payload_offset),
+                                                   bool(payload_in_workspace))
         # Reset state for next round
         self._state = "idle"
         self.send_counters = None
         self.recv_counters = None
         self.topk_target_ranks = None
         self.topk_send_indices = None
+        self.combine_payload_offset = None
         return output
