@@ -113,6 +113,9 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_sessionstart(session):
+    if session.config.getoption("--run-ray"):
+        os.environ["TLLM_DISABLE_MPI"] = "1"
+
     # To counter TransformerEngine v2.3's lazy_compile deferral,
     # which will cause Pytest thinks there's a thread leakage.
     import torch._inductor.async_compile  # noqa: F401

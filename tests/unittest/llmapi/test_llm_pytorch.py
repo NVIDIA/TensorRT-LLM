@@ -27,7 +27,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
-                        skip_gpu_memory_less_than_138gb)
+                        skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -50,6 +50,7 @@ def test_tinyllama_logits_processor(enable_chunked_prefill):
         backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
 
 
+@skip_ray
 @pytest.mark.parametrize(
     "return_context_logits, use_overlap, enable_iter_req_stats", [
         (False, False, False),
@@ -66,6 +67,7 @@ def test_llm_get_stats(return_context_logits, use_overlap,
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
+@skip_ray
 @pytest.mark.parametrize(
     "return_context_logits, use_overlap, enable_iter_req_stats", [
         (False, False, False),
