@@ -338,7 +338,7 @@ TEST(GemmSwigluRunner, Sm90FP8)
     Result hopperFp8 = run("SM90 FP8 WS GEMM", options, buffers);
     EXPECT_TRUE(hopperFp8.passed);
 #else  // COMPILE_HOPPER_TMA_GEMMS
-    std::cout << "[TensorRT-LLm Error][GemmSwigluRunnerTest] Please recompile with support for hopper by passing "
+    std::cout << "[TensorRT LLM Error][GemmSwigluRunnerTest] Please recompile with support for hopper by passing "
                  "90-real as an arch to build_wheel.py."
               << std::endl;
 #endif // COMPILE_HOPPER_TMA_GEMMS

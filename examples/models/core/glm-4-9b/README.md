@@ -1,6 +1,6 @@
 # ChatGLM
 
-This document explains how to build the [glm-4-9b](https://huggingface.co/THUDM/glm-4-9b) models using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
+This document explains how to build the [glm-4-9b](https://huggingface.co/THUDM/glm-4-9b) models using TensorRT LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
 - [glm-4-9b](#glm-4-9b)
   - [Overview](#overview)
@@ -9,7 +9,7 @@ This document explains how to build the [glm-4-9b](https://huggingface.co/THUDM/
   - [Tokenizer and special tokens comparison](#tokenizer-and-special-tokens-comparison)
   - [Usage](#usage)
     - [1. Download repo and weights from HuggingFace Transformers](#1-download-repo-and-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
       - [Enable plugins](#enable-plugins)
       - [In-flight batching](#in-flight-batching)
@@ -26,10 +26,10 @@ This document explains how to build the [glm-4-9b](https://huggingface.co/THUDM/
 
 ## Overview
 
-The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../../../tensorrt_llm/models/chatglm/model.py).
-The TensorRT-LLM ChatGLM example code is located in [`examples/models/core/glm-4-9b`](./). There is one main file:
+The TensorRT LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../../../tensorrt_llm/models/chatglm/model.py).
+The TensorRT LLM ChatGLM example code is located in [`examples/models/core/glm-4-9b`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -98,9 +98,9 @@ git clone https://huggingface.co/THUDM/glm-10b          glm_10b
 git clone https://huggingface.co/THUDM/glm-4-9b         glm_4_9b
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
+### 2. Convert weights from HF Transformers to TensorRT LLM format
 
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
 # GLM-4-9B: single gpu, dtype float16
@@ -109,7 +109,7 @@ python3 convert_checkpoint.py --model_dir glm_4_9b --output_dir trt_ckpt/glm_4_9
 
 ### 3. Build TensorRT engine(s)
 
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
@@ -240,7 +240,7 @@ python3 ../../../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM
 
 ### Activation-aware Weight Quantization (AWQ)
 
-The [`quantize.py`](../../../quantization/quantize.py) script can be used to quantize the models and export TensorRT-LLM checkpoints.
+The [`quantize.py`](../../../quantization/quantize.py) script can be used to quantize the models and export TensorRT LLM checkpoints.
 
 ```bash
 # glm_4_9b: single gpu, int4 awq quantization
@@ -263,7 +263,7 @@ python3 ../../../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM
 
 ### FP8 Quantization
 
-The [`quantize.py`](../../../quantization/quantize.py) script can be used to quantize the models and export TensorRT-LLM checkpoints.
+The [`quantize.py`](../../../quantization/quantize.py) script can be used to quantize the models and export TensorRT LLM checkpoints.
 
 ```bash
 # glm_4_9b: single gpu, fp8 quantization

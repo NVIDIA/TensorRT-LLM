@@ -1,6 +1,6 @@
 # BLOOM
 
-This document shows how to build and run a BLOOM model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
+This document shows how to build and run a BLOOM model in TensorRT LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
 ## Table of Contents
 
@@ -17,9 +17,9 @@ This document shows how to build and run a BLOOM model in TensorRT-LLM on both s
 
 ## Overview
 
-The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/models/contrib/bloom`](./). There is one main file:
+The TensorRT LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT LLM BLOOM example code is located in [`examples/models/contrib/bloom`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -36,7 +36,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-The TensorRT-LLM BLOOM example code locates at [examples/models/contrib/bloom](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM BLOOM example code locates at [examples/models/contrib/bloom](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
 
@@ -57,7 +57,7 @@ rm -rf ./bloom/560M
 mkdir -p ./bloom/560M && git clone https://huggingface.co/bigscience/bloom-560m ./bloom/560M
 ```
 
-TensorRT-LLM BLOOM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
+TensorRT LLM BLOOM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT LLM will build engine(s) with dummy weights.
 
 Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed for inference, you could enable parallel building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
@@ -159,7 +159,7 @@ trtllm-build --checkpoint_dir ./bloom/560m/trt_ckpt/int8/1-gpu/ \
 
 #### SmoothQuant
 
-Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
 
 Example:
 ```bash

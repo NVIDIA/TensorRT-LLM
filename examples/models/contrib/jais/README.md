@@ -16,9 +16,9 @@ Currently it has been tested on
 
 ## Overview
 
-The TensorRT-LLM support for Jais is based on the GPT model, the implementation can be found in [tensorrt_llm/models/gpt/model.py](../../../../tensorrt_llm/models/gpt/model.py). Jais model resembles GPT very much except it uses alibi embedding, embedding scale, swiglu, and logits scale, we therefore reuse the [GPT example code](../../../gpt) for Jais,
+The TensorRT LLM support for Jais is based on the GPT model, the implementation can be found in [tensorrt_llm/models/gpt/model.py](../../../../tensorrt_llm/models/gpt/model.py). Jais model resembles GPT very much except it uses alibi embedding, embedding scale, swiglu, and logits scale, we therefore reuse the [GPT example code](../../../gpt) for Jais,
 
-* [`convert_checkpoint.py`](../../../gpt/convert_checkpoint.py) to convert the Jais model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](../../../gpt/convert_checkpoint.py) to convert the Jais model into TensorRT LLM checkpoint format.
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -34,7 +34,7 @@ The tested configurations are:
 
 ## Usage
 
-This section gives a whole process where we convert HF models, build TensorRT-LLM engines and ultimately perform summarization.
+This section gives a whole process where we convert HF models, build TensorRT LLM engines and ultimately perform summarization.
 
 ### Build TensorRT engine(s)
 
@@ -54,15 +54,15 @@ python3 ../../../gpt/convert_checkpoint.py --model_dir core42/jais-30b-chat-v3 \
 ```
 
 ```bash
-# Build a single-GPU float16 engine from TensorRT-LLM checkpoint for jais-13b-chat
-# Enable the special TensorRT-LLM GPT Attention plugin (--gpt_attention_plugin) to increase runtime performance.
+# Build a single-GPU float16 engine from TensorRT LLM checkpoint for jais-13b-chat
+# Enable the special TensorRT LLM GPT Attention plugin (--gpt_attention_plugin) to increase runtime performance.
 # It is recommend to use --remove_input_padding along with --gpt_attention_plugin for better performance
 trtllm-build --checkpoint_dir jais-13b-chat/trt_ckpt/fp16/1-gpu \
         --gpt_attention_plugin float16 \
         --remove_input_padding enable \
         --output_dir jais-13b-chat/trt_engines/fp16/1-gpu
 
-# Build 2-way tensor parallelism engines from TensorRT-LLM checkpoint for jais-30b-chat-v3
+# Build 2-way tensor parallelism engines from TensorRT LLM checkpoint for jais-30b-chat-v3
 trtllm-build --checkpoint_dir jais-30b-chat-v3/trt_ckpt/fp16/2-gpu \
         --gpt_attention_plugin float16 \
         --remove_input_padding enable \

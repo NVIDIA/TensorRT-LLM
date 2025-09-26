@@ -71,7 +71,7 @@ tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& con
 
 PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 {
-    m.doc() = "TensorRT-LLM Python bindings for C++ runtime";
+    m.doc() = "TensorRT LLM Python bindings for C++ runtime";
     m.attr("binding_type") = "pybind";
 
     // Create MpiComm binding first since it's used in the executor bindings

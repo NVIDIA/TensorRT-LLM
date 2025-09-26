@@ -235,7 +235,7 @@ struct BatchedGemmData
         void const* mPtrBias{nullptr};
 
         // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
-        // TensorRT-LLM API requires a scaling factor on the device.
+        // TensorRT LLM API requires a scaling factor on the device.
         // scaleC = dequantA * dequantB * quantC,
         // where dequantA is global dequantization scaling factor of A
         //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
@@ -250,7 +250,7 @@ struct BatchedGemmData
         float const* mPtrScaleC{nullptr};
 
         // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
-        // TensorRT-LLM API requires a scaling factor on the device.
+        // TensorRT LLM API requires a scaling factor on the device.
         // scaleGate = dequantA * dequantB,
         // where dequantA is global dequantization scaling factor of A
         //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]

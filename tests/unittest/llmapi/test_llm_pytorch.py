@@ -925,3 +925,17 @@ def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
                                      return_generation_logits,
                                      streaming=True,
                                      backend="pytorch")
+
+
+class TestLlmError:
+
+    def test_max_num_token_check(self):
+        """ LLM should raise error when got prompt length exceed the valid range. """
+        llm = LLM(llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  max_num_tokens=100)
+
+        with pytest.raises(ValueError,
+                           match="should not exceed max_num_tokens"):
+            ids = [random.randint(10, 100) for _ in range(101)]
+            llm.generate([ids])

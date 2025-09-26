@@ -1,6 +1,6 @@
 # ChatGLM
 
-This document explains how to build the [ChatGLM2-6B](https://huggingface.co/THUDM/chatglm2-6b), [ChatGLM2-6B-32k](https://huggingface.co/THUDM/chatglm2-6b-32k) models using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
+This document explains how to build the [ChatGLM2-6B](https://huggingface.co/THUDM/chatglm2-6b), [ChatGLM2-6B-32k](https://huggingface.co/THUDM/chatglm2-6b-32k) models using TensorRT LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
 - [ChatGLM](#chatglm)
   - [Overview](#overview)
@@ -9,7 +9,7 @@ This document explains how to build the [ChatGLM2-6B](https://huggingface.co/THU
   - [Tokenizer and special tokens comparison](#tokenizer-and-special-tokens-comparison)
   - [Usage](#usage)
     - [1. Download repo and weights from HuggingFace Transformers](#1-download-repo-and-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
       - [Enable plugins](#enable-plugins)
       - [In-flight batching](#in-flight-batching)
@@ -26,10 +26,10 @@ This document explains how to build the [ChatGLM2-6B](https://huggingface.co/THU
 
 ## Overview
 
-The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).
-The TensorRT-LLM ChatGLM example code is located in [`examples/models/contrib/chatglm2-6b`](./). There is one main file:
+The TensorRT LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).
+The TensorRT LLM ChatGLM example code is located in [`examples/models/contrib/chatglm2-6b`](./). There is one main file:
 
-* [`examples/models/core/glm-4-9b/convert_checkpoint.py`](../../../glm-4-9b/convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`examples/models/core/glm-4-9b/convert_checkpoint.py`](../../../glm-4-9b/convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 

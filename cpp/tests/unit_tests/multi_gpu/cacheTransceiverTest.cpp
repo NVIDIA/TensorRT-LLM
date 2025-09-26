@@ -233,7 +233,7 @@ protected:
             {
                 void* ret = dllGetSym(handle, name);
                 TLLM_CHECK_WITH_INFO(ret != nullptr,
-                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
                     "built with UCX support, please rebuild in UCX-enabled environment.");
                 return ret;
             };
@@ -661,7 +661,7 @@ protected:
                 {
                     void* ret = dllGetSym(handle, name);
                     TLLM_CHECK_WITH_INFO(ret != nullptr,
-                        "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                        "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
                         "built with UCX support, please rebuild in UCX-enabled environment.");
                     return ret;
                 };
@@ -1313,14 +1313,14 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
-// (eop) Waive off isWindow test for now
+// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(/*true,*/ false)));
 
-// (eop) Waive off isWindow test for now
+// Waive off isWindow test for now
 // INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
 //     testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
 //     testing::Values(1),
@@ -1328,7 +1328,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
 //         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
 //         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true)));
 
-// (eop) Waive off isWindow test for now
+// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(8), testing::Values(4), testing::Values(4), testing::Values(8),

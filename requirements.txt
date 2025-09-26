@@ -4,7 +4,7 @@ accelerate>=1.7.0
 build
 colored
 # cuda-python>=12,<13  # <For CUDA 12.9>
-cuda-python>=12
+cuda-python>=13
 diffusers>=0.27.0
 lark
 mpi4py
@@ -15,15 +15,13 @@ openai
 polygraphy
 psutil
 # nvidia-ml-py>=12,<13  # <For CUDA 12.9>
-nvidia-ml-py>=12
-# Just a wrapper since nvidia-modelopt requires pynvml
-pynvml==12.0.0
+nvidia-ml-py>=13
 pulp
 pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# tensorrt>=10.11.0,<=10.13.0  # <For CUDA 12.9>
+# tensorrt~=10.11.0  # <For CUDA 12.9>
 tensorrt~=10.13.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.8.0a0.
 # torch>=2.7.1,<=2.8.0a0  # <For CUDA 12.9>
@@ -31,7 +29,8 @@ torch>=2.8.0a0,<=2.8.0
 torchvision
 nvidia-modelopt[torch]~=0.33.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.27.7
-nvidia-nccl-cu12
+# nvidia-nccl-cu12  # <For CUDA 12.9>
+nvidia-nccl-cu13
 # nvidia-cuda-nvrtc-cu12  # <For CUDA 12.9>
 nvidia-cuda-nvrtc
 transformers==4.56.0
@@ -51,7 +50,7 @@ click
 click_option_group
 aenum
 pyzmq
-fastapi==0.115.4
+fastapi>=0.115.4,<=0.117.1
 uvicorn
 setuptools<80
 ordered-set
