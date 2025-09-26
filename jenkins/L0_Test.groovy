@@ -1280,9 +1280,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         makoArgs += ["auto_trigger=others"]
     }
     if (stageName.contains("-Ray-")) {
+        // If stageName contains "-Ray-", add "orchestrator=ray" to makoArgs
+        // At this point, only tests with orchestrator=ray or unspecified orchestrator will be run.
+        // Mark tests with orchestrator=mpi to exclude them from Ray stage.
         makoArgs += ["orchestrator=ray"]
     } else {
-        // Select tests with mpi or unspecified orchestrator
+        // Otherwise select tests with orchestrator=mpi or unspecified orchestrator
         makoArgs += ["orchestrator=mpi"]
     }
 

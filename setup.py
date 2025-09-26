@@ -256,6 +256,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
+        "ray": ["ray[default]"]
     },
     zip_safe=True,
     install_requires=required_deps,
