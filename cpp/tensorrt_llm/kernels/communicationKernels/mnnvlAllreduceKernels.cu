@@ -373,12 +373,6 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
     // ======================= Reduction =============================
     float accum[ELTS_PER_THREAD];
     PackedVec<PackedType, T> packed_accum;
-    PackedVec<PackedType, T> residual_in;
-    // Move the residual loading up to here
-    if constexpr (RESNORM_FUSION)
-    {
-        residual_in.packed = *reinterpret_cast<PackedType const*>(&residual_in_ptr[thread_offset]);
-    }
 
 #pragma unroll
     for (int i = 0; i < ELTS_PER_THREAD; i++)
@@ -405,6 +399,8 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
     if constexpr (RESNORM_FUSION)
     {
         // =============================== Residual ===============================
+        PackedVec<PackedType, T> residual_in;
+        residual_in.packed = *reinterpret_cast<PackedType const*>(&residual_in_ptr[thread_offset]);
         packed_accum += residual_in;
         *reinterpret_cast<PackedType*>(&prenormed_ptr[thread_offset]) = packed_accum.packed;
         // =============================== Rmsnorm ================================
@@ -417,7 +413,7 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
         for (int i = 0; i < ELTS_PER_THREAD; i++)
         {
             // FIXME: Use float square if accuracy issue
-            thread_sum += cuda_cast<float, T>(packed_accum.elements[i]) * cuda_cast<float, T>(packed_accum.elements[i]);
+            thread_sum += cuda_cast<float, T>(packed_accum.elements[i] * packed_accum.elements[i]);
         }
         float token_sum = blockReduceSum<float, false>(thread_sum);
 #ifdef SUPPORT_CGA
