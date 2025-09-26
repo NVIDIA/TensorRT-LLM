@@ -256,6 +256,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(
             pytorch_backend_config.attn_backend)
+        self.draft_tokens_cuda = None
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -327,7 +328,22 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_runner = CUDAGraphRunner(self)
+        self.cuda_graph_runner = CUDAGraphRunner(
+            use_cuda_graph=pytorch_backend_config.use_cuda_graph,
+            cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
+            supported_batch_sizes=self._cuda_graph_batch_sizes,
+            max_supported_batch_size=self._max_cuda_graph_batch_size,
+            max_batch_size=self.batch_size,
+            max_beam_width=self.max_beam_width,
+            max_draft_len=self.max_draft_len,
+            max_num_tokens=self.max_num_tokens,
+            use_mrope=self.use_mrope,
+            spec_config=self.spec_config,
+            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            enable_attention_dp=self.enable_attention_dp,
+            mapping=self.mapping,
+            dist=self.dist,
+            kv_cache_manager_key=self.kv_cache_manager_key)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -2095,7 +2111,13 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, resource_manager) as padded_requests:
 
             maybe_graph, maybe_attn_metadata, maybe_spec_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_requests)
+                padded_requests,
+                iter_counter=self.iter_counter,
+                is_spec_decode=self.enable_spec_decode,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_tokens_cuda=self.draft_tokens_cuda,
+            )
             if maybe_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -2119,7 +2141,8 @@ class PyTorchModelEngine(ModelEngine):
                                                  gather_context_logits)
             else:
                 batch_size = len(padded_requests.generation_requests)
-                if self.cuda_graph_runner.needs_capture(batch_size):
+                if self.cuda_graph_runner.needs_capture(
+                        batch_size, self.enable_spec_decode):
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -2132,16 +2155,18 @@ class PyTorchModelEngine(ModelEngine):
                         self._postprocess_inputs(inputs)
 
                     self.cuda_graph_runner.capture(batch_size,
+                                                   self.enable_spec_decode,
                                                    capture_forward_fn, inputs,
                                                    capture_postprocess_fn)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
-                    outputs = self.cuda_graph_runner.replay(batch_size, inputs)
+                    outputs = self.cuda_graph_runner.replay(
+                        batch_size, self.enable_spec_decode, inputs)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.replay(
-                            batch_size, inputs)
+                            batch_size, self.enable_spec_decode, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
