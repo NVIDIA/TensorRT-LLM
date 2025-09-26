@@ -239,8 +239,8 @@ __device__ void vectorized_dispatch_impl(
  }
  
  
- __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* send_indices,
-     int* local_token_counter, int ep_size, int local_num_tokens, uint32_t* flag_val_ptr)
+__global__ void moeA2APrepareDispatchKernel(int* send_counters,
+    int* local_token_counter, int ep_size, uint32_t* flag_val_ptr)
  {
      int idx = blockIdx.x * blockDim.x + threadIdx.x;
      // Zero send_counters
@@ -255,12 +255,7 @@ __device__ void vectorized_dispatch_impl(
          // Increment flag_val for this dispatch round
          *flag_val_ptr = *flag_val_ptr + 1;
      }
-     // Fill send_indices with -1
-     int total = local_num_tokens * ep_size;
-     if (idx < total)
-     {
-         send_indices[idx] = -1;
-     }
+
  }
  
  // ============================================================================
@@ -328,9 +323,7 @@ __device__ void vectorized_dispatch_impl(
          int dst_token_idx;
         if (thread_idx == 0)
          {
-             dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
-             // TODO: send_indices is to be deprecated
-             ptrs.send_indices[local_token_idx * ep_size + target_rank] = dst_token_idx;
+            dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
 
 
              ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
@@ -428,9 +421,9 @@ __device__ void vectorized_dispatch_impl(
      constexpr int kBlockSize = 256;
      int n = params.local_num_tokens * params.ep_size;
      int grid = ceilDiv(n, kBlockSize);
-     moeA2APrepareDispatchKernel<<<grid, kBlockSize, 0, params.stream>>>(
-         params.send_counters, params.send_indices, params.local_token_counter,
-         params.ep_size, params.local_num_tokens, params.flag_val);
+    moeA2APrepareDispatchKernel<<<grid, kBlockSize, 0, params.stream>>>(
+        params.send_counters, params.local_token_counter,
+         params.ep_size, params.flag_val);
  }
  
  // ============================================================================
@@ -474,8 +467,7 @@ __device__ void vectorized_dispatch_impl(
      kernel_ptrs.flag_val = params.flag_val;
      
      // Copy communication tracking pointers
-     kernel_ptrs.send_counters = params.send_counters;
-     kernel_ptrs.send_indices = params.send_indices;
+    kernel_ptrs.send_counters = params.send_counters;
      kernel_ptrs.local_token_counter = params.local_token_counter;     
      kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
      kernel_ptrs.topk_send_indices = params.topk_send_indices;
@@ -837,7 +829,6 @@ __device__ void vectorized_dispatch_impl(
      kernel_ptrs.flag_val = params.flag_val;
      
      // Copy communication tracking pointers
-     kernel_ptrs.send_indices = params.send_indices;
      kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
      kernel_ptrs.topk_send_indices = params.topk_send_indices;
  

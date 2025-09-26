@@ -51,7 +51,6 @@ struct DispatchKernelPointers
     
     // Local aux data pointers
     int* send_counters;       // [ep_size] How many tokens have been sent to each target rank
-    int* send_indices;        // [local_num_tokens, ep_size] send index tensor  //TODO: this is not used anymore
     int* recv_counters[kMaxRanks];       // How many tokens have been received from each source rank. Each rank has [ep_size] counters
     int* local_token_counter; // Atomic counter for completed tokens
 
@@ -71,9 +70,6 @@ struct CombineKernelPointers
     uint32_t* completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
     uint32_t* flag_val;                     // The value of the flag for this round (stored on the local rank)
     
-    // Local aux data pointers
-    int const* send_indices;  // [local_num_tokens, ep_size] from dispatch
-
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int const* topk_target_ranks;   // target rank per k, -1 for duplicates
     int const* topk_send_indices;   // dst index per k, -1 for duplicates
@@ -112,7 +108,6 @@ struct MoeA2ADispatchParams
     // Communication tracking
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
     int* recv_counters[kMaxRanks];       // tracks tokens received from each source rank. Each rank has [ep_size] counters
-    int* send_indices;        // [local_num_tokens, ep_size] send index tensor
     int* local_token_counter; // Atomic counter for completed tokens on this rank
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
@@ -124,7 +119,7 @@ struct MoeA2ADispatchParams
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
-// Prepare for dispatch: zero send_counters, send_indices, local_token_counter and increment flag_val
+// Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
 // Combine phase parameters
@@ -142,7 +137,6 @@ struct MoeA2ACombineParams
     int top_k;               // Number of experts per token
 
     // Expert routing information
-    int const* send_indices; // [local_num_tokens, ep_size] from dispatch
     int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])

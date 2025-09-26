@@ -33,7 +33,6 @@ class MoeAlltoAll:
     LOCAL_TOKEN_COUNTER_OFFSET_INDEX = None
     SEND_COUNTERS_OFFSET_INDEX = None
     COMPLETION_FLAGS_OFFSET_INDEX = None
-    SEND_INDICES_OFFSET_INDEX = None
     PAYLOAD_DATA_OFFSET_INDEX = None
     
     @classmethod
@@ -44,7 +43,6 @@ class MoeAlltoAll:
             cls.LOCAL_TOKEN_COUNTER_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX()
             cls.SEND_COUNTERS_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_SEND_COUNTERS_OFFSET_INDEX()
             cls.COMPLETION_FLAGS_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_COMPLETION_FLAGS_OFFSET_INDEX()
-            cls.SEND_INDICES_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_SEND_INDICES_OFFSET_INDEX()
             cls.PAYLOAD_DATA_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX()
     
     def __init__(
@@ -111,7 +109,6 @@ class MoeAlltoAll:
         self.moe_a2a_metainfo = self._WORKSPACE["metainfo"]
         self.max_num_tokens_per_rank = self._WORKSPACE["max_num_tokens_per_rank"]
         # Internal state and aux data
-        self.send_indices: torch.Tensor | None = None
         self.send_counters: torch.Tensor | None = None
         self.recv_counters: torch.Tensor | None = None
         self._state: str = "idle"  # idle | dispatched
@@ -135,7 +132,7 @@ class MoeAlltoAll:
         if self._state == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
 
-        recv_buffers, send_counters, send_indices, recv_counters = torch.ops.trtllm.moe_a2a_dispatch(
+        recv_buffers, send_counters, recv_counters, topk_target_ranks, topk_send_indices = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -146,9 +143,10 @@ class MoeAlltoAll:
             self.num_experts
         )
         self._state = "dispatched"
-        self.send_indices = send_indices
         self.send_counters = send_counters
         self.recv_counters = recv_counters
+        self.topk_target_ranks = topk_target_ranks
+        self.topk_send_indices = topk_send_indices
 
         if invalid_token_expert_id is not None:
             assert expert_id_payload_index is not None, "expert_id_payload_index must be provided if invalid_token_expert_id is not None"
@@ -172,19 +170,22 @@ class MoeAlltoAll:
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
-        if self._state != "dispatched" or self.send_indices is None:
+        if self._state != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
 
-        output = torch.ops.trtllm.moe_a2a_combine(
-            self.send_indices,
-            payload,
-            self.workspace,
-            self.max_num_tokens_per_rank,
-            self.ep_rank,
-            self.ep_size,
-            self.top_k
-        )
+        output = torch.ops.trtllm.moe_a2a_combine(self.topk_target_ranks,
+                                                   self.topk_send_indices,
+                                                   self.recv_counters,
+                                                   payload,
+                                                   self.workspace,
+                                                   self.max_num_tokens_per_rank,
+                                                   self.ep_rank,
+                                                   self.ep_size,
+                                                   self.top_k)
         # Reset state for next round
-        self.send_indices = None
         self._state = "idle"
+        self.send_counters = None
+        self.recv_counters = None
+        self.topk_target_ranks = None
+        self.topk_send_indices = None
         return output

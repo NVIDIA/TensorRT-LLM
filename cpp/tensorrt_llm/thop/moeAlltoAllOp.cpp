@@ -34,9 +34,8 @@ enum MoeA2AMetaInfoIndex {
     SEND_COUNTERS_OFFSET_INDEX = 2,
     RECV_COUNTERS_OFFSET_INDEX = 3,
     COMPLETION_FLAGS_OFFSET_INDEX = 4,
-    SEND_INDICES_OFFSET_INDEX = 5,
-    PAYLOAD_DATA_OFFSET_INDEX = 6,
-    NUM_METAINFO_FIELDS = 7
+    PAYLOAD_DATA_OFFSET_INDEX = 5,
+    NUM_METAINFO_FIELDS = 6
 };
 
 namespace
@@ -56,7 +55,6 @@ struct MoeA2ADataOffsets
     size_t send_counters_offset;
     size_t recv_counters_offset;
     size_t completion_flags_offset;
-    size_t sendIndices_offset;
     size_t topk_target_ranks_offset;
     size_t topk_send_indices_offset;
     size_t payload_data_offset;
@@ -92,10 +90,6 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokensPerRank)
     offsets.completion_flags_offset = offset;
     offset += epSize * SIZEOF_INT32;
     
-    // send_indices
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets.sendIndices_offset = offset;
-    offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokensPerRank) * SIZEOF_INT32;
 
     // topk_target_ranks: [maxNumTokensPerRank, kMaxTopK]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
@@ -133,11 +127,14 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokensPerRank)
 //
 // Returns:
 //   - recvBuffers: List of receive buffers, one for each payload
-//   - recvCounters: [ep_size] tensor tracking tokens received from each rank
+//   - sendCounters: [ep_size] tensor tracking tokens sent to each rank (local)
+//   - recvCounters: [ep_size] tensor tracking tokens received from each rank (all ranks)
+//   - topkTargetRanks: [local_num_tokens, top_k] compact routing - target EP rank per k
+//   - topkSendIndices: [local_num_tokens, top_k] compact routing - dst slot per k
 //
 // Note: token_selected_experts is used for routing but is NOT automatically included as a payload.
 //       If you want to dispatch token_selected_experts, include it explicitly in inputPayloads.
-std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor> moeA2ADispatchOp(
+std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK, int64_t numExperts)
 {
@@ -260,17 +257,10 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
         options
     );
     
-    // Create send_indices tensor - view into workspace
-    // Initialized to -1 in prepare dispatch kernel
-    torch::Tensor sendIndices = torch::from_blob(
-        rank_workspace + offsets.sendIndices_offset,
-        {localNumTokens, epSize},
-        options
-    );
 
-    // Derive Top-K compact buffers from workspace
-    int* topkTargetRanksPtr = reinterpret_cast<int*>(rank_workspace + offsets.topk_target_ranks_offset);
-    int* topkSendIndicesPtr = reinterpret_cast<int*>(rank_workspace + offsets.topk_send_indices_offset);
+    // Allocate compact Top-K routing tensors [localNumTokens, topK]
+    torch::Tensor topkTargetRanks = torch::empty({localNumTokens, topK}, options);
+    torch::Tensor topkSendIndices = torch::empty({localNumTokens, topK}, options);
 
     // Setup dispatch parameters
     MoeA2ADispatchParams params{};
@@ -303,9 +293,8 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
     params.max_tokens_per_rank = static_cast<int>(maxTokensPerRank);
     params.send_counters = sendCounters.data_ptr<int>();
     params.local_token_counter = localTokenCounter.data_ptr<int>();
-    params.send_indices = sendIndices.data_ptr<int>();
-    params.topk_target_ranks = topkTargetRanksPtr;
-    params.topk_send_indices = topkSendIndicesPtr;
+    params.topk_target_ranks = topkTargetRanks.data_ptr<int>();
+    params.topk_send_indices = topkSendIndices.data_ptr<int>();
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
@@ -339,7 +328,7 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
         offset += payloadByteSizes[payload_idx];
     }
 
-    return std::make_tuple(std::move(recvBuffers), sendCounters, sendIndices, recvCounters);
+    return std::make_tuple(std::move(recvBuffers), sendCounters, recvCounters, topkTargetRanks, topkSendIndices);
 }
 
 // MoE All-to-All Combine Operation
@@ -347,7 +336,6 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
 // Each rank acts as a sender in dispatch stage, pulling back the processed results of tokens it originally sent.
 //
 // Inputs:
-//   - sendIndices: [local_num_tokens, ep_size] tensor from dispatch showing where tokens were sent
 //   - payload: [ep_size, max_tokens_per_rank, elements_per_token] MoE-processed results (NOT on workspace)
 //              This contains the expert outputs for all tokens that were dispatched to this rank
 //   - workspace: [ep_size, size_per_rank] unified virtual memory workspace for synchronization
@@ -361,7 +349,8 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
 //
 // Note: The payload is the receive buffer from MoE processing. It needs to be copied to
 // workspace before the combine kernel can gather results across ranks.
-torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor const& payload,
+torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tensor const& topkSendIndices,
+    torch::Tensor const& recvCounters, torch::Tensor const& payload,
     torch::Tensor const& workspace, int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK)
 {
     using tensorrt_llm::kernels::moe_a2a::MoeA2ACombineParams;
@@ -369,12 +358,17 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     using tensorrt_llm::kernels::moe_a2a::kMaxTopK;
 
     // Validate inputs
-    CHECK_INPUT(sendIndices, torch::kInt32);
-    TORCH_CHECK(sendIndices.dim() == 2, "sendIndices must be a 2D tensor");
-    TORCH_CHECK(sendIndices.size(1) == epSize, "sendIndices must have epSize columns");
-
-    int64_t localNumTokens = sendIndices.size(0);
-    TORCH_CHECK(localNumTokens > 0, "localNumTokens must be positive");
+    CHECK_INPUT(topkTargetRanks, torch::kInt32);
+    CHECK_INPUT(topkSendIndices, torch::kInt32);
+    CHECK_INPUT(recvCounters, torch::kInt32);
+    TORCH_CHECK(topkTargetRanks.dim() == 2 && topkSendIndices.dim() == 2,
+        "topkTargetRanks/topkSendIndices must be 2D [local_num_tokens, top_k]");
+    TORCH_CHECK(topkTargetRanks.size(0) == topkSendIndices.size(0),
+        "topkTargetRanks and topkSendIndices must have the same first dimension, which is local_num_tokens");
+        int64_t localNumTokens = topkTargetRanks.size(0);
+    TORCH_CHECK(topkTargetRanks.size(1) == topK && topkSendIndices.size(1) == topK,
+        "topk tensors second dim must equal topK");
+    
 
     CHECK_TH_CUDA(payload);
     TORCH_CHECK(payload.dim() == 3, "payload must be a 3D tensor [ep_size, max_tokens_per_rank, elements_per_token]");
@@ -411,7 +405,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
         TORCH_CHECK(false, "Unsupported data type for payload");
     }
 
-    // Calculate auxiliary data offsets
+    // Calculate auxiliary data offsets (only to compute payload pointer region)
     MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxTokensPerRank);
     
     // Calculate workspace requirements
@@ -442,13 +436,12 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.max_tokens_per_rank = static_cast<int>(maxTokensPerRank);
     params.top_k = static_cast<int>(topK);
-    params.send_indices = sendIndices.data_ptr<int>();
-    params.topk_target_ranks = reinterpret_cast<int const*>(current_rank_workspace + offsets.topk_target_ranks_offset);
-    params.topk_send_indices = reinterpret_cast<int const*>(current_rank_workspace + offsets.topk_send_indices_offset);
+    params.topk_target_ranks = topkTargetRanks.data_ptr<int>();
+    params.topk_send_indices = topkSendIndices.data_ptr<int>();
     params.output_data = output.data_ptr();
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;
-    params.recv_counters = reinterpret_cast<int const*>(current_rank_workspace + offsets.recv_counters_offset);
+    params.recv_counters = recvCounters.data_ptr<int>();
     params.stream = at::cuda::getCurrentCUDAStream();
 
     // Set up completion flag pointers for all ranks (reuse from dispatch)
@@ -518,7 +511,6 @@ torch::Tensor moeA2AInitializeOp(
     moe_a2a_metainfo[SEND_COUNTERS_OFFSET_INDEX] = static_cast<int64_t>(offsets.send_counters_offset);
     moe_a2a_metainfo[RECV_COUNTERS_OFFSET_INDEX] = static_cast<int64_t>(offsets.recv_counters_offset);
     moe_a2a_metainfo[COMPLETION_FLAGS_OFFSET_INDEX] = static_cast<int64_t>(offsets.completion_flags_offset);
-    moe_a2a_metainfo[SEND_INDICES_OFFSET_INDEX] = static_cast<int64_t>(offsets.sendIndices_offset);
     moe_a2a_metainfo[PAYLOAD_DATA_OFFSET_INDEX] = static_cast<int64_t>(offsets.payload_data_offset);
 
     // Memset workspace to 0 and synchronize among ranks
@@ -566,15 +558,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def("MOE_A2A_SEND_COUNTERS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::SEND_COUNTERS_OFFSET_INDEX); });
     module.def("MOE_A2A_RECV_COUNTERS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::RECV_COUNTERS_OFFSET_INDEX); });
     module.def("MOE_A2A_COMPLETION_FLAGS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::COMPLETION_FLAGS_OFFSET_INDEX); });
-    module.def("MOE_A2A_SEND_INDICES_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::SEND_INDICES_OFFSET_INDEX); });
     module.def("MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::PAYLOAD_DATA_OFFSET_INDEX); });
     
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor workspace, int "
         "max_tokens_per_rank, "
-        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor[], Tensor, Tensor, Tensor)");
+        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor[], Tensor, Tensor, Tensor, Tensor)");
     module.def(
-        "moe_a2a_combine(Tensor send_indices, Tensor payload, Tensor workspace, "
+        "moe_a2a_combine(Tensor topk_target_ranks, Tensor topk_send_indices, Tensor recv_counters, Tensor payload, Tensor workspace, "
         "int max_tokens_per_rank, int ep_rank, int ep_size, int top_k) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
