@@ -565,6 +565,8 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         if model_config.pretrained_config.torch_dtype is None:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
 
+        assert model_config.mapping.pp_size == 1, "Pipeline parallelism is not supported."
+
         super().__init__(
             Transformer(model_config),
             model_config=model_config,
