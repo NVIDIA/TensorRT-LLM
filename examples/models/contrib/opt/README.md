@@ -1,6 +1,6 @@
 # OPT
 
-This document explains how to build the [OPT](https://huggingface.co/docs/transformers/model_doc/opt) model using TensorRT-LLM and run on a single GPU, a single node with
+This document explains how to build the [OPT](https://huggingface.co/docs/transformers/model_doc/opt) model using TensorRT LLM and run on a single GPU, a single node with
 multiple GPUs or multiple nodes with multiple GPUs.
 
 - [OPT](#opt)
@@ -8,7 +8,7 @@ multiple GPUs or multiple nodes with multiple GPUs.
   - [Support Matrix](#support-matrix)
   - [Usage](#usage)
     - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
     - [4. Summarization using the OPT model](#4-summarization-using-the-opt-model)
       - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
@@ -18,9 +18,9 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM OPT implementation can be found in [`tensorrt_llm/models/opt/model.py`](../../tensorrt_llm/models/opt/model.py). The TensorRT-LLM OPT example code is located in [`examples/models/contrib/opt`](./). There is one file:
+The TensorRT LLM OPT implementation can be found in [`tensorrt_llm/models/opt/model.py`](../../tensorrt_llm/models/opt/model.py). The TensorRT LLM OPT example code is located in [`examples/models/contrib/opt`](./). There is one file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -35,7 +35,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-format to the TensorRT-LLM format.
+format to the TensorRT LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
@@ -61,7 +61,7 @@ git-lfs clone https://huggingface.co/facebook/opt-2.7b
 git-lfs clone https://huggingface.co/facebook/opt-66b
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
+### 2. Convert weights from HF Transformers to TensorRT LLM format
 
 ```bash
 # OPT-125M
@@ -126,7 +126,7 @@ trtllm-build --checkpoint_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
 
 ### 4. Summarization using the OPT model
 
-The following section describes how to run a TensorRT-LLM OPT model to summarize the articles from the
+The following section describes how to run a TensorRT LLM OPT model to summarize the articles from the
 [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 The script can also perform the same summarization using the HF OPT model.

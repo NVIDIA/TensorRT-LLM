@@ -335,7 +335,8 @@ class TestNemotron(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1,
+                key = (1, 0, False)
+                graph_runner.capture(key,
                                      lambda inputs: nemotron.forward(**inputs),
                                      inputs)
 
@@ -343,7 +344,7 @@ class TestNemotron(unittest.TestCase):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if scenario.use_cuda_graph:

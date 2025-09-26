@@ -4,7 +4,7 @@
 
 ### 0. Clone the repo
 
-Clone the TensorRT-LLM repo and `cd` into it:
+Clone the TensorRT LLM repo and `cd` into it:
 
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
@@ -76,7 +76,7 @@ python build_and_run_ad.py --config '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1
 
 ### Linting and Pre-commit hooks
 
-TensorRT-LLM uses pre-commit hooks to lint code.
+TensorRT LLM uses pre-commit hooks to lint code.
 
 #### Set up pre-commit hooks
 
