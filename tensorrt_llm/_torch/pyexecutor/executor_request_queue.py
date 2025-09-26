@@ -596,6 +596,72 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
+    # Note: Helix parallelism is a decode-only feature run with disaggregated serving. This function gets called on gen server
+    # during initialization of a new request.
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
+                              tokens_per_block: int):
+        req_with_children = []
+        num_cp_ranks = self.dist.cp_size
+        curr_cp_rank = self.dist.cp_rank
+
+        # For each request, partition the input_token_ids into blocks and then partition blocks across CP ranks.
+        # Currently, the partitioning is such that contiguous blocks are assigned to the same CP rank (as opposed
+        # to round-robin).
+        for req_item in new_requests:
+            all_input_ids = torch.tensor(req_item.request.input_token_ids,
+                                         dtype=torch.int64).unsqueeze(0)
+            input_len = all_input_ids.shape[-1]
+
+            num_total_blocks = (input_len + tokens_per_block -
+                                1) // tokens_per_block
+            if num_total_blocks < num_cp_ranks:
+                raise ValueError(
+                    f"There aren't enough tokens to get at least one block per CP rank. num_total_blocks {num_total_blocks} < num_cp_ranks {num_cp_ranks}. Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
+                )
+
+            # Padding to ensure torch.stack used with torch.tensor_split works properly.
+            padding_len = 0
+            if input_len % tokens_per_block != 0:
+                padding_len = tokens_per_block - (input_len % tokens_per_block)
+                padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
+                all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
+            all_position_ids = torch.arange(0,
+                                            input_len + padding_len,
+                                            dtype=torch.int64).unsqueeze(0)
+
+            input_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_input_ids.split(tokens_per_block, dim=-1)),
+                num_cp_ranks)
+            position_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_position_ids.split(tokens_per_block, dim=-1)),
+                num_cp_ranks)
+
+            # Get the input_ids and position_ids for this rank.
+            input_ids_this_rank = input_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+            position_ids_this_rank = position_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+
+            # Undo the padding. Only last rank's last block will be padded right now
+            # given contiguous block assignment.
+            if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
+                input_ids_this_rank = input_ids_this_rank[:-padding_len]
+                position_ids_this_rank = position_ids_this_rank[:-padding_len]
+
+            req = executor_request_to_llm_request(
+                req_id=req_item.id,
+                executor_request=req_item.request,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits(),
+                input_token_ids=input_ids_this_rank,
+                position_ids=position_ids_this_rank,
+            )
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
+
     @nvtx_range("_merge_requests")
     def _merge_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
@@ -604,20 +670,24 @@ class ExecutorRequestQueue:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == CpType.RING:
-                raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.HELIX:
+                # Take the usual route below.
+                return self._merge_helix_requests(
+                    new_requests,
+                    tokens_per_block=cp_config['tokens_per_block'])
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
-        else:
-            req_with_children = []
-            for req_item in new_requests:
-                req = executor_request_to_llm_request(
-                    req_item.id, req_item.request, req_item.child_req_ids,
-                    self._should_exclude_last_generation_logits())
-                req_with_children.append(req)
-                if req.child_requests:
-                    req_with_children.extend(req.child_requests)
-            return req_with_children
+                raise NotImplementedError(
+                    f'Unsupported cp type {cp_type.name}.')
+
+        req_with_children = []
+        for req_item in new_requests:
+            req = executor_request_to_llm_request(
+                req_item.id, req_item.request, req_item.child_req_ids,
+                self._should_exclude_last_generation_logits())
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
 
     def _merge_star_attention_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
