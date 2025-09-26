@@ -2,9 +2,13 @@ from typing import Optional
 
 import torch
 from torch import nn
+from tqdm import tqdm
 from transformers import Qwen3Config
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -49,10 +53,6 @@ class Qwen3Attention(QKNormRoPEAttention):
                 rope=RopeParams.from_config(config),
             )
 
-        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
-        # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -65,7 +65,6 @@ class Qwen3Attention(QKNormRoPEAttention):
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
-            disable_deep_gemm=disable_deep_gemm,
         )
 
 
@@ -86,10 +85,6 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
-        # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
-
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -97,7 +92,6 @@ class Qwen3DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             overridden_tp_size=1 if self.enable_attention_dp else None,
             config=model_config,
-            disable_deep_gemm=disable_deep_gemm,
         )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -223,3 +217,24 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
             Qwen3Model(model_config),
             model_config,
         )
+
+    def post_load_weights(self):
+        all_named_modules = dict(self.model.named_modules())
+        for name, module in tqdm(all_named_modules.items(),
+                                 desc="Post loading weights"):
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
+                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                ) and is_sm_100f() and hasattr(module, "weight_scale"):
+                    weight, weight_scale = resmooth_to_fp8_e8m0(
+                        module.weight, module.weight_scale)
+                    transfromed_scale = transform_sf_into_required_layout(
+                        weight_scale,
+                        mn=weight.shape[0],
+                        k=weight.shape[1],
+                        recipe=(1, 128, 128),
+                        is_sfa=False)
+                    module.weight = nn.Parameter(weight, requires_grad=False)
+                    module.weight_scale = nn.Parameter(transfromed_scale,
+                                                       requires_grad=False)
