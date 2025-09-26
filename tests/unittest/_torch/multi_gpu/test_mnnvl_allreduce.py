@@ -183,8 +183,9 @@ def row_linear_residual_norm_fusion_forward(
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("dtype", [torch.bfloat16],
                          ids=lambda x: f"dtype:{torch.finfo(x).dtype}")
-@pytest.mark.parametrize("strategy", [AllReduceStrategy.MNNVL],
-                         ids=lambda x: f"strategy:{x}")
+@pytest.mark.parametrize(
+    "strategy", [AllReduceStrategy.MNNVL, AllReduceStrategy.NCCL_SYMMETRIC],
+    ids=lambda x: f"strategy:{x}")
 @pytest.mark.parametrize(
     "fusion",
     [True, False],
