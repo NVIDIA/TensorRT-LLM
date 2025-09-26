@@ -18,6 +18,9 @@ TensorRT LLM
 <div align="left">
 
 ## Tech Blogs
+* [09/26] Inference Time Compute Implementation in TensorRT LLM
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md)
+
 * [09/19] Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)
 
