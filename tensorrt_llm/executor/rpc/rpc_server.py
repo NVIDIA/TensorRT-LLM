@@ -292,9 +292,37 @@ class RPCServer:
             if req.method_name not in ["_rpc_shutdown", "shutdown"]:
                 self._num_pending_requests -= 1
 
+    def _calculate_adjusted_timeout(self,
+                                    req: RPCRequest,
+                                    is_streaming: bool = False) -> float:
+        """Calculate adjusted timeout based on pending overhead.
+
+        Args:
+            req: The RPC request
+            is_streaming: Whether this is for a streaming request
+
+        Returns:
+            The adjusted timeout value
+        """
+        adjusted_timeout = req.timeout
+        if req.creation_timestamp is not None and req.timeout is not None and req.timeout > 0:
+            pending_time = time.time() - req.creation_timestamp
+            adjusted_timeout = max(0.1, req.timeout -
+                                   pending_time)  # Keep at least 0.1s timeout
+            if pending_time > 0.1:  # Only log if significant pending time
+                method_type = "streaming " if is_streaming else ""
+                logger_debug(
+                    f"RPC Server adjusted timeout for {method_type}{req.method_name}: "
+                    f"original={req.timeout}s, pending={pending_time:.3f}s, adjusted={adjusted_timeout:.3f}s"
+                )
+        return adjusted_timeout
+
     async def _process_request(self, req: RPCRequest) -> Optional[RPCResponse]:
         """Process a request. Returns None for streaming requests (handled separately)."""
         func = self._functions[req.method_name]
+
+        # Calculate adjusted timeout based on pending overhead
+        adjusted_timeout = self._calculate_adjusted_timeout(req)
 
         try:
             if inspect.iscoroutinefunction(func):
@@ -303,7 +331,7 @@ class RPCServer:
                     f"RPC Server running async task {req.method_name} in dispatcher"
                 )
                 result = await asyncio.wait_for(func(*req.args, **req.kwargs),
-                                                timeout=req.timeout)
+                                                timeout=adjusted_timeout)
             else:
                 # Execute sync function in thread executor
                 loop = asyncio.get_running_loop()
@@ -317,7 +345,7 @@ class RPCServer:
                 # TODO: let num worker control the pool size
                 result = await asyncio.wait_for(loop.run_in_executor(
                     self._executor, call_with_kwargs),
-                                                timeout=req.timeout)
+                                                timeout=adjusted_timeout)
 
             logger_debug(f"RPC Server returned result for request {req}")
             response = RPCResponse(req.request_id, result)
@@ -354,6 +382,10 @@ class RPCServer:
 
         sequence_number = 0
 
+        # Calculate adjusted timeout based on pending overhead
+        adjusted_timeout = self._calculate_adjusted_timeout(req,
+                                                            is_streaming=True)
+
         try:
             logger_debug(f"RPC Server running streaming task {req.method_name}")
             # Send start signal
@@ -362,16 +394,37 @@ class RPCServer:
                             'start'))
             sequence_number += 1
 
-            # Stream the results
-            async for result in func(*req.args, **req.kwargs):
-                logger_debug(
-                    f"RPC Server got data and ready to send result {result}")
-                response = RPCResponse(req.request_id, result, None, True,
-                                       sequence_number, 'data')
-                if not await self._send_response(req, response):
-                    # Stop streaming after a pickle error
-                    return
-                sequence_number += 1
+            # Apply timeout to the entire streaming operation if specified
+            if adjusted_timeout is not None and adjusted_timeout > 0:
+                # Create a task for the async generator with timeout
+                async def stream_with_timeout():
+                    nonlocal sequence_number
+                    async for result in func(*req.args, **req.kwargs):
+                        logger_debug(
+                            f"RPC Server got data and ready to send result {result}"
+                        )
+                        response = RPCResponse(req.request_id, result, None,
+                                               True, sequence_number, 'data')
+                        if not await self._send_response(req, response):
+                            # Stop streaming after a pickle error
+                            return
+                        sequence_number += 1
+
+                # Use wait_for for timeout handling
+                await asyncio.wait_for(stream_with_timeout(),
+                                       timeout=adjusted_timeout)
+            else:
+                # No timeout specified, stream normally
+                async for result in func(*req.args, **req.kwargs):
+                    logger_debug(
+                        f"RPC Server got data and ready to send result {result}"
+                    )
+                    response = RPCResponse(req.request_id, result, None, True,
+                                           sequence_number, 'data')
+                    if not await self._send_response(req, response):
+                        # Stop streaming after a pickle error
+                        return
+                    sequence_number += 1
 
             # Send end signal
             await self._client_socket.put_async(
