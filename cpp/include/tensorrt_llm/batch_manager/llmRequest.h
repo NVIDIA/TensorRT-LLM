@@ -140,8 +140,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
-        std::optional<Duration> globalSteadyClockOffset = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -199,7 +198,6 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
-        , mGlobalSteadyClockOffset(globalSteadyClockOffset)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -227,8 +225,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<Duration> globalSteadyClockOffset = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -269,7 +266,6 @@ public:
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
         , mCacheSaltID(cacheSaltID)
-        , mGlobalSteadyClockOffset(globalSteadyClockOffset)
     {
         if (mEncoderTokens.has_value())
         {
@@ -1887,6 +1883,9 @@ public:
     // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
 
+    // The offset between local steady clock and global steady clock (at rank 0)
+    inline static std::optional<Duration> mGlobalSteadyClockOffset{std::nullopt};
+
 protected:
     bool mIsStreaming;
 
@@ -2046,9 +2045,6 @@ protected:
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
 
-    // The offset between local steady clock and global steady clock (at rank 0)
-    std::optional<Duration> mGlobalSteadyClockOffset;
-
 private:
     void initialize(
         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
@@ -2145,6 +2141,7 @@ private:
 
         if (mReturnPerfMetrics)
         {
+            // arrivalTime is assumed to be recorded at the rank 0, so no need to convert it to global clock
             mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getSteadyClockNow());
         }
         mStartTime = getSteadyClockNow();
@@ -2252,8 +2249,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
-        std::optional<Duration> globalSteadyClockOffset = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2284,7 +2280,7 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime, globalSteadyClockOffset)
+            arrivalTime)
     {
     }
 

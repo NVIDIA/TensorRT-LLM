@@ -12,6 +12,8 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
+
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
@@ -166,8 +168,6 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
-        self.dist = dist
-        self.global_steady_clock_offset = self._get_global_steady_clock_offset()
 
         self.peft_cache_config = peft_cache_config
 
@@ -186,6 +186,7 @@ class PyExecutor:
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
+        self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
         # enqueue and _fetch_new_requests used data
@@ -255,6 +256,7 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
 
         # request fetcher initialization
+        self._set_global_steady_clock_offset()
         self.executor_request_queue = ExecutorRequestQueue(
             dist=self.dist,
             enable_attention_dp=self.enable_attention_dp,
@@ -264,7 +266,6 @@ class PyExecutor:
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
-            global_steady_clock_offset=self.global_steady_clock_offset,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -367,20 +368,24 @@ class PyExecutor:
                 self.worker_thread.start()
                 self.worker_started = True
 
-    def _get_global_steady_clock_offset(self):
+    def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
 
         # Sync all ranks
         self.dist.barrier()
         # Immediately take the local steady clock timestamp
-        local_timestamp = time.monotonic()
+        local_timestamp = get_steady_clock_now_in_seconds()
         all_rank_timestamps = self.dist.allgather(local_timestamp)
         if self.global_rank == 0:
             logger.info(
                 f"global_steady_clock_offset at each rank: {[local_timestamp - ts for ts in all_rank_timestamps]}"
             )
         # Compute the steady clock offset between rank 0 and current rank
-        return all_rank_timestamps[0] - local_timestamp
+        global_steady_clock_offset = all_rank_timestamps[0] - local_timestamp
+        LlmRequest.global_steady_clock_offset = global_steady_clock_offset
+        logger.info(
+            f"Setting global_steady_clock_offset: {global_steady_clock_offset} seconds for rank {self.global_rank}"
+        )
 
     def __enter__(self):
         return self

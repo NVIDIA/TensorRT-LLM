@@ -4,7 +4,6 @@ import copy
 import itertools
 import os
 import signal
-import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -31,6 +30,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 DisaggregatedParams,
                                                 ErrorResponse)
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -56,7 +56,7 @@ class OpenAIDisaggServer:
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
             # record corresponding keys of context and generation servers for perf metrics
-            # (ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_ts)
+            # (ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_time)
             self.perf_metrics_keys = deque(maxlen=self.perf_metrics_max_requests)
             self.perf_metrics_keys_lock = asyncio.Lock()
             # server_url -> {ctx_request_id: perf_metrics}
@@ -139,8 +139,7 @@ class OpenAIDisaggServer:
 
         @self.app.middleware("http")
         async def add_process_time_header(raw_request: Request, call_next):
-            start_time = time.monotonic()
-            raw_request.state.server_arrival_time = start_time
+            raw_request.state.server_arrival_time = get_steady_clock_now_in_seconds()
             response = await call_next(raw_request)
             return response
 
@@ -199,7 +198,7 @@ class OpenAIDisaggServer:
 
     async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int, raw_request: Request):
         async with self.perf_metrics_keys_lock:
-            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id, raw_request.state.server_arrival_time, raw_request.state.server_first_token_ts))
+            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id, raw_request.state.server_arrival_time, raw_request.state.server_first_token_time))
 
     async def perf_metrics(self) -> JSONResponse:
         if self.perf_metrics_keys is None:
@@ -236,18 +235,18 @@ class OpenAIDisaggServer:
                 raise exc
 
             remain_keys = []
-            for ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_ts in self.perf_metrics_keys:
+            for ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_time in self.perf_metrics_keys:
                 gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
                 if gen_perf_metrics is None:
                     # generation not finished
-                    remain_keys.append((ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_ts))
+                    remain_keys.append((ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_time))
                     continue
                 ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
                 return_metrics.append({
                     "ctx_server": ctx_server,
                     "gen_server": gen_server,
                     "disagg_server_arrival_time": server_arrival_time,
-                    "disagg_server_first_token_ts": server_first_token_ts,
+                    "disagg_server_first_token_time": server_first_token_time,
                     "ctx_perf_metrics": ctx_perf_metrics,
                     "gen_perf_metrics": gen_perf_metrics})
             self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
@@ -340,7 +339,7 @@ class OpenAIDisaggServer:
                         raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
                     first_response = await anext(gen_response.body_iterator)
-                    raw_request.state.server_first_token_ts = time.monotonic()
+                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
                     yield first_response
                     async for chunk in gen_response.body_iterator:
                         yield chunk
@@ -420,6 +419,10 @@ class OpenAIDisaggServer:
                             assert isinstance(req, ChatCompletionRequest)
                             gen_response = await self.send_chat_request(gen_server, req)
                         await self._increment_metric("gen_completed_requests")
+                        if need_ctx and self.perf_metrics_keys is not None:
+                            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                            asyncio.create_task(self._add_perf_metrics_keys(
+                                ctx_server, gen_server, ctx_request_id, raw_request))
                         return gen_response
                 finally:
                     if gen_server is not None:
@@ -509,11 +512,11 @@ class OpenAIDisaggServer:
 
     async def set_steady_clock_offsets(self, session: aiohttp.ClientSession):
         STEADY_CLOCK_OFFSET_ENDPOINT = "/steady_clock_offset"
-        async def query_steady_clock_offset(server_url: str) -> Optional[float]:
+        async def query_steady_clock_offset(server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
-                originate_ts = time.monotonic()
+                originate_ts = get_steady_clock_now_in_seconds()
                 async with session.get(server_url + STEADY_CLOCK_OFFSET_ENDPOINT) as response:
-                    destination_ts = time.monotonic()
+                    destination_ts = get_steady_clock_now_in_seconds()
                     if response.status == 200:
                         response = await response.json()
                         # Compute the steady clock timestamp difference using the NTP clock synchronization algorithm. https://en.wikipedia.org/wiki/Network_Time_Protocol#Clock_synchronization_algorithm
@@ -533,8 +536,11 @@ class OpenAIDisaggServer:
                     logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
         for server_url in self.ctx_servers + self.gen_servers:
             delay, offset = await query_steady_clock_offset(server_url)
+            if delay is None or offset is None:
+                logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
+                continue
             logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second')
-            # Negate the offset so that worker servers can adjust their steady block by adding the new offset
+            # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(server_url, -offset)
 
     @classmethod
