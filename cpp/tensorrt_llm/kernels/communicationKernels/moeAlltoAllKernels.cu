@@ -13,7 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
  #include "tensorrt_llm/common/cudaUtils.h"
  #include "tensorrt_llm/common/vec_dtypes.cuh"
  #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
@@ -480,9 +481,9 @@ __device__ void vectorized_dispatch_impl(
      kernel_ptrs.topk_send_indices = params.topk_send_indices;
  
  
-     constexpr int kBlockSize = 256;
-     constexpr int kWarpSize = 32;
-     constexpr int kWarpsPerBlock = kBlockSize / kWarpSize;
+    int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+    constexpr int kWarpSize = 32;
+    int const kWarpsPerBlock = kBlockSize / kWarpSize;
  
     // Configure kernel launch
      if (params.one_block_per_token)
@@ -498,7 +499,7 @@ __device__ void vectorized_dispatch_impl(
      }
      else
      {
-         int grid_size = ceilDiv(params.local_num_tokens,kWarpsPerBlock);
+        int grid_size = ceilDiv(params.local_num_tokens,kWarpsPerBlock);
         int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
          SWITCH_TOP_K(params.top_k, TOP_K,
             moeA2ADispatchKernel<WarpPolicy, TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
@@ -698,6 +699,7 @@ __device__ void vectorized_dispatch_impl(
          return;
      }
  
+#if !DISABLE_SYNC_FOR_PROFILING
      // In-kernel readiness synchronization at start of combine:
      // - Block 0, thread 0 signals readiness to all peers with current flag_val.
      // - Thread 0 of each block waits for all peers' readiness (equality), then __syncthreads.
@@ -713,8 +715,7 @@ __device__ void vectorized_dispatch_impl(
              #endif
          }
      }
- 
- #if !DISABLE_SYNC_FOR_PROFILING
+
      if (threadIdx.x == 0)
      {
          uint32_t expected_value = *ptrs.flag_val;
@@ -775,7 +776,7 @@ __device__ void vectorized_dispatch_impl(
      
      if (params.one_block_per_token)
      {
-         moeA2APrepareCombineKernel<BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(
+        moeA2APrepareCombineKernel<BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(
              static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])), 
              static_cast<const uint8_t*>(params.prepare_payload),
              bytes_per_token,
@@ -786,7 +787,7 @@ __device__ void vectorized_dispatch_impl(
      }
      else
      {
-         moeA2APrepareCombineKernel<WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(
+        moeA2APrepareCombineKernel<WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(
              static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])), 
              static_cast<const uint8_t*>(params.prepare_payload),
              bytes_per_token,
@@ -811,8 +812,8 @@ __device__ void vectorized_dispatch_impl(
      TLLM_CHECK(params.elements_per_token > 0);
  
      // Configure kernel launch
-     constexpr int kBlockSize = 256;
-     constexpr int kWarpsPerBlock = kBlockSize / 32; // warpSize
+    int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
+    int const kWarpsPerBlock = kBlockSize / 32; // warpSize
      int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
      int grid_size_block = params.local_num_tokens;
  
@@ -854,7 +855,7 @@ __device__ void vectorized_dispatch_impl(
                params.ep_size);
            };
            int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
-           int cta  = kBlockSize;
+          int cta  = kBlockSize;
            launch(grid, cta);
          });
        });
