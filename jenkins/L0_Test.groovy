@@ -661,8 +661,6 @@ def ONLY_MULTI_GPU_TEST = "only_multi_gpu_test"
 @Field
 def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 @Field
-def ONLY_PERF_SANITY_TEST = "only_perf_sanity_test"
-@Field
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
@@ -1682,7 +1680,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "${bench_dir}/run_benchmark_serve.py",
                 "--output_folder ${output_folder}",
                 "--config_file ${bench_dir}/${config_file}",
-                // "--timeout ${testTimeout}",
+                "--timeout ${testTimeout}",
+            ]
+
+            def printOutputCmdLine = [
+                "python3",
+                "${bench_dir}/parse_benchmark_results.py",
+                "--config_file ${bench_dir}/${config_file}",
+                "--input_folder ${output_folder}",
+                "--print_perf",
             ]
 
             def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
@@ -1706,6 +1712,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         sh """
                             sh "mkdir -p ${output_folder}"
                             sh "${testCmdLine.join(" ")}"
+                            sh "${printOutputCmdLine.join(" ")}"
                         """
                     } catch (InterruptedException e) {
                         throw e
@@ -2592,11 +2599,6 @@ def launchTestJobs(pipeline, testFilter)
     // Check --disable-multi-gpu-test, if true, remove multi-GPU test stages.
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         parallelJobsFiltered -= multiGpuJobs
-    }
-
-    // Check --only-perf-sanity-test, if true, only run perf sanity test stages.
-    if (testFilter[(ONLY_PERF_SANITY_TEST)]) {
-        parallelJobsFiltered = perfSanityJobs
     }
 
     // Check --gpu-type, filter test stages.

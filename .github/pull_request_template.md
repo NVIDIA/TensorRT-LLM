@@ -86,8 +86,6 @@ Launch build/test pipelines. All previously running jobs will be killed.
 
 `--only-multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitHub check status.
 
-`--only-perf-sanity-test` *(OPTIONAL)* : Only run perf sanity tests. Note: Does **NOT** update GitHub check status.
-
 `--disable-multi-gpu-test ` *(OPTIONAL)* : Disable the multi-GPU tests. Note: Does **NOT** update GitHub check status.
 
 `--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests in addition to running L0 pre-merge pipeline.
