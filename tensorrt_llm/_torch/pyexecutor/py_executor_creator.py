@@ -81,9 +81,8 @@ class _ExecutorMemoryMonitor():
         elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
               and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
               in str(e)):
-            msg = (
-                "Executor creation failed with an error which might indicate "
-                "insufficient GPU memory.")
+            msg = (f"Executor creation failed with NCCL error: {str(e)}")
+            return msg
         else:
             return None
 
