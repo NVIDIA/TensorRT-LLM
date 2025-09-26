@@ -20,12 +20,92 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "transfer_engine_c.h"
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+class MooncakeTransferStatus final : public TransferStatus
+{
+public:
+    MooncakeTransferStatus(transfer_engine_t engine, uint64_t batchId, size_t requestCount);
+
+    [[nodiscard]] bool isCompleted() const override;
+
+    void wait() const override;
+
+private:
+    transfer_engine_t mEngine;
+    uint64_t mBatchId;
+    size_t mRequestCount;
+};
+
+class MooncakeMemoryDesc
+{
+public:
+    MooncakeMemoryDesc(MemoryDesc desc)
+        : mDesc{std::move(desc)}
+        , mRefCnt{0}
+    {
+    }
+
+    MooncakeMemoryDesc(MooncakeMemoryDesc const& other)
+        : mDesc{other.mDesc}
+        , mRefCnt{0}
+    {
+    }
+
+    MooncakeMemoryDesc& operator=(MooncakeMemoryDesc const&) = delete;
+
+    ~MooncakeMemoryDesc() = default;
+
+    void addRef() noexcept
+    {
+        ++mRefCnt;
+    }
+
+    int releaseRef() noexcept
+    {
+        return --mRefCnt;
+    }
+
+    int getRefCount() const noexcept
+    {
+        return mRefCnt;
+    }
+
+    MemoryDesc const& getDesc() const noexcept
+    {
+        return mDesc;
+    }
+
+private:
+    MemoryDesc mDesc;
+    int mRefCnt;
+};
+
+class MooncakeBase64Helper
+{
+public:
+    static std::string encode(std::vector<uint8_t> const& data);
+    static std::string encode(std::string const& data);
+
+    static std::vector<uint8_t> decode(std::string const& encoded);
+    static std::string decodeToString(std::string const& encoded);
+
+private:
+    static const std::string STANDARD_CHARS;
+
+    static std::string encodeInternal(std::vector<uint8_t> const& data, std::string const& chars);
+    static std::vector<uint8_t> decodeInternal(std::string const& encoded, std::string const& chars);
+
+    static inline bool is_base64(unsigned char c, std::string const& chars);
+    static inline bool is_whitespace(unsigned char c);
+};
+
 class MooncakeTransferAgent final : public BaseTransferAgent
 {
 public:
@@ -44,18 +124,6 @@ public:
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 
-    /*
-     [[nodiscard]] TransferEngine* getRawAgent() const noexcept
-    {
-        return mRawAgent.get();
-    }
-
-    nixl_opt_args_t* getExtraParams() noexcept
-    {
-        return &mExtraParams;
-    }
-    */
-
     void notifySyncMessage(std::string const& name, SyncMessage const& syncMessage) override;
 
     [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
@@ -69,12 +137,28 @@ public:
 private:
     struct AgentInfo
     {
-        int segment_id;
+        int segmentId;
     };
 
-    mutable std::mutex mutex_;
-    transfer_engine_t engine_;
-    std::string local_agent_name_;
-    std::string segment_name_;
+    mutable std::mutex mMutex;
+    transfer_engine_t mEngine;
+    std::unordered_map<uintptr_t, std::shared_ptr<MooncakeMemoryDesc>> mMemRegInfo;
+    std::unordered_map<std::string, AgentInfo> mConnectedAgents;
+    std::string mLocalAgentName;
 };
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+#endif
+
+extern "C"
+{
+    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createMooncakeTransferAgent(BaseAgentConfig const* config);
+}
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
 } // namespace tensorrt_llm::executor::kv_cache
