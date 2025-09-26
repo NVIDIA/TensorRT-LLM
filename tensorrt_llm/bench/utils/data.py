@@ -9,6 +9,8 @@ from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -43,7 +45,7 @@ def create_dataset_from_stream(
     modality: str = None,
     image_data_format: str = "pt",
     data_device: str = "cpu",
-    max_input_seq_len_for_multimodal: int = 4096,
+    processor: DefaultInputProcessor = None,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:
     """Generate metadata and a list of requests to drive benchmarking.
 
@@ -127,7 +129,7 @@ def create_dataset_from_stream(
             "image", "video"
         ], f"Modality must be one of ['image', 'video'] but got {modality}."
         prompts = default_multimodal_input_loader(
-            tokenizer=tokenizer,
+            tokenizer=processor.tokenizer,
             model_dir=model_dir,
             model_type=model_type,
             modality=modality,
@@ -135,16 +137,29 @@ def create_dataset_from_stream(
             media=media_paths,  # list of dicts
             image_data_format=image_data_format,
             device=data_device)
+        for i in range(len(prompts)):
+            prompt = prompts[i]
+            prompt_token_ids, extra_processed_inputs = processor(prompt, None)
+            multimodal_params = MultimodalParams(
+                multimodal_input=extra_processed_inputs.get('multimodal_input'),
+                multimodal_data=extra_processed_inputs.get('multimodal_data'))
+            # Only pass it if it has content
+            if not multimodal_params.has_content():
+                multimodal_params = None
+            else:
+                # Convert to shared tensor handle to reduce IPC overhead
+                multimodal_params.to_handle("multimodal_data")
+            prompt['multimodal_params'] = multimodal_params
+            prompt['prompt_token_ids'] = prompt_token_ids
+            all_logits[i] = prompt_token_ids
 
     all_isl = []
     all_seq_len = []
     for prompt, logits, osl, task_id, lora_request in zip(
             prompts, all_logits, all_osl, task_ids, lora_requests):
         if modality is not None:
-            # NOTE: we cannot tokenize multi-modal data, handled by preprocessor
-            #       so the actual sequence length is unknown until the model is run
-            logits = None
-            cur_isl = max_input_seq_len_for_multimodal
+            # NOTE: For multimodal models, we assume that all the inputs are processed by the input processor.
+            cur_isl = len(logits)
         else:
             # If the request comes in with logits, just use the provided.
             # Otherwise we need to tokenize it.
