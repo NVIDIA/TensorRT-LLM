@@ -171,7 +171,8 @@ public:
 
         // Log runtime strategy
         auto const rank = COMM_SESSION.getRank();
-        logRunTimeStrategy(runtime_strategy, rank);
+        TLLM_LOG_DEBUG(
+            "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
 
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
@@ -687,49 +688,6 @@ private:
             }
         }
         return runtime_strategy;
-    }
-
-    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
-    {
-        switch (strategy)
-        {
-        case AllReduceStrategyType::NCCL:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
-            break;
-        }
-        case AllReduceStrategyType::NCCL_SYMMETRIC:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
-            break;
-        }
-        case AllReduceStrategyType::MIN_LATENCY:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
-            break;
-        }
-        case AllReduceStrategyType::ONESHOT:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: ONESHOT", rank);
-            break;
-        }
-        case AllReduceStrategyType::TWOSHOT:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: TWOSHOT", rank);
-            break;
-        }
-        case AllReduceStrategyType::UB:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
-            break;
-        }
-        case AllReduceStrategyType::LOWPRECISION:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
-            break;
-        }
-        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
-        }
     }
 
     void initGroupTopology()

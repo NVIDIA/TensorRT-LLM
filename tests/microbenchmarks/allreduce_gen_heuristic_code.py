@@ -18,14 +18,14 @@ def process_allreduce_df(fname):
 @dataclass
 class Constants:
     # 16384
-    num_tokens_bits = 14
-    hidden_size_bits = 13
+    num_tokens_bits = 15
+    hidden_size_bits = 14
     max_num_tokens_considered = 2**num_tokens_bits
     max_hidden_size_considered = 2**hidden_size_bits
     oneshot_num_tokens_threshold: int = 1
-    oneshot_hidden_size_threshold = 1
+    oneshot_hidden_size_threshold = 128
     num_tokens_list = [2**i for i in range(num_tokens_bits)]
-    hidden_size_list = [2**i for i in range(hidden_size_bits)]
+    hidden_size_list = [2**i for i in range(7, hidden_size_bits)]
     fusion_op_list = ['NONE', 'RESIDUAL_RMS_NORM']
     tp_size_list = [2, 4, 8]
     strategy_name_to_enum = {
@@ -118,8 +118,9 @@ def generate_heuristic_look_up_table(df: pd.DataFrame) -> str:
     return strategy_table
 
 
-def generate_cpp_array_code(strategy_table: np.ndarray, sm_version: int) -> str:
-    """Generate compressed C++ array code from numpy lookup table."""
+def generate_cpp_strategy_matrix_code(strategy_table: np.ndarray,
+                                      sm_version: int) -> str:
+    """Generate formatted C++ array code from numpy lookup table."""
     tp_size_count, fusion_count, hidden_size_count, num_tokens_count = strategy_table.shape
 
     # Header with compact comments
@@ -128,17 +129,16 @@ def generate_cpp_array_code(strategy_table: np.ndarray, sm_version: int) -> str:
     cpp_code += f"// Hidden:{Constants.hidden_size_list} Tokens:{Constants.num_tokens_list}\n"
     cpp_code += f"inline AllReduceBestStrategyTableType AllReduceBestStrategyTableSM{sm_version} = {{\n"
 
-    # Generate compact array notation
+    # Generate formatted array notation
     for tp_idx in range(tp_size_count):
-        cpp_code += "    {"
+        cpp_code += "    {\n"
+        cpp_code += f"        // TP={Constants.tp_size_list[tp_idx]}\n"
+
         for fusion_idx in range(fusion_count):
-            if fusion_idx > 0:
-                cpp_code += ","
-            cpp_code += "{"
+            cpp_code += f"        {{ // Fusion={Constants.fusion_op_list[fusion_idx]}\n"
+
             for hidden_idx in range(hidden_size_count):
-                if hidden_idx > 0:
-                    cpp_code += ","
-                cpp_code += "{"
+                cpp_code += "            {"
                 # Put all token values on one line
                 token_values = []
                 for token_idx in range(num_tokens_count):
@@ -147,11 +147,19 @@ def generate_cpp_array_code(strategy_table: np.ndarray, sm_version: int) -> str:
                     token_values.append(str(value))
                 cpp_code += ",".join(token_values)
                 cpp_code += "}"
-            cpp_code += "}"
-        cpp_code += "}"
+                if hidden_idx < hidden_size_count - 1:
+                    cpp_code += ","
+                cpp_code += "\n"
+
+            cpp_code += "        }"
+            if fusion_idx < fusion_count - 1:
+                cpp_code += ","
+            cpp_code += "\n"
+
+        cpp_code += "    }"
         if tp_idx < tp_size_count - 1:
             cpp_code += ","
-        cpp_code += f"  // tp={Constants.tp_size_list[tp_idx]}\n"
+        cpp_code += "\n"
 
     cpp_code += "};\n"
     return cpp_code
@@ -161,7 +169,7 @@ def main():
     # add args
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default='data')
+    parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--sm_version", type=int, default=100)
     args = parser.parse_args()
     tp_size_list = [
@@ -175,6 +183,7 @@ def main():
     df = pd.DataFrame()
     sm_version = args.sm_version
     platform = 'B200' if sm_version == 100 else 'H200'
+
     for tp_size in tp_size_list:
         data_file = f"{args.data_dir}/benchmark.tp{tp_size}.{platform}.csv"
         df = pd.concat([df, process_allreduce_df(data_file)])
@@ -194,7 +203,7 @@ def main():
 
         print(f"\nGenerated C++ lookup table written to: {output_file}")
         print("\nFirst 20 lines of generated code:")
-        print('\n'.join(cpp_code.split('\n')[:20]))
+        print(cpp_code)
     else:
         print("Failed to load benchmark data")
 

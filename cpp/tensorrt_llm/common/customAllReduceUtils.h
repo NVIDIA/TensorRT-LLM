@@ -99,63 +99,116 @@ inline AllReduceStrategyType SelectStrategyLP(size_t seq_len, size_t hidden_size
 // num_tokens < 32 or hidden_size < 1024 -> ONESHOT
 // otherwise -> NCCL
 
+constexpr auto kHiddenSizeChoice = 13;
+constexpr auto kNumTokensChoice = 14;
+
 inline std::unordered_map<AllReduceFusionOp, int> mapFusionOpToIndex = {
     {AllReduceFusionOp::NONE, 0},
     {AllReduceFusionOp::RESIDUAL_RMS_NORM, 1},
 };
 
-auto const kHiddenSizeChoice = 13;
-auto const kNumTokensChoice = 14;
-constexpr auto kMaxNumTokensConsidered = 1 << kNumTokensChoice;
-constexpr auto kMaxHiddenSizeConsidered = 1 << kHiddenSizeChoice;
-
 // AllReduce lookup: [tp][fusion][hidden][tokens] = strategy
 // TP:[2, 4, 8] Fusion:['NONE', 'RESIDUAL_RMS_NORM']
-// Hidden:[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] Tokens:[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
-// 2048, 4096, 8192]
-using AllReduceBestStrategyTableType = std::vector<std::vector<std::vector<std::vector<int>>>>;
-inline AllReduceBestStrategyTableType AllReduceBestStrategyTableSM100 = {
-    {{{4, 4, 5, 4, 4, 4, 4, 4, 0, 0}, {4, 4, 4, 5, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 0, 0, 0, 0},
-         {4, 4, 4, 4, 4, 0, 0, 0, 0, 0}},
-        {{4, 4, 4, 4, 4, 4, 4, 4, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 0, 0, 0, 0},
-            {4, 4, 4, 4, 4, 0, 0, 0, 0, 0}}}, // tp=2
-    {{{4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
-         {4, 4, 4, 5, 0, 0, 0, 0, 0, 0}},
-        {{4, 4, 5, 4, 4, 4, 5, 0, 0, 0}, {4, 4, 4, 4, 4, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
-            {4, 4, 4, 4, 0, 0, 0, 0, 0, 0}}}, // tp=4
-    {{{4, 4, 4, 4, 4, 5, 5, 0, 0, 0}, {4, 4, 4, 4, 5, 5, 0, 0, 0, 0}, {4, 4, 4, 5, 5, 0, 0, 0, 0, 0},
-         {4, 4, 5, 5, 0, 0, 0, 0, 0, 0}},
-        {{4, 4, 4, 4, 4, 5, 5, 0, 0, 0}, {4, 4, 4, 4, 4, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
-            {4, 4, 4, 5, 0, 0, 0, 0, 0, 0}}} // tp=8
-};
+// Hidden:[128, 256, 512, 1024, 2048, 4096, 8192] Tokens:[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+// 16384]
 
-inline std::unordered_map<int, AllReduceBestStrategyTableType> AllReduceBestStrategyTable = {
-    {90, AllReduceBestStrategyTableSM90},
-    {100, AllReduceBestStrategyTableSM100},
-};
+using AllReduceBestStrategyTableType = std::vector<std::vector<std::vector<std::vector<int>>>>;
+
+// Forward declarations for strategy tables
+extern const std::unordered_map<int, AllReduceBestStrategyTableType> AllReduceBestStrategyTable;
 
 inline AllReduceStrategyType selectStrategyLookUpTable(
     size_t num_tokens, size_t hidden_size, AllReduceFusionOp fusionOp, int tp_size)
 {
-    if (num_tokens < kMaxNumTokensConsidered || hidden_size < kMaxHiddenSizeConsidered)
-    {
-        return AllReduceStrategyType::ONESHOT;
-    }
-
     auto sm_version = (size_t) std::min(100, std::max(90, tensorrt_llm::common::getSMVersion()));
     auto tp_index = (size_t) std::log2(tp_size) - 1;
     auto fusion_op_index = (size_t) mapFusionOpToIndex.find(fusionOp)->second;
-    auto num_token_pow2 = (size_t) std::log2(num_tokens);
-    auto hidden_size_pow2 = (size_t) std::log2(hidden_size);
+    auto num_token_index = (size_t) std::log2(num_tokens);
+    auto hidden_size_index = (size_t) std::log2(hidden_size) - 7;
 
-    if (tp_index >= 3 || fusion_op_index >= mapFusionOpToIndex.size() || num_token_pow2 >= kNumTokensChoice
-        || hidden_size_pow2 >= kHiddenSizeChoice)
+    if (tp_index >= 3 || fusion_op_index >= mapFusionOpToIndex.size() || num_token_index >= kNumTokensChoice
+        || hidden_size_index >= kHiddenSizeChoice)
     {
         return AllReduceStrategyType::NCCL;
     }
 
     return static_cast<AllReduceStrategyType>(
-        AllReduceBestStrategyTable[sm_version][tp_index][fusion_op_index][num_token_pow2][hidden_size_pow2]);
+        AllReduceBestStrategyTable.at(sm_version)[tp_index][fusion_op_index][hidden_size_index][num_token_index]);
 }
 
+// Strategy table definitions
+inline const AllReduceBestStrategyTableType AllReduceBestStrategyTableSM90
+    = {{    // TP=2
+           {// Fusion=NONE
+               {4, 4, 4, 4, 4, 5, 5, 4, 4, 4, 5, 4, 0, 0, 0}, {4, 4, 5, 5, 4, 4, 4, 5, 4, 4, 4, 4, 4, 0, 0},
+               {4, 4, 5, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4, 0, 0}, {4, 4, 5, 4, 4, 4, 5, 4, 4, 5, 4, 4, 0, 0, 0},
+               {4, 4, 4, 4, 4, 5, 4, 4, 5, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 5, 4, 4, 4, 5, 4, 4, 4, 0, 0, 0, 0},
+               {4, 4, 4, 4, 5, 5, 5, 4, 4, 4, 0, 0, 0, 0, 0}},
+           {// Fusion=RESIDUAL_RMS_NORM
+               {4, 4, 4, 4, 5, 5, 5, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0},
+               {4, 4, 4, 4, 4, 4, 5, 5, 4, 4, 4, 4, 4, 0, 0}, {4, 4, 5, 5, 4, 5, 4, 5, 4, 4, 4, 4, 0, 0, 0},
+               {4, 5, 5, 4, 4, 4, 5, 4, 4, 4, 4, 5, 0, 0, 0}, {4, 5, 4, 5, 5, 5, 4, 5, 4, 4, 4, 0, 0, 0, 0},
+               {4, 4, 4, 4, 5, 5, 5, 4, 4, 4, 0, 0, 0, 0, 0}}},
+        {    // TP=4
+            {// Fusion=NONE
+                {4, 4, 4, 5, 4, 5, 4, 4, 5, 5, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 5, 5, 4, 5, 4, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 5, 5, 4, 4, 4, 5, 0, 0, 0}, {4, 4, 4, 4, 5, 4, 5, 5, 5, 4, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 5, 4, 4, 5, 4, 5, 5, 0, 0, 0, 0}, {4, 4, 5, 4, 4, 4, 5, 4, 5, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 5, 5, 4, 5, 5, 0, 0, 0, 0, 0, 0}},
+            {// Fusion=RESIDUAL_RMS_NORM
+                {4, 4, 4, 5, 4, 5, 5, 4, 5, 5, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 5, 5, 4, 4, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0}, {4, 4, 4, 5, 4, 4, 4, 4, 4, 5, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 5, 4, 4, 4, 5, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 5, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0, 0}}},
+        {    // TP=8
+            {// Fusion=NONE
+                {4, 4, 4, 4, 4, 4, 4, 5, 5, 4, 4, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0}},
+            {// Fusion=RESIDUAL_RMS_NORM
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 0, 5, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 0, 5, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0}}}};
+
+inline const AllReduceBestStrategyTableType AllReduceBestStrategyTableSM100
+    = {{    // TP=2
+           {// Fusion=NONE
+               {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 5, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+               {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0}, {4, 4, 4, 4, 4, 4, 4, 5, 4, 4, 4, 4, 4, 0, 0},
+               {4, 4, 5, 5, 4, 4, 4, 4, 5, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0},
+               {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0}},
+           {// Fusion=RESIDUAL_RMS_NORM
+               {4, 4, 4, 4, 4, 5, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+               {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0}, {4, 4, 4, 4, 5, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0},
+               {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0},
+               {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0}}},
+        {    // TP=4
+            {// Fusion=NONE
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0, 0}},
+            {// Fusion=RESIDUAL_RMS_NORM
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 5, 4, 4, 4, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0}}},
+        {    // TP=8
+            {// Fusion=NONE
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0, 0, 0, 0}},
+            {// Fusion=RESIDUAL_RMS_NORM
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0}, {4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0},
+                {4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 0, 0, 0}}}};
+
+inline const std::unordered_map<int, AllReduceBestStrategyTableType> AllReduceBestStrategyTable = {
+    {90, AllReduceBestStrategyTableSM90},
+    {100, AllReduceBestStrategyTableSM100},
+};
 } // namespace tensorrt_llm::utils::customAllReduceUtils

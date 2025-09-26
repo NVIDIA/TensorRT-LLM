@@ -110,11 +110,13 @@ def profile_allreduce(
     return median_ms
 
 
-def allreduce_benchmark(dtype: str,
-                        test_range: str = "256,256000000,10",
-                        enable_cudagraph: bool = False,
-                        explore_2d: bool = False,
-                        output_csv: str = None):
+def allreduce_benchmark(
+    dtype: str = 'bfloat16',
+    test_range: str = "256,256000000,10",
+    enable_cudagraph: bool = False,
+    explore_2d: bool = False,
+    output_csv: str = None,
+):
     tllm.logger.set_level('error')
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -227,6 +229,8 @@ def allreduce_benchmark(dtype: str,
     # # save the dataframe to a csv file
     if mapping.rank == 0 and output_csv is not None:
         df.to_csv(f"{output_csv}", index=False)
+
+    return df
 
 
 if __name__ == "__main__":
