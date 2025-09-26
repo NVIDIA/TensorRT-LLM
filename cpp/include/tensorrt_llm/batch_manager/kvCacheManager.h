@@ -239,6 +239,8 @@ public:
 
     [[nodiscard]] bool isFull() const;
 
+    [[nodiscard]] bool isLeaf() const;
+
 private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
@@ -607,7 +609,7 @@ public:
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool isSWA);
 
     ~WindowBlockManager();
 
@@ -810,6 +812,11 @@ public:
         return 0;
     }
 
+    [[nodiscard]] bool isSWA() const
+    {
+	return mIsSWA;
+    }
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -900,6 +907,9 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
+
+    // Whether this window block manager is for an SWA layer. Affects evicting policies
+    bool mIsSWA;
 };
 
 class BlockManager

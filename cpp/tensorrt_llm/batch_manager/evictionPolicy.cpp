@@ -187,9 +187,6 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     // Detach block from expiring heap (processing of time limited retention priority)
     mExpiringBlockHeap.erase(block);
     block->setDurationMs(durationMs);
-
-    // Detach block from search structure
-    block->setLookupNode(nullptr, nullptr);
 }
 
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const

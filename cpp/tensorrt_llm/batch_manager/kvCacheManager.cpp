@@ -612,6 +612,11 @@ bool KVCachePromptLookupNode::isFull() const
     return mIsFull;
 }
 
+bool KVCachePromptLookupNode::isLeaf() const
+{
+    return mNextNodes.empty();
+}
+
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
     std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
@@ -689,10 +694,11 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         }
         auto const [allottedPrimaryBlocks, allottedSecondaryBlocks] = blocksPerWindow.at(windowSize);
         TLLM_CHECK(allottedPrimaryBlocks > 0); // You can't have a model with negative primary blocks...
-        mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
+        auto isSWA = windowSize < maxSequenceLength;
+	mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
             sizePerHead, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks, maxNumSequences, stream,
             onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager, enablePartialReuse,
-            copyOnPartialReuse, kvCacheConnectorManager);
+            copyOnPartialReuse, kvCacheConnectorManager, isSWA);
     }
 
     auto const numAllPools = getNumPools();
@@ -735,7 +741,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
-    std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager)
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool isSWA)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -760,6 +766,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
     , mKvCacheConnectorManager{std::move(kvCacheConnectorManager)}
+    , mIsSWA{isSWA}
 {
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
@@ -1016,6 +1023,8 @@ BlockPtr WindowBlockManager::getFreeBlock(
         mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
         block = offloadBlock;
     }
+    // Detach block from search structure
+    block->setLookupNode(nullptr, nullptr);
 
     return block;
 }
@@ -1164,29 +1173,35 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
                         .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority),
                     mWindowSize);
             }
-            if (partialMatch && matchingBlock->hasRefs())
+            if (partialMatch)
             {
-                // Somebody else is using partially filled block, copy reusable tokens
-                auto newBlock = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs());
-                mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched);
-                // TODO: (optional) Send out event
-                matchingBlock = newBlock;
-                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
-                    matchingBlockId);
+                if (matchingBlock->hasRefs() || (!isSWA() && !matchingNode->isLeaf()))
+                {
+                    // Somebody else is using block or it is not a leaf, copy reusable tokens
+                    auto newBlock = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs());
+                    mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched);
+                    // TODO: (optional) Send out event
+                    matchingBlock = newBlock;
+                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
+                        matchingBlockId);
+                }
+                else
+                {
+                    // Leaf block that nobody is using. Make block private and reuse
+                    mEvictionPolicy->claimBlock(
+                        matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
+		    // Free block from search structure
+		    matchingBlock->setLookupNode(nullptr, nullptr);
+                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
+                        matchingBlockId);
+                }
             }
             else
             {
                 // Recover block and reuse
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-		if (partialMatch)
-		{
-		    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched partially filled block %d", mLogPrefix.c_str(), matchingBlockId);
-		}
-		else
-		{
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
-		}
+                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
             }
             onboardBlock(matchingBlock);
             addBlockToAllBeams(matchingBlock, sequence);
