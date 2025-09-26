@@ -718,6 +718,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, fused_scale)
 
     def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
         if is_sm_100f():
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)

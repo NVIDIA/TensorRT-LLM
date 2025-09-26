@@ -729,6 +729,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         super().load_weights(module, weights, weight_loading_mode)
 
     def post_load_weights(self, module: torch.nn.Module):
+        super().post_load_weights(module)
         if is_sm_100f():
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 module.quant_scales[0],
