@@ -377,9 +377,8 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
              {
                  // Store the number of tokens sent by this rank to the recv_counters of the target rank
                  // TODO: Are acquire and release necessary here?
-                 int send_count;
-                 asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(send_count) : "l"(&ptrs.send_counters[target_rank]));
-                 asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(&ptrs.recv_counters[target_rank][rank_id]), "r"(send_count));
+                 int send_count = ptrs.send_counters[target_rank];
+                 ptrs.recv_counters[target_rank][rank_id] = send_count;
                  
                  uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                  uint32_t flag_value = *ptrs.flag_val;
