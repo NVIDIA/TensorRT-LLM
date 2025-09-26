@@ -1767,11 +1767,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
-                sh """
-                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
-                    ${stageName}/perf_script_test_results.csv \
-                    ${basePerfPath}
-                """
+                def perfCheckResult = sh(
+                    script: """
+                        python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
+                        ${stageName}/perf_script_test_results.csv \
+                        ${basePerfPath}
+                    """,
+                    returnStatus: true
+                )
+                if (perfCheckResult != 0) {
+                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                }
             }
             stage("Create perf report") {
                 sh """

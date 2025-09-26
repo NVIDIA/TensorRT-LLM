@@ -105,8 +105,11 @@ class CapturedGraph(nn.Module):
             for input in args_batched
         ]
 
-        # create new args, kwargs with the input buffers and static args
-        args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
+        # truncate input buffers to cuda_graph_max_batch_size
+        inputs_truncated = [
+            in_buffer[: self.cuda_graph_max_batch_size] for in_buffer in self._input_buffers
+        ]
+        args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
 
         # capture output once with cuda_graph_max_batch_size to capture output buffers
         with CudaGraphWarmUpPhase():
@@ -118,11 +121,6 @@ class CapturedGraph(nn.Module):
         # capture graph now for a range of batch sizes
         for bs in self.cuda_graph_batch_sizes:
             ad_logger.info(f"Capturing graph for batch size: {bs}")
-
-            # setup args, kwargs
-            inputs_truncated = [in_buffer[:bs] for in_buffer in self._input_buffers]
-            args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
-
             # capture graph for truncated inputs
             combined_shape = sum((input.shape for input in inputs_truncated), start=())
             self.graphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
@@ -141,9 +139,24 @@ class CapturedGraph(nn.Module):
             return self.model(*args, **kwargs)
 
         # Calculate rounded-up shapes for each input
+        # If any batch size exceeds max cuda_graph_batch_sizes, fall back to regular forward
+        rounded_batch_sizes = [
+            self.round_to_cuda_batch_size(input.shape[0]) for input in args_batched
+        ]
+
+        # If any rounded batch size is None (exceeds max), use regular forward
+        if any(bs is None for bs in rounded_batch_sizes):
+            actual_batch_sizes = [input.shape[0] for input in args_batched]
+            max_cuda_bs = max(self.cuda_graph_batch_sizes) if self.cuda_graph_batch_sizes else 0
+            ad_logger.debug(
+                f"Batch size {actual_batch_sizes} exceeds max CUDA graph batch size {max_cuda_bs}. "
+                f"Falling back to regular forward pass."
+            )
+            return self.model(*args, **kwargs)
+
         rounded_shapes = [
-            (self.round_to_cuda_batch_size(input.shape[0]),) + input.shape[1:]
-            for input in args_batched
+            (rounded_bs,) + input.shape[1:]
+            for rounded_bs, input in zip(rounded_batch_sizes, args_batched)
         ]
         combined_shape = sum(rounded_shapes, start=())
 
