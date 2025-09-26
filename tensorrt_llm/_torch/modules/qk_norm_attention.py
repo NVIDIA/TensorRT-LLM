@@ -157,7 +157,7 @@ class QKNormRoPEAttention(Attention):
         q_scaling: float = 1.0,
         disable_deep_gemm: bool = False,
         use_gemma_rms_norm: bool = False,
-        attn_output_gate: Optional[bool] = False,
+        attn_output_gate: Optional[bool] = None,
     ):
         self.pretrained_config = config.pretrained_config
 
