@@ -922,8 +922,9 @@ class PyExecutor:
                                     self.ctx_in_transmission_requests.append(
                                         (req, block_id))
 
-                        self._send_disagg_ctx_cache(
-                            previous_batch.scheduled_ctx_reqs)
+                        if self.kv_cache_transceiver:
+                            self._send_disagg_ctx_cache(
+                                previous_batch.scheduled_ctx_reqs)
                         self._handle_canceled_requests()
 
                         self._handle_logits_communication(

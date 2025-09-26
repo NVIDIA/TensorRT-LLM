@@ -244,12 +244,6 @@ class CacheSender::Impl
 public:
     using RequestIdType = LlmRequest::RequestIdType;
 
-    struct Response
-    {
-        LlmRequest* mRequest;
-        std::promise<void> mPromise;
-    };
-
     Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
         : mManager{manager}
