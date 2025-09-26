@@ -527,11 +527,15 @@ class PyTorchModelEngine(ModelEngine):
                 result = None
             return result
 
-        def get_warmup_request(num_tokens: int, num_gen_tokens: int):
+        def get_warmup_request(num_tokens: int,
+                               num_gen_tokens: int,
+                               least_requests: bool = True):
             available_tokens = kv_cache_manager.get_num_available_tokens(
                 self.runtime_draft_len)
             available_blocks = kv_cache_manager.get_num_free_blocks()
             if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
+                return None
+            if num_gen_tokens > self.batch_size:
                 return None
 
             num_extra_decoding_steps = get_num_extra_decoding_steps()
@@ -550,14 +554,28 @@ class PyTorchModelEngine(ModelEngine):
             num_full_seqs = 0
             num_left_over_tokens = 0
 
+            max_context_requests = self.batch_size - num_gen_tokens
+            if max_context_requests * max_seq_len < num_ctx_tokens:
+                return None
+
             if num_ctx_tokens > 0:
-                # We will try to assign as less context requests as possible to
-                # fill the num_ctx_tokens.
+                if least_requests:
+                    # We will try to assign as less context requests as possible to
+                    # fill the num_ctx_tokens.
 
-                # Num full sequences:
-                num_full_seqs = num_ctx_tokens // max_seq_len
-                num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
+                    # Num full sequences:
+                    num_full_seqs = num_ctx_tokens // max_seq_len
+                    num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
 
+                else:
+                    max_bs = min(num_ctx_tokens,
+                                 self.batch_size - num_gen_tokens)
+                    if num_ctx_tokens % max_bs == 0:
+                        num_full_seqs = max_bs
+                    else:
+                        num_full_seqs = max_bs - 1
+                    max_seq_len = num_ctx_tokens // num_full_seqs
+                    num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
                 num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens
                                                     > 0 else 0)
 
@@ -633,6 +651,32 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == CpType.STAR:
             return
 
+        def general_warmup(reverse: bool = False):
+            warmup_requests = set([
+                (1, 1),  # Specialize for 1 token.
+                (self.batch_size,
+                 self.batch_size),  # max_batch_size, pure generation
+                (2, 0),  # Non-one, pure context
+                (curr_max_num_tokens, 0),  # max_num_tokens, pure context
+            ])
+            if reverse:
+                warmup_requests = sorted(list(warmup_requests), reverse=reverse)
+
+            for warmup_num_tokens, warmup_num_gen_tokens in warmup_requests:
+                with release_batch(
+                        get_warmup_request(warmup_num_tokens,
+                                           warmup_num_gen_tokens)) as batch:
+                    if batch is None:
+                        # No KV cache space!
+                        continue
+                    logger.info(
+                        f"Run warmup with {warmup_num_tokens} tokens, include {warmup_num_gen_tokens} generation tokens"
+                    )
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+                    torch.cuda.synchronize()
+
         if self._torch_compile_enabled:
 
             warmup_requests = set([
@@ -645,21 +689,7 @@ class PyTorchModelEngine(ModelEngine):
 
             # Disable cuda graph capture here so that we can properly capture it later
             with self.no_cuda_graph():
-                for warmup_num_tokens, warmup_num_gen_tokens in warmup_requests:
-
-                    with release_batch(
-                            get_warmup_request(warmup_num_tokens,
-                                               warmup_num_gen_tokens)) as batch:
-                        if batch is None:
-                            # No KV cache space!
-                            continue
-                        logger.info(
-                            f"Run warmup with {warmup_num_tokens} tokens, include {warmup_num_gen_tokens} generation tokens"
-                        )
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
-                        torch.cuda.synchronize()
+                general_warmup()
 
         if self.pytorch_backend_config.enable_autotuner:
             with self.no_cuda_graph(), autotune():
@@ -762,6 +792,27 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
                             gc.collect()
                             torch.cuda.empty_cache()
+
+            # When using piecewise cuda graph, the logits may suffer severe memory faction problem.
+            # When the num of requests is growing, the block allocated by torch cannot be reused.
+            # So after piecewise cuda graph capture, a request with most requests is triggered to make
+            # sure that large enough blocks are allocated and can be correctly reused.
+            for num_tokens in piecewise_cuda_graph_num_tokens:
+                batch = get_warmup_request(num_tokens, 0, False)
+                if batch is None:
+                    continue
+                with release_batch(batch) as batch:
+                    logger.info(
+                        f"Run piecewise CUDA graph warmup for num tokens={num_tokens} with most requests"
+                    )
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+
+                    torch.cuda.synchronize()
+
+            # Also, we run a general warmup from large to small to make sure that blocks are allocated well.
+            general_warmup(reverse=True)
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
