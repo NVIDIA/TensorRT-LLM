@@ -20,48 +20,52 @@ class RemoteCall:
         self.args = args
         self.kwargs = kwargs
 
+    def _prepare_and_call(self, timeout: Optional[float], need_response: bool,
+                          mode: str, call_method: str) -> Any:
+        """Common method to prepare RPC params and make the call.
+
+        Args:
+            timeout: Timeout for the RPC call
+            need_response: Whether a response is expected
+            mode: The RPC mode ("sync", "async", "future")
+            call_method: The method name to call on the client
+
+        Returns:
+            The result of the client method call
+        """
+        rpc_params = RPCParams(timeout=timeout,
+                               need_response=need_response,
+                               mode=mode)
+        self.kwargs["__rpc_params"] = rpc_params
+        client_method = getattr(self.client, call_method)
+        return client_method(self.method_name, *self.args, **self.kwargs)
+
     def remote(self,
                timeout: Optional[float] = None,
                need_response: bool = True) -> Any:
         """Synchronous remote call with optional RPC parameters."""
-        rpc_params = RPCParams(timeout=timeout,
-                               need_response=need_response,
-                               mode="sync")
-        self.kwargs["__rpc_params"] = rpc_params
-        return self.client._call_sync(self.method_name, *self.args,
-                                      **self.kwargs)
+        return self._prepare_and_call(timeout, need_response, "sync",
+                                      "_call_sync")
 
     def remote_async(self,
                      timeout: Optional[float] = None,
                      need_response: bool = True):
         """Asynchronous remote call that returns a coroutine."""
-        rpc_params = RPCParams(timeout=timeout,
-                               need_response=need_response,
-                               mode="async")
-        self.kwargs["__rpc_params"] = rpc_params
-        return self.client._call_async(self.method_name, *self.args,
-                                       **self.kwargs)
+        return self._prepare_and_call(timeout, need_response, "async",
+                                      "_call_async")
 
     def remote_future(self,
                       timeout: Optional[float] = None,
                       need_response: bool = True) -> concurrent.futures.Future:
         """Remote call that returns a Future object."""
-        rpc_params = RPCParams(timeout=timeout,
-                               need_response=need_response,
-                               mode="future")
-        self.kwargs["__rpc_params"] = rpc_params
-        return self.client.call_future(self.method_name, *self.args,
-                                       **self.kwargs)
+        return self._prepare_and_call(timeout, need_response, "future",
+                                      "call_future")
 
     def remote_streaming(self,
                          timeout: Optional[float] = None) -> AsyncIterator[Any]:
         """Remote call for streaming results."""
-        rpc_params = RPCParams(timeout=timeout,
-                               need_response=True,
-                               mode="async")
-        self.kwargs["__rpc_params"] = rpc_params
-        return self.client.call_streaming(self.method_name, *self.args,
-                                          **self.kwargs)
+        # Streaming always needs a response
+        return self._prepare_and_call(timeout, True, "async", "call_streaming")
 
 
 class RPCClient:
@@ -309,7 +313,7 @@ class RPCClient:
                 res = await future
             else:
                 # Add 1 second to the timeout to ensure the client can get
-                res = await asyncio.wait_for(future, timeout + 1)
+                res = await asyncio.wait_for(future, timeout)
             logger_debug(
                 f"RPC Client _call_async: Got result for request_id: {request_id}: {res}"
             )
@@ -361,7 +365,7 @@ class RPCClient:
             f"RPC Client _call_sync: Got result for {method_name}: {result}")
         return result
 
-    def call_async(self, name: str, *args, **kwargs):
+    def call_async(self, name: str, *args, **kwargs) -> Any:
         """
         Call a remote method asynchronously.
 
@@ -408,7 +412,7 @@ class RPCClient:
 
         return self._executor.submit(_async_to_sync)
 
-    def call_sync(self, name: str, *args, **kwargs):
+    def call_sync(self, name: str, *args, **kwargs) -> Any:
         """
         Call a remote method synchronously (blocking).
 
@@ -476,7 +480,7 @@ class RPCClient:
                     response = await queue.get()
                 else:
                     response = await asyncio.wait_for(queue.get(),
-                                                      timeout=timeout + 1)
+                                                      timeout=timeout)
 
                 logger_debug(
                     f"RPC Client call_streaming received [{response.stream_status}] response: {response}",

@@ -1,3 +1,5 @@
+import time
+from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Optional
 
 
@@ -48,7 +50,8 @@ class RPCStreamingError(RPCError):
     """Exception for streaming-related errors."""
 
 
-class RPCRequest(NamedTuple):
+@dataclass
+class RPCRequest:
     request_id: str
     method_name: str
     args: tuple
@@ -56,6 +59,13 @@ class RPCRequest(NamedTuple):
     need_response: bool = True
     timeout: float = 0.5
     is_streaming: bool = False
+    creation_timestamp: Optional[
+        float] = None  # Unix timestamp when request was created
+
+    def __post_init__(self):
+        """Initialize creation_timestamp if not provided."""
+        if self.creation_timestamp is None:
+            self.creation_timestamp = time.time()
 
 
 class RPCResponse(NamedTuple):
