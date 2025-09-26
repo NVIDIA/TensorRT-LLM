@@ -219,7 +219,7 @@ CacheTransBufferManager::CacheTransBufferManager(
         = maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
+    mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
         && FabricMemory::supportFbaricMemory();
     if (mUseFabricMemory)
@@ -269,7 +269,7 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         TransferBufferSize = FabricMemory::getAlignedSize(TransferBufferSize);
     }
     size_t RecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
-    size_t SendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
+    size_t SendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     size_t PreAllocBufferSize = TransferBufferSize * (RecvBufferCount + SendBufferCount);
     return PreAllocBufferSize;
 }

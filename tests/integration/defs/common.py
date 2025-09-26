@@ -647,7 +647,7 @@ def get_trt_llm_lib_dir(venv):
         "import tensorrt_llm; print(f'{tensorrt_llm.__path__[0]}/libs')",
         caller=check_output).strip()
 
-    if "TensorRT-LLM version: " in output:
+    if "TensorRT LLM version: " in output:
         output = output.split('\n')[-1]
 
     return output.strip()

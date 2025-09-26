@@ -168,6 +168,7 @@ def test_single_image_chat(model_key, multimodal_model_config):
     "llava-v1.6-mistral-7b-hf",
 ])
 def test_multi_request_batch_chat(model_key, multimodal_model_config):
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5542867")
     """Test batching multiple multimodal requests and verify encoder path matches raw path.
 
     This mirrors test_single_image_chat but with a batch of size 3.

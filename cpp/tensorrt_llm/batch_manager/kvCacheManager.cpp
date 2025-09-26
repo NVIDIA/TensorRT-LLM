@@ -618,12 +618,12 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             mAbsolutePoolToWindowSize.push_back(windowSize);
             mAbsolutePoolToRelativePoolIndex.push_back(i);
         }
-        // (eop) SWA allocates blocks linearly, and we need as many blocks as full attention,
+        // SWA allocates blocks linearly, and we need as many blocks as full attention,
         // where full attention has windowSize = maxSequenceLength.
         auto const maxTokenNum = std::max(windowSize, maxSequenceLength) + sinkBubbleLength;
         auto const temporaryAttentionWindow = manager.calculateTemporaryAttentionWindow(tempAttentionWindowInputs);
         // Consider the temporaryAttentionWindow when allocating blocks.
-        // (eop) Current tempAttentionWindow calculation does not consider the
+        // Current tempAttentionWindow calculation does not consider the
         // concept of SWA right now at most occupying maxSequenceLength of
         // blocks. So the calculation of maxToken + tempAttention will exceed
         // maxSequenceLength. A temporary resolution here is to cap the
