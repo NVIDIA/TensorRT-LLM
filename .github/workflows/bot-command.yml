@@ -56,6 +56,7 @@ jobs:
             "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitHub check status.\n\n" +
             "`--test-backend \"pytorch, cpp\"` *(OPTIONAL)* : Skip test stages which don't match the specified backends. Only support [pytorch, cpp, tensorrt, triton]. Examples: \"pytorch, cpp\" (does not run test stages with tensorrt or triton backend). Note: Does **NOT** update GitHub pipeline status.\n\n" +
             "`--only-multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--only-perf-sanity-test ` *(OPTIONAL)* : Only run the perf sanity tests. Note: Does **NOT** update GitHub check status.\n\n" +
             "`--disable-multi-gpu-test ` *(OPTIONAL)* : Disable the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
             "`--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests in addition to running L0 pre-merge pipeline.\n\n" +
             "`--post-merge ` *(OPTIONAL)* : Run the L0 post-merge pipeline instead of the ordinary L0 pre-merge pipeline.\n\n" +
