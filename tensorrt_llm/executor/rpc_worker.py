@@ -76,9 +76,6 @@ class RpcWorker(BaseWorker):
         """ Submits a request to the worker. """
         super().submit(request)
 
-    def fetch_stats(self) -> list:
-        return super().fetch_stats()
-
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         logger_debug(f"RpcWorker {mpi_rank()} is fetching responses",
                      color="yellow")
@@ -109,6 +106,11 @@ class RpcWorker(BaseWorker):
     async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
         return await asyncio.to_thread(self.fetch_stats)
 
+    async def fetch_kv_cache_events_async(self,
+                                          timeout: Optional[float] = None
+                                          ) -> list:
+        return await asyncio.to_thread(self.fetch_kv_cache_events)
+
     # for streaming performance
     async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
         while not self.shutdown_event.is_set():
@@ -125,19 +127,49 @@ class RpcWorker(BaseWorker):
             f"RpcWorker {mpi_rank()} quitting fetch_responses_loop_async",
             color="yellow")
 
+    async def _generic_fetch_loop_async(
+            self,
+            fetch_method,
+            serializer,
+            method_name: str,
+            timeout: Optional[float] = None) -> AsyncGenerator[list, None]:
+        """Generic method for fetching data in a loop.
+
+        Args:
+            fetch_method: The async method to call for fetching data
+            serializer: The serializer function to apply to each item
+            method_name: Name of the method for logging
+            timeout: Optional timeout between fetches
+        """
+        while not self.shutdown_event.is_set():
+            timeout = timeout or 0.1
+            await asyncio.sleep(timeout)
+            data = await fetch_method()
+            # Always yield data, even if empty, to prevent the client looks like hanging
+            # TODO: Remove the empty data to reduce the IPC overhead
+            yield [serializer(item) for item in data]
+        logger_debug(f"RpcWorker {mpi_rank()} quitting {method_name}",
+                     color="yellow")
+
     async def fetch_stats_loop_async(
             self,
             timeout: Optional[float] = None) -> AsyncGenerator[list, None]:
-        while not self.shutdown_event.is_set():
-            logger_debug(f"RpcWorker {mpi_rank()} is fetching stats async")
-            timeout = timeout or 0.1
-            await asyncio.sleep(timeout)
-            stats = await self.fetch_stats_async()
-            # Always yield stats, even if empty, to prevent the client looks like hanging
-            # TODO: Remove the empty stats to reduce the IPC overhead
-            yield stats
-        logger_debug(f"RpcWorker {mpi_rank()} quitting fetch_stats_loop_async",
-                     color="yellow")
+        async for data in self._generic_fetch_loop_async(
+                fetch_method=self.fetch_stats_async,
+                serializer=self._stats_serializer,
+                method_name="fetch_stats_loop_async",
+                timeout=timeout):
+            yield data
+
+    async def fetch_kv_cache_events_loop_async(
+            self,
+            timeout: Optional[float] = None) -> AsyncGenerator[list, None]:
+        async for data in self._generic_fetch_loop_async(
+                fetch_method=self.fetch_kv_cache_events_async,
+                serializer=self._kv_cache_events_serializer,
+                method_name="fetch_kv_cache_events_loop_async",
+                timeout=timeout):
+            yield data
 
     def setup_engine(self):
         # Force all the ranks to wait here, and start creating the executor simultaneously.

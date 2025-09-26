@@ -179,11 +179,10 @@ class TestRpcWorkerTP1:
         results = []
         async for stats in self.client.fetch_stats_loop_async(
         ).remote_streaming():
-            results.append(stats)  # empty stats
-            print(f"fetch_stats_async batch, received {len(stats)} stats")
-            if len(results) >= 10:
-                break
-        assert len(results) >= 10
+            results.append(stats)
+            assert not stats  # empty stats
+
+        assert len(results) == 0
 
 
 class TestRpcWorkerTP2:

@@ -79,6 +79,7 @@ class RPCClient:
             address: The ZMQ address to connect to.
             hmac_key: The HMAC key for encryption.
             timeout: The timeout (seconds) for RPC calls.
+            num_workers: The number of workers for the RPC client.
         '''
         self._address = address
         self._timeout = timeout
@@ -307,6 +308,7 @@ class RPCClient:
             if timeout is None:
                 res = await future
             else:
+                # Add 1 second to the timeout to ensure the client can get
                 res = await asyncio.wait_for(future, timeout + 1)
             logger_debug(
                 f"RPC Client _call_async: Got result for request_id: {request_id}: {res}"

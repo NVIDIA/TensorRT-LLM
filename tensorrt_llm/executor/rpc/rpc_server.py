@@ -31,7 +31,7 @@ class RPCServer:
         Args:
             instance: The instance whose methods will be exposed via RPC.
             hmac_key (bytes, optional): HMAC key for encryption.
-            num_workers (int): Number of worker threads.
+            num_workers (int): Number of worker threads or worker tasks that help parallelize the task execution.
             timeout (int): Timeout for RPC calls.
             async_run_task (bool): Whether to run the task asynchronously.
 

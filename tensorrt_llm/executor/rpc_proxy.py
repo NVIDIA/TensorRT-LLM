@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import json
 import os
 import threading
 import time
@@ -8,8 +9,8 @@ from typing import Optional
 from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import (_SyncQueue, logger_debug, print_colored_debug,
-                            print_traceback_on_error)
+from ..llmapi.utils import (AsyncQueue, _SyncQueue, logger_debug,
+                            print_colored_debug)
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
@@ -86,24 +87,57 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                                 rpc_addr=self.rpc_addr,
                                 **self.worker_kwargs)
 
-    @print_traceback_on_error
-    async def main_loop_task(self):
-        """
-        Main loop of the proxy, it will invoke the actions periodically.
+    async def _generic_fetch_loop_async(self, fetch_method_name: str,
+                                        handler_method, method_name: str):
+        """Generic method for fetching data in a loop from RPC worker.
+
+        Args:
+            fetch_method_name: Name of the RPC client method to call
+            handler_method: The handler method to call with the fetched data
+            method_name: Name of the method for logging
         """
         try:
-            async for responses in self.rpc_client.fetch_responses_loop_async(
-            ).remote_streaming():
+            fetch_method = getattr(self.rpc_client, fetch_method_name)
+            async for data in fetch_method().remote_streaming():
                 if self._shutdown_event.is_set():
                     return
-                self.handle_responses(responses)
+                handler_method(data)
         except asyncio.CancelledError:
-            logger.debug("Main loop task cancelled")
+            logger.debug(f"{method_name} task cancelled")
         except Exception as e:
-            logger.error(f"Error in main_loop_task: {e}")
+            logger.error(f"Error in {method_name}: {e}")
             raise
 
+    async def _fetch_responses_loop_async(self):
+        await self._generic_fetch_loop_async(
+            fetch_method_name="fetch_responses_loop_async",
+            handler_method=self.handle_responses,
+            method_name="_fetch_responses_loop_async")
+
+    async def _fetch_stats_loop_async(self):
+        await self._generic_fetch_loop_async(
+            fetch_method_name="fetch_stats_loop_async",
+            handler_method=self.handle_stats,
+            method_name="_fetch_stats_loop_async")
+
+    async def _fetch_kv_cache_events_loop_async(self):
+        await self._generic_fetch_loop_async(
+            fetch_method_name="fetch_kv_cache_events_loop_async",
+            handler_method=self.handle_kv_cache_events,
+            method_name="_fetch_kv_cache_events_loop_async")
+
     def setup_mainloop(self):
+
+        async def main_loop_task():
+            tasks = [
+                self._fetch_responses_loop_async(),
+                self._fetch_stats_loop_async(),
+                self._fetch_kv_cache_events_loop_async(),
+            ]
+            # Only add kv_cache_events loop if it's enabled
+            if self._iter_kv_events_result:
+                tasks.append(self._fetch_kv_cache_events_loop_async())
+            await asyncio.gather(*tasks)
 
         def _run_main_loop_task():
             """Local method to run the main loop task."""
@@ -111,7 +145,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             asyncio.set_event_loop(self.main_loop)
 
             self.main_loop_task_obj = self.main_loop.create_task(
-                self.main_loop_task())
+                main_loop_task())
             try:
                 self.main_loop.run_until_complete(self.main_loop_task_obj)
             except asyncio.CancelledError:
@@ -164,9 +198,95 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
 
-    def handle_stats(self, stats: dict):
-        # raise NotImplementedError
-        pass
+    def _handle_iteration_data(self, data, result_singleton, data_type: str):
+        """Generic method to handle iteration data received from RPC worker.
+
+        Args:
+            data: Data from the RPC worker (can be dict, str, or list)
+            result_singleton: The iteration result singleton to put data into
+            data_type: Type of data for logging (e.g., "stats", "kv_cache_events")
+        """
+        # Make sure we have initialized the iteration results
+        self._maybe_initialize_iteration_results()
+
+        if not result_singleton:
+            logger.debug(
+                f"Skipping {data_type} handling while result_singleton=None")
+            return
+
+        # Get the queue from the result singleton
+        queue = result_singleton.queue
+        async_queues = []
+
+        # Clear old data if queue is full (similar to _iteration_result_task)
+        while queue.full():
+            queue.get()
+
+        try:
+            # Handle different types of data
+            if isinstance(data, str):
+                # Already JSON serialized
+                data_json = data
+            elif isinstance(data, list):
+                # Skip empty lists to avoid putting nothing in the queue
+                if not data:
+                    logger.debug(
+                        f"rpc_proxy.py: Skipping empty {data_type} list")
+                    return
+
+                # Handle list of data (multiple iterations)
+                for item in data:
+                    if isinstance(item, str):
+                        item_json = item
+                    else:
+                        item_json = json.dumps(item)
+
+                    if isinstance(queue, _SyncQueue):
+                        queue.put_nowait(item_json)
+                        async_queues.append(queue)
+                    else:
+                        queue.put(item_json)
+
+                if async_queues:
+                    _SyncQueue.notify_many(queue.loop, async_queues)
+                return
+            else:
+                # Convert dict/other to JSON string as expected by IterationResult
+                data_json = json.dumps(data)
+
+            if isinstance(queue, _SyncQueue):
+                queue.put_nowait(data_json)
+                async_queues.append(queue)
+            else:
+                queue.put(data_json)
+
+            if async_queues:
+                _SyncQueue.notify_many(queue.loop, async_queues)
+
+        except AsyncQueue.EventLoopShutdownError:
+            # This happens when the event loop is already closed
+            logger.debug(
+                f"rpc_proxy.py: EventLoopShutdownError in handle_{data_type}")
+        except Exception as e:
+            logger.error(f"rpc_proxy.py: Error in handle_{data_type}: {e}")
+            raise e
+
+    def handle_stats(self, stats):
+        """Handle stats received from RPC worker and put them into the stats result queue.
+
+        Args:
+            stats: Statistics data from the RPC worker (can be dict, str, or list)
+        """
+        self._handle_iteration_data(stats, self._iter_stats_result, "stats")
+
+    def handle_kv_cache_events(self, events):
+        """Handle KV cache events received from RPC worker and put them into the events result queue.
+
+        Args:
+            events: KV cache events data from the RPC worker (can be dict, str, or list)
+        """
+        self._handle_iteration_data(events, self._iter_kv_events_result,
+                                    "kv_cache_events")
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         request.set_id(self._get_next_client_id())

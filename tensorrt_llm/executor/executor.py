@@ -451,6 +451,7 @@ class GenerationExecutor(ABC):
                     postproc_worker_config=postproc_worker_config,
                     is_llm_executor=is_llm_executor,
                     kv_connector_config=kv_connector_config)
+
             return GenerationExecutorWorker(
                 **worker_kwargs,
                 is_llm_executor=is_llm_executor,
