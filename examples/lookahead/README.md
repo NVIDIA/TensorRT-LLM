@@ -11,7 +11,7 @@ Lookahead algorithm is configured with a tuple of `(windows_size, ngram_size, ve
 + `ngram_size` is the n-gram size, meaning the maximum number of draft tokens accepted per iteration.
 + `verification_set_size` is the maximum number of n-grams considered for verification, meaning the number of draft token beam hypotheses.
 
-You can enable Lookahead decoding for any of decoder-only autoregressive LLM models without any fine-tuning. Some TensorRT-LLM models might not work with Lookahead due to the missing head size in the speculative decoding XQA attention kernels. Lookahead performance greatly depends on the base model, hardware, batch size, sequence length, and the dataset. It is recommended to profile various configurations to find the best `(W, N, G)` configuration given the setup.
+You can enable Lookahead decoding for any of decoder-only autoregressive LLM models without any fine-tuning. Some TensorRT LLM models might not work with Lookahead due to the missing head size in the speculative decoding XQA attention kernels. Lookahead performance greatly depends on the base model, hardware, batch size, sequence length, and the dataset. It is recommended to profile various configurations to find the best `(W, N, G)` configuration given the setup.
 
 Specify the Lookahead related flags in three places:
 
@@ -25,8 +25,8 @@ def max_draft_len(windows_size, ngram_size, verification_set_size):
         + (windows_size - 1 + verification_set_size) * (ngram_size - 1)
 ```
 
-2. *Setup TensorRT-LLM runtime*
-When TensorRT-LLM server starts, the server reserves resources according to the `executor_lookahead_config`. `executor_lookahead_config` is noted as `(W, N, G)`. Ensure the `max_draft_len` derived from `executor_lookahead_config` equals to the `max_draft_len` specified in the engine-building phase -- `--max_draft_len == max_draft_len(W, N, G)`.
+2. *Setup TensorRT LLM runtime*
+When TensorRT LLM server starts, the server reserves resources according to the `executor_lookahead_config`. `executor_lookahead_config` is noted as `(W, N, G)`. Ensure the `max_draft_len` derived from `executor_lookahead_config` equals to the `max_draft_len` specified in the engine-building phase -- `--max_draft_len == max_draft_len(W, N, G)`.
 
 3. *Setup the request*
 Each request can specify a Lookahead configuration, noted as `(w, n, g)`. If none are specified, the `executor_lookahead_config` is used. The minimum Lookahead config `(1, 1, 0)` forces non speculative, autoregressive mode. The meaningful minimum configuration is `(2, 2, 1)`. Ensure the Lookahead configuration for each request satisfies `w <= W, n <= N, g <= G`.

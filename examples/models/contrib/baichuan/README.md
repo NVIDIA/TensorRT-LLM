@@ -1,6 +1,6 @@
 # Baichuan
 
-This document shows how to build and run a Baichuan models (including `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b`) in TensorRT-LLM on both single GPU and single node multi-GPU.
+This document shows how to build and run a Baichuan models (including `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b`) in TensorRT LLM on both single GPU and single node multi-GPU.
 
 ## Table of Contents
 
@@ -21,9 +21,9 @@ This document shows how to build and run a Baichuan models (including `v1_7b`/`v
 
 ## Overview
 
-The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT-LLM Baichuan example code is located in [`examples/models/contrib/baichuan`](./). There is one main file:
+The TensorRT LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT LLM Baichuan example code is located in [`examples/models/contrib/baichuan`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert supported checkpoints into TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert supported checkpoints into TensorRT LLM format.
 
 The script accepts an argument named model_version, whose value should be `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b` and the default value is `v1_13b`.
 
@@ -43,7 +43,7 @@ In addition, there are two shared files in the folder [`examples`](../../../) fo
 
 ## Usage
 
-The TensorRT-LLM Baichuan example code locates at [examples/models/contrib/baichuan](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM Baichuan example code locates at [examples/models/contrib/baichuan](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
 
@@ -55,14 +55,14 @@ pip install -r requirements.txt
 
 Need to specify the HF Baichuan checkpoint path. For `v1_13b`, you should use whether [baichuan-inc/Baichuan-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan-13B-Chat) or [baichuan-inc/Baichuan-13B-Base](https://huggingface.co/baichuan-inc/Baichuan-13B-Base). For `v2_13b`, you should use whether [baichuan-inc/Baichuan2-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat) or [baichuan-inc/Baichuan2-13B-Base](https://huggingface.co/baichuan-inc/Baichuan2-13B-Base). More Baichuan models could be found on [baichuan-inc](https://huggingface.co/baichuan-inc).
 
-TensorRT-LLM Baichuan builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
+TensorRT LLM Baichuan builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT LLM will build engine(s) with dummy weights.
 
 ***For all kinds of checkpoints, they share the same trtllm-build command like:***
 
 ```bash
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Enable several TensorRT LLM plugins to increase runtime performance. It also helps with build time.
 
-# The TensorRT-LLM GPT Attention plugin (--gpt_attention_plugin) is
+# The TensorRT LLM GPT Attention plugin (--gpt_attention_plugin) is
 # enabled by default to increase runtime performance.
 # 7B models should always enable `gpt_attention_plugin`` since RoPE is only
 # supported with GPTAttention plugin now.
@@ -117,7 +117,7 @@ python convert_checkpoint.py --model_version v1_13b \
 
 #### SmoothQuant
 
-The SmoothQuant supports all Baichuan model variants. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+The SmoothQuant supports all Baichuan model variants. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
 
 `--smoothquant` is the starting point of INT8 inference. By default, it
 will run the model in the _per-tensor_ mode.
@@ -150,7 +150,7 @@ python ../../../quantization/quantize.py --model_dir /code/model/Baichuan2-13B-C
                                    --calib_size 256
 ```
 
-The quantized model checkpoint is saved to `./quantized_fp8/` for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
+The quantized model checkpoint is saved to `./quantized_fp8/` for future TensorRT LLM engine build directly with the `trtllm-build` command mentioned above.
 Note that you can enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable` when building the engines.
 
 #### Groupwise quantization (AWQ/GPTQ)
@@ -164,7 +164,7 @@ python ../../../quantization/quantize.py --model_dir /code/model/Baichuan2-13B-C
                                    --output_dir ./quantized_int4-awq_gs128 \
                                    --calib_size 32
 ```
-The quantized model checkpoint is saved to `./quantized_int4-awq_gs128/` for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
+The quantized model checkpoint is saved to `./quantized_int4-awq_gs128/` for future TensorRT LLM engine build directly with the `trtllm-build` command mentioned above.
 
 ##### GPTQ
 To run the GPTQ Baichuan example, the following steps are required:
@@ -173,7 +173,7 @@ To run the GPTQ Baichuan example, the following steps are required:
 
     Quantized weights for GPTQ can be generated using an open source project such as [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git).
 
-    Let us build the TensorRT-LLM engine with the saved `./baichuan-2-13b-4bit-gs64.safetensors`.
+    Let us build the TensorRT LLM engine with the saved `./baichuan-2-13b-4bit-gs64.safetensors`.
 
 2. Checkpoint conversion:
 
@@ -189,7 +189,7 @@ To run the GPTQ Baichuan example, the following steps are required:
                                  --tp_size 2 \
                                  --output_dir ./tmp/baichuan_v2_13b/trt_ckpts/int4_gptq_gs64/2-gpu/
     ```
-    The quantized model checkpoint is saved for future TensorRT-LLM engine build directly with the `trtllm-build` command mentioned above.
+    The quantized model checkpoint is saved for future TensorRT LLM engine build directly with the `trtllm-build` command mentioned above.
 
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
@@ -249,7 +249,7 @@ python convert_checkpoint.py --model_version v1_13b \
 
 ### Run
 
-To run a TensorRT-LLM Baichuan model using the engines generated by `trtllm-build`
+To run a TensorRT LLM Baichuan model using the engines generated by `trtllm-build`
 
 ```bash
 # With fp16 inference

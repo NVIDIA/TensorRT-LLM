@@ -584,7 +584,9 @@ class ApiParamTagger:
 
     def __call__(self, cls: Type[BaseModel]) -> None:
         """ The main entry point to tag the api doc. """
-        self._process_pydantic_model(cls)
+        if cls.__name__ in ["LlmArgs", "TorchLlmArgs"]:
+            # TODO: apply this to other classes
+            self._process_pydantic_model(cls)
 
     def _process_pydantic_model(self, cls: Type[BaseModel]) -> None:
         """Process the Pydantic model to add tags to the fields.
@@ -594,6 +596,9 @@ class ApiParamTagger:
                 status = field_info.json_schema_extra['status']
                 self._amend_pydantic_field_description_with_tags(
                     cls, [field_name], status)
+            else:
+                self._amend_pydantic_field_description_with_tags(
+                    cls, [field_name], "stable")
 
     def _amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
                                                     field_names: list[str],

@@ -53,7 +53,7 @@ def _load_plugin_lib():
         handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         handle.initTrtLlmPlugins.restype = ctypes.c_bool
     except AttributeError as err:
-        raise ImportError('TensorRT-LLM Plugin is unavailable') from err
+        raise ImportError('TensorRT LLM Plugin is unavailable') from err
 
     try:
         assert handle.initTrtLlmPlugins(
@@ -422,7 +422,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
         init=False,
         metadata={
             "help":
-            "Enable TensorRT-LLM managed weights to speed up engine building process."
+            "Enable TensorRT LLM managed weights to speed up engine building process."
         })
     _use_fused_mlp: bool = field(
         default=True,

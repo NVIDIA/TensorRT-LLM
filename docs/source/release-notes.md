@@ -178,6 +178,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### Known Issues
 - When using disaggregated serving with pipeline parallelism and KV cache reuse, a hang can occur. This will be fixed in a future release. In the meantime, disabling KV cache reuse will fix this issue.
 - Running multi-node cases where each node has just a single GPU is known to fail. This will be addressed in a future release. 
+- For the Llama 3.x and Llama 4 models, there is an issue with pipeline parallelism when using FP8 and NVFP4 weights. As a workaround, you can set the environment variable `export TRTLLM_LLAMA_EAGER_FUSION_DISABLED=1`.
 
 ## TensorRT-LLM Release 0.21.0
 

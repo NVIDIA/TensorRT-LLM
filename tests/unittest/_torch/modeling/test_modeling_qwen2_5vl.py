@@ -498,8 +498,9 @@ class TestQwen2_5_VL(unittest.TestCase):
                     "attn_metadata": attn_metadata,
                     "multimodal_params": multimodal_params,
                 }
+                key = (1, 0, False)
                 graph_runner.capture(
-                    batch_size=1,
+                    key=key,
                     forward_fn=lambda inputs: qwen2_5_vl.forward(**inputs),
                     initial_inputs=inputs)
 
@@ -507,8 +508,7 @@ class TestQwen2_5_VL(unittest.TestCase):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(batch_size=1,
-                                                 current_inputs=inputs)
+                    logits = graph_runner.replay(key=key, current_inputs=inputs)
                 return logits
 
         if scenario.use_cuda_graph:

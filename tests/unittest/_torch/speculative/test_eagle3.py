@@ -73,11 +73,11 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     # Mock _get_allow_chain_drafter to return False when use_chain_drafter is False
     if not use_chain_drafter:
         patch_context = patch(
-            'tensorrt_llm._torch.pyexecutor.py_executor_creator._get_allow_chain_drafter',
+            'tensorrt_llm._torch.utils._get_allow_chain_drafter',
             return_value=False)
     else:
         patch_context = patch(
-            'tensorrt_llm._torch.pyexecutor.py_executor_creator._get_allow_chain_drafter',
+            'tensorrt_llm._torch.utils._get_allow_chain_drafter',
             return_value=True)
 
     with patch_context:
@@ -88,7 +88,8 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
                                         max_tokens=8192)
         cuda_graph_config = CudaGraphConfig(
-            batch_sizes=[1]) if use_cuda_graph else None
+            batch_sizes=[i for i in range(1, max_batch_size +
+                                          1)]) if use_cuda_graph else None
 
         llm_common_config = dict(
             model=target_model_dir,
@@ -124,28 +125,32 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             prompts = [
                 "The capital of France is a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for anyone who loves history, architecture, and culture. From the iconic Eiffel Tower to the world-famous Louvre Museum, Paris has something to offer for every interest and age.\nThe city is divided into 20 arrondissements, each with its own unique character and charm. The Latin Quarter is a popular area for students and young travelers, while the Champs-Élysées is a hub for shopping and dining. The Montmartre neighborhood is famous for its bohemian vibe and stunning views of the city.\nParis is also known for its beautiful parks and gardens, such as the Luxembourg Gardens and the Tuileries Garden. The city has a rich history, with landmarks like the Notre-Dame Cathedral and the Arc de Triomphe. Visitors can also explore the city's many museums, including the Musée d'Orsay and the Musée Rodin.\nIn addition to its cultural and historical attractions, Paris is also a great destination for foodies. The city is famous for its cuisine, including croissants, baguettes, and cheese. Visitors can sample the city's famous dishes at one of the many restaurants, cafes, and "
             ]
-            tok_ids = llm_spec.tokenizer.encode(prompts[0])
+            tok_ids = [llm_spec.tokenizer.encode(prompts[0])]
         else:
             prompts = [
                 "The capital of France is",
                 "The president of the United States is",
             ]
-            tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+            tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
+            if multi_batch:
+                tok_ids.append(llm_spec.tokenizer.encode(prompts))
 
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
         sampling_params = SamplingParams(max_tokens=128, temperature=0)
-        for output in llm_spec.generate_async(tok_ids,
-                                              sampling_params,
-                                              streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_drafted += max_draft_len
-            num_accepted += len(new_tokens) - num_tokens - 1
-            num_tokens = len(new_tokens)
+        for i in range(len(tok_ids)):
+            num_tokens = 0
+            num_drafted = 0
+            num_accepted = 0
 
-        accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.15
+            for output in llm_spec.generate_async(tok_ids[i],
+                                                  sampling_params,
+                                                  streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_drafted += max_draft_len
+                num_accepted += len(new_tokens) - num_tokens - 1
+                num_tokens = len(new_tokens)
+
+            accept_rate = num_accepted / num_drafted
+            assert accept_rate > 0.15
 
         # Output tests
         sampling_params = SamplingParams(max_tokens=10, temperature=0)

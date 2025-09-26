@@ -121,6 +121,7 @@ class DeepGemmMoEOp(MoEOp):
             output_dtype: torch.dtype,
             # Quantization parameters
             quant_scales: List[torch.Tensor],
+            use_all_to_all: bool,
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
             # Performance tuning (only runtime-variable parameters)
@@ -148,7 +149,7 @@ class DeepGemmMoEOp(MoEOp):
         ep_rank = module.ep_rank
         cluster_size = module.cluster_size
         cluster_rank = module.cluster_rank
-        enable_alltoall = module.enable_alltoall
+        use_all_to_all = use_all_to_all
 
         # Not supported: min_latency_mode. Raise error if enabled.
         if min_latency_mode:
@@ -289,7 +290,7 @@ class DeepGemmMoEOp(MoEOp):
             permuted_row_to_unpermuted_row_tensor,
             token_selected_slots,
             expert_first_token_offset_tensor,
-            enable_alltoall,
+            use_all_to_all,
             x.shape[0],  # num_rows
             x.shape[1],  # hidden_size
             unpadded_hidden_size,  # unpadded_hidden_size (may be different from hidden_size if padding was applied)

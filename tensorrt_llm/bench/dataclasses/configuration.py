@@ -100,7 +100,6 @@ class RuntimeConfig(BaseModel):
                 if not batch_sizes_set and not max_batch_size_set:
                     cuda_graph_config[
                         "max_batch_size"] = self.settings_config.max_batch_size
-
             updated_llm_args["cuda_graph_config"] = cuda_graph_config
 
         return updated_llm_args

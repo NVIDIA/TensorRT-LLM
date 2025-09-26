@@ -89,9 +89,6 @@ class ADEngine(ModelEngine):
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
         max_beam_width = ad_config.max_beam_width
-        ad_logger.info(
-            f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
-        )
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)

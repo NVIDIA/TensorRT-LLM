@@ -35,7 +35,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 @click.command(name="throughput")
 @optgroup.group("Engine run configuration.",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--engine_dir",
     type=click.Path(exists=True,

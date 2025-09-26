@@ -67,16 +67,14 @@ class DummyModelEngine(PyTorchModelEngine):
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
-        self.model_is_wrapped = False
+        model = DummyModel(self.dtype)
         super().__init__(model_path="",
                          pytorch_backend_config=pytorch_backend_config,
                          checkpoint_loader=None,
                          batch_size=batch_size,
                          max_seq_len=max_seq_len,
-                         mapping=mapping)
-
-    def _load_model(self, mode_path: str, **kwargs) -> torch.nn.Module:
-        return DummyModel(self.dtype)
+                         mapping=mapping,
+                         model=model)
 
 
 def _create_request(num_tokens, req_id: int):

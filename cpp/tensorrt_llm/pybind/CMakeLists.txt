@@ -43,8 +43,6 @@ endif()
 target_link_libraries(
   ${TRTLLM_PYBIND_MODULE}
   PUBLIC ${SHARED_TARGET}
-         ${UNDEFINED_FLAG}
-         ${NO_AS_NEEDED_FLAG}
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
@@ -56,10 +54,15 @@ target_compile_definitions(
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)
 
 if(NOT WIN32)
-  set_target_properties(
-    ${TRTLLM_PYBIND_MODULE}
-    PROPERTIES
-      LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+  set(TRTLLM_PYBIND_MODULE_RPATH_LIST
+      "$ORIGIN/libs" # TRTLLM libraries
+      "$ORIGIN/../../.." # Shared libraries under $PREFIX/lib
+      "$ORIGIN/../nvidia/nccl/lib" # NCCL libraries
   )
+  set_target_properties(
+    ${TRTLLM_PYBIND_MODULE} PROPERTIES BUILD_RPATH
+                                       "${TRTLLM_PYBIND_MODULE_RPATH_LIST}")
+  set_target_properties(
+    ${TRTLLM_PYBIND_MODULE} PROPERTIES LINK_FLAGS
+                                       "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 endif()

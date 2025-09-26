@@ -90,9 +90,9 @@ bool CacheFormatter::needSendCache(
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
         selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
     }
+    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
 
-    // only TP rank % dupHeadFactor == 0 need to send cache.
-    return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
+    return (destDPRank % targetInfo.mDupHeadFactor) == (selfTpRankInDpGroup % targetInfo.mDupHeadFactor);
 }
 
 void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
@@ -140,11 +140,12 @@ std::vector<size_t> CacheFormatter::pickRecvConnections(
         return ret;
     }
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
+    int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     std::vector<size_t> ret;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
-        if (i % targetInfo.mPeerDupHeadFactor == 0)
+        if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
         {
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
