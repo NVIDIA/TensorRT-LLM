@@ -6,6 +6,7 @@ import pytest
 from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
@@ -26,6 +27,12 @@ class TestRpcProxy:
         llm_args, executor_config = create_fake_executor_config(model_path,
                                                                 tp_size=tp_size)
 
+        # Enable KV cache events
+        llm_args.kv_cache_config = KvCacheConfig(
+            event_buffer_max_size=1000,  # Enable event buffer
+            enable_block_reuse=True,  # Required for KV cache events
+        )
+
         mpi_session = MpiPoolSession(n_workers=tp_size)
         proxy = GenerationExecutorRpcProxy(
             worker_kwargs={
@@ -37,6 +44,7 @@ class TestRpcProxy:
             },
             model_world_size=tp_size,
             mpi_session=mpi_session,
+            is_llm_executor=True,  # Enable stats collection
         )
 
         # Add additional wait for PyTorch backend with multi-rank setup
@@ -62,6 +70,13 @@ class TestRpcProxy:
                 assert similar(tokenizer.decode(result.outputs[0].token_ids),
                                'E F G H I J K L')
 
+            stats = proxy.get_stats(timeout=2)
+            assert stats
+
+            kv_cache_events = proxy.get_kv_events(timeout=2)
+            # KV cache events may be empty if no cache operations occurred
+            assert isinstance(kv_cache_events, list)
+
     @pytest.mark.parametrize("num_reqs", [1, 10])
     def test_tp2(self, num_reqs):
         tokenizer = TransformersTokenizer.from_pretrained(model_path)
@@ -73,9 +88,9 @@ class TestRpcProxy:
             sampling_params = SamplingParams(max_tokens=max_tokens)
             for _ in range(num_reqs):
                 result = proxy.generate(prompt_token_ids, sampling_params)
-            print(f"get result: {result}")
-            assert similar(tokenizer.decode(result.outputs[0].token_ids),
-                           'E F G H I J K L')
+                print(f"get result: {result}")
+                assert similar(tokenizer.decode(result.outputs[0].token_ids),
+                               'E F G H I J K L')
 
 
 if __name__ == "__main__":

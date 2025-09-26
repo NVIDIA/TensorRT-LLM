@@ -117,9 +117,12 @@ class TestWorkerBase:
 
 def create_fake_executor_config(model_path, tp_size=1):
     # Use TorchLlmArgs for PyTorch backend tests
-    llm_args = TorchLlmArgs(model=model_path,
-                            tensor_parallel_size=tp_size,
-                            backend='pytorch')
+    llm_args = TorchLlmArgs(
+        model=model_path,
+        tensor_parallel_size=tp_size,
+        backend='pytorch',
+        enable_iter_perf_stats=True,
+    )
 
     executor_config = tllm.ExecutorConfig(1)
     executor_config.max_batch_size = 1
