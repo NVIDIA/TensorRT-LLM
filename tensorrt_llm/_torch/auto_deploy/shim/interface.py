@@ -73,7 +73,9 @@ class CachedSequenceInterface:
         self.info.num_pages = new_num_pages
         for name, cache in self._caches.items():
             # We assume cache is a tensor of shape (max_batch_size, page_size, n_heads, head_dim)
-            if "cache" in name:
+            # TODO: cache resize should ideally be handled via a callback to the AttentionDescriptor
+            # to avoid hard-coding any assumptions about the cache shape or its "pagedness"
+            if "k_cache" in name or "v_cache" in name:
                 current_shape = cache.shape
                 new_shape = (new_num_pages, *current_shape[1:])
                 cache.resize_(new_shape)

@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
+from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -139,6 +140,22 @@ class ModelDrafter(Drafter):
             input_tokens) - num_accepted_tokens - 1
         return new_request
 
+    def _create_accepted_tokens_request_for_trtllm_attn(
+            self, request: LlmRequest, input_tokens: Any,
+            num_accepted_tokens: int) -> LlmRequest:
+        """
+        Create a chunked context request for accepted tokens.
+        Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
+        """
+        # Pad input_tokens to max_draft_tokens
+        input_tokens.extend(
+            0 for _ in range(self.max_draft_tokens - num_accepted_tokens))
+        new_request = self._create_draft_request(request, input_tokens)
+        new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
+        new_request.py_is_first_draft = True
+        return new_request
+
     def _create_draft_request_for_request(
             self, request: LlmRequest) -> Optional[LlmRequest]:
         """Create a draft request based on the original request state."""
@@ -154,6 +171,14 @@ class ModelDrafter(Drafter):
             # the newly decoded one - this is the convention for EAGLE 2 and 3.
             assert num_draft_tokens == 0
             return self._create_context_request(request, input_tokens)
+
+        # For TRTLLM attention backend, we need to create a generation request for both no tokens accepted and tokens accepted
+        elif issubclass(
+                self.draft_model_engine.attn_backend, TrtllmAttention
+        ) and self.use_static_draft_loop and self.spec_config.spec_dec_mode.is_eagle3(
+        ):
+            return self._create_accepted_tokens_request_for_trtllm_attn(
+                request, input_tokens, num_accepted_tokens)
 
         # No tokens accepted - generation request. This only applies to speculation algorithms
         # that need to recompute KV cache for accepted tokens like eagle3.
@@ -570,6 +595,8 @@ class ModelDrafter(Drafter):
             The final sample state
         """
         # Convert context requests to generation requests
+        for req in draft_batch.generation_requests:
+            req.py_is_first_draft = False
         draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
         draft_batch.context_requests = []
 
