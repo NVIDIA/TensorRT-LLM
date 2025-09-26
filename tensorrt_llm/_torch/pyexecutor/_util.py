@@ -708,9 +708,18 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
+    max_total_draft_tokens = 0
+    if speculative_config is None:
+        max_total_draft_tokens = 0
+    elif hasattr(speculative_config, 'max_total_draft_tokens'):
+        max_total_draft_tokens = speculative_config.max_total_draft_tokens
+    else:
+        max_total_draft_tokens = max_draft_len
+
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
     )

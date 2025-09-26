@@ -618,6 +618,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
+        capture_graph = torch.cuda.is_current_stream_capturing()
+
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
                       cache_name: str) -> torch.Tensor:
             """
@@ -635,36 +637,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 tensor_shape: The required shape.
                 dtype: The required dtype.
                 cache_name: The key for the specific list of buffers to search in.
-
             Returns:
                 An existing compatible buffer or a newly created one.
             """
-            if buffers is not None:
-                # Safely get the list of candidates. Defaults to an empty list if key is missing.
-                candidate_buffers = buffers.get(cache_name, [])
-                numel_like = math.prod(tensor_shape)
+            if buffers is None:
+                return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
 
-                for buffer in candidate_buffers:
-                    numel_buffer = buffer.numel()
-
-                    # buffer just needs to be large enough.
-                    if numel_buffer >= numel_like:
-                        return buffer[0:numel_like].view(
-                            tensor_shape)  # Found a fit, return immediately.
-
-            # If we get here, no suitable buffer was found in the cache. Create a new one.
-            new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-            if buffers is not None:
-                buffers.setdefault(cache_name, []).append(new_buffer)
-            return new_buffer
+            return buffers.get_buffer(tensor_shape, dtype, cache_name,
+                                      capture_graph)
 
         def get_empty_like(like_tensor: torch.Tensor,
                            cache_name: str) -> torch.Tensor:
-            return get_empty(
-                like_tensor.shape,
-                cache_name=cache_name,
-                dtype=like_tensor.dtype,
-            )
+            return get_empty(like_tensor.shape,
+                             cache_name=cache_name,
+                             dtype=like_tensor.dtype)
 
         self.prompt_lens_cuda = get_empty(
             (self.max_num_sequences, ),
@@ -676,10 +662,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
-        self.kv_lens_cuda = get_empty_like(
-            self.prompt_lens_cuda,
-            cache_name="kv_lens_cuda",
-        )
+        self.kv_lens_cuda = get_empty_like(self.prompt_lens_cuda,
+                                           cache_name="kv_lens_cuda")
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)

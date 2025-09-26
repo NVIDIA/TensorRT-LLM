@@ -715,6 +715,7 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
                 torch.ops.auto_deploy.torch_moe,
                 torch.ops.auto_deploy.torch_quant_fp8_moe,
                 torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+                torch.ops.auto_deploy.triton_mxfp4_moe,
             ),
         ):
             continue
