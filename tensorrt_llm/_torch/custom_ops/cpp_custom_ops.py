@@ -500,3 +500,12 @@ def _register_fake():
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::alltoall_helix")
+    def _(input_list, group, num_lists):
+        num_ranks = len(group)
+        len(input_list) // num_ranks
+        return [
+            input_list[i].new_empty((num_ranks, ) + i.shape)
+            for i in range(0, len(input_list), num_ranks)
+        ]

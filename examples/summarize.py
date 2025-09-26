@@ -403,7 +403,7 @@ def main(args):
                         ],
                                                 dim=0)
                         curr_ppl = ppl(curr_logits, curr_ids)
-                        logger.debug(f"TensorRT-LLM PPL: {curr_ppl:.3f} | "
+                        logger.debug(f"TensorRT LLM PPL: {curr_ppl:.3f} | "
                                      f"Generation length: {curr_gen_len}")
                         ppls[batch_idx].append(curr_ppl)
             return output_beams_list, output_ids_list, ppls, lengths_info
@@ -622,7 +622,7 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("TensorRT-LLM Generated: ")
+            logger.info("TensorRT LLM Generated: ")
             logger.info(f" Input: {datapoint[dataset_input_key]}")
             logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
             logger.info(f"\n Output: {output}")
@@ -683,7 +683,7 @@ def main(args):
 
                 logger.debug('-' * 100)
                 logger.debug(f"Input: {datapoint[dataset_input_key]}")
-                logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
+                logger.debug(f'TensorRT LLM Output: {output_tensorrt_llm}')
                 logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
@@ -807,17 +807,17 @@ def main(args):
         if test_trt_llm:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
-                f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
+                f'TensorRT LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
             )
 
             logger.info(
-                f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
+                f'TensorRT LLM (total output tokens: {total_output_token_count_trt_llm})'
             )
             logger.info(
-                f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
+                f'TensorRT LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
             )
             for beam_idx in range(num_sequences):
-                logger.info(f"TensorRT-LLM beam {beam_idx} result")
+                logger.info(f"TensorRT LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
                     if args.estimate_accuracy_std_dev:
                         computed_metrics_tensorrt_llm = metric_tensorrt_llm[
@@ -923,7 +923,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help="Directory where to save output sentences. 'trtllm.out' for "
-        "TensorRT-LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
+        "TensorRT LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
         "save outputs.")
     parser.add_argument(
         '--rouge_dir',

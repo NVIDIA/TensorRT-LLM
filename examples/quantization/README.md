@@ -1,10 +1,10 @@
-# TensorRT-LLM Quantization Toolkit Installation Guide
+# TensorRT LLM Quantization Toolkit Installation Guide
 
 ## Introduction
 
 This document introduces:
 
-- The steps to install the TensorRT-LLM quantization toolkit.
+- The steps to install the TensorRT LLM quantization toolkit.
 - The Python APIs to quantize the models.
 
 The detailed LLM quantization recipe is distributed to the README.md of the corresponding model examples.
@@ -129,13 +129,13 @@ FP_O * output_scale = FP8_O
 
 ### Format of Mixed Precision Checkpoints
 
-ModelOpt can produce a mixed precision TensorRT-LLM checkpoint. After producing the quantized checkpoint, you can build engine directly by `trtllm-build` command:
+ModelOpt can produce a mixed precision TensorRT LLM checkpoint. After producing the quantized checkpoint, you can build engine directly by `trtllm-build` command:
 ```bash
 trtllm-build --checkpoint_dir <mixed-precision-checkpoint> --output_dir $OUTPUT_PATH
 ```
 If you have some special needs about the model weights, such as int4 for MLP and int8 for the rest, you need to generate the checkpoint and config files by yourself.
 
-The `trtllm-build` command consumes the same format of weights, which is presented in [TensorRT-LLM checkpoint formats](https://nvidia.github.io/TensorRT-LLM/architecture/checkpoint.html), but has different quantization method for every linear. Therefore, each layer, such as layer30.mlp.fc, layer30.attention.dense, and so on, keeps the same model weights according to the quantization formats in TensorRT-LLM checkpoint. What's more, the `quantization` field in `config.json` will be like this:
+The `trtllm-build` command consumes the same format of weights, which is presented in [TensorRT LLM checkpoint formats](https://nvidia.github.io/TensorRT-LLM/architecture/checkpoint.html), but has different quantization method for every linear. Therefore, each layer, such as layer30.mlp.fc, layer30.attention.dense, and so on, keeps the same model weights according to the quantization formats in TensorRT LLM checkpoint. What's more, the `quantization` field in `config.json` will be like this:
 ```
     "quantization": {
         "quant_algo": "MIXED_PRECISION",
@@ -171,11 +171,11 @@ There will be another file about per-layer quantization information named `quant
 }
 ```
 
-TensorRT-LLM will automatically read `quant_cfg.json` after recogniziong the `MIXED_PRECISION` quantization method in `config.json`. All the specific algorithm keeps the same as what in `quantization` field before. If some layers are not listed, they'll be treated as no quantization.
+TensorRT LLM will automatically read `quant_cfg.json` after recogniziong the `MIXED_PRECISION` quantization method in `config.json`. All the specific algorithm keeps the same as what in `quantization` field before. If some layers are not listed, they'll be treated as no quantization.
 
 ## APIs
 
-[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT-LLM checkpoints. Each TensorRT-LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). It will produce one another quantization config for per-layer's information when setting auto quantization. The checkpoints can be directly used by `trtllm-build` command to build TensorRT-LLM engines. See this [`doc`](../../docs/source/architecture/checkpoint.md) for more details on the TensorRT-LLM checkpoint format.
+[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT LLM checkpoints. Each TensorRT LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). It will produce one another quantization config for per-layer's information when setting auto quantization. The checkpoints can be directly used by `trtllm-build` command to build TensorRT LLM engines. See this [`doc`](../../docs/source/architecture/checkpoint.md) for more details on the TensorRT LLM checkpoint format.
 
 > *This quantization step may take a long time to finish and requires large GPU memory. Please use a server grade GPU if a GPU out-of-memory error occurs*
 
@@ -227,7 +227,7 @@ with torch.no_grad():
 
 ### Export Quantized Model
 
-After the model is quantized, it can be exported to a TensorRT-LLM checkpoint, which includes
+After the model is quantized, it can be exported to a TensorRT LLM checkpoint, which includes
 
 - One json file recording the model structure and metadata, and
 - One or several rank weight files storing quantized model weights and scaling factors.

@@ -27,6 +27,35 @@ def _add_trt_llm_dll_directory():
 
 _add_trt_llm_dll_directory()
 
+
+def _preload_python_lib():
+    """
+    Preload Python library.
+
+    On Linux, the python executable links to libpython statically,
+    so the dynamic library `libpython3.x.so` is not loaded.
+    When using virtual environment on top of non-system Python installation,
+    our libraries installed under `$VENV_PREFIX/lib/python3.x/site-packages/`
+    have difficulties loading `$PREFIX/lib/libpython3.x.so.1.0` on their own,
+    since venv does not symlink `libpython3.x.so` into `$VENV_PREFIX/lib/`,
+    and the relative path from `$VENV_PREFIX` to `$PREFIX` is arbitrary.
+
+    We preload the libraries here since the Python executable under `$PREFIX/bin`
+    can easily find the library.
+    """
+    import platform
+    on_linux = platform.system() == "Linux"
+    if on_linux:
+        import sys
+        from ctypes import cdll
+        v_major, v_minor, *_ = sys.version_info
+        pythonlib = f'libpython{v_major}.{v_minor}.so'
+        _ = cdll.LoadLibrary(pythonlib + '.1.0')
+        _ = cdll.LoadLibrary(pythonlib)
+
+
+_preload_python_lib()
+
 import sys
 
 # Need to import torch before tensorrt_llm library, otherwise some shared binary files
@@ -119,6 +148,6 @@ __all__ = [
 
 _init()
 
-print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}")
+print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
 
 sys.stdout.flush()
