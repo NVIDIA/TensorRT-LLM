@@ -1283,7 +1283,7 @@ class BaseLlmArgs(StrictBaseModel):
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
         description="Enable LM head TP in attention dp.",
-        status="beta")
+        status="prototype")
 
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
@@ -1297,8 +1297,8 @@ class BaseLlmArgs(StrictBaseModel):
     fail_fast_on_attention_window_too_large: bool = Field(
         default=False,
         description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
-    )
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
+        status="prototype")
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
@@ -2284,6 +2284,7 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
+        status="prototype",
     )
 
     mm_encoder_only: bool = Field(

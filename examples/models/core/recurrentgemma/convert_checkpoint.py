@@ -41,7 +41,7 @@ def parse_arguments():
         "--output_dir",
         type=Path,
         default="recurrentgemma_tllm_checkpoint",
-        help="The path to save the recurrentgemma TensorRT-LLM checkpoint")
+        help="The path to save the recurrentgemma TensorRT LLM checkpoint")
     parser.add_argument("--log_level", type=str, default="info")
     args = parser.parse_args()
     return args
@@ -506,11 +506,11 @@ def main():
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()
-    print(f"Determined TensorRT-LLM configuration {trt_llm_config_dict}")
+    print(f"Determined TensorRT LLM configuration {trt_llm_config_dict}")
 
     config_path = args.output_dir / "config.json"
     config_path.parent.mkdir(exist_ok=True, parents=True)
-    LOGGER.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+    LOGGER.debug(f"Saving TensorRT LLM configuration to {config_path}")
     with config_path.open("w") as config_file:
         json.dump(trt_llm_config_dict, config_file, indent=4)
 

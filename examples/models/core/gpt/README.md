@@ -1,13 +1,13 @@
 # GPT
 
-This document explains how to build the [GPT](https://huggingface.co/gpt2) model using TensorRT-LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
+This document explains how to build the [GPT](https://huggingface.co/gpt2) model using TensorRT LLM and run on a single GPU, a single node with multiple GPUs or multiple nodes with multiple GPUs.
 
 - [GPT](#gpt)
   - [Overview](#overview)
   - [Support Matrix](#support-matrix)
   - [Usage](#usage)
     - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
       - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
       - [In-flight batching and paged KV cache](#in-flight-batching-and-paged-kv-cache)
@@ -37,9 +37,9 @@ This document explains how to build the [GPT](https://huggingface.co/gpt2) model
 
 ## Overview
 
-The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/models/core/gpt`](./). There is one main file:
+The TensorRT LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../../../tensorrt_llm/models/gpt/model.py). The TensorRT LLM GPT example code is located in [`examples/models/core/gpt`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -62,7 +62,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-format to the TensorRT-LLM format.
+format to the TensorRT LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
@@ -78,8 +78,8 @@ rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
 pushd gpt2 && rm pytorch_model.bin model.safetensors && wget -q https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin && popd
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
+### 2. Convert weights from HF Transformers to TensorRT LLM format
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
 # single gpu, dtype float16
@@ -102,7 +102,7 @@ python3 convert_checkpoint.py --model_dir gpt2 \
 ```
 
 ### 3. Build TensorRT engine(s)
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The checkpoint directory provides the model's weights and architecture configuration. The number of engine files is also same to the number of GPUs used to run inference.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The checkpoint directory provides the model's weights and architecture configuration. The number of engine files is also same to the number of GPUs used to run inference.
 
 `trtllm-build` command has a variety of options. In particular, the plugin-related options have two categories:
 * Plugin options that requires a data type (e.g., `gpt_attention_plugin`), you can
@@ -117,16 +117,16 @@ The defaults have been carefully tuned for better performance. For example, `gpt
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
 ```bash
-# Build a single-GPU float16 engine from TensorRT-LLM checkpoint.
-# gpt_attention_plugin (the special TensorRT-LLM GPT Attention plugin) and remove_input_padding are enabled by default for runtime performance.
+# Build a single-GPU float16 engine from TensorRT LLM checkpoint.
+# gpt_attention_plugin (the special TensorRT LLM GPT Attention plugin) and remove_input_padding are enabled by default for runtime performance.
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/1-gpu \
         --output_dir gpt2/trt_engines/fp16/1-gpu
 
-# Build 2-way tensor parallelism engines from TensorRT-LLM checkpoint.
+# Build 2-way tensor parallelism engines from TensorRT LLM checkpoint.
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 
-# Build 2-way tensor parallelism and 2-way pipeline parallelism engines from TensorRT-LLM checkpoint.
+# Build 2-way tensor parallelism and 2-way pipeline parallelism engines from TensorRT LLM checkpoint.
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/4-gpu \
         --output_dir gpt2/trt_engines/fp16/4-gpu
 ```
@@ -157,7 +157,7 @@ Note that the FMHA kernels have to be used together with `gpt_attention_plugin` 
 If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine(s) must be built accordingly. In-flight batching in C++ runtime works only with attention plugin, paged KV cache and with packed data. Currently, the `trtllm-build` by default enables `gpt_attention_plugin`, `paged_kv_cache` and `remove_input_padding`, so the built engine(s) can support in-flight batching (unless you explicitly disable one of these options). One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
 
 ### 4. Build TensorRT engine(s) with Random Weights
-You can build engine(s) using random weights, which is useful for benchmarking. First, the [`../generate_checkpoint_config.py`](../generate_checkpoint_config.py) script can be used to generate a TensorRT-LLM checkpoint config file:
+You can build engine(s) using random weights, which is useful for benchmarking. First, the [`../generate_checkpoint_config.py`](../generate_checkpoint_config.py) script can be used to generate a TensorRT LLM checkpoint config file:
 
 ```bash
 # Generate an 8-GPU GPT-175B float16 checkpoint config file.
@@ -186,7 +186,7 @@ Then, use `trtllm-build` command to build engine(s) with random weights and the 
 
 ```bash
 # Build 8-GPU GPT-175B float16 engines using dummy weights, useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Enable several TensorRT LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build --model_config gpt_175b/trt_ckpt/fp16/8-gpu/config.json \
         --gemm_plugin auto \
         --max_batch_size 256 \
@@ -194,7 +194,7 @@ trtllm-build --model_config gpt_175b/trt_ckpt/fp16/8-gpu/config.json \
         --workers 8
 
 # Build 16-GPU GPT-530B float16 engines using dummy weights, useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Enable several TensorRT LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build --model_config gpt_530b/trt_ckpt/fp16/16-gpu/config.json \
         --gemm_plugin auto \
         --max_batch_size 128 \
@@ -225,7 +225,7 @@ Output [Text 0 Beam 0]: " chef before moving to London in the early"
 The [`summarize.py`](../../../summarize.py) script can run the built engines to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
-By passing `--test_trt_llm` flag, the script will evaluate TensorRT-LLM engines. You may also pass `--test_hf` flag to evaluate the HF model.
+By passing `--test_trt_llm` flag, the script will evaluate TensorRT LLM engines. You may also pass `--test_hf` flag to evaluate the HF model.
 
 ```bash
 python3 ../../../summarize.py --engine_dir gpt2/trt_engines/fp16/1-gpu \
@@ -236,10 +236,10 @@ python3 ../../../summarize.py --engine_dir gpt2/trt_engines/fp16/1-gpu \
 If the engines are run successfully, you will see output like:
 ```
 ......
-[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM (total latency: 1.520904541015625 sec)
-[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 0)
-[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 0.0)
-[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT LLM (total latency: 1.520904541015625 sec)
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT LLM (total output tokens: 0)
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT LLM (tokens per second: 0.0)
+[03/13/2024-05:43:18] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [03/13/2024-05:43:18] [TRT-LLM] [I]   rouge1 : 21.13474087351942
 [03/13/2024-05:43:18] [TRT-LLM] [I]   rouge2 : 6.2641616526063775
 [03/13/2024-05:43:18] [TRT-LLM] [I]   rougeL : 16.693574311238077
@@ -270,7 +270,7 @@ mpirun -np 8 \
 
 #### Multiple nodes, multiple GPUs using [Slurm](https://slurm.schedmd.com)
 
-To run engines using multiple nodes, you should use a cluster manager like `Slurm`. The following section shows how to configure TensorRT-LLM to execute on two nodes using Slurm.
+To run engines using multiple nodes, you should use a cluster manager like `Slurm`. The following section shows how to configure TensorRT LLM to execute on two nodes using Slurm.
 
 We start by preparing an `sbatch` script called `tensorrt_llm_run.sub`. That script contains the following code (you must replace the `<REPLACE ...>` strings with your own values):
 
@@ -340,7 +340,7 @@ during inference.
 
 #### INT8 inference
 
-The INT8 quantization scheme used in TensorRT-LLM theoretically works on any
+The INT8 quantization scheme used in TensorRT LLM theoretically works on any
 GPT model. However, Smoothquant'd models tend to produce more accurate results
 with reduced precision.
 
@@ -354,7 +354,7 @@ range: `[-128, 127]`. Similarly, W is scaled, `W_{i8} <- W_{fp} * s_w` but that
 operation is done at model export time, no need for subsequent operations at
 run-time.
 
-The optimized TensorRT-LLM GEMM implementation for SmoothQuant does the integer
+The optimized TensorRT LLM GEMM implementation for SmoothQuant does the integer
 matrix-multiplication `Y_{i32} <- X_{i8} W_{i8}` and rescales the result to its
 original range `Y_{fp} <- Y_{i32} * (s_x)^{-1} * (s_w)^{-1}`. Note that
 `Y_{i32}` isn't stored in memory, the re-scaling happens in the GEMM's epilogue
@@ -364,9 +364,9 @@ By default `s_x` and `s_w` are single-value coefficients. This is the
 *per-tensor* mode. Values for `s_x` and `s_w` are static, estimated at model
 export time.
 
-TensorRT-LLM also supports more elaborate modes:
+TensorRT LLM also supports more elaborate modes:
  - per-channel: `s_w` is a fixed vector of size `[1, m]`. For that,
-   TensorRT-LLM loads the adequately scaled version of of `W_{i8}` at model
+   TensorRT LLM loads the adequately scaled version of of `W_{i8}` at model
    construction time.
  - per-token: `s_x` is a vector of size `[n, 1]` determined at run-time, based
    on the per-token (a.k.a. per-row) absolute maximum of `X`.
@@ -482,7 +482,7 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/int4-wo/1-gpu \
 
 ### FP8 Quantization
 
-[`quantize.py`](../../../quantization/quantize.py) can do FP8 quantization and/or FP8 kv cache quantization, and export TensorRT-LLM checkpoint.
+[`quantize.py`](../../../quantization/quantize.py) can do FP8 quantization and/or FP8 kv cache quantization, and export TensorRT LLM checkpoint.
 
 ```bash
 # FP8 quantization with FP8 kv cache
@@ -544,14 +544,14 @@ For Granite, the steps are similar to StarCoder.
 # Download hf granite model
 git clone https://huggingface.co/ibm-granite/granite-34b-code-instruct granite
 
-# Convert to TensorRT-LLM checkpoint
+# Convert to TensorRT LLM checkpoint
 python3 convert_checkpoint.py --model_dir granite \
         --dtype float16 \
         --gpt_variant starcoder \
         --tp_size 4 \
         --output_dir granite/trt_ckpt/fp16/4-gpu
 
-# Build TensorRT-LLM engines
+# Build TensorRT LLM engines
 trtllm-build --checkpoint_dir granite/trt_ckpt/fp16/4-gpu \
         --gemm_plugin auto \
         --output_dir granite/trt_engines/fp16/4-gpu
@@ -572,13 +572,13 @@ The SantaCoder extends the existing GPT model with multi-query attention mechani
 # Download hf santacoder model
 git clone https://huggingface.co/bigcode/santacoder
 
-# Convert to TensorRT-LLM checkpoint
+# Convert to TensorRT LLM checkpoint
 python3 convert_checkpoint.py --model_dir santacoder \
         --dtype float16 \
         --tp_size 4 \
         --output_dir santacoder/trt_ckpt/fp16/4-gpu
 
-# Build TensorRT-LLM engines
+# Build TensorRT LLM engines
 trtllm-build --checkpoint_dir santacoder/trt_ckpt/fp16/4-gpu \
         --gemm_plugin auto \
         --output_dir santacoder/trt_engines/fp16/4-gpu
@@ -600,13 +600,13 @@ For StarCoder, the steps are similar to SantaCoder.
 # Download hf starcoder model
 git clone https://huggingface.co/bigcode/starcoder
 
-# Convert to TensorRT-LLM checkpoint
+# Convert to TensorRT LLM checkpoint
 python3 convert_checkpoint.py --model_dir starcoder \
         --dtype float16 \
         --tp_size 4 \
         --output_dir starcoder/trt_ckpt/fp16/4-gpu
 
-# Build TensorRT-LLM engines
+# Build TensorRT LLM engines
 trtllm-build --checkpoint_dir starcoder/trt_ckpt/fp16/4-gpu \
         --gemm_plugin auto \
         --output_dir starcoder/trt_engines/fp16/4-gpu
@@ -626,7 +626,7 @@ For StarCoder2, you can use almost the same steps as shown above.
 
 ### Run StarCoder2 with LoRA
 
-TensorRT-LLM supports running StarCoder2 models with FP16/BF16/FP32 LoRA. In this section, we use starcoder2-15b as an example to show how to run an FP8 base model with FP16 LoRA module.
+TensorRT LLM supports running StarCoder2 models with FP16/BF16/FP32 LoRA. In this section, we use starcoder2-15b as an example to show how to run an FP8 base model with FP16 LoRA module.
 
 * download the base model and lora model from HF
 
@@ -667,19 +667,19 @@ python ../../../run.py --engine_dir starcoder2-15b/trt_engines/fp8_lora/1-gpu \
 
 NVIDIA has released a GPT-like model with some architectural improvements, that you can find here: [https://huggingface.co/nvidia/GPT-2B-001](https://huggingface.co/nvidia/GPT-2B-001). This architecture is also supported by TensorRT-LLM.
 
-Different from Huggingface's checkpoint, you should specify the NeMo checkpoint path using `--nemo_ckpt_path` for `convert_checkpoint.py`. The script also extracts the tokenizer file from the NeMo checkpoint and saves it to the TensorRT-LLM checkpoint folder, which can be used in the inference scripts.
+Different from Huggingface's checkpoint, you should specify the NeMo checkpoint path using `--nemo_ckpt_path` for `convert_checkpoint.py`. The script also extracts the tokenizer file from the NeMo checkpoint and saves it to the TensorRT LLM checkpoint folder, which can be used in the inference scripts.
 
 ```bash
 # Download NeMo checkpoint
 wget https://huggingface.co/nvidia/GPT-2B-001/resolve/main/GPT-2B-001_bf16_tp1.nemo
 
-# Convert to TensorRT-LLM checkpoint
-# It also extracts the tokenizer file and saves to the TensorRT-LLM checkpoint folder
+# Convert to TensorRT LLM checkpoint
+# It also extracts the tokenizer file and saves to the TensorRT LLM checkpoint folder
 python3 convert_checkpoint.py --nemo_ckpt_path GPT-2B-001_bf16_tp1.nemo \
         --dtype bfloat16 \
         --output_dir gpt-next-2B/trt_ckpt/bf16/1-gpu
 
-# Build TensorRT-LLM engines
+# Build TensorRT LLM engines
 # --gpt_attention_plugin must be set for GPT-Next since Rotary positional embeddings (RoPE) is only supported by the gpt attention plugin at this time.
 trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/bf16/1-gpu \
         --output_dir gpt-next-2B/trt_engines/bf16/1-gpu
@@ -696,15 +696,15 @@ python3 ../../../run.py --engine_dir gpt-next-2B/trt_engines/bf16/1-gpu \
 For efficient fine-tuning, the NeMo framework allows you to learn virtual tokens to accomplish a downstream task. For more details, please read the
 NeMo documentation [here](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html).
 
-TensorRT-LLM supports inference with those virtual tokens. To enable it, pass the prompt embedding table's maximum size at build time with `--max_prompt_embedding_table_size N`. For example:
+TensorRT LLM supports inference with those virtual tokens. To enable it, pass the prompt embedding table's maximum size at build time with `--max_prompt_embedding_table_size N`. For example:
 
 ```bash
-# Convert to TensorRT-LLM checkpoint
+# Convert to TensorRT LLM checkpoint
 python3 convert_checkpoint.py --nemo_ckpt_path megatron_converted_8b_tp4_pp1.nemo \
         --dtype float16 \
         --output_dir gpt-next-8B/trt_ckpt/fp16/1-gpu
 
-# Build TensorRT-LLM engines with prompt-tuning enabled
+# Build TensorRT LLM engines with prompt-tuning enabled
 trtllm-build --checkpoint_dir gpt-next-8B/trt_ckpt/fp16/1-gpu \
         --max_prompt_embedding_table_size 100 \
         --output_dir gpt-next-8B/trt_engines/fp16/1-gpu
@@ -733,12 +733,12 @@ python3 ../../../run.py --engine_dir gpt-next-8B/trt_engines/fp16/1-gpu \
 # Download NeMo checkpoint
 wget https://huggingface.co/nvidia/GPT-2B-001/resolve/main/GPT-2B-001_bf16_tp1.nemo
 
-# Convert to TensorRT-LLM checkpoint
+# Convert to TensorRT LLM checkpoint
 python3 convert_checkpoint.py --nemo_ckpt_path GPT-2B-001_bf16_tp1.nemo \
         --dtype float16 \
         --output_dir gpt-next-2B/trt_ckpt/fp16/1-gpu
 
-# Build TensorRT-LLM engines
+# Build TensorRT LLM engines
 trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/fp16/1-gpu \
         --lora_plugin auto \
         --lora_dir gpt2b_lora-900.nemo gpt2b_lora-stories.nemo \

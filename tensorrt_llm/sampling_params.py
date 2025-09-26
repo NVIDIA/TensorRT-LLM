@@ -467,7 +467,7 @@ class SamplingParams:
                     "internally enabling context logits for prompt logprobs computation. "
                     "context logits will be dropped after computation as the user didn't explicitly request them."
                 )
-                # TODO(venky): Find a more elegant way to do this.
+                # TODO: Find a more elegant way to do this.
                 # NOTE: This is an internal hack, so we can entirely avoid introducing
                 # `prompt_logprobs` into the executor bindings and further into
                 # model engine / sampler.

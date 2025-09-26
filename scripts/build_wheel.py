@@ -240,9 +240,9 @@ def setup_conan(scripts_dir, venv_python):
     # Create default profile
     build_run(f'"{venv_conan}" profile detect -f')
 
-    # Add the tensorrt-llm remote if it doesn't exist
+    # Add the TensorRT LLM remote if it doesn't exist
     build_run(
-        f'"{venv_conan}" remote add --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
+        f'"{venv_conan}" remote add --force TensorRT-LLM https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
         stdout=DEVNULL,
         stderr=DEVNULL)
 
@@ -634,7 +634,7 @@ def main(*,
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --remote=TensorRT-LLM --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
