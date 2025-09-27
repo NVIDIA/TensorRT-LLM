@@ -20,9 +20,9 @@ from ..interface import (
 class MoveDeviceConfig(TransformConfig):
     """Configuration for the moving inputs/arguments to the device transform."""
 
-    device: str = Field(default="meta", description="The device to load the weights on.")
-    adconfig_checkpoint_device: Optional[str] = Field(
-        default=None, description="Optional checkpoint device argument from adconfig."
+    checkpoint_device: Optional[str] = Field(
+        default=None,
+        description="Optional device to init checkpoint before move to shared_config.local_device.",
     )
 
 
@@ -45,9 +45,9 @@ class LoadWeightsToDevice(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         factory.load_or_random_init(
             gm,
-            device=self.config.adconfig_checkpoint_device or self.config.device,
+            device=self.config.checkpoint_device or shared_config.local_device,
         )
-        move_to_device(gm, self.config.device)
+        move_to_device(gm, shared_config.local_device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
@@ -58,12 +58,6 @@ class LoadWeightsToDevice(BaseTransform):
 class LoadFactoryModelWeights(BaseTransform):
     """Wrapper transform to move all inputs/arguments to the device."""
 
-    config: MoveDeviceConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return MoveDeviceConfig
-
     def _apply(
         self,
         gm: GraphModule,
@@ -71,7 +65,7 @@ class LoadFactoryModelWeights(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        cm.to(self.config.device)
+        cm.to(shared_config.local_device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 

@@ -20,11 +20,13 @@ transforms:
   transformers_replace_cached_attn:
     stage: cache_init
     attn_backend: flashinfer
+    expected_layout: bsnd
   initialize_cache:
     stage: cache_init
   resize_kv_cache:
     stage: cache_init
     args_only: false # use kwargs instead of args
+    free_mem_ratio: 0.0
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################

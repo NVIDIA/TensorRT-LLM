@@ -1,6 +1,6 @@
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Type, Union
+from typing import Any, Dict, Literal, Optional, Type, Union
 
 import torch
 from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
@@ -75,11 +75,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If True, only the model architecture is loaded.",
     )
 
-    checkpoint_device: Optional[str] = Field(
-        default=None,
-        description="Device on which to load the model checkpoint. "
-        "Defaults to the same device as the rest of the pipeline.",
-    )
+    # checkpoint_device: Optional[str] = Field(
+    #     default=None,
+    #     description="Device on which to load the model checkpoint. "
+    #     "Defaults to the same device as the rest of the pipeline.",
+    # )
 
     tokenizer: Optional[PathLike] = Field(
         description="The tokenizer",
@@ -129,49 +129,49 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
-        default="flashinfer", description="Attention backend to use."
-    )
+    # attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
+    #     default="flashinfer", description="Attention backend to use."
+    # )
 
-    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-        default="MultiHeadLatentAttention",
-        description="The Multi-Head Latent Attention backend to use.",
-    )
+    # mla_backend: Literal["MultiHeadLatentAttention"] = Field(
+    #     default="MultiHeadLatentAttention",
+    #     description="The Multi-Head Latent Attention backend to use.",
+    # )
 
-    free_mem_ratio: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="The fraction of available memory to allocate for cache.",
-    )
+    # free_mem_ratio: float = Field(
+    #     default=0.0,
+    #     ge=0.0,
+    #     le=1.0,
+    #     description="The fraction of available memory to allocate for cache.",
+    # )
 
-    simple_shard_only: bool = Field(
-        default=False,
-        description="If True, force simple sharding (all_gather) in tensor parallelism. "
-        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    )
+    # simple_shard_only: bool = Field(
+    #     default=False,
+    #     description="If True, force simple sharding (all_gather) in tensor parallelism. "
+    #     "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
+    # )
 
-    use_sharding_from_factory: bool = Field(
-        default=False,
-        description="If True, use sharding from the model factory. If False, use sharding from the "
-        "AutoDeployConfig.",
-    )
+    # use_sharding_from_factory: bool = Field(
+    #     default=False,
+    #     description="If True, use sharding from the model factory. If False, use sharding from the "
+    #     "AutoDeployConfig.",
+    # )
 
-    sharding_dims: List[str] = Field(
-        default=["tp", "ep", "dp"],
-        description="The sharding methods to apply by the heuristic sharding stage.",
-    )
+    # sharding_dims: List[str] = Field(
+    #     default=["tp", "ep", "dp"],
+    #     description="The sharding methods to apply by the heuristic sharding stage.",
+    # )
 
-    compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
-        Field(
-            default="torch-compile",
-            description="The backend to use for compiling the model.",
-        )
-    )
+    # compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
+    #     Field(
+    #         default="torch-compile",
+    #         description="The backend to use for compiling the model.",
+    #     )
+    # )
 
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
-        default=None, description="List of batch sizes to create CUDA graphs for."
-    )
+    # cuda_graph_batch_sizes: Optional[List[int]] = Field(
+    #     default=None, description="List of batch sizes to create CUDA graphs for."
+    # )
 
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
@@ -207,7 +207,10 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     # TODO: discuss what to do with this once we fully transition to the new inference optimizer
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.attn_backend == "triton" or self.attn_backend == "torch":
+        if self.transforms.get("insert_cached_attention", {}).get("attn_backend") in [
+            "triton",
+            "torch",
+        ]:
             self.attn_page_size = self.max_seq_len
         return self
 
