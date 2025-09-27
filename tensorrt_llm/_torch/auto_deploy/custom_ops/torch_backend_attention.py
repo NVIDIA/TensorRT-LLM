@@ -477,8 +477,8 @@ class TorchBackendAttention(AttentionDescriptor):
             scale = source_attn_node.kwargs.get("scale", None)
 
         # Validate scale
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
         # Get sinks, sliding_window, and logit_cap from args or kwargs

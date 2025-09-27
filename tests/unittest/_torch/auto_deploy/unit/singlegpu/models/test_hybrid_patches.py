@@ -1,26 +1,32 @@
 import torch  # noqa
 import torch.export as te
 from torch.export import Dim  # noqa
+import pytest
 
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device  # noqa
 from _model_test_utils import get_small_model_config
 
-MODEL_DIR = "ibm-ai-platform/Bamba-9B-v2"
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
-# EXAMPLE_INPUT = "Boa is a snake with the following properties:"
 EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
-def test_bamba_patches():
-    model_on_meta_during_export = True
-    export_func: str = "torch_export_to_gm"
-    use_cache: bool = True
-
+@pytest.mark.parametrize(
+    "model_dir,run_verify_generation",
+    [
+        pytest.param("ibm-ai-platform/Bamba-9B-v2", True),
+        pytest.param("nvidia/NVIDIA-Nemotron-Nano-12B-v2", False),
+    ],
+)
+def test_bamba_patches(model_dir: str, run_verify_generation: bool):
     # NOTE: set to False if you want to locally test the full model
     use_small_config: bool = True
+
+    model_on_meta_during_export = True
+    use_cache: bool = True
+    export_func: str = "torch_export_to_gm"
 
     common_kwargs = {
         "world_size": 0,
@@ -32,11 +38,11 @@ def test_bamba_patches():
     }
 
     if use_small_config:
-        llm_args = get_small_model_config(MODEL_DIR, **common_kwargs)["args"]
+        llm_args = get_small_model_config(model_dir, **common_kwargs)["args"]
         llm_args["model_kwargs"]["use_cache"] = use_cache
     else:
         llm_args = {
-            "model": MODEL_DIR,
+            "model": model_dir,
             **common_kwargs,
             "model_kwargs": {
                 "use_cache": use_cache,
@@ -74,7 +80,8 @@ def test_bamba_patches():
     def _run_torch_export_to_gm():
         return torch_export_to_gm(
             model,
-            args=(input_ids, position_ids),
+            args=tuple(),
+            kwargs={"input_ids": input_ids, "position_ids": position_ids},
             dynamic_shapes=dynamic_shapes,
             patch_list=[
                 "bamba",
@@ -87,7 +94,8 @@ def test_bamba_patches():
             with torch.inference_mode():
                 ep = te.export(
                     model,
-                    args=(input_ids, position_ids),
+                    args=(),
+                    kwargs={"input_ids": input_ids, "position_ids": position_ids},
                     dynamic_shapes=dynamic_shapes,
                     strict=False,
                 )
@@ -111,7 +119,8 @@ def test_bamba_patches():
         gm = _run_export()
         move_to_device(gm, "cuda")
 
-    _verify_generation(factory, model, tokenizer)
+    if run_verify_generation:
+        _verify_generation(factory, model, tokenizer)
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
@@ -125,7 +134,7 @@ def test_bamba_patches():
             )
 
     with torch.inference_mode():
-        outputs_for_comparison["gm"] = gm(input_ids, position_ids)
+        outputs_for_comparison["gm"] = gm(input_ids=input_ids, position_ids=position_ids)
 
     atol, rtol = 1e-3, 1e-3
     for comp, outs in outputs_for_comparison.items():
