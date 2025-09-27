@@ -388,7 +388,8 @@ void initBindings(pybind11::module_& m)
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
         .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"))
-        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
+        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors)
+        .def_readwrite_static("global_steady_clock_offset", &tb::LlmRequest::mGlobalSteadyClockOffset);
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),

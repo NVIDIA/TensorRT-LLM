@@ -35,6 +35,7 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             StreamState, SystemContent, TextContent,
                             ToolDescription, load_harmony_encoding)
 
+from tensorrt_llm.bindings import steady_clock_now
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
@@ -76,6 +77,10 @@ def get_encoding():
 
 def decode_tokens(tokens):
     return get_encoding().decode(tokens)
+
+
+def get_steady_clock_now_in_seconds() -> float:
+    return steady_clock_now().total_seconds()
 
 
 def parse_response_input(
