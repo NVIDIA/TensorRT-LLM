@@ -161,6 +161,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mUsePdl = true;
         routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
+        routingData.mUseLargeN = numExperts > 128;
         routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method

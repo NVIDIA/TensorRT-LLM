@@ -277,16 +277,17 @@ struct Data : public DataBase
 
     bool mDoSoftmaxBeforeTopK{false};
     bool mNormTopkProb{true}; // Default value is true for Qwen3 model
+    bool mUseLargeN{false};
 };
 
-template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UseLargeN_, bool UsePdl_>
 struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
 
     static constexpr bool DoSoftmaxBeforeTopK = DoSoftmaxBeforeTopK_;
-
+    static constexpr bool UseLargeN = UseLargeN_;
     PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
     int32_t mTopK = 0;
