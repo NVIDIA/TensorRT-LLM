@@ -238,15 +238,13 @@ RTX 6000 Pro Blackwell Server Edition
 | 20000/2000 | 1,804 | 1,351 |
 
 
-
-
-
 ## Reproducing Benchmarked Results
 
-> [!NOTE] The only models supported in this workflow are those listed in the table above.
+```{note}
+Only the models shown in the table above are supported by this workflow.
+```
 
-The following tables are references for commands that are used as part of the benchmarking process. For a more detailed
-description of this benchmarking workflow, see the [benchmarking suite documentation](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html).
+The following tables are references for commands that are used as part of the benchmarking process. For a more detailed description of this benchmarking workflow, see the [benchmarking suite documentation](./perf-benchmarking.md).
 
 ### Command Overview
 
@@ -274,7 +272,7 @@ Starting with v0.19, testing was performed using the PyTorch backend - this work
 
 ### Preparing a Dataset
 
-In order to prepare a dataset, you can use the provided [script](../../../benchmarks/cpp/prepare_dataset.py).
+In order to prepare a dataset, you can use the provided [script](source:benchmarks/cpp/prepare_dataset.py).
 To generate a synthetic dataset, run the following command:
 
 ```shell
@@ -310,7 +308,7 @@ remain in the system longer and therefore require less requests to achieve stead
 
 To run the benchmark with the generated data set, simply use the `trtllm-bench throughput` subcommand. The benchmarker will
 run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
-a model name (HuggingFace reference or path to a local model), a [generated dataset](#preparing-a-dataset), and a file containing any desired extra options to the LLMApi (details in [tensorrt_llm/llmapi/llm_args.py:LlmArgs](../../../tensorrt_llm/llmapi/llm_args.py)).
+a model name (HuggingFace reference or path to a local model), a [generated dataset](#preparing-a-dataset), and a file containing any desired extra options to the LLM APIs (details in [tensorrt_llm/llmapi/llm_args.py:LlmArgs](source:tensorrt_llm/llmapi/llm_args.py)).
 
 For dense / non-MoE models:
 
