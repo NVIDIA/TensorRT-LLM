@@ -216,6 +216,7 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.block_reuse_enabled = True if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse else False
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
 
@@ -911,10 +912,19 @@ class PyExecutor:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
                         self._update_requests(previous_batch.sample_state)
 
-                        if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
+                        if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
+                            for req in previous_batch.scheduled_ctx_reqs:
+                                if req.is_context_only_request and (
+                                        req.is_context_finished
+                                        or req.is_finished_due_to_length):
+                                    block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                                        req, True)
+                                    self.ctx_in_transmission_requests.append(
+                                        (req, block_id))
+
+                        if self.kv_cache_transceiver:
                             self._send_disagg_ctx_cache(
                                 previous_batch.scheduled_ctx_reqs)
-
                         self._handle_canceled_requests()
 
                         self._handle_logits_communication(
@@ -1103,6 +1113,15 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
+                    if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
+                        for req in scheduled_batch.context_requests:
+                            if req.is_context_only_request and (
+                                    req.is_context_finished
+                                    or req.is_finished_due_to_length):
+                                block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                                    req, True)
+                                self.ctx_in_transmission_requests.append(
+                                    (req, block_id))
 
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1240,6 +1259,16 @@ class PyExecutor:
                                                     draft_outputs, draft_batch)
                     elif self.previous_batch is not None and not use_previous_draft_tokens:
                         self._update_requests(self.previous_batch.sample_state)
+
+                        if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and self.kv_cache_transceiver:
+                            for req in self.previous_batch.sample_state.scheduled_requests.context_requests:
+                                if req.is_context_only_request and (
+                                        req.is_context_finished
+                                        or req.is_finished_due_to_length):
+                                    block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                                        req, True)
+                                    self.ctx_in_transmission_requests.append(
+                                        (req, block_id))
 
                     if self.guided_decoder is not None:
                         # add_batch must be called again to have updated new tokens.
@@ -1840,8 +1869,6 @@ class PyExecutor:
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
-        logger.debug(
-            f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
                 responses_list = self.dist.tp_gather(responses)
@@ -1920,25 +1947,33 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
-                if request.is_disagg_context_transmission_state:
-                    self.ctx_in_transmission_requests.append(request)
-                else:
+                if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
                     requests_to_terminate.append(request)
+                else:
+                    if request.is_disagg_context_transmission_state:
+                        self.ctx_in_transmission_requests.append(
+                            (request, None))
+                    else:
+                        requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
+
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
-        self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+        self._enqueue_responses(new_responses)
         return requests_to_terminate
 
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
-        for request in self.ctx_in_transmission_requests[:]:
+        for request, block_id in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
-                self._terminate_request(request)
-                self.ctx_in_transmission_requests.remove(request)
+                if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
+                    self._terminate_request(request)
+                else:
+                    self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                self.ctx_in_transmission_requests.remove((request, block_id))
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
