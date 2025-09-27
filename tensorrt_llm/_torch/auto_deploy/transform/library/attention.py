@@ -11,7 +11,6 @@ from ...custom_ops.attention_interface import AttentionDescriptor
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -279,12 +278,12 @@ def _grouped_attn_pattern_1(q, k, v, n_rep, attn_mask, dropout_p, scale):
 
 
 def _grouped_attn_replacement_1(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
     )
 
 
-# Only expose torch_attention_grouped_sdpa after the transformation
+# Only expose torch_attention after the transformation
 def _grouped_attn_pattern_2(q, k, v, attn_mask, dropout_p, scale):
     return torch.ops.auto_deploy.torch_attention_sdpa.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
@@ -292,7 +291,7 @@ def _grouped_attn_pattern_2(q, k, v, attn_mask, dropout_p, scale):
 
 
 def _grouped_attn_replacement_2(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
     )
 
@@ -306,12 +305,12 @@ def _grouped_attn_pattern_3(q, k, v, n_rep, attn_mask, dropout_p, scale):
 
 
 def _grouped_attn_replacement_3(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
     )
 
 
-# Only expose torch_attention_grouped_sdpa after the transformation
+# Only expose torch_attention after the transformation
 def _grouped_attn_pattern_4(q, k, v, attn_mask, dropout_p, scale):
     return torch.ops.auto_deploy.torch_attention_sdpa.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
@@ -319,7 +318,7 @@ def _grouped_attn_pattern_4(q, k, v, attn_mask, dropout_p, scale):
 
 
 def _grouped_attn_replacement_4(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
     )
 
@@ -331,7 +330,7 @@ def _grouped_attn_pattern_5(q, k, v, n_rep, attn_mask):
 
 
 def _grouped_attn_replacement_5(q, k, v, n_rep, attn_mask):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(q, k, v, attn_mask)
+    return torch.ops.auto_deploy.torch_attention.default(q, k, v, attn_mask)
 
 
 def _grouped_attn_pattern_6(q, k, v, attn_mask, dropout_p, scale):
@@ -512,7 +511,7 @@ class MatchEagerAttention(BaseTransform):
 class MatchGroupedAttention(BaseTransform):
     """
     Match and replace the grouped attention pattern with
-    torch.ops.auto_deploy.torch_attention_grouped_sdpa.
+    torch.ops.auto_deploy.torch_attention.
     """
 
     def _apply(
@@ -631,6 +630,256 @@ class MatchGroupedAttention(BaseTransform):
         return gm, info
 
 
+def _attn_bnsd_pattern_1(q, k, v, attn_mask, dropout_p, scale):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=scale,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_2(q, k, v, dropout_p, scale):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=scale,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_3(q, k, v, attn_mask, dropout_p, scale):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=True,
+        scale=scale,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_4(q, k, v, dropout_p, scale):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=dropout_p,
+        is_causal=True,
+        scale=scale,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_5(q, k, v, attn_mask, dropout_p):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=None,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_6(q, k, v, dropout_p):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=None,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_7(q, k, v, attn_mask, dropout_p):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=True,
+        scale=None,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_pattern_8(q, k, v, dropout_p):
+    return torch.ops.auto_deploy.torch_attention.default(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=dropout_p,
+        is_causal=True,
+        scale=None,
+        layout="bnsd",
+    )
+
+
+def _attn_bnsd_to_bnsd_via_bsnd(q, k, v, *, attn_mask, dropout_p, is_causal, scale):
+    q_bsnd = torch.ops.aten.transpose.int(q, 1, 2)
+    k_bsnd = torch.ops.aten.transpose.int(k, 1, 2)
+    v_bsnd = torch.ops.aten.transpose.int(v, 1, 2)
+
+    out_bsnd = torch.ops.auto_deploy.torch_attention.default(
+        q_bsnd,
+        k_bsnd,
+        v_bsnd,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        layout="bsnd",
+    )
+    return torch.ops.aten.transpose.int(out_bsnd, 1, 2)
+
+
+# 1) is_causal=False, mask present, scale present
+def _attn_bnsd_replacement_1(q, k, v, attn_mask, dropout_p, scale):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+# 2) is_causal=False, mask None, scale present
+def _attn_bnsd_replacement_2(q, k, v, dropout_p, scale):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=scale
+    )
+
+
+# 3) is_causal=True, mask present, scale present
+def _attn_bnsd_replacement_3(q, k, v, attn_mask, dropout_p, scale):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
+    )
+
+
+# 4) is_causal=True, mask None, scale present
+def _attn_bnsd_replacement_4(q, k, v, dropout_p, scale):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=scale
+    )
+
+
+# 5) is_causal=False, mask present, scale=None
+def _attn_bnsd_replacement_5(q, k, v, attn_mask, dropout_p):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=None
+    )
+
+
+# 6) is_causal=False, mask None, scale=None
+def _attn_bnsd_replacement_6(q, k, v, dropout_p):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=None
+    )
+
+
+# 7) is_causal=True, mask present, scale=None
+def _attn_bnsd_replacement_7(q, k, v, attn_mask, dropout_p):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=None
+    )
+
+
+# 8) is_causal=True, mask None, scale=None
+def _attn_bnsd_replacement_8(q, k, v, dropout_p):
+    return _attn_bnsd_to_bnsd_via_bsnd(
+        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=None
+    )
+
+
+def register_match_attn_layout(patterns: ADPatternMatcherPass):
+    # Dummy tensors in BNSD (we match bnsd calls)
+    bs, n_heads, s_q, head_dim = 8, 8, 16, 64
+    q = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
+    v = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
+    attn_mask = torch.randn(bs, n_heads, 1, s_q, device="cuda", dtype=torch.float16)
+
+    dropout_p = 0.12345
+    scale_val = 0.56789
+
+    # 1..4 (scale present)
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_1,
+        replace_fn=_attn_bnsd_replacement_1,
+        patterns=patterns,
+        dummy_args=[q, k, v, attn_mask, dropout_p, scale_val],
+        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
+    )
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_2,
+        replace_fn=_attn_bnsd_replacement_2,
+        patterns=patterns,
+        dummy_args=[q, k, v, dropout_p, scale_val],
+        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
+    )
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_3,
+        replace_fn=_attn_bnsd_replacement_3,
+        patterns=patterns,
+        dummy_args=[q, k, v, attn_mask, dropout_p, scale_val],
+        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
+    )
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_4,
+        replace_fn=_attn_bnsd_replacement_4,
+        patterns=patterns,
+        dummy_args=[q, k, v, dropout_p, scale_val],
+        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
+    )
+
+    # 5..8 (scale None)
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_5,
+        replace_fn=_attn_bnsd_replacement_5,
+        patterns=patterns,
+        dummy_args=[q, k, v, attn_mask, dropout_p],
+        scalar_workaround={"dropout_p": dropout_p},
+    )
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_6,
+        replace_fn=_attn_bnsd_replacement_6,
+        patterns=patterns,
+        dummy_args=[q, k, v, dropout_p],
+        scalar_workaround={"dropout_p": dropout_p},
+    )
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_7,
+        replace_fn=_attn_bnsd_replacement_7,
+        patterns=patterns,
+        dummy_args=[q, k, v, attn_mask, dropout_p],
+        scalar_workaround={"dropout_p": dropout_p},
+    )
+    register_ad_pattern(
+        search_fn=_attn_bnsd_pattern_8,
+        replace_fn=_attn_bnsd_replacement_8,
+        patterns=patterns,
+        dummy_args=[q, k, v, dropout_p],
+        scalar_workaround={"dropout_p": dropout_p},
+    )
+
+
 class MatchAttentionLayoutConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
@@ -640,13 +889,8 @@ class MatchAttentionLayoutConfig(TransformConfig):
 @TransformRegistry.register("match_attention_layout")
 class MatchAttentionLayout(BaseTransform):
     """
-    Match and transform attention operations to match the layout expected by the attention backend.
-
-    If the attention backend expects 'bnsd' layout (batch, num_heads, seq_len, head_dim), which
-    is the default for SDPA operations, we don't need to transform anything.
-
-    If the backend expects 'bsnd' layout (batch, seq_len, num_heads, head_dim), we insert
-    appropriate transposes before and after SDPA operations and replace them with bsnd_grouped_sdpa.
+    Convert unified torch_attention calls from layout='bnsd' (explicit, positional or default)
+    into layout='bsnd' + correct Q/K/V transposes, and transpose the output back to bnsd.
     """
 
     config: MatchAttentionLayoutConfig
@@ -662,82 +906,26 @@ class MatchAttentionLayout(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Get attention layout from attention_op
         attention_layout = self.config.attention_op.get_attention_layout()
 
-        # List of SDPA operations to look for
-        sdpa_ops = {
-            torch.ops.auto_deploy.torch_attention_grouped_sdpa,
-        }
+        if attention_layout not in ("bnsd", "bsnd"):
+            raise ValueError(f"Unsupported attention layout: {attention_layout}")
 
-        graph = gm.graph
-        num_bsnd_patterns = 0
+        # If backend expects bnsd, nothing to do.
+        if attention_layout == "bnsd":
+            return gm, TransformInfo(
+                skipped=False, num_matches=0, is_clean=False, has_valid_shapes=False
+            )
 
-        # Look for SDPA operations
-        for sdpa_node in list(graph.nodes):
-            if sdpa_node.op != "call_function" or not is_op(sdpa_node, sdpa_ops):
-                continue
+        num_matches = _apply_pattern(
+            gm, "MatchAttentionLayout(bnsd→bsnd)", register_match_attn_layout
+        )
 
-            ad_logger.debug(f"Found SDPA node to transform for bsnd layout: {sdpa_node}")
-
-            # Extract q, k, v inputs
-            q, k, v = sdpa_node.args[:3]
-
-            # Check if we need to transpose the inputs
-            if attention_layout == "bsnd":
-                # Add transposes before the node (from bnsd to bsnd)
-                with graph.inserting_before(sdpa_node):
-                    q_updated = graph.call_function(torch.ops.aten.transpose.int, args=(q, 1, 2))
-                    k_updated = graph.call_function(torch.ops.aten.transpose.int, args=(k, 1, 2))
-                    v_updated = graph.call_function(torch.ops.aten.transpose.int, args=(v, 1, 2))
-
-                # Preserve fake tensor in meta["val"] for the transposed inputs
-                q_updated.meta["val"] = q.meta["val"].transpose(1, 2)
-                k_updated.meta["val"] = k.meta["val"].transpose(1, 2)
-                v_updated.meta["val"] = v.meta["val"].transpose(1, 2)
-            elif attention_layout == "bnsd":
-                # we don't need to do anything...
-                q_updated = q
-                k_updated = k
-                v_updated = v
-            else:
-                raise ValueError(f"Unsupported attention layout: {attention_layout}")
-
-            # Create bsnd_grouped_sdpa node with the same args as the original node
-            # but using the transposed inputs
-            with graph.inserting_before(sdpa_node):
-                source_sdpa_node = graph.call_function(
-                    self.config.attention_op.get_source_attention_op(),
-                    args=(q_updated, k_updated, v_updated) + sdpa_node.args[3:],
-                    kwargs=sdpa_node.kwargs,
-                )
-
-            # Check if need to update the output node to match the layout
-            if attention_layout == "bsnd":
-                # Add transpose for the output (from bsnd back to bnsd)
-                with graph.inserting_after(source_sdpa_node):
-                    output_updated = graph.call_function(
-                        torch.ops.aten.transpose.int, args=(source_sdpa_node, 1, 2)
-                    )
-
-                # Preserve fake tensor in meta["val"] for the transposed inputs
-                source_sdpa_node.meta["val"] = sdpa_node.meta["val"].transpose(1, 2).contiguous()
-                output_updated.meta["val"] = source_sdpa_node.meta["val"].transpose(1, 2)
-            elif attention_layout == "bnsd":
-                output_updated = source_sdpa_node
-            else:
-                raise ValueError(f"Unsupported attention layout: {attention_layout}")
-
-            # Replace the old node with the transposed output
-            sdpa_node.replace_all_uses_with(output_updated)
-
-            num_bsnd_patterns += 1
-
+        # If we changed any attention calls, the shapes may change around the transposes; flag for shape prop.
         info = TransformInfo(
             skipped=False,
-            num_matches=num_bsnd_patterns,
+            num_matches=num_matches,
             is_clean=False,
             has_valid_shapes=False,
         )
-
         return gm, info

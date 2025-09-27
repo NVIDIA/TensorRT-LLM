@@ -46,6 +46,7 @@ def fake_profiler_mha(
         "sinks": "sinks",
         "sliding_window": "sliding_window",
         "logit_cap": "logit_cap",
+        "layout": "bsnd",
     }
     for k_kwargs, k_op_kwargs in kwargs_to_op.items():
         if k_kwargs in kwargs:
@@ -61,7 +62,7 @@ def fake_profiler_mha(
     v_fake.meta["val"] = torch.empty_like(value.transpose(1, 2), device="meta", dtype=value.dtype)
 
     module._node_ref = graph.call_function(
-        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention,
         args=(q_fake, k_fake, v_fake),
         kwargs=node_kwargs,
     )

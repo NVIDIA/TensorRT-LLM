@@ -355,7 +355,7 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
         """Get the source attention op that we target for replacement."""
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
