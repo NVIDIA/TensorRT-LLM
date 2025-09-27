@@ -117,11 +117,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
-    if (worldConfig.isPipelineParallel())
-    {
-        mMpiGroupPipeParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
-            mMpiGroupComm->split(worldConfig.getTensorParallelRank(), worldConfig.getPipelineParallelRank()));
-    }
+    using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isTensorParallel())
     {
         mMpiGroupTensorParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
@@ -132,8 +128,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         kvFactor = 1;
     }
-    mCacheState = std::make_unique<executor::kv_cache::CacheState>(
-        cacheStateModelCfg, worldConfig, attentionLayerNumPerPP, dataType, attentionType, kvFactor);
+    mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
+        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -311,7 +307,6 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     int localSize = static_cast<int>(requestIds.size());
     std::vector<int> sizes(mpiComm.getSize());
     mpiComm.allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
-    // std::vector<LlmRequest::RequestIdType> all_data(total_size);
     std::vector<int> displs(mpiComm.getSize());
     int totalSize = 0;
     for (int i = 0; i < mpiComm.getSize(); i++)

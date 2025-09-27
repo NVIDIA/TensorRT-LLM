@@ -11,6 +11,7 @@
  */
 
 #include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -1030,4 +1031,37 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
     EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
     EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
+}
+
+TEST(SerializeUtilsTest, BlockKeyBasic)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+
+    VecUniqueTokens uniqueTokens{UniqueToken{1, 0}, UniqueToken{2, 0}, UniqueToken{3, 0}};
+    BlockKey key(false, std::nullopt, uniqueTokens, {});
+
+    testSerializeDeserialize(key);
+}
+
+TEST(SerializeUtilsTest, BlockKeyWithExtras)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+
+    // Prepare multimodal extra keys
+    std::array<uint8_t, 32> h1{};
+    std::array<uint8_t, 32> h2{};
+    for (size_t i = 0; i < h1.size(); ++i)
+    {
+        h1[i] = static_cast<uint8_t>(i);
+        h2[i] = static_cast<uint8_t>(255 - i);
+    }
+    std::vector<MmKey> extraKeys{{h1, SizeType32{0}}, {h2, SizeType32{5}}};
+
+    VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
+    std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
+
+    // Note: cacheSaltID is intentionally not set since it is not serialized
+    BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
+
+    testSerializeDeserialize(key);
 }

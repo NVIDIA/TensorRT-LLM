@@ -545,8 +545,15 @@ class KVCacheManager(BaseResourceManager):
         for request in scheduled_batch.context_requests:
             self.impl.store_context_blocks(request)
 
-    def free_resources(self, request: LlmRequest):
-        self.impl.remove_sequence(request.py_request_id, request)
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        return self.impl.remove_sequence(request.py_request_id, request,
+                                         pin_on_release)
+
+    def store_blocks_for_reuse(self,
+                               request: LlmRequest,
+                               pin_blocks: bool = False):
+        return self.impl.store_blocks_for_reuse(request.py_request_id, request,
+                                                pin_blocks)
 
     @staticmethod
     def calculate_scaling_factor_size_bytes(
@@ -643,6 +650,12 @@ class KVCacheManager(BaseResourceManager):
                                                window_size)
         assert len(result) == 1
         return result[0]
+
+    def unpin_blocks_by_id(self, kv_cache_block_id: int):
+        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+
+    def get_last_block_id(self, request_id: int) -> int:
+        return self.impl.get_last_block_id(request_id)
 
     def get_batch_cache_indices(
         self,
@@ -1004,6 +1017,9 @@ class KVCacheManager(BaseResourceManager):
             return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
+
+    def pin_blocks(self, request_id: int):
+        self.impl.pin_blocks(request_id)
 
     def _set_temp_attention_window_inputs(
             self) -> Optional[TempAttentionWindowInputs]:
