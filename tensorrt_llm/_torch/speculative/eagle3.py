@@ -14,6 +14,7 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 from .mtp import MTPSampler
+from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -35,6 +36,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
         self.slot_manager = SlotManager(max_num_requests)
+        self.max_total_draft_tokens = config.max_total_draft_tokens
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
@@ -49,6 +51,16 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.start_indices = {i: 0 for i in range(max_num_requests)}
         # whether the next draft forward is the first
         self.is_first_draft = True
+        self.spec_tree_manager = None
+        if config.eagle_choices is not None:
+            self.spec_tree_manager = SpecTreeManager(
+                max_num_requests=self.max_num_requests,
+                use_dynamic_tree=config.use_dynamic_tree,
+                max_draft_len=self.max_draft_len,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+                eagle_choices=config.eagle_choices,
+                dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+            )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
@@ -97,6 +109,9 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
     is_mtp_eagle: bool = False
 
+    eagle_choices: Optional[List[List[int]]] = None
+    max_total_draft_tokens: int = 0
+
     def __post_init__(self):
         if self.is_draft_model:
             self.layers_to_capture = (self.num_layers - 1, )
@@ -122,6 +137,10 @@ class Eagle3SpecMetadata(SpecMetadata):
                                                        device='cuda')
         self.hidden_states_read_indices_host = None
         self.hidden_states_write_indices_host = None
+
+        if self.eagle_choices is not None:
+            self.is_spec_dec_tree = True
+            self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
         is_first_draft = self.eagle3_resource_manager.is_first_draft

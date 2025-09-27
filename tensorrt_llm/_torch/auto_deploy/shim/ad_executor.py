@@ -306,6 +306,13 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     max_draft_len = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
     )
+    max_total_draft_tokens = 0
+    if ad_config.speculative_config is None:
+        max_total_draft_tokens = 0
+    elif hasattr(ad_config.speculative_config, "max_total_draft_tokens"):
+        max_total_draft_tokens = ad_config.speculative_config.max_total_draft_tokens
+    else:
+        max_total_draft_tokens = max_draft_len
 
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
@@ -340,6 +347,7 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=ad_config.max_beam_width,
     )

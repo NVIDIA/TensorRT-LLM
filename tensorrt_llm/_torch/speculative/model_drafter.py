@@ -12,7 +12,8 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
+from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
+                                           ResourceManagerType)
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
@@ -198,7 +199,7 @@ class ModelDrafter(Drafter):
         # Copy additional properties
         draft_request.py_stop_words_list = original_request.py_stop_words_list
 
-        # Add to appropriate batch based on request type
+        # Add to appropriate batch based on request typetensorrt_llm/_torch/speculative/model_drafter.py
         if draft_request.state == LlmRequestState.GENERATION_IN_PROGRESS:
             draft_batch.generation_requests.append(draft_request)
         else:
@@ -308,8 +309,12 @@ class ModelDrafter(Drafter):
 
         return outputs
 
-    def sample_async(self, draft_batch: ScheduledRequests,
-                     outputs: Dict[str, Any]) -> Optional[SampleState]:
+    def sample_async(
+        self,
+        draft_batch: ScheduledRequests,
+        outputs: Dict[str, Any],
+        resource_manager: Optional[ResourceManager] = None
+    ) -> Optional[SampleState]:
         """Sample tokens from draft model outputs."""
         try:
             num_context_logits_prefix_sum = [0]
@@ -325,7 +330,8 @@ class ModelDrafter(Drafter):
                            self.sampler.is_generation_model())
 
             return self.sampler.sample_async(draft_batch, outputs,
-                                             num_context_logits_prefix_sum)
+                                             num_context_logits_prefix_sum,
+                                             resource_manager)
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")
             return None
@@ -339,9 +345,25 @@ class ModelDrafter(Drafter):
             if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
-    def update_requests(self, sample_state: SampleState) -> None:
+    def update_cur_draft_layer_idx(
+            self,
+            cur_draft_layer_idx: int,
+            resource_manager: Optional[ResourceManager] = None):
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is None:
+            return None
+
+        spec_tree_manager = spec_resource_manager.spec_tree_manager
+        if spec_tree_manager is not None:
+            spec_tree_manager.cur_draft_layer_idx = cur_draft_layer_idx
+
+    def update_requests(
+            self,
+            sample_state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         """Update requests with sample state."""
-        self.sampler.update_requests(sample_state)
+        self.sampler.update_requests(sample_state, resource_manager)
 
     def process_decoded_tokens(
             self, draft_batch: ScheduledRequests,
@@ -503,7 +525,8 @@ class ModelDrafter(Drafter):
         return draft_batch, req_id_to_old_request
 
     def process_static_draft_outputs(
-            self, outputs: Any, draft_batch: ScheduledRequests,
+            self, outputs: torch.Tensor | SampleState,
+            draft_batch: ScheduledRequests,
             req_id_to_old_request: Dict[int, LlmRequest]) -> None:
         """
         Process outputs from static draft loop, update target requests, and clean up resources.
@@ -513,7 +536,13 @@ class ModelDrafter(Drafter):
             draft_batch: The draft batch that was processed
             req_id_to_old_request: Mapping from draft request ID to original request
         """
-        outputs_host = outputs.cpu()
+        if isinstance(outputs, torch.Tensor):
+            # For non-overlap scheduler path.
+            outputs_host = outputs.cpu()
+        else:
+            outputs_host = outputs.host.new_tokens
+            outputs.sampler_event.synchronize()
+
         for token_idx in range(self.max_draft_tokens):
             for req_idx, req in enumerate(draft_batch.all_requests()):
                 target_model_req = req_id_to_old_request[req.py_request_id]
@@ -530,19 +559,25 @@ class ModelDrafter(Drafter):
             self.draft_seq_slot_manager.free_resources(req)
 
     def process_dynamic_draft_outputs(
-            self, outputs: Any,
-            req_id_to_old_request: Dict[int, LlmRequest]) -> None:
+            self,
+            outputs: Any,
+            req_id_to_old_request: Dict[int, LlmRequest],
+            resource_manager: Optional[ResourceManager] = None) -> None:
         """
         Process outputs from dynamic draft loop, update target requests, and clean up resources.
         """
-        self.update_requests(outputs)
+        self.update_requests(outputs, resource_manager)
         self.process_decoded_tokens(outputs.scheduled_requests,
                                     req_id_to_old_request)
 
     def _execute_draft_iteration(
-        self, draft_batch: ScheduledRequests, resource_manager: ResourceManager,
-        previous_draft_state: Optional[SampleState]
-    ) -> Tuple[Any, Optional[SampleState]]:
+            self, draft_batch: ScheduledRequests,
+            resource_manager: ResourceManager,
+            previous_draft_state: Optional[SampleState],
+            cur_draft_layer_idx: int) -> Tuple[Any, Optional[SampleState]]:
+        self.update_cur_draft_layer_idx(
+            cur_draft_layer_idx, resource_manager
+        )  # Update the current draft layer index in the resource manager.
         """Forward pass through the draft model."""
         outputs = self.forward_draft_model(
             draft_batch,
@@ -552,14 +587,14 @@ class ModelDrafter(Drafter):
             if previous_draft_state else None)
 
         if previous_draft_state is not None:
-            self.update_requests(previous_draft_state)
+            self.update_requests(previous_draft_state, resource_manager)
 
         if self.guided_decoder is not None:
             self.guided_decoder.add_batch(draft_batch)
             self.guided_decoder.execute(outputs['logits'],
                                         d2t=outputs.get('d2t'))
 
-        sample_state = self.sample_async(draft_batch, outputs)
+        sample_state = self.sample_async(draft_batch, outputs, resource_manager)
         self.update_request_states(draft_batch)
 
         return outputs, sample_state
@@ -601,7 +636,7 @@ class ModelDrafter(Drafter):
                 break
 
             _, sample_state = self._execute_draft_iteration(
-                draft_batch, resource_manager, previous_draft_state)
+                draft_batch, resource_manager, previous_draft_state, i + 1)
 
             # Update target inputs if provided (for overlap mode)
             if target_inputs is not None and num_draft_reqs is not None:
@@ -657,6 +692,9 @@ class ModelDrafter(Drafter):
             return None, None, None
 
         # Initial forward pass
+        self.update_cur_draft_layer_idx(
+            0, resource_manager
+        )  # Update the current draft layer index in the resource manager.
         outputs = self.forward_draft_model(draft_batch,
                                            resource_manager,
                                            is_first_draft_token=True,
@@ -672,6 +710,17 @@ class ModelDrafter(Drafter):
                 draft_length=self.max_draft_tokens,
                 draft_batch=draft_batch,
                 req_id_to_old_request=req_id_to_old_request)
+
+            new_tokens_host = outputs.to(device='cpu', non_blocking=True)
+            sampler_event = torch.cuda.Event()
+            sampler_event.record()
+
+            outputs = SampleState(
+                scheduled_requests=draft_batch,
+                device=SampleStateTensors(new_tokens=outputs),
+                host=SampleStateTensors(new_tokens=new_tokens_host),
+                sampler_event=sampler_event)
+
             return target_inputs, outputs, draft_batch
 
         # Handle guided decoder and sampling for non-static loop
@@ -679,7 +728,8 @@ class ModelDrafter(Drafter):
             self.guided_decoder.add_batch(draft_batch)
             self.guided_decoder.execute(outputs['logits'],
                                         d2t=outputs.get('d2t'))
-        draft_sample_state = self.sample_async(draft_batch, outputs)
+        draft_sample_state = self.sample_async(draft_batch, outputs,
+                                               resource_manager)
 
         # Update target inputs with first iteration results
         draft_tensors = draft_sample_state and draft_sample_state.device and draft_sample_state.device.new_tokens
@@ -725,6 +775,9 @@ class ModelDrafter(Drafter):
             if draft_batch is None:
                 return
 
+            self.update_cur_draft_layer_idx(
+                0, resource_manager
+            )  # Update the current draft layer index in the resource manager.
             # Initial forward pass. May do the complete drafting loop
             # if use_static_draft_loop is set.
             outputs = self.forward_draft_model(draft_batch,
@@ -740,7 +793,8 @@ class ModelDrafter(Drafter):
                 self.guided_decoder.add_batch(draft_batch)
                 self.guided_decoder.execute(outputs['logits'],
                                             d2t=outputs.get('d2t'))
-            sample_state = self.sample_async(draft_batch, outputs)
+            sample_state = self.sample_async(draft_batch, outputs,
+                                             resource_manager)
             self.update_request_states(draft_batch)
 
             # Execute the iterative draft loop

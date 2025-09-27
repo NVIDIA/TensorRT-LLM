@@ -53,6 +53,11 @@ class QuantConfigReader(ABC):
         """
         pass
 
+    # optional hook; default is no-op
+    def post_process_model(self, model, model_config):
+        """Optional hook to mutate model after construction (e.g., dtype moves)."""
+        return model
+
 
 class QuantConfigReaderRegistry:
     _registry: Dict[str, Type[QuantConfigReader]] = {}
@@ -128,3 +133,80 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         reader = cls()
         extra_model_kwargs = reader.read_config(raw)
         return reader, extra_model_kwargs
+
+
+@QuantConfigReaderRegistry.register("hf")
+class HFQuantConfigReader(QuantConfigReader):
+    """
+    Quantization reader that process transformers.quantizers.HFQuantizer functionality
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._hf_quantizer = None
+
+    def read_config(self, config: Dict) -> Dict:
+        # 'config' here is the full HF config.json object
+        qconf = config.get("quantization_config")
+        if not qconf:
+            raise ValueError("HF quantization_config not found.")
+
+        self._quant_config = qconf
+        from transformers.quantizers import AutoHfQuantizer
+
+        try:
+            self._hf_quantizer = AutoHfQuantizer.from_config(qconf, pre_quantized=True)
+        except Exception:
+            self._hf_quantizer = None
+
+        return {}
+
+    @classmethod
+    def from_file(cls, ckpt_dir: str) -> Optional[Tuple["HFQuantConfigReader", Dict[str, Any]]]:
+        config_file = os.path.join(ckpt_dir, "config.json")
+        if not os.path.exists(config_file):
+            return None
+        with open(config_file, "r") as f:
+            raw = json.load(f)
+        qconf = raw.get("quantization_config")
+        if not isinstance(qconf, dict):
+            return None
+
+        # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4, other hf quantizers
+        # should have similar workflow and will be added to the pipeline
+        quant_method = str(qconf.get("quant_method", "")).lower()
+        if quant_method != "mxfp4":
+            return None
+
+        reader = cls()
+        extra_model_kwargs = reader.read_config(raw)
+        return reader, extra_model_kwargs
+
+    # Apply dtype using HF quantizer, this is needed for GPT-OSS MXFP4 integration into AD pipeline,
+    # more features to be added
+    def post_process_model(self, model, model_config):
+        if self._hf_quantizer is None:
+            return
+        dtype = getattr(model_config, "dtype", None)
+        new_dtype = self._hf_quantizer.update_dtype(dtype)
+        if new_dtype is None:
+            return
+        model.to(new_dtype)
+        return model
+
+
+def autodetect_quant_config_reader(
+    fetched_dir: str,
+) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
+    """Try ModelOPT first; if not found, fall back to HF. Returns (reader, extra_kwargs) or None."""
+    reader_cls = QuantConfigReaderRegistry.get("modelopt")
+    result = reader_cls.from_file(fetched_dir)
+    # Fallback to HF reader if ModelOPT not present
+    if result is None:
+        hf_cls = QuantConfigReaderRegistry.get("hf")
+        try:
+            result = hf_cls.from_file(fetched_dir)
+        except Exception:
+            # Skip HF reader if it errors out during probing
+            result = None
+    return result
