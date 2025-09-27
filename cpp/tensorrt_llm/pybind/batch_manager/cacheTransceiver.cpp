@@ -97,5 +97,6 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), py::arg("cache_manager"),
             py::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            py::arg("cache_size_bytes_per_token_per_window"), py::arg("cache_transceiver_config") = py::none());
+            py::arg("cache_size_bytes_per_token_per_window"), py::arg("tokens_per_block"),
+            py::arg("cache_transceiver_config") = py::none());
 }

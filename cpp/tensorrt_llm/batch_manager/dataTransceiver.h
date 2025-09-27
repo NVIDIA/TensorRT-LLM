@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -134,7 +135,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes,
+    RequestInfo(LlmRequest::RequestIdType requestId,
+        std::unordered_map<SizeType32, std::vector<size_t>>&& blockHashesPerWindow,
         executor::DataTransceiverState transState);
     RequestInfo() = default;
 
@@ -146,7 +148,7 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<size_t> const& getBlockHashes() const noexcept;
+    [[nodiscard]] std::unordered_map<SizeType32, std::vector<size_t>> const& getBlockHashesPerWindow() const noexcept;
 
     /// @brief Return the state of the data transceiver.
     /// @return The state of the data transceiver.
@@ -170,7 +172,7 @@ private:
     // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mRequestId;
 
-    std::vector<size_t> mBlockHashes;
+    std::unordered_map<SizeType32, std::vector<size_t>> mBlockHashesPerWindow;
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;

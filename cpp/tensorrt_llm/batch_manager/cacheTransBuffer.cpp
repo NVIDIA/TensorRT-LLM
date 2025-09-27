@@ -210,7 +210,13 @@ CacheTransBufferManager::CacheTransBufferManager(
         {
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
-            auto validTokenNum = (windowSize < maxNumTokens.value() ? windowSize : maxNumTokens.value());
+            auto validTokenNum
+                = (windowSize < maxNumTokens.value() ? (windowSize + tokensPerBlock) : maxNumTokens.value());
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
+
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
     }
@@ -238,7 +244,7 @@ CacheTransBufferManager::CacheTransBufferManager(
 }
 
 size_t CacheTransBufferManager::preAllocBufferSize(
-    std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+    std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow, SizeType32 tokensPerBlock,
     std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig)
 {
     if (!cacheTransceiverConfig.has_value())
@@ -256,9 +262,13 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         TransferBufferSize = 0;
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
-            auto validTokenNum
-                = (static_cast<size_t>(windowSize) < maxNumTokens.value() ? static_cast<size_t>(windowSize)
-                                                                          : maxNumTokens.value());
+            auto validTokenNum = (static_cast<size_t>(windowSize) < maxNumTokens.value()
+                    ? static_cast<size_t>(windowSize) + tokensPerBlock
+                    : maxNumTokens.value());
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
             TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
