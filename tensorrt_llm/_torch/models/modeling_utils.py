@@ -963,7 +963,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 module_name, module_weights, n, p)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      False) in ["True", "true", "1", "yes", "y"]:
+                      "True") in ["True", "true", "1", "yes", "y"]:
         for name, module in tqdm(list(model.named_modules()),
                                  desc="Loading weights"):
             load_single_module(name, module)
