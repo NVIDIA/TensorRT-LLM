@@ -683,7 +683,6 @@ def testFilter = [
     (ADD_MULTI_GPU_TEST): false,
     (ONLY_MULTI_GPU_TEST): false,
     (DISABLE_MULTI_GPU_TEST): false,
-    (ONLY_PERF_SANITY_TEST): false,
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_ONE_GROUP_CHANGED): "",
