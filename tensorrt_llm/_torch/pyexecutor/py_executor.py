@@ -1180,17 +1180,10 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        if self.dist.rank == 0 and not self.is_warmup and self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver:
-            while self.executor_request_queue.get_request_queue_size(
-            ) < self.benchmark_req_queues_size:
-                logger.info(
-                    f"sleep 5 seconds, num_request_queue: {self.executor_request_queue.get_request_queue_size()}"
-                )
-                time.sleep(5)
-
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
+            can_forward = False if self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver else True
             while True:
                 profile_step()
                 if self.enable_iter_perf_stats:
@@ -1199,6 +1192,36 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
+                # In gen-only benchmarking mode, wait until the number of scheduled generation
+                # requests reaches the required threshold before starting forward pass,
+                # to ensure consistent batch sizes for accurate performance measurement.
+                if not self.is_warmup and not can_forward:
+                    if self.enable_attention_dp:
+                        local_can_forward = self.executor_request_queue.num_fetch_requests + \
+                            len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
+                        all_can_forward = self.dist.tp_allgather(
+                            local_can_forward)
+                        if all(all_can_forward):
+                            can_forward = True
+                            time.sleep(10)
+                        else:
+                            if self.dist.rank == 0:
+                                logger.info(
+                                    f"sleep 10 seconds, num_fetched_requests: {self.executor_request_queue.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                )
+                            time.sleep(10)
+                            continue
+                    else:
+                        if len(scheduled_batch.generation_requests
+                               ) < self.benchmark_req_queues_size:
+                            if self.dist.rank == 0:
+                                logger.info(
+                                    f"sleep 10 seconds, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
+                                )
+                            time.sleep(10)
+                            continue
+                        else:
+                            can_forward = True
 
                 self._pause_requests(scheduled_batch.paused_requests)
 
