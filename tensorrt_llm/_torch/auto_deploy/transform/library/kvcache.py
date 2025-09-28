@@ -12,6 +12,7 @@ from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import add_graph_input
+from ...utils.logger import ad_logger
 from ...utils.node_utils import get_all_input_output_nodes, is_op
 from ..interface import (
     BaseTransform,
@@ -305,6 +306,12 @@ class ResizeKVCache(BaseTransform):
         self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
 
         cm.resize_cache(new_num_pages)
+        # Log the final cache size for performance measurement, do not remove this log.
+        final_cache_size_bytes = cm.current_cache_size_bytes()
+        final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
+        ad_logger.info(
+            f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
+        )
 
         # Free memory
         torch.cuda.empty_cache()
