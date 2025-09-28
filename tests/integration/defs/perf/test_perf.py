@@ -29,6 +29,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
 from .pytorch_model_config import get_model_yaml_config
+from .sampler_options import get_sampler_options
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfDisaggScriptTestCmds, PerfMetricType,
                     PerfScriptTestCmds, generate_test_nodes)
@@ -1373,8 +1374,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
         #use default yaml config
+        import yaml
         if self._config.backend == "pytorch":
-            import yaml
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
@@ -1385,6 +1386,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             with open(pytorch_config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
+        # add sampling options.yml
+        sampling_options_path = os.path.join(engine_dir, "sampling_options.yml")
+        if not os.path.exists(sampling_options_path):
+            os.makedirs(os.path.dirname(sampling_options_path), exist_ok=True)
+        config = get_sampler_options(self._config.to_string())
+        print_info(f"sampler options: {config}")
+        with open(sampling_options_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+        benchmark_cmd += [f"--sampler_options={sampling_options_path}"]
         return benchmark_cmd
 
     def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,
