@@ -8,7 +8,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## Prerequisites
 
-* GPU: NVIDIA Blackwell Architecture
+* GPU: NVIDIA Hopper or Blackwell Architecture
 * OS: Linux
 * Drivers: CUDA Driver 575 or Later
 * Docker with NVIDIA Container Toolkit installed
@@ -62,22 +62,26 @@ moe_config:
     backend: TRTLLM
 stream_interval: 20
 num_postprocess_workers: 4
+kv_cache_config:
+    enable_block_reuse: false
 EOF
 ```
 
 
 ### Launch the TRT-LLM Server
 
-Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
+Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container. 
+
+Note that we currently only support pytorch backend, and kv_cache_reuse is yet to be supported. 
 
 ```shell
 trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
     --host 0.0.0.0 \
     --port 8000 \
     --backend pytorch \
-    --max_batch_size 720 \
-    --max_num_tokens 16384 \
-    --kv_cache_free_gpu_memory_fraction 0.9 \
+    --max_batch_size 1 \
+    --max_num_tokens 4096 \
+    --kv_cache_free_gpu_memory_fraction 0.6 \
     --tp_size 4 \
     --ep_size 4 \
     --trust_remote_code \
@@ -185,6 +189,13 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 }' -w "\n"
 ```
 
+Here is an example response:
+
+```
+{"id":"chatcmpl-64ac201c77bf46a7a3a4eca7759b1fd8","object":"chat.completion","created":1759022940,"model":"Qwen/Qwen3-Next-80B-A3B-Thinking","choices":[{"index":0,"message":{"role":"assistant","content":"Okay, the user is asking \"Where is New York?\" Hmm, this seems straightforward but I need to be careful. New York could mean different things—maybe they're confused about the city versus the state. \n\nFirst thought: Are they a tourist planning a trip? Or maybe a student doing homework? Could even be someone国外 who's only heard \"New York\" in movies and isn't sure if it's a city or state. \n\nI should clarify both possibilities immediately. People often mix them up. Like, if someone says \"I'm going to New York\" they're probably talking about NYC, but technically New York State is bigger. \n\nLet me break it down: \n- New York City (NYC) is the famous one—Manhattan, skyscrapers, Times Square. \n- Then New York State (NY) is the whole state, which includes NYC but also upstate areas like Albany (the capital), Buffalo, and even the Adirondacks. \n\nWait, should I mention that NYC is in New York State? Yeah, that's crucial. Otherwise they might think it's two separate things. Also, where is the state located? Northeast US, borders other states like Pennsylvania, New Jersey... maybe name a few neighbors for context. \n\nOh! And the city vs state confusion is super common. Like, people say \"New York\" for the city but forget it's part of a larger state. Should I give examples? \n- \"If someone says 'hot dogs in New York' they mean NYC\" \n- But \"the New York State Police\" covers the whole state\" \n\n...Maybe add a fun fact? Like how NYC is just one city within the state? Or that the state capital isn't NYC but Albany? Yeah, that'll help clear confusion. \n\nAlso—should I ask if they meant the city or the state? Nah, better to cover both upfront. Keep it simple but precise. No jargon. They might not know terms like \"metropolitan area\" or \"boroughs,\" so explain \"boroughs\" as neighborhoods (Manhattan, Brooklyn etc.). \n\nCoordinates: 40.7°N, 74°W? Maybe overkill unless they're into geography. But for the state, roughly 42°N to 45°N latitude? Hmm, probably unnecessary. Stick to landmarks: borders Lake Erie, Atlantic coast... \n\nWait—user might be asking literally for GPS coordinates? Unlikely, but just in case I can add: \"Geographically, New York City is at approximately 40.7°N latitude and 74.0°W longitude...\" but only if the answer feels too dry otherwise. \n\nPriority: Clear, simple, correct. No assuming prior knowledge. Say \"New York can refer to...\" then split into two cases. End with \"Most people mean the city when they say 'New York' in casual talk.\" That’s the key takeaway. \n\n...Double-check: Is Albany really the capital? Yes. And NYC is the largest city but not capital. Got it. Also, New York State is the 27th largest by area? Maybe not relevant. Stick to basics. \n\nFinal structure: \n1. \"New York can mean two things: the city or the state.\" \n2. For city: \n   - Where it is (Northeast US) \n   - Inside New York State \n   - Famous parts (Manhattan etc.) \n3. For state: \n   - Larger area, includes city \n   - Borders (PA, NJ, CT, MA, VT, Canada) \n   - Capital is Albany (not NYC!) \n4. Clear summary: \"In everyday talk, 'New York' usually means NYC.\" \n\nYeah. That covers it without overwhelming them. No markdown, just plain English. Keep it warm—add a \"hope that helps!\" at the end.\n</think>\n\nThat's a common point of confusion! **\"New York\" can refer to two different things**, and it's important to distinguish between them:\n\n### 1. **New York City (NYC)**  \n   - **What it is**: The largest and most famous city in the United States, known for landmarks like Times Square, Central Park, the Statue of Liberty, and Wall Street.  \n   - **Where it is**:  \n     - Located in the **northeastern United States**.  \n     - Situated at the mouth of the **Hudson River**, where it meets the **Atlantic Ocean**.  \n     - Part of **New York State** (see below).  \n   - **Geographic details**:  \n     - Coordinates: Approximately **40.7° N latitude, 74.0° W longitude**.  \n     - Composed of **5 boroughs**: Manhattan (the \"city\" most people picture), Brooklyn, Queens, The Bronx, and Staten Island.  \n     - Panoramic view of NYC (including Brooklyn and New Jersey skyline):","reasoning_content":null,"reasoning":null,"tool_calls":[]},"logprobs":null,"finish_reason":"length","stop_reason":null,"mm_embedding_handle":null,"disaggregated_params":null,"avg_decoded_tokens_per_iter":1.0}],"usage":{"prompt_tokens":15,"total_tokens":1039,"completion_tokens":1024},"prompt_token_ids":null}
+```
+
+
 
 ### Troubleshooting Tips
 
@@ -205,11 +216,11 @@ cat <<'EOF' > bench.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-concurrency_list="32 64 128 256 512 1024 2048 4096"
-multi_round=5
+concurrency_list="4 8 16"
+multi_round=3
 isl=1024
 osl=1024
-result_dir=/tmp/gpt_oss_output
+result_dir=/tmp/qwen3_output
 
 for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
