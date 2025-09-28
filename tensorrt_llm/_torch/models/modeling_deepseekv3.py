@@ -405,6 +405,8 @@ class DeepseekV3MTPHead(nn.Module):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
+        self.mapping_lm_head_tp = None
+
     @torch.compile(options={"max-autotune": True})
     def get_last_token_states(self, hidden_states, attn_metadata):
         last_tokens = torch.cumsum(
@@ -427,7 +429,7 @@ class DeepseekV3MTPHead(nn.Module):
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
-        enable_lm_head_tp_in_adp = self.model_config.mapping.enable_lm_head_tp_in_adp
+        enable_lm_head_tp_in_adp = enable_attention_dp and self.model_config.mapping.enable_lm_head_tp_in_adp
 
         # Add pre-lm gather logic
         if enable_lm_head_tp_in_adp:
