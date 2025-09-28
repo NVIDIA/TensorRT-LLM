@@ -418,6 +418,18 @@ class WideEPMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
         return outputs
 
+    def is_post_quant_all2all_supported(self):
+        if not self.use_postquant_alltoall:
+            return False
+        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            return False
+        elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
+            return self.has_nvfp4
+        elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+            return self.has_fp8_qdq or self.has_nvfp4 or self.has_w4afp8
+        else:
+            return False
+
     def forward_chunk(
             self,
             x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -494,7 +506,8 @@ class WideEPMoE(MoE):
         use_allgather = not use_all_to_all
 
         # If alltoall is disabled, we need also disable use_postquant_alltoall
-        use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all and self.has_any_quant
+        use_postquant_alltoall = use_all_to_all and self.is_post_quant_all2all_supported(
+        )
 
         # Prepare additional information for profiling in case padding is applied when using alltoall.
         # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -614,6 +627,7 @@ class WideEPMoE(MoE):
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 pass
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
+                assert self.has_nvfp4, "DeepEP postquant alltoall should have nvfp4"
                 if x_sf is not None:
                     # Adapter between `x_sf` and DeepEP
                     # TODO: remove the adapter by adding dtype support to DeepEP
