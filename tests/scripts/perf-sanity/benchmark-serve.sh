@@ -75,7 +75,7 @@ run_benchmark_and_parse() {
 
             echo 'Benchmarks completed. Generating CSV report...'
             if [[ -f '${bench_dir}/parse_benchmark_results.py' ]]; then
-                python3 ${bench_dir}/parse_benchmark_results.py --config_file ${bench_dir}/${config_file} --input_folder ${output_folder} --output_csv ${output_folder}.csv
+                python3 ${bench_dir}/parse_benchmark_results.py --config_file ${bench_dir}/${config_file} --input_folder ${output_folder} --output_csv ${output_folder}.csv --print_perf --generate_table
                 echo 'CSV report generated successfully'
             else
                 echo 'Warning: parse_benchmark_results.py not found'

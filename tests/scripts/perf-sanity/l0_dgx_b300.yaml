@@ -1,0 +1,69 @@
+server_configs:
+  - id: 1
+    model_name: "R1-FP4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
+    moe_max_num_tokens: ""
+    enable_attention_dp: true
+    enable_chunked_prefill: false
+    isl: 1024
+    osl: 1024
+    max_num_tokens: 2176
+    disable_overlap_scheduler: false
+    kv_cache_dtype: "fp8"
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - concurrency: 1
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 4
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 16
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 64
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 128
+        iterations: 1
+        random_range_ratio: 0.0
+
+  - id: 2
+    model_name: "R1-FP4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
+    moe_max_num_tokens: 131072
+    enable_attention_dp: true
+    enable_chunked_prefill: true
+    isl: 131072
+    osl: 8192
+    max_num_tokens: 32768
+    disable_overlap_scheduler: false
+    kv_cache_dtype: "fp8"
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - concurrency: 32
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 64
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 128
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 256
+        iterations: 1
+        random_range_ratio: 0.0

@@ -5,304 +5,227 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import yaml
+# Import ServerConfig, ClientConfig, and parse_config_file from run_benchmark_serve.py
+from run_benchmark_serve import (CLIENT_CONFIG_METRICS, SERVER_CONFIG_METRICS,
+                                 ClientConfig, ServerConfig, parse_config_file)
 
 
-def extract_config_from_log_filename(log_file):
-    """
-    Extract configuration from log filename using the naming pattern:
-    serve.{model_label}.tp{tp}.ep{ep}.adp{enable_attention_dp}.attn{attn_backend}.moe{moe_backend}.gpu{free_gpu_mem_fraction}.batch{max_batch_size}.isl{isl}.osl{osl}.tokens{max_num_tokens}.moetokens{moe_max_num_tokens}.concurrency{concurrency}.iter{iteration}.log
-    """
-    filename = Path(log_file).name
+class PerfMetrics:
+    """Class to store and parse performance metrics from benchmark logs"""
 
-    # Define regex pattern to match the log filename format
-    pattern = r'serve\.([^.]+)\.tp(\d+)\.ep(\d+)\.adp([^.]+)\.attn([^.]+)\.moe([^.]*)\.gpu([^.]+\.[^.]*)\.batch(\d+)\.isl(\d+)\.osl(\d+)\.tokens(\d+)\.moetokens([^.]*)\.concurrency(\d+)\.iter(\d+)\.log'
+    def __init__(self):
+        # Basic metrics
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.benchmark_duration = 0.0
+        self.total_input_tokens = 0
+        self.total_generated_tokens = 0
+        self.request_throughput = 0.0
+        self.output_token_throughput = 0.0
+        self.total_token_throughput = 0.0
+        self.user_throughput = 0.0
+        self.avg_decoded_tokens_per_iter = 0.0
 
-    match = re.match(pattern, filename)
-    if not match:
-        print(f"Warning: Could not parse filename {filename}")
-        return None
+        # Time to First Token (TTFT)
+        self.mean_ttft_ms = 0.0
+        self.median_ttft_ms = 0.0
+        self.p99_ttft_ms = 0.0
 
-    # Extract all groups from the match
-    groups = match.groups()
+        # Time per Output Token (TPOT)
+        self.mean_tpot_ms = 0.0
+        self.median_tpot_ms = 0.0
+        self.p99_tpot_ms = 0.0
 
-    try:
-        model_label = groups[0]
-        tp = int(groups[1])
-        ep = int(groups[2])
-        enable_attention_dp_str = groups[3]
-        attn_backend = groups[4]
-        moe_backend = groups[5]
-        free_gpu_mem_fraction = float(groups[6])
-        max_batch_size = int(groups[7])
-        isl = int(groups[8])
-        osl = int(groups[9])
-        max_num_tokens = int(groups[10])
-        moe_max_num_tokens_str = groups[11]
-        concurrency = int(groups[12])
-        iteration = int(groups[13])
+        # Inter-token Latency (ITL)
+        self.mean_itl_ms = 0.0
+        self.median_itl_ms = 0.0
+        self.p99_itl_ms = 0.0
 
-        # Handle moe_max_num_tokens (could be "N/A", empty, or a number)
-        moe_max_num_tokens = ""
-        if moe_max_num_tokens_str and moe_max_num_tokens_str != "N/A":
-            try:
-                moe_max_num_tokens = int(moe_max_num_tokens_str)
-            except ValueError:
-                moe_max_num_tokens = ""
-        elif not moe_max_num_tokens_str:
-            moe_max_num_tokens = ""
+        # End-to-end Latency (E2EL)
+        self.mean_e2el_ms = 0.0
+        self.median_e2el_ms = 0.0
+        self.p99_e2el_ms = 0.0
 
-        # Handle enable_attention_dp (convert string to boolean)
-        enable_attention_dp_bool = enable_attention_dp_str.lower() == "true"
+    def to_str(self) -> str:
+        return f"Total Requests: {self.total_requests}, Successful Requests: {self.successful_requests}, Failed Requests: {self.failed_requests}, Benchmark Duration (s): {self.benchmark_duration}, Total Input Tokens: {self.total_input_tokens}, Total Generated Tokens: {self.total_generated_tokens}, Request Throughput (req/s): {self.request_throughput}, Output Token Throughput (tok/s): {self.output_token_throughput}, Total Token Throughput (tok/s): {self.total_token_throughput}, User Throughput (tok/s): {self.user_throughput}, Avg Decoded Tokens per Iter: {self.avg_decoded_tokens_per_iter}, Mean TTFT (ms): {self.mean_ttft_ms}, Median TTFT (ms): {self.median_ttft_ms}, P99 TTFT (ms): {self.p99_ttft_ms}, Mean TPOT (ms): {self.mean_tpot_ms}, Median TPOT (ms): {self.median_tpot_ms}, P99 TPOT (ms): {self.p99_tpot_ms}, Mean ITL (ms): {self.mean_itl_ms}, Median ITL (ms): {self.median_itl_ms}, P99 ITL (ms): {self.p99_itl_ms}, Mean E2EL (ms): {self.mean_e2el_ms}, Median E2EL (ms): {self.median_e2el_ms}, P99 E2EL (ms): {self.p99_e2el_ms}"
 
-        # Note: We don't have GPUs information in the filename, so we'll leave it empty
-        # and let the caller handle this if needed
+    @classmethod
+    def from_log_content(cls, log_content: str) -> 'PerfMetrics':
+        """Parse performance metrics from log content"""
+        metrics = cls()
 
-        return {
-            'model_name': model_label,
-            'gpus': tp,
-            'tp': tp,
-            'ep': ep,
-            'attn_backend': attn_backend,
-            'moe_backend': moe_backend,
-            'enable_attention_dp': enable_attention_dp_bool,
-            'free_gpu_mem_fraction': free_gpu_mem_fraction,
-            'max_batch_size': max_batch_size,
-            'isl': isl,
-            'osl': osl,
-            'max_num_tokens': max_num_tokens,
-            'moe_max_num_tokens': moe_max_num_tokens,
-            'concurrency': concurrency,
-            'iteration': iteration,
-            'found_in_filename': True
+        # Define patterns for each metric
+        patterns = {
+            'total_requests': r'Total requests:\s+(\d+)',
+            'successful_requests': r'Successful requests:\s+(\d+)',
+            'failed_requests': r'Failed requests:\s+(\d+)',
+            'benchmark_duration': r'Benchmark duration \(s\):\s+([\d.]+)',
+            'total_input_tokens': r'Total input tokens:\s+(\d+)',
+            'total_generated_tokens': r'Total generated tokens:\s+(\d+)',
+            'request_throughput': r'Request throughput \(req/s\):\s+([\d.]+)',
+            'output_token_throughput':
+            r'Output token throughput \(tok/s\):\s+([\d.]+)',
+            'total_token_throughput':
+            r'Total Token throughput \(tok/s\):\s+([\d.]+)',
+            'user_throughput': r'User throughput \(tok/s\):\s+([\d.]+)',
+            'avg_decoded_tokens_per_iter':
+            r'Avg Decoded Tokens per Iter:\s+([\d.]+)',
+            'mean_ttft_ms': r'Mean TTFT \(ms\):\s+([\d.]+)',
+            'median_ttft_ms': r'Median TTFT \(ms\):\s+([\d.]+)',
+            'p99_ttft_ms': r'P99 TTFT \(ms\):\s+([\d.]+)',
+            'mean_tpot_ms': r'Mean TPOT \(ms\):\s+([\d.]+)',
+            'median_tpot_ms': r'Median TPOT \(ms\):\s+([\d.]+)',
+            'p99_tpot_ms': r'P99 TPOT \(ms\):\s+([\d.]+)',
+            'mean_itl_ms': r'Mean ITL \(ms\):\s+([\d.]+)',
+            'median_itl_ms': r'Median ITL \(ms\):\s+([\d.]+)',
+            'p99_itl_ms': r'P99 ITL \(ms\):\s+([\d.]+)',
+            'mean_e2el_ms': r'Mean E2EL \(ms\):\s+([\d.]+)',
+            'median_e2el_ms': r'Median E2EL \(ms\):\s+([\d.]+)',
+            'p99_e2el_ms': r'P99 E2EL \(ms\):\s+([\d.]+)',
         }
-    except (ValueError, IndexError) as e:
-        print(f"Warning: Could not parse filename {filename}: {e}")
-        return None
 
-
-def extract_config_from_log_content(log_file):
-    """
-    Extract configuration from log file content using "Completed benchmark with Configuration:" pattern.
-    If that fails, try to extract from the log filename as a fallback.
-    """
-    # First try to extract from log content
-    try:
-        with open(log_file, 'r') as f:
-            for line in f:
-                if "Completed benchmark with Configuration:" in line:
-                    # Extract values using regex patterns
-                    model_label_match = re.search(r'model_label=([^,]+)', line)
-                    gpus_match = re.search(r'GPUs=(\d+)', line)
-                    tp_match = re.search(r'TP=(\d+)', line)
-                    ep_match = re.search(r'EP=(\d+)', line)
-                    attn_backend_match = re.search(r'attn_backend=([^,]+)',
-                                                   line)
-                    moe_backend_match = re.search(r'moe_backend=([^,]+)', line)
-                    enable_attention_dp_match = re.search(
-                        r'enable_attention_dp=([^,]+)', line)
-                    free_gpu_mem_fraction_match = re.search(
-                        r'free_gpu_mem_fraction=([^,]+)', line)
-                    max_batch_size_match = re.search(r'max_batch_size=(\d+)',
-                                                     line)
-                    isl_match = re.search(r'ISL=(\d+)', line)
-                    osl_match = re.search(r'OSL=(\d+)', line)
-                    max_num_tokens_match = re.search(r'max_num_tokens=(\d+)',
-                                                     line)
-                    moe_max_num_tokens_match = re.search(
-                        r'moe_max_num_tokens=([^,]+)', line)
-                    concurrency_match = re.search(r'Concurrency=(\d+)', line)
-
-                    # Extract values, use empty string if not found
-                    model_label = model_label_match.group(
-                        1) if model_label_match else ""
-                    gpus = int(gpus_match.group(1)) if gpus_match else ""
-                    tp = int(tp_match.group(1)) if tp_match else ""
-                    ep = int(ep_match.group(1)) if ep_match else ""
-                    attn_backend = attn_backend_match.group(
-                        1) if attn_backend_match else ""
-                    moe_backend = moe_backend_match.group(
-                        1) if moe_backend_match else ""
-                    enable_attention_dp = enable_attention_dp_match.group(
-                        1) if enable_attention_dp_match else ""
-                    free_gpu_mem_fraction = float(
-                        free_gpu_mem_fraction_match.group(
-                            1)) if free_gpu_mem_fraction_match else ""
-                    max_batch_size = int(max_batch_size_match.group(
-                        1)) if max_batch_size_match else ""
-                    isl = int(isl_match.group(1)) if isl_match else ""
-                    osl = int(osl_match.group(1)) if osl_match else ""
-                    max_num_tokens = int(max_num_tokens_match.group(
-                        1)) if max_num_tokens_match else ""
-                    moe_max_num_tokens_str = moe_max_num_tokens_match.group(
-                        1) if moe_max_num_tokens_match else ""
-                    concurrency = int(
-                        concurrency_match.group(1)) if concurrency_match else ""
-
-                    # Handle moe_max_num_tokens (could be "N/A", empty, or a number)
-                    moe_max_num_tokens = ""
-                    if moe_max_num_tokens_str and moe_max_num_tokens_str != "N/A":
-                        try:
-                            moe_max_num_tokens = int(moe_max_num_tokens_str)
-                        except ValueError:
-                            moe_max_num_tokens = ""
-                    elif not moe_max_num_tokens_str:
-                        moe_max_num_tokens = ""
-
-                    # Handle enable_attention_dp (convert string to boolean)
-                    enable_attention_dp_bool = ""
-                    if enable_attention_dp:
-                        enable_attention_dp_bool = enable_attention_dp.lower(
-                        ) == "true"
-
-                    # Check if all required fields are present (not empty strings)
-                    if (model_label and gpus != "" and tp != "" and ep != ""
-                            and attn_backend and free_gpu_mem_fraction != ""
-                            and max_batch_size != "" and isl != "" and osl != ""
-                            and max_num_tokens != "" and concurrency != ""):
-                        return {
-                            'model_name': model_label,
-                            'gpus': gpus,
-                            'tp': tp,
-                            'ep': ep,
-                            'attn_backend': attn_backend,
-                            'moe_backend': moe_backend,
-                            'enable_attention_dp': enable_attention_dp_bool,
-                            'free_gpu_mem_fraction': free_gpu_mem_fraction,
-                            'max_batch_size': max_batch_size,
-                            'isl': isl,
-                            'osl': osl,
-                            'max_num_tokens': max_num_tokens,
-                            'moe_max_num_tokens': moe_max_num_tokens,
-                            'concurrency': concurrency,
-                            'found_in_log': True
-                        }
+        # Parse each metric
+        for attr_name, pattern in patterns.items():
+            match = re.search(pattern, log_content)
+            if match:
+                value = match.group(1)
+                try:
+                    if '.' in value:
+                        setattr(metrics, attr_name, float(value))
                     else:
-                        print(
-                            f"Warning: Incomplete configuration in {log_file} - missing required fields"
-                        )
-                        # Fall through to try filename extraction
-    except Exception as e:
-        print(f"Warning: Could not read {log_file}: {e}")
-        # Fall through to try filename extraction
+                        setattr(metrics, attr_name, int(value))
+                except ValueError:
+                    # Keep default value if parsing fails
+                    pass
 
-    # If log content extraction failed, try extracting from filename
-    print(f"Trying to extract configuration from filename: {log_file}")
-    filename_config = extract_config_from_log_filename(log_file)
-    if filename_config:
-        print(f"Successfully extracted configuration from filename")
-        return filename_config
-    else:
-        print(f"Could not extract configuration from filename either")
-        return None
+        return metrics
 
 
-def extract_and_update_metrics(log_file, test_case, metrics_dict):
+def extract_server_and_client_config_from_log(log_file):
     """
-    Extract metrics from log file and update the metrics_dict
+    Extract ServerConfig and ClientConfig from log file content using the new format:
+    [Perf Sanity Test] Server Config: ... and [Perf Sanity Test] Client Config: ...
     """
     try:
         with open(log_file, 'r') as f:
-            for line in f:
-                for metric_name, metric_header in metrics_dict.items():
-                    if metric_header in line:
-                        metric_value = line.strip().split()[-1]
-                        test_case[metric_name] = metric_value
-                        break
+            content = f.read()
+
+            # Extract ServerConfig
+            server_config = extract_server_config_from_content(content)
+            if server_config is None:
+                print(
+                    f"Warning: Could not extract ServerConfig from {log_file}")
+                return None, None, None
+
+            # Extract ClientConfig
+            client_config = extract_client_config_from_content(content)
+            if client_config is None:
+                print(
+                    f"Warning: Could not extract ClientConfig from {log_file}")
+                return None, None, None
+
+            # Extract PerfMetrics
+            perf_metrics = PerfMetrics.from_log_content(content)
+
+            return server_config, client_config, perf_metrics
+
     except Exception as e:
         print(f"Warning: Could not read {log_file}: {e}")
+        return None, None, None
 
 
-def generate_all_test_cases(benchmark_config, metrics_dict):
+def extract_server_config_from_content(content):
     """
-    Generate all test cases from benchmark_config.yaml including all concurrency iterations
+    Extract ServerConfig from log content
     """
-    all_test_cases = []
+    # Find the Server Config section
+    server_config_match = re.search(
+        r'\[Perf Sanity Test\] Server Config:\s*\n(.*?)(?=\[Perf Sanity Test\] Client Config:|$)',
+        content, re.DOTALL)
+    if not server_config_match:
+        return None
 
-    for test_case in benchmark_config['test_cases']:
-        base_config = {
-            'model_name': test_case['model'],
-            'gpus': test_case['gpus'],
-            'tp': test_case['tp'],
-            'ep': test_case['ep'],
-            'attn_backend': test_case['attn_backend'],
-            'moe_backend': test_case['moe_backend'],
-            'enable_attention_dp': test_case['enable_attention_dp'],
-            'free_gpu_mem_fraction': test_case['free_gpu_mem_fraction'],
-            'max_batch_size': test_case['max_batch_size'],
-            'isl': test_case['isl'],
-            'osl': test_case['osl'],
-            'max_num_tokens': test_case['max_num_tokens'],
-            'moe_max_num_tokens': test_case['moe_max_num_tokens'],
-        }
+    config_text = server_config_match.group(1)
 
-        # Generate a test case for each concurrency iteration
-        for concurrency, iterations in test_case['concurrency_iterations']:
-            test_case_config = base_config.copy()
-            test_case_config['concurrency'] = concurrency
-            test_case_config['iterations'] = iterations
-            for metric_name, _ in metrics_dict.items():
-                test_case_config[metric_name] = ""
-            all_test_cases.append(test_case_config)
+    # Parse line by line to avoid regex issues with empty values
+    config_values = {}
+    lines = config_text.strip().split('\n')
 
-    return all_test_cases
+    for line in lines:
+        line = line.strip()
+        if ':' in line:
+            key, value = line.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            if key in SERVER_CONFIG_METRICS.keys() and value != "":
+                config_values[key] = SERVER_CONFIG_METRICS[key][1](value)
+
+    # Check for required fields
+    for key in SERVER_CONFIG_METRICS.keys():
+        if not SERVER_CONFIG_METRICS[key][0] and (key not in config_values
+                                                  or config_values[key] == ""):
+            print(f"Warning: Missing required field '{key}' in ServerConfig")
+            return None
+
+    return ServerConfig(**config_values)
 
 
-def match_log_to_test_case(log_config, test_case):
+def extract_client_config_from_content(content):
     """
-    Check if a log configuration matches a test case configuration
-    Returns True if all parameters match exactly
+    Extract ClientConfig from log content
     """
-    if not log_config:
+    # Find the Client Config section
+    client_config_match = re.search(
+        r'\[Perf Sanity Test\] Client Config:\s*\n(.*?)(?=\[|$)', content,
+        re.DOTALL)
+    if not client_config_match:
+        return None
+
+    config_text = client_config_match.group(1)
+
+    # Parse line by line
+    config_values = {}
+    lines = config_text.strip().split('\n')
+
+    for line in lines:
+        line = line.strip()
+        if ':' in line:
+            key, value = line.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            if key in CLIENT_CONFIG_METRICS.keys() and value != "":
+                config_values[key] = CLIENT_CONFIG_METRICS[key][1](value)
+
+    # Check for required fields
+    for key in CLIENT_CONFIG_METRICS.keys():
+        if not CLIENT_CONFIG_METRICS[key][0] and (key not in config_values
+                                                  or config_values[key] == ""):
+            print(f"Warning: Missing required field '{key}' in ClientConfig")
+            return None
+
+    return ClientConfig(**config_values)
+
+
+def match_log_to_server_and_client_config(log_server_config, log_client_config,
+                                          server_configs, client_configs):
+    """
+    Check if log_server_config and log_client_config match a server_config and client_config
+    """
+    if not log_server_config or not log_client_config:
         return False
 
-    # Check if all key parameters match exactly
-    return (log_config['model_name'] == test_case['model_name']
-            and log_config['tp'] == test_case['tp']
-            and log_config['ep'] == test_case['ep']
-            and log_config['attn_backend'] == test_case['attn_backend']
-            and log_config['moe_backend'] == test_case['moe_backend']
-            and log_config['enable_attention_dp']
-            == test_case['enable_attention_dp']
-            and log_config['free_gpu_mem_fraction']
-            == test_case['free_gpu_mem_fraction']
-            and log_config['max_batch_size'] == test_case['max_batch_size']
-            and log_config['isl'] == test_case['isl']
-            and log_config['osl'] == test_case['osl']
-            and log_config['max_num_tokens'] == test_case['max_num_tokens'] and
-            (log_config['moe_max_num_tokens'] == test_case['moe_max_num_tokens']
-             or (not log_config['moe_max_num_tokens']
-                 and not test_case['moe_max_num_tokens']))
-            and log_config['concurrency'] == test_case['concurrency'])
+    # Check if log_server_config and log_client_config match a server_config and client_config
+    for server_config_id, server_config in server_configs:
+        if log_server_config.to_str() == server_config.to_str():
+            for client_config in client_configs[server_config_id]:
+                if log_client_config.to_str() == client_config.to_str():
+                    return True
+    return False
 
 
-def create_test_case_row(test_case, metrics_dict):
-    """
-    Create a row for a test case with empty performance data
-    """
-    row = {
-        'model_name': test_case['model_name'],
-        'GPUs': test_case['gpus'],
-        'TP': test_case['tp'],
-        'EP': test_case['ep'],
-        'attn_backend': test_case['attn_backend'],
-        'moe_backend': test_case['moe_backend'],
-        'enable_attention_dp': test_case['enable_attention_dp'],
-        'free_gpu_mem_fraction': test_case['free_gpu_mem_fraction'],
-        'max_batch_size': test_case['max_batch_size'],
-        'ISL': test_case['isl'],
-        'OSL': test_case['osl'],
-        'max_num_tokens': test_case['max_num_tokens'],
-        'moe_max_num_tokens': test_case['moe_max_num_tokens'],
-        'Concurrency': test_case['concurrency'],
-        'Iterations': test_case['iterations'],
-    }
-    for metric_name, _ in metrics_dict.items():
-        row[metric_name] = test_case[metric_name]
-    return row
-
-
-def parse_benchmark_results(input_folder, output_csv, config_file):
+def parse_benchmark_results(input_folder, output_csv, config_file, print_perf,
+                            generate_csv):
     """
     Parse benchmark results and generate CSV table
     """
@@ -322,83 +245,130 @@ def parse_benchmark_results(input_folder, output_csv, config_file):
         print(f"Error: Config file '{config_file}' does not exist")
         return
 
-    # Load benchmark configuration
-    try:
-        with open(config_file, 'r') as f:
-            benchmark_config = yaml.safe_load(f)
-        print(f"Loaded benchmark configuration from: {config_file}")
-    except Exception as e:
-        print(f"Error: Could not load {config_file}: {e}")
-        return
+    server_configs, client_configs = parse_config_file(config_file)
 
-    # Metrics to extract from log file
-    metrics_dict = {
-        "TPS/System": "Total Token throughput (tok/s):",
-        "TPS/User": "User throughput (tok/s):",
-        "Benchmark Duration": "Benchmark duration (s):",
-    }
-
-    # Generate all test cases from config
-    all_test_cases = generate_all_test_cases(benchmark_config, metrics_dict)
-    print(f"Generated {len(all_test_cases)} test cases from configuration")
-
-    # Find all serve.*.log files
-    log_files = list(input_folder.glob("serve.*.log"))
+    # Find all trtllm-benchmark.*.log files
+    log_files = list(input_folder.glob("trtllm-benchmark.*.log"))
     print(f"Found {len(log_files)} log files to process")
 
     # Process each log file
     matched_count = 0
-    for log_file in log_files:
-        print(f"Processing: {log_file.name}")
+    parsed_results = []  # Store all parsed results for summary printing
 
-        # Extract configuration from log
-        log_config = extract_config_from_log_content(log_file)
-        if not log_config:
-            print(f"  Skipped - could not parse configuration")
+    for log_file in log_files:
+        # Extract ServerConfig, ClientConfig, and PerfMetrics from log
+        server_config, client_config, perf_metrics = extract_server_and_client_config_from_log(
+            log_file)
+        if not server_config or not client_config or not perf_metrics:
+            print(f"  Skipped - could not parse configuration or metrics")
             continue
 
-        # Find matching test case in table
-        matched = False
-        for test_case in all_test_cases:
-            if match_log_to_test_case(log_config, test_case):
-                # Update performance data
-                extract_and_update_metrics(log_file, test_case, metrics_dict)
-                matched = True
-                matched_count += 1
-                break
+        # Store parsed results for summary printing
+        parsed_results.append((server_config, client_config, perf_metrics))
 
-        if not matched:
+        # Match log to test case
+        matched = match_log_to_server_and_client_config(server_config,
+                                                        client_config,
+                                                        server_configs,
+                                                        client_configs)
+        if matched:
+            matched_count += 1
+        else:
             print(
-                f"  Skipped - no matching test case found for log case {log_config}"
+                f"  Skipped - no matching test case found for server_config={server_config.model_name}, client_config={client_config.concurrency}"
             )
 
     print(f"Successfully matched {matched_count} log files to test cases")
 
-    table_rows = []
-    for test_case in all_test_cases:
-        row = create_test_case_row(test_case, metrics_dict)
-        table_rows.append(row)
+    # Print summary of all parsed results if requested
+    if print_perf and parsed_results:
+        print_all_configs_summary(parsed_results)
+    # Generate CSV file of results if requested
+    if generate_csv:
+        generate_csv_summary(server_configs, client_configs, parsed_results,
+                             output_csv)
 
-    # Add empty rows between different test configurations
-    final_table = []
-    for i, row in enumerate(table_rows):
-        if i > 0:
-            prev_row = table_rows[i - 1]
-            # Check if any key parameters changed
-            if (row['model_name'] != prev_row['model_name']
-                    or row['TP'] != prev_row['TP']
-                    or row['EP'] != prev_row['EP']
-                    or row['moe_backend'] != prev_row['moe_backend']
-                    or row['ISL'] != prev_row['ISL']
-                    or row['OSL'] != prev_row['OSL']):
-                # Add empty row
-                empty_row = {key: '' for key in row.keys()}
-                final_table.append(empty_row)
 
-        final_table.append(row)
+def print_all_configs_summary(parsed_results):
+    """
+    Print summary of all ServerConfigs and their ClientConfigs with performance metrics
+    """
+    print("=" * 100)
+    print("BENCHMARK RESULTS SUMMARY")
+    print("=" * 100)
+
+    # Group results by ServerConfig
+
+    for server_config, client_config, perf_metrics in parsed_results:
+        # Create a key for ServerConfig comparison
+        print("ServerConfig: ")
+        print(server_config.to_str())
+        print("ClientConfig: ")
+        print(client_config.to_str())
+        print("PerfMetrics: ")
+        print(perf_metrics.to_str())
+        print("-" * 100)
+
+
+def generate_csv_summary(server_configs, client_configs, parsed_results,
+                         output_csv):
+    """
+    Generate a CSV file of results with specified columns
+    """
+    # Create a mapping of (server_config, client_config) -> perf_metrics for quick lookup
+    parsed_results_map = {}
+    for server_config, client_config, perf_metrics in parsed_results:
+        # Create a key using the string representation for matching
+        server_key = server_config.to_str()
+        client_key = client_config.to_str()
+        parsed_results_map[(server_key, client_key)] = perf_metrics
+
+    # Define CSV columns
+    columns = [
+        'ServerConfig', 'TP', 'EP', 'Concurrency', 'Iterations',
+        'Total Token Throughput', 'User Throughput', 'Median TTFT',
+        'Benchmark Duration'
+    ]
+
+    # Generate CSV rows
+    csv_rows = []
+
+    for server_config_id, server_config in server_configs:
+        # Add empty row before each new server config (except the first one)
+        if csv_rows:
+            empty_row = {col: '' for col in columns}
+            csv_rows.append(empty_row)
+
+        # Process each client config for this server config
+        for client_config in client_configs[server_config_id]:
+            # Create row for this test case
+            row = {
+                'ServerConfig': server_config.to_str(),
+                'TP': server_config.tp,
+                'EP': server_config.ep,
+                'Concurrency': client_config.concurrency,
+                'Iterations': client_config.iterations,
+                'Total Token Throughput': '',
+                'User Throughput': '',
+                'Median TTFT': '',
+                'Benchmark Duration': ''
+            }
+
+            # Try to find matching performance metrics
+            server_key = server_config.to_str()
+            client_key = client_config.to_str()
+
+            if (server_key, client_key) in parsed_results_map:
+                perf_metrics = parsed_results_map[(server_key, client_key)]
+                row['Total Token Throughput'] = perf_metrics.total_token_throughput
+                row['User Throughput'] = perf_metrics.user_throughput
+                row['Median TTFT'] = perf_metrics.median_ttft_ms
+                row['Benchmark Duration'] = perf_metrics.benchmark_duration
+
+            csv_rows.append(row)
 
     # Create DataFrame and save to CSV
-    df = pd.DataFrame(final_table)
+    df = pd.DataFrame(csv_rows)
 
     # Ensure output directory exists
     output_path = Path(output_csv)
@@ -408,10 +378,7 @@ def parse_benchmark_results(input_folder, output_csv, config_file):
     df.to_csv(output_path, index=False)
 
     # Print summary
-    print(f"\nCSV table saved to: {output_path}")
-    print(
-        f"Total rows: {len(final_table)} (including {len(final_table) - len(table_rows)} empty separator rows)"
-    )
+    print(f"Table summary saved to: {output_path}")
 
     return df
 
@@ -419,19 +386,36 @@ def parse_benchmark_results(input_folder, output_csv, config_file):
 def main():
     parser = argparse.ArgumentParser(
         description=
-        "Script to parse benchmark metrics from a specified folder and generate CSV table",
+        "Script to parse benchmark metrics from a specified folder and generate CSV file",
         epilog=
         "Example: python parse_benchmark_results.py ./benchmark_logs results.csv ./benchmark_config.yaml"
     )
     parser.add_argument(
         "--input_folder",
         help="Folder containing benchmark log files (serve.*.log)")
-    parser.add_argument("--output_csv",
-                        help="Output CSV filename for the results table")
     parser.add_argument("--config_file",
                         help="Path to benchmark_config.yaml file")
+    parser.add_argument("--print_perf",
+                        action="store_true",
+                        help="Print performance summary for each test case")
+    parser.add_argument("--generate_csv",
+                        action="store_true",
+                        help="Generate the CSV file of results")
+    parser.add_argument("--output_csv",
+                        default="",
+                        help="Output CSV filename for the results")
 
     args = parser.parse_args()
+
+    if not args.print_perf and not args.generate_csv:
+        print("Error: Either --print_perf or --generate_csv must be specified")
+        sys.exit(1)
+
+    if args.generate_csv and not args.output_csv:
+        print(
+            "Error: --output_csv must be specified when --generate_csv is specified"
+        )
+        sys.exit(1)
 
     # Validate inputs
     input_folder_path = Path(args.input_folder)
@@ -447,13 +431,9 @@ def main():
         print(f"Error: Config file '{args.config_file}' not found.")
         sys.exit(1)
 
-    print(f"Using input folder: {input_folder_path}")
-    print(f"Using config file: {config_file_path}")
-    print(f"Output will be saved to: {args.output_csv}")
-    print()
-
     parse_benchmark_results(args.input_folder, args.output_csv,
-                            args.config_file)
+                            args.config_file, args.print_perf,
+                            args.generate_csv)
 
 
 if __name__ == "__main__":

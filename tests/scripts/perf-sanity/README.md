@@ -16,52 +16,68 @@ Benchmarking scripts for TensorRT-LLM serving performance tests with configurati
 
 **Structure**:
 ```yaml
-test_cases:
+server_configs:
   - id: 1
-    model: "70B-FP8"
-    gpus: 1
-    tp: 1
-    ep: 1
-    attn_backend: "TRTLLM"
-    moe_backend: ""
-    enable_attention_dp: false
-    free_gpu_mem_fraction: 0.9
-    max_batch_size: 512
-    isl: 1024
-    osl: 1024
-    max_num_tokens: 16384
+    model_name: "R1-FP4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "TRTLLM"
     moe_max_num_tokens: ""
-    concurrency_iterations:
-      - [1, 10]
-      - [8, 10]
-      - [64, 5]
-      - [512, 2]
+    enable_attention_dp: false
+    enable_chunked_prefill: false
+    isl: 131072
+    osl: 8192
+    max_num_tokens: 131072
+    disable_overlap_scheduler: false
+    kv_cache_dtype: "fp8"
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - concurrency: 1
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 16
+        iterations: 1
+        random_range_ratio: 0.0
+
+  - id: 2
+    model_name: "R1-FP4"
+    tp: 4
+    ep: 4
+    pp: 1
+    attention_backend: "TRTLLM"
+    moe_backend: "CUTLASS"
+    moe_max_num_tokens: 131072
+    enable_attention_dp: true
+    enable_chunked_prefill: false
+    isl: 131072
+    osl: 8192
+    max_num_tokens: 32768
+    disable_overlap_scheduler: false
+    kv_cache_dtype: "fp8"
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.8
+    max_batch_size: 256
+    enable_padding: true
+    client_configs:
+      - concurrency: 32
+        iterations: 1
+        random_range_ratio: 0.0
+      - concurrency: 64
+        iterations: 1
+        random_range_ratio: 0.0
 ```
-
-**Configuration Fields**:
-- `id`: Unique identifier for the test case
-- `model`: Model name (e.g., "70B-FP8", "Scout-FP4")
-- `gpus`: Number of GPUs to use
-- `tp`: Tensor parallelism size
-- `ep`: Expert parallelism size
-- `attn_backend`: Attention backend ("TRTLLM", "FLASHINFER")
-- `moe_backend`: MoE backend ("DEEPGEMM", "TRTLLM", "CUTLASS", "")
-- `enable_attention_dp`: Enable attention data parallelism
-- `free_gpu_mem_fraction`: GPU memory fraction to reserve
-- `max_batch_size`: Maximum batch size
-- `isl`: Input sequence length
-- `osl`: Output sequence length
-- `max_num_tokens`: Maximum number of tokens
-- `moe_max_num_tokens`: Maximum number of tokens for MoE
-- `concurrency_iterations`: List of [concurrency, iteration] pairs
-
 
 ### 2. `run_benchmark_serve.py` - Main Benchmark Runner
 **Purpose**: Executes performance benchmarks based on YAML configuration files.
 
 **Usage**:
 ```bash
-python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
+python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>] [--timeout 3600]
 ```
 
 **Arguments**:
@@ -69,6 +85,7 @@ python run_benchmark_serve.py --output_folder <output_folder> --config_file <con
 - `--config_file`: Path to YAML configuration file (required)
 - `--skip`: Skip pattern for specific test cases/concurrencies (optional, default: no skipping)
 - `--select`: Select pattern for specific test cases/concurrencies (optional, default: all test cases)
+- `--timeout`: Timeout for server setup. (optional, default: 3600 seconds)
 
 **Examples**:
 ```bash
@@ -97,17 +114,12 @@ Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_c
 
 
 ### 3. `parse_benchmark_results.py` - Results Parser
-**Purpose**: Parses benchmark log files and generates comprehensive CSV reports with all test cases from the configuration file.
+**Purpose**: Parses benchmark log files, prints log's perf and generates comprehensive CSV reports with all test cases from the configuration file.
 
 **Usage**:
 ```bash
-python parse_benchmark_results.py --input_folder <input_folder> --output_csv <output_csv> --config_file <config_file>
+python parse_benchmark_results.py --input_folder <input_folder> --output_csv <output_csv> --config_file <config_file> --print_perf --generate_table
 ```
-
-**Arguments**:
-- `input_folder`: Folder containing benchmark log files (serve.*.log) (required)
-- `output_csv`: Output CSV filename for the results table (required)
-- `config_file`: Path to benchmark_config.yaml file (required)
 
 **Examples**:
 ```bash
