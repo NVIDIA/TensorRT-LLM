@@ -7,7 +7,7 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import move_to_device
+from ...utils._graph import move_to_device
 from ..interface import (
     BaseTransform,
     SharedConfig,

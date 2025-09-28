@@ -121,6 +121,12 @@ transforms:
     stage: post_load_fusion
     backend: flashinfer
   ############################################################################################
+  # VISUALIZE GRAPH
+  ############################################################################################
+  visualize_namespace:
+    stage: visualize
+    enabled: false #TODO (hg): visualization has some errors now
+  ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
   update_in_out_nodes:

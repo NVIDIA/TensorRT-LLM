@@ -25,7 +25,7 @@ from ...pyexecutor.scheduler import (
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
 from ..llm_args import AutoDeployConfig, LlmArgs
-from ..transformations.transform import InferenceOptimizer
+from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -115,7 +115,7 @@ class ADEngine(ModelEngine):
 
         # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
-            factory=factory, ad_config=ad_config, local_device=device
+            factory=factory, config=ad_config.transforms, local_device=device
         )
 
         # construct engine

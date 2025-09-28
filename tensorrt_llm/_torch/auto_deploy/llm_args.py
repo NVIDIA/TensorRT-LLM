@@ -129,49 +129,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    # attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
-    #     default="flashinfer", description="Attention backend to use."
-    # )
-
-    # mla_backend: Literal["MultiHeadLatentAttention"] = Field(
-    #     default="MultiHeadLatentAttention",
-    #     description="The Multi-Head Latent Attention backend to use.",
-    # )
-
-    # free_mem_ratio: float = Field(
-    #     default=0.0,
-    #     ge=0.0,
-    #     le=1.0,
-    #     description="The fraction of available memory to allocate for cache.",
-    # )
-
-    # simple_shard_only: bool = Field(
-    #     default=False,
-    #     description="If True, force simple sharding (all_gather) in tensor parallelism. "
-    #     "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    # )
-
-    # use_sharding_from_factory: bool = Field(
-    #     default=False,
-    #     description="If True, use sharding from the model factory. If False, use sharding from the "
-    #     "AutoDeployConfig.",
-    # )
-
-    # sharding_dims: List[str] = Field(
-    #     default=["tp", "ep", "dp"],
-    #     description="The sharding methods to apply by the heuristic sharding stage.",
-    # )
-
-    # compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
-    #     Field(
-    #         default="torch-compile",
-    #         description="The backend to use for compiling the model.",
-    #     )
-    # )
-
-    # cuda_graph_batch_sizes: Optional[List[int]] = Field(
-    #     default=None, description="List of batch sizes to create CUDA graphs for."
-    # )
 
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 

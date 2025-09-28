@@ -1,7 +1,9 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
+import gc
 from typing import Optional
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.fx import Graph, GraphModule
@@ -83,4 +85,6 @@ class InferenceOptimizer:
         ############################################################################################
         # RETURN OPTIMIZED GRAPH
         ############################################################################################
+        torch.cuda.empty_cache()
+        gc.collect()
         return gm
