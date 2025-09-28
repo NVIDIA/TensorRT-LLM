@@ -798,7 +798,6 @@ def trtllm_bench_unified_comparison(
             )
 
 
-@pytest.mark.skip(reason="https://nvbugs/5542907")
 @pytest.mark.parametrize("compile_backend", ["torch-compile", "torch-opt", "torch-cudagraph"])
 def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
     model_path_or_name, model_name, model_path = tiny_llama_details()
