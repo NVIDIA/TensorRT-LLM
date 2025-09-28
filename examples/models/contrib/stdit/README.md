@@ -3,9 +3,9 @@ This document shows how to build and run a STDiT in [OpenSoRA](https://github.co
 
 ## Overview
 
-The TensorRT-LLM implementation of STDiT can be found in [tensorrt_llm/models/stdit/model.py](../../../../tensorrt_llm/models/stdit/model.py). The TensorRT-LLM STDiT (OpenSoRA) example code is located in [`examples/models/contrib/stdit`](./). There are main files to build and run STDiT with TensorRT-LLM:
+The TensorRT LLM implementation of STDiT can be found in [tensorrt_llm/models/stdit/model.py](../../../../tensorrt_llm/models/stdit/model.py). The TensorRT LLM STDiT (OpenSoRA) example code is located in [`examples/models/contrib/stdit`](./). There are main files to build and run STDiT with TensorRT-LLM:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the STDiT model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the STDiT model into TensorRT LLM checkpoint format.
 * [`sample.py`](./sample.py) to run the pipeline with TensorRT engine(s) to generate videos.
 
 ## Support Matrix
@@ -16,7 +16,7 @@ The TensorRT-LLM implementation of STDiT can be found in [tensorrt_llm/models/st
 
 ## Usage
 
-The TensorRT-LLM STDiT example code locates at [examples/models/contrib/stdit](./). It takes HuggingFace checkpoint as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM STDiT example code locates at [examples/models/contrib/stdit](./). It takes HuggingFace checkpoint as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Requirements
 
@@ -30,7 +30,7 @@ pip install colossalai --no-deps
 
 ### Build STDiT TensorRT engine(s)
 
-This checkpoint will be converted to the TensorRT-LLM checkpoint format by [`convert_checkpoint.py`](./convert_checkpoint.py). After that, we can build TensorRT engine(s) with the TensorRT-LLM checkpoint. The pretrained checkpoint can be downloaded from [here](https://huggingface.co/hpcai-tech/OpenSora-STDiT-v3).
+This checkpoint will be converted to the TensorRT LLM checkpoint format by [`convert_checkpoint.py`](./convert_checkpoint.py). After that, we can build TensorRT engine(s) with the TensorRT LLM checkpoint. The pretrained checkpoint can be downloaded from [here](https://huggingface.co/hpcai-tech/OpenSora-STDiT-v3).
 
 ```bash
 # Convert to TRT-LLM
@@ -46,7 +46,7 @@ trtllm-build --checkpoint_dir=tllm_checkpoint/ \
              --context_fmha=enable
 ```
 
-After build, we can find a `./engine_output` directory, it is ready for running STDiT model with TensorRT-LLM now.
+After build, we can find a `./engine_output` directory, it is ready for running STDiT model with TensorRT LLM now.
 
 ### Generate videos
 

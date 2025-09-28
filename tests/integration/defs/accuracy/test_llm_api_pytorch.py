@@ -2959,6 +2959,38 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [(8, 1, 8, True, True, True, "DEEPGEMM"),
+         (8, 1, 8, False, True, True, "DEEPGEMM"),
+         (8, 1, 8, True, True, True, "TRTLLM"),
+         (8, 1, 8, False, True, True, "TRTLLM")],
+        ids=[
+            "latency_deepgemm", "throughput_latency_deepgemm", "latency_trtllm",
+            "throughput_latency_trtllm"
+        ])
+    def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
+                              cuda_graph, overlap_scheduler, moe_backend):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-235B-A22B-FP8",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize(

@@ -72,10 +72,12 @@ std::vector<size_t> MLACacheFormatter::pickRecvConnections(
     TLLM_CHECK(targetInfo.mDomainCPSize == 1);
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
     std::vector<size_t> ret;
-    // targetInfo , mRanks [tpranks, dpranks]
+    // targetInfo , mRanks [tpranks, ppranks]
+    int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
+
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
     {
-        ret.push_back(i);
+        ret.push_back(i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize);
     }
     return ret;
 }
@@ -85,19 +87,24 @@ bool MLACacheFormatter::needSendCache(
 {
     int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
 
+    int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
+        ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
+        : destConfig.getParallelConfig().mTensorParallelism;
+    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
+
     if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {
         int selfTPNumInDPGroup
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
-        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
-            ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
-            : destConfig.getParallelConfig().mTensorParallelism;
+
         int selfTPrankINDPGroup = selfTpRank % selfTPNumInDPGroup;
         if (selfTPNumInDPGroup <= destTPNumInDPGroup)
         {
             return true;
         }
-        return selfTPrankINDPGroup % (selfTPNumInDPGroup / destTPNumInDPGroup) == 0;
+
+        int dupHeadFactor = selfTPNumInDPGroup / destTPNumInDPGroup;
+        return selfTPrankINDPGroup % dupHeadFactor == destDPRank % dupHeadFactor;
     }
 
     int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
@@ -108,7 +115,8 @@ bool MLACacheFormatter::needSendCache(
     {
         return true;
     }
-    return selfTpRank % (selfTPNum / destTPNum) == 0;
+    int dupHeadFactor = selfTPNum / destTPNum;
+    return selfTpRank % dupHeadFactor == destDPRank % dupHeadFactor;
 }
 
 void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
@@ -120,6 +128,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto indexFromEnd = session.getIndexFromEnd();
+    auto const& lastBlockKey = session.getLastBlockKey();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
@@ -130,7 +140,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     }
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd);
 
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
     bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
@@ -139,7 +149,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
-        blockRange.updatePoolIdx(poolIdx);
+        if (numPools > 1)
+        {
+            blockRange.updatePoolIdx(poolIdx);
+        }
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;
@@ -338,7 +351,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
     bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
