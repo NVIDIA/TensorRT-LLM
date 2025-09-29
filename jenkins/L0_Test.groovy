@@ -2038,7 +2038,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
         }
         if (rerunFailed) {
-            error "Some tests failed after rerun attempts, please check the test report."
+            error "Some tests still failed after rerun attempts, please check the test report."
         }
 
         if (perfMode) {
