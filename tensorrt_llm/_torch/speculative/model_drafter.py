@@ -36,8 +36,10 @@ def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         # EAGLE3 always throws away the first token when processing draft inputs
         draft_input_tokens = draft_input_tokens[1:]
-        if request.is_context_init_state:
-            draft_input_tokens.append(0)
+    if request.is_context_init_state:
+        # A draft request's prompt is its target request's prompt adding the first golden token.
+        # Add a fake golden token here since the real one has not been generated.
+        draft_input_tokens.append(0)
     return draft_input_tokens
 
 
