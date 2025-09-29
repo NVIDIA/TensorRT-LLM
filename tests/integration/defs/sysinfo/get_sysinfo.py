@@ -187,7 +187,7 @@ def construct_gpu_properties(mako_opts, device_index=0):
                         entity)
                     logger.warning(err_msg)
 
-        gpu_name = full_name.replace("NVIDIA", "").strip()
+        gpu_name = full_name.replace("NVIDIA", "").strip().upper()
         assert gpu_name != "", "device_product_name is empty after removing substring 'NVIDIA' and leading/trailing whitespaces."
 
         compute_capability = get_compute_capability(device_index)
