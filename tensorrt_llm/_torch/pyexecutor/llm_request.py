@@ -392,11 +392,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self._py_embedding_bias_1d = self.embedding_bias
 
     @property
-    def cached_tokens(self):
+    def cached_tokens(self) -> int:
         return self._cached_tokens
 
     @cached_tokens.setter
-    def cached_tokens(self, value):
+    def cached_tokens(self, value: int):
         if not self._cached_tokens_set:
             self._cached_tokens = value
             self._cached_tokens_set = True
