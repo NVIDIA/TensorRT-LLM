@@ -757,16 +757,16 @@ class WideEPMoE(MoE):
 
         all_rank_max_num_tokens = max(all_rank_num_tokens)
 
-        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
-        num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
-        use_all_to_all = self.can_use_alltoall(all_rank_num_tokens,
-                                               all_rank_max_num_tokens)
-
         if use_dp_padding:
             all_rank_num_tokens_padded = [all_rank_max_num_tokens
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
+
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
+        num_chunks = self.calculate_num_chunks(all_rank_num_tokens_padded)
+        use_all_to_all = self.can_use_alltoall(all_rank_num_tokens_padded,
+                                               all_rank_max_num_tokens)
         if num_chunks == 1:
             is_first_call = self.repeat_idx == 0
             is_last_call = self.repeat_idx == self.repeat_count - 1
