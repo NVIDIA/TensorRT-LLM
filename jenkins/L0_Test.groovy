@@ -274,6 +274,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
+    def rerunFailed = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -302,15 +303,18 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, results_isolated_${i}.xml)
-                if (isRerunFailed) {
-                    error "The tests still failed after rerun attempt."
-                }
+            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml")
+            if (isRerunFailed) {
+                echo "The tests still failed after rerun attempt."
+                rerunFailed = true
+            }
         } finally {
             // Clean up the temporary test file
             sh "rm -f ${singleTestFile}"
         }
     }
+
+    return rerunFailed  // Return the updated value
 }
 
 def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
@@ -1899,6 +1903,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         def extraInternalEnv = ""
         def pytestTestTimeout = "3600"
+        def noRegularTests = false
+        def noIsolateTests = false
+        def rerunFailed = false
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
@@ -1921,7 +1928,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             testFilter[(DETAILED_LOG)] ? "-s" : "",
             "--timeout-method=thread",
             "--apply-test-list-correction",
-            "--splitting-algorithm least_duration",
             "--timeout=${pytestTestTimeout}",
             "--rootdir ${llmSrc}/tests/integration/defs",
             "--test-prefix=${stageName}",
@@ -1934,7 +1940,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Only add --test-list if there are regular tests to run
         if (preprocessedLists.regularCount > 0) {
-            testCmdLine.add(testCmdLine.size() - 4, "--test-list=${preprocessedLists.regular}")
+            // Remove any existing --test-list options and add the new one
+            testCmdLine = testCmdLine.findAll { cmd -> !cmd.contains("--test-list=") }
+            testCmdLine += ["--test-list=${preprocessedLists.regular}"]
         }
         if (perfMode) {
             testCmdLine += [
@@ -1990,6 +1998,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         """
                     } else {
                         echo "No regular tests to run for stage ${stageName}"
+                        noRegularTests = true
                         sh "mkdir -p ${stageName}"
                         // Create an empty results.xml file for consistency
                         sh """
@@ -2005,7 +2014,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (Exception e) {
                     def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
-                        error "The tests still failed after rerun attempt."
+                        echo "The tests still failed after rerun attempt."
+                        rerunFailed = true
                     }
                 }
             }
@@ -2013,14 +2023,20 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Run the isolated tests if exists
         if (preprocessedLists.isolateCount > 0) {
-            try {
+            stage ("[${stageName}] Run Pytest (Isolated)") {
                 echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
-            } catch (Exception e) {
-               throw e
+                rerunFailed = runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
             }
         } else {
             echo "No isolated tests to run for stage ${stageName}"
+            noIsolateTests = true
+        }
+
+        if (noRegularTests && noIsolateTests) {
+            error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+        }
+        if (rerunFailed) {
+            error "Some tests failed after rerun attempts, please check the test report."
         }
 
         if (perfMode) {
