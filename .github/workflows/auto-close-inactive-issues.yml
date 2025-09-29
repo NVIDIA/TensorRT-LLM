@@ -7,7 +7,7 @@ on:
 
 jobs:
   stale:
-    if: ${{ github.repository == 'Nvidia/TensorRT-LLM' }}
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
     runs-on: ubuntu-latest
     permissions:
       issues: write
