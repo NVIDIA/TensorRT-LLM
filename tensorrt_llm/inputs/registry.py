@@ -78,7 +78,7 @@ class BaseMultimodalInputProcessor:
                                                   None) is not None:
             return int(self.tokenizer.vocab_size)
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
@@ -93,7 +93,7 @@ class BaseMultimodalInputProcessor:
                                              None) is not None:
             return processor.mm_token_ids
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
             "If needed, please override this method to return multimodal token ids. "
         )
