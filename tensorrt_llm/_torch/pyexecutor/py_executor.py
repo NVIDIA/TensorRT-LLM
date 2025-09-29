@@ -1872,7 +1872,7 @@ class PyExecutor:
                 or request.state
                 == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
 
-    def _can_cancel_request(self, request) -> bool:
+    def _try_cancel_request(self, request) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
@@ -1899,7 +1899,7 @@ class PyExecutor:
             if req_id not in self.executor_request_queue.get_canceled_req_ids():
                 continue
 
-            is_cancelled = self._can_cancel_request(request)
+            is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.

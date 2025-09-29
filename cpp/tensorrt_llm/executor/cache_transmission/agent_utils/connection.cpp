@@ -283,10 +283,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
         while (it != mUnhandledNotifications.end())
         {
             auto& [agent, notifs] = *it;
-            auto it2 = notifs.begin();
-            while (it2 != notifs.end())
+            auto notifIt = notifs.begin();
+            while (notifIt != notifs.end())
             {
-                std::stringstream ss(*it2);
+                std::stringstream ss(*notifIt);
                 NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
                 bool erase = false;
                 if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
@@ -306,7 +306,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto offsetRatio = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
                         requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState, validConnectionIdx);
                     connection->setSenderState(bufferDesc, validConnectionIdx, offsetRatio);
-                    it2 = notifs.erase(it2);
+                    notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {
                         it = mUnhandledNotifications.erase(it);
@@ -316,7 +316,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
                 if (!erase)
                 {
-                    it2++;
+                    notifIt++;
                 }
             }
             if (notifs.empty())
@@ -463,10 +463,10 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
                 it++;
                 continue;
             }
-            auto it2 = notifs.begin();
-            while (it2 != notifs.end())
+            auto notifIt = notifs.begin();
+            while (notifIt != notifs.end())
             {
-                std::stringstream ss(*it2);
+                std::stringstream ss(*notifIt);
                 NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
                 bool erase = false;
                 if constexpr (std::is_same_v<NotificationType, NotificationSyncInfo>)
@@ -478,7 +478,27 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
                             && notificationData.mAgentName == expectedInfo.mAgentName)
                         {
                             erase = true;
-                            it2 = notifs.erase(it2);
+                            notifIt = notifs.erase(notifIt);
+                            if (notifs.empty())
+                            {
+                                it = mUnhandledNotifications.erase(it);
+                            }
+                            return;
+                        }
+                    }
+                }
+                else if constexpr (std::is_same_v<NotificationType, ReadySignalInfo>)
+                {
+                    if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
+                    {
+                        auto readySignalData = std::get<ReadySignalInfo>(notificationInfo.mInfo);
+                        if (readySignalData.mContext.getTag() == expectedInfo.mContext.getTag()
+                            && readySignalData.mAgentName == expectedInfo.mAgentName)
+                        {
+                            expectedInfo.mIsReady = readySignalData.mIsReady;
+
+                            erase = true;
+                            notifIt = notifs.erase(notifIt);
                             if (notifs.empty())
                             {
                                 it = mUnhandledNotifications.erase(it);
@@ -488,27 +508,9 @@ void AgentConnectionManager::waitForNotification(std::string const& remoteAgentN
                     }
                 }
 
-                if constexpr (std::is_same_v<NotificationType, ReadySignalInfo>)
-                {
-                    auto readySignalData = std::get<ReadySignalInfo>(notificationInfo.mInfo);
-                    if (readySignalData.mContext.getTag() == expectedInfo.mContext.getTag()
-                        && readySignalData.mAgentName == expectedInfo.mAgentName)
-                    {
-                        expectedInfo.mIsReady = readySignalData.mIsReady;
-
-                        erase = true;
-                        it2 = notifs.erase(it2);
-                        if (notifs.empty())
-                        {
-                            it = mUnhandledNotifications.erase(it);
-                        }
-                        return;
-                    }
-                }
-
                 if (!erase)
                 {
-                    it2++;
+                    notifIt++;
                 }
             }
             if (notifs.empty())
