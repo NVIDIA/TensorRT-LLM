@@ -318,12 +318,6 @@ bool getEnvDisaggLayerwise()
     return disaggLayerwise;
 }
 
-bool getEnvDisableSelectiveCacheTransfer()
-{
-    static bool const disableSelectiveCacheTransfer = getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
-    return disableSelectiveCacheTransfer;
-}
-
 bool getEnvRequestKVCacheConcurrent()
 {
     static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");

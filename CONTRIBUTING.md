@@ -102,7 +102,7 @@ Developer workflow for code contributions is as follows:
 The naming of the merge requests in TensorRT-LLM follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If the PR includes an API change that might break user code/API usage, consider adding "BREAKING CHANGE" in the title so that reviewers know what to expect. Additionally, if the PR is not related to any bug and task, consider using "chore" or None as the placeholder.
 
 [!IMPORTANT]
-For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible.
+For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible. Also, to identify the author of the PR, please ensure that your GitHub account either displays your full name or your NVIDIA account name in the `Name` field of your profile.
 
 Good PR Titles Examples:
 * feat: Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA

@@ -21,13 +21,14 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Quick start](#quick-start)
       - [Run a single inference](#run-a-single-inference)
     - [Evaluation](#evaluation)
-    - [Model Quantization to FP4](#model-quantization-to-fp4)
+    - [Model Quantization](#model-quantization)
     - [Benchmark](#benchmark)
     - [Serving](#serving)
       - [trtllm-serve](#trtllm-serve)
       - [Disaggregated Serving](#disaggregated-serving)
     - [Eagle3](#eagle3)
-  - [Dynamo](#dynamo)
+    - [Dynamo](#dynamo)
+  - [Qwen3-Next](#qwen3-next)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Credits](#credits)
 
@@ -925,6 +926,15 @@ For further details, please refer to [speculative-decoding.md](../../../../docs/
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
 Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+
+## Qwen3-Next
+
+Below is the command to run the Qwen3-Next model.
+
+```bash
+mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir /Qwen3-Next-80B-A3B-Thinking --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 4
+
+```
 
 ## Notes and Troubleshooting
 

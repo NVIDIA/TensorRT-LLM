@@ -226,6 +226,7 @@ class MTPSampler(TorchSampler):
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
+        max_total_draft_tokens: torch.Tensor
 
     def create_store(self) -> Store:
         num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
@@ -236,6 +237,7 @@ class MTPSampler(TorchSampler):
             next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
             next_draft_tokens=int_tensor((seq_slots, draft_len)),
             new_tokens_lens=int_tensor((seq_slots, )),
+            max_total_draft_tokens=int_tensor((seq_slots, draft_len)),
         )
 
     def _request_common_handling(self, request: LlmRequest,
@@ -246,7 +248,11 @@ class MTPSampler(TorchSampler):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
-    def update_requests(self, state: SampleStateMTP) -> None:
+    def update_requests(
+            self,
+            state: SampleStateMTP,
+            resource_manager: Optional[BaseResourceManager] = None) -> None:
+        # resource_manager will be not be used in this function
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
