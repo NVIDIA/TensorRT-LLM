@@ -202,68 +202,61 @@ inline __device__ __host__ T divUp(T m, T n)
 
 // A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels
 // Return (block_size, cluster_size, loads_per_thread)
-// We'd prefer 4 warps (128 threads) per CTA and prefer to increase the occupancy by using CGA
-// The Adjustment logic is as follows:
-// 1. Reduce cluster_size if total threads exceed what's needed
-// 2. If we have too few CTAs, trying to use CGA to increase occupancy
-// 3. Trying to scale up use multiple loads or CGA
-// 4. The block_size is adjusted to be the minimum value that satisfies the above conditions
-template <bool USE_CGA = false>
 std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread)
 {
     // Start with preferred block_size and cluster_size
-    int clusterSize = USE_CGA ? 8 : 1;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    int clusterSize = 8;
+#else
+    int clusterSize = 1;
+#endif
     int blockSize = 128;
     // ========================== Adjust the grid configuration ==========================
     int threadsNeeded = divUp(dim, eltsPerThread);
     int loadsPerThread = 1;
 
     blockSize = divUp(threadsNeeded, clusterSize);
-    if (USE_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    while (threadsNeeded % clusterSize != 0 && clusterSize > 1)
     {
-        while (threadsNeeded % clusterSize != 0 && clusterSize > 1)
-        {
-            clusterSize /= 2;
-        }
-        blockSize = divUp(threadsNeeded, clusterSize);
-        while (blockSize < 128 && clusterSize >= 2)
-        {
-            blockSize *= 2;
-            clusterSize /= 2;
-        }
-        int smCount = getMultiProcessorCount();
-        while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512)
-        {
-            blockSize *= 2;
-            clusterSize /= 2;
-        }
+        clusterSize /= 2;
     }
+    blockSize = divUp(threadsNeeded, clusterSize);
+    while (blockSize < 128 && clusterSize >= 2)
+    {
+        blockSize *= 2;
+        clusterSize /= 2;
+    }
+    int smCount = getMultiProcessorCount();
+    while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512)
+    {
+        blockSize *= 2;
+        clusterSize /= 2;
+    }
+#endif
 
     // Trying to scale up use multiple loads or CGA
     while (blockSize > 1024)
     {
-        if constexpr (USE_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        if (clusterSize < 8)
         {
-            if (clusterSize < 8)
-            {
-                clusterSize = clusterSize << 1;
-            }
-            else
-            {
-                break;
-            }
+            clusterSize = clusterSize << 1;
         }
         else
         {
-            if (loadsPerThread < 8)
-            {
-                loadsPerThread += 1;
-            }
-            else
-            {
-                break;
-            }
+            break;
         }
+#else
+        if (loadsPerThread < 8)
+        {
+            loadsPerThread += 1;
+        }
+        else
+        {
+            break;
+        }
+#endif
         blockSize = divUp(threadsNeeded, clusterSize * loadsPerThread);
     }
     return {blockSize, clusterSize, loadsPerThread};
@@ -278,11 +271,6 @@ using detail::blockReduceSum;
 using detail::divUp;
 using detail::copyF4;
 
-// Use another macro to enhance readability
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-#define SUPPORT_CGA
-#endif
-
 template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, typename PackedType = float4>
 __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPtr, T* prenormedPtr, T const* shardPtr,
     T const* residualInPtr, T const* gammaPtr, T** inputPtrs, T* mcastPtr, int const numTokens, int const tokenDim,
@@ -291,12 +279,14 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
     constexpr int kLAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
     constexpr uint32_t kELT_SIZE = sizeof(T);
-#if defined(SUPPORT_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
     int packedIdx = cluster.thread_rank();
     int token = blockIdx.x;
     int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
+
+    cudaGridDependencySynchronize();
 #else
     int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
@@ -304,14 +294,8 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 #endif
 
-    cudaGridDependencySynchronize();
-
-// We only use 1 stage for the oneshot allreduce
-#if defined(SUPPORT_CGA)
-    LamportFlags<PackedType, true> flag(bufferFlags, 1);
-#else
-    LamportFlags<PackedType, false> flag(bufferFlags, 1);
-#endif
+    // We only use 1 stage for the oneshot allreduce
+    LamportFlags<PackedType> flag(bufferFlags, 1);
     T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(mcastPtr, 0));
     T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], 0));
 
@@ -387,7 +371,9 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     {
         packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
     if constexpr (RMSNormFusion)
     {
         // =============================== Residual ===============================
@@ -408,7 +394,7 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
             threadSum += cuda_cast<float, T>(packedAccum.elements[i] * packedAccum.elements[i]);
         }
         float tokenSum = blockReduceSum<float, false>(threadSum);
-#if defined(SUPPORT_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
@@ -454,16 +440,12 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     int const tokenDim = params.tokenDim;
     int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
 
-#if defined(SUPPORT_CGA)
-    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread);
-#else
-    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<false>(numTokens, tokenDim, eltsPerThread);
-#endif
+    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig(numTokens, tokenDim, eltsPerThread);
     dim3 grid(numTokens, clusterSize, 1);
 
     TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
         "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim,
-#if defined(SUPPORT_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         1024 * 8 * eltsPerThread);
 #else
         1024 * eltsPerThread);
@@ -478,7 +460,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
-#if defined(SUPPORT_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     attrs[1].id = cudaLaunchAttributeClusterDimension;
     attrs[1].val.clusterDim.x = 1;
     attrs[1].val.clusterDim.y = clusterSize;
@@ -488,7 +470,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     cudaLaunchConfig_t config
     {
         .gridDim = grid, .blockDim = blockSize, .dynamicSmemBytes = 0, .stream = params.stream, .attrs = attrs,
-#if defined(SUPPORT_CGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         .numAttrs = 2,
 #else
         .numAttrs = 1,
@@ -566,10 +548,10 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
 
     int destRank = token % WorldSize;
     int destTokenOffset = token / WorldSize;
-
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
-
-    LamportFlags<PackedType, false> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+#endif
+    LamportFlags<PackedType> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
 
     T* scatterBufLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::SCATTER));
     T* scatterBufDest = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[destRank], MNNVLTwoShotStage::SCATTER));
@@ -656,7 +638,9 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
         }
         reinterpret_cast<PackedType*>(&broadcastBufW[token * tokenDim])[packedIdx] = packedAccum.packed;
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
     flag.clearDirtyLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::BROADCAST);
 
     // Optionally wait for results if the next layer isn't doing the Lamport check
@@ -691,7 +675,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
 //      1. Use CGA if supported. It expands the hidden dimension to 8k x 8 = 64k.
 //      2. Set loads_per_thread >1. Which can be used if CGA is not supported. Note that this will be limited by the
 //      shared memory size and register count.
-template <typename T_IN, typename T_OUT, bool USE_CGA = false, int LoadsPerThread = 1>
+template <typename T_IN, typename T_OUT, int LoadsPerThread = 1>
 __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OUT* outputNorm, T_IN* bufferInput,
     T_IN const* gamma, float epsilon, T_IN const* residual, uint32_t numTokens, uint32_t dim, uint32_t worldSize,
     uint32_t* bufferFlags)
@@ -706,14 +690,13 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     uint32_t numThreads = blockSize;
     uint32_t clusterSize = 1;
     uint32_t blockOffset = 0;
-    if constexpr (USE_CGA)
-    {
-        namespace cg = cooperative_groups;
-        cg::cluster_group cluster = cg::this_cluster();
-        numThreads = cluster.num_threads();
-        clusterSize = cluster.num_blocks();
-        blockOffset = cluster.block_rank();
-    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    numThreads = cluster.num_threads();
+    clusterSize = cluster.num_blocks();
+    blockOffset = cluster.block_rank();
+#endif
     uint32_t const dimPadded = divUp(dim, kELTS_PER_LOAD * numThreads) * kELTS_PER_LOAD * numThreads;
     uint32_t const elemsPerThread = dimPadded / numThreads;
     uint32_t const loadStride = blockSize;
@@ -727,12 +710,13 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     T_IN* smemResidual = (T_IN*) &smem[smemBufferSize];
     T_IN* smemGamma = (T_IN*) &smem[2 * smemBufferSize];
 
-    LamportFlags<float4, USE_CGA> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    LamportFlags<float4> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
     T_IN* input = reinterpret_cast<T_IN*>(
         flag.getCurLamportBuf(reinterpret_cast<void*>(bufferInput), MNNVLTwoShotStage::BROADCAST));
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
-
+#endif
     // The offset that current thread should load from. Note that the hidden dimension is split by CGA size and each
     // block loads a contiguous chunk;
     // The size of chunk that each block processes
@@ -825,29 +809,29 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 
     float rcpRms;
     __shared__ float sharedVal;
-    if constexpr (USE_CGA)
+    // Use CGA Reduction if supported
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    if (cluster.num_blocks() > 1)
     {
-        namespace cg = cooperative_groups;
-        cg::cluster_group cluster = cg::this_cluster();
-        if (cluster.num_blocks() > 1)
+        // Need to reduce over the entire cluster
+        if (threadIdx.x == 0)
         {
-            // Need to reduce over the entire cluster
-            if (threadIdx.x == 0)
-            {
-                sharedVal = clusterSum;
-                clusterSum = 0.F;
-            }
-            cluster.sync();
-            if (threadIdx.x == 0)
-            {
-                for (int i = 0; i < clusterSize; ++i)
-                {
-                    clusterSum += *cluster.map_shared_rank(&sharedVal, i);
-                }
-            }
-            cluster.sync();
+            sharedVal = clusterSum;
+            clusterSum = 0.F;
         }
+        cluster.sync();
+        if (threadIdx.x == 0)
+        {
+            for (int i = 0; i < clusterSize; ++i)
+            {
+                clusterSum += *cluster.map_shared_rank(&sharedVal, i);
+            }
+        }
+        cluster.sync();
     }
+#endif
 
     if (threadIdx.x == 0)
     {
@@ -945,11 +929,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     // Launch the rmsnorm lamport kernel if fusion is enabled
     if (params.rmsNormFusion)
     {
-#ifdef SUPPORT_CGA
-        auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread);
-#else
-        auto gridConfig = adjustGridConfig<false>(numTokens, tokenDim, numEltsPerThread);
-#endif
+        auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread);
         int rnBlockSize = std::get<0>(gridConfig);
         int rnClusterSize = std::get<1>(gridConfig);
         int rnLoadsPerThread = std::get<2>(gridConfig);
@@ -986,13 +966,13 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             "threads_needed: %d",
             numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread, divUp(tokenDim, numEltsPerThread));
 
-#define RUN_RMSNORM_KERNEL(T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD)                                                     \
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsNormLamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,                      \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));                                                       \
+#define RUN_RMSNORM_KERNEL(T_IN, T_OUT, LOADS_PER_THREAD)                                                              \
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(                                                                              \
+        &rmsNormLamport<T_IN, T_OUT, LOADS_PER_THREAD>, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));       \
     rnConfig.dynamicSmemBytes = smemSize;                                                                              \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,             \
-        residualOut, output, bufferInput, gamma, static_cast<float>(params.epsilon), residualIn, numTokens, tokenDim,  \
-        params.nRanks, params.bufferFlags));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T_IN, T_OUT, LOADS_PER_THREAD>, residualOut, output, \
+        bufferInput, gamma, static_cast<float>(params.epsilon), residualIn, numTokens, tokenDim, params.nRanks,        \
+        params.bufferFlags));
 
         // C++ 17 does not support capturing structured bindings
         auto dispatchRN = [&, rnLoadsPerThread](auto* type_ptr)
@@ -1006,20 +986,20 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             T_IN const* residualIn = reinterpret_cast<T_IN const*>(params.residualIn);
             if (rnUseCGA)
             {
-                RUN_RMSNORM_KERNEL(T_IN, T_OUT, true, 1);
+                RUN_RMSNORM_KERNEL(T_IN, T_OUT, 1);
             }
             else
             {
                 switch (rnLoadsPerThread)
                 {
-                case 1: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 1); break;
-                case 2: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 2); break;
-                case 3: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 3); break;
-                case 4: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 4); break;
-                case 5: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 5); break;
-                case 6: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 6); break;
-                case 7: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 7); break;
-                case 8: RUN_RMSNORM_KERNEL(T_IN, T_OUT, false, 8); break;
+                case 1: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 1); break;
+                case 2: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 2); break;
+                case 3: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 3); break;
+                case 4: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 4); break;
+                case 5: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 5); break;
+                case 6: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 6); break;
+                case 7: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 7); break;
+                case 8: RUN_RMSNORM_KERNEL(T_IN, T_OUT, 8); break;
                 default: return false;
                 }
             }

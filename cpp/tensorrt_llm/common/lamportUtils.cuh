@@ -151,7 +151,7 @@ struct LamportBufferLayout
 namespace cg = cooperative_groups;
 
 // PackedType is the one used in kernel for Lamport buffer (LDG.128 or LDG.64)
-template <typename PackedType = float4, bool USE_CGA = false>
+template <typename PackedType = float4>
 __device__ struct __attribute__((aligned(32))) LamportFlags
 {
 public:
@@ -204,18 +204,16 @@ public:
     __device__ void ctaArrive()
     {
         int tid{0};
-        if constexpr (USE_CGA)
-        {
-            cg::cluster_group cluster = cg::this_cluster();
-            // We update the atomic counter per cluster
-            tid = cluster.thread_rank();
-            cluster.sync();
-        }
-        else
-        {
-            tid = threadIdx.x;
-            __syncthreads();
-        }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+
+        cg::cluster_group cluster = cg::this_cluster();
+        // We update the atomic counter per cluster
+        tid = cluster.thread_rank();
+        cluster.sync();
+#else
+        tid = threadIdx.x;
+        __syncthreads();
+#endif
         if (tid == 0)
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
@@ -232,18 +230,15 @@ public:
     {
         bool isLastCtaT0{false};
         int targetCount{0};
-        if constexpr (USE_CGA)
-        {
-            cg::grid_group grid = cg::this_grid();
-            // Use the first thread instead of the last thread as the last thread may exit early
-            isLastCtaT0 = grid.thread_rank() == 0;
-            targetCount = grid.num_clusters();
-        }
-        else
-        {
-            isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
-            targetCount = gridDim.x * gridDim.y;
-        }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cg::grid_group grid = cg::this_grid();
+        // Use the first thread instead of the last thread as the last thread may exit early
+        isLastCtaT0 = grid.thread_rank() == 0;
+        targetCount = grid.num_clusters();
+#else
+        isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
+        targetCount = gridDim.x * gridDim.y;
+#endif
         if (isLastCtaT0)
         {
             uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);
