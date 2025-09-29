@@ -127,6 +127,7 @@ class Attention(nn.Module):
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
+        attn_output_gate: Optional[bool] = None,
     ):
         """
         Initialize the Attention module.
@@ -146,6 +147,7 @@ class Attention(nn.Module):
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
+            attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -172,6 +174,11 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+        self.attn_output_gate = attn_output_gate
+
+        if self.attn_output_gate:
+            logger.warning_once("using attn output gate!",
+                                key="attn_output_gate")
 
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
@@ -217,7 +224,8 @@ class Attention(nn.Module):
 
         self.qkv_proj = Linear(
             self.hidden_size,
-            tp_size * self.q_size + 2 * tp_size * self.kv_size,
+            tp_size * self.q_size * (1 + (1 if self.attn_output_gate else 0)) +
+            2 * tp_size * self.kv_size,
             bias=bias,
             dtype=dtype,
             mapping=mapping,
@@ -521,6 +529,17 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+            ### TODO: avoid the redundant split and concat
+            qkv = torch.concat([q, k, v], dim=-1)
+
         q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
@@ -528,17 +547,21 @@ class Attention(nn.Module):
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
 
-        output = self.forward_impl(q,
-                                   k,
-                                   v,
-                                   attn_metadata,
-                                   attention_mask,
-                                   attention_window_size,
-                                   attention_mask_data,
-                                   mrope_config=mrope_config,
-                                   attention_sinks=attention_sinks)
+        attn_output = self.forward_impl(q,
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        attention_mask,
+                                        attention_window_size,
+                                        attention_mask_data,
+                                        mrope_config=mrope_config,
+                                        attention_sinks=attention_sinks)
 
-        attn_output = self.o_proj(output,
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+
+        attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
@@ -561,7 +584,8 @@ class Attention(nn.Module):
         """
         # If RoPE is fused into the attention OP, do not apply RoPE here.
         if not self.rope_fusion and position_ids is not None:
-            q, k, v = self.split_qkv(q, k, v)
+            if k is None and v is None:
+                q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
