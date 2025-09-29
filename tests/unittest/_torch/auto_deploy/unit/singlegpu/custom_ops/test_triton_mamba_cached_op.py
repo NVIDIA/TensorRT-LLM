@@ -28,6 +28,7 @@ def mamba_env():
     return {"device": device, "dtype": dtype, "atol": atol, "rtol": rtol}
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5548861")
 def test_triton_generate_only_with_slot_mapping(mamba_env):
     device = mamba_env["device"]
     dtype = mamba_env["dtype"]
