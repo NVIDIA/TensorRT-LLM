@@ -1,8 +1,12 @@
 #! /usr/bin/env bash
 
+# Set to TinyLlama/TinyLlama-1.1B-Chat-v1.0 to download from Hugging Face.
+# Or set to the path of a local tokenizer directory.
+TOKENIZER_PATH_OR_NAME= \
+    "/home/scratch.trt_llm_data/llm-models/Qwen2.5-VL-3B-Instruct"
 genai-perf profile \
     -m Qwen2.5-VL-3B-Instruct \
-    --tokenizer Qwen/Qwen2.5-VL-3B-Instruct \
+    --tokenizer $TOKENIZER_PATH_OR_NAME \
     --endpoint-type multimodal \
     --random-seed 123 \
     --image-width-mean 64 \
