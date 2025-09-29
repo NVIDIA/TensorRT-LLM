@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 
 from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
@@ -94,7 +95,7 @@ class LMHead(Linear):
             # For LM head TP in ADP, we need to slice the weight for the LM head
             tp_rank = mapping_lm_head_tp.tp_rank
             tp_size = mapping_lm_head_tp.tp_size
-            slice_width = math.ceil(self.out_features / tp_size)
+            slice_width = ceil_div(self.out_features, tp_size)
             slice_start = tp_rank * slice_width
             slice_end = min((tp_rank + 1) * slice_width, self.out_features)
             output = F.linear(input, self.weight[slice_start:slice_end, :],

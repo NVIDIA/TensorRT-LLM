@@ -2016,7 +2016,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
         ],
         ids=[
-            "latency", "latency_trtllmgen", "latency_trtllmgen_adp",
+            "latency", "latency_trtllmgen", "latency_adp_lmtp",
             "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
             "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp"
         ])
