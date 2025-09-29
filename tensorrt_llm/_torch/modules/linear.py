@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
+import flashinfer.comm as flashinfer_comm
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -15,7 +16,7 @@ from torch.nn.parameter import Parameter
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy, FlashInferAllReduceParams)
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -28,7 +29,6 @@ from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
-import flashinfer.comm as flashinfer_comm
 
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
@@ -1876,6 +1876,9 @@ class Linear(nn.Module):
                 hidden_dim=self.out_features,
                 strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
                 dtype=self.dtype) if reduce_output else None
+            # self.flash_infer_vllm_all_reduce = FlashInferVLLMAllReduce(
+            #     mapping=self.mapping,
+            #     dtype=self.dtype) if reduce_output else None
 
         self._weights_created = False
         self.reduce_output = reduce_output
@@ -2012,7 +2015,7 @@ class Linear(nn.Module):
                 bias = None if fuse_bias else bias
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
 
-                if self.use_flashinfer_allreduce and output.size(0) <= 150:
+                if self.use_flashinfer_allreduce and output.size(0) == 150:
                     output = self.flash_infer_all_reduce(
                         output,
                         all_reduce_params=all_reduce_params,
