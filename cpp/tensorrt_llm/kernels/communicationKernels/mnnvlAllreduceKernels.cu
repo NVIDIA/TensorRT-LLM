@@ -811,8 +811,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     __shared__ float sharedVal;
     // Use CGA Reduction if supported
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
     if (cluster.num_blocks() > 1)
     {
         // Need to reduce over the entire cluster
