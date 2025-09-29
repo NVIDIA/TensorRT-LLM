@@ -649,14 +649,13 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8), (4, 1, 1),
                                     (4, 1, 2), (4, 1, 4)],
         ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        if get_device_memory() < 270000 and get_device_count() < 8:
-            pytest.skip("Not enough memory for this test")
         if get_device_count() != tp_size * pp_size:
             pytest.skip("Device count mismatch with world size")
 
@@ -678,6 +677,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
         pytorch_config = dict(attn_backend=attn_backend,
@@ -2170,6 +2170,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [(8, 1, 4, 3, False, False, True, True, 1, "_DEFAULT"),
