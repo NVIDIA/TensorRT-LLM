@@ -277,7 +277,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         engine_config = EngineConfig.from_json_file(f"{engine_dir}/config.json")
         if model_config.use_lora_plugin and rank == 0:
-            lora_manager = LoraManager()
+            lora_manager = LoraManager(
+                mapping=_world_config_to_mapping(world_config))
             if lora_dir is None:
                 config_lora_dir = engine_config.build_config.lora_config.lora_dir
                 if len(config_lora_dir) > 0:
@@ -292,7 +293,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 # For Executor, only rank 0 can enqueue requests, and should hold all lora weights
                 lora_manager.load_from_ckpt(lora_dir,
                                             model_config=runtime_model_config,
-                                            runtime_mapping=None,
                                             ckpt_source=lora_ckpt_source)
             else:
                 raise RuntimeError(
