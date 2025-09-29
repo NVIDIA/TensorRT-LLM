@@ -312,3 +312,26 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
 # It's here so that unit tests can mock it and turn it off.
 def _get_allow_chain_drafter() -> bool:
     return True
+
+
+_buffer_pool = None
+
+
+def set_mem_pool(buffer_pool):
+    global _buffer_pool
+    _buffer_pool = buffer_pool
+
+
+def get_graph_pool():
+    global _buffer_pool
+    return _buffer_pool
+
+
+@contextlib.contextmanager
+def set_prefer_mem_pool(mem_pool):
+    old_buffer_pool = get_graph_pool()
+    set_mem_pool(mem_pool)
+    try:
+        yield
+    finally:
+        set_mem_pool(old_buffer_pool)

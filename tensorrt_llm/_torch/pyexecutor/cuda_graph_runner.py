@@ -194,6 +194,9 @@ class CUDAGraphRunner:
 
         return key not in self.graph_outputs
 
+    def get_graph_pool(self):
+        return self.memory_pool
+
     def capture(self,
                 key: Tuple[int, int, int],
                 forward_fn: Callable,
@@ -255,6 +258,7 @@ class CUDAGraphRunner:
                                                  capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
+
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
