@@ -428,7 +428,9 @@ class OpenAIServer:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
-                yield first_response
+                pp_results = first_response.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(first_response, args)
+                for pp_res in pp_results:
+                    yield pp_res
                 async for res in promise:
                     pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                     for pp_res in pp_results:

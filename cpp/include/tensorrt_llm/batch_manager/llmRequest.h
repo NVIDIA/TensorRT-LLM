@@ -1864,6 +1864,15 @@ public:
         return mUseDraftModel;
     }
 
+    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // time point
+    [[nodiscard]] TimePoint getSteadyClockNow() const
+    {
+        const TimePoint time_point = std::chrono::steady_clock::now();
+
+        return maybeToGlobalSteadyClock(time_point);
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -2183,15 +2192,6 @@ private:
         {
             return time_point;
         }
-    }
-
-    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
-    // time point
-    TimePoint getSteadyClockNow() const
-    {
-        const TimePoint time_point = std::chrono::steady_clock::now();
-
-        return maybeToGlobalSteadyClock(time_point);
     }
 };
 

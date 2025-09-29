@@ -518,18 +518,18 @@ class OpenAIDisaggServer:
                 async with session.get(server_url + STEADY_CLOCK_OFFSET_ENDPOINT) as response:
                     destination_ts = get_steady_clock_now_in_seconds()
                     if response.status == 200:
-                        response = await response.json()
+                        response_content = await response.json()
                         # Compute the steady clock timestamp difference using the NTP clock synchronization algorithm. https://en.wikipedia.org/wiki/Network_Time_Protocol#Clock_synchronization_algorithm
-                        receive_ts = response['receive_ts']
-                        transmit_ts = response['transmit_ts']
+                        receive_ts = response_content['receive_ts']
+                        transmit_ts = response_content['transmit_ts']
                         delay = (destination_ts - originate_ts) - (transmit_ts - receive_ts)
                         offset = ((receive_ts - originate_ts) + (transmit_ts - destination_ts)) / 2
                         return delay, offset
                     else:
                         return None, None
             except Exception:
-                return None
-        async def set_steady_clock_offset(server_url: str, offset: float) -> Optional[float]:
+                return None, None
+        async def set_steady_clock_offset(server_url: str, offset: float) -> None:
             payload = {"offset": offset}
             async with session.post(server_url + STEADY_CLOCK_OFFSET_ENDPOINT, json=payload) as response:
                 if response.status != 200:
