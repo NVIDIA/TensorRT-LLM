@@ -74,8 +74,6 @@ class BuildAndLoadFactoryModel(BuildModel):
     We also assume that the `build_and_load_model` method will auto-shard the model appropriately.
     """
 
-    config: BuildModelConfig
-
     def _apply(
         self,
         gm: GraphModule,
@@ -87,7 +85,7 @@ class BuildAndLoadFactoryModel(BuildModel):
         assert isinstance(factory, hf.AutoModelFactory), "Only HF models are supported."
 
         # build and load the model
-        model = factory.build_and_load_model(self.config.device)
+        model = factory.build_and_load_model(cm.device)
 
         assert not self.config.use_strict_forward, "Only regular forward is supported."
 

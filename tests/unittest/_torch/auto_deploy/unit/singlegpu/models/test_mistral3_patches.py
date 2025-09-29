@@ -4,7 +4,7 @@ from build_and_run_ad import ExperimentConfig
 
 from tensorrt_llm._torch.auto_deploy import LlmArgs
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 
 def test_build_run_mistral3_vlm():

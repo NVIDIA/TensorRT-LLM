@@ -12,10 +12,13 @@ from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionDescriptor,
+    AttentionRegistry,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 torch.manual_seed(0)
 
@@ -59,7 +62,7 @@ def _joint_transform(gm: GraphModule) -> None:
             },
             "match_attention_layout": {
                 "stage": "pattern_matcher",
-                "attention_op": MockAttentionDescriptor,
+                "attn_backend": "mock",
             },
         },
     )(None, gm)
@@ -78,6 +81,7 @@ def _joint_transform(gm: GraphModule) -> None:
     ["eager", "sdpa"],
 )
 def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str):
+    AttentionRegistry._attention_registry["mock"] = MockAttentionDescriptor
     if attn_implementation == "sdpa":
         pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
 

@@ -25,6 +25,7 @@ transforms:
   resize_kv_cache:
     stage: cache_init
     args_only: false # use kwargs instead of args
+    free_mem_ratio: 0.0
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################

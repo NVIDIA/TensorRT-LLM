@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from pydantic import Field
 from torch.fx import GraphModule
 
-from ...custom_ops.attention_interface import AttentionDescriptor
+from ...custom_ops.attention_interface import AttentionRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -494,9 +494,9 @@ class MatchGroupedAttention(BaseTransform):
 
 
 class MatchAttentionLayoutConfig(TransformConfig):
-    """Configuration for the insert cached attention transform."""
+    """Configuration for the match attention layout transform."""
 
-    attention_op: Type[AttentionDescriptor] = Field(description="The attention descriptor to use.")
+    attn_backend: str = Field(description="Attention backend to use.")
 
 
 @TransformRegistry.register("match_attention_layout")
@@ -525,7 +525,8 @@ class MatchAttentionLayout(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         # Get attention layout from attention_op
-        attention_layout = self.config.attention_op.get_attention_layout()
+        attention_op = AttentionRegistry.get(self.config.attn_backend)
+        attention_layout = attention_op.get_attention_layout()
 
         # List of SDPA operations to look for
         sdpa_ops = {
@@ -570,7 +571,7 @@ class MatchAttentionLayout(BaseTransform):
             # but using the transposed inputs
             with graph.inserting_before(sdpa_node):
                 source_sdpa_node = graph.call_function(
-                    self.config.attention_op.get_source_attention_op(),
+                    attention_op.get_source_attention_op(),
                     args=(q_updated, k_updated, v_updated) + sdpa_node.args[3:],
                     kwargs=sdpa_node.kwargs,
                 )

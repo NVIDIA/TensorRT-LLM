@@ -82,9 +82,14 @@ def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 2},
-                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                     "max_batch_size": 128,
-                    "compile_backend": compile_backend,
+                    "transforms": {
+                        "compile_model": {
+                            "stage": "compile",
+                            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                            "compile_backend": compile_backend,
+                        }
+                    },
                 },
                 f,
             )

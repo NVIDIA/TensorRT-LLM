@@ -39,10 +39,12 @@ transforms:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
+    attn_backend: flashinfer
   match_rope_pattern:
     stage: pattern_matcher
   match_rope_layout:
     stage: pattern_matcher
+    expected_layout: bsnd
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -85,6 +87,7 @@ transforms:
   ############################################################################################
   load_weights:
     stage: weight_load
+    checkpoint_device: null
   move_inputs_to_device:
     stage: weight_load
   ############################################################################################
@@ -118,12 +121,19 @@ transforms:
     stage: post_load_fusion
     backend: flashinfer
   ############################################################################################
+  # VISUALIZE GRAPH
+  ############################################################################################
+  visualize_namespace:
+    stage: visualize
+    enabled: false #TODO (hg): visualization has some errors now
+  ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
   update_in_out_nodes:
     stage: cache_init
   insert_cached_attention:
     stage: cache_init
+    attn_backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
     attn_backend: MultiHeadLatentAttention
@@ -131,11 +141,14 @@ transforms:
     stage: cache_init
   resize_kv_cache:
     stage: cache_init
+    free_mem_ratio: 0.0
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
   compile_model:
     stage: compile
+    cuda_graph_batch_sizes: null
+    compile_backend: torch-compile
   forward_with_cached_sequence_interface:
     stage: compile
     args_only: true
