@@ -59,13 +59,13 @@ class RemoteCall:
                       need_response: bool = True) -> concurrent.futures.Future:
         """Remote call that returns a Future object."""
         return self._prepare_and_call(timeout, need_response, "future",
-                                      "call_future")
+                                      "_call_future")
 
     def remote_streaming(self,
                          timeout: Optional[float] = None) -> AsyncIterator[Any]:
         """Remote call for streaming results."""
         # Streaming always needs a response
-        return self._prepare_and_call(timeout, True, "async", "call_streaming")
+        return self._prepare_and_call(timeout, True, "async", "_call_streaming")
 
 
 class RPCClient:
@@ -365,27 +365,8 @@ class RPCClient:
             f"RPC Client _call_sync: Got result for {method_name}: {result}")
         return result
 
-    def call_async(self, name: str, *args, **kwargs) -> Any:
-        """
-        Call a remote method asynchronously.
-
-        Args:
-            name: Method name to call
-            *args: Positional arguments
-            **kwargs: Keyword arguments
-
-        Returns:
-            Coroutine that can be awaited
-
-        Example:
-            result = await client.call_async('remote_method', arg1, arg2, key=value)
-        """
-        if "__rpc_params" not in kwargs:
-            kwargs["__rpc_params"] = RPCParams(need_response=True)
-        return self._call_async(name, *args, **kwargs)
-
-    def call_future(self, name: str, *args,
-                    **kwargs) -> concurrent.futures.Future:
+    def _call_future(self, name: str, *args,
+                     **kwargs) -> concurrent.futures.Future:
         """
         Call a remote method and return a Future.
 
@@ -396,12 +377,6 @@ class RPCClient:
 
         Returns:
             A Future object that can be used to retrieve the result
-
-        Example:
-            future = client.call_future('remote_method', arg1, arg2, key=value)
-            result = future.result()  # blocks until complete
-            # or
-            future.add_done_callback(lambda f: print(f.result()))
         """
 
         def _async_to_sync():
@@ -412,25 +387,8 @@ class RPCClient:
 
         return self._executor.submit(_async_to_sync)
 
-    def call_sync(self, name: str, *args, **kwargs) -> Any:
-        """
-        Call a remote method synchronously (blocking).
-
-        Args:
-            name: Method name to call
-            *args: Positional arguments
-            **kwargs: Keyword arguments
-
-        Returns:
-            The result of the remote method call
-
-        Example:
-            result = client.call_sync('remote_method', arg1, arg2, key=value)
-        """
-        return self._call_sync(name, *args, **kwargs)
-
-    async def call_streaming(self, name: str, *args,
-                             **kwargs) -> AsyncIterator[Any]:
+    async def _call_streaming(self, name: str, *args,
+                              **kwargs) -> AsyncIterator[Any]:
         """
         Call a remote async generator method and get streaming results.
 
@@ -441,10 +399,6 @@ class RPCClient:
 
         Yields:
             Results from the remote async generator
-
-        Example:
-            async for result in client.call_streaming('streaming_task'):
-                print(result)
         """
         if self._server_stopped:
             raise RPCCancelled("Server is shutting down, request cancelled")
@@ -474,7 +428,7 @@ class RPCClient:
 
             # Read streaming responses
             while True:
-                logger_debug(f"RPC Client call_streaming waiting for response",
+                logger_debug(f"RPC Client _call_streaming waiting for response",
                              color="green")
                 if timeout is None:
                     response = await queue.get()
@@ -483,14 +437,14 @@ class RPCClient:
                                                       timeout=timeout)
 
                 logger_debug(
-                    f"RPC Client call_streaming received [{response.stream_status}] response: {response}",
+                    f"RPC Client _call_streaming received [{response.stream_status}] response: {response}",
                     color="green")
                 if response.stream_status == 'start':
                     # Start of stream
                     continue
                 elif response.stream_status == 'data':
                     logger_debug(
-                        f"RPC Client call_streaming received data: {response.result}",
+                        f"RPC Client _call_streaming received data: {response.result}",
                         color="green")
                     yield response.result
                 elif response.stream_status == 'end':

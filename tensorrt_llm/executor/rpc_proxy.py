@@ -3,7 +3,6 @@ import atexit
 import json
 import os
 import threading
-import time
 from typing import Optional
 
 from ..llmapi.llm_args import KvCacheConnectorConfig
@@ -71,7 +70,6 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         self.main_loop = None
 
         self.launch_workers()
-        time.sleep(1)  # wait for the workers to launch
 
         # Invoke model creation on the remote
         # TBD: Move model creation to the mpi task, or left in RPC?

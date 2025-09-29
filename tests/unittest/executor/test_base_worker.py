@@ -12,6 +12,7 @@ from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
+from utils.util import skip_single_gpu
 # isort: on
 
 from tensorrt_llm._torch.pyexecutor.config import update_executor_config
@@ -156,6 +157,8 @@ class TestRpcWorkerBaseTP2:
         session = MpiPoolSession(n_workers=2)
         return session
 
+    @pytest.mark.gpu2
+    @skip_single_gpu
     def test_create_executor(self):
         futures = self.session.submit(
             TestRpcWorkerBaseTP2.create_executor,

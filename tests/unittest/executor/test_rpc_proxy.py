@@ -14,7 +14,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
-from utils.util import similar
+from utils.util import similar, skip_single_gpu
 # isort: on
 
 model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
@@ -78,6 +78,8 @@ class TestRpcProxy:
             assert isinstance(kv_cache_events, list)
 
     @pytest.mark.parametrize("num_reqs", [1, 10])
+    @skip_single_gpu
+    @pytest.mark.gpu2
     def test_tp2(self, num_reqs):
         tokenizer = TransformersTokenizer.from_pretrained(model_path)
         prompt = "A B C D"

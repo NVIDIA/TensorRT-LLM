@@ -230,7 +230,7 @@ class RpcWorker(BaseWorker):
                          color="yellow")
             worker.setup_engine()
 
-        if mpi_rank() == 0:
+        else:
             logger_debug(f"Worker {mpi_rank()} is creating the RPC service",
                          color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client

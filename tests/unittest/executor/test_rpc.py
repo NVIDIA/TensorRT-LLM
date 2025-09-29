@@ -238,10 +238,10 @@ class TestRpcError:
                 with pytest.raises(RPCError) as exc_info:
                     client.slow_method().remote(timeout=0.5)
 
-                    error = exc_info.value
-                    # Should be either a timeout error or RPC error indicating timeout
-                    assert "timed out" in str(
-                        error).lower() or "timeout" in str(error).lower()
+                error = exc_info.value
+                # Should be either a timeout error or RPC error indicating timeout
+                assert "timed out" in str(error).lower() or "timeout" in str(
+                    error).lower()
 
     def test_method_not_found_error(self):
         """Test that calling non-existent methods returns proper error."""

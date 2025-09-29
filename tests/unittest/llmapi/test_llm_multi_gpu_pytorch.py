@@ -63,30 +63,31 @@ def test_llama_7b_multi_lora_tp2():
 
 @pytest.mark.gpu2
 def test_llm_rpc_tp2():
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-              orchestrator_type="rpc",
-              tensor_parallel_size=2)
-    assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+    with LLM(model=llama_model_path,
+             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+             orchestrator_type="rpc",
+             tensor_parallel_size=2) as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
 
-    res = llm.generate("Tell me a joke",
-                       sampling_params=SamplingParams(max_tokens=10, end_id=-1))
-    print(f"get result: {res}")
+        res = llm.generate("Tell me a joke",
+                           sampling_params=SamplingParams(max_tokens=10,
+                                                          end_id=-1))
+        print(f"get result: {res}")
 
-    assert len(res.outputs) == 1
-    assert len(res.outputs[0].token_ids) == 10
+        assert len(res.outputs) == 1
+        assert len(res.outputs[0].token_ids) == 10
 
 
 @pytest.mark.gpu2
 @pytest.mark.asyncio
 async def test_llm_rpc_streaming_tp2():
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-              orchestrator_type="rpc",
-              tensor_parallel_size=2)
-    assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+    with LLM(model=llama_model_path,
+             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+             orchestrator_type="rpc",
+             tensor_parallel_size=2) as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
 
-    async for output in llm.generate_async("Tell me a joke",
-                                           sampling_params=SamplingParams(
-                                               max_tokens=10, end_id=-1)):
-        print(f"get result: {output}")
+        async for output in llm.generate_async("Tell me a joke",
+                                               sampling_params=SamplingParams(
+                                                   max_tokens=10, end_id=-1)):
+            print(f"get result: {output}")

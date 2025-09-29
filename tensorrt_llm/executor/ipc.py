@@ -194,38 +194,6 @@ class ZeroMqQueue:
             logger.error(traceback.format_exc())
             raise e
 
-    async def put_async_with_timeout(self, obj: Any, timeout: float = 5.0):
-        """
-        Send an object with timeout to detect connection failures.
-
-        Args:
-            obj: The object to send
-            timeout: Timeout in seconds for the send operation
-
-        Raises:
-            zmq.Again: If send operation times out (peer may be disconnected)
-            Exception: Other send errors
-        """
-        self.setup_lazily()
-        try:
-            if self.use_hmac_encryption:
-                data = pickle.dumps(obj)  # nosec B301
-                signed_data = self._sign_data(data)
-                # Use asyncio.wait_for to implement timeout instead of zmq.NOBLOCK
-                await asyncio.wait_for(self.socket.send(signed_data),
-                                       timeout=timeout)
-            else:
-                await asyncio.wait_for(self.socket.send_pyobj(obj),
-                                       timeout=timeout)
-        except asyncio.TimeoutError:
-            # Convert timeout to zmq.Again to maintain compatibility with existing error handling
-            raise zmq.Again(
-                "Send operation timed out - peer may be disconnected")
-        except Exception as e:
-            logger.error(f"Error sending object: {e}")
-            logger.error(traceback.format_exc())
-            raise e
-
     def get(self) -> Any:
         self.setup_lazily()
         return self._recv_data()

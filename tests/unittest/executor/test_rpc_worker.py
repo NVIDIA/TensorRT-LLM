@@ -18,6 +18,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
+from utils.util import skip_single_gpu
 # isort: on
 
 model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
@@ -177,12 +178,20 @@ class TestRpcWorkerTP1:
     async def test_fetch_stats_loop_async(self):
         await asyncio.sleep(1)
         results = []
-        async for stats in self.client.fetch_stats_loop_async(
-        ).remote_streaming():
-            results.append(stats)
-            assert not stats  # empty stats
+        max_batches = 5
 
-        assert len(results) == 0
+        async def consume_stats():
+            async for stats in self.client.fetch_stats_loop_async(
+            ).remote_streaming():
+                results.append(stats)
+                assert not stats  # empty stats
+                if len(results) >= max_batches:
+                    break
+
+        await asyncio.wait_for(consume_stats(), timeout=5)
+
+        assert len(results) == max_batches
+        assert all(not stats for stats in results)
 
 
 class TestRpcWorkerTP2:
@@ -215,11 +224,15 @@ class TestRpcWorkerTP2:
     def create_rpc_client(self, addr: str):
         return RPCClient(addr)
 
+    @skip_single_gpu
+    @pytest.mark.gpu2
     def test_create_shutdown(self):
         # Invoke setup_engine in rank 0, and that will unblock all the ranks to
         # invoke setup_engine simultaneously.
         pass
 
+    @skip_single_gpu
+    @pytest.mark.gpu2
     def test_fetch_responses_sync(self):
         # Wait a bit to ensure engine is ready
         time.sleep(1)
