@@ -2027,7 +2027,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (preprocessedLists.isolateCount > 0) {
             stage ("[${stageName}] Run Pytest (Isolated)") {
                 echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                rerunFailed = runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
+                rerunFailed = runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) || rerunFailed
             }
         } else {
             echo "No isolated tests to run for stage ${stageName}"
