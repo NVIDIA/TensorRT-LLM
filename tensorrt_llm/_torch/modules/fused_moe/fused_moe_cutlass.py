@@ -469,8 +469,13 @@ class CutlassFusedMoE(MoE):
             num_rows = x.shape[0]
 
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
-        num_chunks = (num_rows + self.moe_max_num_tokens -
-                      1) // self.moe_max_num_tokens
+        if self.use_dp and self.parallel_size > 1 and use_dp_padding:
+            num_chunks = (max(all_rank_num_tokens) * len(all_rank_num_tokens) +
+                          self.moe_max_num_tokens -
+                          1) // self.moe_max_num_tokens
+        else:
+            num_chunks = (num_rows + self.moe_max_num_tokens -
+                          1) // self.moe_max_num_tokens
 
         if use_dp_padding:
             all_rank_num_tokens_padded = [max(all_rank_num_tokens)
