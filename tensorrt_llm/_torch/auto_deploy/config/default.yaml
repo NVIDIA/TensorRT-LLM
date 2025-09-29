@@ -32,6 +32,7 @@ transforms:
     stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
+    run_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
   match_grouped_attention:
