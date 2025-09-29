@@ -40,8 +40,8 @@ from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
 from tensorrt_llm.runtime.redrafter_utils import *
 
-from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
-                      trt_dtype_to_torch)
+from .._utils import (binding_to_str_dtype, pad_vocab_size, str_dtype_to_torch,
+                      torch_to_numpy, trt_dtype_to_torch)
 from ..bindings import KVCacheType, ipc_nvls_allocate, ipc_nvls_free
 from ..layers import LanguageAdapterConfig
 from ..logger import logger
@@ -652,6 +652,37 @@ class ModelConfig:
     skip_cross_attn_blocks: bool = False
     # language adapter
     language_adapter_config: Optional[LanguageAdapterConfig] = None
+
+    @classmethod
+    def from_model_config_cpp(cls, model_config_cpp,
+                              mapping: Mapping) -> 'ModelConfig':
+        """Create a partially initialized ModelConfigPython from a given ModelConfigCpp.
+
+        Note that each of these classes have fields that don't exist in the other, so the created ModelConfigPython
+        won't have all of its fields initialized.
+        """
+        return cls(
+            max_batch_size=model_config_cpp.max_batch_size,
+            max_beam_width=model_config_cpp.max_beam_width,
+            vocab_size=model_config_cpp.vocab_size,
+            num_layers=model_config_cpp.num_layers(
+                pipeline_parallelism=mapping.pp_size,
+                pipeline_parallelism_rank=mapping.pp_rank,
+            ),
+            num_heads=model_config_cpp.num_heads,
+            num_kv_heads=model_config_cpp.num_kv_heads(0),
+            hidden_size=model_config_cpp.hidden_size,
+            kv_cache_type=model_config_cpp.kv_cache_type,
+            cross_attention=model_config_cpp.use_cross_attention,
+            head_size=model_config_cpp.head_size,
+            max_prompt_embedding_table_size=model_config_cpp.
+            max_prompt_embedding_table_size,
+            gpt_attention_plugin=model_config_cpp.use_gpt_attention_plugin,
+            dtype=binding_to_str_dtype(model_config_cpp.data_type),
+            num_kv_heads_per_layer=model_config_cpp.num_kv_heads_per_layer,
+            tokens_per_block=model_config_cpp.tokens_per_block,
+            lora_plugin=model_config_cpp.use_lora_plugin,
+        )
 
 
 @dataclass

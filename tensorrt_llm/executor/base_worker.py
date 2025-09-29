@@ -206,10 +206,14 @@ class BaseWorker(GenerationExecutor):
                 # point in the TRT flow is currently not supported (it's at the CPP
                 # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
                 # optimization is not available in TRT-python flow.
+
+                # NOTE: In TRT-python flow, llm_args is not set, so we create Mapping() with default values here.
+                #       this would cause incorrect weight split on TP>1 for fused LoRA modules.
+                mapping = Mapping(
+                ) if self.llm_args is None else self.llm_args.parallel_config.to_mapping(
+                )
                 self._lora_manager = LoraManager(
-                    # TODO ZUKER: Somehow create Mapping with real info when self.llm_args is None
-                    mapping=Mapping() if self.llm_args is None else
-                    self.llm_args.parallel_config.to_mapping(),
+                    mapping=mapping,
                     model_config=self._runtime_model_config,
                     cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
@@ -222,7 +226,7 @@ class BaseWorker(GenerationExecutor):
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
                 ResourceManagerType.PEFT_CACHE_MANAGER)
-            self._lora_manager = peft_cache_manager._lora_manager
+            self._lora_manager = peft_cache_manager.get_lora_manager()
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
