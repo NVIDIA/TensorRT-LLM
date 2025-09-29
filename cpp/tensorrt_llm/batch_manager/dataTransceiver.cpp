@@ -382,7 +382,7 @@ public:
     bool cancelRequest(LlmRequest const& llmRequest)
     {
         bool isCancelled = false;
-        std::unique_lock lkResp(mSenderMutex);
+        std::scoped_lock lkResp(mSenderMutex);
         auto it = mReadyResponses.find(llmRequest.mRequestId);
         // If the request is not the current request and already in the ready queue, we can cancel it.
         if (it != mReadyResponses.end() && (!isSending() || getCurrentRequestId() != llmRequest.mRequestId))
@@ -402,14 +402,14 @@ public:
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
         auto& session = it->second;
-        auto connections = session.getConnections();
+        auto const& connections = session.getConnections();
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager != nullptr)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
-                TLLM_CHECK(agentConnection != nullptr);
+                TLLM_CHECK(agentConnection);
                 agentConnection->sendReadySignal(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, isReady);
             }
@@ -508,7 +508,7 @@ private:
             // Check if the request is cancelled
             bool isReady = true;
             {
-                std::unique_lock lk(mSenderMutex);
+                std::scoped_lock lk(mSenderMutex);
                 if (mCancelledRequests.find(reqId) != mCancelledRequests.end())
                 {
                     isReady = false;
@@ -527,7 +527,7 @@ private:
                 // not be removed from mCancelledRequests. This should be handled by timeout.
                 auto it = mReadyResponses.find(mCurrentRequest.value());
                 {
-                    std::unique_lock lkResp(mSenderMutex);
+                    std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
                     mCancelledRequests.erase(mCurrentRequest.value());
                     mRemainSendCount.erase(mCurrentRequest.value());
@@ -567,7 +567,7 @@ private:
                     auto reqId = requestInfo.getRequestId();
 
                     {
-                        std::unique_lock lk(mSenderMutex);
+                        std::scoped_lock lk(mSenderMutex);
                         mCurrentRequest = reqId;
                     }
 
@@ -890,7 +890,7 @@ public:
     {
         bool isReadyFinal = true;
         bool isReady = false;
-        auto connections = session.getConnections();
+        auto const& connections = session.getConnections();
 
         for (size_t i = 0; i < connections.size(); i++)
         {
@@ -898,7 +898,7 @@ public:
             if (agentConnectionManager != nullptr)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
-                TLLM_CHECK(agentConnection != nullptr);
+                TLLM_CHECK(agentConnection);
                 isReady = agentConnection->recvReadySignal(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG});
             }
