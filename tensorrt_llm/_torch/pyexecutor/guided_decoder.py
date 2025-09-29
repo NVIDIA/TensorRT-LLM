@@ -511,6 +511,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
                 continue
             req.new_token = new_tokens_list[i]
             if draft_step == 0:
+                self.is_draft_terminated[slot] = False
                 # When overlap scheduler is enabled, it is possible that
                 # - The EOS token is in the draft tokens, and
                 # - Some draft tokens after the EOS token are accepted by the target model.
@@ -522,10 +523,6 @@ class CapturableGuidedDecoder(GuidedDecoder):
                 req.cast_to_draft()
             else:
                 assert req.is_draft
-                # For subsequent draft steps (draft_step > 0), ensure proper state management
-                # Reset any previous draft termination state if this is a new draft sequence
-                if draft_step == 0:
-                    self.is_draft_terminated[slot] = False
 
     def execute_draft_batch(self,
                             logits: torch.Tensor,
