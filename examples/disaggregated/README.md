@@ -200,6 +200,63 @@ srun -A <account> -p <partition> -t <time> \
 
 Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/simple_example/).
 
+## Mixed Precision Context and Generation
+
+In disaggregated serving, the context (prefill) workers and generation (decode) workers have different performance characteristics: prefill workers are typically compute-bound while decode workers are memory-bound. By running these workers with different precisions, you can optimize resource utilization and maximize overall throughput.
+
+### Prerequisites
+
+To enable mixed precision serving, you'll need:
+1. A quantized checkpoint created with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+2. The original unquantized checkpoint
+3. Both checkpoints must use the same KV cache dtype to ensure compatibility when transferring KV cache between context and generation servers
+
+### Example (BF 16 Prefill, FP 8 Decode)
+
+A quantized checkpoint can be created `--kv_cache_qformat none`.
+
+```bash
+python $MODELOPT_ROOT/examples/llm_ptq/hf_ptq.py \
+    --pyt_ckpt_path=meta-llama/Llama-3.1-8B-Instruct \
+    --export_path=./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
+    --sparsity_fmt=dense \
+    --qformat=fp8 \
+    --calib_size=512 \
+    --batch_size=8 \
+    --inference_tensor_parallel=1 \
+    --inference_pipeline_parallel=1 \
+    --kv_cache_qformat none \
+    --export_fmt=hf
+```
+
+Verify both checkpoints have the same KV cache dtype by checking `hf_quant_config.json`.
+
+```bash
+# Start context servers with original BF16 checkpoint
+CUDA_VISIBLE_DEVICES=0 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+    --host localhost --port 8001 \
+    --server_role CONTEXT \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+    --host localhost --port 8002 \
+    --server_role CONTEXT \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
+
+# Start generation server with FP8 quantized checkpoint
+CUDA_VISIBLE_DEVICES=2 trtllm-serve ./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
+    --host localhost --port 8003 \
+    --server_role GENERATION \
+    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
+
+# Start disaggregated server
+trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
+```
+
+You can also run FP8 for context and BF16 for generation, as long as the KV-cache dtype is consistent across all workers.
 
 ## Dynamic scaling (Prototype)
 
