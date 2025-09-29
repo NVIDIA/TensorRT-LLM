@@ -664,6 +664,7 @@ class LoraManager(object):
         self,
         *,
         mapping: Mapping,
+        model_config: "ModelConfig",
         cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None,
     ):
         """Constructor.
@@ -709,6 +710,7 @@ class LoraManager(object):
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
         self.lora_target_modules: List[str] = []
         self._mapping = mapping
+        self._model_config = model_config
         self._cpp_peft_cache_manager = cpp_peft_cache_manager
 
     def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:
@@ -969,6 +971,34 @@ class LoraManager(object):
                         lora_model[key] = value
             return lora_model
 
+        def interleave_fused_lora_weights_for_tp(
+            weight: torch.Tensor, rank_dim: int, tp_size: int, part_sizes: list[int]
+        ) -> list[torch.Tensor]:
+            assert weight.shape[rank_dim] == sum(part_sizes)
+
+            # Split the weights into their respective parts. e.g. weight -> [q, k, v] for attn_qkv.
+            weight_parts = [
+                weight.narrow(rank_dim, sum(part_sizes[:i]), part_sizes[i])
+                for i in range(len(part_sizes))
+            ]
+            for i in range(len(part_sizes)):
+                assert weight_parts[i].shape[rank_dim] % tp_size == 0
+
+            # Split each part into tp_size chunks.
+            # e.g. [q, k, v] -> [[q_rank0, ..., q_rankN], [k_rank0, ..., k_rankN], [v_rank0, ..., v_rankN]]
+            # where N is TP size, for attn_qkv.
+            weight_parts_tp_weights = [
+                torch.split(
+                    weight_parts[i], weight_parts[i].shape[rank_dim] // tp_size, dim=rank_dim
+                )
+                for i in range(len(part_sizes))
+            ]
+
+            # Interleave the parts across TP ranks and flatten the list of lists into a single list.
+            # e.g. [[q_rank0, ..., q_rankN], [k_rank0, ..., k_rankN], [v_rank0, ..., v_rankN]]
+            # -> [q_rank0, k_rank0, v_rank0, ..., q_rankN, k_rankN, v_rankN] where N is TP size, for attn_qkv.
+            return list(itertools.chain.from_iterable(zip(*weight_parts_tp_weights)))
+
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._cpp_lora_weights:
                 self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
@@ -1048,33 +1078,32 @@ class LoraManager(object):
                     is_dora = t_mag is not None
                     rank_dim = 1 if has_expert_indices else 0
 
-                    if lora_module in ["mlp_gate_up"]:
-                        # Special handling for fused module mlp_gate_up:
-                        # HF stores each part's weights sequentially, whereas we need to interleave them for TP.
-                        # We have to concatenate them all back after interleaving, as the CPP expects the full
-                        # non-split weights.
+                    # Prepare fused modules weights for TP
+                    # For fused modules, HF stores the parts weights sequentially, whereas with TP>1 we need them to be
+                    # interleaved.
+                    # e.g. Convert [q, k, v] to [q_rank0, k_rank0, v_rank0, ..., q_rankN, k_rankN, v_rankN] where
+                    # N=TP size
+                    tp_size = self._mapping.tp_size
+                    interleaved_parts = []
+                    if lora_module == "mlp_gate_up":
                         assert t_out.shape[rank_dim] % 2 == 0
                         half_size = t_out.shape[rank_dim] // 2
-                        tp_size = self._mapping.tp_size
-                        assert half_size % tp_size == 0
-
-                        first_half = t_out.narrow(rank_dim, 0, half_size)
-                        second_half = t_out.narrow(rank_dim, half_size, half_size)
-                        tp_parts_a = [
-                            torch.split(
-                                first_half, first_half.shape[rank_dim] // tp_size, dim=rank_dim
-                            )[r]
-                            for r in range(tp_size)
-                        ]
-                        tp_parts_b = [
-                            torch.split(
-                                second_half, second_half.shape[rank_dim] // tp_size, dim=rank_dim
-                            )[r]
-                            for r in range(tp_size)
-                        ]
-                        interleaved_parts = list(
-                            itertools.chain.from_iterable(zip(tp_parts_a, tp_parts_b))
+                        interleaved_parts = interleave_fused_lora_weights_for_tp(
+                            t_out, rank_dim, tp_size, [half_size, half_size]
                         )
+                    elif lora_module == "attn_qkv":
+                        q_size = (
+                            self._model_config.head_size * self._model_config.num_heads * tp_size
+                        )
+                        kv_size = (
+                            self._model_config.head_size * self._model_config.num_kv_heads * tp_size
+                        )
+                        interleaved_parts = interleave_fused_lora_weights_for_tp(
+                            t_out, rank_dim, tp_size, [q_size, kv_size, kv_size]
+                        )
+                    # We have to concatenate them all back after interleaving, as the CPP expects the full non-split
+                    # weights.
+                    if interleaved_parts:
                         t_out = torch.cat(interleaved_parts, dim=rank_dim)
 
                     effective_rank = t_in.shape[rank_dim]
