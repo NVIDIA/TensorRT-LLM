@@ -1037,14 +1037,6 @@ class HCXVisionForCausalLM(PreTrainedModel):
         self.is_loaded = True
 
     def load_weights(self, weights):
-
-        def _filter_weights(weights: Dict[str, torch.Tensor],
-                            prefix: str) -> Dict[str, torch.Tensor]:
-            return {
-                name[len(prefix):]: weight
-                for name, weight in weights.items() if name.startswith(prefix)
-            }
-
         language_weights = _filter_weights(weights, "language_model.")
         self.llm.load_weights(language_weights)
 
@@ -1103,3 +1095,11 @@ class HCXVisionForCausalLM(PreTrainedModel):
 
         logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
+
+
+def _filter_weights(weights: Dict[str, torch.Tensor],
+                    prefix: str) -> Dict[str, torch.Tensor]:
+    return {
+        name[len(prefix):]: weight
+        for name, weight in weights.items() if name.startswith(prefix)
+    }
