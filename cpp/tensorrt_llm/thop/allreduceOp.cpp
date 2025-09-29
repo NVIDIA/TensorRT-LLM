@@ -163,14 +163,16 @@ public:
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
+        size_t hidden_size = input.size(-1);
         size_t bytes_per_element = input.element_size();
         TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
-        AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
+        AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, hidden_size);
 
         // Log runtime strategy
         auto const rank = COMM_SESSION.getRank();
-        logRunTimeStrategy(runtime_strategy, rank);
+        TLLM_LOG_DEBUG(
+            "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
 
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
@@ -657,7 +659,7 @@ private:
         return {};
     }
 
-    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
+    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t hidden_size)
     {
         AllReduceStrategyType runtime_strategy;
         if (mStrategy == AllReduceStrategyType::UB)
@@ -682,43 +684,10 @@ private:
             }
             else
             {
-                runtime_strategy = selectImplementation(seq_len, size, mGroup.size(), mType);
+                runtime_strategy = selectImplementation(seq_len, hidden_size, mGroup.size(), mType);
             }
         }
         return runtime_strategy;
-    }
-
-    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
-    {
-        switch (strategy)
-        {
-        case AllReduceStrategyType::NCCL:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
-            break;
-        }
-        case AllReduceStrategyType::NCCL_SYMMETRIC:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
-            break;
-        }
-        case AllReduceStrategyType::MIN_LATENCY:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
-            break;
-        }
-        case AllReduceStrategyType::UB:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
-            break;
-        }
-        case AllReduceStrategyType::LOWPRECISION:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
-            break;
-        }
-        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
-        }
     }
 
     void initGroupTopology()
@@ -882,10 +851,10 @@ private:
     }
 
     AllReduceStrategyType selectImplementation(
-        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type)
+        size_t seq_len, size_t hidden_size, int world_size, nvinfer1::DataType type)
     {
-
-        if (isUsingLowPrecision(message_size))
+        auto const message_size = seq_len * hidden_size;
+        if (isUsingLowPrecision(hidden_size))
         {
             return AllReduceStrategyType::LOWPRECISION;
         }
@@ -941,37 +910,13 @@ private:
         // user should guarantee the correctness of the fusion pattern dispatching.
         if (!is_auto)
         {
-            if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = mStrategy;
-            }
-        }
-        else if (world_size <= 2)
-        {
-            strategy = AllReduceStrategyType::MIN_LATENCY;
+            strategy = mStrategy;
         }
         else
         {
-            static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
-            size_t threshold = 128;
-            if (threshold_ptr)
-            {
-                threshold = static_cast<size_t>(std::atoi(threshold_ptr));
-            }
-            // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
-            // set the threshold here to 128 tokens.
-            if (seq_len > threshold)
-            {
-                strategy = AllReduceStrategyType::NCCL;
-            }
-            else
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
+            // strategy = SelectStrategyLP(seq_len, hidden_size, world_size, mOp);
+            strategy = tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
+                seq_len, hidden_size, mOp, world_size);
         }
         return strategy;
     }
@@ -1000,6 +945,7 @@ private:
     AllReduceFusionOp mOp;
     float mEps;
     std::shared_ptr<ncclComm_t> mNcclComm;
+    static std::unordered_map<int, std::unordered_map<int, std::pair<size_t, size_t>>> m2DHeuristicThreshold;
 };
 
 } // namespace
