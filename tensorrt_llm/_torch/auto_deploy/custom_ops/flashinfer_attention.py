@@ -173,7 +173,7 @@ def prepare_flashinfer_metadata(
     _GlobalFlashInferPlanner.reset()
 
     # retrieve sanitzed metadata
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    # seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     num_seq = len(seq_len)
 
     # prepare flashinfer-style metadata
@@ -215,7 +215,7 @@ def prepare_flashinfer_metadata(
 def prepare_flashinfer_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    # seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
     return (
         qo_indptr,  # qo_indptr

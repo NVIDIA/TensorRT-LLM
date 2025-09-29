@@ -31,3 +31,8 @@ transforms:
   forward_with_cached_sequence_interface:
     stage: compile
     args_only: false # use kwargs instead of args
+  compile_model:
+    stage: compile
+    compile_backend: torch-simple
+    requires_clean_graph: false
+    requires_shape_prop: false
