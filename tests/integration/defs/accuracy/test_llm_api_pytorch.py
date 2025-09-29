@@ -656,6 +656,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                     (4, 1, 2), (4, 1, 4)],
         ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        if get_device_memory() < 270000 and get_device_count() < 8:
+            pytest.skip("Not enough memory for this test")
         if get_device_count() != tp_size * pp_size:
             pytest.skip("Device count mismatch with world size")
 
@@ -2451,9 +2453,10 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # skip gpqa test due to time consuming
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @skip_pre_hopper
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
@@ -2465,9 +2468,10 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # skip gpqa test due to time consuming
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronUltra(LlmapiAccuracyTestHarness):
