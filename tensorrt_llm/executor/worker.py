@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import time
@@ -247,6 +248,10 @@ class GenerationExecutorWorker(BaseWorker):
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
 
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self.shutdown()
+        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
+
 
 @print_traceback_on_error
 def worker_main(
@@ -408,6 +413,10 @@ def worker_main(
             if not worker_init_status_queue.notify_with_retry(error_msg):
                 logger.error("Failed to deliver error message to proxy")
         return
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
+        gc.disable()
 
     with worker:
         try:

@@ -4,7 +4,7 @@ import os
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
-from typing import Any, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import click
 import torch
@@ -108,7 +108,6 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
-    backend = backend if backend in ["pytorch", "_autodeploy"] else None
     llm_args = {
         "model":
         model,
@@ -170,13 +169,22 @@ def launch_server(host: str,
         # AutoDeploy does not support cache reuse yet.
         llm_args["kv_cache_config"].enable_block_reuse = False
         llm = AutoDeployLLM(**llm_args)
-    else:
+    elif backend == 'tensorrt' or backend == 'trt':
+        llm_args.pop("backend")
         llm = LLM(**llm_args)
+    else:
+        raise click.BadParameter(
+            f"{backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
     server = OpenAIServer(llm=llm,
                           model=model,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+        gc.disable()
 
     asyncio.run(server(host, port))
 
@@ -197,6 +205,27 @@ def launch_mm_encoder_server(
     asyncio.run(server(host, port))
 
 
+class ChoiceWithAlias(click.Choice):
+
+    def __init__(self,
+                 choices: Sequence[str],
+                 aliases: Mapping[str, str],
+                 case_sensitive: bool = True) -> None:
+        super().__init__(choices, case_sensitive)
+        self.aliases = aliases
+
+    def to_info_dict(self) -> Dict[str, Any]:
+        info_dict = super().to_info_dict()
+        info_dict["aliases"] = self.aliases
+        return info_dict
+
+    def convert(self, value: Any, param: Optional["click.Parameter"],
+                ctx: Optional["click.Context"]) -> Any:
+        if value in self.aliases:
+            value = self.aliases[value]
+        return super().convert(value, param, ctx)
+
+
 @click.command("serve")
 @click.argument("model", type=str)
 @click.option("--tokenizer",
@@ -211,11 +240,10 @@ def launch_mm_encoder_server(
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option(
     "--backend",
-    type=click.Choice(["pytorch", "trt", "_autodeploy"]),
+    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
+                         {"trt": "tensorrt"}),
     default="pytorch",
-    help=
-    "Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path."
-)
+    help="The backend to use to serve the model. Default is pytorch backend.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -494,7 +522,7 @@ def disaggregated(config_file: Optional[str],
     #   increment, and observed that `count0` (obtained by `gc.get_count()`)
     #   increases by fewer than 1,000 after every 200,000 requests, while the
     #   maximum value of `count0` exceeded 3,000,000 during the test.
-    if int(os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1")):
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))

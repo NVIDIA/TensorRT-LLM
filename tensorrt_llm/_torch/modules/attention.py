@@ -67,6 +67,16 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
     return metadata, attn_layer
 
 
+@torch.compile
+def compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@torch.compile
+def compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)
+
+
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
                          mutates_args=("output", ))
 def attn_custom_op_inplace(
@@ -1063,8 +1073,8 @@ class MLA(nn.Module):
         )
 
         k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
-        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
-                                                     self.qk_nope_head_dim)
+        compiled_copy_(k[..., :self.qk_nope_head_dim],
+                       k_nope.view(-1, self.num_heads, self.qk_nope_head_dim))
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
@@ -1122,7 +1132,7 @@ class MLA(nn.Module):
         full_k_nope = full_k_nope.view(-1, self.num_heads,
                                        self.qk_nope_head_dim)
         full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = torch.cat(
+        full_k = compiled_cat(
             (full_k_nope, full_k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         full_k = full_k.view(-1, self.num_heads * self.qk_head_dim)
 
@@ -1217,7 +1227,7 @@ class MLA(nn.Module):
             chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
                                                  self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = torch.cat(
+            chunked_k = compiled_cat(
                 (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads, -1)),
                 dim=-1)
             chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
@@ -1275,7 +1285,7 @@ class MLA(nn.Module):
 
         k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = torch.cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
+        k = compiled_cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime

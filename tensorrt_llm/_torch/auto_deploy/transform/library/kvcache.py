@@ -280,34 +280,38 @@ class ResizeKVCache(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        try:
-            # Let's run a forward pass to get the memory usage
-            cm.info.set_max_num_tokens_sample()
-            free_mem_pre, _ = _get_mem_info_in_mb()
-            self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
+        # TODO: the manual PyTorch workflow respects max_num_tokens if set and does _NOT_ resize
+        # the cache in this case. Should we do the same here?
 
-            self._run_forward(gm, cm)
+        # Let's run a forward pass to get the memory usage
+        cm.info.set_max_num_tokens_sample()
+        free_mem_pre, _ = _get_mem_info_in_mb()
+        self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-            free_mem_post, _ = _get_mem_info_in_mb()
-            self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
+        self._run_forward(gm, cm)
 
-            memory_for_forward_pass = free_mem_pre - free_mem_post
-            self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
+        free_mem_post, _ = _get_mem_info_in_mb()
+        self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
 
-            new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
-            new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+        memory_for_forward_pass = free_mem_pre - free_mem_post
+        self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
-            # Need to sync all the GPUs
-            gathered_num_pages = [None] * get_world_size()
-            all_gather_object(gathered_num_pages, new_num_pages)
-            new_num_pages = min(gathered_num_pages)
-            self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
+        new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
+        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
 
-            cm.resize_cache(new_num_pages)
-        except Exception as e:
-            ad_logger.warning(
-                f"Error encountered while resizing kv cache: {e}.\nSkipping cache resize."
-            )
+        # Need to sync all the GPUs
+        gathered_num_pages = [None] * get_world_size()
+        all_gather_object(gathered_num_pages, new_num_pages)
+        new_num_pages = min(gathered_num_pages)
+        self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
+
+        cm.resize_cache(new_num_pages)
+        # Log the final cache size for performance measurement, do not remove this log.
+        final_cache_size_bytes = cm.current_cache_size_bytes()
+        final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
+        ad_logger.info(
+            f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
+        )
 
         # Free memory
         torch.cuda.empty_cache()

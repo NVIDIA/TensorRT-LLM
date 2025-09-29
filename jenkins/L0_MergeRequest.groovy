@@ -630,6 +630,7 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
         "cpp/kernels/fmha_v2/": ["-FMHA-"],
+        "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
     ]
     for (file in changedFileList) {
         for (String key : specialFileToTagMap.keySet()) {

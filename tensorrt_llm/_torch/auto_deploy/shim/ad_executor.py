@@ -89,9 +89,6 @@ class ADEngine(ModelEngine):
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
         max_beam_width = ad_config.max_beam_width
-        ad_logger.info(
-            f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
-        )
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
@@ -309,6 +306,13 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     max_draft_len = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
     )
+    max_total_draft_tokens = 0
+    if ad_config.speculative_config is None:
+        max_total_draft_tokens = 0
+    elif hasattr(ad_config.speculative_config, "max_total_draft_tokens"):
+        max_total_draft_tokens = ad_config.speculative_config.max_total_draft_tokens
+    else:
+        max_total_draft_tokens = max_draft_len
 
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
@@ -340,16 +344,12 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require enable_mixed_sampler=True to have good outputs, see
-    # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
-    # We should expose mixed_sample to our build_and_run_ad script so we can configure this
-    # correctly for models as needed.
     sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=ad_config.max_beam_width,
-        enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
 

@@ -11,8 +11,7 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, AllReduceStrategy,
-                                             MoEAllReduce)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version
@@ -419,11 +418,12 @@ class Llama4DecoderLayer(DecoderLayer):
                 overridden_tp_size=1 if self.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
-
+            # TODO(TRTLLM-7809): Fix fusion with PP>1
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+            ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+            )
+            self.fusion_config.POST_MLP_FUSION = self.fusion_config.PRE_MLP_FUSION
+
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -437,9 +437,9 @@ class Llama4DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+            ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+            )
+            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -563,7 +563,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
@@ -649,12 +650,7 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
-        # TODO: This is a temporary fix to disable oneshot kernel for pre-Blackwell arch to avoid perf regressions
-        self.all_reduce = AllReduce(
-            strategy=model_config.allreduce_strategy
-            if get_sm_version() >= 100 else AllReduceStrategy.NCCL,
-            mapping=model_config.mapping,
-        )
+        self.all_reduce = AllReduce(mapping=model_config.mapping)
 
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
@@ -777,7 +773,8 @@ class LlamaDecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None

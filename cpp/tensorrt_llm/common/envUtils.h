@@ -66,8 +66,6 @@ std::string getEnvNixlInterface();
 
 bool getEnvDisaggLayerwise();
 
-bool getEnvDisableSelectiveCacheTransfer();
-
 bool getEnvParallelCacheSend();
 
 bool getEnvRequestKVCacheConcurrent();

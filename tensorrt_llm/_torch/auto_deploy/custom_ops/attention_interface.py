@@ -19,6 +19,7 @@ from torch.export import Dim
 from torch.fx import Node
 
 from ...._utils import nvtx_range
+from ..utils.logger import ad_logger
 
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 DynamicShapeCallback = Callable[[], DynamicShape]
@@ -122,21 +123,27 @@ class SequenceInfo:
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1
 
-        if max_num_tokens is None or max_num_tokens < 1:
-            self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
-        else:
-            self.max_num_tokens = max_num_tokens
+        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len_adjusted,
+        # we use the provided max_num_tokens. If max_num_tokens provided is more, we still use
+        # max_batch_size * max_seq_len_adjusted since the extra tokens cannot be used.
+        self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
+        if max_num_tokens is not None and max_num_tokens > 0:
+            self.max_num_tokens = min(self.max_num_tokens, max_num_tokens)
 
-        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
-        # we use the provided max_num_tokens to calculate the number of pages
-        total_tokens = min(self.max_num_tokens, self.max_batch_size * max_seq_len_adjusted)
         # Num pages can not be less than max_batch_size.
         self._num_pages = max(
             self.max_batch_size,
-            (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
+            (self.max_num_tokens) // self.page_size  # floored number of pages
+            + (self.max_num_tokens % self.page_size > 0) * self.max_batch_size,  # +1 per sequence
         )
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
+
+        # log parameters
+        ad_logger.info(
+            f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.page_size=}, "
+            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}"
+        )
 
         # indicator if extra args are activated that are needed for cached attention backends
         self._is_cached_attn = False
@@ -572,6 +579,12 @@ class SequenceInfo:
             # pin the memory on the host
             tnsr_host = torch.tensor(tnsr_like, dtype=tnsr_device.dtype, pin_memory=True)
 
+            # check for available space
+            assert tnsr_device.numel() >= tnsr_host.numel(), (
+                f"device tensor {name} is too small, available: {tnsr_device.numel()}, "
+                f"required: {tnsr_host.numel()}"
+            )
+
             # reset/copy to the device in a non-blocking fashion
             if reset:
                 tnsr_device.zero_()
@@ -632,8 +645,8 @@ class SequenceInfo:
             cache_loc, pages_per_seq = self._get_cache_locations_and_pages_per_sequence(
                 page_assignments
             )
-            self._store_arg("cache_loc", cache_loc)
-            self._store_arg("pages_per_seq", pages_per_seq)
+            self._store_arg("cache_loc", cache_loc, reset=True)
+            self._store_arg("pages_per_seq", pages_per_seq, reset=True)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it

@@ -234,7 +234,8 @@ def test_fused_moe_alltoall(alltoall_method_type):
                 dtype=dtype,
                 reduce_results=True,
                 model_config=ModelConfig(mapping=mapping,
-                                         max_num_tokens=MAX_NUM_TOKENS),
+                                         max_num_tokens=MAX_NUM_TOKENS,
+                                         moe_max_num_tokens=MAX_NUM_TOKENS),
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
@@ -884,6 +885,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
+    fused_moe.post_load_weights()
 
     def swiglu_fused_moe(x):
         x, gate = x.chunk(2, dim=-1)

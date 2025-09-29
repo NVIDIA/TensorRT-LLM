@@ -1,3 +1,4 @@
+import ast
 import copy
 import functools
 import json
@@ -191,6 +192,12 @@ class MoeConfig(StrictBaseModel):
         "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
     )
 
+    use_low_precision_moe_combine: bool = Field(
+        default=False,
+        description=
+        "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
+    )
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -356,7 +363,11 @@ class DecodingBaseConfig(StrictBaseModel):
     # When specified, speculation will be disabled at batch sizes above
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
+
     load_format: Optional[str] = None
+
+    # If set, drafting uses greedy sampling, irrespective of sampling parameters.
+    _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -439,12 +450,68 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle_choices: Optional[List[List[int]]] = None
     greedy_sampling: Optional[bool] = True
     posterior_threshold: Optional[float] = None
+    # Whether to use dynamic tree.
     use_dynamic_tree: Optional[bool] = False
+    # The topK value for each layer when enable dynamic tree.
     dynamic_tree_max_topK: Optional[int] = None
+    # The number of draft tokens in the draft tokens tree.
+    max_total_draft_tokens: Optional[int] = None
+    # The number of eagle layer. will not be used in pytorch flow, just for compatibility with TRT flow
     num_eagle_layers: Optional[int] = None
+    # The number of non-leaves in each layer.
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            if attr_name == 'max_draft_len':
+                self.num_eagle_layers = attr_value
+                self.max_total_draft_tokens = attr_value  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
+            # Convert the data type of Eagle choice from str to List[List[int]]
+            if attr_name == 'eagle_choices' and attr_value is not None:
+                logger.warning(
+                    "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                )
+                if not isinstance(attr_value, list):
+                    if isinstance(attr_value, str):
+                        attr_value = ast.literal_eval(
+                            attr_value.replace(" ", ""))
+                    else:
+                        raise ValueError(
+                            "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                        )
+            setattr(self, attr_name, attr_value)
+
+        assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+
+        # Static tree logic
+        # Checks whether the input eagle choices is valid
+        # and reset the max_draft_len and num_eagle_layers if necessary
+        if self.eagle_choices is not None:
+            # If eagle_choices is provided, use_dynamic_tree will not be used
+            assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
+
+            # Get num_eagle_layers from eagle_choices
+            num_eagle_layers_from_choices = self.check_eagle_choices()
+            if num_eagle_layers_from_choices != self.num_eagle_layers:
+                logger.warning(
+                    f"Base on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
+                )
+                self.num_eagle_layers = num_eagle_layers_from_choices
+                self.max_draft_len = num_eagle_layers_from_choices
+
+            # Each draft node has a path(choice) from the root to it.
+            # So the number of choices also represents the number of max draft nodes.
+            self.max_total_draft_tokens = len(self.eagle_choices)
+
+        # Dynamic tree logic
+        if self.use_dynamic_tree:
+            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
+            assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
+            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
+            assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -455,6 +522,25 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate(self) -> None:
         if self.speculative_model_dir is None:
             raise ValueError("Draft model must be provided for EAGLE")
+
+    def check_eagle_choices(self):
+        # 1) Check connectivity
+        unique_choices = set(
+            tuple(sub_choice)
+            for sub_choice in self.eagle_choices)  # remove repeated choices
+        self.eagle_choices = sorted([list(t) for t in unique_choices],
+                                    key=lambda x: (len(x), x))  # sort choices
+        for choice in self.eagle_choices:
+            if len(choice) > 1:
+                assert choice[
+                    0:
+                    -1] in self.eagle_choices, f"Error: choice {choice} is not connected"
+
+        # 2) Get num_eagle_layers_from_choices
+        num_eagle_layers_from_choices = max(
+            len(choice) for choice in self.eagle_choices)
+
+        return num_eagle_layers_from_choices
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -1278,7 +1364,7 @@ class BaseLlmArgs(StrictBaseModel):
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
         description="Enable LM head TP in attention dp.",
-        status="beta")
+        status="prototype")
 
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
@@ -1292,8 +1378,8 @@ class BaseLlmArgs(StrictBaseModel):
     fail_fast_on_attention_window_too_large: bool = Field(
         default=False,
         description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
-    )
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
+        status="prototype")
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
@@ -2169,17 +2255,11 @@ class TorchLlmArgs(BaseLlmArgs):
                               description="Attention backend to use.",
                               status="beta")
 
-    enable_mixed_sampler: bool = Field(
-        default=False,
-        description=
-        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
-        status="beta")
-
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
-        status="prototype")
+        status="beta")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
@@ -2285,6 +2365,7 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
+        status="prototype",
     )
 
     mm_encoder_only: bool = Field(
@@ -2539,7 +2620,8 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
-            enable_mixed_sampler=self.enable_mixed_sampler,
+            use_low_precision_moe_combine=self.moe_config.
+            use_low_precision_moe_combine,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
@@ -2619,6 +2701,22 @@ def update_llm_args_with_extra_dict(
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
+
+    # For trtllm-bench or trtllm-serve, build_config may be passed for the PyTorch
+    # backend, overwriting the knobs there since build_config always has the highest priority
+    if "build_config" in llm_args:
+        for key in [
+                "max_batch_size",
+                "max_num_tokens",
+                "max_beam_width",
+                "max_seq_len",
+        ]:
+            if key in llm_args_dict:
+                logger.info(
+                    f"Overriding {key} from build_config to {llm_args_dict[key]}"
+                )
+                setattr(llm_args["build_config"], key, llm_args_dict[key])
+
     return llm_args
 
 

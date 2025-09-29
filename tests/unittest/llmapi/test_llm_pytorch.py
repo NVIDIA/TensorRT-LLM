@@ -1,5 +1,6 @@
 import random
 from contextlib import contextmanager, nullcontext
+from typing import Optional
 
 import pytest
 
@@ -19,8 +20,9 @@ from .lora_test_utils import (
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, llm_test_harness, prompts,
-                       run_llm_abort_request,
+                       llm_get_stats_test_harness,
+                       llm_return_logprobs_test_harness, llm_test_harness,
+                       prompts, run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
@@ -226,19 +228,9 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
-@pytest.mark.parametrize(
-    "enable_mixed_sampler,enable_logprobs",
-    [
-        (False, False),  # Fast path: no mixed sampler, no logits, greedy
-        (True,
-         False),  # Batched strategy path: mixed sampler enabled, same strategy
-        (False,
-         True),  # Per-request path: mixed sampler disabled, logprobs enabled
-    ])
 @pytest.mark.part0
-def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
-                                                      enable_logprobs):
-    """Test embedding bias application in all 3 TorchSampler paths: fast, batched strategy, and per-request"""
+def test_embedding_bias_with_torch_sampler_strategies():
+    """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     vocab_size_padded = 32000
@@ -250,17 +242,17 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
         "embedding_bias": embedding_bias,
     }
 
-    if enable_logprobs:
-        sampling_kwargs["logprobs"] = 1
     # All test cases use greedy sampling for simplicity
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
-    llm_test_harness(llama_model_path,
-                     prompts, ["Z Z Z Z Z Z"],
-                     sampling_params=sampling_params,
-                     backend="pytorch",
-                     enable_mixed_sampler=enable_mixed_sampler)
+    llm_test_harness(
+        llama_model_path,
+        prompts,
+        ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        backend="pytorch",
+    )
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
@@ -869,7 +861,6 @@ def test_min_tokens(use_speculative: bool):
         max_batch_size=2,
         kv_cache_config=global_kvcache_config,
         max_num_tokens=2048,
-        enable_mixed_sampler=True,
     )
 
     if use_speculative:
@@ -892,3 +883,59 @@ def test_min_tokens(use_speculative: bool):
 
     assert len(res.outputs) == 1
     assert len(res.outputs[0].token_ids) == output_len
+
+
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
+    [
+        (2, None, True, False,
+         "pytorch"),  # prompt_logprobs with context_logits
+        (None, 1, False, False,
+         "pytorch"),  # generation logprobs only (top-1, PyTorch limit)
+        (2, None, False, False,
+         "pytorch"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "pytorch"),  # no logprobs at all
+    ])
+def test_llm_return_logprobs(prompt_logprobs: Optional[int],
+                             logprobs: Optional[int],
+                             return_context_logits: bool,
+                             return_generation_logits: bool, backend: str):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     backend=backend)
+
+
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (None, 1, False,
+         False),  # generation logprobs only (top-1, PyTorch limit)
+        (2, None, True, False),  # prompt_logprobs with context_logits
+        (2, None, False, False),  # prompt_logprobs only
+        (2, 1, False, False),  # both prompt and generation logprobs
+    ])
+def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
+                                       return_context_logits,
+                                       return_generation_logits):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     streaming=True,
+                                     backend="pytorch")
+
+
+class TestLlmError:
+
+    def test_max_num_token_check(self):
+        """ LLM should raise error when got prompt length exceed the valid range. """
+        llm = LLM(llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  max_num_tokens=100)
+
+        with pytest.raises(ValueError,
+                           match="should not exceed max_num_tokens"):
+            ids = [random.randint(10, 100) for _ in range(101)]
+            llm.generate([ids])

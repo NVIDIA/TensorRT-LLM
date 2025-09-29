@@ -73,6 +73,11 @@ def add_llm_args(parser):
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
+    parser.add_argument(
+        '--use_low_precision_moe_combine',
+        default=False,
+        action='store_true',
+        help='Use low precision combine in MoE (only for NVFP4 quantization)')
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -128,6 +133,11 @@ def add_llm_args(parser):
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
     parser.add_argument('--use_one_model', default=False, action='store_true')
+    parser.add_argument('--eagle_choices', type=str, default=None)
+    parser.add_argument('--use_dynamic_tree',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -183,7 +193,10 @@ def setup_llm(args, **kwargs):
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model_dir=args.draft_model_dir,
-            eagle3_one_model=args.use_one_model)
+            eagle3_one_model=args.use_one_model,
+            eagle_choices=args.eagle_choices,
+            use_dynamic_tree=args.use_dynamic_tree,
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -228,7 +241,7 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend),
+        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,

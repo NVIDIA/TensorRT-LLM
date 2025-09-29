@@ -9,7 +9,7 @@ involves a sequence of batched matrix multiplications, a softmax operation, and 
 as described in the [Attention Is All You Need](https://arxiv.org/abs/1706.03762) paper.
 [Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are
 variants of MHA that use fewer KV heads than the number of query heads.
-TensorRT-LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
+TensorRT LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
 The following sections explain how to use these implementations and provide a brief guide on implementing new backends.
 
 ## Attention Backends

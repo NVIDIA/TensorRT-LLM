@@ -229,6 +229,44 @@ def allgather(
     return output
 
 
+def alltoall_helix(
+    inputs: List[torch.Tensor],
+    group: List[int],
+) -> List[torch.Tensor]:
+    '''
+    Add an operation that performs a collective all-to-all across a given group.
+    The operation is implemented using a torch op that wraps a NCCL group call of a series of
+    NCCL send/recv operations to implement the all-to-all. See the following materials for details.
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/p2p.html#all-to-all,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
+    Args:
+        inputs (List[Tensor]): The input tensors.
+            Its length must be a multiple of the group size,
+            and all tensors in a group must have the same shape.
+        group (List[int]): The group of ranks to participate in the all-to-all.
+    Returns:
+        The output tensors.
+        For each group of input tensors (of size group size),
+        there is one output tensor with shape (group size, *input shape).
+    '''
+    n_ranks = len(group)
+    if n_ranks == 1:
+        return inputs
+
+    assert n_ranks > 0, "group must be non-empty"
+    assert n_ranks == len(set(group)), "group must be unique"
+
+    assert len(inputs) % n_ranks == 0,\
+        "inputs length must be a multiple of the group size"
+    num_lists = len(inputs) // n_ranks
+    for il in range(num_lists):
+        ref_input = inputs[il * n_ranks]
+        assert all([inputs[i].shape == ref_input.shape for i in range(il * n_ranks + 1, (il + 1) * n_ranks)]),\
+            "all input tensors in a group must have the same shape"
+
+    return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
+
+
 def reducescatter(
     input: Union[torch.Tensor, List[torch.Tensor]],
     mapping: Mapping,

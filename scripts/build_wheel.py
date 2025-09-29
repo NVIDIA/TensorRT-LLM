@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 import os
 import platform
 import re
+import shutil
 import sys
 import sysconfig
 import tempfile
@@ -154,7 +155,7 @@ def setup_venv(project_dir: Path, requirements_file: Path,
             warnings.warn(
                 f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
                 f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "
-                f"`build_wheel.py` can recreate the virtual environment correctly."
+                f"`build_wheel.py` can recreate a virtual environment using container-provided PyTorch installation."
             )
             print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
             input("Press Ctrl+C to stop, any key to continue...\n")
@@ -187,7 +188,7 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                     f"Incompatible NVIDIA PyTorch container detected. "
                     f"The container provides PyTorch version {version_installed}, "
                     f"but current revision requires {version_required}. "
-                    f"Please recreate your container using image specified in .devcontainer/docker-compose.yml. "
+                    f"Please recreate your container using image specified in jenkins/current_image_tags.properties. "
                     f"NOTE: Please don't try install PyTorch using pip. "
                     f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues."
                 )
@@ -239,9 +240,9 @@ def setup_conan(scripts_dir, venv_python):
     # Create default profile
     build_run(f'"{venv_conan}" profile detect -f')
 
-    # Add the tensorrt-llm remote if it doesn't exist
+    # Add the TensorRT LLM remote if it doesn't exist
     build_run(
-        f'"{venv_conan}" remote add --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
+        f'"{venv_conan}" remote add --force TensorRT-LLM https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
         stdout=DEVNULL,
         stderr=DEVNULL)
 
@@ -253,7 +254,6 @@ def generate_fmha_cu(project_dir, venv_python):
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
-    os.chdir(fmha_v2_dir)
 
     env = os.environ.copy()
     env.update({
@@ -267,19 +267,41 @@ def generate_fmha_cu(project_dir, venv_python):
         "GENERATE_CU_TRTLLM": "true"
     })
 
-    build_run("rm -rf generated")
-    build_run("rm -rf temp")
-    build_run("rm -rf obj")
-    build_run("python3 setup.py", env=env)
+    shutil.rmtree(fmha_v2_dir / "generated", ignore_errors=True)
+    shutil.rmtree(fmha_v2_dir / "temp", ignore_errors=True)
+    shutil.rmtree(fmha_v2_dir / "obj", ignore_errors=True)
+    build_run("python3 setup.py", env=env, cwd=fmha_v2_dir)
+
+    # Only touches generated source files if content is updated
+    def move_if_updated(src, dst):
+        with open(src, "rb") as f:
+            new_content = f.read()
+        try:
+            with open(dst, "rb") as f:
+                old_content = f.read()
+        except FileNotFoundError:
+            old_content = None
+
+        if old_content != new_content:
+            shutil.move(src, dst)
 
     # Copy generated header file when cu path is active and cubins are deleted.
     cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
-    build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+    move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
+                    cubin_dir / "fmha_cubin.h")
 
+    generated_files = set()
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
-        build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
+        dst_file = fmha_v2_cu_dir / os.path.basename(cu_file)
+        move_if_updated(cu_file, dst_file)
+        generated_files.add(str(dst_file.resolve()))
 
-    os.chdir(project_dir)
+    # Remove extra files
+    for root, _, files in os.walk(fmha_v2_cu_dir):
+        for file in files:
+            file_path = os.path.realpath(os.path.join(root, file))
+            if file_path not in generated_files:
+                os.remove(file_path)
 
 
 def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
@@ -606,16 +628,13 @@ def main(*,
     source_dir = get_source_dir()
 
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
-    if clean or generate_fmha:
-        build_run(f"rm -rf {fmha_v2_cu_dir}")
-        generate_fmha_cu(project_dir, venv_python)
-    elif not fmha_v2_cu_dir.exists():
+    if clean or generate_fmha or not fmha_v2_cu_dir.exists():
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --remote=TensorRT-LLM --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
