@@ -16,7 +16,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## Models
 
-* model: [Qwen3-Next-80B-A3B-Thinking](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking)
+* BF16 model: [Qwen3-Next-80B-A3B-Thinking](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking)
 
 ## Deployment Steps
 
@@ -46,9 +46,7 @@ If you want to use latest main branch, you can choose to build from source to in
 
 ### Creating the TRT-LLM Server config
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings.
-
-For low-latency with `TRTLLM` MOE backend:
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings. Note that we should set kv_cache_reuse to false. 
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
@@ -70,9 +68,7 @@ EOF
 
 ### Launch the TRT-LLM Server
 
-Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container. 
-
-Note that we currently only support pytorch backend, and kv_cache_reuse is yet to be supported. 
+Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container. Note that we currently only support pytorch backend. 
 
 ```shell
 trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
@@ -216,8 +212,8 @@ cat <<'EOF' > bench.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-concurrency_list="4 8 16"
-multi_round=3
+concurrency_list="1 2 4 8 16 32 64 128 256"
+multi_round=5
 isl=1024
 osl=1024
 result_dir=/tmp/qwen3_output
@@ -258,4 +254,38 @@ Run `bench.sh` to begin a serving benchmark. This will take a long time if you r
 
 ```shell
 ./bench.sh
+```
+
+Sample result
+
+```
+============ Serving Benchmark Result ============
+Total requests:                          12        
+Successful requests:                     12        
+Failed requests:                         0         
+Benchmark duration (s):                  91.81     
+Total input tokens:                      12288     
+Total generated tokens:                  12288     
+Request throughput (req/s):              0.13      
+Output token throughput (tok/s):         133.83    
+Total Token throughput (tok/s):          267.67    
+User throughput (tok/s):                 45.55     
+Avg Decoded Tokens per Iter:             1.00      
+---------------Time to First Token----------------
+Mean TTFT (ms):                          19226.68  
+Median TTFT (ms):                        23045.72  
+P99 TTFT (ms):                           23066.03  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.38      
+Median TPOT (ms):                        7.38      
+P99 TPOT (ms):                           7.39      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           145.20    
+Median ITL (ms):                         147.53    
+P99 ITL (ms):                            151.14    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          26777.18  
+Median E2EL (ms):                        30595.78  
+P99 E2EL (ms):                           30619.67  
+==================================================
 ```
