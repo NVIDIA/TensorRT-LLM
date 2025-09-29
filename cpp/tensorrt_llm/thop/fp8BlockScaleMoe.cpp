@@ -115,7 +115,8 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(false, "Don't support this routing method type Renormalize(Naive).");
+        TORCH_CHECK(top_k <= 8 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {

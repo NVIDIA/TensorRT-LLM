@@ -649,14 +649,13 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8), (4, 1, 1),
                                     (4, 1, 2), (4, 1, 4)],
         ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        if get_device_memory() < 270000 and get_device_count() < 8:
-            pytest.skip("Not enough memory for this test")
         if get_device_count() != tp_size * pp_size:
             pytest.skip("Device count mismatch with world size")
 
@@ -678,6 +677,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
         pytorch_config = dict(attn_backend=attn_backend,
@@ -2093,7 +2093,45 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-    @skip_pre_blackwell
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_nvfp4_multi_gpus_corner_case(self):
+        """
+        This test is used to test the corner case of the NVFP4 model.
+        When using the same value for max_seq_len and max_num_tokens, there will be no
+        enough kv block for the dummy requests in CUDA graph warmup when creating
+        the py_executor before estimating kv cache. Then CUDA graph capture will be
+        triggered when estimating kv cache. This may cause some errors.
+        More info in https://nvbugs/5485325.
+        """
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
+                                        dtype="fp8",
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(
+                                  enable_padding=True, max_batch_size=1024),
+                              moe_config=MoeConfig(backend="TRTLLM"))
+
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                 tensor_parallel_size=8,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=8,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=False,
+                 speculative_config=mtp_config,
+                 max_seq_len=5120,
+                 max_num_tokens=5120) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def test_nvfp4_multi_gpus_corner_case(self):
         """
         This test is used to test the corner case of the NVFP4 model.
@@ -2132,6 +2170,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [(8, 1, 4, 3, False, False, True, True, 1, "_DEFAULT"),
@@ -2954,6 +2993,38 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
                 kv_cache_config=kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [(8, 1, 8, True, True, True, "DEEPGEMM"),
+         (8, 1, 8, False, True, True, "DEEPGEMM"),
+         (8, 1, 8, True, True, True, "TRTLLM"),
+         (8, 1, 8, False, True, True, "TRTLLM")],
+        ids=[
+            "latency_deepgemm", "throughput_latency_deepgemm", "latency_trtllm",
+            "throughput_latency_trtllm"
+        ])
+    def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
+                              cuda_graph, overlap_scheduler, moe_backend):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-235B-A22B-FP8",
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
