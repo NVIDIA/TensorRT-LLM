@@ -236,7 +236,7 @@ class CompletionRequest(OpenAIBaseModel):
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
-    min_tokens: int = 0
+    min_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
@@ -537,7 +537,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
-    min_tokens: int = 0
+    min_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
