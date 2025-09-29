@@ -1,7 +1,3 @@
-# I want to create accuracy tests for disaggregated serving.
-# I need to to this by creating a new class that mimics LLM class. Instead of implementing the
-# actual methods it will send OAI requests to the disaggregated serving endpoint.
-# Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
 import itertools
@@ -359,12 +355,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-    def test_auto_dtype(self, disable_overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {
-            "disable_overlap_scheduler": disable_overlap_scheduler
+    @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
+    @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
+    def test_auto_dtype(self, disable_overlap_scheduler, ctx_enable_block_reuse,
+                        gen_enable_block_reuse):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "enable_block_reuse": ctx_enable_block_reuse
+            }
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config = {
+            "disable_overlap_scheduler": disable_overlap_scheduler,
+            "kv_cache_config": {
+                "enable_block_reuse": gen_enable_block_reuse
+            },
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",

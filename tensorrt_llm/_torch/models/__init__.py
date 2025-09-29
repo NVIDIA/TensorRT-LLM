@@ -26,6 +26,7 @@ from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
+from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
@@ -66,6 +67,7 @@ __all__ = [
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "Qwen3NextForCausalLM",
     "GptOssForCausalLM",
     "SeedOssForCausalLM",
 ]

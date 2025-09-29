@@ -166,7 +166,7 @@ prototype_controller = NativeGenerationController(sampling_params={
 
 llm = ScaffoldingLlm(
     prototype_controller,
-    {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
+    {NativeGenerationController.WorkerTag.GENERATION: llm_worker},
 )
 results = llm.generate(prompts)
 ```

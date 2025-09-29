@@ -303,7 +303,9 @@ class ModelLoader:
             attn_backend=self.pytorch_backend_config.attn_backend,
             moe_backend=self.pytorch_backend_config.moe_backend,
             moe_disable_finalize_fusion=self.pytorch_backend_config.
-            moe_disable_finalize_fusion)
+            moe_disable_finalize_fusion,
+            use_low_precision_moe_combine=self.pytorch_backend_config.
+            use_low_precision_moe_combine)
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)

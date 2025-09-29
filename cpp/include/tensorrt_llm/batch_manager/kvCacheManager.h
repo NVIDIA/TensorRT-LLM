@@ -41,6 +41,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
@@ -84,6 +85,32 @@ using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
+//! \brief Split vector into list of blocks of given size.
+//! \param vec vector to split
+//! \param usableSize part of the vector that is processed
+//! \param elementsPerBlock desired size of blocks
+//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
+//! \return list of blocks
+template <typename T>
+std::list<std::vector<T>> chopVectorIntoBlocks(
+    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
+{
+    TLLM_CHECK_WITH_INFO(
+        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
+    std::list<std::vector<T>> blockedVectors;
+    auto const vecEnd = vec.begin() + usableSize;
+    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
+    {
+        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
+        auto end = begin + blockSize;
+        if (blockSize == elementsPerBlock || allowPartial)
+        {
+            blockedVectors.emplace_back(begin, end);
+        }
+    }
+    return blockedVectors;
+}
+
 struct TempAttentionWindowInputs
 {
     bool pagedContextFMHA;
@@ -113,6 +140,9 @@ struct WindowSizeMetadata
             maxNumBlocks, temporaryAttentionWindow);
     }
 };
+
+std::vector<MmKey> generateBlockHashExtraKeys(
+    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
 
 struct BlockKey
 {
@@ -147,11 +177,7 @@ struct BlockKey
     {
     }
 
-    bool operator==(BlockKey const& other) const noexcept
-    {
-        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
-    }
+    bool operator==(BlockKey const& other) const noexcept;
 
     int partialMatch(BlockKey const& other) const noexcept
     {
@@ -165,6 +191,8 @@ struct BlockKey
         return numMatched;
     }
 };
+
+std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
 
 // Implement hash functor for BlockKey.
 // This allows us to use unordered_map with BlockKey as key.
@@ -577,14 +605,18 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
-    //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
-    std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
+    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Pin blocks associated with a sequence to prevent eviction.
+    void pinBlocks(GenerationRequest& sequence);
+
     //! \brief Release blocks of the sequence.
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
-    void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+    std::optional<KVCacheBlock::IdType> releaseBlocks(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -757,8 +789,11 @@ public:
     //! \brief Store blocks in cached blocks.
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
-    //! \return Number of actual blocks stored.
-    SizeType32 storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
+    //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
+    //! \return Pair of (num blocks stored for reuse, id of the last block stored if any).
+    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -785,6 +820,11 @@ public:
     {
         return mIsSWA;
     }
+
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
+
+    //! \brief Unpin blocks by starting from a block id and walking prev pointers.
+    void unpinBlocksById(KVCacheBlock::IdType blockId);
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -890,6 +930,9 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
+
+    // Mutex for the cached blocks root
+    std::mutex mCachedBlocksRootMutex;
 };
 
 class BlockManager
@@ -940,12 +983,19 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
-    std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(
-        GenerationRequest const& sequence, SizeType32 windowSize) const;
+    std::optional<KVCacheBlock::IdType> releaseBlocks(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
-    void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
+    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
+
+    /// @brief Pin all blocks associated with a sequence across all window managers.
+    /// @param sequence The generation request whose blocks should be pinned.
+    void pinBlocks(GenerationRequest& sequence);
+
+    void unpinBlocksById(KVCacheBlock::IdType blockId);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -966,10 +1016,11 @@ public:
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        SizeType32 windowSize)
+    [[nodiscard]] std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> storeBlocks(
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        SizeType32 windowSize, bool pinBlocks = false)
     {
-        mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
@@ -1001,6 +1052,15 @@ public:
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumAllocTotalBlocks(); });
+    }
+
+    [[nodiscard]] SizeType32 getFirstWindowSize() const
+    {
+        if (mWindowBlockManagers.empty())
+        {
+            return 0;
+        }
+        return mWindowBlockManagers.begin()->first;
     }
 
     [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
@@ -1131,6 +1191,12 @@ public:
     [[nodiscard]] BlockPtr const& getBlockById(KVCacheBlock::IdType blockId, SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
+    }
+
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize)
+    {
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -1274,6 +1340,10 @@ public:
     [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
         = 0;
 
+    /// @brief Pin blocks associated with a request to prevent eviction.
+    /// @param requestId The ID of the request whose blocks should be pinned.
+    virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
+
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
 
@@ -1287,8 +1357,8 @@ public:
         OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
-    virtual void removeSequence(
-        LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt)
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
+        OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false)
         = 0;
 
     virtual void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) = 0;
@@ -1332,6 +1402,11 @@ public:
     //! \details This block become reusable from next step.
     virtual void storeNewBlock(LlmRequest const& llmRequest) = 0;
 
+    /// \brief Store blocks for reuse for a given request id
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+        LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false)
+        = 0;
+
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
     [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
@@ -1342,8 +1417,8 @@ public:
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
         = 0;
 
-    [[nodiscard]] virtual std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
+    /// @brief Get the last block id (beam 0) for a given sequence and window size
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
         = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
@@ -1414,6 +1489,12 @@ public:
     [[nodiscard]] virtual SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const = 0;
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
+
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize)
+        = 0;
+
+    virtual void unpinBlocksById(KVCacheBlock::IdType blockId) = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1591,8 +1672,8 @@ public:
     void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
 
-    void removeSequence(
-        LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;
+    [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
+        OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false) override;
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;
 
@@ -1652,6 +1733,9 @@ public:
     //! \brief Store newest blocks for reuse
     void storeNewBlock(LlmRequest const& llmRequest) override;
 
+    [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
+        LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false) override;
+
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
     [[nodiscard]] SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const override;
@@ -1668,6 +1752,12 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
+    void pinBlocks(LlmRequest::RequestIdType requestId) override;
+
+    void unpinBlocksById(KVCacheBlock::IdType blockId) override;
+
+    std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
+
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.
     ///
     /// @param sequenceLength The total length of the sequence (input and output).
@@ -1683,9 +1773,6 @@ public:
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override;
-
-    std::vector<SizeType32> getNewlyAllocatedBlockIds(
-        LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
     runtime::ITensor::SharedPtr getUniquePrimaryPool() const override;
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
@@ -1704,6 +1791,12 @@ public:
     void flushIterationEvents() override
     {
         mBlockManager.flushIterationEvents();
+    }
+
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize) override
+    {
+        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
     }
 
     /// @brief Finds the maximum attention window that can be used on a sequence, given some kv-cache block capacity.

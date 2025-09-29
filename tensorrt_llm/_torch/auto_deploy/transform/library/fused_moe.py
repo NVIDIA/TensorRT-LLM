@@ -57,6 +57,12 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
 
+        # Delete the unstacked weights immediately to save GPU memory
+        # This will happen automatically after the graph is canonicalized, but for large models we'll run out of memory
+        # during the transformation itself.
+        gm.graph.eliminate_dead_code()
+        gm.delete_all_unused_submodules()
+
     return fused_key_counter
 
 

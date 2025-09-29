@@ -128,6 +128,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto indexFromEnd = session.getIndexFromEnd();
+    auto const& lastBlockKey = session.getLastBlockKey();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
@@ -138,7 +140,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     }
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd);
 
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
     bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
@@ -147,7 +149,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
-        blockRange.updatePoolIdx(poolIdx);
+        if (numPools > 1)
+        {
+            blockRange.updatePoolIdx(poolIdx);
+        }
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;
@@ -346,7 +351,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
     bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();

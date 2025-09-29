@@ -29,18 +29,23 @@ class RMSNorm(nn.Module):
     _ArgumentNotSpecifiedSentinelType: TypeAlias = EllipsisType
 
     def __init__(
-        self,
-        *,
-        hidden_size: int,
-        eps: float,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        has_weights: bool = True,
+            self,
+            *,
+            hidden_size: int,
+            eps: float,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None,
+            has_weights: bool = True,
+            use_gemma_rms_norm: bool = False,  # Assume has_weights = True
     ):
         super().__init__()
         if has_weights:
-            self.weight = nn.Parameter(
-                torch.ones(hidden_size, dtype=dtype, device=device))
+            if not use_gemma_rms_norm:
+                self.weight = nn.Parameter(
+                    torch.ones(hidden_size, dtype=dtype, device=device))
+            else:
+                self.weight = nn.Parameter(
+                    torch.zeros(hidden_size, dtype=dtype, device=device))
         else:
             self.register_buffer('weight',
                                  torch.ones(hidden_size,
@@ -48,6 +53,7 @@ class RMSNorm(nn.Module):
                                             device=device),
                                  persistent=False)
         self.variance_epsilon = eps
+        self.use_gemma_rms_norm = use_gemma_rms_norm
 
     def forward(
         self,
@@ -63,13 +69,26 @@ class RMSNorm(nn.Module):
 
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
+                                      flashinfer_gemma_fused_add_rmsnorm,
+                                      flashinfer_gemma_rmsnorm,
                                       flashinfer_rmsnorm)
             if residual is not None:
-                flashinfer_fused_add_rmsnorm(hidden_states, residual,
-                                             self.weight, self.variance_epsilon)
+                if not self.use_gemma_rms_norm:
+                    flashinfer_fused_add_rmsnorm(hidden_states, residual,
+                                                 self.weight,
+                                                 self.variance_epsilon)
+                else:
+                    flashinfer_gemma_fused_add_rmsnorm(hidden_states, residual,
+                                                       self.weight,
+                                                       self.variance_epsilon)
             else:
-                hidden_states = flashinfer_rmsnorm(hidden_states, self.weight,
-                                                   self.variance_epsilon)
+                if not self.use_gemma_rms_norm:
+                    hidden_states = flashinfer_rmsnorm(hidden_states,
+                                                       self.weight,
+                                                       self.variance_epsilon)
+                else:
+                    hidden_states = flashinfer_gemma_rmsnorm(
+                        hidden_states, self.weight, self.variance_epsilon)
         else:
             input_dtype = hidden_states.dtype
             hidden_states = hidden_states.to(torch.float32)
@@ -80,7 +99,11 @@ class RMSNorm(nn.Module):
             variance = hidden_states.pow(2).mean(-1, keepdim=True)
             hidden_states = hidden_states * torch.rsqrt(variance +
                                                         self.variance_epsilon)
-            hidden_states = self.weight * hidden_states.to(input_dtype)
+            if not self.use_gemma_rms_norm:
+                hidden_states = self.weight * hidden_states.to(input_dtype)
+            else:
+                hidden_states = (self.weight +
+                                 1) * hidden_states.to(input_dtype)
 
         if return_residual:
             return hidden_states, cast(Optional[torch.Tensor], residual)

@@ -408,6 +408,11 @@ class PerfTestConfig:
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
+        # _autodeploy backend specific parameters
+        ad_compile_backend: str = "torch-opt",
+        free_mem_ratio: float = 0.9,
+        extra_runtime: str = "trtllm",
+        skip_loading_weights: bool = False,
     ):
         # The model name.
         self.model_name = model_name
@@ -461,6 +466,11 @@ class PerfTestConfig:
         self.pp_size = pp_size
         # Number of GPUs.
         self.num_gpus = num_gpus
+        # _autodeploy backend specific parameters
+        self.ad_compile_backend = ad_compile_backend
+        self.free_mem_ratio = free_mem_ratio
+        self.extra_runtime = extra_runtime
+        self.skip_loading_weights = skip_loading_weights
         # Just build engines
         self.build_only = False
 
@@ -507,6 +517,8 @@ class PerfTestConfig:
             entries.append(f"bench")
             if self.backend == 'pytorch':
                 entries.append(f"pytorch")
+            elif self.backend == '_autodeploy':
+                entries.append(f"_autodeploy")
             if self.streaming == "streaming":
                 entries.append(f"streaming")
         elif self.runtime == "disagg_server":  # trtllm-serve
@@ -658,7 +670,8 @@ class PerfTestConfig:
             return self._load_from_str_disagg(labels)
 
         self.api = labels.pop(0) if labels[0] == "exe" else ""
-        self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
+        self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
+                                                      ] else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
         self.static_batching = labels.pop(
             0) if labels[0] == "static_batching" else ""
@@ -1354,12 +1367,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--report_json={report_path}",
             f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
         ]
-        if self._config.backend != "pytorch":
+        if self._config.backend == "pytorch":
+            benchmark_cmd += ["--backend=pytorch"]
+        elif self._config.backend == "_autodeploy":
+            benchmark_cmd += ["--backend=_autodeploy"]
+        else:
             benchmark_cmd += [
                 f"--backend=tensorrt", f"--engine_dir={engine_dir}"
             ]
-        else:
-            benchmark_cmd += ["--backend=pytorch"]
         if self._config.num_reqs > 0:
             benchmark_cmd += [f"--num_requests={self._config.num_reqs}"]
         if self._config.concurrency != -1:
@@ -1385,6 +1400,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             with open(pytorch_config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
+        elif self._config.backend == "_autodeploy":
+            import yaml
+            autodeploy_config_path = os.path.join(engine_dir,
+                                                  "extra_llm_api_options.yaml")
+            if not os.path.exists(autodeploy_config_path):
+                os.makedirs(os.path.dirname(autodeploy_config_path),
+                            exist_ok=True)
+
+            # Create _autodeploy specific configuration
+            autodeploy_config = {
+                'compile_backend': self._config.ad_compile_backend,
+                'free_mem_ratio': self._config.free_mem_ratio,
+                'runtime': self._config.extra_runtime,
+                'skip_loading_weights': self._config.skip_loading_weights
+            }
+
+            print_info(f"_autodeploy model config: {autodeploy_config}")
+            with open(autodeploy_config_path, 'w') as f:
+                yaml.dump(autodeploy_config, f, default_flow_style=False)
+            benchmark_cmd += [
+                f"--extra_llm_api_options={autodeploy_config_path}"
+            ]
         return benchmark_cmd
 
     def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,
@@ -1499,8 +1536,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             build_cmd = self.get_trtllm_build_command(engine_dir,
                                                       checkpoint_dir)
         elif self._config.runtime == "bench":
-            if self._config.backend == "pytorch":
-                # Skip building process as it is pytorch backend")
+            if self._config.backend in ["pytorch", "_autodeploy"]:
+                # Skip building process as it is pytorch or _autodeploy backend")
                 pass
             else:
                 build_cmd = self.get_trtllm_bench_build_command(engine_dir)
@@ -1561,7 +1598,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # Make sure we have outputs.
         assert cmd_idx in outputs, f"Output log for command {cmd_idx} does not exist!"
 
-        # Use the regex to go through the log from the N-th command, where N = cmd_idx.
+        # Use all applicable regex patterns to go through the log from the N-th command, where N = cmd_idx.
         print_info(
             f"Searching for metric {metric_name} from output log of command {cmd_idx} ..."
         )
@@ -1769,9 +1806,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # Build command is the first command.
         cmd_idx = 0 if self._config.runtime != "bench" else 1
         if self._config.runtime == "bench":
-            if self._config.backend == "pytorch":
+            if self._config.backend in ["pytorch", "_autodeploy"]:
                 print_info(
-                    f"Skip building process for {self._config.model_name} as it is pytorch backend"
+                    f"Skip building process for {self._config.model_name} as it is {self._config.backend} backend"
                 )
                 builder_metrics = []
             else:
