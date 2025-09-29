@@ -1,6 +1,6 @@
 """Pattern matching for detecting repeat_kv, eager, grouped attention patterns from Huggingface models."""
 
-from typing import Any, Callable, Dict, List, Literal, Tuple, Type
+from typing import Any, Callable, Dict, List, Tuple, Type
 
 import torch
 import torch.nn.functional as F
@@ -496,9 +496,7 @@ class MatchGroupedAttention(BaseTransform):
 class MatchAttentionLayoutConfig(TransformConfig):
     """Configuration for the match attention layout transform."""
 
-    attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
-        description="Attention backend to use."
-    )
+    attn_backend: str = Field(description="Attention backend to use.")
 
 
 @TransformRegistry.register("match_attention_layout")

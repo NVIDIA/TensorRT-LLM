@@ -114,9 +114,7 @@ class ADEngine(ModelEngine):
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(
-            factory=factory, config=ad_config.transforms, local_device=device
-        )
+        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
         return cls(build_and_optimize, seq_info, device, max_beam_width)

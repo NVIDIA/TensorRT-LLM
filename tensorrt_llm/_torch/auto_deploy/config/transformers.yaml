@@ -20,7 +20,6 @@ transforms:
   transformers_replace_cached_attn:
     stage: cache_init
     attn_backend: flashinfer
-    expected_layout: bsnd
   initialize_cache:
     stage: cache_init
   resize_kv_cache:

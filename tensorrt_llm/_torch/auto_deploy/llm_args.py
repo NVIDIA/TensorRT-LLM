@@ -75,12 +75,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If True, only the model architecture is loaded.",
     )
 
-    # checkpoint_device: Optional[str] = Field(
-    #     default=None,
-    #     description="Device on which to load the model checkpoint. "
-    #     "Defaults to the same device as the rest of the pipeline.",
-    # )
-
     tokenizer: Optional[PathLike] = Field(
         description="The tokenizer",
         default=None,
@@ -165,6 +159,12 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
         if self.transforms.get("insert_cached_attention", {}).get("attn_backend") in [
+            "triton",
+            "torch",
+        ]:
+            self.attn_page_size = self.max_seq_len
+        # NOTE: (hg) For transformers mode. This is ugly.
+        if self.transforms.get("transformers_replace_cached_attn", {}).get("attn_backend") in [
             "triton",
             "torch",
         ]:

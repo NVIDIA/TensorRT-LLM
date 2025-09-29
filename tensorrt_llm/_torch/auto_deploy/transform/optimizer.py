@@ -22,7 +22,7 @@ from .interface import (
 
 
 class InferenceOptimizer:
-    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig, local_device: str):
+    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig):
         self.factory = factory
         self.config = self._clean_config(config)
         if not dist.is_initialized():
@@ -30,7 +30,9 @@ class InferenceOptimizer:
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
         self.shared_config = SharedConfig(
-            local_rank=local_rank, world_size=world_size, local_device=local_device
+            local_rank=local_rank,
+            world_size=world_size,
+            # local_device=local_device
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:

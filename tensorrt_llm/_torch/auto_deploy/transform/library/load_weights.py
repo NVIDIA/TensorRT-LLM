@@ -45,9 +45,9 @@ class LoadWeightsToDevice(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         factory.load_or_random_init(
             gm,
-            device=self.config.checkpoint_device or shared_config.local_device,
+            device=self.config.checkpoint_device or cm.device,
         )
-        move_to_device(gm, shared_config.local_device)
+        move_to_device(gm, cm.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
@@ -65,7 +65,9 @@ class LoadFactoryModelWeights(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        cm.to(shared_config.local_device)
+        # TODO (hg) This is weird but equivalent to previous code.
+        # We does not seems to need this transform.
+        cm.to(cm.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 

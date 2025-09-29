@@ -224,7 +224,7 @@ class ResizeKVCacheConfig(TransformConfig):
     """Configuration for the resize kv cache transform."""
 
     free_mem_ratio: float = Field(
-        description="The fraction of available memory to occupy.", default=0.8
+        default=0.8, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
     )
     args_only: bool = Field(
         description="Use ``*cm.args`` (default) or use ``**cm.named_args`` for the forward pass.",

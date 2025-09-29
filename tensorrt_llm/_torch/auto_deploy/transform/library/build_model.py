@@ -85,7 +85,7 @@ class BuildAndLoadFactoryModel(BuildModel):
         assert isinstance(factory, hf.AutoModelFactory), "Only HF models are supported."
 
         # build and load the model
-        model = factory.build_and_load_model(shared_config.local_device)
+        model = factory.build_and_load_model(cm.device)
 
         assert not self.config.use_strict_forward, "Only regular forward is supported."
 

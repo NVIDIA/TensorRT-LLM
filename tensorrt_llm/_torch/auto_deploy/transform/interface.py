@@ -55,7 +55,7 @@ class SharedConfig(BaseModel):
     sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    local_device: str = Field(description="Current rank device.")
+    # local_device: str = Field(description="Current rank device.")
 
 
 class TransformConfig(BaseModel):

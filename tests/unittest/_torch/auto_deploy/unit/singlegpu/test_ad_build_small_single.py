@@ -7,7 +7,7 @@ from _model_test_utils import get_small_model_config_pytest_param
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
-from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
@@ -43,7 +43,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
 
 @pytest.mark.parametrize("mode", ["graph", "transformers"])
 @pytest.mark.parametrize(
-    "experiment_config",
+    "experiment_config, attn_backend, compile_backend",
     [
         get_small_model_config_pytest_param(
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -96,7 +96,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         ),
     ],
 )
-def test_build_ad(experiment_config: Dict, mode: str):
+def test_build_ad(experiment_config: Dict, attn_backend: str, compile_backend: str, mode: str):
     if (
         "DeepSeek-V3" in experiment_config["args"]["model"]
         or "Phi-3-mini-4k-instruct" in experiment_config["args"]["model"]
@@ -107,18 +107,47 @@ def test_build_ad(experiment_config: Dict, mode: str):
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
     experiment_config["args"]["mode"] = mode
+    experiment_config["args"]["transforms"] = (
+        {
+            "resize_kv_cache": {
+                "stage": "cache_init",
+                "free_mem_ratio": 0.00,
+            },
+            "match_attention_layout": {
+                "stage": "pattern_matcher",
+                "attn_backend": attn_backend,
+            },
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "attn_backend": attn_backend,
+            },
+            "compile_model": {
+                "stage": "compile",
+                "compile_backend": compile_backend,
+            },
+        }
+        if mode == "graph"
+        else {
+            "transformers_replace_cached_attn": {
+                "stage": "cache_init",
+                "attn_backend": attn_backend,
+            },
+        }
+    )
+    print(f"Experiment Config: {experiment_config}")
     experiment_config = ExperimentConfig(**experiment_config)
-    original_init = InferenceOptimizer.__init__
+    original_build_from_config = ADEngine.build_from_config
 
-    def check_and_original_init(self, factory, ad_config):
+    @classmethod
+    def check_and_original_build(cls, ad_config):
         _check_ad_config(experiment_config, ad_config)
-        return original_init(self, factory, ad_config=ad_config)
+        return original_build_from_config.__func__(cls, ad_config)
 
-    # Temporarily replace the __init__ method
-    InferenceOptimizer.__init__ = check_and_original_init
+    # Temporarily replace the build_from_config classmethod
+    ADEngine.build_from_config = check_and_original_build
 
     try:
         main(experiment_config)
     finally:
-        # Restore original __init__
-        InferenceOptimizer.__init__ = original_init
+        # Restore original build_from_config
+        ADEngine.build_from_config = original_build_from_config

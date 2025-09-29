@@ -440,7 +440,7 @@ _SMALL_MODEL_CONFIGS = {
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
         "llm_models_subdir": "Mistral-Small-3.1-24B-Instruct-2503",
         "model_factory": "Mistral3VLM",
-        "compile_backend": "torch-simple",
+        # "compile_backend": "torch-simple",
         "model_kwargs": {
             "text_config": {"num_hidden_layers": 2},
             "vision_config": {"num_hidden_layers": 2},
@@ -473,10 +473,8 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
     # add some defaults to llm_args
     llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
-    llm_args["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
     llm_args["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
-
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
 
@@ -494,10 +492,16 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
 
 def get_small_model_config_pytest_param(
-    model_hub_id: str, pytest_param_kwargs=None, **llm_args_kwargs
+    model_hub_id: str,
+    attn_backend: str,
+    compile_backend: str,
+    pytest_param_kwargs=None,
+    **llm_args_kwargs,
 ):
     return pytest.param(
         get_small_model_config(model_hub_id, **llm_args_kwargs),
+        attn_backend,
+        compile_backend,
         id=model_hub_id,
         **(pytest_param_kwargs or {}),
     )

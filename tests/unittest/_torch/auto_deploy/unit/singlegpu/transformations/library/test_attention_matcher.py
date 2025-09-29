@@ -7,7 +7,10 @@ from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionDescriptor,
+    AttentionRegistry,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -1180,6 +1183,7 @@ def test_match_attention_layout(layout, model_config, has_mask):
     else:
         source_op = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
     MockAttentionDescriptor.source_attention_op = source_op
+    AttentionRegistry._attention_registry["mock"] = MockAttentionDescriptor
 
     # Create appropriate model based on model_config
     if model_config["type"] == "standard":
@@ -1325,7 +1329,7 @@ def test_match_attention_layout(layout, model_config, has_mask):
             {
                 "match_attention_layout": {
                     "stage": "pattern_matcher",
-                    "attention_op": MockAttentionDescriptor,
+                    "attn_backend": "mock",
                 },
             },
         )(None, gm),
