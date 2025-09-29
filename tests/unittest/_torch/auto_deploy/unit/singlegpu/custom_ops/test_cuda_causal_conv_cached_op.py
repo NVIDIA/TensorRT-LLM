@@ -97,7 +97,6 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     )
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5548861")
 def test_context_flattened_and_state_writeback_cuda(conv_env):
     device = conv_env["device"]
     dtype = conv_env["dtype"]

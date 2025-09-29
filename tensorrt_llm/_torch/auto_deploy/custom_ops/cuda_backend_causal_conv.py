@@ -186,6 +186,12 @@ def _cuda_cached_causal_conv1d(
         # Use true start offsets for decode tokens (tail after prefills)
         decode_idx = seq_start[num_prefill:].to(torch.long)
         x_decode = inp_flat.index_select(0, decode_idx)  # [num_decode, C_in]
+        slot_idx_decode = slot_idx[num_prefill:].to(torch.long)
+        # Only zero-initialize decode cache rows in the mixed/context path.
+        # For generate-only (s == 1), caches must carry prior state.
+        if num_prefill > 0 and slot_idx_decode.numel() > 0:
+            zero_rows = torch.zeros_like(conv_state_cache.index_select(0, slot_idx_decode))
+            conv_state_cache.index_copy_(0, slot_idx_decode, zero_rows)
 
         y_dec = causal_conv1d_update(
             x_decode,  # [batch, dim]
@@ -194,7 +200,7 @@ def _cuda_cached_causal_conv1d(
             bias,
             activation=None,
             cache_seqlens=None,
-            conv_state_indices=slot_idx[num_prefill:].to(torch.int32),
+            conv_state_indices=slot_idx_decode.to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
         )
 
