@@ -5,8 +5,8 @@ import threading
 from typing import List, Optional, Tuple, Union
 
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
@@ -33,20 +33,25 @@ _thread_local = threading.local()
 _enable_debug = os.environ.get("_FLASHINFER_DEBUG", "0") == "1"
 
 
-def get_flashinfer_allreduce_workspace(mapping: Mapping, max_num_tokens: int, hidden_dim: int):
-    if not hasattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}', {})
-    
-    flashinfer_allreduce_workspaces = getattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}')
+def get_flashinfer_allreduce_workspace(mapping: Mapping, max_num_tokens: int,
+                                       hidden_dim: int):
+    if not hasattr(_thread_local,
+                   f'flashinfer_allreduce_workspaces_{mapping.pp_rank}'):
+        setattr(_thread_local,
+                f'flashinfer_allreduce_workspaces_{mapping.pp_rank}', {})
+
+    flashinfer_allreduce_workspaces = getattr(
+        _thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}')
 
     if mapping not in flashinfer_allreduce_workspaces:
-        flashinfer_allreduce_workspaces[mapping] = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
-            rank=mapping.rank,
-            tp_size=mapping.tp_size,
-            max_token_num=max_num_tokens,
-            hidden_dim=hidden_dim,
-            group=dist.group.WORLD,
-        )
+        flashinfer_allreduce_workspaces[
+            mapping] = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
+                rank=mapping.rank,
+                tp_size=mapping.tp_size,
+                max_token_num=max_num_tokens,
+                hidden_dim=hidden_dim,
+                group=dist.group.WORLD,
+            )
         if _enable_debug:
             print(
                 f"FlashInferAllReduce.init: {mapping.rank} {mapping.tp_size} {max_num_tokens} {hidden_dim}"
@@ -743,8 +748,10 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
 
+
 _RANK_DIST_INITIALIZED = False
 _GLOBAL_FLAG_VALUE = 1
+
 
 class FlashInferAllReduce(nn.Module):
 
@@ -755,49 +762,41 @@ class FlashInferAllReduce(nn.Module):
         global _RANK_DIST_INITIALIZED
 
         self.mapping = mapping
-        # self.max_message_size = 70 * 1024 * 1024  # 70MB
         self.dtype = dtype
-        self.hidden_dim = 8192
+        self.hidden_dim = hidden_dim  # Use the passed parameter instead of hardcoded value
         self.strategy = strategy
 
         if not _RANK_DIST_INITIALIZED:
             TorchDist(mapping)
             _RANK_DIST_INITIALIZED = True
 
-        # flashinfer all reduce is better for message sizes < ~70MB
-        # num tokens * hidden dim * 2 < 70 *1024*1024
-        # TODO: 2 is for bf16,fp16. need to add fp8, fp4
-        self.max_num_tokens = 8192 #self.max_message_size // (self.hidden_dim * 2)
+        self.max_num_tokens = 8192
 
-        self.workspace = get_flashinfer_allreduce_workspace(self.mapping, self.max_num_tokens, self.hidden_dim)
+        self.workspace = get_flashinfer_allreduce_workspace(
+            self.mapping, self.max_num_tokens, self.hidden_dim)
 
         self.all_reduce_params = FlashInferAllReduceParams(
-            strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
+            strategy=
+            strategy,  # Use the passed strategy instead of hardcoded TWOSHOT
             fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
-            config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
+            # config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
         )
 
         # each linear layer will have its own pointers to the workspace.
         # The workspace is common
         # Can we use common pointers?
-        self.peer_comm_buffer_ptrs = torch.tensor(
-            self.workspace[0], dtype=torch.int64
-        )
-        self.peer_barrier_ptrs_in = torch.tensor(
-            self.workspace[2], dtype=torch.int64
-        )
-        self.peer_barrier_ptrs_out = torch.tensor(
-            self.workspace[3], dtype=torch.int64
-        )
-        self.lamport_peer_comm_buffer_ptrs_0 = torch.tensor(
-            self.workspace[4], dtype=torch.int64
-        )
-        self.lamport_peer_comm_buffer_ptrs_1 = torch.tensor(
-            self.workspace[5], dtype=torch.int64
-        )
-        self.lamport_peer_comm_buffer_ptrs_2 = torch.tensor(
-            self.workspace[6], dtype=torch.int64
-        )
+        self.peer_comm_buffer_ptrs = torch.tensor(self.workspace[0],
+                                                  dtype=torch.int64)
+        self.peer_barrier_ptrs_in = torch.tensor(self.workspace[2],
+                                                 dtype=torch.int64)
+        self.peer_barrier_ptrs_out = torch.tensor(self.workspace[3],
+                                                  dtype=torch.int64)
+        self.lamport_peer_comm_buffer_ptrs_0 = torch.tensor(self.workspace[4],
+                                                            dtype=torch.int64)
+        self.lamport_peer_comm_buffer_ptrs_1 = torch.tensor(self.workspace[5],
+                                                            dtype=torch.int64)
+        self.lamport_peer_comm_buffer_ptrs_2 = torch.tensor(self.workspace[6],
+                                                            dtype=torch.int64)
 
     def forward(
         self,
@@ -811,46 +810,171 @@ class FlashInferAllReduce(nn.Module):
         num_token = input.size(0)
         hidden_dim = input.size(1)
 
-        output_buffer = torch.empty_like(input)
-        if _enable_debug:
-            print(
-                f"FlashInferAllReduce.forward: {num_token} {hidden_dim}"
+        # Validate input dimensions
+        if hidden_dim != self.hidden_dim:
+            logger.warning(
+                f"Input hidden_dim {hidden_dim} doesn't match expected {self.hidden_dim}"
             )
 
-        # if all_reduce_params is None:
-        #     all_reduce_params = FlashInferAllReduceParams(
-        #         strategy=self.strategy,
-        #         fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
-        #         config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
-        #     )
+        if num_token > self.max_num_tokens:
+            logger.warning(
+                f"Input num_token {num_token} exceeds max_num_tokens {self.max_num_tokens}"
+            )
 
-        flashinfer_comm.trtllm_custom_all_reduce(
-            inp=input,
-            out=output_buffer,
-            tp_size=self.mapping.tp_size,
-            tp_rank=self.mapping.rank,
-            token_num=num_token,
-            fusion_op_code=self.all_reduce_params.fusion_op,
-            strategy_code=self.all_reduce_params.strategy,
-            config_code=self.all_reduce_params.config_mode,
-            launch_with_pdl=False,
-            flag_value=_GLOBAL_FLAG_VALUE,
-            peer_comm_buffer_ptrs=self.peer_comm_buffer_ptrs,
-            peer_barrier_ptrs_in=self.peer_barrier_ptrs_in,
-            peer_barrier_ptrs_out=self.peer_barrier_ptrs_out,
-            bias=None,
-            residual=None,
-            weight=None,
-            weight_pre_residual_norm=None,
-            eps=None,
-            intermediate_buffer=None,
-            lamport_peer_comm_buffer_ptrs_0=None,
-            lamport_peer_comm_buffer_ptrs_1=None,
-            lamport_peer_comm_buffer_ptrs_2=None,
-            # lamport_peer_comm_buffer_ptrs_0=self.lamport_peer_comm_buffer_ptrs_0,
-            # lamport_peer_comm_buffer_ptrs_1=self.lamport_peer_comm_buffer_ptrs_1,
-            # lamport_peer_comm_buffer_ptrs_2=self.lamport_peer_comm_buffer_ptrs_2,
-        )
+        output_buffer = torch.empty_like(input)
+        if _enable_debug:
+            print(f"FlashInferAllReduce.forward: {num_token} {hidden_dim}")
+
+        # Use provided params or default
+        if all_reduce_params is None:
+            all_reduce_params = self.all_reduce_params
+
+        # Validate required parameters
+        if not hasattr(all_reduce_params,
+                       'fusion_op') or all_reduce_params.fusion_op is None:
+            logger.warning("fusion_op is None, using NONE as default")
+            all_reduce_params.fusion_op = flashinfer_comm.AllReduceFusionOp.NONE
+
+        if not hasattr(all_reduce_params,
+                       'strategy') or all_reduce_params.strategy is None:
+            logger.warning("strategy is None, using TWOSHOT as default")
+            all_reduce_params.strategy = flashinfer_comm.AllReduceStrategyType.TWOSHOT
+
+        if not hasattr(all_reduce_params,
+                       'config_mode') or all_reduce_params.config_mode is None:
+            logger.warning("config_mode is None, using USE_MEMCPY as default")
+            all_reduce_params.config_mode = flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY
+
+        try:
+            flashinfer_comm.trtllm_custom_all_reduce(
+                inp=input,
+                out=output_buffer,
+                tp_size=self.mapping.tp_size,
+                tp_rank=self.mapping.rank,
+                token_num=num_token,
+                fusion_op_code=all_reduce_params.fusion_op,
+                strategy_code=all_reduce_params.strategy,
+                config_code=all_reduce_params.config_mode,
+                launch_with_pdl=False,
+                flag_value=_GLOBAL_FLAG_VALUE,
+                peer_comm_buffer_ptrs=self.peer_comm_buffer_ptrs,
+                peer_barrier_ptrs_in=self.peer_barrier_ptrs_in,
+                peer_barrier_ptrs_out=self.peer_barrier_ptrs_out,
+                bias=all_reduce_params.bias,
+                residual=all_reduce_params.residual,
+                weight=all_reduce_params.norm_weight,
+                weight_pre_residual_norm=all_reduce_params.
+                norm_pre_residual_weight,
+                eps=all_reduce_params.eps,
+                intermediate_buffer=None,
+                # Enable Lamport communication buffers for better synchronization
+                lamport_peer_comm_buffer_ptrs_0=self.
+                lamport_peer_comm_buffer_ptrs_0,
+                lamport_peer_comm_buffer_ptrs_1=self.
+                lamport_peer_comm_buffer_ptrs_1,
+                lamport_peer_comm_buffer_ptrs_2=self.
+                lamport_peer_comm_buffer_ptrs_2,
+            )
+        except Exception as e:
+            logger.error(f"FlashInferAllReduce failed: {e}")
+            raise
+
         _GLOBAL_FLAG_VALUE += 1
 
         return output_buffer
+
+
+class FlashInferVLLMAllReduce(nn.Module):
+
+    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+        super().__init__()
+        global _RANK_DIST_INITIALIZED
+
+        self.mapping = mapping
+        self.dtype = dtype
+
+        if not _RANK_DIST_INITIALIZED:
+            TorchDist(mapping)
+            _RANK_DIST_INITIALIZED = True
+
+        # Create IPC workspace for vLLM allreduce
+        max_size = 8192 * 8192 * 2  # 2 bytes for bfloat16
+        self.meta_ptrs = flashinfer_comm.create_shared_buffer(
+            flashinfer_comm.vllm_meta_size() + max_size, dist.group.WORLD)
+
+        # Create rank data buffer (8MB as in test)
+        self.rank_data = torch.empty(8 * 1024 * 1024,
+                                     dtype=torch.uint8,
+                                     device=f"cuda:{mapping.local_rank}")
+
+        # Create buffer pointers for IPC communication
+        self.buffer_ptrs = flashinfer_comm.create_shared_buffer(
+            max_size, dist.group.WORLD)
+
+        # Initialize custom allreduce
+        self.fa = flashinfer_comm.vllm_init_custom_ar(
+            ipc_tensors=self.meta_ptrs,
+            rank_data=self.rank_data,
+            rank=mapping.rank,
+            full_nvlink=True)
+
+        # Register buffer - this is crucial!
+        flashinfer_comm.vllm_register_buffer(self.fa, self.buffer_ptrs)
+
+        # Create registration buffer for allreduce operations
+        self.reg_buffer_size = max_size
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: Optional[FlashInferAllReduceParams] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for vLLM custom AllReduce.
+
+        Args:
+            input (torch.Tensor): Input tensor to be reduced
+            all_reduce_params (Optional[FlashInferAllReduceParams]): Parameters for fused operations
+
+        Returns:
+            torch.Tensor: Reduced tensor
+        """
+        input_tensor = input.contiguous()
+        output_tensor = torch.empty_like(input_tensor)
+
+        try:
+            # Perform vLLM custom allreduce
+            flashinfer_comm.vllm_all_reduce(
+                self.fa,
+                input_tensor,
+                output_tensor,
+                self.buffer_ptrs[self.mapping.rank],
+                self.reg_buffer_size,
+                36,  # CTA upper bounds: 36 as mentioned in the API
+            )
+        except Exception as e:
+            logger.error(f"FlashInferVLLMAllReduce failed: {e}")
+            raise
+
+        return output_tensor
+
+    def destroy(self):
+        """Clean up vLLM resources"""
+        try:
+            # Clean up vLLM resources
+            flashinfer_comm.vllm_dispose(self.fa)
+
+            # Free shared buffers
+            flashinfer_comm.free_shared_buffer(self.buffer_ptrs,
+                                               dist.group.WORLD)
+            flashinfer_comm.free_shared_buffer(self.meta_ptrs, dist.group.WORLD)
+        except Exception as e:
+            logger.error(f"Error during FlashInferVLLMAllReduce cleanup: {e}")
+
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        try:
+            self.destroy()
+        except:
+            pass
