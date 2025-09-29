@@ -75,13 +75,17 @@ class SiglipVisionModel(nn.Module):
         self.vision_model = SiglipVisionTransformer(
             model_config, use_post_layernorm=use_post_layernorm)
         self.model_config = model_config
+
+        # Needed for prepare_attn_metadata
+        self.image_size = self.config.image_size
+        self.patch_size = self.config.patch_size
+
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
         self.attn_metadata = self.metadata_cls(
             max_num_requests=
             8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
-            max_num_tokens=
-            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_tokens
+            max_num_tokens=model_config.max_num_tokens,
             kv_cache_manager=None,
         )
 
@@ -90,7 +94,7 @@ class SiglipVisionModel(nn.Module):
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
         """
-        seq_len = (self.config.image_size // self.config.patch_size)**2
+        seq_len = (self.image_size // self.patch_size)**2
         request_ids = list(range(1, batch_size + 1))
         prompt_lens = [seq_len] * batch_size
         seq_lens = torch.tensor([seq_len] * batch_size,

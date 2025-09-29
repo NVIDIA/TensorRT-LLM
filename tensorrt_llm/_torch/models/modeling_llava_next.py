@@ -422,11 +422,10 @@ class LlavaNextVisionModel(nn.Module):
     ):
         """
         Pads images on the `num_of_patches` dimension with zeros to form a batch of same number of patches.
-        Optimized for CUDA tensors using torch.nn.functional.pad.
 
         Args:
             pixel_values (`list[torch.Tensor]`):
-                A list of pixel value tensors, each of shape (`batch`, `num_patches`, `height`, `width`, `channels`)
+                A list of pixel value tensors, each of shape (`batch`, `num_patches`, `channels`, `height`, `width`)
 
         Returns:
             list[`torch.Tensor`]: The padded image tensors.
@@ -437,22 +436,16 @@ class LlavaNextVisionModel(nn.Module):
         # Find max patches across all images
         max_patches = max(tensor.shape[1] for tensor in pixel_values)
 
-        # Pad each tensor efficiently using torch.nn.functional.pad
+        # Pad each tensor by concatenating zeros on dim=1 (num_patches)
         padded_values = []
 
         for pixel_value in pixel_values:
             current_patches = pixel_value.shape[1]
             if current_patches < max_patches:
-                # Pad the second dimension (num_patches at index 1)
-                # torch.nn.functional.pad expects padding in reverse order of dimensions
-                # For shape (batch, num_patches, height, width, channels), we pad the second dim:
-                # padding format: (channels_before, channels_after, width_before, width_after, height_before, height_after, patches_before, patches_after, batch_before, batch_after)
-                padding = (0, 0, 0, 0, 0, 0, 0, max_patches - current_patches,
-                           0, 0)
-                padded_pixel_value = F.pad(pixel_value,
-                                           padding,
-                                           mode='constant',
-                                           value=0.0)
+                pad_len = max_patches - current_patches
+                zeros = pixel_value.new_zeros(
+                    (pixel_value.shape[0], pad_len, *pixel_value.shape[2:]))
+                padded_pixel_value = torch.cat([pixel_value, zeros], dim=1)
             else:
                 padded_pixel_value = pixel_value
 

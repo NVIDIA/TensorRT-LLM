@@ -9,9 +9,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from PIL import Image
-from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
-                          PretrainedConfig, PreTrainedModel)
-from transformers.modeling_utils import load_sharded_checkpoint
+from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
+                          PreTrainedModel)
 from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -588,6 +587,7 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         self.tllm_multimodal_token_id = self.pretrained_config.language_config[
             "vocab_size"] + 1
         self.vision_query_lengths = None
+        self._vision_query_generator = None
 
     def get_vocab_size(self):
         return self.pretrained_config.language_config["vocab_size"]
@@ -597,10 +597,55 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         image: Image.Image,
         **kwargs,
     ):
-        return self.vision_query_lengths[0].pop(0)
+        """
+        Get the number of tokens per image.
+
+        This method must be called after __call__ is executed.
+        Uses a generator pattern to safely iterate through vision_query_lengths.
+
+        Args:
+            image: PIL Image to get token count for
+            **kwargs: Additional arguments for processor (unused)
+
+        Returns:
+            int: Number of tokens for the image
+
+        Raises:
+            RuntimeError: If called before __call__ is executed
+            IndexError: If called more times than there are images
+        """
+        if self.vision_query_lengths is None:
+            raise RuntimeError(
+                "get_num_tokens_per_image() must be called after __call__() is executed. "
+                "vision_query_lengths is not available.")
+
+        # Initialize generator if not already done
+        if self._vision_query_generator is None:
+            self._vision_query_generator = self._create_vision_query_generator()
+
+        try:
+            return next(self._vision_query_generator)
+        except StopIteration:
+            raise IndexError(
+                "get_num_tokens_per_image() called more times than the number of images processed. "
+                "No more vision query lengths available.")
 
     def get_mm_token_ids(self):
         return torch.tensor([self.tllm_multimodal_token_id])
+
+    def _create_vision_query_generator(self):
+        """Create a generator that yields vision query lengths for each image."""
+        if self.vision_query_lengths is None:
+            return
+
+        # Flatten all vision query lengths from all batches
+        for batch_vision_queries in self.vision_query_lengths:
+            for query_length in batch_vision_queries:
+                yield query_length
+
+    def _reset_vision_query_generator(self):
+        """Reset the vision query generator."""
+        self._vision_query_generator = None
 
     def _post_process(self,
                       input_ids: torch.Tensor,
@@ -677,6 +722,8 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             )
             self.vision_query_lengths = preprocessed_image.get(
                 "vision_query_lengths", None)
+            # Reset generator when new vision_query_lengths are available
+            self._reset_vision_query_generator()
 
         input_ids = self.tokenizer.encode(text_prompt,
                                           add_special_tokens=False,
@@ -726,97 +773,70 @@ class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         }
 
 
-class HCXVisionModel:
+@register_auto_model("HCXVisionModel")
+class HCXVisionModel(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-
+        super().__init__()
+        self.model_config = model_config
         self.pretrained_config = model_config.pretrained_config
-        self.vision_config = self.pretrained_config.vision_config
-
-        model_path = self.pretrained_config._name_or_path
-        # TODO: use config.mapping.get_local_rank() instead
-        self.device = f"cuda:{torch.cuda.current_device()}"
-
-        hf_model_config = AutoConfig.from_pretrained(model_path,
-                                                     trust_remote_code=True)
-        vision_model_type = hf_model_config.vision_config["model_type"]
-        vision_config = CONFIG_MAPPING[vision_model_type](
-            **hf_model_config.vision_config)
-        self.dtype = vision_config.torch_dtype
-        module_dict = nn.ModuleDict({
-            "vision_model":
-            AutoModel.from_config(vision_config, trust_remote_code=True),
-            "mm_projector":
-            HCXVisionCAbstractor(
-                num_queries=hf_model_config.num_queries_vis_abstractor,
-                num_input_tokens=(vision_config.image_size //
-                                  vision_config.patch_size)**2,
-                encoder_hidden_size=vision_config.hidden_size,
-                hidden_size=vision_config.hidden_size,
-                output_hidden_size=hf_model_config.
-                language_config["hidden_size"],
-                pos_emb=hf_model_config.proj_pos_emb,
-                prenorm=hf_model_config.proj_prenorm,
-            ),
-        })
-
-        module_dict.register_parameter(
-            "image_newline",
-            nn.Parameter(
-                torch.empty(hf_model_config.language_config["hidden_size"])))
-
-        missing_keys, _ = load_sharded_checkpoint(module_dict,
-                                                  model_path,
-                                                  strict=False)
-        assert len(missing_keys) == 0, f"Missing keys: {missing_keys}"
-        hf_vision_model = module_dict["vision_model"].to(self.dtype)
-        hf_mm_projector = module_dict["mm_projector"].to(self.dtype).to(
-            self.device)
-        hf_image_newline = module_dict.image_newline.to(self.dtype).to(
-            self.device)
-
-        vision_model_config = ModelConfig(pretrained_config=vision_config,
-                                          attn_backend="TRTLLM")
-
-        # Model related lines
-        self.vision_model = SiglipVisionModel(vision_model_config).to(
-            self.device).to(self.dtype)
-        self.vision_model.load_weights(hf_vision_model.state_dict())
-        self.mm_projector = hf_mm_projector.eval()
-        self.image_newline = hf_image_newline
+        siglip_model_config = copy.deepcopy(self.model_config)
+        siglip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
+        self.visual_token_idx = 0 if "siglip" in self.model_config.pretrained_config.vision_config.model_type else 1
+        self.dtype = self.model_config.pretrained_config.vision_config.torch_dtype
+        self.vision_model = SiglipVisionModel(siglip_model_config).to(
+            self.dtype)
+        self.mm_projector = HCXVisionCAbstractor(
+            num_queries=self.pretrained_config.num_queries_vis_abstractor,
+            num_input_tokens=(
+                self.pretrained_config.vision_config.image_size //
+                self.pretrained_config.vision_config.patch_size)**2,
+            encoder_hidden_size=self.pretrained_config.vision_config.
+            hidden_size,
+            hidden_size=self.pretrained_config.vision_config.hidden_size,
+            output_hidden_size=self.pretrained_config.hidden_size,
+            pos_emb=self.pretrained_config.proj_pos_emb,
+            prenorm=self.pretrained_config.proj_prenorm,
+        ).to(self.dtype)
+        self.image_newline = nn.Parameter(torch.empty(
+            self.pretrained_config.hidden_size, ),
+                                          requires_grad=False).to(self.dtype)
 
         self.unpad = self.pretrained_config.unpad
         self.use_nth_layer = self.pretrained_config.use_nth_layer
         self.anyres = self.pretrained_config.anyres
-        self.possible_resolutions = self._init_possible_resolutions(
-            self.pretrained_config)
+        self.possible_resolutions = self._init_possible_resolutions()
+        self.post_config()
 
-    def _init_possible_resolutions(self, config: PretrainedConfig):
+    def post_config(self):
+        self.config = self.vision_model.config
+        self.model_config.pretrained_config = self.vision_model.config
+
+    def _init_possible_resolutions(self):
         possible_resolutions = []
-        if config.anyres:
-            assert config.max_num_grids > 0
-            for i in range(1, config.max_num_grids + 1):
-                for j in range(1, config.max_num_grids + 1):
-                    if i == 1 and j == 1 and not config.use_1x1_grid:
+        if self.pretrained_config.anyres:
+            assert self.pretrained_config.max_num_grids > 0
+            for i in range(1, self.pretrained_config.max_num_grids + 1):
+                for j in range(1, self.pretrained_config.max_num_grids + 1):
+                    if i == 1 and j == 1 and not self.pretrained_config.use_1x1_grid:
                         continue
-                    if i * j <= config.max_num_grids:
+                    if i * j <= self.pretrained_config.max_num_grids:
                         possible_resolutions.append([i, j])
 
             possible_resolutions = [[
-                ys * config.vision_config["image_size"],
-                xs * config.vision_config["image_size"]
+                ys * self.pretrained_config.vision_config.image_size,
+                xs * self.pretrained_config.vision_config.image_size
             ] for ys, xs in possible_resolutions]
         return possible_resolutions
 
-    def _to_device(
-        self, input_tensor: Union[torch.Tensor, List, None]
-    ) -> Union[torch.Tensor, List, None]:
-        if input_tensor is None:
-            return None
-        elif isinstance(input_tensor, list):
-            return [self._to_device(item) for item in input_tensor]
-        elif isinstance(input_tensor, torch.Tensor):
-            return input_tensor.to(self.device)
+    def load_weights(self, weights):
+        vision_weights = _filter_weights(weights, "vision_model.")
+        self.vision_model.load_weights(vision_weights)
+
+        mm_projector_weights = _filter_weights(weights, "mm_projector.")
+        self.mm_projector.load_state_dict(mm_projector_weights, strict=True)
+
+        self.image_newline.data.copy_(weights["image_newline"])
 
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
@@ -842,8 +862,6 @@ class HCXVisionModel:
 
         pixel_values, mm_extra_data = self._parse_and_batch_multimodal_data(
             multimodal_params)
-        pixel_values = self._to_device(
-            pixel_values)  # TODO: remove this once we have the shared tensor
         image_sizes = mm_extra_data.get("image_sizes", None)
         is_videos = mm_extra_data.get("is_videos", None)
         num_queries_vis_abstractors = mm_extra_data.get(
@@ -856,8 +874,6 @@ class HCXVisionModel:
         len_pixel_values = [len(pixel_value) for pixel_value in pixel_values]
         concat_pixel_values = torch.cat(list(chain(*pixel_values)),
                                         dim=0)  # list of list of 4D Tensor
-        visual_token_idx = 0 if "siglip" in self.vision_config[
-            "model_type"] else 1
 
         n_chunks = 1
         total_len = concat_pixel_values.size(0)
@@ -867,7 +883,7 @@ class HCXVisionModel:
         for i in range(n_chunks):
             start = i * chunk_size
             end = (i + 1) * chunk_size
-            chunk = concat_pixel_values[start:end].to(self.vision_model.dtype)
+            chunk = concat_pixel_values[start:end]
             if chunk.size(0) < chunk_size:
                 pad_size = chunk_size - chunk.size(0)
                 dummy_shape = (pad_size, ) + tuple(
@@ -883,10 +899,10 @@ class HCXVisionModel:
             if self.use_nth_layer == -1:
                 self.vision_model.vision_model.post_layernorm = nn.Identity()
                 outs = self.vision_model(chunk, attn_metadata=attn_metadata)
-                outs = outs[:, visual_token_idx:]
+                outs = outs[:, self.visual_token_idx:]
             else:
                 outs = self.vision_model(chunk, attn_metadata=attn_metadata)
-                outs = outs[self.use_nth_layer][:, visual_token_idx:]
+                outs = outs[self.use_nth_layer][:, self.visual_token_idx:]
             image_forward_outs_chunks.append(outs)
 
         image_forward_outs = torch.cat(image_forward_outs_chunks, dim=0).to(
@@ -999,30 +1015,41 @@ class HCXVisionForCausalLM(PreTrainedModel):
         if hasattr(self, "llm"):
             return
         if not DISAGG:
-            self.mm_encoder = HCXVisionModel(model_config)
+            vision_model_config = copy.deepcopy(model_config)
+            vision_model_type = self.model_config.pretrained_config.vision_config[
+                "model_type"]
+            vision_config_obj = CONFIG_MAPPING[vision_model_type](
+                **self.model_config.pretrained_config.vision_config)
+            vision_model_config.pretrained_config.vision_config = vision_config_obj
+            vision_model_config.pretrained_config.architectures = [
+                "HCXVisionModel"
+            ]
+            self.mm_encoder = AutoModelForCausalLM.from_config(
+                vision_model_config)
+
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
             llm_model_config.pretrained_config.language_config)
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
-
-        self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
-        logger.info(f"{self.dtype=} {self.model_dtype=}")
+        self.model_dtype = getattr(config.language_config, "torch_dtype",
+                                   torch.bfloat16)
         self.post_config()
         self.is_loaded = True
 
     def load_weights(self, weights):
 
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v.to(self.dtype)
-                    assert result[new_k] is not None
-            return result
+        def _filter_weights(weights: Dict[str, torch.Tensor],
+                            prefix: str) -> Dict[str, torch.Tensor]:
+            return {
+                name[len(prefix):]: weight
+                for name, weight in weights.items() if name.startswith(prefix)
+            }
 
-        weights = filter_weights("language_model", weights)
-        self.llm.load_weights(weights)
+        language_weights = _filter_weights(weights, "language_model.")
+        self.llm.load_weights(language_weights)
+
+        if not DISAGG:
+            self.mm_encoder.load_weights(weights)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
