@@ -974,8 +974,8 @@ class LoraManager(object):
             return lora_model
 
         def interleave_fused_lora_weights_for_tp(
-            weight: torch.Tensor, rank_dim: int, tp_size: int, part_sizes: list[int]
-        ) -> list[torch.Tensor]:
+            weight: torch.Tensor, rank_dim: int, tp_size: int, part_sizes: List[int]
+        ) -> List[torch.Tensor]:
             assert weight.shape[rank_dim] == sum(part_sizes)
 
             # Split the weights into their respective parts. e.g. weight -> [Wq, Wk, Wv] for attn_qkv.
