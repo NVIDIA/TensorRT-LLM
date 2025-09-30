@@ -157,6 +157,9 @@ class GPUClockLock:
     def _lock_gpu_clocks(self):
         """
         Lock GPU clocks to maximum supported frequencies for consistent performance.
+
+        Implements fail-fast semantics: if any GPU fails to lock, all operations
+        are rolled back and an exception is raised.
         """
         if self._mobile_disable_clock_locking:
             print_info("Clock locking disabled for mobile/Jetson devices")
@@ -169,33 +172,86 @@ class GPUClockLock:
         target_clocks = self.get_target_gpu_clocks()
         if not target_clocks:
             print_warning("Could not determine target GPU clocks")
-            return
+            raise GPUClockLockFailFastError(
+                "Could not determine target GPU clocks")
 
         target_sm_clk, target_mem_clk = target_clocks
 
+        # Phase 1: Retrieve original clocks for all GPUs (fail-fast if any fails)
+        original_clocks_backup = {}
         for gpu_idx, handle in enumerate(self._gpu_handles):
             try:
-                # Store original clocks for restoration later
                 original_sm_clk = pynvml.nvmlDeviceGetApplicationsClock(
                     handle, pynvml.NVML_CLOCK_SM)
                 original_mem_clk = pynvml.nvmlDeviceGetApplicationsClock(
                     handle, pynvml.NVML_CLOCK_MEM)
-                self._original_clocks[gpu_idx] = (original_sm_clk,
-                                                  original_mem_clk)
-
-                # Set application clocks to maximum supported values
-                pynvml.nvmlDeviceSetApplicationsClocks(handle, target_mem_clk,
-                                                       target_sm_clk)
+                original_clocks_backup[gpu_idx] = (original_sm_clk,
+                                                   original_mem_clk)
                 print_info(
-                    f"GPU {gpu_idx}: Locked clocks to SM={target_sm_clk}MHz, MEM={target_mem_clk}MHz"
+                    f"GPU {gpu_idx}: Retrieved original clocks SM={original_sm_clk}MHz, MEM={original_mem_clk}MHz"
+                )
+            except pynvml.NVMLError as e:
+                print_error(
+                    f"Failed to retrieve original clocks for GPU {gpu_idx}: {e}"
+                )
+                raise GPUClockLockFailFastError(
+                    f"Failed to retrieve original clocks for GPU {gpu_idx}: {e}"
                 )
 
-            except pynvml.NVMLError as e:
-                print_warning(f"Failed to lock clocks for GPU {gpu_idx}: {e}")
-                # Try to continue with other GPUs
-                continue
+        # Phase 2: Apply clock locks to all GPUs (fail-fast if any fails)
+        locked_gpus = []
+        try:
+            for gpu_idx, handle in enumerate(self._gpu_handles):
+                try:
+                    pynvml.nvmlDeviceSetApplicationsClocks(
+                        handle, target_mem_clk, target_sm_clk)
+                    locked_gpus.append(gpu_idx)
+                    print_info(
+                        f"GPU {gpu_idx}: Locked clocks to SM={target_sm_clk}MHz, MEM={target_mem_clk}MHz"
+                    )
+                except pynvml.NVMLError as e:
+                    print_error(f"Failed to lock clocks for GPU {gpu_idx}: {e}")
+                    # Rollback any GPUs that were successfully locked
+                    self._rollback_locked_gpus(locked_gpus,
+                                               original_clocks_backup)
+                    raise GPUClockLockFailFastError(
+                        f"Failed to lock clocks for GPU {gpu_idx}: {e}")
 
-        self._clocks_locked = True
+            # Phase 3: Only mark as locked if all GPUs succeeded
+            self._original_clocks = original_clocks_backup
+            self._clocks_locked = True
+            print_info(
+                f"Successfully locked clocks on {len(locked_gpus)} GPU(s)")
+
+        except Exception:
+            # Ensure we don't leave any GPUs in a locked state
+            if locked_gpus:
+                self._rollback_locked_gpus(locked_gpus, original_clocks_backup)
+            raise
+
+    def _rollback_locked_gpus(self, locked_gpu_indices, original_clocks_backup):
+        """
+        Rollback clock locks for specific GPUs to their original values.
+
+        Args:
+            locked_gpu_indices: List of GPU indices that were successfully locked
+            original_clocks_backup: Dictionary of original clock values for each GPU
+        """
+        for gpu_idx in locked_gpu_indices:
+            if gpu_idx < len(
+                    self._gpu_handles) and gpu_idx in original_clocks_backup:
+                try:
+                    handle = self._gpu_handles[gpu_idx]
+                    original_sm_clk, original_mem_clk = original_clocks_backup[
+                        gpu_idx]
+                    pynvml.nvmlDeviceSetApplicationsClocks(
+                        handle, original_mem_clk, original_sm_clk)
+                    print_info(
+                        f"GPU {gpu_idx}: Rolled back clocks to SM={original_sm_clk}MHz, MEM={original_mem_clk}MHz"
+                    )
+                except pynvml.NVMLError as e:
+                    print_warning(
+                        f"Failed to rollback clocks for GPU {gpu_idx}: {e}")
 
     def _unlock_gpu_clocks(self):
         """
