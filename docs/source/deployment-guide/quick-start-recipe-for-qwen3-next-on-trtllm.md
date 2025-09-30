@@ -241,37 +241,3 @@ Run `bench.sh` to begin a serving benchmark. This will take a long time if you r
 ```shell
 ./bench.sh
 ```
-
-Sample result
-
-```
-============ Serving Benchmark Result ============
-Total requests:                          12        
-Successful requests:                     12        
-Failed requests:                         0         
-Benchmark duration (s):                  91.81     
-Total input tokens:                      12288     
-Total generated tokens:                  12288     
-Request throughput (req/s):              0.13      
-Output token throughput (tok/s):         133.83    
-Total Token throughput (tok/s):          267.67    
-User throughput (tok/s):                 45.55     
-Avg Decoded Tokens per Iter:             1.00      
----------------Time to First Token----------------
-Mean TTFT (ms):                          19226.68  
-Median TTFT (ms):                        23045.72  
-P99 TTFT (ms):                           23066.03  
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          7.38      
-Median TPOT (ms):                        7.38      
-P99 TPOT (ms):                           7.39      
----------------Inter-token Latency----------------
-Mean ITL (ms):                           145.20    
-Median ITL (ms):                         147.53    
-P99 ITL (ms):                            151.14    
-----------------End-to-end Latency----------------
-Mean E2EL (ms):                          26777.18  
-Median E2EL (ms):                        30595.78  
-P99 E2EL (ms):                           30619.67  
-==================================================
-```
