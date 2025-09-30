@@ -25,7 +25,7 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.torch_moe_fused` | Fused Mixture of Experts implementation |
 | `torch.ops.auto_deploy.torch_quant_fn` | Generic quantization function that scales, rounds, and clamps input values |
 | `torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce operation |
-| `torch.ops.auto_deploy.torch_quant_fp4_linear` | FP4 quantized linear layer |
+| `torch.ops.auto_deploy.torch_quant_nvfp4_linear` | FP4 quantized linear layer |
 | `torch.ops.auto_deploy.torch_quant_fp8_linear` | FP8 quantized linear layer |
 | `torch.ops.auto_deploy.torch_rope_with_complex_freqs` | RoPE with complex frequencies |
 | `torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin` | RoPE with explicit cosine/sine |
@@ -38,5 +38,5 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache` | Triton fused flattened Multi-head Latent Attention with cache support |
 | `torch.ops.auto_deploy.triton_rope_on_flattened_inputs` | Triton RoPE on flattened inputs |
 | `torch.ops.auto_deploy.triton_rope_with_input_pos` | Triton RoPE with input positions |
-| `torch.ops.auto_deploy.trtllm_moe_fused` | TensorRT-LLM fused MoE implementation |
-| `torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce` | TensorRT-LLM fused linear layer followed by all-reduce operation |
+| `torch.ops.auto_deploy.trtllm_moe_fused` | TensorRT LLM fused MoE implementation |
+| `torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce` | TensorRT LLM fused linear layer followed by all-reduce operation |

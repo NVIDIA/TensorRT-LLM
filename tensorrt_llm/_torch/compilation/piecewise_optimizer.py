@@ -11,8 +11,9 @@ from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
-from ..utils import (get_model_extra_attrs, get_piecewise_cuda_graph_flag,
-                     make_weak_ref)
+from ..utils import (get_model_extra_attrs,
+                     get_per_request_piecewise_cuda_graph_flag,
+                     get_piecewise_cuda_graph_flag, make_weak_ref)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import get_capture_piecewise_cuda_graph_flag, is_call_function
 
@@ -154,8 +155,10 @@ class PiecewiseRunner(object):
         elif isinstance(self.compile_time_num_tokens, int):
             runtime_num_of_token = self.compile_time_num_tokens
 
-        if runtime_num_of_token is None or runtime_num_of_token not in self.entries or not get_piecewise_cuda_graph_flag(
-        ):
+        if (runtime_num_of_token is None
+                or runtime_num_of_token not in self.entries
+                or not get_piecewise_cuda_graph_flag()
+                or not get_per_request_piecewise_cuda_graph_flag()):
             return self.default_callable(*args)
 
         entry = self.entries[runtime_num_of_token]
@@ -207,15 +210,9 @@ class PiecewiseRunner(object):
             runtime_input_addresses = [
                 i.data_ptr() for i in args if isinstance(i, torch.Tensor)
             ]
-            runtime_output_addresses = [
-                i.data_ptr() for i in output if isinstance(i, torch.Tensor)
-            ]
 
             assert (entry.input_addresses == runtime_input_addresses
                     ), f"{entry.input_addresses} vs\n {runtime_input_addresses}"
-            assert (
-                entry.output_addresses == runtime_output_addresses
-            ), f"{entry.output_addresses} vs\n {runtime_output_addresses}"
 
         entry.cuda_graph.replay()
 

@@ -11,7 +11,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
-from .transform.interface import TransformConfig
 from .utils._config import DynamicYamlMixInForSettings
 
 PathLike = Union[str, Path]
@@ -21,7 +20,6 @@ def _get_config_dict() -> SettingsConfigDict:
     return SettingsConfigDict(
         arbitrary_types_allowed=True,
         extra="forbid",
-        yaml_file=str(files("tensorrt_llm._torch.auto_deploy.config") / "default.yaml"),
         nested_model_default_partial_update=True,
     )
 
@@ -57,7 +55,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="The path to the model checkpoint or the model name from the Hugging Face Hub."
     )
 
-    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
+    model_factory: str = Field(
         default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
     )
@@ -107,12 +105,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="Disable the overlap scheduler in trtllm runtime",
     )
 
-    enable_mixed_sampler: bool = Field(
-        default=False,
-        description="If true, will iterate over sampling_params of each request and use the corresponding "
-        "sampling strategy, e.g. top-k, top-p, etc.",
-    )
-
     world_size: int = Field(
         default=1,
         ge=0,
@@ -159,6 +151,17 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
     )
 
+    use_sharding_from_factory: bool = Field(
+        default=False,
+        description="If True, use sharding from the model factory. If False, use sharding from the "
+        "AutoDeployConfig.",
+    )
+
+    sharding_dims: List[str] = Field(
+        default=["tp", "ep", "dp"],
+        description="The sharding methods to apply by the heuristic sharding stage.",
+    )
+
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
         Field(
             default="torch-compile",
@@ -173,7 +176,14 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
     ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
-    transforms: Dict[str, TransformConfig] = Field(
+    mode: Literal["graph", "transformers"] = Field(
+        default="graph",
+        description="The mode to use for the inference optimizer. Currently, we "
+        "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
+        "or transformers-only cached attention optimization.",
+    )
+
+    transforms: Dict[str, Any] = Field(
         default_factory=dict,
         description="A dictionary of transform configurations. The key is the transform name and "
         "the value is the transform configuration.",
@@ -194,11 +204,24 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     ### VALIDATION #################################################################################
     @model_validator(mode="after")
+    # TODO: discuss what to do with this once we fully transition to the new inference optimizer
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
+        # TODO: maybe don't do this and rely on slot_idx instead??
         if self.attn_backend == "triton" or self.attn_backend == "torch":
             self.attn_page_size = self.max_seq_len
         return self
+
+    @field_validator("model_factory", mode="after")
+    @classmethod
+    def model_factory_exists(cls, value: str) -> str:
+        if not ModelFactoryRegistry.has(value):
+            raise ValueError(
+                f"'{value}' does not exist in the model factory registry. Available values: "
+                f"{ModelFactoryRegistry.entries()}."
+            )
+
+        return value
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
@@ -218,9 +241,27 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         """Convert the arguments to a dictionary."""
         return self.model_dump()
 
-    def to_llm_args(self) -> "LlmArgs":
-        """Convert the arguments to a LlmArgs instance that is used for the LLM API."""
-        return LlmArgs(**self.to_dict())
+    def to_llm_kwargs(self) -> Dict[str, Any]:
+        """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
+        kwargs = self.to_dict()
+
+        # ensure we remove the mode and yaml_default fields since they otherwise may conflict each
+        # other.
+        if "mode" not in self.model_fields_set:
+            kwargs.pop("mode")
+        if "yaml_default" not in self.model_fields_set:
+            kwargs.pop("yaml_default")
+        return kwargs
+
+    ### PRIVATE METHODS ############################################################################
+    @classmethod
+    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
+        config_path = files("tensorrt_llm._torch.auto_deploy.config")
+        mapping = {
+            "graph": str(config_path / "default.yaml"),
+            "transformers": str(config_path / "transformers.yaml"),
+        }
+        return mapping.get(mode)
 
 
 class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
@@ -330,11 +371,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     def get_pytorch_backend_config(self) -> "LlmArgs":
         """Return the LlmArgs (self) object."""
         # TODO: can we just pass through self directly??
-        return type(self)(**self.to_dict())
+        return type(self)(**self.to_llm_kwargs())
 
     def to_dict(self) -> Dict:
         """Convert model to a dictionary such that cls(**self.to_dict()) == self."""
-        self_dict = dict(self)
-        self_dict.pop("build_config")
-        self_dict.pop("mpi_session")
+        self_dict = super().to_dict()
+        self_dict.pop("build_config", None)
+        self_dict.pop("mpi_session", None)
         return self_dict

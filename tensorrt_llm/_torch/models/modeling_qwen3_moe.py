@@ -5,20 +5,20 @@ import torch
 from torch import nn
 from transformers import Qwen3MoeConfig
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe)
+                                 RoutingMethodType, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -46,6 +46,7 @@ class Qwen3Gate(nn.Module):
                                                dtype=dtype),
                                    requires_grad=False)
         self.routing_method_type = routing_method_type
+        self.moe_backend = moe_backend
         # FIXME: out_dtype=float32 does not work
         # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
         self.out_dtype = dtype
@@ -65,9 +66,15 @@ class Qwen3Gate(nn.Module):
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
-            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
+            return RenormalizeNaiveMoeRoutingMethod(
+                top_k=self.top_k,
+                output_dtype=torch.bfloat16
+                if self.moe_backend.upper() == "TRTLLM" else torch.float32)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
-            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+            return RenormalizeMoeRoutingMethod(
+                top_k=self.top_k,
+                output_dtype=torch.bfloat16
+                if self.moe_backend.upper() == "TRTLLM" else torch.float32)
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
@@ -78,7 +85,7 @@ class Qwen3MoE(nn.Module):
     def __init__(
         self,
         model_config: ModelConfig[Qwen3MoeConfig],
-        aux_stream: torch.cuda.Stream,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         layer_idx: Optional[int] = None,
     ):
         super().__init__()
@@ -108,7 +115,7 @@ class Qwen3MoE(nn.Module):
             routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
-            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
+            aux_stream_dict=aux_stream_dict,
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
@@ -127,24 +134,15 @@ class Qwen3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
         if not do_finalize:
             assert not self.enable_attention_dp
-
-        if self.enable_attention_dp and self.mapping.tp_size > 1:
-            if isinstance(self.experts, TRTLLMGenFusedMoE):
-                hidden_states = allgather(hidden_states,
-                                          self.mapping,
-                                          dim=0,
-                                          sizes=all_rank_num_tokens)
 
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
         )
@@ -162,7 +160,8 @@ class Qwen3MoE(nn.Module):
 class Qwen3MoEDecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[Qwen3MoeConfig],
-                 layer_idx: int, aux_stream: torch.cuda.Stream):
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
+                                                       torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
@@ -173,7 +172,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3MoE(model_config, aux_stream, layer_idx=layer_idx)
+        self.mlp = Qwen3MoE(model_config, aux_stream_dict, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -187,6 +186,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
+
+        self.is_p2p_supported = can_access_peer(model_config.mapping)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -243,11 +244,11 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 hidden_states, residual)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        do_finalize = not (
+            hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and self.fusion_config.POST_MOE_FUSION
+            and self.model_config.moe_backend == 'TRTLLM'
+            and self.mlp.experts.has_nvfp4 and self.is_p2p_supported)
 
         hidden_states = self.mlp(
             hidden_states,
@@ -304,7 +305,10 @@ class Qwen3MoEModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen3MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.aux_stream = torch.cuda.Stream()
+        self.aux_stream_dict = {
+            AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
+            AuxStreamType.MoeBalancer: torch.cuda.Stream(),
+        }
         self.preload_weight_modules = []
         if config.moe_backend == "TRTLLM":
             self.preload_weight_modules = [
@@ -334,7 +338,7 @@ class Qwen3MoEModel(DecoderModel):
             Qwen3MoEDecoderLayer(
                 model_config,
                 layer_idx,
-                self.aux_stream,
+                self.aux_stream_dict,
             ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
         self.norm = RMSNorm(

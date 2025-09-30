@@ -1749,6 +1749,98 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile>
 
     // Default ctor
     Tile_o_normalizer() = default;
+
+    // The fragment accumulator.
+    using Fragment_accu = Fragment_accumulator<Traits>;
+
+    // The Mma tile.
+    using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+
+    // The number of MMAs in the M dimension.
+    enum
+    {
+        MMAS_M = Mma_tile::MMAS_M
+    };
+
+    // The number of MMAs in the N dimension.
+    enum
+    {
+        MMAS_N = Mma_tile::VALID_MMAS_N
+    };
+
+    // The number of rows per thread.
+    enum
+    {
+        ROWS_PER_THREAD = 2 * MMAS_M
+    };
+
+    // The number of registers per thread.
+    enum
+    {
+        REGS_PER_THREAD = 8
+    };
+
+    // Warps.
+    enum
+    {
+        WARPS_M = Cta_tile::WARPS_M
+    };
+
+    enum
+    {
+        WARPS_N = Cta_tile::WARPS_N
+    };
+
+    enum
+    {
+        WARPS_K = Cta_tile::WARPS_K
+    };
+
+    // softmax data bytes
+    enum
+    {
+        BYTES_PER_ELEMENT = sizeof(float)
+    };
+
+    // Update o after P * V, the only difference from the basic class is we need to dequant the sum for softmax saver.
+    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&sum)[ROWS_PER_THREAD])
+    {
+
+        constexpr float dequant_scale = Traits::SOFTMAX_FP_DEQUANT_SCALE;
+#pragma unroll
+        for (int mi = 0; mi < MMAS_M; ++mi)
+        {
+
+            // Precompute the scaling factors for the 2 rows.
+            float beta[2];
+#pragma unroll
+            for (int ii = 0; ii < 2; ++ii)
+            {
+                // The row.
+                int jj = 2 * mi + ii;
+
+                // The diviser.
+                beta[ii] = (sum[jj] == 0.f || sum[jj] != sum[jj]) ? 1.f : 1.f / sum[jj];
+                // softmax saver need the original sum.
+                sum[jj] = sum[jj] * dequant_scale;
+            }
+
+#pragma unroll
+            for (int ni = 0; ni < MMAS_N; ++ni)
+            {
+#pragma unroll
+                for (int ii = 0; ii < REGS_PER_THREAD; ++ii)
+                {
+                    // The register for O.
+                    float acc_o_f = acc_o[mi][ni].elt(ii);
+                    // Compute the next accumulator.
+                    acc_o_f = acc_o_f * beta[(ii & 2) / 2];
+                    // Update the accumulator.
+                    acc_o[mi][ni].elt(ii) = acc_o_f;
+                }
+            }
+        }
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

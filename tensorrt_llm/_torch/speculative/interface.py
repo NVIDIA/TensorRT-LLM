@@ -7,11 +7,13 @@ import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..pyexecutor.resource_manager import BaseResourceManager
 
 
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
+    MTP_EAGLE_ONE_MODEL = auto()
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
@@ -20,8 +22,11 @@ class SpeculativeDecodingMode(IntEnum):
     NONE = auto()
     AUTO = auto()
 
-    def is_mtp(self):
-        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
+    def is_mtp_one_model(self):
+        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+
+    def is_mtp_eagle_one_model(self):
+        return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
 
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
@@ -33,7 +38,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_one_model()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -51,16 +56,24 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
     def without_logits(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.has_draft_model()
+
+    def support_guided_decoder(self):
+        return self.is_none() or self.has_spec_drafter()
+
+    def support_capturable_guided_decoder(self):
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
     def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target()
+        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
     def needs_kv_cache_recompute(self):
         """
@@ -68,7 +81,7 @@ class SpeculativeDecodingMode(IntEnum):
         If true, the 1st draft model forward will recompute the kv cache for
         the accepted draft tokens.
         """
-        return self.is_eagle3()
+        return self.is_eagle3() or self.is_mtp_eagle()
 
     def need_load_draft_weights(self):
         """
@@ -78,11 +91,12 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model()
 
     def has_spec_decoder(self):
-        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
+        ) or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided()
+        ) or self.is_user_provided() or self.is_mtp_eagle()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -94,16 +108,23 @@ class SpeculativeDecodingMode(IntEnum):
         if self.use_one_engine():
             # 1-model has separate logic for handling draft tokens
             return False
-
-        # The special XQA generation kernels only exist with the TRTLLM backend on blackwell.
         return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 
-    def attention_need_spec_dec_mode(self):
+    def attention_need_spec_dec_mode(
+        self,
+        spec_resource_manager: BaseResourceManager,
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
+        use_chain_drafter: bool,
+    ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         """
-        return self.is_eagle3_one_model()
+        is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
+        return self.is_eagle3_one_model() or (
+            self.is_eagle3() and spec_resource_manager.is_first_draft
+            and is_trtllm_attention and use_chain_drafter and is_draft_model)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
@@ -126,11 +147,11 @@ class SpecMetadata:
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
     # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE,
+    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # Draft tokens.
-    draft_tokens: Optional[torch.Tensor] = None,
+    draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
-    draft_lens: Optional[torch.Tensor] = None,
+    draft_lens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -138,15 +159,12 @@ class SpecMetadata:
     seq_lens: Optional[List[int]] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
+    # The number of accepted draft tokens for each request.
+    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
-    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
-                                                      default=None,
-                                                      repr=False)
-    all_rank_num_tokens: Optional[List[int]]
-    # The max number of tokens among all ranks.
-    all_rank_max_num_tokens: Optional[int] = None
+    all_rank_num_tokens: Optional[List[int]] = None
 
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
@@ -199,13 +217,3 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
-
-    @property
-    def all_rank_num_tokens(self) -> Optional[List[int]]:
-        return self._all_rank_num_tokens
-
-    @all_rank_num_tokens.setter
-    def all_rank_num_tokens(self, value: Optional[List[int]]):
-        value = value if value is not SpecMetadata.all_rank_num_tokens else None
-        self._all_rank_num_tokens = value
-        self.all_rank_max_num_tokens = max(value) if value is not None else None

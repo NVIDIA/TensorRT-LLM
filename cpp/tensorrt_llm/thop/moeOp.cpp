@@ -32,6 +32,7 @@
 #include <ATen/native/cuda/Resize.h>
 
 #include <functional>
+#include <map>
 
 #define C10_THROW_ERROR_FORMATTED(ErrorType, ...)                                                                      \
     do                                                                                                                 \
@@ -200,6 +201,21 @@ public:
             }
             switch (mActivationDtype)
             {
+#ifdef ENABLE_FP8
+            case c10::ScalarType::Float8_e4m3fn:
+            {
+                if (isInt4Quant() and mUseW4GroupScaling)
+                {
+                    mKernelRunner = std::make_unique<
+                        kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>>();
+                }
+                else
+                {
+                    C10_THROW_ERROR_FORMATTED(Error, "FP8 activation type is not supported for non-W4A8 quantization");
+                }
+                break;
+            }
+#endif
             case c10::ScalarType::Half: mKernelRunner = create_weight_quant_runner<half>(); break;
             case c10::ScalarType::BFloat16: mKernelRunner = create_weight_quant_runner<__nv_bfloat16>(); break;
             default: C10_THROW_ERROR_FORMATTED(Error, "Unsupported activation type for int-type weight");
@@ -242,7 +258,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+        torch::optional<int64_t> const& unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -326,6 +343,8 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
+        int64_t unpadded_hidden_size_val
+            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         if (mUseINT8WoqPerChannel)
         {
@@ -386,11 +405,13 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows, hidden_size};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode);
+        // output is smaller than workspace. Create output after workspace to avoid output_shape occupied a little
+        // piece of memory which makes a big partition of memory segment can't be used by workspace.
+        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
+        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -407,10 +428,10 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
+            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
+            false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
@@ -439,7 +460,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+        torch::optional<int64_t> const& unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -498,6 +520,8 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
+        int64_t unpadded_hidden_size_val
+            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
@@ -534,7 +558,7 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, hidden_size};
+        std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, unpadded_hidden_size_val};
         auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         auto num_active_experts_per_node = torch::empty({1}, input.options().dtype(at::ScalarType::Int));
@@ -547,8 +571,8 @@ public:
         min_latency_params.experts_to_token_score = static_cast<float*>(experts_to_token_score.data_ptr());
         min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
 
-        WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode);
+        WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
 
@@ -564,10 +588,10 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
-            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
+            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
+            false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
@@ -600,7 +624,7 @@ public:
         torch::optional<torch::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
         int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
         int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation)
+        int64_t const profile_id, bool const do_preparation, int64_t const unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -662,7 +686,8 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size, inter_size, group_size,
+                ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config, enable_alltoall);
 #else
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
@@ -702,6 +727,7 @@ private:
     // e.g. 16 nvfp4 elements are packed into a single int64 element
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
+    std::map<cudaStream_t, WorkspaceInfo> mStreamWorkspaces;
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
@@ -750,26 +776,43 @@ private:
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
 
-    WorkspaceInfo getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
+    WorkspaceInfo const& getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int num_experts, int experts_per_token, ActivationType activation_type,
-        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode)
+        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode, cudaStream_t stream)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
             experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
+        auto& workspace_info = mStreamWorkspaces[stream];
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
 
-        size_t total_workspace_size = common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
+        int64_t const total_workspace_size = common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
 
-        WorkspaceInfo info{};
-        info.workspace = torch::empty({static_cast<long>(total_workspace_size)},
-            torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
-        info.src_to_dest_map
-            = common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace.data_ptr()), moe_workspace_size);
+        bool is_capturing = tensorrt_llm::common::isCapturing(stream);
+        // Always allocate workspace when capturing cuda graph to avoid illegal memory access during replay
+        if (is_capturing || workspace_info.workspace.numel() < total_workspace_size)
+        {
+            if (is_capturing)
+            {
+                TLLM_LOG_DEBUG(
+                    "Allocating MoE workspace with %ld bytes size during cuda graph capture", total_workspace_size);
+            }
+            else
+            {
+                TLLM_LOG_DEBUG("MoE workspace size is not enough, increase the size from %ld bytes to %ld bytes",
+                    workspace_info.workspace.numel(), total_workspace_size);
+            }
+            // Release memory first to avoid OOM.
+            workspace_info = WorkspaceInfo();
+            workspace_info.workspace = torch::empty({static_cast<long>(total_workspace_size)},
+                torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
+        }
+        workspace_info.src_to_dest_map
+            = common::nextWorkspacePtr(static_cast<int8_t*>(workspace_info.workspace.data_ptr()), moe_workspace_size);
 
-        return info;
+        return workspace_info;
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,

@@ -91,7 +91,7 @@ class CompletionOutput:
         text (str): The generated output text. Defaults to "".
         token_ids (List[int], optional): The token ids of the generated output text. Defaults to [].
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
-        logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
         prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
@@ -102,14 +102,15 @@ class CompletionOutput:
     Attributes:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
-        logprobs_diff (List[float]): Logprobs of newly generated tokens.
+        logprobs_diff (TokenLogprobs | List[float]): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
     """
     index: int
     text: str = ""
     token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
-    logprobs: Optional[TokenLogprobs] = field(default_factory=list)
+    logprobs: Optional[TokenLogprobs
+                       | List[float]] = field(default_factory=list)
     prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
@@ -141,7 +142,7 @@ class CompletionOutput:
         return self.token_ids[self._last_token_ids_len:]
 
     @property
-    def logprobs_diff(self) -> List[float]:
+    def logprobs_diff(self) -> TokenLogprobs | List[float]:
         return self.logprobs[self._last_logprobs_len:]
 
 
@@ -216,6 +217,7 @@ class GenerationResultBase:
         return self._context_logits
 
     @property
+    # TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.
     def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
         return self._mm_embedding_handle
 
@@ -243,20 +245,36 @@ class GenerationResultBase:
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
-        if logprobs_result:
+        # prompt logprobs handling
+        if logprobs_result and logprobs_result.prompt is not None:  # both backends
             output.prompt_logprobs = logprobs_result.prompt
-            output.logprobs = logprobs_result.generation
-
-        if response_tensors.log_probs is not None:
+        # generation logprobs handling (provenance varies by backend)
+        if logprobs_result and logprobs_result.generation is not None:  # TRT backend
+            # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
-            output.logprobs = response_tensors.log_probs[src_idx]
+            output.logprobs += logprobs_result.generation
+        elif response_tensors.log_probs is not None:  # PyTorch backend
+            # handle logprobs directly from response tensors given by sampler
+            output._last_logprobs_len = len(output.logprobs)
+            # In streaming mode, since out-of-order responses are not possible,
+            # each streamed response_tensors.log_probs[src_idx]
+            # contains a streamwise monotonically growing list of logprobs.
+            # so we need to accumulate only the new ones unique to that particular streamed response
+            assert output._last_logprobs_len <= len(
+                response_tensors.log_probs[src_idx]
+            ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                f"{len(response_tensors.log_probs[src_idx])})")
+            output.logprobs += response_tensors.log_probs[src_idx][
+                output._last_logprobs_len:]
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                # Check if logprobs is a list (not a dict or other structure)
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
+
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
@@ -366,6 +384,17 @@ class GenerationResultBase:
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
+                if self.disaggregated_params is not None:
+                    self.disaggregated_params.multimodal_embedding_handles = [
+                        response_result.mm_embedding_handle
+                    ],
+                    self.disaggregated_params.multimodal_hashes = self._multimodal_hashes
+                else:
+                    self.disaggregated_params = DisaggregatedParams(
+                        multimodal_embedding_handles=[
+                            response_result.mm_embedding_handle
+                        ],
+                        multimodal_hashes=self._multimodal_hashes)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -516,6 +545,12 @@ class GenerationResult(GenerationResultBase):
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
         self._aborted = False
+
+        # Pipelined multimodal hashes from request to result
+        mm_hashes = getattr(
+            getattr(getattr(generation_request, "multimodal_params", None),
+                    "multimodal_input", None), "multimodal_hashes", None)
+        self._multimodal_hashes = mm_hashes
 
     @property
     def request_id(self) -> int:
@@ -695,7 +730,12 @@ def compute_logprobs(
     output_token_ids: Optional[list[int]],
 ) -> LogProbsResult:
     """
-    Compute top-K logprobs and ranks for each token position.
+    Compute top-K logprobs from logits when engine doesn't provide them directly.
+
+    Used for post-processing logits into logprobs.
+    - Prompt logprobs (from context_logits): always used.
+    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
+    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
 
     Returns:
         LogProbsResult, a NamedTuple containing:

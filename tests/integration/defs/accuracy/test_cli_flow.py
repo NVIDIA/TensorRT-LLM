@@ -782,6 +782,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             extra_build_args=extra_build_args)
 
     @skip_pre_hopper
+    @skip_post_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "gemm_allreduce", [False, pytest.param(True, marks=skip_no_nvls)],

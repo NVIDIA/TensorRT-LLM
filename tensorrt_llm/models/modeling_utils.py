@@ -1233,6 +1233,11 @@ def fuse_gate_mlp(
                     mlp.gate.activation_scaling_factor.raw_value,
                     mlp.fc.activation_scaling_factor.raw_value,
                 )
+
+                if mlp.bias:
+                    fused_layer.fused_fc.bias.value = np.concatenate(
+                        [mlp.gate.bias.raw_value, mlp.fc.bias.raw_value],
+                        axis=0)
             elif layer_quant_algo is None:
                 fused_layer.fused_fc.weight.value = np.concatenate(
                     [
@@ -1958,7 +1963,7 @@ def save_config(config: PretrainedConfig, *, output_dir: str,
                 log: bool) -> None:
     config_path = Path(output_dir) / "config.json"
     if log:
-        logger.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+        logger.debug(f"Saving TensorRT LLM configuration to {config_path}")
     config_path.parent.mkdir(exist_ok=True, parents=True)
     config_path.write_text(json.dumps(config.to_dict(), indent=4))
 

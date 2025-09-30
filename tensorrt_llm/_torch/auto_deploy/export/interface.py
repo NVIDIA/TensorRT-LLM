@@ -5,7 +5,7 @@ This module defines the base classes and interfaces for all export patches.
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Type, Union, final
+from typing import Any, Callable, Dict, List, Optional, Type, Union, final
 
 from pydantic import BaseModel, Field
 
@@ -183,6 +183,8 @@ class ExportPatchRegistry:
     @classmethod
     def get(cls, name: str) -> Type[BaseExportPatch]:
         """Get a patch class by name."""
+        if not cls.has(name):
+            raise ValueError(f"Unknown patch: {name}")
         return cls._registry[name]
 
     @classmethod
@@ -212,20 +214,29 @@ class ExportPatchRegistry:
 
 
 @contextmanager
-def apply_export_patches(patch_configs: Dict[str, Union[ExportPatchConfig, Dict[str, Any]]]):
+def apply_export_patches(
+    patch_configs: Optional[Dict[str, Union[ExportPatchConfig, Dict[str, Any]]]] = None,
+    patch_list: Optional[List[str]] = None,
+):
     """Context manager to apply multiple patches.
 
     Args:
         patch_configs: Dict mapping patch names to their configurations.
     """
-    patches = []
+    # Validate that both patch_configs and patch_list are not provided simultaneously
+    if patch_configs is not None and patch_list is not None:
+        raise ValueError("Cannot specify both patch_configs and patch_list. Use only one.")
+
+    # Handle patch configuration
+    if patch_list is not None:
+        # Convert patch_list to patch_configs format
+        patch_configs = {patch_name: {} for patch_name in patch_list}
+    elif patch_configs is None:
+        # Default patch configurations - apply all registered patches with default settings
+        patch_configs = {patch_name: {} for patch_name in ExportPatchRegistry.list_patches()}
 
     # Create patch instances
-    for name, config in patch_configs.items():
-        if not ExportPatchRegistry.has(name):
-            raise ValueError(f"Unknown patch: {name}")
-        patch = ExportPatchRegistry.create_patch(name, config)
-        patches.append(patch)
+    patches = [ExportPatchRegistry.create_patch(k, conf) for k, conf in patch_configs.items()]
 
     # Apply patches using nested context managers
     if not patches:

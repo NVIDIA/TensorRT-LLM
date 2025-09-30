@@ -14,7 +14,7 @@ This document shows how to build and run a DBRX model in TensorRT-LLM. DBRX is a
 
 ## Overview
 
-The TensorRT-LLM DBRX implementation can be found in [tensorrt_llm/models/dbrx/model.py](../../../../tensorrt_llm/models/dbrx/model.py).
+The TensorRT LLM DBRX implementation can be found in [tensorrt_llm/models/dbrx/model.py](../../../../tensorrt_llm/models/dbrx/model.py).
 
 ## Support Matrix
   * BF16
@@ -41,7 +41,7 @@ pip install -r requirements.txt
 git lfs install
 ```
 
-Download one or more DBRX models that you would like to build to TensorRT-LLM engines. You can download from the [HuggingFace](https://huggingface.co) hub:
+Download one or more DBRX models that you would like to build to TensorRT LLM engines. You can download from the [HuggingFace](https://huggingface.co) hub:
 
 ```bash
 # Download dbrx-base
@@ -53,9 +53,9 @@ git clone https://huggingface.co/databricks/dbrx-instruct
 
 ### Build TensorRT engine(s)
 
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. A DBRX model has 132B parameters, so you need at least 4 x 80GB GPUs to load the model in 16-bit precision for weight conversion.
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints. A DBRX model has 132B parameters, so you need at least 4 x 80GB GPUs to load the model in 16-bit precision for weight conversion.
 
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is same to the number of GPUs used to run inference. Normally, `trtllm-build` uses one GPU by default, but if you have already more GPUs available at build time, you may enable parallel builds to make the engine building process faster by adding the `--workers` argument.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The number of engine files is same to the number of GPUs used to run inference. Normally, `trtllm-build` uses one GPU by default, but if you have already more GPUs available at build time, you may enable parallel builds to make the engine building process faster by adding the `--workers` argument.
 
 Here are some examples:
 
@@ -221,10 +221,10 @@ mpirun -n 8 \
 If the engines are run successfully, you will see output like:
 ```
 ......
-[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT-LLM (total latency: 9.962657451629639 sec)
-[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1189)
-[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 119.34566713477734)
-[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT LLM (total latency: 9.962657451629639 sec)
+[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT LLM (total output tokens: 1189)
+[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT LLM (tokens per second: 119.34566713477734)
+[04/02/2024-11:16:37] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [04/02/2024-11:16:37] [TRT-LLM] [I]   rouge1 : 26.842471264679535
 [04/02/2024-11:16:37] [TRT-LLM] [I]   rouge2 : 9.979512100961314
 [04/02/2024-11:16:37] [TRT-LLM] [I]   rougeL : 19.50336050538688

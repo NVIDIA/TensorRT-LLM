@@ -8,7 +8,6 @@ import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
-from ..custom_ops.quant import QUANT_BMM_OPS, QUANT_LINEAR_OPS
 from .logger import ad_logger
 
 try:
@@ -152,9 +151,6 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
-    assert is_linear_op(mm_node, include_quantization=True) or is_bmm_op(mm_node), (
-        f"Expecting linear or bmm node, Found: {mm_node}"
-    )
     weight_node = extract_weight_node(mm_node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
@@ -207,37 +203,51 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
 
 
 def filtered_nodes(
-    nodes: Iterable[Node], ops: Union[OperatorLike, Iterable[OperatorLike]]
+    nodes: Iterable[Node],
+    target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
+    ops: Union[OperatorLike, Iterable[OperatorLike]] = None,
 ) -> Iterable[Node]:
-    """Iterate over nodes that are filtered by the given operations.
+    """Iterate over nodes that are filtered by the given operations or target function.
 
     This utility function simplifies the common pattern of iterating through nodes
-    and filtering by operation type.
+    and filtering by operation type or custom function.
 
     Args:
         nodes: Iterable of nodes to filter (e.g., gm.graph.nodes)
-        ops: Operation(s) to match against
+        target: Either a callable function that takes a Node and returns bool,
+               or operation(s) to match against (deprecated, use ops parameter)
+        ops: Operation(s) to match against (preferred over target for operations)
 
     Yields:
-        Node: Nodes that match the given operations
+        Node: Nodes that match the given operations or target function
 
     Example:
-        # Instead of:
-        for node in gm.graph.nodes:
-            if not is_op(node, torch.ops.aten.linear):
-                continue
+        # Using callable function:
+        for node in filtered_nodes(gm.graph.nodes, is_linear_op):
             # process node
 
-        # Use:
-        for node in filtered_nodes(gm.graph.nodes, torch.ops.aten.linear):
+        # Using operations:
+        for node in filtered_nodes(gm.graph.nodes, ops=torch.ops.aten.linear):
+            # process node
+
+        # Using multiple operations:
+        for node in filtered_nodes(gm.graph.nodes, ops=[torch.ops.aten.linear, torch.ops.aten.bmm]):
             # process node
     """
-    for node in nodes:
-        if is_op(node, ops):
-            yield node
+    # Handle the case where target is a callable function
+    if callable(target) and not isinstance(target, (OpOverloadPacket, OpOverload)):
+        for node in nodes:
+            if target(node):
+                yield node
+    else:
+        # Handle the case where target or ops contains operations
+        operations = ops if ops is not None else target
+        for node in nodes:
+            if is_op(node, operations):
+                yield node
 
 
-def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
+def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
     Using this function is preferred over `is_op` for linear ops to ensure all variants are covered.
@@ -247,19 +257,22 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
         torch.ops.auto_deploy.torch_linear_simple,
     }
 
-    if include_quantization:
-        lin_ops.update(QUANT_LINEAR_OPS)
     return is_op(node, lin_ops)
 
 
-def is_bmm_op(node: Node, include_quantization: bool = False) -> bool:
-    """Check if the node is a distributed op."""
-    dist_ops = {torch.ops.aten.bmm}
+def is_fake_quantized_linear_op(node: Node) -> bool:
+    quantized_linear_op = {
+        torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+    }
 
-    if include_quantization:
-        dist_ops.update(QUANT_BMM_OPS)
+    return is_op(node, quantized_linear_op)
 
-    return is_op(node, dist_ops)
+
+def is_bmm_op(node: Node) -> bool:
+    bmm_ops = {torch.ops.aten.bmm}
+
+    return is_op(node, bmm_ops)
 
 
 def is_dist_op(node: Node) -> bool:

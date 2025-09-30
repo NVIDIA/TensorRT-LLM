@@ -263,7 +263,9 @@ class Gemma3VLM(PreTrainedModel):
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=self.image_token_ids)
+            mm_token_ids=self.image_token_ids,
+            **kwargs,
+        )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -285,16 +287,6 @@ class Gemma3VLM(PreTrainedModel):
             image_features = self.mm_projector(image_features)
         return image_features
 
-
-def _load_weights_into_hf_module(
-    model: torch.nn.Module,
-    weights: dict,
-    prefix: str,
-    model_name: str,
-) -> None:
-    filtered_weights = filter_weights(prefix, weights)
-    missing_keys, _ = model.load_state_dict(filtered_weights)
-    if len(missing_keys) > 0:
-        raise KeyError(
-            f"Missing the following keys for the {model_name} in the checkpoint: "
-            f"[{', '.join(missing_keys)}].")
+    @property
+    def mm_token_ids(self):
+        return self.image_token_ids

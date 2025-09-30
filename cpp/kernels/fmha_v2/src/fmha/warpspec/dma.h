@@ -755,7 +755,7 @@ struct DMA
             for (int kgroup_idx = 0; kgroup_idx < Kernel_traits::BMM2_K_GROUPS; kgroup_idx++)
             {
 #pragma unroll
-                for (int dgroup_idx = 0; dgroup_idx < Kernel_traits::D_GROUPS; dgroup_idx++)
+                for (int dgroup_idx = 0; dgroup_idx < Kernel_traits::DV_GROUPS; dgroup_idx++)
                 {
                     // Src smem block is k first then d
                     uint32_t src_offset = (kgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::D_PER_GROUP
@@ -764,7 +764,7 @@ struct DMA
 
                     // Dst smem block is d first then k
                     uint32_t dst_offset = (dgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::D_PER_GROUP
-                                              + kgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::D)
+                                              + kgroup_idx * Kernel_traits::BMM2_K_PER_GROUP * Kernel_traits::DV)
                         * Kernel_traits::ELEMENT_BYTES;
 
                     transposer.template transpose_<false>(smem_v_src + src_offset, smem_v_dst + dst_offset);

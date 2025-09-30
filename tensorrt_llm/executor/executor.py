@@ -21,9 +21,11 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
@@ -122,6 +124,8 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt_id: Optional[int] = None,
+        arrival_time: Optional[float] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -145,7 +149,9 @@ class GenerationExecutor(ABC):
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             multimodal_params=multimodal_params,
-            scheduling_params=scheduling_params)
+            scheduling_params=scheduling_params,
+            cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -247,21 +253,29 @@ class GenerationExecutor(ABC):
         """
         if error is not None:
             # For details please refer to the comment of `GenerationResult.error`
-            if isinstance(error, Exception):
+
+            if isinstance(error, RequestError):
+                # A per-request error, can be captured and ignored
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+            elif isinstance(error, str):
+                # A per-request error, can be captured and ignored
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+                    print_colored(str(traceback.extract_stack()) + "\n", "red")
+                error = RequestError(error)
+            else:
                 # Serious error from background thread or process
+                if not isinstance(error, BaseException):
+                    error = RuntimeError(repr(error))
                 if enable_llm_debug():
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
                 self.shutdown()
-                raise error
-            elif isinstance(error, str):
-                if enable_llm_debug():
-                    print_colored(f"Got per-request error: {repr(error)}\n",
-                                  "red")
-                    print_colored(str(traceback.extract_stack()) + "\n", "red")
-                # A per-request error, can be captured and ignored
-                raise RequestError(error)
+            raise error
 
         # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
         # more than one error.
@@ -354,7 +368,10 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -381,6 +398,9 @@ class GenerationExecutor(ABC):
             "engine": engine,
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
+            "hf_model_dir": hf_model_dir,
+            "tokenizer": tokenizer,
+            "llm_args": llm_args,
         }
 
         if lora_config:
@@ -399,8 +419,7 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                kv_connector_config=kv_connector_config)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -410,10 +429,10 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
-            return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor,
-                                            garbage_collection_gen0_threshold=
-                                            garbage_collection_gen0_threshold)
+            return GenerationExecutorWorker(
+                **worker_kwargs,
+                is_llm_executor=is_llm_executor,
+                kv_connector_config=kv_connector_config)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -426,8 +445,7 @@ class GenerationExecutor(ABC):
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                kv_connector_config=kv_connector_config)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -439,8 +457,7 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                kv_connector_config=kv_connector_config)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

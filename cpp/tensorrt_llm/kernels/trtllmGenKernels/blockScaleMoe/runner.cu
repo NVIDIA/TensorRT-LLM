@@ -60,9 +60,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
     int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
-    void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-    int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-    RoutingMethodType routingMethodType, cudaStream_t stream)
+    void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
+    int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
+    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream)
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
@@ -73,12 +73,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mUsePdl = true;
 
         // output:
-        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrTopKPacked = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrExpertWeights = expertWeights;
+        routingData.mPtrTopKWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
         routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -86,7 +86,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         // input:
         routingData.mPtrRoutingBias = routingBias;
-        routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        routingData.mPtrTopKIds = expertIds;
         routingData.mNumTokens = numTokens;
         routingData.mNumExperts = numExperts;
         routingData.mNumExpertGroups = nGroup;
@@ -112,12 +114,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mUsePdl = true;
 
         // output:
-        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrTopKPacked = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrExpertWeights = expertWeights;
+        routingData.mPtrTopKWeights = expertWeights;
 
         routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
         routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -127,7 +129,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // input:
         // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
         // routingData.mPtrRoutingBias = routingBias;
-        routingData.mPtrScores = routingLogits;
+
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        routingData.mPtrTopKIds = expertIds;
         // routingData.mPtrIn = args.mInputActs;
         routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
@@ -158,18 +163,18 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
         routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
 
-        routingData.mPtrScores = routingLogits;
-
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
         //
         // Outputs
         //
-        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrTopKPacked = routingExpertIndexes;
         routingData.mPtrExpertCounts = expertCountHistogram;
         routingData.mPtrPermutedIdxSize = permutedIdxSize;
         routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
         routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-        routingData.mPtrExpertWeights = expertWeights;
-
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
         //
         // Grouped Gemm Launch Config Buffers
         //

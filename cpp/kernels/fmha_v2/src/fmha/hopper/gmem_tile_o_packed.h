@@ -1222,6 +1222,14 @@ struct Gmem_tile_o_qgmma_fp32_16bits
     inline __device__ Gmem_tile_o_qgmma_fp32_16bits(
         Params const& params, Block_info const& block_info, Shared&&, int tidx, int cta_row_offset = 0)
         : params_o_stride_in_bytes_(params.o_stride_in_bytes)
+        , params_scale_bmm2_(
+#ifdef GENERATE_CUBIN
+              // Specialized for trt-llm generated cubins only.
+              params.scale_bmm2_d ? *params.scale_bmm2_d : params.scale_bmm2
+#else
+              params.scale_bmm2
+#endif
+              )
         , actual_seqlen_(block_info.actual_seqlen)
         , o_ptr_(reinterpret_cast<char*>(params.o_ptr))
     {
@@ -1251,21 +1259,24 @@ struct Gmem_tile_o_qgmma_fp32_16bits
     inline __device__ void store(Accumulators const (&acc)[M][N])
     {
         int64_t const step_m = 8 * params_o_stride_in_bytes_;
-        // we assume M = 1. some shortcuts.
-        static_assert(M == 1);
-
-#define STORE_COLUMN(idx)                                                                                              \
-    {                                                                                                                  \
-        float _reg0 = acc[0][mma_ni].elt(((ci + 0) * ROWS_PER_THREAD + ri) * 2 + idx);                                 \
-        float _reg1 = acc[0][mma_ni].elt(((ci + 1) * ROWS_PER_THREAD + ri) * 2 + idx);                                 \
-        static_assert(std::is_same_v<Output_type, bf16_t> || std::is_same_v<Output_type, fp16_t>);                     \
-        uint32_t _out = fmha::float2_to_16bit_2<Output_type>(_reg0, _reg1);                                            \
-        int64_t _offset = (int64_t) ri * step_m + (int64_t) (ci + mma_ni * COLS_PER_THREAD) * STEP_N;                  \
-        fmha::stg(o_ptr_ + _offset + 4 * idx, _out);                                                                   \
-    }
+#ifdef UNIFIED_EPILOGUE_SCALE
+        constexpr bool Scale = false;
+#else
+        constexpr bool Scale = true;
+#endif
 #define STORE_COLUMNS()                                                                                                \
     {                                                                                                                  \
-        STORE_COLUMN(0) STORE_COLUMN(1)                                                                                \
+        /* we assume M = 1. some shortcuts. */                                                                         \
+        static_assert(M == 1);                                                                                         \
+        uint4 _src = {                                                                                                 \
+            .x = acc[0][mma_ni].reg(((ci + 0) * ROWS_PER_THREAD + ri) * 2),                                            \
+            .y = acc[0][mma_ni].reg(((ci + 1) * ROWS_PER_THREAD + ri) * 2),                                            \
+            .z = acc[0][mma_ni].reg(((ci + 0) * ROWS_PER_THREAD + ri) * 2 + 1),                                        \
+            .w = acc[0][mma_ni].reg(((ci + 1) * ROWS_PER_THREAD + ri) * 2 + 1),                                        \
+        };                                                                                                             \
+        uint2 _dst = Acc_packer<float, Output_type, Scale>::run(this, _src);                                           \
+        int64_t _offset = (int64_t) ri * step_m + (int64_t) (ci + mma_ni * COLS_PER_THREAD) * STEP_N;                  \
+        fmha::stg(o_ptr_ + _offset, _dst);                                                                             \
     }
 
 #pragma unroll
@@ -1303,6 +1314,8 @@ struct Gmem_tile_o_qgmma_fp32_16bits
 
     // The stride between rows for the QKV matrice.
     int64_t params_o_stride_in_bytes_;
+    // Scaling factor; this usually means QKV descale factor in actuality
+    uint32_t params_scale_bmm2_;
     // The pointer.
     char* o_ptr_;
     // The row loaded by this thread.

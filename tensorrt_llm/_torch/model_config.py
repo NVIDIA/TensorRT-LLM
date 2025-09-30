@@ -1,11 +1,15 @@
+import contextlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
 
+import filelock
 import torch
 import transformers
+from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
@@ -58,6 +62,50 @@ class MoeLoadBalancerConfig:
             return None
 
 
+@contextlib.contextmanager
+def config_file_lock(timeout: int = 10):
+    """
+    Context manager for file locking when loading pretrained configs.
+
+    This prevents race conditions when multiple processes try to download/load
+    the same model configuration simultaneously.
+
+    Args:
+        timeout: Maximum time to wait for lock acquisition in seconds
+    """
+    # Use a single global lock file in HF cache directory
+    # This serializes all model loading operations to prevent race conditions
+    lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
+
+    # Create and acquire the lock
+    lock = filelock.FileLock(str(lock_path), timeout=timeout)
+
+    try:
+        with lock:
+            yield
+    except (PermissionError, filelock.Timeout):
+        # Fallback to tempdir
+        tmp_dir = Path(tempfile.gettempdir())
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_lock_path = tmp_dir / "_remote_code.lock"
+        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
+        try:
+            with tmp_lock:
+                yield
+        except filelock.Timeout:
+            logger.warning(
+                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
+            )
+            # proceed without lock
+            yield
+        except (PermissionError) as e:
+            logger.warning(
+                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
+            )
+            # proceed without lock
+            yield
+
+
 @dataclass(kw_only=True)
 class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
@@ -85,6 +133,8 @@ class ModelConfig(Generic[TConfig]):
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
+    # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
+    use_low_precision_moe_combine: bool = False
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
@@ -358,16 +408,20 @@ class ModelConfig(Generic[TConfig]):
                         checkpoint_dir: str,
                         trust_remote_code=False,
                         **kwargs):
-        pretrained_config = transformers.AutoConfig.from_pretrained(
-            checkpoint_dir,
-            trust_remote_code=trust_remote_code,
-        )
+        # Use file lock to prevent race conditions when multiple processes
+        # try to import/cache the same remote model config file
+        with config_file_lock():
+            pretrained_config = transformers.AutoConfig.from_pretrained(
+                checkpoint_dir,
+                trust_remote_code=trust_remote_code,
+            )
 
-        # Find the cache path by looking for the config.json file which should be in all
-        # huggingface models
-        model_dir = Path(
-            transformers.utils.hub.cached_file(checkpoint_dir,
-                                               'config.json')).parent
+            # Find the cache path by looking for the config.json file which should be in all
+            # huggingface models
+            model_dir = Path(
+                transformers.utils.hub.cached_file(checkpoint_dir,
+                                                   'config.json')).parent
+
         quant_config = QuantConfig()
         layer_quant_config = None
         moe_backend = kwargs.get('moe_backend', 'CUTLASS')
@@ -458,7 +512,8 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
-                    mlp_hidden_size = self._infer_nemotron_ffn_mult()
+                    mlp_hidden_size = self._infer_nemotron_ffn_mult(
+                    ) // self.mapping.tp_size
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"

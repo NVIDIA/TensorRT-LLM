@@ -19,6 +19,7 @@ endif()
 
 add_subdirectory(common)
 add_subdirectory(kernels)
+add_subdirectory(multi_gpu)
 add_subdirectory(layers)
 add_subdirectory(runtime)
 add_subdirectory(thop)
