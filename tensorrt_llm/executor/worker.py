@@ -11,7 +11,6 @@ from typing import Callable, List, Optional, Tuple, Union
 import zmq
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
 from ..bindings import executor as tllm
