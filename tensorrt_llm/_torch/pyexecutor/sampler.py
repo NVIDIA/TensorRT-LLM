@@ -1111,10 +1111,12 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
-    def process_draft_tokens(self, request: LlmRequest,
-                             new_tokens: list[list[list[int]]],
-                             new_tokens_tensor: torch.Tensor,
-                             resource_manager: Optional[ResourceManager] = None) -> int:
+    def process_draft_tokens(
+            self,
+            request: LlmRequest,
+            new_tokens: list[list[list[int]]],
+            new_tokens_tensor: torch.Tensor,
+            resource_manager: Optional[ResourceManager] = None) -> int:
         if request.py_draft_logits is None:
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:
@@ -1153,7 +1155,8 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             processed = 1
-            num_accepted = self.process_draft_tokens(req, new_tokens, state.host.new_tokens, 
+            num_accepted = self.process_draft_tokens(req, new_tokens,
+                                                     state.host.new_tokens,
                                                      resource_manager)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
