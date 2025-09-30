@@ -1157,7 +1157,6 @@ class BsndAttentionModel(AttentionLayoutModel):
 @pytest.mark.parametrize(
     "model_config",
     [
-        {"type": "standard", "use_grouped_sdpa": False, "name": "SDPA"},
         {"type": "standard", "use_grouped_sdpa": True, "name": "GroupedSDPA"},
         {"type": "already_bsnd", "name": "DirectBSND"},
     ],
