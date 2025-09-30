@@ -249,7 +249,6 @@ TEST_F(SparseKvCacheTest, UpdateSparseKvCacheAfterFmha)
     params.size_per_head = mHeadSize;
     params.cache_type = KvCacheDataType::BASE;
     params.rotary_embedding_dim = 0; // No rotary embedding for this test
-    params.num_sparse_kv_tokens = 8; // Total sparse tokens: 5 (batch 0) + 3 (batch 1)
 
     params.setCommonParameters();
 

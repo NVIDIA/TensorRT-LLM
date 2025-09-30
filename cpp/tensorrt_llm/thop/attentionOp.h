@@ -55,9 +55,9 @@ void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optiona
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
-    std::vector<std::optional<torch::Tensor>> mla_tensor_params, 
-    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
-    std::vector<bool> spec_decoding_bool_params, std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
+    std::vector<std::optional<torch::Tensor>> mla_tensor_params, std::optional<int64_t> attention_chunk_size,
+    std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
+    std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
     std::vector<torch::optional<torch::Tensor>> sparse_attention_params);
 
 } // namespace torch_ext

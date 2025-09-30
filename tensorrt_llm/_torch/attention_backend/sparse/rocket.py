@@ -865,8 +865,8 @@ class RocketKVCacheManager(KVCacheManager):
         return (token_count + tokens_per_page) // tokens_per_page
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 tokens_per_block: int, mapping: Mapping):
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+                                 **kwargs):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -896,6 +896,7 @@ class RocketKVCacheManager(KVCacheManager):
 
         # K and V
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
+        tokens_per_block = kwargs['tokens_per_block']
         sparse_attn_config = model_config.sparse_attention_config
         kt_tokens_per_block = next_power_of_two(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))

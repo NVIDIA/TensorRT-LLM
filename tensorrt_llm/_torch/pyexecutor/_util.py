@@ -11,8 +11,8 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SpeculativeConfig,
-                                          TorchLlmArgs, SparseAttentionConfig)
+                                          SamplerType, SparseAttentionConfig,
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -106,11 +106,13 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
         kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
-            model_config, self._tokens_per_block, mapping)
+            model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
-                draft_model_config, self._tokens_per_block, mapping)
+                draft_model_config,
+                mapping,
+                tokens_per_block=self._tokens_per_block)
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,

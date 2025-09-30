@@ -561,8 +561,8 @@ class KVCacheManager(BaseResourceManager):
                                  scaling_factor_dtype)
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 tokens_per_block: int, mapping: Mapping):
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+                                 **kwargs):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
