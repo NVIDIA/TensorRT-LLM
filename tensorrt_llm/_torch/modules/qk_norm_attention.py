@@ -156,11 +156,20 @@ class QKNormRoPEAttention(Attention):
         config: ModelConfig,
         q_scaling: float = 1.0,
         disable_deep_gemm: bool = False,
+        use_gemma_rms_norm: bool = False,
+        attn_output_gate: Optional[bool] = None,
     ):
         self.pretrained_config = config.pretrained_config
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
         self.skip_rope = skip_rope
+        if use_gemma_rms_norm:
+            assert fuse_qk_norm_rope is False, "fused_qk_norm_rope is not supported for gemma rms norm."
+
+        # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
+        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope
+        if attn_output_gate and use_gemma_rms_norm:
+            rope_fusion = False
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
 
@@ -173,23 +182,26 @@ class QKNormRoPEAttention(Attention):
             pos_embd_params=pos_embd_params,
             # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP,
             # and self.rotary_emb will be skipped in the overridden apply_rope.
-            rope_fusion=not self.fuse_qk_norm_rope and not skip_rope,
+            rope_fusion=rope_fusion,
             layer_idx=layer_idx,
             dtype=dtype,
             dense_bias=dense_bias,
             config=config,
             q_scaling=q_scaling,
             disable_deep_gemm=disable_deep_gemm,
+            attn_output_gate=attn_output_gate,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
-                              has_weights=True)
+                              has_weights=True,
+                              use_gemma_rms_norm=use_gemma_rms_norm)
         self.k_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
-                              has_weights=True)
+                              has_weights=True,
+                              use_gemma_rms_norm=use_gemma_rms_norm)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 

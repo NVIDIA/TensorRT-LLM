@@ -2303,6 +2303,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--tp_size=8",
             "--max_batch_size=32",
+            "--max_num_tokens=256",
         ],
                          stdout=running_log)
         if model_name in mapping:
@@ -2366,6 +2367,7 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         "--tp_size=2",
+        "--max_num_tokens=256",
     ])
 
 

@@ -23,7 +23,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
-from .config_utils import is_mla, is_nemotron_hybrid
+from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -452,6 +452,56 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
             )
+        elif is_qwen3_next(config):
+            if self._max_beam_width > 1:
+                raise ValueError(
+                    "MambaHybridCacheManager + beam search is not supported yet."
+                )
+
+            if not estimating_kv_cache and self._kv_connector_manager is not None:
+                raise NotImplementedError(
+                    "Connector manager is not supported for MambaHybridCacheManager."
+                )
+            config = model_engine.model.model_config.pretrained_config
+            mamba_layer_mask = [
+                True if i % config.full_attention_interval
+                != config.full_attention_interval - 1 else False
+                for i in range(num_hidden_layers)
+            ]
+            layer_mask = [
+                False if i % config.full_attention_interval
+                != config.full_attention_interval - 1 else True
+                for i in range(num_hidden_layers)
+            ]
+            num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
+                config.full_attention_interval - 1)
+            num_layers = num_hidden_layers - num_mamba_layers
+            kv_cache_manager = MambaHybridCacheManager(
+                # mamba cache parameters
+                config.linear_key_head_dim,
+                config.linear_conv_kernel_dim,
+                config.linear_num_value_heads,
+                config.linear_num_key_heads,
+                config.linear_value_head_dim,
+                num_mamba_layers,
+                mamba_layer_mask,
+                config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
+                # kv cache parameters
+                self._kv_cache_config,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=num_layers,
+                layer_mask=layer_mask,
+                num_kv_heads=num_key_value_heads,
+                head_dim=head_dim,
+                tokens_per_block=self._tokens_per_block,
+                max_seq_len=self._max_seq_len,
+                max_batch_size=self._max_batch_size,
+                mapping=mapping,
+                dtype=kv_cache_dtype,
+                spec_config=spec_config,
+            )
         else:
             # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
             is_vswa = self._kv_cache_config.max_attention_window is not None and len(
@@ -708,9 +758,18 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
+    max_total_draft_tokens = 0
+    if speculative_config is None:
+        max_total_draft_tokens = 0
+    elif hasattr(speculative_config, 'max_total_draft_tokens'):
+        max_total_draft_tokens = speculative_config.max_total_draft_tokens
+    else:
+        max_total_draft_tokens = max_draft_len
+
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
     )

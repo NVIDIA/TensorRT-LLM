@@ -35,7 +35,7 @@ from ..custom_ops.attention_interface import CacheConfig, Dim, DynamicShapeCallb
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry, ShardingConfigSource
-from .quant_config_reader import QuantConfigReader, QuantConfigReaderRegistry
+from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
 
 
 @contextmanager
@@ -218,6 +218,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
         model.eval()
+
+        if self._quant_config_reader is not None:
+            model = self._quant_config_reader.post_process_model(model, model_config)
 
         return model
 
@@ -435,13 +438,10 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config_reader is not None:
             return
-        # TODO: specified by user or auto-detect
-        reader_cls = QuantConfigReaderRegistry.get("modelopt")
-        result = reader_cls.from_file(fetched_dir)
+        result = autodetect_quant_config_reader(fetched_dir)
         if result is None:
             return
         reader, extra_model_kwargs = result
-
         if reader is not None:
             self._quant_config_reader = reader
             self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)
