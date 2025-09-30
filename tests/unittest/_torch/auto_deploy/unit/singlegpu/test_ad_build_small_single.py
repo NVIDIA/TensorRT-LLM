@@ -92,6 +92,9 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         ),
         get_small_model_config_pytest_param(
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            pytest_param_kwargs={
+                "marks": pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5505835")
+            },
             attn_backend="flashinfer",
             compile_backend="torch-simple",
         ),

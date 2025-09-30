@@ -140,7 +140,6 @@ def _torch_causal_conv1d_decode(
 
 @torch.library.custom_op("auto_deploy::torch_causal_conv_prepare_metadata", mutates_args=())
 def torch_causal_conv_prepare_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
@@ -153,7 +152,7 @@ def torch_causal_conv_prepare_metadata(
 
     Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
     """
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
 
     seq_start = torch.zeros_like(seq_len_sanitized)
@@ -167,9 +166,9 @@ def torch_causal_conv_prepare_metadata(
 
 @torch_causal_conv_prepare_metadata.register_fake
 def torch_causal_conv_prepare_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
     return (
         torch.empty_like(seq_len_sanitized),

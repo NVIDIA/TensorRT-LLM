@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.fx as fx
-from torch.fx import GraphModule, Node
+import torch.nn as nn
+from torch.fx import Graph, GraphModule, Node
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -106,23 +107,24 @@ class DetectHFAttnLayers(BaseTransform):
     This is achieved by running a single forward pass to profile the model.
     """
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        model = gm.factory_model
-
         # Register profiler attn operator
         ALL_ATTENTION_FUNCTIONS.register("ad_profile_mha", fake_profiler_mha)
 
+        # let's start a fake graph module for making tracing/profiling easier
+        mod._gm = GraphModule(nn.Module(), Graph())
+
         # run the forward pass with the profiling function
-        with switch_attn_implementation(model.config, "ad_profile_mha"):
+        with switch_attn_implementation(mod.config, "ad_profile_mha"):
             # update the graph module with the fake attn nodes during the profiling run
-            profiling_metadata = {"gm": gm, "num_matches": 0}
-            model.forward(**cm.named_args, profiling_metadata=profiling_metadata)
+            profiling_metadata = {"gm": mod._gm, "num_matches": 0}
+            mod.forward(**cm.named_args, profiling_metadata=profiling_metadata)
 
         info = TransformInfo(
             skipped=False,
@@ -131,7 +133,7 @@ class DetectHFAttnLayers(BaseTransform):
             has_valid_shapes=True,
         )
 
-        return gm, info
+        return mod, info
 
 
 def get_cached_attn(
@@ -188,9 +190,9 @@ def get_cached_attn(
     return cached_attn
 
 
-def forward_with_prepare_metadata(gm: GraphModule, **cm_kwargs):
+def forward_with_prepare_metadata(mod: nn.Module, **cm_kwargs):
     """Run prepare_metadata as pre-processing step, add to kwargs, and then run regular forward."""
-
+    gm = mod._gm
     if hasattr(gm, "_prepare_metadata_info"):
         # collect args+constant args
         args = [cm_kwargs[k] for k in gm._prepare_metadata_info["arg_names"]]
@@ -201,7 +203,7 @@ def forward_with_prepare_metadata(gm: GraphModule, **cm_kwargs):
         return_names = gm._prepare_metadata_info["return_names"]
         cm_kwargs.update({k: v for k, v in zip(return_names, metadata)})
 
-    return gm.factory_model.forward(**cm_kwargs)
+    return mod._original_forward(**cm_kwargs)
 
 
 # TODO: how running different kv cache transforms look like? This one below wouldn't work if we
@@ -242,28 +244,29 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         attn_node.meta["metadata_cache_buffer_keys"] = (*meta_nodes, *cache_nodes, *buffer_nodes)
         attn_node.meta["constants"] = constants
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         # switch to cached attn inputs from now
         cm.info.switch_to_cached_attn_inputs()
 
-        # run actual insert cached attn transform
-        gm, info = super()._apply(gm, cm, factory, shared_config)
+        # run actual insert cached attn transform with fake graph module
+        mod._gm, info = super()._apply(mod._gm, cm, factory, shared_config)
 
         # register cached attn operator and switch to cached forward function
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", get_cached_attn(self.attn_descriptor))
-        gm.forward = types.MethodType(forward_with_prepare_metadata, gm)
+        mod._original_forward = mod.forward
+        mod.forward = types.MethodType(forward_with_prepare_metadata, mod)
 
-        # switch to cached attn implementation but _only_ for modules/configs that have a cached
+        # switch to cached attn implementation but _only_ for submodules/configs that have a cached
         # attn node (we don't want to switch to cached attn implementation for all modules)
-        for mod in gm.factory_model.modules():
-            if hasattr(mod, "_node_ref"):
-                mod.config._attn_implementation = "ad_cached_mha"
+        for submod in mod.modules():
+            if hasattr(submod, "_node_ref"):
+                submod.config._attn_implementation = "ad_cached_mha"
 
         # we assume graph is clean again by definition
         info_dict = info.model_dump()
@@ -271,4 +274,4 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         info_dict["has_valid_shapes"] = True
         info = TransformInfo(**info_dict)
 
-        return gm, info
+        return mod, info
