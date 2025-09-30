@@ -55,7 +55,7 @@ uvicorn
 setuptools<80
 ordered-set
 peft
-patchelf==0.18.0
+patchelf>=0.17.2.4
 einops
 flashinfer-python>=0.3.0
 opencv-python-headless
