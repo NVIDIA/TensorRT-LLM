@@ -45,7 +45,7 @@ def moe_custom_op(
     router_logits: torch.Tensor,
     do_finalize: bool,
     output_dtype: Optional[torch.dtype],
-    all_tp_rank_num_tokens: Optional[List[int]],
+    all_rank_num_tokens: Optional[List[int]],
     use_dp_padding: Optional[bool],
 ) -> List[torch.Tensor]:
     moe_layer = extract_extra_attrs(layer_idx)
@@ -58,7 +58,7 @@ def moe_custom_op(
         router_logits,
         do_finalize=do_finalize,
         output_dtype=output_dtype,
-        all_tp_rank_num_tokens=all_tp_rank_num_tokens,
+        all_rank_num_tokens=all_rank_num_tokens,
         use_dp_padding=use_dp_padding,
     )
 
@@ -77,7 +77,7 @@ def _(
     router_logits,
     do_finalize,
     output_dtype,
-    all_tp_rank_num_tokens,
+    all_rank_num_tokens,
     use_dp_padding,
 ):
     moe_layer = extract_extra_attrs(layer_idx)
@@ -88,7 +88,7 @@ def _(
         router_logits,
         do_finalize=do_finalize,
         output_dtype=output_dtype,
-        all_tp_rank_num_tokens=all_tp_rank_num_tokens,
+        all_rank_num_tokens=all_rank_num_tokens,
         use_dp_padding=use_dp_padding,
     )
 
@@ -206,7 +206,7 @@ class MoE(nn.Module):
         *,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
-        all_tp_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -219,15 +219,15 @@ class MoE(nn.Module):
         *,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
-        all_tp_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
         assert do_finalize, "Default forward_fake does not support do_finalize=False"
         data_type = output_dtype if is_nvfp4_input else x.dtype
-        num_tokens = all_tp_rank_num_tokens[
-            self.tp_rank] if all_tp_rank_num_tokens else x.shape[0]
+        num_tokens = all_rank_num_tokens[
+            self.tp_rank] if all_rank_num_tokens else x.shape[0]
         hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
         return x.new_empty((num_tokens, hidden_size), dtype=data_type)
 
@@ -240,7 +240,7 @@ class MoE(nn.Module):
         router_logits: torch.Tensor,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
-        all_tp_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -260,7 +260,7 @@ class MoE(nn.Module):
                 router_logits,
                 do_finalize,
                 output_dtype,
-                all_tp_rank_num_tokens,
+                all_rank_num_tokens,
                 use_dp_padding,
             )
             if do_finalize:
@@ -273,7 +273,7 @@ class MoE(nn.Module):
                 router_logits,
                 do_finalize=do_finalize,
                 output_dtype=output_dtype,
-                all_tp_rank_num_tokens=all_tp_rank_num_tokens,
+                all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 **kwargs,
             )
@@ -330,7 +330,7 @@ class MoE(nn.Module):
     def reducescatter_or_allreduce(
         self,
         inputs,
-        all_tp_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
     ):
         """
@@ -343,7 +343,7 @@ class MoE(nn.Module):
                     inputs,
                     self.mapping,
                     dim=0,
-                    sizes=None if use_dp_padding else all_tp_rank_num_tokens)
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs

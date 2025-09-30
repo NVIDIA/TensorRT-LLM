@@ -54,7 +54,7 @@ from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import LlmRequest, get_draft_token_length
+from .llm_request import get_draft_token_length
 from .model_loader import ModelLoader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -629,14 +629,9 @@ class PyTorchModelEngine(ModelEngine):
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
 
-        # TODO: current warmup_request is not suitable for context parallelism
-        # TODO: check whether this is actually the case for Helix parallelism:
-        # mainly, the dummy requests need to be split across KVP ranks for Helix
+        # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type is not None:
-            print(
-                "[ModelEngine::warmup] EARLY RETURN since cp_type is not None. cp_type: ",
-                cp_type)
+        if cp_type == CpType.STAR:
             return
 
         if self._torch_compile_enabled:
@@ -1012,15 +1007,6 @@ class PyTorchModelEngine(ModelEngine):
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
-
-    def _get_helix_prompt_length(self, request: LlmRequest):
-        # we split the request across KVP ranks for Helix parallelism
-        kvp_rank = self.mapping.cp_rank
-        len_per_rank = (request.py_prompt_len + self.mapping.cp_size -
-                        1) // self.mapping.cp_size
-        len_this_rank = len_per_rank if kvp_rank != self.mapping.cp_size - 1 else request.py_prompt_len - len_per_rank * (
-            self.mapping.cp_size - 1)
-        return len_this_rank
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -1622,18 +1608,16 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_tp_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
 
-                spec_all_tp_rank_num_tokens = [
-                    item[0] for item in all_tp_rank_num_tokens
+                spec_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
                 ]
-                all_tp_rank_num_seqs = [
-                    item[1] for item in all_tp_rank_num_tokens
-                ]
-                spec_metadata.all_tp_rank_num_tokens = spec_all_tp_rank_num_tokens
-                spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
+                all_rank_num_seqs = [item[1] for item in all_rank_num_tokens]
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
 
         if mm_token_indices is not None:
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
@@ -1732,9 +1716,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
         if self.enable_attention_dp:
-            all_tp_rank_num_tokens = self.dist.allgather(
-                attn_metadata.num_tokens)
-            attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
 
         virtual_num_tokens = num_tokens
         if attn_metadata.padded_num_tokens is not None:
@@ -1783,26 +1765,24 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_tp_rank_num_tokens = self.dist.tp_allgather([
+                all_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                attn_all_tp_rank_num_tokens = [
-                    item[0] for item in all_tp_rank_num_tokens
+                attn_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
                 ]
-                spec_all_tp_rank_num_tokens = [
-                    item[1] for item in all_tp_rank_num_tokens
+                spec_all_rank_num_tokens = [
+                    item[1] for item in all_rank_num_tokens
                 ]
-                all_tp_rank_num_seqs = [
-                    item[2] for item in all_tp_rank_num_tokens
-                ]
-                attn_metadata.all_tp_rank_num_tokens = attn_all_tp_rank_num_tokens
-                spec_metadata.all_tp_rank_num_tokens = spec_all_tp_rank_num_tokens
-                spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
+                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
+                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_tp_rank_num_tokens = self.dist.tp_allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return inputs, None
 
@@ -2014,9 +1994,9 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
         if self.enable_attention_dp:
-            all_tp_rank_num_tokens = self.dist.tp_allgather(
+            all_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)
-            attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return {
             'attn_metadata': attn_metadata,
@@ -2126,19 +2106,13 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
-        cp_type = None if self.mapping is None else self.mapping.cp_config.get(
-            "cp_type", None)
-        if cp_type == CpType.HELIX:
-            return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                           attn_metadata, spec_metadata,
-                                           new_tensors_device,
-                                           cache_indirection_buffer)
-        elif cp_type == CpType.STAR:
-            return self._prepare_star_attention_inputs(scheduled_requests,
-                                                       kv_cache_manager,
-                                                       attn_metadata)
-        elif cp_type is not None:
-            assert False, f'Unsupport cp_type {cp_type}'
+        if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
+            cp_type = self.mapping.cp_config['cp_type']
+            if CpType.STAR == cp_type:
+                return self._prepare_star_attention_inputs(
+                    scheduled_requests, kv_cache_manager, attn_metadata)
+            else:
+                assert False, f'Unsupport cp_type {cp_type}'
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,

@@ -1222,7 +1222,7 @@ class MTPEagleWorker(MTPWorker):
             if i == 0:
                 hidden_states = draft_model.mtp_layers[0](
                     embed_tokens=draft_model.embed_tokens,
-                    all_tp_rank_num_tokens=spec_metadata.all_tp_rank_num_tokens,
+                    all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
                     **inputs)
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.mtp_num_modules + 1)).long()
@@ -1234,7 +1234,7 @@ class MTPEagleWorker(MTPWorker):
             else:
                 hidden_states = draft_model.mtp_layers[0](
                     embed_tokens=draft_model.embed_tokens,
-                    all_tp_rank_num_tokens=spec_metadata.
+                    all_rank_num_tokens=spec_metadata.
                     subseq_all_rank_num_tokens,
                     **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
