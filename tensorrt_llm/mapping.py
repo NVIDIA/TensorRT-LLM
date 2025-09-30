@@ -148,6 +148,11 @@ class Mapping(object):
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
+        #################################################################
+        # TODO: Remove this hardcoding and obtain cp_config from llm_args.
+        if cp_size > 1:
+            cp_config = {"cp_type": CpType.HELIX}
+        #################################################################
         cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
             "cp_type", CpType.ULYSSES)
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size

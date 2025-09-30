@@ -1600,6 +1600,9 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                print(
+                    "[PyExecutor::_prepare_disagg_gen_transmission_complete]: TRANSMISSION COMPLETE for request ID: ",
+                    req.py_request_id)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
@@ -1609,6 +1612,9 @@ class PyExecutor:
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
+                    print(
+                        f"[PyExecutor::_prepare_disagg_gen_transmission_complete]: Adding new token {first_gen_tokens[beam]} for beam {beam}."
+                    )
                     req.add_new_token(first_gen_tokens[beam], beam)
 
     @nvtx_range("_recv_disagg_gen_cache")
@@ -1760,12 +1766,13 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # note: helix parallelism uses the same logic as tp parallelism here
+        if 'cp_type' in cp_config and cp_config['cp_type'] != CpType.HELIX:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
+                assert False, f'Unsupported cp type {cp_type.name}'
         else:
             self._update_request_states_tp(scheduled_requests)
 

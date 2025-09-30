@@ -19,6 +19,7 @@
 #include "cuda_runtime_api.h"
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
@@ -271,6 +272,104 @@ public:
                     continue;
                 }
             }
+
+            // TODO: remove this
+            // Print all RunnerParams values at the start of the while loop
+            // TLLM_LOG_INFO("--- RunnerParams values ---");
+            // TLLM_LOG_INFO("mQkvLayout = %d", static_cast<int>(params.mQkvLayout));
+            // TLLM_LOG_INFO("mMaskType = %d", static_cast<int>(params.mMaskType));
+            // TLLM_LOG_INFO("mKernelType = %d", static_cast<int>(params.mKernelType));
+            // TLLM_LOG_INFO("mTileScheduler = %d", static_cast<int>(params.mTileScheduler));
+            // TLLM_LOG_INFO("mMultiCtasKvMode = %d", static_cast<int>(params.mMultiCtasKvMode));
+            // TLLM_LOG_INFO("qPtr = %p", params.qPtr);
+            // TLLM_LOG_INFO("kPtr = %p", params.kPtr);
+            // TLLM_LOG_INFO("vPtr = %p", params.vPtr);
+            // TLLM_LOG_INFO("kvPtr = %p", params.kvPtr);
+            // TLLM_LOG_INFO("qkvPtr = %p", params.qkvPtr);
+            // TLLM_LOG_INFO("kSfBasePtr = %p", params.kSfBasePtr);
+            // TLLM_LOG_INFO("vSfBasePtr = %p", params.vSfBasePtr);
+            // TLLM_LOG_INFO("customMaskPtr = %p", params.customMaskPtr);
+            // TLLM_LOG_INFO("customMaskOffsetsPtr = %p", params.customMaskOffsetsPtr);
+            // TLLM_LOG_INFO("firstSparseMaskOffsetsKvPtr = %p", params.firstSparseMaskOffsetsKvPtr);
+            // TLLM_LOG_INFO("multiCtasKvCounterPtr = %p", params.multiCtasKvCounterPtr);
+            // TLLM_LOG_INFO("seqLensKvPtr = %p", params.seqLensKvPtr);
+            // TLLM_LOG_INFO("cumSeqLensQPtr = %p", params.cumSeqLensQPtr);
+            // TLLM_LOG_INFO("cumSeqLensKvPtr = %p", params.cumSeqLensKvPtr);
+            // TLLM_LOG_INFO("kvPageIdxPtr = %p", params.kvPageIdxPtr);
+            // TLLM_LOG_INFO("outputScalePtr = %p", params.outputScalePtr);
+            // TLLM_LOG_INFO("scaleSoftmaxLog2Ptr = %p", params.scaleSoftmaxLog2Ptr);
+            // TLLM_LOG_INFO("kvSfScalePtr = %p", params.kvSfScalePtr);
+            // TLLM_LOG_INFO("oSfScalePtr = %p", params.oSfScalePtr);
+            // TLLM_LOG_INFO("multiCtasKvScratchPtr = %p", params.multiCtasKvScratchPtr);
+            // TLLM_LOG_INFO("softmaxStatsPtr = %p", params.softmaxStatsPtr);
+            // TLLM_LOG_INFO("oPtr = %p", params.oPtr);
+            // TLLM_LOG_INFO("oSfPtr = %p", params.oSfPtr);
+            // TLLM_LOG_INFO("mHeadDimQk = %d", params.mHeadDimQk);
+            // TLLM_LOG_INFO("mHeadDimV = %d", params.mHeadDimV);
+            // TLLM_LOG_INFO("mNumHeadsQ = %d", params.mNumHeadsQ);
+            // TLLM_LOG_INFO("mNumHeadsKv = %d", params.mNumHeadsKv);
+            // TLLM_LOG_INFO("mNumHeadsQPerKv = %d", params.mNumHeadsQPerKv);
+            // TLLM_LOG_INFO("mBatchSize = %d", params.mBatchSize);
+            // TLLM_LOG_INFO("mMaxSeqLenCacheKv = %d", params.mMaxSeqLenCacheKv);
+            // TLLM_LOG_INFO("mMaxSeqLenQ = %d", params.mMaxSeqLenQ);
+            // TLLM_LOG_INFO("mMaxSeqLenKv = %d", params.mMaxSeqLenKv);
+            // TLLM_LOG_INFO("mAttentionWindowSize = %d", params.mAttentionWindowSize);
+            // TLLM_LOG_INFO("mChunkedAttentionSize = %d", params.mChunkedAttentionSize);
+            // TLLM_LOG_INFO("mSumOfSeqLensQ = %d", params.mSumOfSeqLensQ);
+            // TLLM_LOG_INFO("mSumOfSeqLensKv = %d", params.mSumOfSeqLensKv);
+            // TLLM_LOG_INFO("mMaxNumPagesPerSeqKv = %d", params.mMaxNumPagesPerSeqKv);
+            // TLLM_LOG_INFO("mNumTokensPerPage = %d", params.mNumTokensPerPage);
+            // TLLM_LOG_INFO("mNumPagesInMemPool = %d", params.mNumPagesInMemPool);
+            // TLLM_LOG_INFO("mMultiProcessorCount = %d", params.mMultiProcessorCount);
+            // TLLM_LOG_INFO("mScaleQ = %f", params.mScaleQ);
+            // TLLM_LOG_INFO("mSfStartTokenIdx = %d", params.mSfStartTokenIdx);
+            // TLLM_LOG_INFO("mScaleSfKv = %f", params.mScaleSfKv);
+            // TLLM_LOG_INFO("stream = %p", (void*) params.stream);
+
+            // For seqLensKvPtr, cumSeqLensKvPtr, kvPageIdxPtr: print first 10 ints if not null
+            // do
+            // {
+            //     int const max_bs = 2;
+            //     int const max_print = 10;
+            //     if (params.seqLensKvPtr)
+            //     {
+            //         int host_buf[max_bs] = {0};
+            //         cudaMemcpy(host_buf, params.seqLensKvPtr, sizeof(int) * max_bs, cudaMemcpyDeviceToHost);
+            //         std::string s = "seqLensKvPtr[0:2] = ";
+            //         for (int i = 0; i < max_bs; ++i)
+            //             s += std::to_string(host_buf[i]) + " ";
+            //         TLLM_LOG_INFO("%s", s.c_str());
+            //     }
+            //     if (params.cumSeqLensKvPtr)
+            //     {
+            //         int host_buf[max_bs] = {0};
+            //         cudaMemcpy(host_buf, params.cumSeqLensKvPtr, sizeof(int) * max_bs, cudaMemcpyDeviceToHost);
+            //         std::string s = "cumSeqLensKvPtr[0:2] = ";
+            //         for (int i = 0; i < max_bs; ++i)
+            //             s += std::to_string(host_buf[i]) + " ";
+            //         TLLM_LOG_INFO("%s", s.c_str());
+            //     }
+            //     if (params.kvPageIdxPtr)
+            //     {
+            //         int host_buf[max_print] = {0};
+            //         cudaMemcpy(host_buf, params.kvPageIdxPtr, sizeof(int) * max_print, cudaMemcpyDeviceToHost);
+            //         std::string s = "kvPageIdxPtr[0:10] = ";
+            //         for (int i = 0; i < max_print; ++i)
+            //             s += std::to_string(host_buf[i]) + " ";
+            //         TLLM_LOG_INFO("%s", s.c_str());
+            //     }
+            // } while (0);
+            // if (params.kvPtr)
+            // {
+            //     // Print first 10 __nv_bfloat16 values
+            //     __nv_bfloat16 host_bf16[10] = {0};
+            //     cudaMemcpy(host_bf16, params.kvPtr, sizeof(__nv_bfloat16) * 10, cudaMemcpyDeviceToHost);
+            //     std::string s_bf16 = "kvPtr[0:10] as __nv_bfloat16 = ";
+            //     for (int i = 0; i < 10; ++i)
+            //         s_bf16 += std::to_string(__bfloat162float(host_bf16[i])) + " ";
+            //     TLLM_LOG_INFO("%s", s_bf16.c_str());
+            // }
+            // TLLM_LOG_INFO("--- End RunnerParams values ---");
 
             TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 

@@ -28,6 +28,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
 # Global variable to store the Popen object of the child process
@@ -80,6 +81,8 @@ def get_llm_args(model: str,
                  max_seq_len: int = BuildConfig.max_seq_len,
                  tensor_parallel_size: int = 1,
                  pipeline_parallel_size: int = 1,
+                 context_parallel_size: int = 1,
+                 cp_config: Optional[dict] = None,
                  moe_expert_parallel_size: Optional[int] = None,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
@@ -108,6 +111,14 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
+    backend = backend if backend in ["pytorch", "_autodeploy"] else None
+    if cp_config is not None and "cp_type" in cp_config:
+        cp_config = cp_config.copy()
+        try:
+            cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+        except KeyError:
+            raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                             f"Must be one of: {', '.join([t.name for t in CpType])}")
     llm_args = {
         "model":
         model,
@@ -119,6 +130,10 @@ def get_llm_args(model: str,
         tensor_parallel_size,
         "pipeline_parallel_size":
         pipeline_parallel_size,
+        "context_parallel_size":
+        context_parallel_size,
+        "cp_config":
+        cp_config,
         "moe_expert_parallel_size":
         moe_expert_parallel_size,
         "gpus_per_node":
@@ -280,6 +295,10 @@ class ChoiceWithAlias(click.Choice):
               type=int,
               default=1,
               help='Pipeline parallelism size.')
+@click.option("--cp_size",
+              type=int,
+              default=1,
+              help='Context parallelism size.')
 @click.option("--ep_size",
               type=int,
               default=None,
@@ -342,7 +361,7 @@ def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
         max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
+        cp_size: int, ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
@@ -364,6 +383,7 @@ def serve(
         max_seq_len=max_seq_len,
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,
+        context_parallel_size=cp_size,
         moe_expert_parallel_size=ep_size,
         moe_cluster_parallel_size=cluster_size,
         gpus_per_node=gpus_per_node,

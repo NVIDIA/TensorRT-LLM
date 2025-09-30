@@ -58,6 +58,24 @@ TargetRanksInfo targetIRanks(
 TargetRanksInfo TargetRanksInfoForDP(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
+/**
+ * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
+ *
+ * This function determines how many blocks should be allocated to a given CP rank when
+ * distributing a total number of blocks across multiple CP ranks. It supports two distribution
+ * modes: strict and non-strict.
+ *
+ * @param cpRank The rank (index) of the current CP process. Must be in range [0, cpSize).
+ * @param cpSize The total number of CP ranks/processes in the parallel group.
+ * @param numTotalBlocks The total number of blocks to be distributed across all CP ranks.
+ * @param strict Flag controlling the distribution strategy:
+ *               - true: Use strict round-robin distribution with exact allocation
+ *               - false: Use ceiling division which may over-allocate
+ *
+ * @return The number of blocks allocated to the specified CP rank.
+ */
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks, bool strict);
+
 void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
     runtime::ITensor::SharedPtr* outputBlocks, int outputBlockNum, int selfRank,

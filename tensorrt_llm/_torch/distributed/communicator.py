@@ -86,8 +86,8 @@ class Distributed(ABC):
         return self.mapping.prev_pp_rank()
 
     @property
-    def has_cp(self):
-        return self.mapping.has_cp()
+    def has_cp_ulysses(self):
+        return self.mapping.has_cp_ulysses()
 
     @property
     def cp_config(self):
@@ -328,6 +328,7 @@ class MPIDist(Distributed):
         super().__init__(mapping)
         self.create_tp_comm()
         self.create_pp_comm()
+        self.create_cp_comm()
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
@@ -388,6 +389,13 @@ class MPIDist(Distributed):
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
 
+    def create_cp_comm(self):
+        new_group = mpi_comm().group.Incl(self.mapping.cp_group)
+        self.cp_comm = mpi_comm().Create_group(new_group)
+
+    def cp_allgather(self, obj):
+        return self.cp_comm.allgather(obj)
+
 
 class TorchDist(Distributed):
 
@@ -438,9 +446,9 @@ class TorchDist(Distributed):
             return recv[0]
 
     def broadcast(self, obj, root=0):
-        assert not (self.mapping.has_cp()
-                    and self.mapping.has_tp()), 'unsupport mix cp and tp now'
-        if self.mapping.has_cp():
+        assert not (self.mapping.has_cp_ulysses() and self.mapping.has_tp()
+                    ), 'unsupported mix cp ulysses and tp now'
+        if self.mapping.has_cp_ulysses():
             self.broadcast_cp(obj, root)
         elif self.mapping.has_tp():
             self.broadcast_tp(obj, root)

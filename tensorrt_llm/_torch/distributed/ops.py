@@ -142,9 +142,10 @@ def restore_full_output(valid_outputs: List[torch.Tensor],
     return full_outputs
 
 
-def allgather(
+def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
-    mapping: Mapping,
+    group: List[int],
+    rank: int,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -173,16 +174,16 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    if mapping.tp_size == 1:
+    if len(group) == 1:
         return input
 
     if sizes is not None:
-        assert len(sizes) == len(mapping.tp_group)
+        assert len(sizes) == len(group)
         if isinstance(input, torch.Tensor):
-            assert input.shape[dim] == sizes[mapping.tp_rank]
+            assert input.shape[dim] == sizes[rank]
         else:
             assert all([
-                val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                val.shape[dim] == sizes[rank] for val in input
                 if val is not None
             ])
 
@@ -203,7 +204,7 @@ def allgather(
     output = torch_op(
         input,
         sizes,
-        mapping.tp_group,
+        group,
     )
 
     def convert_output(x, x_info):
@@ -211,7 +212,7 @@ def allgather(
             x = x.view(x_info['output_shape'])
         else:
             if sizes is None:
-                x_list = x.chunk(mapping.tp_size)
+                x_list = x.chunk(len(group))
             else:
                 x_list = x.split(sizes)
             x = torch.cat([x.reshape(x_info['output_shape']) for x in x_list],
@@ -227,6 +228,24 @@ def allgather(
         ]
         output = restore_full_output(output, valid)
     return output
+
+
+def allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    return _allgather(input, mapping.tp_group, mapping.tp_rank, dim, sizes)
+
+
+def cp_allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    return _allgather(input, mapping.cp_group, mapping.cp_rank, dim, sizes)
 
 
 def alltoall_helix(

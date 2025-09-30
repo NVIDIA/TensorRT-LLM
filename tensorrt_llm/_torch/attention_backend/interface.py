@@ -121,8 +121,8 @@ class AttentionMetadata:
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
 
-    # The number of tokens in each rank.
-    all_rank_num_tokens: Optional[List[int]] = None
+    all_tp_rank_num_tokens: Optional[List[int]] = None
+    all_cp_rank_num_tokens: Optional[List[int]] = None
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it

@@ -283,11 +283,12 @@ class ExecutorRequestQueue:
         new_requests = self._validate_and_filter_requests(new_requests)
 
         # Attach Python objects to requests
-        if py_request_objects and (self.dist.tp_size > 1
-                                   or self.dist.has_pp) and self.dist.rank > 0:
+        # @B: What's the significance of this condition?
+        if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
+                                   or self.dist.cp_size
+                                   > 1) and self.dist.rank > 0:
             self._attach_py_objects_to_requests(new_requests,
                                                 py_request_objects)
-
         self.waiting_queue.extend(new_requests)
 
         new_requests = self._get_from_waiting_queue(
@@ -596,14 +597,89 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
+                              num_tokens_per_block: int):
+        print(
+            "[ExecutorRequestQueue::_merge_helix_requests]: FUNCTION CALLED with len(new_requests): ",
+            len(new_requests))
+        req_with_children = []
+        num_cp_ranks = self.dist.cp_size
+        curr_cp_rank = self.dist.cp_rank
+        for req_item in new_requests:
+            all_input_ids = torch.tensor(req_item.request.input_token_ids,
+                                         dtype=torch.int64).unsqueeze(0)
+            print(
+                "[ExecutorRequestQueue::_merge_helix_requests]: all_input_ids.shape: ",
+                all_input_ids.shape)
+            input_len = all_input_ids.shape[-1]
+
+            num_total_blocks = (input_len + num_tokens_per_block -
+                                1) // num_tokens_per_block
+            if num_total_blocks < num_cp_ranks:
+                raise ValueError(
+                    f"There aren't enough tokens to get at least one block per CP rank. num_total_blocks {num_total_blocks} < num_cp_ranks {num_cp_ranks}. Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
+                )
+
+            # Padding to ensure torch.stack used with torch.tensor_split works properly.
+            padding_len = num_tokens_per_block - (input_len %
+                                                  num_tokens_per_block)
+            padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
+            all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
+            all_position_ids = torch.arange(0,
+                                            input_len + padding_len,
+                                            dtype=torch.int64).unsqueeze(0)
+
+            input_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_input_ids.split(num_tokens_per_block, dim=-1)),
+                num_cp_ranks)
+            position_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_position_ids.split(num_tokens_per_block,
+                                                   dim=-1)), num_cp_ranks)
+
+            # Get the ctx_blocks and position_blocks for this rank.
+            input_ids_this_rank = input_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+            position_ids_this_rank = position_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+
+            # Undo the padding. Only last rank's last block will be padded right now.
+            if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
+                input_ids_this_rank = input_ids_this_rank[:-padding_len]
+                position_ids_this_rank = position_ids_this_rank[:-padding_len]
+
+            print(
+                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {input_ids_this_rank}"
+            )
+            print(
+                f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {position_ids_this_rank}"
+            )
+            # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
+            req = executor_request_to_llm_request(
+                req_id=req_item.id,
+                executor_request=req_item.request,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits(),
+                input_token_ids=input_ids_this_rank,
+                position_ids=position_ids_this_rank)
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
+
     @nvtx_range("_merge_requests")
     def _merge_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
+        print("[ExecutorRequestQueue::_merge_requests]: FUNCTION CALLED.")
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
+            elif cp_type == CpType.HELIX:
+                # TODO: Remove this hardcoding and obtain num_tokens_per_block from llm_args.
+                return self._merge_helix_requests(new_requests,
+                                                  num_tokens_per_block=64)
             elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:
@@ -611,6 +687,9 @@ class ExecutorRequestQueue:
         else:
             req_with_children = []
             for req_item in new_requests:
+                print(
+                    f"[ExecutorRequestQueue::_merge_requests][{self.dist.rank}]: req_item.id: {req_item.id}, req_item.request.input_token_ids: {req_item.request.input_token_ids}"
+                )
                 req = executor_request_to_llm_request(
                     req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())

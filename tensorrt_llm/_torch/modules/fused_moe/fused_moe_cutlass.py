@@ -238,7 +238,7 @@ class CutlassFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
+        all_tp_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
@@ -387,7 +387,7 @@ class CutlassFusedMoE(MoE):
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                sizes=None if use_dp_padding else all_tp_rank_num_tokens)
             x_row = x.shape[0]
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
@@ -456,15 +456,15 @@ class CutlassFusedMoE(MoE):
         *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
+        all_tp_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
-            assert all_rank_num_tokens is not None
+            assert all_tp_rank_num_tokens is not None
             assert use_dp_padding is not None
-            num_rows = sum(all_rank_num_tokens)
+            num_rows = sum(all_tp_rank_num_tokens)
         else:
             num_rows = x.shape[0]
 
@@ -473,34 +473,34 @@ class CutlassFusedMoE(MoE):
                       1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
-                                          ] * len(all_rank_num_tokens)
+            all_tp_rank_num_tokens_padded = [max(all_tp_rank_num_tokens)
+                                             ] * len(all_tp_rank_num_tokens)
         else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
+            all_tp_rank_num_tokens_padded = all_tp_rank_num_tokens
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
+                all_tp_rank_num_tokens=all_tp_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
             outputs = self.reducescatter_or_allreduce(
                 outputs,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
+                all_tp_rank_num_tokens=all_tp_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
         else:
             if self.use_dp:
                 all_rank_chunk_size_list = [
                     self.split_chunk(val, num_chunks)
-                    for val in all_rank_num_tokens_padded
+                    for val in all_tp_rank_num_tokens_padded
                 ]
-                all_rank_num_tokens_list = [[
+                all_tp_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
                 chunk_size_list = all_rank_chunk_size_list[self.rank]
             else:
-                all_rank_num_tokens_list = [None] * num_chunks
+                all_tp_rank_num_tokens_list = [None] * num_chunks
                 chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
 
             x_list = x.split(chunk_size_list)
@@ -514,14 +514,14 @@ class CutlassFusedMoE(MoE):
                 return self.forward_chunk(
                     x_,
                     router_logits_,
-                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
+                    all_tp_rank_num_tokens=all_tp_rank_num_tokens_list[idx]
                     if self.use_dp else None,
                     use_dp_padding=use_dp_padding)
 
             def _reducescatter_or_allreduce(x_, idx):
                 return self.reducescatter_or_allreduce(
                     x_,
-                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
+                    all_tp_rank_num_tokens=all_tp_rank_num_tokens_list[idx],
                     use_dp_padding=use_dp_padding)
 
             outputs_list = []
@@ -558,7 +558,7 @@ class CutlassFusedMoE(MoE):
 
         if self.use_dp and self.parallel_size > 1:
             rank = self.mapping.tp_rank
-            outputs = outputs[:all_rank_num_tokens[rank]]
+            outputs = outputs[:all_tp_rank_num_tokens[rank]]
         return outputs
 
     def forward_fake(

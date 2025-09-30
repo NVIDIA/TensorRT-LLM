@@ -164,10 +164,9 @@ class SpecMetadata:
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
-    all_rank_num_tokens: Optional[List[int]] = None
-
+    all_tp_rank_num_tokens: Optional[List[int]] = None
     # The number of sequences for speculative model/layer of different rank
-    all_rank_num_seqs: Optional[List[int]] = None
+    all_tp_rank_num_seqs: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
