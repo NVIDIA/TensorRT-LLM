@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -381,8 +382,5 @@ def test_multi_eagle3(use_one_model: bool):
             pass
 
 
-# if __name__ == "__main__":
-#     # unittest.main()
-
-#     # "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch",
-#     # test_llama_eagle3(True, "TRTLLM", False, True, True, True, False, False)
+if __name__ == "__main__":
+    unittest.main()
