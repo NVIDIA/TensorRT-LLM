@@ -26,7 +26,7 @@ Build and run the docker container. See the [Docker guide](../../../docker/READM
 ```
 cd TensorRT-LLM
 
-make -C docker release_run LOCAL_USER=1
+make -C docker release_build IMAGE_TAG=qwen3-next-local
 ```
 
 ### Creating the TRT-LLM Server config
