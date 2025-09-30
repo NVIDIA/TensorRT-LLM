@@ -1,5 +1,6 @@
 import pathlib
 
+import numpy as np
 import nvtx
 import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import \
@@ -25,9 +26,9 @@ pretrained_config.n_routed_experts = experts_per_rank * world_size
 layer_indices = [5, 6]
 
 # KV cache related args
-MAX_BATCH_SIZE = 2048
-MAX_SEQ_LEN = 2048
-SEQ_LEN_Q = 1
+MAX_BATCH_SIZE = 1024
+MAX_SEQ_LEN = 8192 + 512
+SEQ_LEN_Q = 2
 MAX_NUM_TOKENS = SEQ_LEN_Q * MAX_BATCH_SIZE
 enable_attention_dp = True
 moe_backend = "WIDEEP"
@@ -87,15 +88,37 @@ if runner.is_cuda_capturable():
                               stream=capture_stream,
                               capture_error_mode="global"):
             run_pack()
-for i in range(110):
+
+warmup_times = 20
+run_times = 100
+events = [
+    torch.cuda.Event(enable_timing=True)
+    for _ in range(warmup_times + run_times + 1)
+]
+for i in range(warmup_times + run_times):
+    events[i].record()
     with nvtx.annotate(
-            f"b={batch_size} s={SEQ_LEN_Q} balance={balance_ratio:.2g} #E={experts_per_rank}xEP{world_size}"
+            f"b={batch_size} s={SEQ_LEN_Q} #E={experts_per_rank}xEP{world_size}"
     ):
         if runner.is_cuda_capturable():
             g.replay()
         else:
             run_pack()
+events[-1].record()
 torch.cuda.synchronize()
-torch.cuda.cudart().cudaProfilerStop()
 
-print("finish")
+# Print statistics
+#   Print before `cudaProfilerStop` to ensure messages are included in the profile
+time_list = [
+    start.elapsed_time(stop) for start, stop in zip(events, events[1:])
+]
+time_list = time_list[warmup_times:]
+print(f"[RANK {rank}]"
+      f"  min {np.min(time_list) * 1000:.1f}"
+      f"  max {np.max(time_list) * 1000:.1f}"
+      f"  mean {np.mean(time_list) * 1000:.1f}"
+      f"  median {np.median(time_list) * 1000:.1f}"
+      f"  P90 {np.percentile(time_list, 90) * 1000:.1f}"
+      f"  (us)")
+
+torch.cuda.cudart().cudaProfilerStop()

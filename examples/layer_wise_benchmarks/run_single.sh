@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -euxo pipefail
+set -euo pipefail
 
 if [ -v OMPI_COMM_WORLD_SIZE ]; then
     export WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
@@ -16,8 +16,9 @@ if [ "$PROFILE" -eq 1 ]; then
     PROFILE_FOLDER=profiles/run_single
     mkdir -p ${PROFILE_FOLDER}
     PROFILE_CMD="nsys profile --wait primary \
-        -t cuda,nvtx -s none --cpuctxsw none \
-        --cuda-graph-trace node --cuda-event-trace false \
+        -t cuda,nvtx -s none \
+        --cpuctxsw none --cuda-event-trace false \
+        --cuda-graph-trace node \
         -c cudaProfilerApi --capture-range-end stop \
         -o ${PROFILE_FOLDER}/run_single_ep${WORLD_SIZE}_rank${RANK}.nsys-rep \
         --force-overwrite true"
@@ -25,5 +26,5 @@ else
     PROFILE_CMD=
 fi
 
-$PROFILE_CMD \
-python3 -u run_single.py
+set -x
+$PROFILE_CMD python3 -u run_single.py
