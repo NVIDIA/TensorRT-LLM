@@ -48,7 +48,7 @@ from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
-                     set_prefer_mem_pool, set_torch_compiling,
+                     set_shared_mem_pool, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import PyTorchConfig
 from .config_utils import is_mla
@@ -2187,7 +2187,7 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
-            with set_prefer_mem_pool(self.cuda_graph_runner.get_graph_pool()):
+            with set_shared_mem_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not maybe_graph:
                     # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):

@@ -6,7 +6,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .utils import get_graph_pool
+from .utils import get_shared_pool
 
 
 @dataclass
@@ -86,14 +86,16 @@ class Buffers:
         # The new buffer is created with uint8 to represent raw bytes.
         new_buffer_tensor = None
         try:
-            with torch.cuda.memory.use_mem_pool(get_graph_pool()):
+            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
                 new_buffer_tensor = torch.zeros((required_memory_size, ),
                                                 device='cuda',
                                                 dtype=torch.uint8)
-        except Exception:
+        except Exception as ex:
             # Need to check if this is an OOM exception
             logger.debug(
-                f"Exception happened to create tensor from given memory pool")
+                f"Exception happened to create tensor from given memory pool: {str{ex}}"
+            )
+            # if exception happens during allocating memory from
             new_buffer_tensor = torch.zeros((required_memory_size, ),
                                             device='cuda',
                                             dtype=torch.uint8)

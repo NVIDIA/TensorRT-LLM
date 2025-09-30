@@ -195,6 +195,12 @@ class CUDAGraphRunner:
         return key not in self.graph_outputs
 
     def get_graph_pool(self):
+        """Returns the CUDA memory pool used by this graph runner.
+
+        Returns:
+            The CUDA memory pool associated with captured graphs, or None if
+            no graphs have been captured yet.
+        """
         return self.memory_pool
 
     def capture(self,
