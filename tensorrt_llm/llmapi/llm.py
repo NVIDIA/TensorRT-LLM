@@ -419,6 +419,11 @@ class BaseLLM:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
+            multimodal_params = inputs.get("multimodal_params", None)
+            mm_embedding_info = inputs.get("multimodal_embeddings", None)
+            if mm_embedding_info is not None:
+                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
+                    inputs, mm_embedding_info, sampling_params)
         elif "prompt" in inputs:
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
