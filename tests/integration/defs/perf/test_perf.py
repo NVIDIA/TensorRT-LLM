@@ -274,7 +274,8 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.KV_CACHE_SIZE:
-    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
+    re.compile(r".*(?:Allocated ([\d\.]+) GiB for max tokens in paged KV cache|"
+               r"Final KV cache size after resize: ([\d\.]+) GiB).*"),
 }
 DISAGG_SERVER_METRICS_LOG_QUERIES = {
     PerfMetricType.DISAGG_SERVER_E2EL:
@@ -1608,9 +1609,17 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             for line in outputs[cmd_idx].split("\n")
         ]
         print_info(outputs[cmd_idx].split("\n"))
-        metric_values = [
-            float(match.group(1)) for match in regex_matches if match
-        ]
+        metric_values = []
+        for match in regex_matches:
+            if match:
+                # Handle multiple capture groups - use the first non-None group
+                value = None
+                for i in range(1, len(match.groups()) + 1):
+                    if match.group(i) is not None:
+                        value = match.group(i)
+                        break
+                if value is not None:
+                    metric_values.append(float(value))
 
         if len(metric_values) == 0:
             if self._build_script == "trtllm-build" and metric.metric_type == PerfMetricType.ENGINE_SIZE:
