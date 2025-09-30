@@ -89,6 +89,82 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 non_blocking=True)
 
 
+@torch.compile(dynamic=True)
+def convert_token_to_page_sparse_indices(
+        sparse_attn_indices: torch.Tensor, sparse_attn_offsets: torch.Tensor,
+        metadata: 'TrtllmAttentionMetadata'
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert token-based sparse attention indices to page-based sparse attention indices.
+
+    Args:
+        sparse_attn_indices: Token-based indices with shape [num_tokens, num_kv_heads]
+        sparse_attn_offsets: Offsets with shape [batch_size+1] indicating token boundaries for each batch
+        metadata: Attention metadata containing tokens_per_block (page_size)
+
+    Returns:
+        Tuple of (page_indices, page_offsets):
+        - page_indices: Page-based indices with shape [num_pages, num_kv_heads]
+        - page_offsets: Updated offsets with shape [batch_size+1] indicating page boundaries for each batch
+
+    Example:
+        If sparse_attn_indices first dimension is [1, 30, 67] and page_size=32,
+        the result will be [0, 2] (token 1 -> page 0, token 30 -> page 0, token 67 -> page 2)
+    """
+    page_size = metadata.tokens_per_block
+    batch_size = sparse_attn_offsets.size(0) - 1
+    num_kv_heads = sparse_attn_indices.size(1)
+
+    # Convert token indices to page indices
+    page_indices = sparse_attn_indices // page_size
+
+    # Process each batch and each kv_head separately to remove duplicates
+    new_page_indices_list = []
+    new_offsets = torch.zeros_like(sparse_attn_offsets)
+
+    current_offset = 0
+    for batch_idx in range(batch_size):
+        start_idx = sparse_attn_offsets[batch_idx]
+        end_idx = sparse_attn_offsets[batch_idx + 1]
+
+        if start_idx >= end_idx:
+            # Empty batch
+            new_offsets[batch_idx + 1] = current_offset
+            continue
+
+        batch_page_indices = page_indices[
+            start_idx:end_idx]  # [num_tokens_in_batch, num_kv_heads]
+
+        # For each kv_head, remove duplicates while preserving order
+        batch_unique_pages = []
+        for head_idx in range(num_kv_heads):
+            head_pages = batch_page_indices[:, head_idx]
+            unique_pages = torch.unique(head_pages, sorted=False)
+            batch_unique_pages.append(unique_pages)
+
+        # Find the maximum length among all heads for this batch
+        max_len = max(pages.size(0) for pages in batch_unique_pages)
+
+        if max_len > 0:
+            batch_result = torch.full((max_len, num_kv_heads),
+                                      fill_value=-1,
+                                      dtype=page_indices.dtype,
+                                      device=page_indices.device)
+
+            for head_idx in range(num_kv_heads):
+                unique_pages = batch_unique_pages[head_idx]
+                batch_result[:unique_pages.size(0), head_idx] = unique_pages
+
+            new_page_indices_list.append(batch_result)
+            current_offset += max_len
+
+        new_offsets[batch_idx + 1] = current_offset
+
+    new_page_indices = torch.cat(new_page_indices_list, dim=0)
+
+    return new_page_indices, new_offsets
+
+
 class RocketTrtllmAttention(TrtllmAttention):
     Metadata = RocketTrtllmAttentionMetadata
 
@@ -198,6 +274,10 @@ class RocketTrtllmAttention(TrtllmAttention):
                                             dim=0).to(torch.int32)
             sparse_attn_offsets = torch.tensor(sparse_attn_offsets,
                                                dtype=torch.int32).to(q.device)
+            sparse_attn_indices, sparse_attn_offsets = convert_token_to_page_sparse_indices(
+                sparse_attn_indices, sparse_attn_offsets, metadata)
+            sparse_attn_indices = sparse_attn_indices.transpose(0,
+                                                                1).contiguous()
         return sparse_attn_indices, sparse_attn_offsets
 
     def sparse_kv_predict(
