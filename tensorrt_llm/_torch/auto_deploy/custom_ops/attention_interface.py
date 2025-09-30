@@ -11,12 +11,25 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
+from torch.types import Number
 
 from ...._utils import nvtx_range
 from ..utils.logger import ad_logger
@@ -570,15 +583,15 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[int | float],
-        reset: bool = False,
+        tnsr_like: List[Number],
+        reset_val: Optional[Number] = None,
     ) -> None:
         """Store the argument on the host and copy to the device in a non-blocking fashion.
 
         Args:
             name: Name of the argument to store.
             tnsr_like: List of values to store.
-            reset: Whether to reset the full tensor on the device to 0 before writing to it.
+            reset_val: Value to reset/fill the full tensor on the device to before writing to it.
         """
         with nvtx_range(f"ad_store_seq_info_arg_{name}"):
             tnsr_device = self._args_device[name]
@@ -596,8 +609,8 @@ class SequenceInfo:
             )
 
             # reset/copy to the device in a non-blocking fashion
-            if reset:
-                tnsr_device.zero_()
+            if reset_val is not None:
+                tnsr_device.fill_(reset_val)
             tnsr_device[: len(tnsr_like)].copy_(tnsr_host, non_blocking=True)
 
     def _store_extra_arg(
@@ -615,6 +628,11 @@ class SequenceInfo:
                 self._extra_args[name] = self._extra_none_inputs[name]
             else:
                 self._extra_args[name] = None
+
+    def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
+        """Get un unoccupied value from the range indicated by max_val."""
+        free_values = set(range(max_val)) - occupied
+        return free_values.pop() if free_values else 0
 
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
@@ -636,20 +654,23 @@ class SequenceInfo:
             slot_idx: List of slot indices for each sequence.
             extra_args: Extra arguments to be stored in the interface.
 
-        This i/f will ensure that all sequence info args are updated accordingly.
+        This i/f will ensure that all sequence info args are updated accordingly. Reset values are
+        chosen as "neutral" values so that for cases like rounding up batch sizes for cudagraph we
+        only write to unused buffers/caches.
         """
         ### UPDATE METADATA ########################################################################
         # update metadata first since it's useful for other updates to have up-to-date information
 
         # set new sequence lengths --> resetting the remaining entries to zero is important to help
         # us discern the actual number of sequences in the batch.
-        self._store_arg("seq_len", [len(ids) for ids in input_ids], reset=True)
+        self._store_arg("seq_len", [len(ids) for ids in input_ids], reset_val=0)
 
         # check for updated input_pos (i.e. cache start position)
         if input_pos is not None:
             self._store_arg(
                 "input_pos",
                 [input_pos] * self.num_sequences if isinstance(input_pos, int) else input_pos,
+                reset_val=0,
             )
 
         # check for updated page_assignments
@@ -657,12 +678,14 @@ class SequenceInfo:
             cache_loc, pages_per_seq = self._get_cache_locations_and_pages_per_sequence(
                 page_assignments
             )
-            self._store_arg("cache_loc", cache_loc, reset=True)
-            self._store_arg("pages_per_seq", pages_per_seq, reset=True)
+            free_cache_loc = self._get_unique_value(set(cache_loc), self.num_pages)
+            self._store_arg("cache_loc", cache_loc, reset_val=free_cache_loc)
+            self._store_arg("pages_per_seq", pages_per_seq, reset_val=1)
 
         # check for updated slot_idx
         if slot_idx is not None:
-            self._store_arg("slot_idx", slot_idx)
+            free_slot_idx = self._get_unique_value(set(slot_idx), self.max_batch_size)
+            self._store_arg("slot_idx", slot_idx, reset_val=free_slot_idx)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
