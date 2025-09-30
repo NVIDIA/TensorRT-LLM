@@ -2,8 +2,8 @@
 
 from typing import List, Optional, Tuple, Type
 
+import torch.nn as nn
 from pydantic import Field
-from torch.fx import GraphModule
 
 from ...export import torch_export_to_gm
 from ...models.factory import ModelFactory
@@ -49,25 +49,19 @@ class ExportToGM(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return ExportToGMConfig
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        # at this point we assume the gm is just a dummy graph module
-        assert len(gm.graph.nodes) == 0, "Expected empty graph module."
-
-        # retrieve the actual model from the dummy graph module
-        model = gm.get_submodule("factory_model")
-
+    ) -> Tuple[nn.Module, TransformInfo]:
         # set the example sequence
         cm.info.set_example_sequence(**factory.get_example_inputs())
 
         # export the model to a graph module
         gm = torch_export_to_gm(
-            model,
+            mod,
             args=(),
             kwargs=cm.named_args,
             dynamic_shapes=cm.named_dynamic_shapes,

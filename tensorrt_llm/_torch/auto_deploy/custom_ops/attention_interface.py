@@ -325,7 +325,11 @@ class SequenceInfo:
         like ``insert_cached_attention`` to extract the constant arguments and add them to the
         ``prepare_metadata`` node/op.
         """
-        return tuple(self.named_standard_args.keys())
+        # NOTE: for now we do _not_ include input_ids since we are not guaranteed that input_ids
+        # is part of the graph, e.g., in situations where the graph is a submodule of the overall
+        # model. In such instances, the graph usually sees inputs_embeds. However, we assume for
+        # now that position_ids is always part of the graph.
+        return ("position_ids",) + self._cached_arg_names
 
     @property
     def const_args_for_prepare_metadata(self) -> Tuple[Constant, ...]:
@@ -466,7 +470,9 @@ class SequenceInfo:
         return cache_loc_flat, pages_per_seq
 
     @classmethod
-    def _get_sanitized_seq_len(cls, input_ids: torch.Tensor, seq_len: torch.Tensor) -> torch.Tensor:
+    def _get_sanitized_seq_len(
+        cls, input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
+    ) -> torch.Tensor:
         """Sanitize sequence lengths.
 
         We want to cover the following scenarios with this function:
@@ -499,22 +505,24 @@ class SequenceInfo:
             # valid cache location in the batch. This would ensure that the dummy sequences just
             # repeats valid computation...
         """
-        _, s = input_ids.shape[:2]
-        num_seq = cls._get_sanitized_num_sequences(input_ids, seq_len)
+        _, s = input_or_position_ids.shape[:2]
+        num_seq = cls._get_sanitized_num_sequences(input_or_position_ids, seq_len)
         if s > 1:
             return seq_len[:num_seq].detach().clone()
         else:
             return torch.ones(num_seq, dtype=seq_len.dtype, device=seq_len.device)
 
     @staticmethod
-    def _get_sanitized_num_sequences(input_ids: torch.Tensor, seq_len: torch.Tensor) -> int:
+    def _get_sanitized_num_sequences(
+        input_or_position_ids: torch.Tensor, seq_len: torch.Tensor
+    ) -> int:
         """Get number of sequences.
 
         We makes sure that this function is compatible with both torch graph capture and cudagraph.
         Both can be a bit temparamental when trying to extract the number of sequences from a tensor
         with max_batch_size or max_batch_size*max_seq_len.
         """
-        b, s = input_ids.shape[:2]
+        b, s = input_or_position_ids.shape[:2]
         if s > 1:
             num_seq = torch.sum(seq_len > 0)
             assert seq_len[num_seq:].sum() == 0, "seq_len should be zero-padded"
@@ -814,7 +822,6 @@ class MHACallable(Protocol):
 class PrepareMetadataCallable(Protocol):
     def __call__(
         self,
-        input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         seq_len: torch.Tensor,
         input_pos: torch.Tensor,
@@ -901,7 +908,6 @@ class AttentionDescriptor(ABC):
 
         ```
         def prepare_metadata(
-            input_ids: torch.Tensor,
             position_ids: torch.Tensor,
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,

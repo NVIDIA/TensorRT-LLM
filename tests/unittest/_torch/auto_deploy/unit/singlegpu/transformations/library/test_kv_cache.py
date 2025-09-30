@@ -163,6 +163,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
         {
             "build_model": {
                 "stage": "factory",
+                "run_per_gm": False,
                 "device": "cuda",
                 "run_graph_cleanup": False,
                 "requires_clean_graph": False,
@@ -170,6 +171,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             "export_to_gm": {
                 "stage": "export",
                 "strict": False,
+                "run_per_gm": False,
                 "clone_state_dict": True,
                 "run_graph_cleanup": False,
                 "requires_clean_graph": False,

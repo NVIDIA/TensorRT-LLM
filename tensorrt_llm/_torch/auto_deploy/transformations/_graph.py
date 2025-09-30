@@ -132,12 +132,12 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
         gm.recompile()
 
 
-def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> None:
+def move_to_device(mod: nn.Module, device: DeviceLikeType) -> None:
     """Move the entire graph module and all sub-GraphModules to the specified device."""
     # get device
     device = torch.device(device)
 
-    for _, subgm in reversed(list(named_graphmodules(gm))):
+    for _, subgm in reversed(list(named_graphmodules(mod))):
         # recompile graph to update self generated codes in subgraph
         _move_single_gm_to_device(subgm, device)
 
@@ -171,20 +171,20 @@ def _canonicalize_single_gm(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
-def canonicalize_graph(gm: GraphModule) -> None:
+def canonicalize_graph(mod: nn.Module) -> None:
     """Canonicalize the graph of the given GraphModule.
 
     Args:
-        gm: The GraphModule to canonicalize.
+        mod: The model containing GraphModules to canonicalize.
     Returns:
-        The canonicalized (cleaned-up) GraphModule.
+        The canonicalized (cleaned-up) model.
     """
-    ad_logger.debug(f"Before canonicalizing: {gm}")
+    ad_logger.debug(f"Before canonicalizing: {mod}")
 
-    for _, subgm in reversed(list(named_graphmodules(gm))):
+    for _, subgm in reversed(list(named_graphmodules(mod))):
         _canonicalize_single_gm(subgm)
 
-    ad_logger.debug(f"After canonicalizing: {gm}")
+    ad_logger.debug(f"After canonicalizing: {mod}")
 
 
 def _run_shape_prop_single_gm(
@@ -216,7 +216,7 @@ def _run_shape_prop_single_gm(
 
 
 def run_shape_prop(
-    gm: GraphModule,
+    mod: nn.Module,
     args_static: Optional[Tuple[Any, ...]] = None,
 ) -> None:
     """Run FakeTensor-based shape propagation on the given GraphModule and its submodules.
@@ -228,19 +228,19 @@ def run_shape_prop(
     are synthesized from the static arguments.
 
     Args:
-        gm: The top-level GraphModule on which to run shape propagation. All nested
-            GraphModules are processed in reverse topological order.
+        mod: The top-level model containing GraphModules on which to run shape propagation. All
+            nested GraphModules are processed in reverse topological order.
         args_static: Optional tuple of concrete tensors used to create FakeTensors
             when placeholder metadata is missing. Only applied to the top-level
             GraphModule; submodules reuse their existing placeholder metadata.
 
     """
-    ad_logger.debug(f"Before running shape propagation: {gm}")
+    ad_logger.debug(f"Before running shape propagation: {mod}")
 
-    for _, subgm in reversed(list(named_graphmodules(gm))):
-        _run_shape_prop_single_gm(subgm, args_static=args_static if subgm is gm else None)
+    for _, subgm in reversed(list(named_graphmodules(mod))):
+        _run_shape_prop_single_gm(subgm, args_static=args_static if subgm is mod else None)
 
-    ad_logger.debug(f"After running shape propagation: {gm}")
+    ad_logger.debug(f"After running shape propagation: {mod}")
 
 
 def add_graph_input(
@@ -309,7 +309,7 @@ def add_graph_input(
     return in_node
 
 
-def placeholders_on_meta(gm: GraphModule) -> bool:
+def placeholders_on_meta(mod: nn.Module) -> bool:
     """
     Return True if every placeholder node in the graph is on the meta device.
     """
@@ -324,17 +324,18 @@ def placeholders_on_meta(gm: GraphModule) -> bool:
         # Fallback for objects with .is_meta attribute
         return bool(getattr(t, "is_meta", False))
 
-    for n in gm.graph.nodes:
-        if n.op != "placeholder":
-            continue
-        val = n.meta.get("val", None)
+    for _, subgm in reversed(list(named_graphmodules(mod))):
+        for n in subgm.graph.nodes:
+            if n.op != "placeholder":
+                continue
+            val = n.meta.get("val", None)
 
-        # If placeholder packs multiple values, find the first tensor-like leaf
-        t = val
-        if isinstance(val, (list, tuple)):
-            t = next((x for x in val if hasattr(x, "device") or hasattr(x, "is_meta")), None)
+            # If placeholder packs multiple values, find the first tensor-like leaf
+            t = val
+            if isinstance(val, (list, tuple)):
+                t = next((x for x in val if hasattr(x, "device") or hasattr(x, "is_meta")), None)
 
-        if not _is_meta_tensor(t):
-            return False
+            if not _is_meta_tensor(t):
+                return False
 
     return True
