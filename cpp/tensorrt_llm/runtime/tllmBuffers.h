@@ -217,9 +217,7 @@ public:
         : mPtr(ptr)
         , mCapacity(capacity)
     {
-        TLLM_CHECK_WITH_INFO(capacity == std::size_t(0) || static_cast<bool>(mPtr),
-            "Undefined pointer: capacity=" + std::to_string(capacity)
-                + ", ptr=" + std::to_string(reinterpret_cast<uintptr_t>(mPtr)));
+        TLLM_CHECK_WITH_INFO(capacity == std::size_t(0) || static_cast<bool>(mPtr), "Undefined pointer");
     }
 
 protected:

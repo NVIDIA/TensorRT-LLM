@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
 namespace tensorrt_llm
 {
@@ -110,8 +111,7 @@ struct XQAParams
     int32_t const* encoder_input_lengths = nullptr;
 
     // sparse attention parameters
-    int32_t* sparse_attn_indices = nullptr;
-    int32_t* sparse_attn_offsets = nullptr;
+    SparseAttentionParams sparse_params;
     bool use_sparse_attention = false;
 
     cudaStream_t stream = 0;
@@ -184,8 +184,7 @@ struct XQAParams
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
-           << "sparse_attn_indices :" << sparse_attn_indices << std ::endl
-           << "sparse_attn_offsets :" << sparse_attn_offsets << std ::endl
+           << "sparse_params: " << sparse_params.toString() << std::endl
            << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
            << "stream :" << stream;
 

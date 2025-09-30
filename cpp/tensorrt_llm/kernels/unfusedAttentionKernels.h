@@ -199,8 +199,6 @@ struct QKVPreprocessingParams
     int q_hidden_size{0};
     int kv_hidden_size{0};
     int hidden_size{0};
-    // Sparse attention
-    int num_sparse_kv_tokens{0};
 
     void setCommonParameters()
     {

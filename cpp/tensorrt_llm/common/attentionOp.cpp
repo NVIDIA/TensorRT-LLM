@@ -289,8 +289,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.fp4_out_sf_scale = generationsParams.attention_output_sf_scale;
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
     // Parameters for sparse attention
-    xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
-    xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
+    xqaParams.sparse_params = mRuntimeSparseAttentionParams;
     xqaParams.use_sparse_attention = useTllmGenSparseAttention();
 
     // Cross attention parameters.

@@ -233,8 +233,10 @@ class TrtllmAttentionWrapper:
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
-            all_sparse_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_sparse_tokens, num_heads_kv) on GPU.
-            sparse_batch_offsets (torch.Tensor): The batch offsets for the sparse indices, with shape of (batch_size + 2) on GPU.
+            sparse_kv_indices (torch.Tensor): The sparse indices for the KV cache, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
+            sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
+            sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
+            sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -1334,7 +1336,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.sparse_attention_config is not None:
             sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = self.sparse_attention_predict(
                 q, k, metadata)
-            sparse_attn_indices, sparse_attn_offsets = None, None
             if sparse_kv_indices is not None:
                 sparse_kv_indices = sparse_kv_indices.transpose(0,
                                                                 1).contiguous()

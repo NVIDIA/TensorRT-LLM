@@ -85,7 +85,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_kt_cache_block_offsets = self.kv_cache_manager.get_kt_block_offsets(
                 self.request_ids)
             self.kt_cache_block_offsets[:self.num_seqs].copy_(
-                self.host_kt_cache_block_offsets, non_blocking=True)
+                self.host_kt_cache_block_offsets[:self.num_seqs],
+                non_blocking=True)
 
 
 class RocketTrtllmAttention(TrtllmAttention):
@@ -385,6 +386,14 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
         if self.sparse_attention_config is None:
             raise ValueError("Sparse attention config is not set")
         self.prompt_budget = self.sparse_attention_config.prompt_budget
+        self.kt_cache_block_offsets = torch.empty(
+            [
+                self.max_num_sequences,
+                self.kv_cache_manager.max_kt_blocks_per_seq
+            ],
+            dtype=torch.int32,
+            device='cuda',
+        )
 
     def prepare(self) -> None:
         super().prepare()
@@ -399,6 +408,14 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
                 if self.prompt_lens[i] > self.prompt_budget:
                     self.kv_cache_params.num_cached_tokens_per_seq[
                         i] += self.prompt_budget - self.prompt_lens[i]
+
+        if self.kv_cache_manager is not None:
+            # for kt cache
+            self.host_kt_cache_block_offsets = self.kv_cache_manager.get_kt_block_offsets(
+                self.request_ids)
+            self.kt_cache_block_offsets[:self.num_seqs].copy_(
+                self.host_kt_cache_block_offsets[:self.num_seqs],
+                non_blocking=True)
 
 
 class RocketVanillaAttention(VanillaAttention):
@@ -438,7 +455,7 @@ class RocketVanillaAttention(VanillaAttention):
     def _single_request_sparse_kv_predict(
             self, q: Optional[Tensor], k: Optional[Tensor], v: Optional[Tensor],
             metadata: RocketVanillaAttentionMetadata, past_seen_token: int,
-            cache_idx: int, **kwargs) -> Optional[Tensor]:
+            sample_idx: int, **kwargs) -> Optional[Tensor]:
         """
         Predict KV indices for writing new key/value pairs.
         For RocketKV:
@@ -453,7 +470,7 @@ class RocketVanillaAttention(VanillaAttention):
             return None, k.size(1)
 
         # Context phase: predict SnapKV sparse kv indices
-        sparse_kv_indices = self._get_snapkv_indices(q, k)
+        sparse_kv_indices = self._get_snapkv_indices(q, k, sample_idx)
 
         # Gather the key states using the sparse kv indices
         if sparse_kv_indices is not None:
@@ -469,17 +486,20 @@ class RocketVanillaAttention(VanillaAttention):
                                          math.ceil(target_seq_len /
                                                    self.page_size),
                                          device=q.device)
-        self._single_request_update_kt_cache(k_snap,
-                                             kt_cache_tensor,
-                                             target_seq_len,
-                                             kt_cache_position,
-                                             update=False)
+        self._single_request_update_kt_cache(
+            k_snap,
+            kt_cache_tensor,
+            metadata.kt_cache_block_offsets[sample_idx],
+            target_seq_len,
+            kt_cache_position,
+            update=False)
         return sparse_kv_indices, k_snap.size(1)
 
     def _single_request_sparse_attn_predict(
             self, q: Tensor, k: Optional[Tensor], v: Optional[Tensor],
             kv_cache_tensor: Tensor, metadata: RocketVanillaAttentionMetadata,
-            past_seen_token: int, cache_idx: int, **kwargs) -> Optional[Tensor]:
+            past_seen_token: int, sample_idx: int,
+            **kwargs) -> Optional[Tensor]:
         """
         Predict KV cache indices for sparse attention computation.
         For RocketKV:
@@ -495,10 +515,11 @@ class RocketVanillaAttention(VanillaAttention):
 
         # Get RocketKV sparse indices
         sparse_indices = self._rocketkv_selection(q, k, metadata,
-                                                  past_seen_token)
+                                                  past_seen_token, sample_idx)
         return sparse_indices, sparse_indices.size(1)
 
-    def _get_snapkv_indices(self, q: Tensor, k: Tensor) -> Tensor:
+    def _get_snapkv_indices(self, q: Tensor, k: Tensor,
+                            sample_idx: int) -> Tensor:
         """Get SnapKV sparse kv indices from the input sequence for context phase."""
         bsz = 1
         seq_len = k.size(1)
@@ -563,12 +584,13 @@ class RocketVanillaAttention(VanillaAttention):
     def _single_request_update_kt_cache(self,
                                         k,
                                         kt_cache_tensor,
+                                        kt_cache_block_offsets,
                                         seq_len,
                                         cache_position,
                                         update=True):
         """Update KT cache for RocketKV algorithm."""
         # (1, num_pages_per_block, num_kv_heads, 2*head_dim)
-        k_out = kt_cache_tensor[0, :, :, :].unsqueeze(0)
+        k_out = kt_cache_tensor[kt_cache_block_offsets[0], :, :, :].unsqueeze(0)
 
         # k: (1, seq_len, num_kv_heads, head_dim)
         if k is not None:
@@ -586,7 +608,7 @@ class RocketVanillaAttention(VanillaAttention):
             k_max = torch.cat([k, -padding_tensor], dim=1)
             k_max = k_max.reshape(1, -1, self.page_size, self.num_kv_heads,
                                   self.head_dim).amax(dim=2)
-            if update:
+            if update and (seq_len - 1) % self.page_size > 0:  # gen phase
                 k_min = torch.min(k_min,
                                   k_out[:, cache_position, :, :self.head_dim])
                 k_max = torch.max(k_max, k_out[:, cache_position, :,
@@ -600,7 +622,7 @@ class RocketVanillaAttention(VanillaAttention):
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor,
                             metadata: RocketVanillaAttentionMetadata,
-                            past_seen_token: int) -> Tensor:
+                            past_seen_token: int, sample_idx: int) -> Tensor:
         """Implement RocketKV's two-stage selection process for generation phase."""
         bsz = 1
         q_len = q.size(2)
@@ -627,7 +649,8 @@ class RocketVanillaAttention(VanillaAttention):
                                                    self.page_size),
                                          device=q.device)
         kt_states = self._single_request_update_kt_cache(
-            k, kt_cache_tensor, target_seq_len, kt_cache_position)
+            k, kt_cache_tensor, metadata.kt_cache_block_offsets[sample_idx],
+            target_seq_len, kt_cache_position)
 
         # Reshape query for multi-head processing
         qi = q.view(bsz, self.num_kv_heads, self.num_heads // self.num_kv_heads,
@@ -883,8 +906,8 @@ class RocketKVCacheManager(KVCacheManager):
     def get_cache_bytes_per_token(self):
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
         kv_factor = self.kv_factor + 2 * self.kt_tokens_per_block / self.tokens_per_block
-        cache_size_per_token = kv_factor * sum(
-            self.num_kv_heads_per_layer) * self.head_dim
+        cache_size_per_token = math.ceil(
+            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):

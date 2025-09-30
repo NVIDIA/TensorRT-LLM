@@ -227,34 +227,20 @@ public:
             }
         }
 
-        op.mRuntimeSparseAttentionParams.sparse_kv_offsets = nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_kv_indices = nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_attn_offsets = nullptr;
-        op.mRuntimeSparseAttentionParams.sparse_attn_indices = nullptr;
-        op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens = 0;
-
-        if (op.useSparseAttention() && num_seqs > 0)
+        // Prepare sparse attention parameters
+        if (is_context)
         {
-            if (is_context)
-            {
-                if (sparse_kv_indices.has_value())
-                {
-                    op.mRuntimeSparseAttentionParams.sparse_kv_indices = sparse_kv_indices.value().data_ptr<int32_t>();
-                    op.mRuntimeSparseAttentionParams.sparse_kv_offsets = sparse_kv_offsets.value().data_ptr<int32_t>();
-                    op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
-                        = sparse_kv_offsets.value().index({num_seqs}).item<int32_t>();
-                }
-            }
-            else
-            {
-                if (sparse_attn_indices.has_value())
-                {
-                    op.mRuntimeSparseAttentionParams.sparse_attn_indices
-                        = sparse_attn_indices.value().data_ptr<int32_t>();
-                    op.mRuntimeSparseAttentionParams.sparse_attn_offsets
-                        = sparse_attn_offsets.value().data_ptr<int32_t>();
-                }
-            }
+            op.mRuntimeSparseAttentionParams.sparse_kv_indices
+                = sparse_kv_indices.has_value() ? sparse_kv_indices.value().data_ptr<int32_t>() : nullptr;
+            op.mRuntimeSparseAttentionParams.sparse_kv_offsets
+                = sparse_kv_offsets.has_value() ? sparse_kv_offsets.value().data_ptr<int32_t>() : nullptr;
+        }
+        else
+        {
+            op.mRuntimeSparseAttentionParams.sparse_attn_indices
+                = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
+            op.mRuntimeSparseAttentionParams.sparse_attn_offsets
+                = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
         }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
@@ -528,19 +514,18 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
-void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
-    torch::Tensor& output, torch::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
-    torch::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
+void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
+    std::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
+    std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
     torch::Tensor host_total_kv_lens, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-    torch::Tensor host_request_types, torch::optional<torch::Tensor> kv_cache_block_offsets,
-    torch::optional<torch::Tensor> host_kv_cache_block_offsets,
-    torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
-    torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
-    torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
-    torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
-    torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-    torch::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
+    torch::Tensor host_request_types, std::optional<torch::Tensor> kv_cache_block_offsets,
+    std::optional<torch::Tensor> host_kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
+    std::optional<torch::Tensor> host_kv_cache_pool_mapping, std::optional<torch::Tensor> cache_indirection,
+    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
+    std::optional<torch::Tensor> out_scale, std::optional<torch::Tensor> rotary_inv_freq,
+    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
+    std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
+    std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
     std::vector<int64_t> attention_config_params, std::optional<int64_t> const tokens_per_block, double const q_scaling,
     std::vector<int64_t> rotary_embedding_int_params, double const rotary_embedding_base,
     std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
@@ -552,7 +537,7 @@ void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optiona
     std::vector<std::optional<torch::Tensor>> mla_tensor_params, 
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
     std::vector<bool> spec_decoding_bool_params, std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-    std::vector<torch::optional<torch::Tensor>> sparse_attention_params)
+    std::vector<std::optional<torch::Tensor>> sparse_attention_params)
 {
     // Decompress attention config parameters
     TORCH_CHECK(attention_config_params.size() == 12, "Expected 12 attention config parameters");
