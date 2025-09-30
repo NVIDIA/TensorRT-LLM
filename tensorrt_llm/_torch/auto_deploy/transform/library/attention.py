@@ -269,170 +269,6 @@ def _get_sfdp_patterns() -> List[Dict[str, Any]]:
     return patterns
 
 
-def _grouped_attn_pattern_1(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_replacement_1(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-# Only expose torch_attention after the transformation
-def _grouped_attn_pattern_2(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_replacement_2(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_pattern_3(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_replacement_3(q, k, v, n_rep, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-# Only expose torch_attention after the transformation
-def _grouped_attn_pattern_4(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_replacement_4(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_pattern_5(q, k, v, n_rep, attn_mask):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(q, k, v, attn_mask)
-
-
-def _grouped_attn_replacement_5(q, k, v, n_rep, attn_mask):
-    return torch.ops.auto_deploy.torch_attention.default(q, k, v, attn_mask)
-
-
-def _grouped_attn_pattern_6(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_6(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_pattern_7(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_7(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_pattern_8(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_8(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-def _grouped_attn_pattern_9(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=scale,
-        enable_gqa=True,
-    )
-
-
-def _grouped_attn_replacement_9(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-def _grouped_attn_pattern_10(q, k, v, n_rep, dropout_p):
-    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
-    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
-    return torch.ops.auto_deploy.torch_attention_sdpa.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-    )
-
-
-def _grouped_attn_replacement_10(q, k, v, n_rep, dropout_p):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-    )
-
-
 @TransformRegistry.register("match_repeat_kv")
 class MatchRepeatKV(BaseTransform):
     """
@@ -507,6 +343,195 @@ class MatchEagerAttention(BaseTransform):
         return gm, info
 
 
+def make_grouped_attn_pair(
+    *,
+    repeat_kv: bool,
+    is_causal: bool,
+    has_scale: bool,
+    enable_gqa: bool,
+    has_attn_mask: bool,
+    has_dropout: bool,
+):
+    """
+    Returns (pattern_fn, replacement_fn, argnames) such that:
+      - pattern_fn(*args) calls torch_attention_sdpa.default with the specified knobs
+        and optional pre-repeat kv
+      - replacement_fn(*args) calls torch_attention.default mirroring signature exactly
+      - argnames is the ordered arg list for constructing dummy args
+
+    Arg order rules:
+      - Base: (q, k, v)
+      - +repeat_kv -> insert n_rep after (q, k, v)
+      - +attn_mask  -> include attn_mask after n_rep if repeat_kv else after (q, k, v)
+      - +dropout    -> include dropout_p after attn_mask or after n_rep / base if no attn_mask
+      - +scale      -> include scale last (after dropout_p if present, else after attn_mask/n_rep/base)
+    """
+    # build signature
+    argnames: list[str] = ["q", "k", "v"]
+    if repeat_kv:
+        argnames.append("n_rep")
+    if has_attn_mask:
+        argnames.append("attn_mask")
+    if has_dropout:
+        argnames.append("dropout_p")
+    if has_scale:
+        argnames.append("scale")
+
+    # helper to build call kwargs source strings
+    def _build_sdpa_kw_src():
+        parts = []
+        if has_attn_mask:
+            parts.append("attn_mask=attn_mask")
+        if has_dropout:
+            parts.append("dropout_p=dropout_p")
+        if has_scale:
+            parts.append("scale=scale")
+        parts.append(f"is_causal={str(is_causal)}")
+        if enable_gqa:
+            parts.append("enable_gqa=True")
+        return ", ".join(parts)
+
+    def _build_attn_kw_src():
+        parts = []
+        if has_attn_mask:
+            parts.append("attn_mask=attn_mask")
+        if has_dropout:
+            parts.append("dropout_p=dropout_p")
+        if has_scale:
+            parts.append("scale=scale")
+        parts.append(f"is_causal={str(is_causal)}")
+        return ", ".join(parts)
+
+    sdpa_kw_src = _build_sdpa_kw_src()
+    attn_kw_src = _build_attn_kw_src()
+
+    # factories that also return the source we exec
+    def pattern_factory(argnames=tuple(argnames), repeat_kv=repeat_kv):
+        args_sig = ", ".join(argnames)
+        fn_name = (
+            f"ga_pat_r{int(repeat_kv)}_c{int(is_causal)}_s{int(has_scale)}_"
+            f"g{int(enable_gqa)}_m{int(has_attn_mask)}_d{int(has_dropout)}"
+        )
+        body_lines = [f"def {fn_name}({args_sig}):"]
+        if repeat_kv:
+            body_lines.append("    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)")
+            body_lines.append("    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)")
+        call_line = (
+            "    return torch.ops.auto_deploy.torch_attention_sdpa.default("
+            f"q, k, v{', ' if sdpa_kw_src else ''}{sdpa_kw_src})"
+        )
+        body_lines.append(call_line)
+        src = "\n".join(body_lines)
+        scope = {"torch": torch}
+        exec(src, scope)
+        return scope[fn_name]
+
+    def replacement_factory(argnames=tuple(argnames)):
+        args_sig = ", ".join(argnames)
+        fn_name = (
+            f"ga_rep_r{int(repeat_kv)}_c{int(is_causal)}_s{int(has_scale)}_"
+            f"g{int(enable_gqa)}_m{int(has_attn_mask)}_d{int(has_dropout)}"
+        )
+        body = [f"def {fn_name}({args_sig}):"]
+        call_line = (
+            "    return torch.ops.auto_deploy.torch_attention.default("
+            f"q, k, v{', ' if attn_kw_src else ''}{attn_kw_src})"
+        )
+        body.append(call_line)
+        src = "\n".join(body)
+        scope = {"torch": torch}
+        exec(src, scope)
+        return scope[fn_name]
+
+    pat_fn = pattern_factory()
+    rep_fn = replacement_factory()
+
+    return pat_fn, rep_fn, argnames
+
+
+def generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern: Callable):
+    """
+    Auto-generate all grouped attention patterns across these axes:
+      1) repeat_kv:        [False, True]
+      2) is_causal:        [False, True]
+      3) has_scale:        [False, True]
+      4) enable_gqa:       [False, True]   (only a kwarg to SDPA side)
+      5) has_attn_mask:    [False, True]
+      6) has_dropout:      [False, True]
+
+    For each valid combo, we:
+      - build pattern/replacement functions with exact-arg parity
+      - build dummy args matching the signature (with CUDA fp16 tensors etc.)
+      - build scalar_workaround dict for any scalars/n_rep present
+      - call register_ad_pattern(...)
+    """
+    q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
+    k1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
+    v1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
+    attn_mask_tensor = torch.randn(8, 1, 1, 16, device="cuda", dtype=torch.float16)
+
+    dropout_val = 0.12345
+    scale_val = 0.56789
+    n_rep_val = 7
+
+    total = 0
+    for repeat_kv in (False, True):
+        for is_causal in (False, True):
+            for has_scale in (False, True):
+                for enable_gqa in (False, True):
+                    for has_attn_mask in (False, True):
+                        for has_dropout in (False, True):
+                            # Build functions
+                            pat_fn, rep_fn, argnames = make_grouped_attn_pair(
+                                repeat_kv=repeat_kv,
+                                is_causal=is_causal,
+                                has_scale=has_scale,
+                                enable_gqa=enable_gqa,
+                                has_attn_mask=has_attn_mask,
+                                has_dropout=has_dropout,
+                            )
+
+                            # Build dummy args in the same positional order
+                            dummy_args: List[object] = []
+                            for name in argnames:
+                                if name == "q":
+                                    dummy_args.append(q)
+                                elif name == "k":
+                                    dummy_args.append(k1)
+                                elif name == "v":
+                                    dummy_args.append(v1)
+                                elif name == "n_rep":
+                                    dummy_args.append(n_rep_val)
+                                elif name == "attn_mask":
+                                    dummy_args.append(attn_mask_tensor)
+                                elif name == "dropout_p":
+                                    dummy_args.append(dropout_val)
+                                elif name == "scale":
+                                    dummy_args.append(scale_val)
+                                else:
+                                    raise RuntimeError(f"Unexpected arg name: {name}")
+
+                            # scalar_workaround mirrors only the scalar args present by name
+                            scalar_workaround: Dict[str, object] = {}
+                            if "n_rep" in argnames:
+                                scalar_workaround["n_rep"] = n_rep_val
+                            if "dropout_p" in argnames:
+                                scalar_workaround["dropout_p"] = dropout_val
+                            if "scale" in argnames:
+                                scalar_workaround["scale"] = scale_val
+
+                            # Register
+                            register_ad_pattern(
+                                search_fn=pat_fn,
+                                replace_fn=rep_fn,
+                                patterns=patterns,
+                                dummy_args=dummy_args,
+                                scalar_workaround=scalar_workaround if scalar_workaround else None,
+                            )
+                            total += 1
+    return total
+
+
 @TransformRegistry.register("match_grouped_attention")
 class MatchGroupedAttention(BaseTransform):
     """
@@ -522,99 +547,10 @@ class MatchGroupedAttention(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_grouped_attention(patterns: ADPatternMatcherPass):
-            q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
-            k1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
-            v1 = torch.randn(8, 1, 16, 64, device="cuda", dtype=torch.float16)
-            attn_mask = torch.randn(8, 1, 1, 16, device="cuda", dtype=torch.float16)
-            dropout = 0.12345
-            scale = 0.56789
-            n_rep = 7
-
-            dummy_args_1 = [q, k1, v1, n_rep, attn_mask, dropout, scale]
-            dummy_args_2 = [q, k1, v1, attn_mask, dropout, scale]
-            dummy_args_3 = [q, k1, v1, n_rep, attn_mask]
-            dummy_args_4 = [q, k1, v1, dropout, scale]
-            dummy_args_5 = [q, k1, v1, n_rep, dropout]
-
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_1,
-                replace_fn=_grouped_attn_replacement_1,
-                patterns=patterns,
-                dummy_args=dummy_args_1,
-                scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_2,
-                replace_fn=_grouped_attn_replacement_2,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={
-                    "scale": scale,
-                    "dropout_p": dropout,
-                },
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_3,
-                replace_fn=_grouped_attn_replacement_3,
-                patterns=patterns,
-                dummy_args=dummy_args_1,
-                scalar_workaround={"scale": scale, "dropout_p": dropout, "n_rep": n_rep},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_4,
-                replace_fn=_grouped_attn_replacement_4,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={
-                    "scale": scale,
-                    "dropout_p": dropout,
-                },
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_5,
-                replace_fn=_grouped_attn_replacement_5,
-                patterns=patterns,
-                dummy_args=dummy_args_3,
-                scalar_workaround={"n_rep": n_rep},
-            )
-
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_6,
-                replace_fn=_grouped_attn_replacement_6,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_7,
-                replace_fn=_grouped_attn_replacement_7,
-                patterns=patterns,
-                dummy_args=dummy_args_2,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_8,
-                replace_fn=_grouped_attn_replacement_8,
-                patterns=patterns,
-                dummy_args=dummy_args_4,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_9,
-                replace_fn=_grouped_attn_replacement_9,
-                patterns=patterns,
-                dummy_args=dummy_args_4,
-                scalar_workaround={"scale": scale, "dropout_p": dropout},
-            )
-            register_ad_pattern(
-                search_fn=_grouped_attn_pattern_10,
-                replace_fn=_grouped_attn_replacement_10,
-                patterns=patterns,
-                dummy_args=dummy_args_5,
-                scalar_workaround={"dropout_p": dropout, "n_rep": n_rep},
-            )
+            return generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern)
 
         num_grouped_patterns = _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
+
         if num_grouped_patterns == 0:
             ad_logger.warning(
                 "Fail to find any Group Attention Pattern, output or performance may be incorrect"
@@ -626,190 +562,103 @@ class MatchGroupedAttention(BaseTransform):
             is_clean=False,
             has_valid_shapes=False,
         )
-
         return gm, info
 
 
-def _attn_bnsd_pattern_1(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=scale,
-        layout="bnsd",
-    )
+def make_attn_bnsd_pair(
+    *,
+    has_attn_mask: bool,
+    has_dropout: bool,
+    is_causal: bool,
+    has_scale: bool,
+) -> Tuple[Callable, Callable, List[str], str, str]:
+    """
+    Returns (pattern_fn, replacement_fn, argnames, pat_src, rep_src)
+      - pattern_fn(*args) matches torch_attention.default(..., layout="bnsd")
+      - replacement_fn(*args) transposes to BSND, runs torch_attention.default(..., layout="bsnd"), transposes back
+      - argnames is the ordered arg list: (q, k, v [, attn_mask] [, dropout_p] [, scale])
+      - pat_src / rep_src are the exact function bodies (for debug logging)
+    """
+    # signature in positional order
+    argnames: List[str] = ["q", "k", "v"]
+    if has_attn_mask:
+        argnames.append("attn_mask")
+    if has_dropout:
+        argnames.append("dropout_p")
+    if has_scale:
+        argnames.append("scale")
+
+    # build kw parts (omit anything not present; always include is_causal; set layout explicitly
+    def _build_kw_src(layout_value: str) -> str:
+        parts = []
+        if has_attn_mask:
+            parts.append("attn_mask=attn_mask")
+        if has_dropout:
+            parts.append("dropout_p=dropout_p")
+        if has_scale:
+            parts.append("scale=scale")
+        parts.append(f"is_causal={str(is_causal)}")
+        parts.append(f'layout="{layout_value}"')
+        return ", ".join(parts)
+
+    bnsd_kw_src = _build_kw_src("bnsd")
+    bsnd_kw_src = _build_kw_src("bsnd")
+
+    # factories: generate functions with explicit kwargs
+    def pattern_factory(argnames=tuple(argnames)):
+        args_sig = ", ".join(argnames)
+        fn_name = (
+            f"attn_bnsd_pat_m{int(has_attn_mask)}_d{int(has_dropout)}_"
+            f"c{int(is_causal)}_s{int(has_scale)}"
+        )
+        body = [f"def {fn_name}({args_sig}):"]
+        call = (
+            "    return torch.ops.auto_deploy.torch_attention.default("
+            f"q, k, v{', ' if bnsd_kw_src else ''}{bnsd_kw_src})"
+        )
+        body.append(call)
+        src = "\n".join(body)
+        scope = {"torch": torch}
+        exec(src, scope)
+        return scope[fn_name]
+
+    def replacement_factory(argnames=tuple(argnames)):
+        args_sig = ", ".join(argnames)
+        fn_name = (
+            f"attn_bnsd_rep_m{int(has_attn_mask)}_d{int(has_dropout)}_"
+            f"c{int(is_causal)}_s{int(has_scale)}"
+        )
+        body = [f"def {fn_name}({args_sig}):"]
+        body.append("    q_bsnd = torch.ops.aten.transpose.int(q, 1, 2)")
+        body.append("    k_bsnd = torch.ops.aten.transpose.int(k, 1, 2)")
+        body.append("    v_bsnd = torch.ops.aten.transpose.int(v, 1, 2)")
+        call = (
+            "    out_bsnd = torch.ops.auto_deploy.torch_attention.default("
+            f"q_bsnd, k_bsnd, v_bsnd{', ' if bsnd_kw_src else ''}{bsnd_kw_src})"
+        )
+        body.append(call)
+        body.append("    return torch.ops.aten.transpose.int(out_bsnd, 1, 2)")
+        src = "\n".join(body)
+        scope = {"torch": torch}
+        exec(src, scope)
+        return scope[fn_name]
+
+    pat_fn = pattern_factory()
+    rep_fn = replacement_factory()
+
+    return pat_fn, rep_fn, argnames
 
 
-def _attn_bnsd_pattern_2(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=scale,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_pattern_3(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=scale,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_pattern_4(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=scale,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_pattern_5(q, k, v, attn_mask, dropout_p):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=None,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_pattern_6(q, k, v, dropout_p):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=False,
-        scale=None,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_pattern_7(q, k, v, attn_mask, dropout_p):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=None,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_pattern_8(q, k, v, dropout_p):
-    return torch.ops.auto_deploy.torch_attention.default(
-        q,
-        k,
-        v,
-        attn_mask=None,
-        dropout_p=dropout_p,
-        is_causal=True,
-        scale=None,
-        layout="bnsd",
-    )
-
-
-def _attn_bnsd_to_bnsd_via_bsnd(q, k, v, *, attn_mask, dropout_p, is_causal, scale):
-    q_bsnd = torch.ops.aten.transpose.int(q, 1, 2)
-    k_bsnd = torch.ops.aten.transpose.int(k, 1, 2)
-    v_bsnd = torch.ops.aten.transpose.int(v, 1, 2)
-
-    out_bsnd = torch.ops.auto_deploy.torch_attention.default(
-        q_bsnd,
-        k_bsnd,
-        v_bsnd,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-        scale=scale,
-        layout="bsnd",
-    )
-    return torch.ops.aten.transpose.int(out_bsnd, 1, 2)
-
-
-# 1) is_causal=False, mask present, scale present
-def _attn_bnsd_replacement_1(q, k, v, attn_mask, dropout_p, scale):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-# 2) is_causal=False, mask None, scale present
-def _attn_bnsd_replacement_2(q, k, v, dropout_p, scale):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=scale
-    )
-
-
-# 3) is_causal=True, mask present, scale present
-def _attn_bnsd_replacement_3(q, k, v, attn_mask, dropout_p, scale):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-# 4) is_causal=True, mask None, scale present
-def _attn_bnsd_replacement_4(q, k, v, dropout_p, scale):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=scale
-    )
-
-
-# 5) is_causal=False, mask present, scale=None
-def _attn_bnsd_replacement_5(q, k, v, attn_mask, dropout_p):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=None
-    )
-
-
-# 6) is_causal=False, mask None, scale=None
-def _attn_bnsd_replacement_6(q, k, v, dropout_p):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=None
-    )
-
-
-# 7) is_causal=True, mask present, scale=None
-def _attn_bnsd_replacement_7(q, k, v, attn_mask, dropout_p):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=None
-    )
-
-
-# 8) is_causal=True, mask None, scale=None
-def _attn_bnsd_replacement_8(q, k, v, dropout_p):
-    return _attn_bnsd_to_bnsd_via_bsnd(
-        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=None
-    )
-
-
-def register_match_attn_layout(patterns: ADPatternMatcherPass):
-    # Dummy tensors in BNSD (we match bnsd calls)
+def generate_and_register_attn_layout_patterns(patterns, register_ad_pattern: Callable):
+    """
+    Enumerate all combinations across:
+      - has_attn_mask in {False, True}
+      - has_dropout   in {False, True}
+      - is_causal     in {False, True}
+      - has_scale     in {False, True}
+    Register each pattern/replacement with appropriate dummy args and scalar workarounds.
+    """
+    # Dummy tensors in BNSD
     bs, n_heads, s_q, head_dim = 8, 8, 16, 64
     q = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
     k = torch.randn(bs, n_heads, s_q, head_dim, device="cuda", dtype=torch.float16)
@@ -819,65 +668,58 @@ def register_match_attn_layout(patterns: ADPatternMatcherPass):
     dropout_p = 0.12345
     scale_val = 0.56789
 
-    # 1..4 (scale present)
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_1,
-        replace_fn=_attn_bnsd_replacement_1,
-        patterns=patterns,
-        dummy_args=[q, k, v, attn_mask, dropout_p, scale_val],
-        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
-    )
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_2,
-        replace_fn=_attn_bnsd_replacement_2,
-        patterns=patterns,
-        dummy_args=[q, k, v, dropout_p, scale_val],
-        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
-    )
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_3,
-        replace_fn=_attn_bnsd_replacement_3,
-        patterns=patterns,
-        dummy_args=[q, k, v, attn_mask, dropout_p, scale_val],
-        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
-    )
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_4,
-        replace_fn=_attn_bnsd_replacement_4,
-        patterns=patterns,
-        dummy_args=[q, k, v, dropout_p, scale_val],
-        scalar_workaround={"dropout_p": dropout_p, "scale": scale_val},
-    )
+    total = 0
+    for has_attn_mask in (False, True):
+        for has_dropout in (False, True):
+            for is_causal in (False, True):
+                for has_scale in (False, True):
+                    pat_fn, rep_fn, argnames = make_attn_bnsd_pair(
+                        has_attn_mask=has_attn_mask,
+                        has_dropout=has_dropout,
+                        is_causal=is_causal,
+                        has_scale=has_scale,
+                    )
 
-    # 5..8 (scale None)
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_5,
-        replace_fn=_attn_bnsd_replacement_5,
-        patterns=patterns,
-        dummy_args=[q, k, v, attn_mask, dropout_p],
-        scalar_workaround={"dropout_p": dropout_p},
-    )
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_6,
-        replace_fn=_attn_bnsd_replacement_6,
-        patterns=patterns,
-        dummy_args=[q, k, v, dropout_p],
-        scalar_workaround={"dropout_p": dropout_p},
-    )
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_7,
-        replace_fn=_attn_bnsd_replacement_7,
-        patterns=patterns,
-        dummy_args=[q, k, v, attn_mask, dropout_p],
-        scalar_workaround={"dropout_p": dropout_p},
-    )
-    register_ad_pattern(
-        search_fn=_attn_bnsd_pattern_8,
-        replace_fn=_attn_bnsd_replacement_8,
-        patterns=patterns,
-        dummy_args=[q, k, v, dropout_p],
-        scalar_workaround={"dropout_p": dropout_p},
-    )
+                    # Build dummy args following positional signature
+                    dummy_args: List[object] = []
+                    for name in argnames:
+                        if name == "q":
+                            dummy_args.append(q)
+                        elif name == "k":
+                            dummy_args.append(k)
+                        elif name == "v":
+                            dummy_args.append(v)
+                        elif name == "attn_mask":
+                            dummy_args.append(attn_mask)
+                        elif name == "dropout_p":
+                            dummy_args.append(dropout_p)
+                        elif name == "scale":
+                            dummy_args.append(scale_val)
+                        else:
+                            raise RuntimeError(f"Unexpected arg name: {name}")
+
+                    # Scalar workaround for present scalars only
+                    scalar_workaround = {}
+                    if has_dropout:
+                        scalar_workaround["dropout_p"] = dropout_p
+                    if has_scale:
+                        scalar_workaround["scale"] = scale_val
+                    if not scalar_workaround:
+                        scalar_workaround = None
+
+                    register_ad_pattern(
+                        search_fn=pat_fn,
+                        replace_fn=rep_fn,
+                        patterns=patterns,
+                        dummy_args=dummy_args,
+                        scalar_workaround=scalar_workaround,
+                    )
+                    total += 1
+    return total
+
+
+def register_match_attn_layout(patterns: ADPatternMatcherPass):
+    return generate_and_register_attn_layout_patterns(patterns, register_ad_pattern)
 
 
 class MatchAttentionLayoutConfig(TransformConfig):
