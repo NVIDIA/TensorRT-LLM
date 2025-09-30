@@ -207,6 +207,7 @@ disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
+test_e2e.py::test_openai_chat_harmony
 test_e2e.py::test_openai_consistent_chat
 test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_ptp_quickstart
