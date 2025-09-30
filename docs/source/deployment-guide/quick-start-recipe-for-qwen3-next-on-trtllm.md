@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and tuning guidance will be rolled out in future updates.
+This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support (such as Blackwell) will be rolled out in future updates. 
 
 ## Prerequisites
 
