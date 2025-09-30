@@ -325,6 +325,9 @@ class ModelLoader:
                 if hasattr(config.pretrained_config, sub_config):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
+
+        if config.pretrained_config.model_type == "deepseek_v32":
+            self.sparse_attention_config = DSASparseAttentionConfig()
         return config
 
     def _call_load_weights(self, load_method: Callable, weights, weight_mapper):

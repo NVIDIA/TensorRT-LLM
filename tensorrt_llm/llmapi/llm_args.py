@@ -169,14 +169,13 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """
     Configuration for sparse attention.
     """
-    algorithm: Literal["rocket"] = Field(
-        default="rocket", description="The algorithm for sparse attention.")
 
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
-            "rocket": RocketSparseAttentionConfig,
+            "Rocket": RocketSparseAttentionConfig,
+            "DSA": DSASparseAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -202,8 +201,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
-    Configuration for rocket sparse attention.
+    Configuration for RocketKV sparse attention.
     """
+    algorithm: ClassVar[str] = "rocket"
     window_size: Optional[int] = Field(
         default=None, description="The window size for snap KV.")
     kernel_size: Optional[int] = Field(
@@ -213,6 +213,20 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     prompt_budget: Optional[int] = Field(default=1266,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
+class DSASparseAttentionConfig(SparseAttentionBaseConfig):
+    """
+    Configuration for DeepSeek Sparse Attention.
+    """
+    algorithm: ClassVar[str] = "dsa"
 
     @classmethod
     def from_dict(cls, data: dict):

@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.llm_args import DSASparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -448,6 +449,9 @@ class ModelConfig(Generic[TConfig]):
         elif (quant_config_file := model_dir / 'dtypes.json').exists():
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend)
+
+        if pretrained_config.model_type == "deepseek_v32":
+            kwargs['sparse_attention_config'] = DSASparseAttentionConfig()
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

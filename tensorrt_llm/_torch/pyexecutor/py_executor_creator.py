@@ -384,6 +384,7 @@ def create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
+    sparse_attention_config = model_engine.sparse_attention_config
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):

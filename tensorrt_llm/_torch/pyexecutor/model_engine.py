@@ -211,6 +211,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
+        self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
