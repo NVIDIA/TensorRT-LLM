@@ -1,3 +1,4 @@
+import argparse
 import pathlib
 
 import numpy as np
@@ -12,6 +13,13 @@ from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 from tensorrt_llm.tools.layer_wise_benchmarks.deepseekv3_runner import (
     BalanceMethod, DeepSeekV3Runner)
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--test-case",
+                    type=str,
+                    choices=["CTX", "GEN"],
+                    default="GEN")
+args = parser.parse_args()
+
 # MPI args
 rank = mpi_rank()
 world_size = mpi_world_size()
@@ -21,17 +29,25 @@ torch.cuda.set_device(local_rank)
 # Model definition
 pretrained_config = DeepseekV3Config.from_json_file(
     pathlib.Path(__file__).parent / "config_DeepSeek-R1-FP4.json")
-experts_per_rank = 8
-pretrained_config.n_routed_experts = experts_per_rank * world_size
 layer_indices = [5, 6]
 
 # KV cache related args
-MAX_BATCH_SIZE = 1024
-MAX_SEQ_LEN = 8192 + 512
-SEQ_LEN_Q = 2
-MAX_NUM_TOKENS = SEQ_LEN_Q * MAX_BATCH_SIZE
-enable_attention_dp = True
-moe_backend = "WIDEEP"
+if args.test_case == "GEN":
+    MAX_BATCH_SIZE = 1024
+    MAX_SEQ_LEN = 8192 + 512
+    MAX_SEQ_LEN_Q = 2
+    MAX_NUM_TOKENS = MAX_SEQ_LEN_Q * MAX_BATCH_SIZE
+    enable_attention_dp = True
+    moe_backend = "WIDEEP"
+elif args.test_case == "CTX":
+    MAX_BATCH_SIZE = 4
+    MAX_SEQ_LEN = 8192 + 512
+    MAX_SEQ_LEN_Q = 8192 + 512
+    MAX_NUM_TOKENS = MAX_SEQ_LEN_Q * MAX_BATCH_SIZE
+    enable_attention_dp = True
+    moe_backend = "CUTLASS"
+else:
+    raise NotImplementedError(f"Not support test case \"{args.test_case}\"")
 
 # Create KV cache manager
 mapping = DeepSeekV3Runner.create_mapping(
@@ -46,6 +62,7 @@ kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
 attn_workspace = torch.empty((0, ), device="cuda", dtype=torch.int8)
 
 # Create other global objects
+use_cuda_graph = args.test_case == "GEN"
 AutoTuner.get().clear_cache()
 capture_stream = torch.cuda.Stream()
 
@@ -57,16 +74,26 @@ runner = DeepSeekV3Runner(
     layer_indices=layer_indices,
     kv_cache_dtype=torch.float8_e4m3fn,
     max_num_tokens=MAX_NUM_TOKENS,
+    use_cuda_graph=use_cuda_graph,
 )
 
 # Warm up
-batch_size = 128
-seq_len_kv = 2000
+if args.test_case == "GEN":
+    batch_size = 128
+    seq_len_q = 2  # MTP1
+    seq_len_kv_cache = 2000
+elif args.test_case == "CTX":
+    batch_size = 1
+    seq_len_q = 8193
+    seq_len_kv_cache = 0
+else:
+    raise NotImplementedError(f"Not support test case \"{args.test_case}\"")
 balance_method = BalanceMethod.Balanced
 balance_ratio = 1.
-run_pack = runner.create_run_pack(batch_size=batch_size,
-                                  seq_len_q=SEQ_LEN_Q,
-                                  seq_len_kv=seq_len_kv,
+run_pack = runner.create_run_pack(args.test_case,
+                                  batch_size=batch_size,
+                                  seq_len_q=seq_len_q,
+                                  seq_len_kv_cache=seq_len_kv_cache,
                                   kv_cache_manager=kv_cache_manager,
                                   attn_workspace=attn_workspace)
 runner.replace_routing_method(balance_method=balance_method,
@@ -81,7 +108,7 @@ torch.cuda.synchronize()
 
 # Profile: capture graph and replay it
 torch.cuda.cudart().cudaProfilerStart()
-if runner.is_cuda_capturable():
+if use_cuda_graph:
     with with_multi_stream(True):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g,
@@ -97,10 +124,8 @@ events = [
 ]
 for i in range(warmup_times + run_times):
     events[i].record()
-    with nvtx.annotate(
-            f"b={batch_size} s={SEQ_LEN_Q} #E={experts_per_rank}xEP{world_size}"
-    ):
-        if runner.is_cuda_capturable():
+    with nvtx.annotate(f"b={batch_size} s={seq_len_q} EP{world_size}"):
+        if use_cuda_graph:
             g.replay()
         else:
             run_pack()

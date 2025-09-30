@@ -14,8 +14,6 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import (
     DeepseekV3DecoderLayer, DeepseekV3Gate)
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
-    AlltoallMethodType
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import (AuxStreamType, get_model_extra_attrs,
@@ -140,7 +138,8 @@ class DeepSeekV3Runner:
                  moe_backend: str,
                  layer_indices: List[int],
                  kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
-                 max_num_tokens: int):
+                 max_num_tokens: int,
+                 use_cuda_graph: bool):
 
         self.pretrained_config = pretrained_config
         self.mapping = mapping
@@ -170,15 +169,16 @@ class DeepSeekV3Runner:
             skip_create_weights_in_init=True,
             spec_config=None,
             lora_config=None,
-            # is_generation=True,  # TODO: context?
+            is_generation=True,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=None,
             moe_load_balancer=None,
             attn_backend="TRTLLM",
             moe_backend=moe_backend,
+            use_low_precision_moe_combine=False,
             allreduce_strategy=AllReduceStrategy.MNNVL,  # TODO: AUTO?
             enable_min_latency=False,
-            use_cuda_graph=True,
+            use_cuda_graph=use_cuda_graph,
             force_dynamic_quantization=False,
         )
 
@@ -223,9 +223,10 @@ class DeepSeekV3Runner:
         tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate = gate_cls_orig
 
     def create_run_pack(self,
+                        test_case: str,
                         batch_size: int,
                         seq_len_q: int,
-                        seq_len_kv: int,
+                        seq_len_kv_cache: int,
                         kv_cache_manager: Optional[KVCacheManager] = None,
                         attn_workspace: Optional[torch.Tensor] = None):
         if self.moe_backend == "TRTLLM" and os.getenv(
@@ -239,13 +240,19 @@ class DeepSeekV3Runner:
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
-            num_contexts=0,
-            prompt_lens=[1] * batch_size,
+            num_contexts={
+                "CTX": batch_size,
+                "GEN": 0
+            }[test_case],
+            prompt_lens=[{
+                "CTX": seq_len_q,
+                "GEN": seq_len_kv_cache
+            }[test_case]] * batch_size,
             max_num_tokens=kv_cache_manager.max_seq_len,
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
-                num_cached_tokens_per_seq=[seq_len_kv] * batch_size,
+                num_cached_tokens_per_seq=[seq_len_kv_cache] * batch_size,
             ),
             workspace=attn_workspace,
             mapping=self.mapping,
@@ -256,9 +263,11 @@ class DeepSeekV3Runner:
         with model_extra_attrs(self.layers[0].model_config.extra_attrs):
             get_model_extra_attrs()["attention_metadata"] = weakref.ref(
                 attn_metadata)
-        position_ids = torch.tensor(
-            [list(range(seq_len_kv, seq_len_kv + seq_len_q)) * batch_size],
-            dtype=torch.int32)
+        position_ids = torch.tensor([
+            list(range(seq_len_kv_cache, seq_len_kv_cache + seq_len_q)) *
+            batch_size
+        ],
+                                    dtype=torch.int32)
         hidden_states = torch.rand(
             (batch_size * seq_len_q, self.pretrained_config.hidden_size),
             dtype=torch.bfloat16,
@@ -281,18 +290,13 @@ class DeepSeekV3Runner:
 
     def replace_routing_method(self, balance_method: BalanceMethod,
                                balance_ratio: float):
-        if self.moe_backend != "WIDEEP":
+        if self.moe_backend not in ["CUTLASS", "WIDEEP"]:
             raise NotImplementedError(
-                f"Not support replace routing method for moe_backend \"{moe_backend}\""
+                f"Not support replace routing method for moe_backend \"{self.moe_backend}\""
             )
         for layer in self.layers:
             layer.mlp.gate.balance_method = balance_method
             layer.mlp.gate.balance_ratio = balance_ratio
-
-    def is_cuda_capturable(self):
-        return self.moe_backend == "TRTLLM" or all(
-            layer.mlp.experts.alltoall_method_type != AlltoallMethodType.DeepEP
-            for layer in self.layers)
 
     @staticmethod
     def create_kv_cache_manager(pretrained_config, mapping, kv_cache_dtype,

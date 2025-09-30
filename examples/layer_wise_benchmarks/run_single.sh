@@ -9,7 +9,7 @@ if [ -v OMPI_COMM_WORLD_SIZE ]; then
     export NODE_RANK=$OMPI_COMM_WORLD_NODE_RANK
 fi
 
-export TRTLLM_FORCE_ALLTOALL_METHOD=MNNVL
+export TRTLLM_FORCE_ALLTOALL_METHOD=${TRTLLM_FORCE_ALLTOALL_METHOD:-MNNVL}
 
 PROFILE=${PROFILE:-1}
 if [ "$PROFILE" -eq 1 ]; then
@@ -27,4 +27,4 @@ else
 fi
 
 set -x
-$PROFILE_CMD python3 -u run_single.py
+$PROFILE_CMD python3 -u run_single.py "$@"

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Example: NP=4 ./mpi_launch.sh ./run_single.sh
+# Example: NP=4 ./mpi_launch.sh ./run_single.sh --test-case GEN
 
 set -euo pipefail
 
