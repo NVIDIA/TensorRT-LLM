@@ -1334,11 +1334,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         if self.sparse_attention_config is not None:
-            sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = self.sparse_attention_predict(
+            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
                 q, k, metadata)
-            if sparse_kv_indices is not None:
-                sparse_kv_indices = sparse_kv_indices.transpose(0,
-                                                                1).contiguous()
+            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                q, k, metadata)
             if sparse_attn_indices is not None:
                 sparse_attn_indices, sparse_attn_offsets = convert_token_to_page_sparse_indices(
                     sparse_attn_indices, sparse_attn_offsets, metadata)
@@ -1611,10 +1610,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.v_head_dim,
         )
 
-    def sparse_attention_predict(
-        self, q: torch.Tensor, k: torch.Tensor,
-        metadata: TrtllmAttentionMetadata
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-            Predict sparse kv indices and sparse attn indices for the input sequence. It's implemented in the derived class.
+            Predict sparse attn indices. It's implemented in the derived class.
         """
+        raise NotImplementedError
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse kv indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError
