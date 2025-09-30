@@ -22,27 +22,12 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ### Run Docker Container
 
-Run the docker container using the TensorRT LLM NVIDIA NGC image.
-
-```shell
-docker run --rm -it \
---ipc=host \
---gpus all \
--p 8000:8000 \
--v ~/.cache:/root/.cache:rw \
---name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc7 \
-/bin/bash
+Build and run the docker container. See the [Docker guide](../../../docker/README.md) for details.
 ```
+cd TensorRT-LLM
 
-Note:
-
-* The command mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container. If the `~/.cache` directory doesn’t exist please create it using `$ mkdir ~/.cache`.
-* You can mount additional directories and paths using the `-v <host_path>:<container_path>` flag if needed, such as mounting the downloaded weight paths.
-* The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
-* See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
-
-If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
+make -C docker release_run LOCAL_USER=1
+```
 
 ### Creating the TRT-LLM Server config
 
