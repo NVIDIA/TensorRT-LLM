@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 import pytest
@@ -355,7 +356,6 @@ def test_multi_eagle3(use_one_model: bool):
             pass
 
 
-<<<<<<< HEAD
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     """Test CUDA graph padding with 3 requests and max_batch_size=4.
