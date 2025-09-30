@@ -1,6 +1,6 @@
 # LLaMA
 
-This document shows how to build and run a LLaMA model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
+This document shows how to build and run a LLaMA model in TensorRT LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
 
 - [LLaMA](#llama)
   - [Overview](#overview)
@@ -34,20 +34,24 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
     - [Run INT4-AWQ LLaMa with several FP16 lora checkpoints](#run-int4-awq-llama-with-several-fp16-lora-checkpoints)
   - [Run LLaMa with StreamingLLM](#run-llama-with-streamingllm)
   - [Run LLaMA-3.1 405B Model](#run-llama-31-405b-model)
-    - [Convert Checkpoint to TensorRT-LLM Unified Checkpoint](#convert-checkpoint-to-tensorrt-llm-unified-checkpoint)
+    - [Convert Checkpoint to TensorRT LLM Unified Checkpoint](#convert-checkpoint-to-tensorrt-llm-unified-checkpoint)
     - [Build Engine](#build-engine)
     - [Run Inference](#run-inference)
+  - [Run LLaMa-3.3 70B Model on PyTorch Backend](#run-llama-33-70b-model-on-pytorch-backend)
+    - [Prepare TensorRT LLM extra configs](#prepare-tensorrt-llm-extra-configs)
+    - [Launch trtllm-serve OpenAI-compatible API server](#launch-trtllm-serve-openai-compatible-api-server)
+    - [Run performance benchmarks](#run-performance-benchmarks)
 
 ## Overview
 
-The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py). The TensorRT-LLM LLaMA example code is located in [`examples/models/core/llama`](./). There is one main file:
+The TensorRT LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py). The TensorRT LLM LLaMA example code is located in [`examples/models/core/llama`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the LLaMA model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the LLaMA model into TensorRT LLM checkpoint format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
   * BF16/FP16
@@ -63,7 +67,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-The TensorRT-LLM LLaMA example code locates at [examples/models/core/llama](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM LLaMA example code locates at [examples/models/core/llama](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
 
@@ -75,7 +79,7 @@ pip install --upgrade -r requirements.txt
 
 Need to prepare the HF LLaMA checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
 
-The `trtllm-build` command builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
+The `trtllm-build` command builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT LLM will build engine(s) with dummy weights.
 
 `trtllm-build` command has a variety of options. In particular, the plugin-related options have two categories:
 * Plugin options that requires a data type (e.g., `gpt_attention_plugin`), you can
@@ -128,7 +132,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
             --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
             --gemm_plugin auto
 
-# Build LLaMA 7B using 2-way auto parallelism.
+# Build LLaMA 7B using 2-way auto parallelism (deprecated).
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                             --output_dir ./tllm_checkpoint_1gpu_fp16 \
                             --dtype float16
@@ -610,7 +614,7 @@ python ../../../summarize.py --test_trt_llm \
 
 ### SmoothQuant
 
-The smoothquant supports both LLaMA v1 and LLaMA v2. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+The smoothquant supports both LLaMA v1 and LLaMA v2. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
 
 Example:
 ```bash
@@ -672,7 +676,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
 The peak GPU memory consumption when doing FP8 quantizaton is more than 210GB (there is also some activation memory occupation when doing calibration).
 So you need a node with at least 4 H100(A100) to run the quantization command. After quantization, 2 GPUs are okay to for building and run.
 
-Experimental: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
+Note: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
 
 ```bash
 # Quantize HF LLaMA 7B into FP8 and export trtllm checkpoint
@@ -690,7 +694,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
              --gemm_plugin fp8
 ```
 
-**Note**: FP8 gemm plugin is an experimental feature aimed to improve performance in small-batch-size cases(e.g. BS<=4). Although inputs with batch size larger than 4 can be correctly inferenced, the performance may decrease as batch size grows.
+**Note**: FP8 gemv plugin uses CUDA cores to compute, by contrast to Tensor Core gemm kernel within cuBLAS. Over last year, as cuBLAS have improved their performance by a lot under small M case for Hopper(sm90), FP8 gemv kernel may or may not surpass cuBLAS, depending on specific gemm problem shape. Nonetheless, we still strongly recommend FP8 gemv kernel for Ada (sm89) as cuBLAS still falls behind gemv on it.
 
 ### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
@@ -796,7 +800,7 @@ To run the GPTQ LLaMa example, the following steps are required:
 
 ### w4aINT8 quantization (QServe)
 
-TensorRT-LLM integrates the quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), which employs 4-bit quantization for weights and 8-bit quantization for activations. This technique offers versatile performance benefits across different scenarios. When the GEMM's m dimension is small, as in small batch-size decoding, it achieves performance comparable to w4a16 by reducing the memory bandwidth required for weight access. Conversely, for larger m dimensions, such as during prefilling or large batch-size decoding, it matches the performance of w8a8 by leveraging INT8 Tensor Cores.
+TensorRT LLM integrates the quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), which employs 4-bit quantization for weights and 8-bit quantization for activations. This technique offers versatile performance benefits across different scenarios. When the GEMM's m dimension is small, as in small batch-size decoding, it achieves performance comparable to w4a16 by reducing the memory bandwidth required for weight access. Conversely, for larger m dimensions, such as during prefilling or large batch-size decoding, it matches the performance of w8a8 by leveraging INT8 Tensor Cores.
 
 Please follow the steps to run the model using QServe w4aINT8:
 
@@ -811,7 +815,7 @@ Please follow the steps to run the model using QServe w4aINT8:
 
 2. Checkpoint conversion:
 
-   Convert the DeepCompressor checkpoint into TensorRT-LLM checkpoint, potentially with tensor parallelism:
+   Convert the DeepCompressor checkpoint into TensorRT LLM checkpoint, potentially with tensor parallelism:
 
    ```bash
    export TRTLLM_DISABLE_UNIFIED_CONVERTER=1  # The current checkpoint conversion code requires legacy path
@@ -864,7 +868,7 @@ Please follow the steps to run the model using:
 
 ### Run
 
-To run a TensorRT-LLM LLaMA model using the engines generated by `trtllm-build`
+To run a TensorRT LLM LLaMA model using the engines generated by `trtllm-build`
 
 ```bash
 # With fp16 inference
@@ -917,7 +921,7 @@ srun --container-image=<docker-image> \
 
 Finally, you can submit the task with `sbatch <your-slurm-script>.sh`.
 
-Considering the Slurm or other cluster management systems may be highly customized and the task-submit command may be variant, the forementioned example is for reference only. The key point is to submit the Python script with the MPI runtime, and TensorRT-LLM will take care of the rest.
+Considering the Slurm or other cluster management systems may be highly customized and the task-submit command may be variant, the forementioned example is for reference only. The key point is to submit the Python script with the MPI runtime, and TensorRT LLM will take care of the rest.
 
 ### Summarization using the LLaMA model
 
@@ -1147,7 +1151,7 @@ fine-tuned embedding table or logit GEMM, users should guarantee that all the in
 embedding table or logit GEMM.
 Here, we use two LoRA checkpoints as examples. These two LoRA checkponits add LoRA modules to `q_proj` and `v_proj`. Because we only
 support adding lora modules on `q`, `k` and `v` at the same time, we need to add `--lora_target_modules "attn_q" "attn_k" "attn_v"`.
-In this case, we assign null pointers for the `k` LoRA module in TensorRT-LLM and skip the computation at runtime.
+In this case, we assign null pointers for the `k` LoRA module in TensorRT LLM and skip the computation at runtime.
 
 As the rank of the LoRA modules of both checkpoints is 8, we can set `--max_lora_rank 8` to reduce the memory requirement for the LoRA plugin.
 
@@ -1269,7 +1273,7 @@ Output [Text 0 Beam 0]: "날씨가 아주 좋은 날에 공원에 갔을 때는 
 
 ### Run INT4-AWQ LLaMa with several FP16 lora checkpoints
 
-TensorRT-LLM can also support Quantized base model + FP16/BF16 LoRA. We can first quantize the base model and build engine with the quantized checkpoint and different LoRA adapters. In this section, we show how to run an INT4-AWQ llama model with multiple FP16 LoRA modules.
+TensorRT LLM can also support Quantized base model + FP16/BF16 LoRA. We can first quantize the base model and build engine with the quantized checkpoint and different LoRA adapters. In this section, we show how to run an INT4-AWQ llama model with multiple FP16 LoRA modules.
 
 * Quantize the llama model to INT4-AWQ from HF
 ```bash
@@ -1364,11 +1368,11 @@ Note that the sink tokens is included in the sliding attention tokens, and there
 
 ## Run LLaMA-3.1 405B Model
 
-Currently, TensorRT-LLM supports Meta checkpoint and Huggingface checkpoint for LLaMA-3.1. In this section, we demonstrate how to run the LLaMA-3.1 405B model via TensorRT-LLM. Here, we assume users have downloaded the checkpoints and placed them at `llama_3.1_405B_meta_model/` (Meta BF16 checkpoint), `llama_3.1_405B_HF_model/` (HF BF16 checkpoint) and `llama_3.1_405B_HF_FP8_model/` (HF FP8 checkpoint). Before converting the checkpoints to TensorRT-LLM unified checkpoints, **please check that `{"rope_scaling": {"rope_type": "llama3"}}` is set in the configuration file**. With this flag, TensorRT-LLM will enable the rope scaling of LLaMA-3.1. If not, please add it to the config file.
+Currently, TensorRT LLM supports Meta checkpoint and Huggingface checkpoint for LLaMA-3.1. In this section, we demonstrate how to run the LLaMA-3.1 405B model via TensorRT-LLM. Here, we assume users have downloaded the checkpoints and placed them at `llama_3.1_405B_meta_model/` (Meta BF16 checkpoint), `llama_3.1_405B_HF_model/` (HF BF16 checkpoint) and `llama_3.1_405B_HF_FP8_model/` (HF FP8 checkpoint). Before converting the checkpoints to TensorRT LLM unified checkpoints, **please check that `{"rope_scaling": {"rope_type": "llama3"}}` is set in the configuration file**. With this flag, TensorRT LLM will enable the rope scaling of LLaMA-3.1. If not, please add it to the config file.
 
 Users can run the LLaMA-3.1 model with higher precision (bf16/fp16) or fp8. Here, to prevent accuracy drop, we perform per-channel per-token fp8 quantization (leveraged from https://github.com/pytorch/FBGEMM) on MLP layers, keeping other layers at higher precision. Note that per-channel per-token fp8 quantization is only supported on Huggingface checkpoint now. We will support it on Meta checkpoint soon. Note that this feature only supports SM90.
 
-### Convert Checkpoint to TensorRT-LLM Unified Checkpoint
+### Convert Checkpoint to TensorRT LLM Unified Checkpoint
 
 To use the fp8 quantization, please add the `--use_fp8_rowwise` flag during the checkpoint conversion. In this demonstration, we convert the Meta checkpoint to bfloat16 with TP8-PP2 and the HF checkpoint to FP8 with TP8.
 
@@ -1541,4 +1545,51 @@ bash -c 'python ./examples/mmlu.py --test_trt_llm \
                                    --enable_chunked_context \
                                    --kv_cache_free_gpu_memory_fraction 0.999 \
                                    --max_tokens_in_paged_kv_cache 65064'
+```
+
+## Run LLaMa-3.3 70B Model on PyTorch Backend
+This section provides the steps to run LLaMa-3.3 70B model FP8 precision on PyTorch backend by launching TensorRT LLM server and run performance benchmarks.
+
+
+### Prepare TensorRT LLM extra configs
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+stream_interval: 2
+cuda_graph_config:
+  max_batch_size: 1024
+  enable_padding: true
+EOF
+```
+Explanation:
+- `stream_interval`: The iteration interval to create responses under the streaming mode.
+- `cuda_graph_config`: CUDA Graph config.
+  - `max_batch_size`: Max CUDA graph batch size to capture.
+  - `enable_padding`: Whether to enable CUDA graph padding.
+
+
+### Launch trtllm-serve OpenAI-compatible API server
+TensorRT LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+``` bash
+trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
+    --tp_size 8 \
+    --max_batch_size 1024 \
+    --trust_remote_code \
+    --num_postprocess_workers 2 \
+    --extra_llm_api_options ./extra-llm-api-config.yml
+```
+
+### Run performance benchmarks
+TensorRT LLM provides a benchmark tool to benchmark `trtllm-serve`.
+
+Prepare a new terminal and run `benchmark_serving`.
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model nvidia/Llama-3.3-70B-Instruct-FP8 \
+        --dataset-name random \
+        --ignore-eos \
+        --num-prompts 8192 \
+        --random-input-len 1024 \
+        --random-output-len 2048 \
+        --random-ids \
+        --max-concurrency 1024 \
 ```

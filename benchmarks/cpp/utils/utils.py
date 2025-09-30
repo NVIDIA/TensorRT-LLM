@@ -70,13 +70,28 @@ def multimodal_dataset_dump(multimodal_texts, multimodal_image_paths,
         json.dump(workload.model_dump(), f)
 
 
-def print_text_dataset(input_ids, output_lens):
+def print_text_dataset(input_ids, output_lens, task_ids=None, lora_config=None):
     for i, input_tokens in enumerate(input_ids):
         d = {
             "task_id": i,
             "input_ids": input_tokens,
             "output_tokens": output_lens[i]
         }
+
+        # Add LoRA request if task_ids indicate LoRA usage
+        if task_ids is not None and lora_config is not None:
+            task_id = task_ids[i]
+            if task_id != -1:  # -1 means no LoRA
+                d["lora_request"] = {
+                    "lora_name":
+                    f"lora_{task_id}",
+                    "lora_int_id":
+                    task_id,
+                    "lora_path":
+                    os.path.join(lora_config.get("lora_dir", "loras"),
+                                 str(task_id))
+                }
+
         print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))
 
 

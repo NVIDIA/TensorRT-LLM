@@ -20,6 +20,7 @@ from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..llama.config import LLaMAConfig
 from ..modeling_utils import PretrainedConfig, QuantConfig
+from ..qwen.config import QWenConfig
 
 
 # Medusa-specific config is stored and retrieved from GenericMedusaConfig.
@@ -31,11 +32,10 @@ class MedusaConfig(PretrainedConfig):
                  num_medusa_layers: int = 1,
                  max_draft_len: int = 63,
                  **kwargs):
-        GenericMedusaConfig = QWenConfig if hasattr(
-            kwargs,
-            'model_type') and "qwen" in kwargs['model_type'] else LLaMAConfig
 
-        self.config = GenericMedusaConfig(**kwargs)
+        model_type = str(kwargs.get('model_type', '')).lower()
+        generic_medusa_config = QWenConfig if 'qwen' in model_type else LLaMAConfig
+        self.config = generic_medusa_config(**kwargs)
 
         # Add objects
         self.config.num_medusa_heads = num_medusa_heads
@@ -70,7 +70,7 @@ class MedusaConfig(PretrainedConfig):
         import transformers
 
         trust_remote_code = kwargs.pop('trust_remote_code', True)
-        speculative_config_or_dir = kwargs.pop('speculative_model', None)
+        speculative_config_or_dir = kwargs.pop('speculative_model_dir', None)
         speculative_config = kwargs.pop("speculative_config", None)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):

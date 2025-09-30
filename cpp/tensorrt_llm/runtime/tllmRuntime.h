@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -55,7 +56,7 @@ public:
     }
 
     /// @brief If multiple TensorRT optimization profiles are built in the engine, this function selects the
-    /// corresponding profile that is going to be used based on the runtime shape, for now, TensorRT-LLM only split
+    /// corresponding profile that is going to be used based on the runtime shape, for now, TensorRT LLM only split
     /// multiple profiles on the num_tokens dimension, hence the profile index is selected based on which profile
     /// handles the actual num_tokens
     /// @return The index of the selected TensorRT optimization profile
@@ -143,6 +144,24 @@ public:
         return mUserBufferEnabled;
     }
 
+    void setCurrentBeamWidths(std::vector<SizeType32> const& beamWidth) noexcept
+    {
+        mCurrentBeamWidths = beamWidth;
+    }
+
+    [[nodiscard]] SizeType32 const& getCurrentBeamWidth() const noexcept
+    {
+        // At present, all requests of a batch must have the same beam width in one generation step (or they will not
+        // be batched together). So, the beam widths in `mCurrentBeamWidths` are the same.
+        // Corresponding changes must be done if Diverse-Beam-Width-Search (DBWS, requests with diverse beam width in
+        // a batch in one generation step) is supported in the future.
+        TLLM_CHECK_WITH_INFO(mCurrentBeamWidths.size() > 0, "`mCurrentBeamWidths` is empty.");
+        bool const isEqual = std::all_of(mCurrentBeamWidths.begin(), mCurrentBeamWidths.end(),
+            [&](int elem) { return elem == mCurrentBeamWidths.front(); });
+        TLLM_CHECK_WITH_INFO(isEqual, "beam widths in `mCurrentBeamWidths` are not all equal.");
+        return mCurrentBeamWidths.front();
+    }
+
 private:
     void cacheTensorNames();
 
@@ -218,5 +237,7 @@ private:
     std::vector<std::string> mOutputTensorNames;
 
     bool mUserBufferEnabled;
+    // For Variable-Beam-Width-Search
+    std::vector<SizeType32> mCurrentBeamWidths;
 };
 } // namespace tensorrt_llm::runtime

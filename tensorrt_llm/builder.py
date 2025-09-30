@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import dataclasses
 import json
 import math
 import os
 import shutil
 import time
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -34,7 +36,7 @@ from .bindings import KVCacheType
 from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
 from .logger import logger
-from .lora_manager import LoraConfig
+from .lora_helper import LoraConfig
 from .models import PretrainedConfig, PretrainedModel
 from .models.modeling_utils import SpeculativeDecodingMode, optimize_model
 from .network import Network, net_guard
@@ -49,6 +51,9 @@ class ConfigEncoder(json.JSONEncoder):
         if isinstance(obj, KVCacheType):
             # For KVCacheType, convert it to string by split of 'KVCacheType.PAGED'.
             return obj.__str__().split('.')[-1]
+        elif hasattr(obj, 'model_dump'):
+            # Handle Pydantic models (including DecodingBaseConfig and subclasses)
+            return obj.model_dump(mode='json')
         else:
             return super().default(obj)
 
@@ -298,7 +303,7 @@ class Builder():
                                    builder_config) -> bool:
         '''
             For each profile, validate that the named dimensions of different input tensors in this profile all have same range.
-            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT-LLM are correct and
+            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT LLM are correct and
             makes the error msg more user friendly.
         '''
         valid = True
@@ -474,6 +479,44 @@ class Builder():
 
 @dataclass
 class BuildConfig:
+    """Configuration class for TensorRT LLM engine building parameters.
+
+    This class contains all the configuration parameters needed to build a TensorRT LLM engine,
+    including sequence length limits, batch sizes, optimization settings, and various features.
+
+    Args:
+        max_input_len (int): Maximum length of input sequences. Defaults to 1024.
+        max_seq_len (int, optional): The maximum possible sequence length for a single request, including both input and generated output tokens. Defaults to None.
+        opt_batch_size (int): Optimal batch size for engine optimization. Defaults to 8.
+        max_batch_size (int): Maximum batch size the engine can handle. Defaults to 2048.
+        max_beam_width (int): Maximum beam width for beam search decoding. Defaults to 1.
+        max_num_tokens (int): Maximum number of batched input tokens after padding is removed in each batch. Defaults to 8192.
+        opt_num_tokens (int, optional): Optimal number of batched input tokens for engine optimization. Defaults to None.
+        max_prompt_embedding_table_size (int): Maximum size of prompt embedding table for prompt tuning. Defaults to 0.
+        kv_cache_type (KVCacheType, optional): Type of KV cache to use (CONTINUOUS or PAGED). If None, defaults to PAGED. Defaults to None.
+        gather_context_logits (int): Whether to gather logits during context phase. Defaults to False.
+        gather_generation_logits (int): Whether to gather logits during generation phase. Defaults to False.
+        strongly_typed (bool): Whether to use strongly_typed. Defaults to True.
+        force_num_profiles (int, optional): Force a specific number of optimization profiles. If None, auto-determined. Defaults to None.
+        profiling_verbosity (str): Verbosity level for TensorRT profiling ('layer_names_only', 'detailed', 'none'). Defaults to 'layer_names_only'.
+        enable_debug_output (bool): Whether to enable debug output during building. Defaults to False.
+        max_draft_len (int): Maximum length of draft tokens for speculative decoding. Defaults to 0.
+        speculative_decoding_mode (SpeculativeDecodingMode): Mode for speculative decoding (NONE, MEDUSA, EAGLE, etc.). Defaults to SpeculativeDecodingMode.NONE.
+        use_refit (bool): Whether to enable engine refitting capabilities. Defaults to False.
+        input_timing_cache (str, optional): Path to input timing cache file. If None, no input cache used. Defaults to None.
+        output_timing_cache (str): Path to output timing cache file. Defaults to 'model.cache'.
+        lora_config (LoraConfig): Configuration for LoRA (Low-Rank Adaptation) fine-tuning. Defaults to default LoraConfig.
+        auto_parallel_config (AutoParallelConfig): Configuration for automatic parallelization. Defaults to default AutoParallelConfig.
+        weight_sparsity (bool): Whether to enable weight sparsity optimization. Defaults to False.
+        weight_streaming (bool): Whether to enable weight streaming for large models. Defaults to False.
+        plugin_config (PluginConfig): Configuration for TensorRT LLM plugins. Defaults to default PluginConfig.
+        use_strip_plan (bool): Whether to use stripped plan for engine building. Defaults to False.
+        max_encoder_input_len (int): Maximum encoder input length for encoder-decoder models. Defaults to 1024.
+        dry_run (bool): Whether to perform a dry run without actually building the engine. Defaults to False.
+        visualize_network (str, optional): Path to save network visualization. If None, no visualization generated. Defaults to None.
+        monitor_memory (bool): Whether to monitor memory usage during building. Defaults to False.
+        use_mrope (bool): Whether to use Multi-RoPE (Rotary Position Embedding) optimization. Defaults to False.
+    """
     max_input_len: int = 1024
     max_seq_len: int = None
     opt_batch_size: int = 8
@@ -555,52 +598,88 @@ class BuildConfig:
             override_attri('paged_state', False)
 
     @classmethod
+    @cache
+    def get_build_config_defaults(cls):
+        return {
+            field.name: field.default
+            for field in dataclasses.fields(cls)
+            if field.default is not dataclasses.MISSING
+        }
+
+    @classmethod
     def from_dict(cls, config, plugin_config=None):
         config = copy.deepcopy(
             config
         )  # it just does not make sense to change the input arg `config`
-        max_input_len = config.pop('max_input_len')
-        max_seq_len = config.pop('max_seq_len')
-        max_batch_size = config.pop('max_batch_size')
-        max_beam_width = config.pop('max_beam_width')
-        max_num_tokens = config.pop('max_num_tokens')
-        opt_num_tokens = config.pop('opt_num_tokens')
-        opt_batch_size = config.pop('opt_batch_size', 8)
-        max_prompt_embedding_table_size = config.pop(
-            'max_prompt_embedding_table_size', 0)
 
-        kv_cache_type = KVCacheType(
-            config.pop('kv_cache_type')) if 'plugin_config' in config else None
-        gather_context_logits = config.pop('gather_context_logits', False)
-        gather_generation_logits = config.pop('gather_generation_logits', False)
-        strongly_typed = config.pop('strongly_typed', True)
-        force_num_profiles = config.pop('force_num_profiles', None)
-        weight_sparsity = config.pop('weight_sparsity', False)
+        defaults = cls.get_build_config_defaults()
+        max_input_len = config.pop('max_input_len',
+                                   defaults.get('max_input_len'))
+        max_seq_len = config.pop('max_seq_len', defaults.get('max_seq_len'))
+        max_batch_size = config.pop('max_batch_size',
+                                    defaults.get('max_batch_size'))
+        max_beam_width = config.pop('max_beam_width',
+                                    defaults.get('max_beam_width'))
+        max_num_tokens = config.pop('max_num_tokens',
+                                    defaults.get('max_num_tokens'))
+        opt_num_tokens = config.pop('opt_num_tokens',
+                                    defaults.get('opt_num_tokens'))
+        opt_batch_size = config.pop('opt_batch_size',
+                                    defaults.get('opt_batch_size'))
+        max_prompt_embedding_table_size = config.pop(
+            'max_prompt_embedding_table_size',
+            defaults.get('max_prompt_embedding_table_size'))
+
+        if "kv_cache_type" in config and config["kv_cache_type"] is not None:
+            kv_cache_type = KVCacheType.from_string(config.pop('kv_cache_type'))
+        else:
+            kv_cache_type = None
+        gather_context_logits = config.pop(
+            'gather_context_logits', defaults.get('gather_context_logits'))
+        gather_generation_logits = config.pop(
+            'gather_generation_logits',
+            defaults.get('gather_generation_logits'))
+        strongly_typed = config.pop('strongly_typed',
+                                    defaults.get('strongly_typed'))
+        force_num_profiles = config.pop('force_num_profiles',
+                                        defaults.get('force_num_profiles'))
+        weight_sparsity = config.pop('weight_sparsity',
+                                     defaults.get('weight_sparsity'))
         profiling_verbosity = config.pop('profiling_verbosity',
-                                         'layer_names_only')
-        enable_debug_output = config.pop('enable_debug_output', False)
-        max_draft_len = config.pop('max_draft_len', 0)
-        speculative_decoding_mode = config.pop('speculative_decoding_mode',
-                                               SpeculativeDecodingMode.NONE)
-        use_refit = config.pop('use_refit', False)
-        input_timing_cache = config.pop('input_timing_cache', None)
-        output_timing_cache = config.pop('output_timing_cache', None)
+                                         defaults.get('profiling_verbosity'))
+        enable_debug_output = config.pop('enable_debug_output',
+                                         defaults.get('enable_debug_output'))
+        max_draft_len = config.pop('max_draft_len',
+                                   defaults.get('max_draft_len'))
+        speculative_decoding_mode = config.pop(
+            'speculative_decoding_mode',
+            defaults.get('speculative_decoding_mode'))
+        use_refit = config.pop('use_refit', defaults.get('use_refit'))
+        input_timing_cache = config.pop('input_timing_cache',
+                                        defaults.get('input_timing_cache'))
+        output_timing_cache = config.pop('output_timing_cache',
+                                         defaults.get('output_timing_cache'))
         lora_config = LoraConfig.from_dict(config.get('lora_config', {}))
         auto_parallel_config = AutoParallelConfig.from_dict(
             config.get('auto_parallel_config', {}))
-        max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
-        weight_streaming = config.pop('weight_streaming', False)
-        use_strip_plan = config.pop('use_strip_plan', False)
+        max_encoder_input_len = config.pop(
+            'max_encoder_input_len', defaults.get('max_encoder_input_len'))
+        weight_streaming = config.pop('weight_streaming',
+                                      defaults.get('weight_streaming'))
+        use_strip_plan = config.pop('use_strip_plan',
+                                    defaults.get('use_strip_plan'))
 
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
             plugin_config.update_from_dict(config["plugin_config"])
 
-        dry_run = config.pop('dry_run', False)
-        visualize_network = config.pop('visualize_network', None)
-        monitor_memory = config.pop('monitor_memory', False)
-        use_mrope = config.pop('use_mrope', False)
+        dry_run = config.pop('dry_run', defaults.get('dry_run'))
+        visualize_network = config.pop('visualize_network',
+                                       defaults.get('visualize_network'))
+        monitor_memory = config.pop('monitor_memory',
+                                    defaults.get('monitor_memory'))
+        use_mrope = config.pop('use_mrope', defaults.get('use_mrope'))
 
         return cls(
             max_input_len=max_input_len,

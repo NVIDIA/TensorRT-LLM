@@ -55,9 +55,9 @@ SamplingConfig::SamplingConfig(SizeType32 beamWidth, OptSize32 const& topK, OptF
     , mNoRepeatNgramSize(checkNoRepeatNgramSize(noRepeatNgramSize))
     , mNumReturnSequences(checkNumReturnSequences(numReturnSequences, beamWidth))
     , mMinP(checkMinP(minP))
-    , mBeamWidthArray(checkBeamWidthArray(beamWidthArray, beamWidth))
 {
     updateNumReturnBeams();
+    std::tie(mBeamWidthArray, mBeamWidth) = checkBeamWidthArray(beamWidthArray, mBeamWidth);
 }
 
 bool SamplingConfig::operator==(SamplingConfig const& other) const
@@ -113,12 +113,6 @@ std::optional<RandomSeedType> SamplingConfig::getSeed() const
     return mSeed;
 }
 
-std::optional<RandomSeedType> SamplingConfig::getRandomSeed() const
-{
-    TLLM_LOG_WARNING("getRandomSeed is being deprecated; please use getSeed instead.");
-    return mSeed;
-}
-
 OptFloat SamplingConfig::getTemperature() const
 {
     return mTemperature;
@@ -126,12 +120,6 @@ OptFloat SamplingConfig::getTemperature() const
 
 OptSize32 SamplingConfig::getMinTokens() const
 {
-    return mMinTokens;
-}
-
-OptSize32 SamplingConfig::getMinLength() const
-{
-    TLLM_LOG_WARNING("getMinLength is being deprecated; please use getMinTokens instead.");
     return mMinTokens;
 }
 
@@ -222,12 +210,6 @@ void SamplingConfig::setSeed(std::optional<RandomSeedType> const& seed)
     mSeed = seed;
 }
 
-void SamplingConfig::setRandomSeed(std::optional<RandomSeedType> const& randomSeed)
-{
-    TLLM_LOG_WARNING("setRandomSeed is being deprecated; please use setSeed instead.");
-    mSeed = randomSeed;
-}
-
 void SamplingConfig::setTemperature(OptFloat const& temperature)
 {
     mTemperature = checkTemperature(temperature);
@@ -236,12 +218,6 @@ void SamplingConfig::setTemperature(OptFloat const& temperature)
 void SamplingConfig::setMinTokens(OptSize32 const& minTokens)
 {
     mMinTokens = checkMinTokens(minTokens);
-}
-
-void SamplingConfig::setMinLength(OptSize32 const& minLength)
-{
-    TLLM_LOG_WARNING("setMinLength is being deprecated; please use setMinTokens instead.");
-    mMinTokens = checkMinTokens(minLength);
 }
 
 void SamplingConfig::setBeamSearchDiversityRate(OptFloat const& beamSearchDiversityRate)
@@ -292,7 +268,7 @@ void SamplingConfig::setMinP(std::optional<FloatType> const& minP)
 
 void SamplingConfig::setBeamWidthArray(OptVec<SizeType32> const& beamWidthArray)
 {
-    mBeamWidthArray = checkBeamWidthArray(beamWidthArray, std::nullopt);
+    std::tie(mBeamWidthArray, mBeamWidth) = checkBeamWidthArray(beamWidthArray, mBeamWidth);
 }
 
 // Checkers
@@ -432,26 +408,21 @@ OptFloat const& SamplingConfig::checkMinP(OptFloat const& minP)
     return minP;
 }
 
-OptVec<SizeType32> const& SamplingConfig::checkBeamWidthArray(
-    OptVec<SizeType32> const& beamWidthArray, std::optional<SizeType32> const beamWidth)
+std::pair<OptVec<SizeType32> const&, SizeType32 const> const SamplingConfig::checkBeamWidthArray(
+    OptVec<SizeType32> const& beamWidthArray, SizeType32 const beamWidth)
 {
+    SizeType32 maxBeamWidth = beamWidth;
     if (beamWidthArray.has_value())
     {
-        auto const maxLength = static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength);
         auto array = beamWidthArray.value();
-        TLLM_CHECK(array.size() >= 0 && array.size() <= maxLength);
-        SizeType32 maxBeamWidth = 0;
+        TLLM_CHECK(array.size() <= static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength));
         for (auto const& bm : array)
         {
-            TLLM_CHECK(bm > 0 && bm <= maxLength);
+            TLLM_CHECK(bm > 0 && bm < static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidth));
             maxBeamWidth = std::max(maxBeamWidth, bm);
         }
-        if (beamWidth.has_value())
-        {
-            TLLM_CHECK(maxBeamWidth <= beamWidth.value());
-        }
     }
-    return beamWidthArray;
+    return {beamWidthArray, maxBeamWidth};
 }
 
 void SamplingConfig::updateNumReturnBeams()

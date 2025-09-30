@@ -58,6 +58,8 @@ protected:
             /*padId=*/std::nullopt, /*embeddingBias=*/std::nullopt,
             /*badWordsList=*/std::nullopt, /*stopWordsList=*/std::nullopt, /*positionIds=*/std::nullopt,
             /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
+            /*multimodalHashes=*/std::nullopt, /*multimodalPos=*/std::nullopt, /*multimodalLength=*/std::nullopt,
+            /*multimodalEmbedding=*/std::nullopt,
             /*mropeRotaryCosSin=*/std::nullopt, /*mropePositionDeltas*/ std::nullopt,
             /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
             /*loraConfig=*/std::nullopt, /*lookaheadConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,

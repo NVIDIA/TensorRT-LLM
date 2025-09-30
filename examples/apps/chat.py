@@ -5,7 +5,8 @@ import click
 import colorama
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 
 
 class LlmConsole(code.InteractiveConsole):
@@ -74,10 +75,10 @@ def main(model: str, tokenizer: str, tp_size: int):
                                max_input_len=6000,
                                max_num_tokens=10240)
 
-    sampling_params = SamplingParams(beam_width=1,
-                                     max_tokens=100,
+    sampling_params = SamplingParams(max_tokens=100,
                                      temperature=0.5,
-                                     top_p=0.95)
+                                     top_p=0.95,
+                                     n=1)
 
     llm = LLM(model,
               tokenizer,

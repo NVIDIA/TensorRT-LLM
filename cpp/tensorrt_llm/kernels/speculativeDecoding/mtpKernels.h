@@ -34,7 +34,6 @@ namespace kernels
 struct MTPPrepareDrafterInputsParam
 {
     int numMTPModules;
-    int curMTPLayerIdx;
     int batchSize;
     int numContextRequest;
     int hiddenSize;
@@ -42,8 +41,9 @@ struct MTPPrepareDrafterInputsParam
     int* seqLens;
     void** __restrict__ mtpPastHiddenStatesPtrs;
     int** mtpPastTokensPtrs;
-    void* __restrict__ previousLayerHiddenStates;
-    int* previousLayerDraftTokens;
+    void* __restrict__ hiddenStates;
+    int* acceptedTokens;
+    int* numAcceptedTokens;
     int* returnInputIds;
     void* __restrict__ returnHiddenStates;
 };
@@ -89,6 +89,29 @@ struct MTPUpdateHiddenStatesParam
 
 template <typename T>
 void invokeMTPUpdateHiddenStates(MTPUpdateHiddenStatesParam& params, cudaStream_t const stream = 0);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Relaxed acceptance
+struct MTPRelaxedAcceptanceParam
+{
+    int numMTPModules;
+    int batchSize;
+    int numContextRequest;
+    int relaxedTopK;
+    float relaxedDelta;
+    int beginThinkingTokens;
+    int endThinkingTokens;
+    void* __restrict__ topKValue;
+    int* reqSlotIds;
+    int64_t* topKIndices;
+    int* draftTokens;
+    float* mtpRelaxedDelta;
+    int* numAcceptedTokens;
+    int* acceptedTokens;
+};
+
+template <typename T>
+void invokeMTPRelaxedAcceptance(MTPRelaxedAcceptanceParam& params, cudaStream_t const stream = 0);
 
 } // namespace kernels
 

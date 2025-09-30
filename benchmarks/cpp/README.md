@@ -41,7 +41,7 @@ python3 prepare_dataset.py \
 ```
 
 For datasets that don't have prompt key, set --dataset-prompt instead.
-Take [cnn_dailymail dataset](https://huggingface.co/datasets/cnn_dailymail) for example:
+Take [cnn_dailymail dataset](https://huggingface.co/datasets/abisee/cnn_dailymail) for example:
 ```
 python3 prepare_dataset.py \
     --tokenizer <path/to/tokenizer> \
@@ -316,35 +316,8 @@ For detailed usage, you can do the following
 cd cpp/build
 
 # You can directly execute the binary for help information
-./benchmarks/gptSessionBenchmark --help
 ./benchmarks/bertBenchmark --help
 ```
-
-Take GPT-350M as an example for single GPU
-
-```
-./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_350m/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
-```
-Take GPT-175B as an example for multiple GPUs
-```
-mpirun -n 8 ./benchmarks/gptSessionBenchmark \
-    --engine_dir "../../benchmarks/gpt_175b/" \
-    --batch_size "1" \
-    --input_output_len "60,20"
-
-# Expected output:
-# [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
-```
-
-If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
-
-If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
 
@@ -363,7 +336,7 @@ cd cpp/build
 `disaggServerBenchmark` only supports `decoder-only` models.
 Here is the basic usage:
 ```
-export TRTLLM_USE_MPI_KVCACHE=1
+export TRTLLM_USE_UCX_KVCACHE=1
 mpirun -n ${proc} benchmarks/disaggServerBenchmark --context_engine_dirs ${context_engine_0},${context_engine_1}...,${context_engine_{m-1}} \
 --generation_engine_dirs ${generation_engine_0},${generation_engine_1}...,${generation_engine_{n-1}} --dataset ${dataset_path}
 ```
@@ -371,7 +344,7 @@ This command will launch m context engines and n generation engines. You need to
 
 for example:
 ```
-export TRTLLM_USE_MPI_KVCACHE=1
+export TRTLLM_USE_UCX_KVCACHE=1
 mpirun -n 7 benchmarks/disaggServerBenchmark --context_engine_dirs ${llama_7b_tp2_pp1_dir},${llama_7b_tp1_pp1_dir} --generation_engine_dirs ${llama_7b_tp1_pp1_dir},${llama_7b_tp2_pp1_dir} --dataset ${dataset_path}
 
 # need 6 gpus and 7 processes to launch the benchmark.

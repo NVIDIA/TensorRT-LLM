@@ -644,7 +644,7 @@ class TestSmoothQuant(unittest.TestCase):
         k = 4096
 
         # Init operands for multiplication in int32
-        mat1 = _utils.woq_gen_weights(m, k, dtype) * 200.0
+        mat1 = _utils.woq_gen_weights(m, k, dtype)
         weight = _utils.woq_gen_weights(k, n, dtype)
 
         ref_torch_weights, processed_torch_weights, torch_weight_scales = _utils.woq_conversion(

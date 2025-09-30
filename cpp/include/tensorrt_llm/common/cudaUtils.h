@@ -303,7 +303,18 @@ inline int getSMVersion()
     int sm_minor = 0;
     check_cuda_error(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda_error(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
-    return sm_major * 10 + sm_minor;
+    int sm = sm_major * 10 + sm_minor;
+    if (sm == 121)
+    {
+        return 120;
+    }
+    return sm;
+}
+
+inline bool isSM100Family()
+{
+    int const sm = getSMVersion();
+    return sm == 100 || sm == 103; // To be continued...
 }
 
 inline int getDevice()
@@ -454,7 +465,7 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
     if (isDevicePtr)
     {
         tmpVec.resize(nElement);
-        tmp = tmpVec.data();
+        tmp = tmpVec.data(); // Note `data()` is not supported for vector<bool>
         check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
     }
@@ -626,6 +637,11 @@ __host__ __device__ inline void print_element_(__nv_fp8_e4m3 x)
 }
 #endif
 
+__host__ __device__ inline void print_element_(bool ui)
+{
+    printf("%7" PRIu32 " ", (unsigned int) ui);
+}
+
 __host__ __device__ inline void print_element_(uint8_t ui)
 {
     printf("%7" PRIu32 " ", (unsigned int) ui);
@@ -702,7 +718,7 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
     {
         std::vector<T> tmpVec;
         tmpVec.resize(nRow * nStride);
-        T* tmp = tmpVec.data();
+        T* tmp = tmpVec.data(); // Note `data()` is not supported for vector<bool>
         check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
         check_cuda_error(cudaGetLastError());
@@ -1334,10 +1350,10 @@ struct ConstExprWrapper
 };
 
 template <int VALUE>
-using Int = ConstExprWrapper<int, VALUE>;
+using ConstInt = ConstExprWrapper<int, VALUE>;
 
 template <bool VALUE>
-using Bool = ConstExprWrapper<bool, VALUE>;
+using ConstBool = ConstExprWrapper<bool, VALUE>;
 
 template <typename T>
 struct TmaDescType;

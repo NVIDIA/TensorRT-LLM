@@ -41,7 +41,7 @@ QuantizeToFP4Plugin::QuantizeToFP4Plugin(void const* data, size_t length)
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -160,7 +160,7 @@ int QuantizeToFP4Plugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     case DataType::kHALF:
     {
         auto input = reinterpret_cast<half const*>(inputs[0]);
-        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, FP4QuantizationSFLayout::SWIZZLED,
+        invokeFP4Quantization(1, m, n, input, SFScale, output, SFoutput, false, QuantizationSFLayout::SWIZZLED,
             mMultiProcessorCount, stream);
         break;
     }
@@ -168,7 +168,7 @@ int QuantizeToFP4Plugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     case DataType::kBF16:
     {
         auto input = reinterpret_cast<__nv_bfloat16 const*>(inputs[0]);
-        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, FP4QuantizationSFLayout::SWIZZLED,
+        invokeFP4Quantization(1, m, n, input, SFScale, output, SFoutput, false, QuantizationSFLayout::SWIZZLED,
             mMultiProcessorCount, stream);
         break;
     }
@@ -176,7 +176,7 @@ int QuantizeToFP4Plugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     case DataType::kFP8:
     {
         auto input = reinterpret_cast<__nv_fp8_e4m3 const*>(inputs[0]);
-        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, FP4QuantizationSFLayout::SWIZZLED,
+        invokeFP4Quantization(1, m, n, input, SFScale, output, SFoutput, false, QuantizationSFLayout::SWIZZLED,
             mMultiProcessorCount, stream);
         break;
     }

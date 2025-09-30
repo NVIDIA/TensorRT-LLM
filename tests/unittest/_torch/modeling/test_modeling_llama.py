@@ -4,27 +4,22 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from _torch.helpers import create_mock_engine
 from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
-from utils.llm_data import llm_models_root
-from utils.util import getSMVersion, similar, skip_gpu_memory_less_than
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.llm import LLM
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.sampling_params import SamplingParams
 
 LLAMA_3_1_8B_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
@@ -102,9 +97,10 @@ class TestLlama(unittest.TestCase):
         dtype = llama_config.torch_dtype
         device = torch.device('cuda')
 
-        model_config = ModelConfig(pretrained_config=llama_config,
-                                   quant_config=quant_config)
-        llama = LlamaForCausalLM(model_config).to(device)
+        with torch.device(device), default_dtype(dtype):
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       quant_config=quant_config)
+            llama = LlamaForCausalLM(model_config).to(device)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
@@ -222,12 +218,14 @@ class TestLlama(unittest.TestCase):
         dtype = llama_config.torch_dtype
         device = torch.device('cuda')
 
-        hf_llama = HFLlamaForCausalLM(llama_config).to(dtype).to(device).eval()
+        with torch.device(device), default_dtype(dtype):
+            hf_llama = HFLlamaForCausalLM(llama_config).eval()
 
-        model_config = ModelConfig(pretrained_config=llama_config,
-                                   attn_backend=backend)
-        llama = LlamaForCausalLM(model_config).to(dtype).to(device)
-        llama.load_weights(hf_llama.state_dict())
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       attn_backend=backend)
+
+            llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+            llama.load_weights(hf_llama.state_dict())
 
         num_blocks = 1
         tokens_per_block = 128
@@ -328,6 +326,11 @@ class TestLlama(unittest.TestCase):
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
+        graph_runner = None
+        if scenario.use_cuda_graph:
+            mock_engine = create_mock_engine(1)
+            graph_runner = CUDAGraphRunner(mock_engine)
+
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
             if not scenario.use_cuda_graph:
@@ -335,19 +338,20 @@ class TestLlama(unittest.TestCase):
                                      position_ids=position_ids,
                                      attn_metadata=attn_metadata)
             else:
-                graph_runner = DecodingCUDAGraphRunner(
-                    attn_metadata.max_num_requests, "cuda", attn_metadata)
-                graph_runner.capture(lambda inputs: llama.forward(**inputs))
-
+                inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attn_metadata": attn_metadata,
+                }
+                key = (1, 0, False)
+                graph_runner.capture(key,
+                                     lambda inputs: llama.forward(**inputs),
+                                     inputs)
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.run({
-                        "input_ids": input_ids,
-                        "position_ids": position_ids,
-                        "attn_metadata": attn_metadata,
-                    })
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if scenario.use_cuda_graph:
@@ -366,35 +370,6 @@ class TestLlama(unittest.TestCase):
                                    ref.logits[:, -1].float(),
                                    atol=0.4,
                                    rtol=0.4)
-
+        if graph_runner is not None:
+            graph_runner.clear()
         kv_cache_manager.shutdown()
-
-    @skip_gpu_memory_less_than(40 * 2**30)  # 40GB memory
-    def test_llama_lora(self) -> None:
-        lora_config = LoraConfig(lora_dir=[
-            f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b"
-        ],
-                                 max_lora_rank=64)
-        llm = LLM(
-            model=f"{llm_models_root()}/llama-models-v2/llama-v2-13b-hf",
-            lora_config=lora_config,
-        )
-
-        prompts = [
-            "今天天气很好，我到公园的时候，",
-        ]
-        references = [
-            "发现公园里到处都是人，有的在跑步，有的在打羽毛球，还有的",
-        ]
-        sampling_params = SamplingParams(max_tokens=20,
-                                         add_special_tokens=False)
-        lora_req = LoRARequest(
-            "task-0", 0,
-            f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b")
-        lora_request = [lora_req]
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_request)
-
-        assert similar(outputs[0].outputs[0].text, references[0])

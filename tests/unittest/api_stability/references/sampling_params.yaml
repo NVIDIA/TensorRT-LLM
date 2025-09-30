@@ -8,22 +8,6 @@ methods:
       return_perf_metrics:
         annotation: bool
         default: false
-      # TODO [TRTLLM-3716]: Deprecated arguments
-      beam_width:
-        annotation: int
-        default: 1
-      max_new_tokens:
-        annotation: Optional[int]
-        default: null
-      min_length:
-        annotation: Optional[int]
-        default: null
-      num_return_sequences:
-        annotation: Optional[int]
-        default: null
-      random_seed:
-        annotation: Optional[int]
-        default: null
       beam_width_array:
         annotation: Optional[List[int]]
         default: null

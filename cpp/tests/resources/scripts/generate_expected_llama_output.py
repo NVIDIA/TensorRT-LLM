@@ -15,38 +15,40 @@
 # limitations under the License.
 
 import argparse as _arg
+import os
+import time
 from pathlib import Path
 
-import run
-from build_engines_utils import init_model_spec_module
 from mpi4py.MPI import COMM_WORLD
 
-init_model_spec_module()
-import os
-
-import model_spec
+# isort: off
+import run
+# isort: on
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.bindings.internal.testing import ModelSpec
 
 
 def generate_output(engine: str,
                     num_beams: int,
-                    model_spec_obj: model_spec.ModelSpec,
+                    model_spec_obj: ModelSpec,
                     tp_size: int = 1,
                     pp_size: int = 1,
                     cp_size: int = 1,
-                    max_output_len: int = 8):
+                    max_output_len: int = 8,
+                    output_logits: bool = False,
+                    output_cum_log_probs: bool = False,
+                    output_log_probs: bool = False):
 
-    model = 'llama-7b-hf'
+    model = 'Llama-3.2-1B'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    hf_dir = models_dir / model
     tp_pp_cp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-cp' + str(
         cp_size) + '-gpu/'
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
-    input_file = data_dir / 'input_tokens.npy'
+    input_file = data_dir / 'input_tokens_llama.npy'
     model_data_dir = data_dir / model
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'
@@ -55,16 +57,34 @@ def generate_output(engine: str,
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
-    args = run.parse_arguments([
-        '--engine_dir',
-        str(engine_dir), '--input_file',
-        str(input_file), '--tokenizer_dir',
-        str(hf_dir), '--output_npy',
-        str(output_dir / (base_output_name + '.npy')), '--output_csv',
-        str(output_dir / (base_output_name + '.csv')), '--max_output_len',
-        str(max_output_len), '--num_beams',
-        str(num_beams), '--use_py_session'
-    ])
+    args_list = [
+        f'--engine_dir={engine_dir}',
+        f'--input_file={input_file}',
+        f'--tokenizer_dir={models_dir / model}',
+        f'--output_npy={output_dir / (base_output_name + ".npy")}',
+        f'--output_csv={output_dir / (base_output_name + ".csv")}',
+        f'--max_output_len={max_output_len}',
+        f'--num_beams={num_beams}',
+        '--use_py_session',
+    ]
+
+    if output_logits:
+        args_list.extend([
+            f'--output_logits_npy={output_dir / (base_output_name + "_logits.npy")}',
+            '--output_generation_logits',
+        ])
+
+    if output_cum_log_probs:
+        args_list.extend([
+            f'--output_cum_log_probs_npy={output_dir / model_spec_obj.get_cum_log_probs_file()}'
+        ])
+
+    if output_log_probs:
+        args_list.extend([
+            f'--output_log_probs_npy={output_dir / model_spec_obj.get_log_probs_file()}'
+        ])
+
+    args = run.parse_arguments(args_list)
     run.main(args)
 
 
@@ -79,15 +99,25 @@ def generate_outputs(num_beams, only_multi_gpu=False):
         raise RuntimeError(
             f"The world size of MPI {COMM_WORLD.size} is not equal to 1, 2, or 4."
         )
-    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj = ModelSpec('input_tokens_llama.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
     for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
         print(
-            f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size} and CP={cp_size}'
+            f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size}, CP={cp_size}, BW={num_beams}'
         )
+        start_time = time.time()
+
+        output_logits = False
+        output_log_probs = False
+        output_cum_log_probs = False
+        if tp_size == 4 and pp_size == 1:
+            output_logits = True
+            output_log_probs = True
+            output_cum_log_probs = True
+
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
         model_spec_obj.use_context_parallelism(cp_size)
@@ -96,7 +126,15 @@ def generate_outputs(num_beams, only_multi_gpu=False):
                         tp_size=tp_size,
                         pp_size=pp_size,
                         cp_size=cp_size,
-                        model_spec_obj=model_spec_obj)
+                        model_spec_obj=model_spec_obj,
+                        output_logits=output_logits,
+                        output_log_probs=output_log_probs,
+                        output_cum_log_probs=output_cum_log_probs)
+
+        duration = time.time() - start_time
+        print(
+            f"Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size}, CP={cp_size}, BW={num_beams} took {duration} seconds"
+        )
 
 
 if __name__ == '__main__':

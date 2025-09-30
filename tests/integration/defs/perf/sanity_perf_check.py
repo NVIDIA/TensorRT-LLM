@@ -12,124 +12,172 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import csv
-import os
+import difflib
 import sys
+from pathlib import Path
 
-# This is to prevent csv field size limit error
-maxInt = sys.maxsize
-while True:
-    try:
-        csv.field_size_limit(maxInt)
-        break
-    except OverflowError:
-        maxInt = int(maxInt / 10)
+import pandas as pd
+from diff_tools import get_csv_lines, get_diff, load_file
 
 
 class SanityPerfCheck():
 
-    # This is to prevent redundant messages and long logs.
-    USEFUL_METRICS = [
-        "original_test_name", "perf_case_name", "metric_type", "perf_metric",
-        "command", "sm_clk", "mem_clk", "start_timestamp", "end_timestamp",
-        "state", "threshold", "absolute_threshold"
-    ]
-
     def __init__(self, target_perf_csv, base_perf_csv=None, threshold=0.1):
-        self.target_perf_csv = target_perf_csv
-        self.base_perf_csv = base_perf_csv
+        self.target_perf_csv = Path(target_perf_csv)
+        self.base_perf_csv = Path(base_perf_csv)
         self.threshold = threshold
 
-    def _parse_result(self, csv_path):
-        result = {}
-        with open(csv_path) as csv_file:
-            parsed_csv_file = csv.DictReader(csv_file)
-            for row in parsed_csv_file:
-                if row['metric_type'] not in result:
-                    result[row['metric_type']] = {}
-                result[row['metric_type']][row['perf_case_name']] = float(
-                    row['perf_metric'])
-        return result
+    def report_diff(self, full_diff: pd.DataFrame) -> None:
+        print("=" * 40)
+        for diff in full_diff.itertuples():
+            if pd.isna(diff.perf_metric_base):
+                print(f"perf_case_name: {diff.Index} is missing from base")
+            elif pd.isna(diff.perf_metric_target):
+                print(f"perf_case_name: {diff.Index} is missing from target")
+            else:
+                print(
+                    f"perf_case_name: {diff.Index}, base->target: {diff.perf_metric_base}->{diff.perf_metric_target}"
+                )
+        print("=" * 40)
 
-    def _dump_csv_row(self, csv_path, metric_type, test_name):
-        with open(csv_path) as csv_file:
-            parsed_csv_file = csv.DictReader(csv_file)
-            for row in parsed_csv_file:
-                if row['metric_type'] == metric_type and row[
-                        'perf_case_name'] == test_name:
-                    print('=' * 40)
-                    print('Please fill below content into the base_perf.csv.')
-                    cleaned_row = []
-                    for k in self.USEFUL_METRICS:
-                        v = row[k]
-                        # Need to truncate the commands
-                        if k == "command":
-                            options = v.split(" ")
-                            cleaned_options = []
-                            for option in options:
-                                # Truncate workspace dir
-                                if "build.py" in option or "benchmark.py" in option or "SessionBenchmark.cpp" in option:
-                                    cleaned_options.append("/".join(
-                                        option.split("/")[-5:]))
-                                # Remove engine_dir as it is not useful
-                                elif "--engine_dir=" not in option and "--output_dir=" not in option:
-                                    cleaned_options.append(option)
-                            cleaned_row.append(" ".join(cleaned_options))
-                        else:
-                            cleaned_row.append(v)
+    def write_patch(self, old_lines: list[str], new_lines: list[str],
+                    output_path: str, base_perf_filename: str) -> None:
+        with open(output_path, 'w') as f:
+            for diff_line in difflib.unified_diff(
+                    old_lines, new_lines,
+                    f'a/tests/integration/defs/perf/{base_perf_filename}',
+                    f'b/tests/integration/defs/perf/{base_perf_filename}'):
+                f.write(diff_line)
 
-                    print(",".join(['\"' + row + '\"' for row in cleaned_row]))
-                    print('=' * 40)
-                    break
+    def _check_autodeploy_failures(self, full_diff: pd.DataFrame,
+                                   base_perf: pd.DataFrame,
+                                   current_perf: pd.DataFrame) -> bool:
+        """
+        Check if any of the performance regressions are from autodeploy tests.
+        Only considers actual regressions (worse performance), not improvements.
+        Returns True if there are autodeploy regressions, False otherwise.
+        """
+        # Create mappings for network_name, threshold, absolute_threshold, and metric_type
+        base_network_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['network_name']))
+        current_network_mapping = dict(
+            zip(current_perf['perf_case_name'], current_perf['network_name']))
+        base_threshold_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['threshold']))
+        base_abs_threshold_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['absolute_threshold']))
+        base_metric_type_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['metric_type']))
+
+        # Check each performance difference
+        for idx, row in full_diff.iterrows():
+            # Look up network_name from either base or current (they should be the same)
+            network_name = base_network_mapping.get(
+                idx) or current_network_mapping.get(idx)
+
+            # Only check autodeploy tests
+            if network_name and "_autodeploy" in str(network_name):
+                # Check if this is actually a regression (worse performance)
+                if hasattr(row, 'perf_metric_base') and hasattr(
+                        row, 'perf_metric_target'):
+                    base_value = row.perf_metric_base
+                    target_value = row.perf_metric_target
+                    threshold = base_threshold_mapping.get(idx, 0)
+                    abs_threshold = base_abs_threshold_mapping.get(idx, 50)
+                    metric_type = base_metric_type_mapping.get(idx, '')
+
+                    # Skip if we don't have the necessary data
+                    if pd.isna(base_value) or pd.isna(target_value):
+                        continue
+
+                    # Determine if this is a regression based on metric type and threshold sign
+                    is_regression = self._is_performance_regression(
+                        base_value, target_value, threshold, abs_threshold,
+                        metric_type)
+
+                    if is_regression:
+                        return True
+
+        return False
+
+    def _is_performance_regression(self, base_value: float, target_value: float,
+                                   threshold: float, abs_threshold: float,
+                                   metric_type: str) -> bool:
+        """
+        Determine if a performance change represents a regression (worse performance)
+        that exceeds the acceptable threshold.
+
+        Args:
+            base_value: Baseline performance value
+            target_value: Current performance value
+            threshold: Performance threshold (sign indicates better direction)
+            abs_threshold: Absolute threshold for tolerance calculation
+            metric_type: Type of metric (for context)
+
+        Returns:
+            True if target_value represents worse performance than base_value
+            AND the change exceeds the threshold
+        """
+        import numpy as np
+
+        # First check if the change exceeds the threshold (same logic as diff_tools.py)
+        # Use absolute value of threshold for relative tolerance calculation
+        rel_threshold = abs(threshold)
+
+        # If values are within threshold tolerance, no significant change
+        if np.isclose(base_value,
+                      target_value,
+                      rtol=rel_threshold,
+                      atol=abs(abs_threshold)):
+            return False
+
+        # Now check if it's a regression (worse performance) in the expected direction
+        if threshold > 0:
+            # Positive threshold: lower is better - regression if target > base
+            return target_value > base_value
+        else:
+            # Negative threshold: higher is better - regression if target < base
+            return target_value < base_value
 
     def __call__(self, *args, **kwargs):
         # Check if the base_perf_csv file exists
-        if not os.path.exists(self.base_perf_csv):
-            print(f"base_perf.csv doesn't exist, skip check the perf result.")
+        if not self.base_perf_csv.exists():
+            print(
+                f"{self.base_perf_csv.name} doesn't exist, skip check the perf result."
+            )
             return 0
 
-        base_result = self._parse_result(self.base_perf_csv)
-        target_result = self._parse_result(self.target_perf_csv)
+        base_perf = load_file(self.base_perf_csv.as_posix())
+        current_perf = load_file(self.target_perf_csv.as_posix())
 
-        success = True
+        full_diff, new_base = get_diff(base_perf, current_perf)
+        if not full_diff.empty:
+            self.report_diff(full_diff)
+            output_patch = self.target_perf_csv.with_name(
+                'perf_patch.patch').as_posix()
+            self.write_patch(get_csv_lines(base_perf), get_csv_lines(new_base),
+                             output_patch, self.base_perf_csv.name)
+            print(f"patch_file was written to {output_patch}")
+            print(
+                "You can download the file and update base_perf.csv by `git apply <patch file>`"
+            )
 
-        for _, metric_type in enumerate(target_result):
-            # Engine build time is very CPU specific, so skip the check
-            if metric_type != "BUILD_TIME":
-                for _, test_name in enumerate(target_result[metric_type]):
-                    if metric_type not in base_result or test_name not in base_result[
-                            metric_type]:
+            # Check if any of the failed tests are autodeploy tests
+            autodeploy_failures = self._check_autodeploy_failures(
+                full_diff, base_perf, current_perf)
 
-                        self._dump_csv_row(self.target_perf_csv, metric_type,
-                                           test_name),
-                        print(
-                            f"{metric_type} {test_name} doesn't exist in the base_perf.csv, please add it and rerun the pipeline."
-                        )
-                        success = False
-                    else:
-                        base_perf = base_result[metric_type][test_name]
-                        target_perf = target_result[metric_type][test_name]
-
-                        if target_perf > base_perf * (1 + self.threshold):
-                            # the mr perf is worse than baseline, there's perf regression.
-                            print(
-                                f"Perf Regression found on {metric_type} {test_name} where the current perf is {target_perf} while the baseline is {base_perf}."
-                            )
-                            success = False
-                        elif target_perf < base_perf * (1 - self.threshold):
-                            # the MR perf is better than baseline, please update the base_perf.csv
-                            self._dump_csv_row(self.target_perf_csv,
-                                               metric_type, test_name),
-                            print(
-                                f"Please update {metric_type} {test_name} into base_perf.csv and commit again. The outdated perf baseline is {base_perf} and the new perf baseline is {target_perf}"
-                            )
-                            success = False
-
-        if not success:
-            # We have temporarily disabled post perf sanity tests
-            print("Sanity perf check failed, but it has been disabled")
+            if autodeploy_failures:
+                print(
+                    "Sanity perf check failed for autodeploy tests - failing the build"
+                )
+                return 1
+            else:
+                print(
+                    "Sanity perf check failed, but it has been disabled for non-autodeploy tests"
+                )
         return 0
 
 
 if __name__ == '__main__':
-    SanityPerfCheck(sys.argv[1], sys.argv[2])()
+    exit_code = SanityPerfCheck(sys.argv[1], sys.argv[2])()
+    sys.exit(exit_code)

@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/common/memoryUtils.h"
+
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
@@ -23,36 +23,22 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <NvInfer.h>
-#include <chrono>
 #include <cxxopts.hpp>
+#include <nlohmann/json.hpp>
+
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
 
 using namespace tensorrt_llm::runtime;
 
-namespace tc = tensorrt_llm::common;
 namespace trt = nvinfer1;
 
 namespace
 {
-// follows https://github.com/NVIDIA/TensorRT/blob/release/8.6/samples/common/sampleEngines.cpp
-std::vector<uint8_t> loadEngine(std::string const& enginePath)
-{
-    std::ifstream engineFile(enginePath, std::ios::binary);
-    TLLM_CHECK_WITH_INFO(engineFile.good(), std::string("Error opening engine file: " + enginePath));
-    engineFile.seekg(0, std::ifstream::end);
-    auto const size = engineFile.tellg();
-    engineFile.seekg(0, std::ifstream::beg);
-
-    std::vector<uint8_t> engineBlob(size);
-    engineFile.read(reinterpret_cast<char*>(engineBlob.data()), size);
-    TLLM_CHECK_WITH_INFO(engineFile.good(), std::string("Error loading engine file: " + enginePath));
-    return engineBlob;
-}
 
 std::string engineFilename(
     std::filesystem::path const& dataPath, WorldConfig const& worldConfig, std::string const& model)
@@ -149,7 +135,7 @@ void benchmarkBert(std::string const& modelName, std::filesystem::path const& da
 
 int main(int argc, char* argv[])
 {
-    cxxopts::Options options("TensorRT-LLM C++ Runtime Benchmark", "TensorRT-LLM C++ Runtime Benchmark for BERT.");
+    cxxopts::Options options("TensorRT LLM C++ Runtime Benchmark", "TensorRT LLM C++ Runtime Benchmark for BERT.");
     options.add_options()("h,help", "Print usage");
     options.add_options()(
         "m,model", "Model name specified for engines.", cxxopts::value<std::string>()->default_value("bert_base"));

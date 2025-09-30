@@ -48,10 +48,6 @@ namespace tensorrt_llm::executor
 class RequestWithIdAsyncSend;
 class CancelledRequestsAsyncSend;
 
-std::vector<RequestWithId> requestWithIdRecv(std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer);
-std::unordered_set<IdType> cancelledRequestsRecv(
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer);
-
 class MpiMessageQueue
 {
 public:
@@ -83,6 +79,17 @@ class Executor::Impl
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
     using RequestList = std::list<LlmRequestPtr>;
 
+    // When block reuse is enabled for context worker for disaggregated serving,
+    // we need to store the last block id so that we can unpin the block when
+    // the request is finished.
+    struct InTransmissionItem
+    {
+        LlmRequestPtr request;
+        std::optional<SizeType32> lastBlockId;
+    };
+
+    using InTransList = std::list<InTransmissionItem>;
+
 public:
     Impl(std::filesystem::path const& modelPath, std::optional<std::filesystem::path> const& encoderModelPath,
         [[maybe_unused]] ModelType modelType, ExecutorConfig const& executorConfig);
@@ -111,7 +118,7 @@ public:
     std::vector<Response> awaitResponses(std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
 
     std::vector<Response> awaitResponses(
-        IdType const& optId, std::optional<std::chrono::milliseconds> const& optTimeout = std::nullopt);
+        IdType const& reqId, std::optional<std::chrono::milliseconds> const& optTimeout = std::nullopt);
 
     std::vector<std::vector<Response>> awaitResponses(
         std::vector<IdType> const& requestIds, std::optional<std::chrono::milliseconds> const& timeout);
@@ -131,9 +138,6 @@ public:
     bool isParticipant() const;
 
     std::optional<std::shared_ptr<KVCacheEventManager>> getKVCacheEventManager() const;
-
-    static auto constexpr kMpiTagOffset = 18;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
 
 private:
     using RtTensorPtr = runtime::ITensor::SharedPtr;
@@ -213,7 +217,7 @@ private:
 
     void terminateCancelledRequests(RequestList& activeRequests);
 
-    void terminateContextFinishedRequests(RequestList& inTransmissionRequests);
+    void terminateContextFinishedRequests(InTransList& inTransmissionRequests);
 
     void appendNewResponses(std::vector<Response>&& newResponses);
 
@@ -222,7 +226,7 @@ private:
     ///        and returned for bookkeeping.
     /// @return A list of requests that have completed.
     RequestList populateNewResponses(
-        RequestList& activeRequests, RequestList& inTransmissionRequests, std::vector<Response>& newResponses);
+        RequestList& activeRequests, InTransList& inTransmissionRequests, std::vector<Response>& newResponses);
 
     void executionLoop();
 
@@ -234,9 +238,9 @@ private:
     void cleanupDynamicLogitsPostProcessors(RequestList const& finishedRequests);
 
     void orchSendReqThread();
-    void orchRecvThread(int32_t idTag, int32_t dataTag);
+    void orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag);
     void leaderRecvReqThread();
-    void leaderSendThread(MpiMessageQueue& sendQueue, int32_t idTag, int32_t dataTag);
+    void leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag idTag, mpi::MpiTag dataTag);
 
     void addTerminatedReqId(std::vector<Response> const& responses, IdType const& reqId);
 

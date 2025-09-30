@@ -21,6 +21,7 @@
 #include "ucxx/utils/sockaddr.h"
 #include "ucxx/utils/ucx.h"
 #include <cstdint>
+#include <future>
 #if __linux__
 #include <arpa/inet.h>
 #include <ifaddrs.h>

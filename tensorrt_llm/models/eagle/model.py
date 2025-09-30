@@ -736,7 +736,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             I|1|0|1|0
             J|0|1|0|1
             Note that we could've stored FG in KV cache and provide only IJ tokens here
-            with mask for past KV cache, but it is not supported in TensorRT-LLM attention at the moment.
+            with mask for past KV cache, but it is not supported in TensorRT LLM attention at the moment.
 
             Draft2 produces tokens K and L at positions 6 and 7.
         7. Resulting outputs are:
@@ -948,11 +948,11 @@ class EagleForCausalLM(LLaMAForCausalLM):
             spec_decoding_position_offsets: [bs, max_gen_tokens]
             spec_decoding_packed_mask: [bs, max_draft_len, packed_length] **
             eagle_temperature: [bs]
-            rand_data_validation: [bs, max_draft_tokens]
+            rand_data_validation: [bs, max_draft_len]
 
             ** The mask is tricky since the boolean mask will need to be
                packed in runtime. So, the last dim will be:
-                    packed_length = ceil((max_draft_tokens+1)/32)
+                    packed_length = ceil((max_draft_len+1)/32)
         """
         default_range = GenerationMixin.default_range
         remove_input_padding = default_net().plugin_config.remove_input_padding
@@ -1228,7 +1228,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         assert hf_model_or_dir is not None
-        speculative_model_dir = kwargs.get('speculative_model', None)
+        speculative_model_dir = kwargs.get('speculative_model_dir', None)
         tllm_config = EagleConfig.from_hugging_face(hf_model_or_dir,
                                                     dtype=dtype,
                                                     mapping=mapping,

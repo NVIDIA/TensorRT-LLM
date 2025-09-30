@@ -19,8 +19,34 @@ set_bash_env() {
   fi
 }
 
+cleanup() {
+  # Clean up apt/dnf cache
+  if [ -f /etc/debian_version ]; then
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+  elif [ -f /etc/redhat-release ]; then
+    dnf clean all
+    rm -rf /var/cache/dnf
+  fi
+
+  # Clean up temporary files
+  rm -rf /tmp/* /var/tmp/*
+
+  # Clean up pip cache
+  pip3 cache purge || true
+
+  # Clean up documentation
+  rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*
+
+  # Clean up locale files
+  find /usr/share/locale -maxdepth 1 -mindepth 1 -type d ! -name 'en*' -exec rm -rf {} +
+}
+
 init_ubuntu() {
   apt-get update
+  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
+  apt remove -y ibverbs-providers libibverbs1
+  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     ccache \
     gdb \
@@ -30,16 +56,18 @@ init_ubuntu() {
     llvm \
     libclang-rt-dev \
     libffi-dev \
+    libstdc++-14-dev \
+    libnuma1 \
+    libnuma-dev \
     python3-dev \
     python3-pip \
     python-is-python3 \
     wget \
-    pigz
+    pigz \
+    libzmq3-dev
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
-  apt-get clean
-  rm -rf /var/lib/apt/lists/*
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
@@ -55,7 +83,6 @@ install_python_rockylinux() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
-  PYTHON_ENV_FILE="/tmp/python${PYTHON_VERSION}_env"
   dnf makecache --refresh
   dnf install \
     epel-release \
@@ -68,18 +95,19 @@ install_python_rockylinux() {
     llvm-toolset \
     lld \
     libffi-devel \
+    numactl \
+    numactl-devel \
     zlib-devel \
     xz-devel \
     sqlite-devel \
     -y
+  echo "Installing Python ${PYTHON_VERSION}..."
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
     LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
   ln -s /opt/python/${PYTHON_VERSION}/bin/python3 /usr/local/bin/python
-  echo "export PATH=/opt/python/${PYTHON_VERSION}/bin:\$PATH" >> "${PYTHON_ENV_FILE}"
-  echo "source ${PYTHON_ENV_FILE}" >> "${ENV}"
-  dnf clean all
+  echo "export PATH=/opt/python/${PYTHON_VERSION}/bin:\$PATH" >> "${ENV}"
   cd .. && rm -rf /tmp/Python-${PYTHON_VERSION}
 }
 
@@ -89,26 +117,25 @@ install_pyp_rockylinux() {
 
 install_gcctoolset_rockylinux() {
   dnf install -y gcc gcc-c++ file libtool make wget bzip2 bison flex
-  dnf clean all
-  DEVTOOLSET_ENV_FILE="/tmp/gcctoolset_env"
   # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
-	  vim \
-	  wget \
-	  git-lfs \
-	  gcc-toolset-13 \
-	  libffi-devel \
-	  -y
+    patch \
+    vim \
+    wget \
+    git-lfs \
+    gcc-toolset-11 \
+    libffi-devel \
+    -y
   dnf install \
-	  openmpi \
-	  openmpi-devel \
-	  pigz \
-	  -y
-  echo "source scl_source enable gcc-toolset-13" >> "${DEVTOOLSET_ENV_FILE}"
-  echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
+    openmpi \
+    openmpi-devel \
+    pigz \
+    rdma-core-devel \
+    zeromq-devel \
+    -y
+  echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
-  dnf clean all
 }
 
 # Install base packages depending on the base OS
@@ -128,3 +155,6 @@ case "$ID" in
     exit 1
     ;;
 esac
+
+# Final cleanup
+cleanup

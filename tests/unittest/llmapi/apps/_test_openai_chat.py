@@ -11,6 +11,8 @@ import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
+from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
+                    make_server_with_custom_sampler_fixture)
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -20,9 +22,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module",
-                params=[None, 'pytorch'],
-                ids=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -67,10 +67,9 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str, backend: str, extra_llm_api_options: bool,
            temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
+    args = ["--backend", f"{backend}"]
+    if backend == "trt":
+        args.extend(["--max_beam_width", "4"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -130,26 +129,12 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     )
     assert legacy.choices[0].message.content \
         == chat_completion.choices[0].message.content
-
-
-def test_single_chat_session_with_logprobs(client: openai.OpenAI,
-                                           model_name: str, backend: str):
-    if backend == "pytorch":
-        pytest.skip("Logprobs are not supported in PyTorch backend yet")
-
-    messages = [{
-        "role": "system",
-        "content": "you are a helpful assistant"
-    }, {
-        "role": "user",
-        "content": "what is 1+1?"
-    }]
-
+    # test deduced max_tokens
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_completion_tokens=10,
-        logprobs=True,
+        temperature=0.0,
+        logprobs=False,
     )
     assert chat_completion.id is not None
     assert len(chat_completion.choices) == 1
@@ -157,15 +142,13 @@ def test_single_chat_session_with_logprobs(client: openai.OpenAI,
     assert message.content is not None
     assert message.role == "assistant"
     # test logprobs
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        logprobs=True,
+    )
     logprobs = chat_completion.choices[0].logprobs.content
-    finish_reason = chat_completion.choices[0].finish_reason
-    if finish_reason == "length":
-        assert len(logprobs) == 10
-    elif finish_reason == "stop":
-        assert len(logprobs) <= 10
-    else:
-        raise RuntimeError(
-            f"finish_reason {finish_reason} not in [length, stop]")
     for logprob in logprobs:
         assert logprob.token is not None
         assert logprob.logprob is not None
@@ -193,9 +176,11 @@ def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
     assert message.content is not None and len(message.content) >= 0
 
 
-def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
+def test_multiple_responses(client: openai.OpenAI, model_name: str,
+                            backend: str):
     if backend == "pytorch":
-        pytest.skip("Beam search is not supported in PyTorch backend yet")
+        pytest.skip(
+            "Multiple responses are not supported in PyTorch backend yet")
 
     messages = [{
         "role": "system",
@@ -204,6 +189,7 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
         "role": "user",
         "content": "what is 1+1?"
     }]
+    # test beam search
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -216,75 +202,21 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
     assert chat_completion.choices[
         0].message.content != chat_completion.choices[
             1].message.content, "beam search should be different"
+    # test n and best_of
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        n=2,
+        temperature=0.0,
+        extra_body=dict(best_of=4),
+    )
+    assert len(chat_completion.choices) == 2
 
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_chat_streaming(async_client: openai.AsyncOpenAI,
                               model_name: str):
-    messages = [{
-        "role": "system",
-        "content": "you are a helpful assistant"
-    }, {
-        "role": "user",
-        "content": "what is 1+1?"
-    }]
-
-    chat_completion = await async_client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        logprobs=False,
-    )
-    output = chat_completion.choices[0].message.content
-    _finish_reason = chat_completion.choices[0].finish_reason
-
-    # test streaming
-    stream = await async_client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        logprobs=False,
-        stream=True,
-    )
-    str_chunks: List[str] = []
-
-    finish_reason_counter = 0
-    finish_reason: str = None
-    async for chunk in stream:
-        choice = chunk.choices[0]
-        delta = choice.delta
-        if choice.finish_reason is not None:
-            finish_reason_counter += 1
-            finish_reason = choice.finish_reason
-        if delta.role:
-            assert delta.role == "assistant"
-        if delta.content:
-            str_chunks.append(delta.content)
-    # test finish_reason
-    if delta.content == "":
-        assert finish_reason == "stop"
-    assert finish_reason_counter == 1
-    assert finish_reason == _finish_reason
-    num_tokens = len(str_chunks)
-    if finish_reason == "length":
-        assert num_tokens == 10
-    elif finish_reason == "stop":
-        assert num_tokens <= 10
-    else:
-        raise RuntimeError(
-            f"finish_reason {finish_reason} not in [length, stop]")
-    # test generated tokens
-    assert "".join(str_chunks) == output
-
-
-@pytest.mark.asyncio(loop_scope="module")
-async def test_chat_streaming_with_logprobs(async_client: openai.AsyncOpenAI,
-                                            model_name: str, backend: str):
-    if backend == "pytorch":
-        pytest.skip("Logprobs are not supported in PyTorch backend yet")
-
     messages = [{
         "role": "system",
         "content": "you are a helpful assistant"
@@ -458,6 +390,7 @@ def test_custom_role(client: openai.OpenAI, model_name: str):
             "content": "what is 1+1?",
         }],  # type: ignore
         temperature=0.0,
+        max_completion_tokens=16,
         seed=0)
 
     resp2 = client.chat.completions.create(
@@ -470,6 +403,7 @@ def test_custom_role(client: openai.OpenAI, model_name: str):
             }]
         }],  # type: ignore
         temperature=0.0,
+        max_completion_tokens=16,
         seed=0)
 
     content1 = resp1.choices[0].message.content
@@ -498,3 +432,33 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     )
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].stop_reason == "two"
+
+
+server_with_custom_sampler = make_server_with_custom_sampler_fixture('chat')
+
+
+@pytest.mark.asyncio(loop_scope='function')
+@pytest.mark.parametrize(
+    'server_with_custom_sampler',
+    [
+        {
+            'sampler_type': "TorchSampler"
+        },  # torch_sampler
+        {
+            'sampler_type': "TRTLLMSampler"
+        },  # trtllm_sampler
+    ],
+    indirect=True,
+    ids=['torch_sampler', 'trtllm_sampler'])
+async def test_chat_completion_with_logit_bias_effect(
+        server_with_custom_sampler, model_name: str) -> None:
+    '''Test that logit bias affects output as expected for both samplers (chat endpoint).'''
+    client = server_with_custom_sampler.get_async_client()
+    await logit_bias_effect_helper(client, model_name, 'chat')
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_chat_completion_with_invalid_logit_bias(
+        async_client: openai.AsyncOpenAI, model_name: str):
+    """Test with invalid token IDs (non-integer keys) for chat completions"""
+    await invalid_logit_bias_helper(async_client, model_name, 'chat')

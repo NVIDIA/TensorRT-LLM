@@ -46,7 +46,7 @@ from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
                                    WeightOnlyQuantRowLinear)
 from ..quantization.mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
                                  W8A8_SQ_PLUGIN_LIST, QuantAlgo)
-from ..quantization.utils.fp4_utils import float4_sf_dtype
+from ..quantization.utils import fp4_utils
 from ..top_model_mixin import TopModelMixin
 from .convert_utils import weight_only_quantize_dict
 from .generation_mixin import GenerationMixin
@@ -67,7 +67,7 @@ class Gemma2ConfigGroup:
 class Gemma3ConfigGroup:
     query_pre_attn_scalar: float
     final_logit_softcapping: Optional[float]
-    sliding_window_pattern: int
+    _sliding_window_pattern: int
     rope_local_base_freq: int
     sliding_window: int
 
@@ -96,6 +96,9 @@ class SpeculativeDecodingMode(IntFlag):
     LOOKAHEAD_DECODING = auto()
     EXPLICIT_DRAFT_TOKENS = auto()
     EAGLE = auto()
+    NGRAM = auto()
+    USER_PROVIDED = auto()
+    AUTO = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -111,6 +114,12 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
         elif args.speculative_decoding_mode == "eagle":
             return SpeculativeDecodingMode.EAGLE
+        elif args.speculative_decoding_mode == "ngram":
+            return SpeculativeDecodingMode.NGRAM
+        elif args.speculative_decoding_mode == "user_provided":
+            return SpeculativeDecodingMode.USER_PROVIDED
+        elif args.speculative_decoding_mode == "auto":
+            return SpeculativeDecodingMode.AUTO
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -130,6 +139,7 @@ class QuantConfig:
         has_zero_point (bool): Whether to use zero point for quantization. Defaults to False.
         pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
         exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
+        mamba_ssm_cache_dtype (str, optional): The data type for mamba SSM cache. Defaults to None.
     """
     quant_algo: Optional[QuantAlgo] = None
     kv_cache_quant_algo: Optional[QuantAlgo] = None
@@ -140,6 +150,7 @@ class QuantConfig:
     has_zero_point: bool = False
     pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
+    mamba_ssm_cache_dtype: Optional[str] = None
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
@@ -1222,6 +1233,11 @@ def fuse_gate_mlp(
                     mlp.gate.activation_scaling_factor.raw_value,
                     mlp.fc.activation_scaling_factor.raw_value,
                 )
+
+                if mlp.bias:
+                    fused_layer.fused_fc.bias.value = np.concatenate(
+                        [mlp.gate.bias.raw_value, mlp.fc.bias.raw_value],
+                        axis=0)
             elif layer_quant_algo is None:
                 fused_layer.fused_fc.weight.value = np.concatenate(
                     [
@@ -1800,15 +1816,18 @@ def preprocess_perlayer_weights(weights,
         # Interleave block scale for NVFP4 plugin.
         for name in list(weights):
             if name.endswith('weights_scaling_factor'):
-                ori_shape = weights[name].shape
+                out_features, in_features = weights[name].shape
+                nrows = fp4_utils.pad_up(out_features, 128)
+                ncols = fp4_utils.pad_up(in_features, 4)
                 new_name = name.replace('weights_scaling_factor',
                                         'weights_block_scaling_factor')
                 weights[new_name] = weights[name]
                 weights[
                     new_name +
-                    "_interleaved"] = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
-                        weights[name].view(float4_sf_dtype).cpu().contiguous(
-                        )).reshape(ori_shape).view(float4_sf_dtype)
+                    "_interleaved"] = torch.ops.trtllm.block_scale_interleave(
+                        weights[name].view(fp4_utils.float4_sf_dtype).cpu(
+                        ).contiguous()).reshape(nrows, ncols).view(
+                            fp4_utils.float4_sf_dtype)
                 weights.pop(name)
             if name.endswith('weights_scaling_factor_2'):
                 new_name = name.replace('weights_scaling_factor_2',
@@ -1944,7 +1963,7 @@ def save_config(config: PretrainedConfig, *, output_dir: str,
                 log: bool) -> None:
     config_path = Path(output_dir) / "config.json"
     if log:
-        logger.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+        logger.debug(f"Saving TensorRT LLM configuration to {config_path}")
     config_path.parent.mkdir(exist_ok=True, parents=True)
     config_path.write_text(json.dumps(config.to_dict(), indent=4))
 

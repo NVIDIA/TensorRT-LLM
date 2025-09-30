@@ -67,34 +67,37 @@ public:
             if (kernelMeta.mCubin == nullptr)
                 continue;
 
-            CUmodule hmod{0};
-            auto findModuleIter = mModules.find(kernelMeta.mCubin);
-            if (findModuleIter != mModules.end())
+            CUlibrary hlib{0};
+            auto findLibIter = mCuLibs.find(kernelMeta.mCubin);
+            if (findLibIter != mCuLibs.end())
             {
-                hmod = findModuleIter->second;
+                hlib = findLibIter->second;
             }
             else
             {
-                TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
-                mModules.insert(std::make_pair(kernelMeta.mCubin, hmod));
+                TLLM_CU_CHECK(
+                    mDriver->cuLibraryLoadData(&hlib, kernelMeta.mCubin, nullptr, nullptr, 0, nullptr, nullptr, 0));
+                mCuLibs.insert(std::make_pair(kernelMeta.mCubin, hlib));
             }
 
             XQAKernelFuncInfo funcInfo{};
             funcInfo.mMetaInfoIndex = i;
-            TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-            funcInfo.mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, hmod, "smemSize", true).value();
-            funcInfo.mKernelType = getGlobalVar<XQAKernelType>(mDriver, hmod, "kernelType", false)
+            TLLM_CU_CHECK(mDriver->cuLibraryGetKernel(&funcInfo.mDeviceFunction, hlib, kernelMeta.mFuncName));
+            funcInfo.mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, hlib, "smemSize", true).value();
+            funcInfo.mKernelType = getGlobalVar<XQAKernelType>(mDriver, hlib, "kernelType", false)
                                        .value_or(XQAKernelType::kAMPERE_WARP_SPECIALIZED);
 
             /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
             if (funcInfo.mSharedMemBytes >= 46 * 1024)
             {
-                TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
+                CUdevice dev;
+                TLLM_CU_CHECK(mDriver->cuCtxGetDevice(&dev));
+                TLLM_CU_CHECK(mDriver->cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    funcInfo.mSharedMemBytes, funcInfo.mDeviceFunction, dev));
             }
             XQAKernelRuntimeHashKey hash_key{kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth,
                 kernelMeta.mNumQHeadsOverKV, kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache,
-                kernelMeta.mMultiQueryTokens};
+                kernelMeta.mMultiQueryTokens, false, std::nullopt};
 
             mFunctions.insert(std::make_pair(hash_key, funcInfo));
         }
@@ -121,10 +124,12 @@ public:
             m_tilesize = num_q_heads_over_kv;
         }
 
+        // precompiled XQA does not support param is_fp8_output in hash key
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
                 xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
-                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
+                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens, 0, /* xqa jit param is_fp8_output */
+                std::nullopt};
         auto const findIter = mFunctions.find(hash_key);
         return findIter != mFunctions.end();
     }
@@ -192,7 +197,7 @@ public:
         // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
         // Use the xqaParams.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
         float const* rotary_inv_freq_buf = xqaParams.rotary_embedding_inv_freq_cache;
-        if (decoder_params.isBuildDecoderInfoKernelNeeded())
+        if (decoder_params.isBuildDecoderInfoKernelNeeded() || xqaParams.multi_query_tokens)
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             invokeBuildDecoderInfo(decoder_params, stream);
@@ -219,8 +224,7 @@ public:
         preprocessingParams.cu_seq_lens = xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = xqaParams.rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = xqaParams.kv_scale_orig_quant;
-        preprocessingParams.kv_cache_scale_factors = nullptr;
+        preprocessingParams.qkv_scale_orig_quant = xqaParams.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = xqaParams.spec_decoding_position_offsets;
         preprocessingParams.mrope_position_deltas = xqaParams.mrope_position_deltas;
         // Scalar parameters.
@@ -254,13 +258,13 @@ public:
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
-        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams, false);
+        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams, false, mSM);
         auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
 
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-        const CUfunction func = findIter->second.mDeviceFunction;
+        const CUfunction func = reinterpret_cast<CUfunction>(findIter->second.mDeviceFunction);
         unsigned int const shared_mem_bytes = findIter->second.mSharedMemBytes;
         auto const kernelType = findIter->second.mKernelType;
 
@@ -282,14 +286,8 @@ public:
             void* kernelParams[] = {&maxQSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
                 &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
                 &launchParams.kv_scale_quant_orig, &launchParams.scratch};
+            // precompiled XQA Spec-dec kernel does not support multi-block mode
             int multi_block = 1;
-            if (xqaParams.multi_block_mode)
-            {
-                multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-                check_cuda_error(cudaMemsetAsync(xqaParams.workspaces, 0,
-                    sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
-                sync_check_cuda_error(stream);
-            }
             TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
                 xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }
@@ -321,7 +319,7 @@ public:
             CUtensorMap tensorMap{};
             if (isGmmaKernel)
             {
-                tensorMap = makeTensorMapForKVCache(mDriver, xqaParams, kv_cache_buffer);
+                tensorMap = makeTensorMapForHopperXqaKVCache(mDriver, xqaParams, kv_cache_buffer);
                 appendParam(&tensorMap);
             }
             appendParam(&launchParams.semaphores);
@@ -355,7 +353,7 @@ protected:
     TKernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
-    std::unordered_map<unsigned long long const*, CUmodule> mModules;
+    std::unordered_map<unsigned long long const*, CUlibrary> mCuLibs;
 
     bool mForceXQA = false;
 
@@ -363,7 +361,7 @@ protected:
     {
         unsigned int mMetaInfoIndex;
         unsigned int mSharedMemBytes;
-        CUfunction mDeviceFunction;
+        CUkernel mDeviceFunction;
         XQAKernelType mKernelType;
     };
 
@@ -412,6 +410,10 @@ private:
 
 inline XQAKernelList const* getXQAKernels(Data_type type, unsigned int sm)
 {
+    if (sm == kSM_121)
+    {
+        sm = kSM_120;
+    }
     return XQAKernelLoader::Get().getXQAKernels(type, sm);
 }
 
@@ -438,6 +440,7 @@ void DecoderXQAImplPrecompiled::runDispatchBuffer(
 
 #define SUPPORT_RETURN_FALSE(X)                                                                                        \
     {                                                                                                                  \
+        TLLM_LOG_DEBUG("XQA is not used. Reason: %s", X);                                                              \
         return false;                                                                                                  \
     }
 
@@ -522,8 +525,17 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     }
 
     XQAKernelList const* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
-    return xqa_kernel->supportConfig(xqaParams)
-        && xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
+    bool supportConfig = xqa_kernel->supportConfig(xqaParams);
+    if (!supportConfig)
+    {
+        SUPPORT_RETURN_FALSE("supportConfig");
+    }
+    bool mayHavePerfGain = xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
+    if (!mayHavePerfGain)
+    {
+        SUPPORT_RETURN_FALSE("mayHavePerfGain");
+    }
+    return true;
 }
 
 #undef SUPPORT_RETURN_FALSE

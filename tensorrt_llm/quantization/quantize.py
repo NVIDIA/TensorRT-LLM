@@ -9,16 +9,18 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import LayerQuantConfig, QuantConfig
 from ..parameter import Parameter
-from .layers import (FP4Linear, FP4RowLinear, FP8Linear, FP8RowLinear,
-                     Fp8RowwiseAttention, Fp8RowwiseGatedMLP, Fp8RowwiseMLP,
-                     Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
-                     Int8SmoothQuantRowLinear, QServeAttention, QServeGatedMLP,
-                     QServeMLP, QServeRmsNorm, SmoothQuantAttention,
-                     SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
-                     SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
-                     WeightOnlyGroupwiseQuantRowLinear,
-                     WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
-                     WeightOnlyQuantRowLinear)
+
+# isort: off
+from .layers import (
+    FP4Linear, FP4RowLinear, FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
+    Fp8RowwiseGatedMLP, Fp8RowwiseLayerNorm, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
+    Int8SmoothQuantLinear, Int8SmoothQuantRowLinear, QServeAttention,
+    QServeGatedMLP, QServeMLP, QServeRmsNorm, SmoothQuantAttention,
+    SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
+    SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
+    WeightOnlyGroupwiseQuantRowLinear, WeightOnlyQuantColumnLinear,
+    WeightOnlyQuantEmbedding, WeightOnlyQuantRowLinear)
+# isort: on
 from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
 
 
@@ -28,14 +30,16 @@ def quantize_layers(
     quant_map,
     preprocess_init_params=None,
 ):
-    exclude_modules = quant_config.exclude_modules or [
-        '*lm_head',
-        '*router',
-        '*vocab_embedding',
-        '*position_embedding',
-        '*block_embedding',
-        '*shared_expert_gate',
-    ]
+    exclude_modules = quant_config.exclude_modules
+    if exclude_modules is None:
+        exclude_modules = [
+            '*lm_head',
+            '*router',
+            '*vocab_embedding',
+            '*position_embedding',
+            '*block_embedding',
+            '*shared_expert_gate',
+        ]
 
     for name, module, parent in model.named_modules_with_parent():
         module_name = name.rsplit('.', 1)[-1]
@@ -239,14 +243,18 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
 
     quant_cls_map = {
         RmsNorm: Fp8RowwiseRmsNorm,
+        LayerNorm: Fp8RowwiseLayerNorm,
         GatedMLP: Fp8RowwiseGatedMLP,
         MLP: Fp8RowwiseMLP,
         Attention: Fp8RowwiseAttention,
     }
 
+    exclude_modules = quant_config.exclude_modules
+    if exclude_modules is None:
+        exclude_modules = []
+    # Always exclude these modules for FP8 rowwise
     exclude_modules = list(
-        set((quant_config.exclude_modules or []) +
-            ['*ln_f', '*ln_embed', '*lm_head']))
+        set(exclude_modules + ['*ln_f', '*ln_embed', '*lm_head']))
 
     def extract_layer_idx(name):
         ss = name.split('.')

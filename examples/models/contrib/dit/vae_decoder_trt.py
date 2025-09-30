@@ -81,7 +81,7 @@ class TRT_Exporter(object):
         t0 = time()
         engineString = builder.build_serialized_network(network, config)
         t1 = time()
-        if engineString == None:
+        if engineString is None:
             print("Failed building %s" % planFile)
         else:
             print("Succeeded building %s in %d s" % (planFile, t1 - t0))

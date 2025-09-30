@@ -29,7 +29,6 @@ import time
 import psutil  # type: ignore
 # Nvidia
 import pynvml  # type: ignore
-# TURTLE
 from defs.trt_test_alternative import print_info, print_warning
 
 from .misc import clean_device_product_name
@@ -190,7 +189,7 @@ class GPUClockLock:
         # Initialize thread
         self._thread = threading.Thread(
             target=self._monitoring_thread,
-            name="TURTLE - GPUMonitor",
+            name="LLM Test - GPUMonitor",
             kwargs={"interval_ms": self._interval_ms})
         self._thread.daemon = True
         self._thread.start()

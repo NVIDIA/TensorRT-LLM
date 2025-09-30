@@ -60,14 +60,12 @@ class DecoderDomain
 public:
     DecoderDomain(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize,
         std::optional<runtime::SizeType32> vocabSizePadded = std::nullopt,
-        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr,
-        bool const useVariableBeamWidthSearch = false)
+        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr)
         : mBatchSize(batchSize)
         , mBeamWidth(beamWidth)
         , mVocabSize(vocabSize)
         , mVocabSizePadded(vocabSizePadded.value_or(vocabSize))
         , mSpeculativeDecodingModule(std::move(speculativeDecodingModule))
-        , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
     {
     }
 
@@ -79,6 +77,11 @@ public:
     [[nodiscard]] runtime::SizeType32 getBeamWidth() const
     {
         return mBeamWidth;
+    }
+
+    void setBeamWidth(runtime::SizeType32 beamWidth)
+    {
+        mBeamWidth = beamWidth;
     }
 
     [[nodiscard]] runtime::SizeType32 getVocabSize() const
@@ -107,18 +110,12 @@ public:
         return mSpeculativeDecodingModule;
     }
 
-    [[nodiscard]] bool getUseVariableBeamWidthSearch() const
-    {
-        return mUseVariableBeamWidthSearch;
-    }
-
 private:
     runtime::SizeType32 mBatchSize;
     runtime::SizeType32 mBeamWidth;
     runtime::SizeType32 mVocabSize;
     runtime::SizeType32 mVocabSizePadded;
     std::shared_ptr<runtime::SpeculativeDecodingModule const> mSpeculativeDecodingModule;
-    bool mUseVariableBeamWidthSearch;
 };
 
 class BaseSetupParams
@@ -515,13 +512,16 @@ public:
     TensorPtr outputIdsPtr;     // [maxBatchSize][maxBeamWidth, maxSeqLen], on gpu and outputIdsPtr[i], on gpu
     TensorPtr outputIdsPtrHost; // [maxBatchSize][maxBeamWidth, maxSeqLen], on cpu but outputIdsPtrHost[i], on gpu
     TensorPtr parentIdsPtr;     // [maxBatchSize][maxBeamWidth, maxSeqLen], on cpu but parentIdsPtr[i], on gpu
-
     TensorPtr newTokens;        // [maxBatchSize, maxBeamWidth], on gpu, tokens predicted at current iteration.
 
     // optional parameters
     std::optional<TensorPtr> numNewTokens; // [maxBatchSize], on pinned, number of tokens predicted at current iteration
     std::optional<TensorPtr> finishedSum;  // [1], on pinned
     std::optional<TensorPtr> outputLogProbsTiled; // [maxSeqLen, maxBatchSize, maxBeamWidth], on gpu
+
+    // Beam width might change in Variable-Beam-Width-Search mode.
+    // So the beam width is updated in beam search layer for the later layers.
+    runtime::SizeType32 beamWidth{1};
 };
 
 class BeamSearchOutputs : public BaseDecodingOutputs

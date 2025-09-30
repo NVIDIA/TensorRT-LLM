@@ -30,6 +30,9 @@ from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, get_beam_width_array,
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm._utils import mpi_broadcast, str_dtype_to_torch
+from tensorrt_llm.builder import EngineConfig
+from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
+from tensorrt_llm.layers import MropeParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.qwen.utils import make_context
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -38,16 +41,63 @@ from tensorrt_llm.tools.ppl import ppl
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
+
+
+def ensemble_mrope_params(batch_input_ids, max_position_embeddings,
+                          rotary_embedding_dim, theta):
+    mrope_params = MropeParams()
+    batch_size = len(batch_input_ids)
+
+    _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+        num_pos=max_position_embeddings,
+        dim=rotary_embedding_dim,
+        theta=1000000.0,
+        scale_type=RotaryScalingType.mrope,
+    )
+    rotary_cos_sin = torch.tensor(rotary_cos_sin).to(batch_input_ids[0].device)
+    rotary_cos_sin = rotary_cos_sin.reshape(max_position_embeddings,
+                                            int(rotary_embedding_dim / 2), 2)
+
+    cos_ori = rotary_cos_sin[:, :, 0]
+    sin_ori = rotary_cos_sin[:, :, 1]
+
+    mrope_position_ids_padding = torch.zeros(
+        (batch_size, max_position_embeddings), dtype=torch.int32)
+    for i in range(batch_size):
+        seq_len = batch_input_ids[i].shape[-1]
+        mrope_position_ids_padding[i, :seq_len] = torch.arange(
+            seq_len, device=batch_input_ids[i].device)
+
+    cos = cos_ori[mrope_position_ids_padding].unsqueeze(-1)
+    sin = sin_ori[mrope_position_ids_padding].unsqueeze(-1)
+
+    mrope_params.mrope_rotary_cos_sin = torch.concatenate(
+        (cos, sin), axis=-1).reshape(batch_size, -1)
+    mrope_params.mrope_position_deltas = torch.zeros(
+        [batch_size, 1], device=batch_input_ids[0].device)
+
+    return mrope_params
 
 
 def main(args):
+    is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+    if is_integration_test:
+        logger.info(
+            "Running in integration test mode - will only run one batch and skip accuracy checks"
+        )
+        logger.info(
+            "Setting max_ite=1 and check_accuracy=False for integration test")
+        args.max_ite = 1
+        args.check_accuracy = False
+
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
     test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
     test_trt_llm = args.test_trt_llm
-    model_name, model_version = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(
+        args.engine_dir if not test_hf else args.hf_model_dir, test_hf)
     if args.hf_model_dir is None:
         logger.warning(
             "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -251,22 +301,34 @@ def main(args):
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens,
                                           min_input_length=min_input_length)
-        batch_size = len(batch_input_ids)
-        if batch_size == 0:
+        # Generate mrope params for qwen model
+        engine_config = EngineConfig.from_json_file(
+            f"{args.engine_dir}/config.json")
+        pretrain_config = engine_config.pretrained_config
+        mrope_params = None
+        if 'qwen' in model_name.lower():
+            mrope_params = ensemble_mrope_params(
+                batch_input_ids,
+                max_position_embeddings=pretrain_config.max_position_embeddings,
+                rotary_embedding_dim=pretrain_config.rotary_embedding_dim,
+                theta=pretrain_config.rotary_base,
+            )
+
+        if batch_size == 0 or len(batch_input_ids) == 0:
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
-        if args.prompt_lookup_config is not None:
-            # Speculative decoding of Prompt-Lookup-Decoding (PLD)
-            outputs = run_dtm_pld(batch_input_ids,
-                                  args,
-                                  runtime_rank,
-                                  end_id,
-                                  pad_id,
-                                  stop_words_list,
-                                  bad_words_list,
-                                  tokenizer.vocab_size,
-                                  target_runner=runner)
+        if args.ngram_config is not None:
+            # Speculative decoding of NGram
+            outputs = run_dtm_ngram(batch_input_ids,
+                                    args,
+                                    runtime_rank,
+                                    end_id,
+                                    pad_id,
+                                    stop_words_list,
+                                    bad_words_list,
+                                    tokenizer.vocab_size,
+                                    target_runner=runner)
             if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
                 outputs, runner = list(outputs)[0]
         else:  # Normal run
@@ -298,7 +360,8 @@ def main(args):
                     return_dict=True,
                     random_seed=random_seed,
                     medusa_choices=args.medusa_choices,
-                    eagle_choices=args.eagle_choices)
+                    eagle_choices=args.eagle_choices,
+                    mrope_params=mrope_params)
                 torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
@@ -340,7 +403,7 @@ def main(args):
                         ],
                                                 dim=0)
                         curr_ppl = ppl(curr_logits, curr_ids)
-                        logger.debug(f"TensorRT-LLM PPL: {curr_ppl:.3f} | "
+                        logger.debug(f"TensorRT LLM PPL: {curr_ppl:.3f} | "
                                      f"Generation length: {curr_gen_len}")
                         ppls[batch_idx].append(curr_ppl)
             return output_beams_list, output_ids_list, ppls, lengths_info
@@ -480,10 +543,34 @@ def main(args):
             f"Using {'Python' if args.use_py_session else 'C++'} session")
 
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-        runner_kwargs = dict(engine_dir=args.engine_dir,
-                             rank=runtime_rank,
-                             debug_mode=args.debug_mode,
-                             gpu_weights_percent=args.gpu_weights_percent)
+        runner_kwargs = dict(
+            engine_dir=args.engine_dir,
+            rank=runtime_rank,
+            debug_mode=args.debug_mode,
+            gpu_weights_percent=args.gpu_weights_percent,
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
+        if not args.use_py_session:
+            runner_kwargs.update(
+                lora_dir=args.lora_dir,
+                lora_ckpt_source=args.lora_ckpt_source,
+                max_batch_size=max_batch_size,
+                max_input_len=test_token_num,
+                max_output_len=output_len,
+                max_beam_width=num_beams,
+                max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length,
+                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+                kv_cache_free_gpu_memory_fraction=args.
+                kv_cache_free_gpu_memory_fraction,
+                enable_chunked_context=args.enable_chunked_context,
+                multi_block_mode=args.multi_block_mode,
+                cuda_graph_mode=args.cuda_graph_mode,
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage,
+            )
+
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -509,41 +596,18 @@ def main(args):
                 args.lookahead_config
             ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
             runner_kwargs.update(lookahead_config=args.lookahead_config)
-        if args.prompt_lookup_config is not None:
+        if args.ngram_config is not None:
             assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
             assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
             assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
-            prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
-                args.prompt_lookup_config)
-            args.max_output_len = output_len  # Specialization for PLD
+            max_draft_len, _, target_device_list = ast.literal_eval(
+                args.ngram_config)
+            args.max_output_len = output_len  # Specialization for NGram
             runner_kwargs.update(is_orchestrator_mode=True,
-                                 device_ids=target_device_list)
+                                 device_ids=target_device_list,
+                                 max_input_len=test_token_num + max_draft_len +
+                                 output_len)
 
-        if not args.use_py_session:
-            runner_kwargs.update(
-                lora_dir=args.lora_dir,
-                lora_ckpt_source=args.lora_ckpt_source,
-                max_batch_size=max_batch_size,
-                max_input_len=test_token_num,
-                max_output_len=output_len,
-                max_beam_width=num_beams,
-                max_attention_window_size=max_attention_window_size,
-                sink_token_length=sink_token_length,
-                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
-                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
-                kv_cache_free_gpu_memory_fraction=args.
-                kv_cache_free_gpu_memory_fraction,
-                enable_chunked_context=args.enable_chunked_context,
-                multi_block_mode=args.multi_block_mode,
-                cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.eval_ppl,
-                use_gpu_direct_storage=args.use_gpu_direct_storage)
-        runner_kwargs.update(
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
-        if args.prompt_lookup_config is not None:
-            # Specialization for PLD since many call of `generate()` is needed
-            runner_kwargs.update(max_input_len=test_token_num +
-                                 prompt_lookup_num_tokens + output_len)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not runner.gather_context_logits), \
             "PPL evaluation requires engine built with gather_context_logits enabled"
@@ -558,7 +622,7 @@ def main(args):
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
-            logger.info("TensorRT-LLM Generated: ")
+            logger.info("TensorRT LLM Generated: ")
             logger.info(f" Input: {datapoint[dataset_input_key]}")
             logger.info(f"\n Reference: {datapoint[dataset_output_key]}")
             logger.info(f"\n Output: {output}")
@@ -619,7 +683,7 @@ def main(args):
 
                 logger.debug('-' * 100)
                 logger.debug(f"Input: {datapoint[dataset_input_key]}")
-                logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
+                logger.debug(f'TensorRT LLM Output: {output_tensorrt_llm}')
                 logger.debug(f"Reference: {datapoint[dataset_output_key]}")
 
             data_point_idx += max_batch_size
@@ -743,17 +807,17 @@ def main(args):
         if test_trt_llm:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
-                f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
+                f'TensorRT LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
             )
 
             logger.info(
-                f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
+                f'TensorRT LLM (total output tokens: {total_output_token_count_trt_llm})'
             )
             logger.info(
-                f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
+                f'TensorRT LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
             )
             for beam_idx in range(num_sequences):
-                logger.info(f"TensorRT-LLM beam {beam_idx} result")
+                logger.info(f"TensorRT LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
                     if args.estimate_accuracy_std_dev:
                         computed_metrics_tensorrt_llm = metric_tensorrt_llm[
@@ -859,7 +923,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help="Directory where to save output sentences. 'trtllm.out' for "
-        "TensorRT-LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
+        "TensorRT LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
         "save outputs.")
     parser.add_argument(
         '--rouge_dir',

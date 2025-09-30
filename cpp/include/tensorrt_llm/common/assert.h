@@ -16,19 +16,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
-
-#include <string>
-
-namespace tensorrt_llm::common
-{
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
-{
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
-}
-
-} // namespace tensorrt_llm::common
 
 class DebugConfig
 {
@@ -57,7 +45,7 @@ public:
         TLLM_LIKELY(static_cast<bool>(val))                                                                            \
         ? ((void) 0)                                                                                                   \
         : tensorrt_llm::common::throwRuntimeError(                                                                     \
-            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__));                                    \
+            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                            \
     } while (0)
 
 #define TLLM_CHECK_DEBUG(val)                                                                                          \
@@ -78,15 +66,6 @@ public:
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
             ? ((void) 0)                                                                                               \
             : tensorrt_llm::common::throwRuntimeError(                                                                 \
-                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__));                                \
+                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                        \
         }                                                                                                              \
     } while (0)
-
-#define TLLM_THROW(...)                                                                                                \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        throw NEW_TLLM_EXCEPTION(__VA_ARGS__);                                                                         \
-    } while (0)
-
-#define TLLM_WRAP(ex)                                                                                                  \
-    NEW_TLLM_EXCEPTION("%s: %s", tensorrt_llm::common::TllmException::demangle(typeid(ex).name()).c_str(), ex.what())

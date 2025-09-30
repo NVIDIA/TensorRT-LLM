@@ -3,6 +3,7 @@ import collections
 import hashlib
 import io
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -354,9 +355,26 @@ class AsyncQueue:
         if self._tainted:
             raise AsyncQueue.MixedSyncAsyncAPIError()
 
-        if timeout is None or timeout > 0:
-            # This may raise asyncio.TimeoutError
-            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        # Blocking path: timeout is None (wait indefinitely)
+        if timeout is None:
+            # Wait indefinitely until the queue is non-empty.
+            # It is necessary to check if the queue is empty after waking.
+            # Because multiple waiting coroutines may be awakened simultaneously when a new item entries empty queue.
+            # These coroutines will all pop this item from queue, and then raise IndexError.
+            while not self._q:
+                await self._event.wait()
+        # Blocking path: timeout > 0 (timed wait, retry with remaining time).
+        elif timeout > 0:
+            # Compute the deadline; if the queue is still empty after waking, continue waiting for the remaining time.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while not self._q:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                # This may raise asyncio.TimeoutError.
+                await asyncio.wait_for(self._event.wait(), timeout=remaining)
+        # Non-blocking path: timeout <= 0.
         elif not self._q:
             raise asyncio.QueueEmpty()
 
@@ -493,7 +511,7 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
     for field_name, field_info in schema['properties'].items():
         if field_name.startswith("_"):  # skip private fields
             continue
-        if field_info.get("deprecated", False):
+        if field_info.get("status", None) == "deprecated":
             continue
 
         field_type = field_info.get('type', None)
@@ -507,11 +525,21 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         elif field_name in type_hints:
             type_str = str(type_hints[field_name])
             type_str = type_str.replace("typing.", "")
+            # Extract just the class name from full class path
+            for regex in [r"<class '([^']+)'>", r"<enum '([^']+)'>"]:
+                if (match := re.match(regex, type_str)) is not None:
+                    type_str = match.group(1)
+                    break
         else:
             type_str = field_type or 'Any'
 
         # Format the argument documentation with 12 spaces indent for args
         arg_line = f"{indent}    {field_name} ({type_str}): "
+        if status := field_info.get("status", None):
+            arg_line += f":tag:`{status}` "
+        elif LABEL_STABLE_APIS:
+            arg_line += f":tag:`stable` "
+
         if field_description:
             arg_line += field_description.split('\n')[0]  # First line with type
 
@@ -543,3 +571,101 @@ def get_type_repr(cls):
     if module_name == 'builtins':  # Special case for built-in types
         return cls.__qualname__
     return f"{module_name}.{cls.__qualname__}"
+
+
+LABEL_STABLE_APIS: bool = True
+""" Whether to label the stable APIs with `stable` tags. """
+
+
+class ApiParamTagger:
+    ''' A helper to tag the api doc according to the status of the fields.
+    The status is set in the json_schema_extra of the field.
+    '''
+
+    def __call__(self, cls: Type[BaseModel]) -> None:
+        """ The main entry point to tag the api doc. """
+        if cls.__name__ in ["LlmArgs", "TorchLlmArgs"]:
+            # TODO: apply this to other classes
+            self._process_pydantic_model(cls)
+
+    def _process_pydantic_model(self, cls: Type[BaseModel]) -> None:
+        """Process the Pydantic model to add tags to the fields.
+        """
+        for field_name, field_info in cls.model_fields.items():
+            if field_info.json_schema_extra and 'status' in field_info.json_schema_extra:
+                status = field_info.json_schema_extra['status']
+                self._amend_pydantic_field_description_with_tags(
+                    cls, [field_name], status)
+            else:
+                self._amend_pydantic_field_description_with_tags(
+                    cls, [field_name], "stable")
+
+    def _amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
+                                                    field_names: list[str],
+                                                    tag: str) -> None:
+        """Amend the description of the fields with tags.
+        e.g. :tag:`beta` or :tag:`prototype`
+        Args:
+            cls: The Pydantic BaseModel class.
+            field_names: The names of the fields to amend.
+            tag: The tag to add to the fields.
+        """
+        assert field_names
+        for field_name in field_names:
+            field = cls.model_fields[field_name]
+            cls.model_fields[
+                field_name].description = f":tag:`{tag}` {field.description}"
+        cls.model_rebuild(force=True)
+
+
+def tag_llm_params():
+    from tensorrt_llm.llmapi.llm_args import LlmArgs
+    ApiParamTagger()(LlmArgs)
+
+
+class ApiStatusRegistry:
+    ''' A registry to store the status of the api.
+
+    usage:
+
+    @ApiStatusRegistry.set_api_status("beta")
+    def my_method(self, *args, **kwargs):
+        pass
+
+    class App:
+        @ApiStatusRegistry.set_api_status("beta")
+        def my_method(self, *args, **kwargs):
+            pass
+    '''
+    method_to_status = {}
+
+    @classmethod
+    def set_api_status(cls, status: str):
+
+        def decorator(func):
+            # Use qualified name to support class methods
+            if func.__qualname__ in cls.method_to_status:
+                logger.debug(
+                    f"Method {func.__qualname__} already has a status, skipping the decorator"
+                )
+                return func
+            cls.method_to_status[func.__qualname__] = status
+            func.__doc__ = cls.amend_api_doc_with_status_tags(func)
+            return func
+
+        return decorator
+
+    @classmethod
+    def get_api_status(cls, method: Callable) -> Optional[str]:
+        return cls.method_to_status.get(method.__qualname__, None)
+
+    @classmethod
+    def amend_api_doc_with_status_tags(cls, method: Callable) -> str:
+        status = cls.get_api_status(method)
+        if status is None:
+            return method.__doc__
+        return f":tag:`{status}` {method.__doc__}"
+
+
+set_api_status = ApiStatusRegistry().set_api_status
+get_api_status = ApiStatusRegistry().get_api_status

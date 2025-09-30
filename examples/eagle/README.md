@@ -1,11 +1,11 @@
 # EAGLE speculative Decoding
 
-This document shows how to build and run a model using EAGLE decoding ([`GitHub`](https://github.com/SafeAILab/EAGLE/tree/main), [`BLOG`](https://sites.google.com/view/eagle-llm)) in TensorRT-LLM on a single node with one or multiple GPUs.
+This document shows how to build and run a model using EAGLE decoding ([`GitHub`](https://github.com/SafeAILab/EAGLE/tree/main), [`BLOG`](https://sites.google.com/view/eagle-llm)) in TensorRT LLM on a single node with one or multiple GPUs.
 
 ## Overview
 Different from other models, EAGLE decoding needs a base model and an EAGLE model.
 
-The TensorRT-LLM EAGLE decoding implementation can be found in [tensorrt_llm/models/eagle/model.py](../../tensorrt_llm/models/eagle/model.py).
+The TensorRT LLM EAGLE decoding implementation can be found in [tensorrt_llm/models/eagle/model.py](../../tensorrt_llm/models/eagle/model.py).
 The implementation adds an EAGLE drafter network to a base model.
 
 For more info about EAGLE, refer to [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
@@ -23,10 +23,10 @@ For more info about EAGLE, refer to [speculative decoding documentation](https:/
   * C++ runtime
   * Tensor Parallel
 
-This example is based on the Vicuna-7b v1.3 model, a fine-tuned Llama. With some modifications, you can add EAGLE to other base models as well. Some TensorRT-LLM models might not work with EAGLE due to the missing head size in the speculative decoding XQA attention kernels.
+This example is based on the Vicuna-7b v1.3 model, a fine-tuned Llama. With some modifications, you can add EAGLE to other base models as well. Some TensorRT LLM models might not work with EAGLE due to the missing head size in the speculative decoding XQA attention kernels.
 
 ## Usage
-The TensorRT-LLM EAGLE example code is located in [`examples/eagle`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with EAGLE decoding support.
+The TensorRT LLM EAGLE example code is located in [`examples/eagle`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with EAGLE decoding support.
 In this example, we use the model from HuggingFace [`yuhuili/EAGLE-Vicuna-7B-v1.3`](https://huggingface.co/yuhuili/EAGLE-Vicuna-7B-v1.3), which is a LLAMA-based model.
 
 ### Build TensorRT engine(s)
@@ -80,7 +80,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_eagle \
 
 ### Run
 
-To run a TensorRT-LLM model with EAGLE-1 decoding support, you can use `../run.py` script, with an additional argument
+To run a TensorRT LLM model with EAGLE-1 decoding support, you can use `../run.py` script, with an additional argument
 `--eagle_choices`.
 The `--eagle_choices` argument is of type `list[list[int]]`. If you do not specify any choices, the
 default, [mc_sim_7b_63](https://github.com/FasterDecoding/Medusa/blob/main/medusa/model/medusa_choices.py#L1) choices
@@ -98,7 +98,6 @@ To run non-greedy sampling and use typical acceptance, set `--eagle_posterior_th
 `--temperature` can be specified as well. When no `--eagle_posterior_threshold` is specified or `--temperature=0.0` is set, greedy sampling is used.
 
 #### Run EAGLE-2
-**EAGLE-2 is still under the experimental stage.**
 
 EAGLE-2 can be enabled with 2 runtime flags (`--eagle_use_dynamic_tree` and `--eagle_dynamic_tree_max_top_k=N`). The same engine can be used for EAGLE-1 and EAGLE-2. Eagle choices must not be set in case of EAGLE-2. EAGLE-2 will generate the tree corresponding to choices dynamically in the runtime. For more details, please refer to [EAGLE-2 paper](https://arxiv.org/pdf/2406.16858).
 
@@ -108,7 +107,7 @@ When using EAGLE-2, please enable `--eagle_use_dynamic_tree`, which indicates wh
 - In EagleNet2, the `N` output nodes of EagleNet1 are expanded, and each node expands `N` new draft tokens. Therefore, this layer also has a total of `N * N` draft tokens. And select the top `N` as the output of this layer.
 - Etc.
 
-Finally, after `num_eagle_layer` EagleNets, `N + N * N * (num_eagle_layer - 1)` draft tokens are generated. We will rebuild the final tree based on all draft tokens and their scores. The final generated tree will have `min(N + N * N * (num_eagle_layer - 1), max_draft_tokens)` nodes.
+Finally, after `num_eagle_layer` EagleNets, `N + N * N * (num_eagle_layer - 1)` draft tokens are generated. We will rebuild the final tree based on all draft tokens and their scores. The final generated tree will have `min(N + N * N * (num_eagle_layer - 1), max_draft_len)` nodes.
 
 
 

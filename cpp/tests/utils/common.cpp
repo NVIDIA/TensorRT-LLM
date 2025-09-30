@@ -12,7 +12,6 @@
 
 #include "common.h"
 
-#include "modelSpec.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -20,6 +19,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+#include "tensorrt_llm/testing/modelSpec.h"
 #include "tests/utils/common.h"
 
 #include <gtest/gtest.h>
@@ -131,6 +131,26 @@ std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP2_FILE()
 std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP1_FILE()
 {
     return ModelSpec::getDefaultModelSpec().useTensorParallelism(2).getResultsFile();
+}
+
+std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_CONTEXT_LOGITS_TP4_PP1_FILE()
+{
+    return ModelSpec::getDefaultModelSpec().useTensorParallelism(4).getContextLogitsFile();
+}
+
+std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_TP4_PP1_FILE()
+{
+    return ModelSpec::getDefaultModelSpec().useTensorParallelism(4).getGenerationLogitsFile();
+}
+
+std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_CUM_LOG_PROBS_TP4_PP1_FILE()
+{
+    return ModelSpec::getDefaultModelSpec().useTensorParallelism(4).getCumLogProbsFile();
+}
+
+std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_LOG_PROBS_TP4_PP1_FILE()
+{
+    return ModelSpec::getDefaultModelSpec().useTensorParallelism(4).getLogProbsFile();
 }
 
 std::string PathUtil::FP16_PLUGIN_PACKED_PAGED_GATHER_CONTEXTFMHAFP32ACC_RESULT_FILE()
@@ -408,9 +428,9 @@ TestData TestData::loadTestData(BeamResult const& beamResults, ITensor const& gi
 }
 
 void TestData::verifyOutput(std::unordered_map<SizeType32, std::vector<executor::BeamTokens>> const& resultTokens,
-    std::vector<SizeType32> const& givenInputLengths, SizeType32 nbGivenInputs, bool streaming,
-    bool excludeInputFromOutput, FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, bool returnAllGeneratedTokens,
-    SizeType32 reqBeamWidth, SizeType32 numReturnSequences, bool isNonGreedySampling)
+    std::vector<SizeType32> const& givenInputLengths, bool streaming, bool excludeInputFromOutput,
+    FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
+    bool isNonGreedySampling)
 {
     for (auto const& [batchId, beamTokens] : resultTokens)
     {
@@ -436,12 +456,6 @@ void TestData::verifyOutput(std::unordered_map<SizeType32, std::vector<executor:
                     = expectedOutputLengths[batchId * reqBeamWidth + beam]; // Ground truth output length
                 auto expectedOutputLength
                     = expectInputOutputLength - inputLength;                // Number of new generated output tokens
-                if (returnAllGeneratedTokens)
-                {
-                    // If returnAllGeneratedTokens, then the tokens of each iteration will contain all the previously
-                    // generated tokens. Such as: [(a), (a, b), (a, b, c), (a, b, c, d), ...]
-                    expectedOutputLength = (1 + expectedOutputLength) * expectedOutputLength / 2;
-                }
 
                 bool inputNotIncluded = (streaming || excludeInputFromOutput);
                 bool anyMismatch = false;
@@ -458,12 +472,6 @@ void TestData::verifyOutput(std::unordered_map<SizeType32, std::vector<executor:
                         << "b: " << batchId << " seq: " << seqIdx << " beam: " << beam;
                 }
 
-                if (returnAllGeneratedTokens)
-                {
-                    // If returnAllGeneratedTokens, the output of the last iteration will contain all the output tokens
-                    predictedTokens.erase(
-                        predictedTokens.begin(), predictedTokens.end() - (expectInputOutputLength - inputLength));
-                }
                 auto numPredTokens = static_cast<SizeType32>(predictedTokens.size());
 
                 if (isSpeculativeDecoding)
@@ -576,8 +584,8 @@ void TestData::verifyLogProbs(bool computeLogProbs, bool streaming, bool exclude
 }
 
 void TestData::validateContextLogits(bool getContextLogits, SizeType32 inputLength, SizeType32 beamWidth,
-    std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-    executor::BatchingType batchingType)
+    std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId, float atol,
+    float rtol)
 {
     if (getContextLogits)
     {
@@ -587,10 +595,11 @@ void TestData::validateContextLogits(bool getContextLogits, SizeType32 inputLeng
         EXPECT_EQ(contextLogits.value().getShape()[1], vocabSizePadded);
         auto const expectedContextLogits = this->expectedContextLogits[batchId];
 
-        if (batchingType != executor::BatchingType::kSTATIC && beamWidth == 1)
+        if (beamWidth == 1)
         {
             cudaDeviceSynchronize(); // Make sure the logits copy is complete.
-            EXPECT_TRUE(compareLogits(*expectedContextLogits, *(executor::detail::toITensor(contextLogits.value()))));
+            EXPECT_TRUE(compareLogits(
+                *expectedContextLogits, *(executor::detail::toITensor(contextLogits.value())), atol, rtol));
         }
     }
     else
@@ -602,7 +611,7 @@ void TestData::validateContextLogits(bool getContextLogits, SizeType32 inputLeng
 void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool streaming, bool excludeInputFromOutput,
     SizeType32 inputLength, SizeType32 maxOutputLen, SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
     std::optional<executor::Tensor> const& genLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-    executor::BatchingType batchingType, bool const returnAllGeneratedTokens)
+    bool const returnAllGeneratedTokens, float atol, float rtol)
 {
     auto const numReturnBeams = beamTokens.size();
 
@@ -619,7 +628,7 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
         // 2. streaming: [maxOutputLen (or 1), beamWidth, vocabSizePadded]
         auto const& outputGenerationLogits = executor::detail::toITensor(genLogits.value());
 
-        if (streaming && batchingType != executor::BatchingType::kSTATIC)
+        if (streaming)
         {
             EXPECT_EQ(genLogits.value().getShape()[1], numReturnBeams);
             EXPECT_EQ(beamWidth, 1); // Only support streaming && beamWidth == 1
@@ -632,7 +641,7 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
             SizeType32 numGeneratedToken = genLogits.value().getShape()[0];
             if (returnAllGeneratedTokens)
             {
-                EXPECT_EQ((numGeneratedToken + 1) * numGeneratedToken / 2, numPredTokens);
+                EXPECT_EQ(numGeneratedToken, numPredTokens);
             }
             else
             {
@@ -645,7 +654,7 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
                     numGeneratedToken)); // [numGeneratedToken, vocabSizePadded]
 
             cudaDeviceSynchronize();     // Make sure the logits copy is complete.
-            EXPECT_TRUE(compareLogits(*expectedGenerationLogitsSlice, *outputGenerationLogits));
+            EXPECT_TRUE(compareLogits(*expectedGenerationLogitsSlice, *outputGenerationLogits, atol, rtol));
         }
         else
         {
@@ -653,10 +662,10 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
             EXPECT_EQ(genLogits.value().getShape()[0], numReturnBeams);
             EXPECT_EQ(genLogits.value().getShape()[1], maxOutputLen);
 
-            if (isFinal && batchingType != executor::BatchingType::kSTATIC && beamWidth == 1)
+            if (isFinal && beamWidth == 1)
             {
                 cudaDeviceSynchronize(); // Make sure the logits copy is complete.
-                EXPECT_TRUE(compareLogits(*expectedGenerationLogits, *outputGenerationLogits));
+                EXPECT_TRUE(compareLogits(*expectedGenerationLogits, *outputGenerationLogits, atol, rtol));
             }
         }
         EXPECT_EQ(genLogits.value().getShape()[2], vocabSizePadded);

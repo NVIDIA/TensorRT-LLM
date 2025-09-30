@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
+#include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <cuda_fp16.h>
@@ -104,45 +105,6 @@ float e2M1ToFloat(uint8_t value)
     return result;
 }
 
-// colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
-int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensorrt_llm::FP4QuantizationSFLayout layout)
-{
-    constexpr int kColumnGroup0Size = 4;
-    constexpr int kRowGroup0Size = 32;
-    constexpr int kRowGroup1Size = kRowGroup0Size * 4;
-
-    // Swizzled layout is used as default layout.
-    if (layout == tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)
-    {
-        // int paddedRow = PadUpFn(totalRow, 128);
-        int paddedColumn = PadUpFn(totalColumn, 4);
-
-        int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
-        int columnGroupIdx = colIdx / kColumnGroup0Size;
-        constexpr int columnGroupStride = kColumnGroup0Size * kRowGroup1Size;
-
-        int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
-        int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
-        int rowGroupIdx = rowIdx / kRowGroup1Size;
-        constexpr int rowGroup1Stride = kColumnGroup0Size;
-        constexpr int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;
-        int rowGroupStride = kRowGroup1Size * paddedColumn;
-
-        return columnIdxInGroup0 + columnGroupIdx * columnGroupStride + rowIdxInGroup0 * rowGroup0Stride
-            + rowIdxInGroup1 * rowGroup1Stride + rowGroupIdx * rowGroupStride;
-    }
-    // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
-    else if (layout == tensorrt_llm::FP4QuantizationSFLayout::LINEAR)
-    {
-        // no padding needed. totalColumn is multiple of kVecSize.
-        return rowIdx * totalColumn + colIdx;
-    }
-    else
-    {
-        TLLM_THROW("Other layout not implemented yet.");
-    }
-}
-
 torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
     th::Tensor floatTensor, int64_t sfVecSize, int64_t sfType, torch::optional<bool> isSfSwizzledLayout)
 {
@@ -152,7 +114,7 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
     TORCH_CHECK(inputShape[1] % sfVecSize == 0);
     th::Tensor valueE2M1 = th::zeros({inputShape[0], inputShape[1] / 2}, th::dtype(FLOAT4_E2M1X2).requires_grad(false));
     th::Tensor scaleFP8SF
-        = th::zeros({tensorrt_llm::computeFP4SwizzledLayoutSFSize(inputShape[0], inputShape[1] / sfVecSize)},
+        = th::zeros({tensorrt_llm::computeSwizzledLayoutSFSize(inputShape[0], inputShape[1] / sfVecSize)},
             th::dtype(SF_DTYPE).requires_grad(false));
     th::Tensor repFloat = th::zeros(inputShape, th::dtype(th::kFloat32).requires_grad(false));
 
@@ -161,9 +123,9 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
     // Note: if isSfSwizzledLayout is provided, use its value; otherwise default to true.
-    tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout.value_or(true)
-        ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-        : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    tensorrt_llm::QuantizationSFLayout layout = isSfSwizzledLayout.value_or(true)
+        ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+        : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
     for (size_t vIdx = 0; vIdx < static_cast<size_t>(inputShape[0]); ++vIdx)
     {
@@ -246,7 +208,7 @@ torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
     auto rows = has_experts ? inputShape[1] : inputShape[0];
     auto cols = has_experts ? inputShape[2] : inputShape[1];
 
-    auto const expert_sf_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols / sfVecSize);
+    auto const expert_sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(rows, cols / sfVecSize);
 
     TORCH_CHECK(cols % sfVecSize == 0);
     std::array<int64_t, 3> shape{num_experts, rows, cols / 2};
@@ -262,18 +224,20 @@ torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
         size_t const expert_sf_offset = expert_sf_size * eIdx;
         constexpr int FP4_PER_INT64 = 16;
         constexpr int FP8_PER_INT32 = 4;
-        tensorrt_llm::kernels::invokeFP4Quantization(rows, cols,
+        tensorrt_llm::kernels::invokeFP4Quantization(1, rows, cols,
             reinterpret_cast<half*>(halfTensor.data_ptr()) + expert_elem_offset, globalScale.data_ptr<float>() + eIdx,
             reinterpret_cast<int64_t*>(valueE2M1.data_ptr()) + expert_elem_offset / FP4_PER_INT64,
             reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()) + expert_sf_offset / FP8_PER_INT32, sfType == 0,
-            tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, 0);
+            tensorrt_llm::QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, 0);
     }
 
     return {valueE2M1, scaleFP8SF};
 }
 
-// Interleave the weights block scaling factor.
-th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
+// Interleave (and possibly pad) the weights block scaling factor.
+// blockScale: [num_experts, rows, cols] or [rows, cols]
+// Return: num_experts * pad_up(rows, 128) * pad_up(cols, 4)
+th::Tensor BlockScaleInterleave(th::Tensor const& blockScale)
 {
     bool is_cuda = blockScale.device().is_cuda();
     if (is_cuda)
@@ -290,32 +254,40 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
 
-    auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
-    th::Tensor interleavedBlockScale = th::zeros(
+    auto expert_out_size = tensorrt_llm::computeSwizzledLayoutSFSize(rows, cols);
+    auto rows_padded = PadUpFn(rows, 128);
+    auto cols_padded = PadUpFn(cols, 4);
+    TORCH_CHECK(
+        expert_out_size == rows_padded * cols_padded, "expert_out_size should be equal to rows_padded * cols_padded.");
+    th::Tensor interleavedBlockScale = th::empty(
         {expert_out_size * num_experts}, th::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
 
     if (is_cuda)
     {
         const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
         auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
-        tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(num_experts, rows, cols, blockScale.data_ptr<uint8_t>(),
-            static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
+        tensorrt_llm::kernels::invokeBlockScaleInterleave(num_experts, rows, rows_padded, cols, cols_padded,
+            blockScale.data_ptr<uint8_t>(), static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
     }
     else
     {
-        for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
+        for (int eIdx = 0; eIdx < static_cast<int>(num_experts); eIdx++)
         {
             uint8_t* interleavedBlockScalePtr
                 = static_cast<uint8_t*>(interleavedBlockScale.data_ptr()) + eIdx * expert_out_size;
-            for (size_t rIdx = 0; rIdx < static_cast<size_t>(rows); ++rIdx)
+            for (int rIdx = 0; rIdx < static_cast<int>(rows_padded); ++rIdx)
             {
                 auto globalRowIdx = eIdx * rows + rIdx;
                 uint8_t* blockScalePtr = blockScale.data_ptr<uint8_t>() + globalRowIdx * cols;
-                for (int cIdx = 0; cIdx < cols; ++cIdx)
+                for (int cIdx = 0; cIdx < static_cast<int>(cols_padded); ++cIdx)
                 {
-                    int sf_index
-                        = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
-                    interleavedBlockScalePtr[sf_index] = blockScalePtr[cIdx];
+                    uint8_t sf_ori = 0;
+                    if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols))
+                    {
+                        sf_ori = blockScalePtr[cIdx];
+                    }
+                    int sf_index = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::QuantizationSFLayout::SWIZZLED);
+                    interleavedBlockScalePtr[sf_index] = sf_ori;
                 }
             }
         }
@@ -324,41 +296,67 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     return interleavedBlockScale;
 }
 
-// Reverse nterleave the weights block scaling factor.
-th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor blockScale)
+// Reverse interleave the weights block scaling factor.
+// blockScale: [num_experts, rows, cols] or [rows, cols]
+// Note: rows and cols are the dimensions of the original unswizzled SFMatrix, so reshape input before passing into
+// this function! Return: The same shape as blockScale
+th::Tensor BlockScaleInterleaveReverse(th::Tensor const& blockScale)
 {
-    CHECK_CPU_INPUT(blockScale, SF_DTYPE);
+    bool is_cuda = blockScale.device().is_cuda();
+    if (is_cuda)
+    {
+        CHECK_INPUT(blockScale, SF_DTYPE);
+    }
+    else
+    {
+        CHECK_CPU_INPUT(blockScale, SF_DTYPE);
+    }
     auto blockScaleShape = blockScale.sizes();
     TORCH_CHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3, "Block Scale should be 2D or 3D tensor.");
     auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
     auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
-    auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
+    TORCH_CHECK(rows % 128 == 0, "rows of Interleaved block scales should be multiple of 128.");
+    TORCH_CHECK(cols % 4 == 0, "cols of Interleaved block scales should be multiple of 4.");
+    auto expert_out_size = rows * cols;
+    th::Tensor reversedBlockScale
+        = th::empty(blockScaleShape, th::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
 
-    th::Tensor reversedBlockScale = th::zeros(blockScaleShape, th::dtype(SF_DTYPE).requires_grad(false));
-    std::map<int, std::array<int, 3>> identity;
-    for (int eIdx = 0; eIdx < num_experts; eIdx++)
+    if (is_cuda)
     {
-        for (int rIdx = 0; rIdx < rows; ++rIdx)
+        const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
+        auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
+        tensorrt_llm::kernels::invokeBlockScaleInterleaveReverse(num_experts, rows, cols,
+            blockScale.data_ptr<uint8_t>(), static_cast<uint8_t*>(reversedBlockScale.data_ptr()), smCount, stream);
+    }
+    else
+    {
+        // index in the swizzled SFMatrix -> (eIdx, rIdx, cIdx) in the unswizzled SFMatrix
+        std::map<int, std::array<int, 3>> identity;
+        for (int eIdx = 0; eIdx < num_experts; eIdx++)
         {
-            for (int cIdx = 0; cIdx < cols; ++cIdx)
+            for (int rIdx = 0; rIdx < rows; ++rIdx)
             {
-                int sf_index = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
-                identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
+                for (int cIdx = 0; cIdx < cols; ++cIdx)
+                {
+                    int sf_index = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::QuantizationSFLayout::SWIZZLED);
+                    identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
+                }
+            }
+        }
+        uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale.data_ptr());
+        for (int i = 0; i < expert_out_size * num_experts; i++)
+        {
+            auto loc_2d = identity[i];
+            if (loc_2d[1] < rows && loc_2d[2] < cols)
+            {
+                uint8_t* reversedBlockScalePtr
+                    = reversedBlockScale.data_ptr<uint8_t>() + (loc_2d[0] * rows + loc_2d[1]) * cols + loc_2d[2];
+                *reversedBlockScalePtr = blockScalePtr[i];
             }
         }
     }
-    uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale.data_ptr());
-    for (int i = 0; i < expert_out_size * num_experts; i++)
-    {
-        auto loc_2d = identity[i];
-        if (loc_2d[1] < rows && loc_2d[2] < cols)
-        {
-            uint8_t* reversedBlockScalePtr
-                = reversedBlockScale.data_ptr<uint8_t>() + (loc_2d[0] * rows + loc_2d[1]) * cols + loc_2d[2];
-            *reversedBlockScalePtr = blockScalePtr[i];
-        }
-    }
+
     return reversedBlockScale;
 }
 
@@ -385,7 +383,7 @@ th::Tensor E2M1AndUFP8SFScaleToFloat(th::Tensor valueE2M1, th::Tensor scaleFP8SF
             uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
             uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
             uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(
-                vIdx, group, packedShape[0], groupsPerHiddenDim, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)];
+                vIdx, group, packedShape[0], groupsPerHiddenDim, tensorrt_llm::QuantizationSFLayout::SWIZZLED)];
             int scale = fp8Scale;
             if (sfType == 0)
             {
@@ -414,8 +412,8 @@ th::Tensor E2M1AndUFP8SFScaleToFloat(th::Tensor valueE2M1, th::Tensor scaleFP8SF
 }
 
 // Used by the (fp16 -> int4) quant layer + int4 gemm network.
-th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8SF, th::Tensor globalScale,
-    int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
+th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8SF,
+    std::optional<th::Tensor> globalScale, int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
 {
     CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
     CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
@@ -426,15 +424,20 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8
     th::Tensor floatTensor
         = th::zeros({packedShape[0], packedShape[1] * 2}, th::dtype(th::kFloat32).requires_grad(false));
 
-    CHECK_CPU_INPUT(globalScale, th::kFloat32);
-    float globalScaleVal = globalScale.data_ptr<float>()[0];
+    float globalScaleVal{1.0f};
+    if (sfType == 1)
+    {
+        TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfType is 1.");
+        CHECK_CPU_INPUT(globalScale.value(), th::kFloat32);
+        globalScaleVal = globalScale->data_ptr<float>()[0];
+    }
 
     int hiddenDim = packedShape[1] * 2;
     int packedFp4HiddenDim = hiddenDim / 2;
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-    tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-                                                                      : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    tensorrt_llm::QuantizationSFLayout layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                                                   : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
     for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
     {
@@ -485,8 +488,20 @@ static auto e2m1_and_ufp8sf_scale_to_float
 static auto e2m1_and_ufp8sf_scale_to_float_v2 = torch::RegisterOperators(
     "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float_v2", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
 
-static auto nvfp4_block_scale_interleave
-    = torch::RegisterOperators("tensorrt_llm::nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("block_scale_interleave(Tensor input) -> Tensor");
+    m.def("block_scale_interleave_reverse(Tensor input) -> Tensor");
+}
 
-static auto nvfp4_block_scale_interleave_reverse = torch::RegisterOperators(
-    "tensorrt_llm::nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("block_scale_interleave", &torch_ext::BlockScaleInterleave);
+    m.impl("block_scale_interleave_reverse", &torch_ext::BlockScaleInterleaveReverse);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CPU, m)
+{
+    m.impl("block_scale_interleave", &torch_ext::BlockScaleInterleave);
+    m.impl("block_scale_interleave_reverse", &torch_ext::BlockScaleInterleaveReverse);
+}

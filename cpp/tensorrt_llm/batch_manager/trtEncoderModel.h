@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "trtGptModel.h"
@@ -47,11 +46,14 @@ public:
 
     TrtEncoderModel(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger,
-        TrtGptModelOptionalParams const& optionalParams);
+        executor::ExecutorConfig const& executorConfig);
 
     ~TrtEncoderModel() override;
 
     void terminateRequest(std::shared_ptr<LlmRequest> const& llmRequest, bool pause = false) override;
+    void terminateRequestSync(
+        std::shared_ptr<LlmRequest> const& llmRequest, executor::FinishReason finishReason) override;
+
     void forward(RequestVector& activeRequests);
 
     void forwardSync() override;
@@ -176,7 +178,7 @@ private:
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
 
-    SizeType32 mMicroBatchId;
+    SizeType32 mMicroBatchId{0};
 
     // TODO: Add runtime buffers for async PP
     std::vector<std::shared_ptr<EncoderBuffers>> mBuffers;

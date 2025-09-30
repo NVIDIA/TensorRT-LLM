@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
@@ -129,11 +130,11 @@ MaxRequestsScheduler::MaxRequestsScheduler(
 {
 }
 
-MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool manyMicroBatches,
+MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
     LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
-    , mManyMicroBatches{manyMicroBatches}
+    , mTwoStepsLookAhead{twoStepsLookAhead}
 {
 }
 
@@ -346,7 +347,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 
     // Keep track of number of requests and block needed for the scheduled requests
     auto scheduledBlocksManager
-        = kv_cache_manager::MaxUtilizationScheduledBlocksManager(kvCacheManager, mManyMicroBatches);
+        = kv_cache_manager::MaxUtilizationScheduledBlocksManager(kvCacheManager, mTwoStepsLookAhead);
     SizeType32 numScheduledPeftPages{0};
     std::unordered_set<uint64_t> seenTaskIds;
 
@@ -456,8 +457,8 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
 }
 
 CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
-    executor::CapacitySchedulerPolicy capacitySchedulerPolicy, bool hasKvCacheManager,
-    std::optional<bool> manyMicroBatches, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+    executor::CapacitySchedulerPolicy capacitySchedulerPolicy, bool hasKvCacheManager, bool twoStepsLookAhead,
+    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
 {
     if (!hasKvCacheManager)
     {
@@ -465,8 +466,8 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kMAX_UTILIZATION)
     {
-        mScheduler = MaxUtilizationScheduler{
-            maxNumRequests, manyMicroBatches ? *manyMicroBatches : false, noScheduleUntilState, noScheduleAfterState};
+        mScheduler
+            = MaxUtilizationScheduler{maxNumRequests, twoStepsLookAhead, noScheduleUntilState, noScheduleAfterState};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
     {

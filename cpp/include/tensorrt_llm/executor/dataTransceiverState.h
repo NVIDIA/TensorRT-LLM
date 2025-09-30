@@ -48,42 +48,51 @@ public:
         kMLA = 1,
     };
 
-    CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType,
-        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2)
+    CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false)
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
-              worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(), worldConfig.getTensorParallelism()}
+              worldConfig.getContextParallelism(), worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(),
+              worldConfig.getTensorParallelism(), attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
     }
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false)
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
+              attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false)
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
+              attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
     }
 
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
     {
         return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
-            && mDataType == other.mDataType;
+            && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType;
     }
 
     struct ModelConfig
@@ -103,15 +112,20 @@ public:
     {
         SizeType32 mTensorParallelism;
         SizeType32 mPipelineParallelism;
+        SizeType32 mContextParallelism;
         bool mEnableAttentionDP;
         SizeType32 mDPrank;
         SizeType32 mDPsize;
+        // number of attention layers per pipeline parallelism rank, the size of the vector is equal to the pipeline
+        // parallelism size.
+        std::vector<SizeType32> mAttentionLayerNumPerPP;
 
         [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept
         {
             return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
-                && mEnableAttentionDP == other.mEnableAttentionDP && mDPrank == other.mDPrank
-                && mDPsize == other.mDPsize;
+                && mContextParallelism == other.mContextParallelism && mEnableAttentionDP == other.mEnableAttentionDP
+                && mDPrank == other.mDPrank && mDPsize == other.mDPsize
+                && mAttentionLayerNumPerPP == other.mAttentionLayerNumPerPP;
         }
     };
 
@@ -123,6 +137,11 @@ public:
             , mKvFactor(kvFactor)
 
         {
+        }
+
+        [[nodiscard]] bool operator==(AttentionConfig const& other) const noexcept
+        {
+            return mAttentionType == other.mAttentionType && mKvFactor == other.mKvFactor;
         }
 
         // attentionType ;
@@ -150,6 +169,11 @@ public:
         return mDataType;
     }
 
+    [[nodiscard]] bool getEnableBlockReuse() const
+    {
+        return mEnableBlockReuse;
+    }
+
     [[nodiscard]] std::string toString() const
     {
         std::stringstream sstring;
@@ -162,12 +186,14 @@ public:
         sstring << "mTokensPerBlock:" << mModelConfig.mTokensPerBlock << "\n";
         sstring << "tp:" << mParallelConfig.mTensorParallelism << "\n";
         sstring << "pp:" << mParallelConfig.mPipelineParallelism << "\n";
+        sstring << "cp:" << mParallelConfig.mContextParallelism << "\n";
         sstring << "enableAttentionDP:" << mParallelConfig.mEnableAttentionDP << "\n";
         sstring << "datatype:" << static_cast<int32_t>(mDataType) << "\n";
         sstring << "attentionType:" << static_cast<int32_t>(mAttentionConfig.mAttentionType) << "\n";
         sstring << "kvFactor:" << mAttentionConfig.mKvFactor << "\n";
         sstring << "dpRank:" << mParallelConfig.mDPrank << "\n";
         sstring << "dpSize:" << mParallelConfig.mDPsize << "\n";
+        sstring << "enableBlockReuse:" << mEnableBlockReuse << "\n";
         return sstring.str();
     }
 
@@ -177,6 +203,7 @@ private:
     ParallelConfig mParallelConfig;
     nvinfer1::DataType mDataType;
     AttentionConfig mAttentionConfig;
+    bool mEnableBlockReuse{false};
 };
 
 struct MpiState
@@ -217,6 +244,30 @@ struct SocketState
     std::string mIp;
 };
 
+struct AgentState
+{
+    AgentState(std::string agentName, std::string connectionInfo)
+        : mAgentName(std::move(agentName))
+        , mConnectionInfo(std::move(connectionInfo))
+    {
+    }
+
+    AgentState() = default;
+
+    [[nodiscard]] bool operator==(AgentState const& other) const noexcept
+    {
+        return mAgentName == other.mAgentName && mConnectionInfo == other.mConnectionInfo;
+    }
+
+    [[nodiscard]] std::string toString() const
+    {
+        return mAgentName;
+    }
+
+    std::string mAgentName;
+    std::string mConnectionInfo;
+};
+
 class CommState final
 {
 public:
@@ -240,6 +291,12 @@ public:
     {
     }
 
+    explicit CommState(std::vector<AgentState> agentState, int selfIdx = -1)
+        : mState{std::move(agentState)}
+        , mSelfIdx{selfIdx}
+    {
+    }
+
     [[nodiscard]] bool isMpiState() const noexcept
     {
         return std::holds_alternative<MpiState>(mState);
@@ -248,6 +305,11 @@ public:
     [[nodiscard]] bool isSocketState() const noexcept
     {
         return std::holds_alternative<std::vector<SocketState>>(mState);
+    }
+
+    [[nodiscard]] bool isAgentState() const noexcept
+    {
+        return std::holds_alternative<std::vector<AgentState>>(mState);
     }
 
     [[nodiscard]] MpiState const& getMpiState() const
@@ -260,6 +322,12 @@ public:
     {
         TLLM_CHECK(isSocketState());
         return std::get<std::vector<SocketState>>(mState);
+    }
+
+    [[nodiscard]] std::vector<AgentState> const& getAgentState() const
+    {
+        TLLM_CHECK(isAgentState());
+        return std::get<std::vector<AgentState>>(mState);
     }
 
     [[nodiscard]] int getSelfIdx() const noexcept
@@ -289,12 +357,24 @@ public:
             sstring << "]";
             return sstring.str();
         }
+        if (isAgentState())
+        {
+            std::stringstream sstring;
+            sstring << "AGENT:[";
+            for (auto&& agent : getAgentState())
+            {
+                sstring << agent.toString() << ",";
+            }
+            sstring << "]";
+            return sstring.str();
+        }
+
         return "";
     }
 
 private:
     friend class tensorrt_llm::executor::Serialization;
-    std::variant<std::monostate, MpiState, std::vector<SocketState>> mState;
+    std::variant<std::monostate, MpiState, std::vector<SocketState>, std::vector<AgentState>> mState;
     int mSelfIdx{-1};
 };
 

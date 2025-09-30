@@ -20,8 +20,8 @@ import tensorrt as trt
 import torch
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, get_sm_version, int32_array, is_same_dtype,
-                      set_obj_attrs, trt_dtype_to_np, trt_dtype_to_str)
+from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
+                      trt_dtype_to_np, trt_dtype_to_str)
 
 # isort: off
 from ..functional import (
@@ -631,7 +631,7 @@ class Attention(Module):
                 embed_positions, long_rope_embed_positions, \
                 (rotary_inv_freq, embed_positions_for_gpt_attention), \
                 (long_rope_rotary_inv_freq, long_rope_embed_positions_for_gpt_attention), mscale \
-                    = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
+                    = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin(
                     max_position_embeddings,
                     original_max_position_embeddings, rotary_embedding_dim,
                     rotary_embedding_base, rope_scaling_short_factors,
@@ -672,6 +672,34 @@ class Attention(Module):
                               is_buffer=True))
                 model_cls.short_mscale = short_mscale
                 model_cls.long_mscale = long_mscale
+        elif rotary_embedding_scale_type == RotaryScalingType.yarn:
+            beta_fast = rotary_embedding_scaling.get("beta_fast", 32.0)
+            beta_slow = rotary_embedding_scaling.get("beta_slow", 1.0)
+            mscale = rotary_embedding_scaling.get("mscale", 1.0)
+            mscale_all_dim = rotary_embedding_scaling.get("mscale_all_dim", 0.0)
+            original_max_position_embeddings = rotary_embedding_scaling.get(
+                "original_max_position_embeddings", 4096)
+            rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                max_position_embeddings, rotary_embedding_dim,
+                rotary_embedding_base, rotary_embedding_scale,
+                original_max_position_embeddings, beta_fast, beta_slow, mscale,
+                mscale_all_dim, False)
+
+            embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
+                max_position_embeddings,
+                rotary_embedding_dim,
+            )
+            model_cls.register_parameter(
+                'embed_positions',
+                Parameter(embed_positions, dtype='float32', is_buffer=True))
+            model_cls.register_parameter(
+                'rotary_inv_freq',
+                Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
+            model_cls.register_parameter(
+                'embed_positions_for_gpt_attention',
+                Parameter(embed_positions_for_gpt_attention,
+                          dtype='float32',
+                          is_buffer=True))
         else:
 
             def register_rope_params(rotary_base, names_to_register):
@@ -947,7 +975,7 @@ class Attention(Module):
                 if hasattr(self, 'kv'):
                     # We optimize the graph by adding kv in the cross attention layer, preventing computing the
                     # query of encoder_output.
-                    assert qkv_lora_params == None, "Not support LoRA when we only compute key/value in cross atteniton"
+                    assert qkv_lora_params is None, "Not support LoRA when we only compute key/value in cross atteniton"
                     # see optimization_model's optimize_cross_qkv
                     cross_kv = self.kv(encoder_output, qkv_lora_params)
                     base_shape = shape(
@@ -1608,6 +1636,7 @@ class BertAttention(Module):
                  tp_rank=0,
                  cp_group=None,
                  cp_size=1,
+                 cp_rank=0,
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
@@ -1628,6 +1657,7 @@ class BertAttention(Module):
         self.tp_rank = tp_rank
         self.cp_group = cp_group
         self.cp_size = cp_size
+        self.cp_rank = cp_rank
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -1725,9 +1755,6 @@ class BertAttention(Module):
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
             assert input_lengths is not None
-            assert self.cp_size == 1
-            assert get_sm_version() < 100 or get_sm_version() >= 120, \
-                "bert_attention_plugin does not support SM100"
             context = bert_attention(
                 qkv,
                 input_lengths,
@@ -1738,7 +1765,10 @@ class BertAttention(Module):
                 max_distance=self.max_distance,
                 relative_attention_bias=self.rel_attn_table.value
                 if self.relative_attention else None,
-                max_input_length=max_input_length)
+                max_input_length=max_input_length,
+                cp_group=self.cp_group,
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank)
         else:
             # plain TRT mode
             def transpose_for_scores(x):
@@ -2048,7 +2078,7 @@ class DeepseekV2Attention(Attention):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.q_scaling = 1.0 / (mscale * mscale)
 
-        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+        _, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
             self.max_position_embeddings, self.qk_rope_head_dim,
             self.rotary_embedding_base, self.rotary_scaling["factor"],
             rotary_embedding_origin_max_position, rotary_embedding_beta_fast,

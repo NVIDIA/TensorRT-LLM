@@ -37,7 +37,6 @@ function(add_benchmark test_name test_src)
   add_dependencies(benchmarks ${test_name})
 endfunction()
 
-add_benchmark(gptSessionBenchmark gptSessionBenchmark.cpp)
 add_benchmark(bertBenchmark bertBenchmark.cpp)
 add_benchmark(gptManagerBenchmark gptManagerBenchmark.cpp)
 add_benchmark(disaggServerBenchmark disaggServerBenchmark.cpp)

@@ -28,7 +28,8 @@
 
 #include <cstdio>
 
-#define CHECK_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
+#define CHECK_TYPE(x, st)                                                                                              \
+    TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
 #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CPU(x) TORCH_CHECK(!x.is_cuda(), #x " must be a CPU tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -61,6 +62,7 @@ constexpr auto FLOAT4_E2M1X2 = torch::ScalarType::Byte; // uint8_t
 constexpr auto SF_DTYPE = torch::ScalarType::Byte;      // uint8_t
 
 constexpr auto FP8_BLOCK_SCALING_SF_DTYPE = torch::ScalarType::Float;
+constexpr auto FP8_ROWWISE_SF_DTYPE = torch::ScalarType::Float;
 
 template <typename T>
 inline T* get_ptr(torch::Tensor& t)
@@ -89,4 +91,5 @@ int nextPowerOfTwo(int v);
 std::optional<float> getFloatEnv(char const* name);
 
 cudaDataType_t convert_torch_dtype(torch::ScalarType dtype);
+
 } // namespace torch_ext

@@ -41,6 +41,9 @@ public:
     // Check if fmha is supported with additional info.
     std::pair<bool, std::string> isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const;
 
+    // Get the total device memory.
+    size_t getTotalDeviceMemory() const;
+
     // Run the fmha kernel.
     void run(TllmGenFmhaRunnerParams const&);
 
@@ -49,6 +52,8 @@ private:
     Data_type mDtypeQ, mDtypeKv, mDtypeOut;
     // The SM version.
     int mSM;
+    // The total device memory.
+    size_t mTotalDeviceMemory;
     // The class that stores all the kernels.
     TllmGenFmhaKernel const* mKernel;
 };

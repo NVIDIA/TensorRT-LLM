@@ -47,7 +47,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     }
     else if (mDecodingMode.isBeamSearch())
     {
-        mDecodingLayer = std::make_unique<BeamSearchLayer<T>>(decoderDomain, mBufferManager);
+        mDecodingLayer = std::make_unique<BeamSearchLayer<T>>(mDecodingMode, decoderDomain, mBufferManager);
     }
     else if (mDecodingMode.isMedusa())
     {

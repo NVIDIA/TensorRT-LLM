@@ -55,13 +55,13 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         if use_plugin:
             network.plugin_config.weight_only_quant_matmul_plugin = dtype
         with tensorrt_llm.net_guard(network):
-            # Init TensorRT-LLM tensor for mat1
+            # Init TensorRT LLM tensor for mat1
             x = Tensor(name='x',
                        shape=mat1.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
-            # Init TensorRT-LLM tensor for weight
+            # Init TensorRT LLM tensor for weight
             weights = constant(torch_to_numpy(processed_torch_weights))
-            # Init TensorRT-LLM tensor for per channel scaling
+            # Init TensorRT LLM tensor for per channel scaling
             scale = constant(torch_to_numpy(torch_weight_scales))
             # Get output tensor for WOQ Matmul
             output = weight_only_quant_matmul(x,
@@ -87,7 +87,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
 
     def _woq_matmul(self, m, n, k, dtype, wTypeId, use_plugin=True):
         # Init operands for multiplication in int32
-        mat1 = _utils.woq_gen_weights(m, k, dtype) * 200.0
+        mat1 = _utils.woq_gen_weights(m, k, dtype)
         weight = _utils.woq_gen_weights(k, n, dtype)
 
         ref_torch_weights, processed_torch_weights, torch_weight_scales = _utils.woq_conversion(

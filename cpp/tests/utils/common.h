@@ -45,7 +45,7 @@ auto const TEST_RESOURCE_PATH = fs::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 
 auto const ENGINE_PATH = TEST_RESOURCE_PATH / "models/rt_engine";
 auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
-auto const LLAMA_MODEL_PATH = ENGINE_PATH / "llama-7b-hf";
+auto const LLAMA_MODEL_PATH = ENGINE_PATH / "Llama-3.2-1B";
 auto const MEDUSA_MODEL_PATH = ENGINE_PATH / "vicuna-7b-medusa";
 auto const CHATGLM_MODEL_PATH = ENGINE_PATH / "chatglm-6b";
 auto const CHATGLM2_MODEL_PATH = ENGINE_PATH / "chatglm2-6b";
@@ -56,7 +56,7 @@ auto const ENC_DEC_ENGINE_BASE = TEST_RESOURCE_PATH / "models/enc_dec/trt_engine
 auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 auto const GPT_DATA_PATH = DATA_PATH / "gpt2";
 auto const GPT_XGRAMMAR_TOKENIZER_INFO_PATH = GPT_DATA_PATH / "xgrammar_tokenizer_info.json";
-auto const LLAMA_DATA_PATH = DATA_PATH / "llama-7b-hf";
+auto const LLAMA_DATA_PATH = DATA_PATH / "Llama-3.2-1B";
 auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = LLAMA_DATA_PATH / "xgrammar_tokenizer_info.json";
 auto const MEDUSA_DATA_PATH = DATA_PATH / "vicuna-7b-medusa";
 auto const CHATGLM_DATA_PATH = DATA_PATH / "chatglm-6b";
@@ -101,6 +101,10 @@ public:
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP4_FILE();
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP2_FILE();
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CONTEXT_LOGITS_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CUM_LOG_PROBS_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_LOG_PROBS_TP4_PP1_FILE();
     // GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime for better
     // accuracy
     static std::string FP16_PLUGIN_PACKED_PAGED_GATHER_CONTEXTFMHAFP32ACC_RESULT_FILE();
@@ -187,9 +191,8 @@ public:
         tr::BufferManager& manager, executor::OutputConfig const& outConfig, ModelIds const& modelIds);
 
     void verifyOutput(std::unordered_map<SizeType32, std::vector<executor::BeamTokens>> const& resultTokens,
-        std::vector<SizeType32> const& givenInputLengths, SizeType32 nbGivenInputs, bool streaming,
-        bool excludeInputFromOutput, FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding,
-        bool returnAllGeneratedTokens, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
+        std::vector<SizeType32> const& givenInputLengths, bool streaming, bool excludeInputFromOutput,
+        FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
         bool isNonGreedySampling);
 
     void verifyLogProbs(bool computeLogProbs, bool streaming, bool excludeInputFromOutput, SizeType32 inputLength,
@@ -200,12 +203,12 @@ public:
 
     void validateContextLogits(bool getContextLogits, SizeType32 inputLength, SizeType32 beamWidth,
         std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-        executor::BatchingType batchingType);
+        float atol = 1e-2, float rtol = 1e-3);
 
     void validateGenerationLogits(bool getGenLogits, bool isFinal, bool streaming, bool excludeInputFromOutput,
         SizeType32 inputLength, SizeType32 maxOutputLen, SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
         std::optional<executor::Tensor> const& genLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
-        executor::BatchingType batchingType, bool returnAllGeneratedTokens);
+        bool returnAllGeneratedTokens, float atol = 1e-2, float rtol = 1e-3);
 
     SizeType32 nbGivenInputs{};
     SizeType32 beamWidth{};

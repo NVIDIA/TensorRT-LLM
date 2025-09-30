@@ -40,15 +40,14 @@ namespace
 class AllgatherOp
 {
 public:
-    AllgatherOp(std::set<int> group, nvinfer1::DataType type)
+    AllgatherOp(std::set<int> group)
         : mGroup(std::move(group))
-        , mType(type)
     {
     }
 
     ~AllgatherOp() = default;
 
-    int initialize() noexcept
+    int initialize()
     {
         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mNcclComm = getComm(mGroup);
@@ -56,22 +55,63 @@ public:
         return 0;
     }
 
-    torch::Tensor run(torch::Tensor input) noexcept
+    std::vector<torch::Tensor> run_list(torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes)
     {
-        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        std::vector<int64_t> outputShape = input.sizes().vec();
-        outputShape.insert(outputShape.begin(), mGroup.size());
-        auto output = torch::empty(outputShape, input.options());
-        size_t size = input.numel();
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
-        NCCLCHECK(ncclAllGather(
-            input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType], *mNcclComm, stream));
-        return output;
+        bool use_nccl_allgather = !sizes.has_value()
+            || std::all_of(sizes.value().begin(), sizes.value().end(),
+                [&sizes](int64_t size) { return size == sizes.value()[0]; });
+        int64_t sum_sizes
+            = sizes.has_value() ? std::accumulate(sizes.value().begin(), sizes.value().end(), 0, std::plus<>{}) : 0;
+        std::vector<torch::Tensor> output_list;
+        output_list.reserve(input_list.size());
+        ncclGroupStart();
+        for (auto const& input : input_list)
+        {
+            auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+            auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+            std::vector<int64_t> outputShape = input.sizes().vec();
+            if (sizes.has_value())
+            {
+                outputShape[0] = sum_sizes;
+            }
+            else
+            {
+                outputShape[0] *= mGroup.size();
+            }
+            auto output = torch::empty(outputShape, input.options());
+            if (use_nccl_allgather)
+            {
+                ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(), (*getDtypeMap())[type],
+                    *mNcclComm, stream);
+            }
+            else
+            {
+                size_t numel_base
+                    = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
+                int64_t split_offset = 0;
+                for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
+                {
+                    auto split_size = sizes.value()[root];
+                    ncclBroadcast(input.data_ptr(),
+                        output.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).mutable_data_ptr(),
+                        numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream);
+                    split_offset += split_size;
+                }
+            }
+            output_list.push_back(output);
+        }
+        NCCLCHECK_THROW(ncclGroupEnd());
+        return output_list;
+    }
+
+    torch::Tensor run(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes)
+    {
+        return run_list({input}, sizes)[0];
     }
 
 private:
     std::set<int> mGroup;
-    nvinfer1::DataType mType;
     std::shared_ptr<ncclComm_t> mNcclComm;
 };
 
@@ -79,21 +119,38 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-torch::Tensor allgather(torch::Tensor input, torch::List<int64_t> group_)
+torch::Tensor allgather(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
 {
 #if ENABLE_MULTI_DEVICE
-    auto const type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
     std::set<int> group;
     for (int64_t rank : group_)
     {
         group.insert(static_cast<int>(rank));
     }
-    AllgatherOp op(group, type);
+    AllgatherOp op(group);
     op.initialize();
-    auto output = op.run(input);
+    auto output = op.run(input, sizes);
     return output;
 #else
     return input;
+#endif // ENABLE_MULTI_DEVICE
+}
+
+std::vector<torch::Tensor> allgather_list(
+    torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
+{
+#if ENABLE_MULTI_DEVICE
+    std::set<int> group;
+    for (int64_t rank : group_)
+    {
+        group.insert(static_cast<int>(rank));
+    }
+    AllgatherOp op(group);
+    op.initialize();
+    auto output_list = op.run_list(input_list, sizes);
+    return output_list;
+#else
+    return input_list.vec();
 #endif // ENABLE_MULTI_DEVICE
 }
 
@@ -101,10 +158,12 @@ torch::Tensor allgather(torch::Tensor input, torch::List<int64_t> group_)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("allgather(Tensor input, int[] group) -> Tensor");
+    m.def("allgather(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
+    m.def("allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("allgather", &torch_ext::allgather);
+    m.impl("allgather_list", &torch_ext::allgather_list);
 }

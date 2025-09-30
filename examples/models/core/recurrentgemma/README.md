@@ -4,14 +4,14 @@ This document shows how to build and run a [RecurrentGemma](https://github.com/g
 
 ## Overview
 
-The TensorRT-LLM RecurrentGemma implementation can be found in [`tensorrt_llm/models/recurrentgemma/model.py`](../../../../tensorrt_llm/models/recurrentgemma/model.py). The TensorRT-LLM RecurrentGemma example code is located in [`examples/models/core/recurrentgemma`](./). There is one main file:
+The TensorRT LLM RecurrentGemma implementation can be found in [`tensorrt_llm/models/recurrentgemma/model.py`](../../../../tensorrt_llm/models/recurrentgemma/model.py). The TensorRT LLM RecurrentGemma example code is located in [`examples/models/core/recurrentgemma`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the JAX format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the JAX format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
 |    Checkpoint type    | FP16  | BF16  | FP8 | INT8 SQ | INT4 AWQ | TP  |
@@ -19,7 +19,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 |    Huggingface (HF)   |   Y   |   Y   |  Y  |    Y    |    Y     |  Y  |
 |    Jax                |   Y   |   Y   |  N  |    N    |    N     |  Y  |
 
-* TensorRT-LLM can support different post-training quantization for the Huggingface checkpoints, including FP8, INT8 SmoothQuant, and INT4 AWQ.
+* TensorRT LLM can support different post-training quantization for the Huggingface checkpoints, including FP8, INT8 SmoothQuant, and INT4 AWQ.
 
 ## Usage
 
@@ -48,8 +48,8 @@ git clone https://huggingface.co/google/recurrentgemma-2b-flax ./recurrentgemma_
 git clone https://huggingface.co/google/recurrentgemma-2b-it-flax ./recurrentgemma_model/recurrentgemma-2b-it-flax
 ```
 
-### 2. Convert weights from JAX to TensorRT-LLM format
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF/JAX weights to TensorRT-LLM checkpoints. TensorRT-LLM can support different post-training quantization methods. Here we use recurrentgemma-2b-it model as an example to show how to run quantized model.
+### 2. Convert weights from JAX to TensorRT LLM format
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF/JAX weights to TensorRT LLM checkpoints. TensorRT LLM can support different post-training quantization methods. Here we use recurrentgemma-2b-it model as an example to show how to run quantized model.
 
 ```bash
 # recurrentgemma-2b
@@ -109,7 +109,7 @@ python convert_checkpoint.py --model_dir ${CKPT_2B_IT_FLAX_PATH} \
 ```
 
 ### 3. Build TensorRT engine(s)
-After getting checkpoint, we can use `trtllm-build` command to build TensorRT-LLM engines from TensorRT-LLM checkpoints.
+After getting checkpoint, we can use `trtllm-build` command to build TensorRT LLM engines from TensorRT LLM checkpoints.
 
 ```bash
 # recurrentgemma-2b
@@ -171,7 +171,7 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_FLAX_PATH} \
 
 We provide three examples to run inference `run.py`, `summarize.py` and `mmlu.py`. `run.py` only run inference with `input_text` and show the output.
 
-`summarize.py` runs summarization on [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset and evaluate the model by [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
+`summarize.py` runs summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and evaluate the model by [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 
 `mmlu.py` runs MMLU to evaluate the model by accuracy.
 

@@ -9,7 +9,6 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
@@ -33,7 +32,7 @@ class RuntimeConfig(BaseModel):
     world_config: ExecutorWorldConfig
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", "autodeploy", None] = None
+    backend: Literal["pytorch", "_autodeploy", None] = None
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
 
@@ -59,8 +58,6 @@ class RuntimeConfig(BaseModel):
             self.world_config.cluster_size,
             "trust_remote_code":
             True,
-            "kv_cache_config":
-            self.settings_config.get_kvcache_config(),
             "enable_chunked_prefill":
             self.settings_config.chunking,
             "extended_runtime_perf_knob_config":
@@ -77,15 +74,35 @@ class RuntimeConfig(BaseModel):
 
         backend_config_map = {
             "pytorch": self.performance_options.get_pytorch_perf_config,
-            "autodeploy": self.performance_options.get_autodeploy_perf_config
+            "_autodeploy": self.performance_options.get_autodeploy_perf_config
         }
 
         if self.backend in backend_config_map:
-            llm_args["pytorch_backend_config"] = backend_config_map[
-                self.backend]()
+            llm_args.update(backend_config_map[self.backend]())
 
-        return update_llm_args_with_extra_options(llm_args,
-                                                  self.extra_llm_api_options)
+        kv_cache_config = self.settings_config.get_kvcache_config().__dict__
+        backend_cache_config = llm_args.pop("kv_cache_config", {})
+        llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
+
+        updated_llm_args = update_llm_args_with_extra_options(
+            llm_args, self.extra_llm_api_options)
+
+        if self.backend == "pytorch":
+            cuda_graph_config = updated_llm_args.pop(
+                "cuda_graph_config", llm_args["cuda_graph_config"])
+            if cuda_graph_config:
+                # Use runtime max_batch_size as cuda_graph_config.max_batch_size
+                # if both max_batch_size and batch_sizes are not set.
+                batch_sizes_set = cuda_graph_config.get("batch_sizes",
+                                                        None) is not None
+                max_batch_size_set = cuda_graph_config.get(
+                    "max_batch_size", None) is not None
+                if not batch_sizes_set and not max_batch_size_set:
+                    cuda_graph_config[
+                        "max_batch_size"] = self.settings_config.max_batch_size
+            updated_llm_args["cuda_graph_config"] = cuda_graph_config
+
+        return updated_llm_args
 
     @model_validator(mode="after")
     def validate_full_config(self) -> RuntimeConfig:
@@ -109,13 +126,12 @@ class PerformanceOptions:
         return config
 
     def get_pytorch_perf_config(self) -> PyTorchConfig:
-        return PyTorchConfig(**self.pytorch_config)
+        return self.pytorch_config
 
-    def get_autodeploy_perf_config(self) -> AutoDeployConfig:
-        ad_config = AutoDeployConfig(**self.pytorch_config)
-        ad_config.attn_backend = "FlashInfer"
-        ad_config.torch_compile_enabled = True
-        ad_config.skip_loading_weights = True
+    def get_autodeploy_perf_config(self) -> Dict:
+        AutoDeployPerfConfig = dict
+        ad_config = AutoDeployPerfConfig()
+        ad_config["attn_backend"] = "flashinfer"
         return ad_config
 
 

@@ -12,7 +12,7 @@ from typing import Any, List, Optional
 import filelock
 
 import tensorrt_llm
-from tensorrt_llm import BuildConfig
+from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi.utils import enable_llm_debug, print_colored
 from tensorrt_llm.logger import logger
 

@@ -16,15 +16,59 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::batch_manager
 {
 
-/// Note that there is some dependency on the order of operations in this method. Modify with care!
+template <typename TTensor, typename TStream>
+runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
+{
+    runtime::SizeType32 beamWidth = mSamplingConfig.beamWidth; // For non-Variable-Beam-Width-Search
+    auto const& beamWidthArray = mSamplingConfig.beamWidthArray;
+    if (beamWidthArray.has_value())
+    {
+        auto const iter = mDecodingIter + (forNextIteration ? 1 : 0);
+        // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
+        int const index
+            = std::max(std::min(iter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1, 0);
+        beamWidth = beamWidthArray.value()[0][index];
+    }
+    return beamWidth;
+}
+
+template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
+
 std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
 {
-    TLLM_CHECK(!isDisaggContextCompleteState());
+    auto requestId = isChild() ? mParentRequestId : mRequestId;
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        return executor::Response(requestId, result.value(), mClientId);
+    }
+    return std::nullopt;
+}
+
+void LlmRequest::createSerializedResult(
+    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
+{
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        std::ostringstream oStream;
+        executor::serialize_utils::serialize(result.value(), oStream);
+        auto str = oStream.str();
+        serializedResult.resize(str.size());
+        std::copy(str.begin(), str.end(), serializedResult.begin());
+        isFinal = result.value().isFinal;
+    }
+}
+
+/// Note that there is some dependency on the order of operations in this method. Modify with care!
+std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
+{
     if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
     {
         return std::nullopt;
@@ -155,6 +199,7 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 
     result.finishReasons = sliceBeams(mFinishReasons);
     result.decodingIter = mDecodingIter;
+    result.avgDecodedTokensPerIter = getAvgDecodedTokensPerIter();
 
     if (hasAdditionalOutputs())
     {
@@ -174,11 +219,22 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
+    return result;
+}
 
-    auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto response = executor::Response(requestId, std::move(result), mClientId);
+bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
+{
+    TLLM_CHECK_WITH_INFO(!isContextFinished(), "not supported after prefill");
 
-    return response;
+    if (mSamplingConfig.beamWidth == 0)
+    {
+        return true;
+    }
+
+    // Before generation, all beams contain the same tokens
+    auto const& tokens = getTokens(0);
+    return std::all_of(
+        tokens.begin(), tokens.end(), [&vocabSize](auto const& token) { return token >= 0 && token < vocabSize; });
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
@@ -307,6 +363,12 @@ void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
     // TODO for tp / pp models we only need to move the bit that belong on the local device
     TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
     mLoraWeights = gpuLoraWeights;
+}
+
+void LlmRequest::removeLoraTensors()
+{
+    mLoraWeights.reset();
+    mLoraConfig.reset();
 }
 
 } // namespace tensorrt_llm::batch_manager

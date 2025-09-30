@@ -74,28 +74,35 @@ constexpr inline T roundUp(T a, T b)
 
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams, bool for_configure_plugin)
 {
-    if (xqaParams.multi_query_tokens)
-    {
-        auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
-        // Ampere XQA supports spec dec with pre-compiled cubins (may also work with JIT but not implemented yet)
-        // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
-        // now.
-        return (tensorrt_llm::common::getSMVersion() == 90
-                   && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && 64 % grpSize == 0)
-            ? mJITImpl.get()
-            : mPrecompiledImpl.get();
-    }
+    int const smVersion = tensorrt_llm::common::getSMVersion();
 
     std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
-
     if (envEnableXQAJIT.has_value())
     {
         return envEnableXQAJIT.value() ? mJITImpl.get() : mPrecompiledImpl.get();
     }
     else
     {
-        // If no env var set, default to precompiled impl for sm120, otherwise default to JIT.
-        return tensorrt_llm::common::getSMVersion() == 120 ? mPrecompiledImpl.get() : mJITImpl.get();
+        if (xqaParams.multi_query_tokens)
+        {
+            // Some multi_query kernels are not ported to JIT yet.
+            auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+            // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
+            // now.
+            bool const supportedByHopperXqa
+                = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && grpSize <= 64);
+            bool const supportedBySm120Mla = (smVersion == 120 && xqaParams.isMLA()
+                && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
+            bool const supportedByAmpereXqa = (!xqaParams.isMLA() && (64 % grpSize == 0));
+
+            return (supportedByHopperXqa || supportedBySm120Mla || supportedByAmpereXqa) ? mJITImpl.get()
+                                                                                         : mPrecompiledImpl.get();
+        }
+        else
+        {
+            // regular decoding kernels uses JIT by default
+            return mJITImpl.get();
+        }
     }
 }
 
@@ -116,10 +123,19 @@ void DecoderXQARunner::run(
     return getImplFromXQAParams(xqa_params, false)->run(xqa_params, kv_cache_buffer, stream);
 }
 
-DecoderXQARunner::Resource* DecoderXQARunner::getResourceGlobal()
+std::shared_ptr<DecoderXQARunnerResource> DecoderXQARunner::getResourceGlobal()
 {
-    static DecoderXQARunner::Resource sResource;
-    return &sResource;
+    static std::mutex sMutex;
+    static std::weak_ptr<DecoderXQARunnerResource> sResource;
+    std::lock_guard<std::mutex> lock(sMutex);
+    auto ret = sResource.lock();
+    if (ret != nullptr)
+    {
+        return ret;
+    }
+    ret = std::make_shared<DecoderXQARunnerResource>();
+    sResource = ret;
+    return ret;
 }
 
 template void DecoderXQARunner::run(
@@ -128,17 +144,17 @@ template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
 
 //// DecoderXQARunner::Resource
-DecoderXQARunner::Resource::Resource()
+DecoderXQARunnerResource::DecoderXQARunnerResource()
     : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>())
 {
 }
 
-DecoderXQARunner::Resource::Resource(DecoderXQARunner::Resource const& other)
+DecoderXQARunnerResource::DecoderXQARunnerResource(DecoderXQARunnerResource const& other)
     : mCubinObjRegistry(other.mCubinObjRegistry->clone())
 {
 }
 
-DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunner::Resource const& other)
+DecoderXQARunnerResource& DecoderXQARunnerResource::operator=(DecoderXQARunnerResource const& other)
 {
     if (this == &other)
     {
@@ -148,17 +164,17 @@ DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunn
     return *this;
 }
 
-DecoderXQARunner::Resource::Resource(void const* buffer, size_t buffer_size)
+DecoderXQARunnerResource::DecoderXQARunnerResource(void const* buffer, size_t buffer_size)
     : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>(buffer, buffer_size))
 {
 }
 
-size_t DecoderXQARunner::Resource::getSerializationSize() const noexcept
+size_t DecoderXQARunnerResource::getSerializationSize() const noexcept
 {
     return mCubinObjRegistry->getSerializationSize();
 }
 
-void DecoderXQARunner::Resource::serialize(void* buffer, size_t buffer_size) const noexcept
+void DecoderXQARunnerResource::serialize(void* buffer, size_t buffer_size) const noexcept
 {
     mCubinObjRegistry->serialize(buffer, buffer_size);
 }

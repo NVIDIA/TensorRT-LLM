@@ -24,10 +24,8 @@ set(SRCS
     createNewDecoderRequests.cpp
     contextProgress.cpp
     dataTransceiver.cpp
-    dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
-    generateRequestOptions.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp
@@ -50,7 +48,6 @@ set(SRCS
     transformerBuffers.cpp
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
-    trtGptModelV1.cpp
     updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
@@ -61,7 +58,7 @@ set(SRCS
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${3RDPARTY_DIR}/xgrammar/cpp/pybind/.*\\.cc")
+     "${3RDPARTY_DIR}/xgrammar/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
 
 if(NOT WIN32)
@@ -97,6 +94,10 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
+if(ENABLE_CUFILE)
+  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
+endif()
+
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
@@ -104,4 +105,5 @@ if(ENABLE_UCX)
     ${BATCH_MANAGER_STATIC_TARGET}
     PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
+
 endif()

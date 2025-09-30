@@ -1,20 +1,27 @@
 from ..disaggregated_params import DisaggregatedParams
-from ..executor import CompletionOutput, RequestError
+from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
-from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
+# yapf: disable
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
+                       CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
+                       CudaGraphConfig, DraftTargetDecodingConfig,
                        DynamicBatchConfig, EagleDecodingConfig,
-                       ExtendedRuntimePerfKnobConfig, KvCacheConfig,
-                       LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, SchedulerConfig)
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+                       UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
+from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
     'GuidedDecodingParams',
@@ -22,6 +29,8 @@ __all__ = [
     'DisaggregatedParams',
     'KvCacheConfig',
     'KvCacheRetentionConfig',
+    'CudaGraphConfig',
+    'MoeConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'EagleDecodingConfig',
@@ -40,4 +49,14 @@ __all__ = [
     'ContextChunkingPolicy',
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
+    'NGramDecodingConfig',
+    'UserProvidedDecodingConfig',
+    'TorchCompileConfig',
+    'DraftTargetDecodingConfig',
+    'LlmArgs',
+    'TorchLlmArgs',
+    'TrtLlmArgs',
+    'AutoDecodingConfig',
+    'AttentionDpConfig',
+    'LoRARequest',
 ]

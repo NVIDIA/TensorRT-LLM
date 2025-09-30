@@ -16,14 +16,10 @@
  */
 
 #include "tensorrt_llm/executor/executorImpl.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
@@ -38,6 +34,7 @@
 #include "tensorrt_llm/executor/version.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
+#include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <algorithm>
@@ -49,32 +46,52 @@
 #include <optional>
 #include <utility>
 
+namespace tensorrt_llm::executor
+{
+
 namespace
 {
 
-using namespace tensorrt_llm::batch_manager;
-using namespace tensorrt_llm::runtime;
-namespace su = tensorrt_llm::executor::serialize_utils;
-
-void checkOptionalParams(TrtGptModelOptionalParams& optionalParams, ModelConfig const& modelConfig)
+[[nodiscard]] bool executorConfigIsValid(ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
 {
-    // Disable chunked context when not supported
-    if (optionalParams.enableChunkedContext)
+    // Make sure logic in this function matches fixExecutorConfig
+    if (executorConfig.getEnableChunkedContext())
     {
         if (modelConfig.isRnnBased() || !modelConfig.isKVCacheEnabled() || !modelConfig.getPagedContextFMHA())
         {
-            optionalParams.enableChunkedContext = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] ExecutorConfig fixExecutorConfig(
+    ExecutorConfig const& executorConfig, runtime::ModelConfig const& modelConfig)
+{
+    // Make sure logic in this function matches executorConfigIsValid
+    auto fixedExecutorConfig = executorConfig;
+    // Disable chunked context when not supported
+    if (executorConfig.getEnableChunkedContext())
+    {
+        if (modelConfig.isRnnBased() || !modelConfig.isKVCacheEnabled() || !modelConfig.getPagedContextFMHA())
+        {
+            fixedExecutorConfig.setEnableChunkedContext(false);
             TLLM_LOG_WARNING(
                 "Chunked context is not supported for this configuration and will be disabled. "
                 "Related configs: RNNBased: %d, KVCacheEnabled: %d, PagedContextFMHA: %d",
                 modelConfig.isRnnBased(), modelConfig.isKVCacheEnabled(), modelConfig.getPagedContextFMHA());
         }
     }
+    return fixedExecutorConfig;
 }
-} // namespace
 
-namespace tensorrt_llm::executor
+SizeType32 getNumChildRequests(Request const& request)
 {
+    auto samplingConfig = request.getSamplingConfig();
+    return samplingConfig.getBeamWidth() > 1 ? 0 : samplingConfig.getNumReturnSequences().value_or(1) - 1;
+}
+
+} // namespace
 
 /// @brief Version of TRT-LLM as defined in tensorrt_llm/version.py
 char const* version() noexcept
@@ -89,16 +106,16 @@ public:
         std::unordered_set<IdType> const& cancelledReqIds, int peer)
     {
         TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-        TLLM_LOG_DEBUG("start send cancelled requests to rank %d", peer);
         mNumReq = static_cast<int64_t>(cancelledReqIds.size());
-        mRequest1 = commSession->sendAsync(&mNumReq, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset);
+        TLLM_LOG_DEBUG("start send %ld cancelled requests to rank %d", mNumReq, peer);
+        mRequest1
+            = commSession->sendAsync(&mNumReq, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kCancelledRequestsNumReq);
         if (mNumReq > 0)
         {
             mIds.assign(cancelledReqIds.begin(), cancelledReqIds.end());
-            mRequest2
-                = commSession->sendAsync(mIds.data(), mIds.size(), mpi::MpiType::kUINT64, peer, kMpiTagOffset + 1);
+            mRequest2 = commSession->sendAsync(
+                mIds.data(), mIds.size(), mpi::MpiType::kUINT64, peer, mpi::MpiTag::kCancelledRequestsIds);
         }
-        static_assert(kMpiTagUpperBound >= kMpiTagOffset + 2);
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
@@ -119,9 +136,26 @@ public:
     CancelledRequestsAsyncSend(CancelledRequestsAsyncSend&&) = delete;
     CancelledRequestsAsyncSend& operator=(CancelledRequestsAsyncSend&&) = delete;
 
-    static auto constexpr kMpiTagOffset = 13;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 2;
-    static_assert(kMpiTagOffset >= tensorrt_llm::batch_manager::DecoderSlotAsyncSend::kMpiTagUpperBound);
+    static std::unordered_set<IdType> cancelledRequestsRecv(
+        std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("start recv cancelled requests from rank %d", peer);
+        std::unordered_set<IdType> cancelledReqIds;
+        int64_t numReq{0};
+        commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kCancelledRequestsNumReq);
+        TLLM_LOG_DEBUG("recv %ld cancelled requests", numReq);
+        if (numReq > 0)
+        {
+            std::vector<IdType> buffer(numReq);
+            commSession->recv(
+                buffer.data(), buffer.size(), mpi::MpiType::kUINT64, peer, mpi::MpiTag::kCancelledRequestsIds);
+            cancelledReqIds = std::unordered_set<IdType>(buffer.begin(), buffer.end());
+        }
+        TLLM_LOG_DEBUG("end recv cancelled requests from rank %d", peer);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return cancelledReqIds;
+    }
 
 private:
     int64_t mNumReq;
@@ -129,26 +163,6 @@ private:
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest1;
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest2;
 };
-
-std::unordered_set<IdType> cancelledRequestsRecv(
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start recv cancelled requests from rank %d", peer);
-    std::unordered_set<IdType> cancelledReqIds;
-    int64_t numReq{0};
-    commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, CancelledRequestsAsyncSend::kMpiTagOffset);
-    if (numReq > 0)
-    {
-        std::vector<IdType> buffer(numReq);
-        commSession->recv(
-            buffer.data(), buffer.size(), mpi::MpiType::kUINT64, peer, CancelledRequestsAsyncSend::kMpiTagOffset + 1);
-        cancelledReqIds = std::unordered_set<IdType>(buffer.begin(), buffer.end());
-    }
-    TLLM_LOG_DEBUG("end recv cancelled requests from rank %d", peer);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return cancelledReqIds;
-}
 
 class RequestWithIdAsyncSend
 {
@@ -159,16 +173,16 @@ public:
         TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         TLLM_LOG_DEBUG("start send requests to rank %d", peer);
         mNumReq = static_cast<int64_t>(reqWithIds.size());
-        mRequest1 = commSession->sendAsync(&mNumReq, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset);
+        mRequest1 = commSession->sendAsync(&mNumReq, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kRequestWithIdNumReq);
         if (mNumReq > 0)
         {
             mPacked = RequestWithId::serializeReqWithIds(reqWithIds);
             mVecSize = static_cast<int64_t>(mPacked.size());
-            mRequest2 = commSession->sendAsync(&mVecSize, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset + 1);
-            mRequest3
-                = commSession->sendAsync(mPacked.data(), mPacked.size(), mpi::MpiType::kCHAR, peer, kMpiTagOffset + 2);
+            mRequest2
+                = commSession->sendAsync(&mVecSize, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kRequestWithIdVecSize);
+            mRequest3 = commSession->sendAsync(
+                mPacked.data(), mPacked.size(), mpi::MpiType::kCHAR, peer, mpi::MpiTag::kRequestWithIdPacked);
         }
-        static_assert(kMpiTagUpperBound >= kMpiTagOffset + 3);
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
@@ -193,9 +207,28 @@ public:
     RequestWithIdAsyncSend(RequestWithIdAsyncSend&&) = delete;
     RequestWithIdAsyncSend& operator=(RequestWithIdAsyncSend&&) = delete;
 
-    static auto constexpr kMpiTagOffset = 15;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 3;
-    static_assert(kMpiTagOffset >= CancelledRequestsAsyncSend::kMpiTagUpperBound);
+    static std::vector<RequestWithId> requestWithIdRecv(
+        std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_DEBUG("start recv requests from rank %d", peer);
+        std::vector<RequestWithId> reqWithIds;
+        int64_t numReq{0};
+        commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kRequestWithIdNumReq);
+        if (numReq > 0)
+        {
+            std::vector<char> buffer;
+            int64_t vecSize = 0;
+            commSession->recv(&vecSize, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kRequestWithIdVecSize);
+            buffer.resize(vecSize);
+            commSession->recv(
+                buffer.data(), buffer.size(), mpi::MpiType::kCHAR, peer, mpi::MpiTag::kRequestWithIdPacked);
+            reqWithIds = RequestWithId::deserializeReqWithIds(buffer);
+        }
+        TLLM_LOG_DEBUG("end recv requests from rank %d", peer);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return reqWithIds;
+    }
 
 private:
     int64_t mNumReq;
@@ -205,34 +238,6 @@ private:
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest2;
     std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest3;
 };
-
-std::vector<RequestWithId> requestWithIdRecv(std::shared_ptr<tensorrt_llm::mpi::MpiComm> const& commSession, int peer)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start recv requests from rank %d", peer);
-    std::vector<RequestWithId> reqWithIds;
-    int64_t numReq{0};
-    commSession->recv(&numReq, 1, mpi::MpiType::kINT64, peer, RequestWithIdAsyncSend::kMpiTagOffset);
-    if (numReq > 0)
-    {
-        std::vector<char> buffer;
-        int64_t vecSize = 0;
-        commSession->recv(&vecSize, 1, mpi::MpiType::kINT64, peer, RequestWithIdAsyncSend::kMpiTagOffset + 1);
-        buffer.resize(vecSize);
-        commSession->recv(
-            buffer.data(), buffer.size(), mpi::MpiType::kCHAR, peer, RequestWithIdAsyncSend::kMpiTagOffset + 2);
-        reqWithIds = RequestWithId::deserializeReqWithIds(buffer);
-    }
-    TLLM_LOG_DEBUG("end recv requests from rank %d", peer);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return reqWithIds;
-}
-
-SizeType32 getNumChildRequests(Request const& request)
-{
-    auto samplingConfig = request.getSamplingConfig();
-    return samplingConfig.getBeamWidth() > 1 ? 0 : samplingConfig.getNumReturnSequences().value_or(1) - 1;
-}
 
 void Executor::Impl::loadModel(std::optional<std::filesystem::path> const& modelPathOpt,
     std::optional<BufferView> const& engineBufferOpt, runtime::GptJsonConfig const& jsonConfig,
@@ -485,7 +490,10 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
     {
         switch (executorConfig.getBatchingType())
         {
-        case BatchingType::kSTATIC: return batch_manager::TrtGptModelType::V1;
+        case BatchingType::kSTATIC:
+            TLLM_THROW(
+                "Static batching type is deprecated. Please use in-flight batching with "
+                "CapacitySchedulerPolicy::kSTATIC_BATCH instead.");
         case BatchingType::kINFLIGHT:
             return modelConfig.isRnnBased() ? batch_manager::TrtGptModelType::InflightBatching
                                             : batch_manager::TrtGptModelType::InflightFusedBatching;
@@ -494,19 +502,22 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
     }();
 
     bool const isLeaderInOrchMode = (mCommMode == CommunicationMode::kORCHESTRATOR) && mIsLeader;
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams(executorConfig, isLeaderInOrchMode);
-    ::checkOptionalParams(optionalParams, modelConfig);
-    return batch_manager::TrtGptModelFactory::create(rawEngine, modelConfig, worldConfig, gptModelType, optionalParams);
+    auto const& fixedExecutorConfig = executorConfigIsValid(executorConfig, modelConfig)
+        ? executorConfig
+        : fixExecutorConfig(executorConfig, modelConfig);
+
+    return batch_manager::TrtGptModelFactory::create(
+        rawEngine, modelConfig, worldConfig, gptModelType, fixedExecutorConfig, isLeaderInOrchMode);
 }
 
 std::shared_ptr<Model> Executor::Impl::createEncoderModel(runtime::RawEngine const& rawEngine,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     ExecutorConfig const& executorConfig)
 {
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{};
-    optionalParams.schedulerConfig = executorConfig.getSchedulerConfig();
+    auto fixedExecutorConfig = ExecutorConfig{};
+    fixedExecutorConfig.setSchedulerConfig(executorConfig.getSchedulerConfig());
     return std::make_shared<batch_manager::TrtEncoderModel>(
-        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), optionalParams);
+        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), fixedExecutorConfig);
 }
 
 void Executor::Impl::setOrchLeaderComm(
@@ -631,6 +642,8 @@ void Executor::Impl::initializeOrchestrator(SizeType32 tp, SizeType32 pp, SizeTy
     std::filesystem::path const& modelPath)
 {
 #if ENABLE_MULTI_DEVICE
+    namespace su = tensorrt_llm::executor::serialize_utils;
+
     auto const& worldComm = tensorrt_llm::mpi::MpiComm::world();
     int32_t const worldSize = worldComm.getSize();
 
@@ -692,7 +705,8 @@ void Executor::Impl::initializeOrchestrator(SizeType32 tp, SizeType32 pp, SizeTy
     mOrchSendReqThread = std::thread(&Impl::orchSendReqThread, this);
 
     // Spawn the thread responsible for receiving new responses from the leader of the model
-    mOrchRecvThread = std::thread([&]() { this->orchRecvThread(kMPI_ID_TAG, kMPI_DATA_TAG); });
+    mOrchRecvThread
+        = std::thread([&]() { this->orchRecvThread(mpi::MpiTag::kOrchestratorId, mpi::MpiTag::kOrchestratorData); });
 
 #endif // ENABLE_MULTI_DEVICE
 }
@@ -826,7 +840,8 @@ void Executor::Impl::initializeWorkers(SizeType32 tp, SizeType32 pp, SizeType32 
         mLeaderRecvReqThread = std::thread(&Impl::leaderRecvReqThread, this);
 
         // Spawn the thread responsible for sending new responses to the orchestrator
-        mLeaderSendThread = std::thread([&]() { this->leaderSendThread(mSendQueue, kMPI_ID_TAG, kMPI_DATA_TAG); });
+        mLeaderSendThread = std::thread([&]()
+            { this->leaderSendThread(mSendQueue, mpi::MpiTag::kOrchestratorId, mpi::MpiTag::kOrchestratorData); });
     }
 #endif // ENABLE_MULTI_DEVICE
 }
@@ -949,30 +964,32 @@ std::vector<Response> Executor::Impl::awaitResponses(std::optional<std::chrono::
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<Response> responses;
     std::unique_lock<std::mutex> lck(mResponsesMtx);
-    auto pred = [&mShutdown = mShutdown, &resp = this->mResponses]() -> bool { return !resp.empty() || mShutdown; };
-    auto storeResponses = [this, &resp = this->mResponses, &responses]()
+    auto pred = [this]() -> bool { return !mResponses.empty() || mShutdown; };
+    auto storeResponses = [this]()
     {
-        for (auto it = resp.cbegin(); it != resp.cend();)
+        std::vector<Response> responses;
+        for (auto it = mResponses.begin(); it != mResponses.end();)
         {
             responses.insert(responses.end(), it->second.begin(), it->second.end());
             addTerminatedReqId(it->second, it->first);
-            resp.erase(it++);
+            it = mResponses.erase(it);
         }
+        return responses;
     };
 
+    std::vector<Response> responses;
     if (timeout)
     {
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
-            storeResponses();
+            responses = storeResponses();
         }
     }
     else
     {
         mResponsesCv.wait(lck, pred);
-        storeResponses();
+        responses = storeResponses();
     }
     return responses;
 }
@@ -982,15 +999,16 @@ std::vector<Response> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<Response> responses;
     std::unique_lock<std::mutex> lck(mResponsesMtx);
-    auto pred = [&mShutdown = mShutdown, &resp = this->mResponses, reqId]() -> bool
-    { return (resp.find(reqId) != resp.end() && !resp.at(reqId).empty()) || mShutdown; };
-    auto storeIdResponse = [this, &resp = this->mResponses, &responses, reqId]()
+    auto pred = [this, reqId]() -> bool
+    { return (mResponses.find(reqId) != mResponses.end() && !mResponses.at(reqId).empty()) || mShutdown; };
+    auto storeIdResponse = [this, reqId]()
     {
-        responses.swap(resp.at(reqId));
-        resp.erase(reqId);
+        std::vector<Response> responses;
+        responses.swap(mResponses.at(reqId));
+        mResponses.erase(reqId);
         addTerminatedReqId(responses, reqId);
+        return responses;
     };
 
     // We don't process a terminated request again. Terminated request is defined as a response
@@ -1007,17 +1025,18 @@ std::vector<Response> Executor::Impl::awaitResponses(
         return {Response(reqId, err)};
     }
 
+    std::vector<Response> responses;
     if (timeout)
     {
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
-            storeIdResponse();
+            responses = storeIdResponse();
         }
     }
     else
     {
         mResponsesCv.wait(lck, pred);
-        storeIdResponse();
+        responses = storeIdResponse();
     }
     return responses;
 }
@@ -1027,26 +1046,27 @@ std::vector<std::vector<Response>> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<std::vector<Response>> v(requestIds.size());
+    std::vector<std::vector<Response>> responses;
+    responses.reserve(requestIds.size());
     if (timeout)
     {
         auto const start_time = std::chrono::high_resolution_clock::now();
-        for (unsigned i = 0; i < v.size(); ++i)
+        for (auto const requestId : requestIds)
         {
             auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::high_resolution_clock::now() - start_time);
-            v[i] = awaitResponses(requestIds[i],
-                timeout.value() > elapsed_ms ? timeout.value() - elapsed_ms : std::chrono::milliseconds{0});
+            responses.emplace_back(awaitResponses(
+                requestId, timeout.value() > elapsed_ms ? timeout.value() - elapsed_ms : std::chrono::milliseconds{0}));
         }
     }
     else
     {
-        for (unsigned i = 0; i < v.size(); ++i)
+        for (auto const requestId : requestIds)
         {
-            v[i] = awaitResponses(requestIds[i]);
+            responses.emplace_back(awaitResponses(requestId));
         }
     }
-    return v;
+    return responses;
 }
 
 SizeType32 Executor::Impl::getNumResponsesReady(std::optional<IdType> const& optId) const
@@ -1229,13 +1249,13 @@ std::optional<std::shared_ptr<KVCacheEventManager>> Executor::Impl::getKVCacheEv
 
 void Executor::Impl::requestWithIdLeaderThread()
 {
-    static_assert(kMpiTagOffset >= RequestWithIdAsyncSend::kMpiTagUpperBound);
     TLLM_CUDA_CHECK(cudaSetDevice(mModel->getWorldConfig().getDevice()));
     auto constexpr peer = 0;
     while (true)
     {
         int64_t numActiveRequests;
-        mCommPipelineParallel->recv(&numActiveRequests, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset);
+        mCommPipelineParallel->recv(
+            &numActiveRequests, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kExecutorNumActiveRequests);
         if (numActiveRequests < 0)
         {
             break;
@@ -1243,11 +1263,13 @@ void Executor::Impl::requestWithIdLeaderThread()
 
         bool lowestPriorityActiveHasValue;
         std::optional<PriorityType> lowestPriorityActive;
-        mCommPipelineParallel->recv(&lowestPriorityActiveHasValue, 1, mpi::MpiType::kBOOL, peer, kMpiTagOffset + 1);
+        mCommPipelineParallel->recv(&lowestPriorityActiveHasValue, 1, mpi::MpiType::kBOOL, peer,
+            mpi::MpiTag::kExecutorLowestPriorityActiveHasValue);
         if (lowestPriorityActiveHasValue)
         {
             PriorityType lowestPriorityActiveValue;
-            mCommPipelineParallel->recv(&lowestPriorityActiveValue, 1, mpi::MpiType::kFLOAT, peer, kMpiTagOffset + 2);
+            mCommPipelineParallel->recv(
+                &lowestPriorityActiveValue, 1, mpi::MpiType::kFLOAT, peer, mpi::MpiTag::kExecutorLowestPriorityActive);
             lowestPriorityActive = lowestPriorityActiveValue;
         }
 
@@ -1266,7 +1288,7 @@ void Executor::Impl::cancelledRequestsLeaderThread()
     while (true)
     {
         bool shouldExit;
-        mCommPipelineParallel->recv(&shouldExit, 1, mpi::MpiType::kBOOL, peer, kMpiTagOffset + 3);
+        mCommPipelineParallel->recv(&shouldExit, 1, mpi::MpiType::kBOOL, peer, mpi::MpiTag::kExecutorShouldExit);
         if (shouldExit)
         {
             break;
@@ -1281,7 +1303,6 @@ void Executor::Impl::cancelledRequestsLeaderThread()
         }
         cancelledRequestsAsyncSndHdl.reset(nullptr);
     }
-    static_assert(kMpiTagUpperBound >= kMpiTagOffset + 4);
 }
 
 std::vector<RequestWithId> Executor::Impl::getLeaderNewReqWithIds(
@@ -1378,20 +1399,21 @@ std::vector<RequestWithId> Executor::Impl::getNewReqWithIds(
             auto const peer = worldConfig.getPipelineParallelism() - 1;
             auto numActiveRequestsValue = static_cast<int64_t>(numActiveRequests);
             auto request1 = mCommPipelineParallel->sendAsync(
-                &numActiveRequestsValue, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset);
+                &numActiveRequestsValue, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kExecutorNumActiveRequests);
             bool lowestPriorityActiveHasValue = lowestPriorityActive.has_value();
-            auto request2 = mCommPipelineParallel->sendAsync(
-                &lowestPriorityActiveHasValue, 1, mpi::MpiType::kBOOL, peer, kMpiTagOffset + 1);
-            auto request3 = lowestPriorityActiveHasValue ? mCommPipelineParallel->sendAsync(
-                                &lowestPriorityActive.value(), 1, mpi::MpiType::kFLOAT, peer, kMpiTagOffset + 2)
-                                                         : nullptr;
+            auto request2 = mCommPipelineParallel->sendAsync(&lowestPriorityActiveHasValue, 1, mpi::MpiType::kBOOL,
+                peer, mpi::MpiTag::kExecutorLowestPriorityActiveHasValue);
+            auto request3 = lowestPriorityActiveHasValue
+                ? mCommPipelineParallel->sendAsync(&lowestPriorityActive.value(), 1, mpi::MpiType::kFLOAT, peer,
+                    mpi::MpiTag::kExecutorLowestPriorityActive)
+                : nullptr;
             request1->wait();
             request2->wait();
             if (request3)
             {
                 request3->wait();
             }
-            reqWithIds = requestWithIdRecv(mCommPipelineParallel, peer);
+            reqWithIds = RequestWithIdAsyncSend::requestWithIdRecv(mCommPipelineParallel, peer);
         }
         if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
         {
@@ -1418,7 +1440,7 @@ std::vector<RequestWithId> Executor::Impl::getNewReqWithIds(
         else
         {
             auto const peer = worldConfig.getPipelineParallelRank() - 1;
-            reqWithIds = requestWithIdRecv(mCommPipelineParallel, peer);
+            reqWithIds = RequestWithIdAsyncSend::requestWithIdRecv(mCommPipelineParallel, peer);
         }
     }
     if (!worldConfig.isLastPipelineParallelRank())
@@ -1594,14 +1616,14 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                     }
                 }
 
-                if (newReq->getGuidedDecodingParams() && mModel->getWorldConfig().isLastPipelineParallelRank())
+                if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->getGuidedDecodingParams())
                 {
                     TLLM_CHECK_WITH_INFO(mModel->hasGuidedDecoder(),
                         "Request is specified with GuidedDecodingParams, but GuidedDecoder is not setup. Please "
                         "provide a valid GuidedDecodingConfig to setup GuidedDecoder.");
                 }
 
-                if (newReq->hasAdditionalOutputs())
+                if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->hasAdditionalOutputs())
                 {
                     newReq->allocAdditionalOutputs([this](std::string const& name)
                         { return mModel->getTensorDataType(name); },
@@ -1663,7 +1685,7 @@ void Executor::Impl::terminateActiveRequests(RequestList& activeRequests, std::s
         }
 
         // Remove from the requestList
-        activeRequests.erase(it++);
+        it = activeRequests.erase(it);
     }
 }
 
@@ -1719,9 +1741,6 @@ void Executor::Impl::finishTimedOutRequests(RequestList const& activeRequests)
                     auto& selCancelledReqIds = mUsePipelineParallel ? mPipelineCancelledReqIds : mCancelledReqIds;
                     selCancelledReqIds.insert(request->mRequestId);
                 }
-                request->finishByReason(FinishReason::kTIMED_OUT);
-                request->clearGeneratedTokens();
-                mModel->terminateRequest(request);
             }
         }
     }
@@ -2054,8 +2073,10 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
                 {
                     auto const peer = worldConfig.getPipelineParallelism() - 1;
                     bool shouldExit = false;
-                    mCommPipelineParallel->send(&shouldExit, 1, mpi::MpiType::kBOOL, peer, kMpiTagOffset + 3);
-                    auto pipelineCancelledReqIds = cancelledRequestsRecv(mCommPipelineParallel, peer);
+                    mCommPipelineParallel->send(
+                        &shouldExit, 1, mpi::MpiType::kBOOL, peer, mpi::MpiTag::kExecutorShouldExit);
+                    auto pipelineCancelledReqIds
+                        = CancelledRequestsAsyncSend::cancelledRequestsRecv(mCommPipelineParallel, peer);
                     mCancelledReqIds.insert(pipelineCancelledReqIds.begin(), pipelineCancelledReqIds.end());
                 }
 
@@ -2103,7 +2124,7 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
                 else
                 {
                     auto const peer = worldConfig.getPipelineParallelRank() - 1;
-                    mCancelledReqIds = cancelledRequestsRecv(mCommPipelineParallel, peer);
+                    mCancelledReqIds = CancelledRequestsAsyncSend::cancelledRequestsRecv(mCommPipelineParallel, peer);
                 }
             }
             if (!worldConfig.isLastPipelineParallelRank())
@@ -2133,10 +2154,8 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
             auto reqId = req->isChild() ? req->getParentRequestId() : req->mRequestId;
             if (mCancelledReqIds.find(reqId) != mCancelledReqIds.end())
             {
-                req->setState(batch_manager::LlmRequestState::kGENERATION_COMPLETE);
-                mModel->terminateRequest(req);
-                req->finishByReason(FinishReason::kCANCELLED);
-                req->clearGeneratedTokens();
+                auto finishReason = req->isTimedOut() ? FinishReason::kTIMED_OUT : FinishReason::kCANCELLED;
+                mModel->terminateRequestSync(req, finishReason);
                 // Parent and child requests share the same request id.
                 // Mark it terminated first and remove from the set later.
                 terminatedReqIds.insert(reqId);
@@ -2150,15 +2169,25 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
     }
 }
 
-void Executor::Impl::terminateContextFinishedRequests(RequestList& inTransmissionRequests)
+void Executor::Impl::terminateContextFinishedRequests(InTransList& inTransmissionRequests)
 {
     NVTX3_SCOPED_RANGE(terminateContextFinishedRequests);
     for (auto it = inTransmissionRequests.begin(); it != inTransmissionRequests.end();)
     {
-        auto req = *it;
+        auto& item = *it;
+        auto req = item.request;
         if (req->isDisaggContextCompleteState())
         {
-            mModel->terminateRequest(req);
+            // If lastBlockId was tracked, unpin it. Otherwise, just terminate.
+            auto kvMgr = mModel->getKVCacheManager();
+            if (kvMgr && item.lastBlockId.has_value())
+            {
+                kvMgr->unpinBlocksById(item.lastBlockId.value());
+            }
+            else
+            {
+                mModel->terminateRequest(req);
+            }
             it = inTransmissionRequests.erase(it);
         }
         else
@@ -2181,7 +2210,7 @@ void Executor::Impl::appendNewResponses(std::vector<Response>&& newResponses)
 }
 
 Executor::Impl::RequestList Executor::Impl::populateNewResponses(
-    RequestList& activeRequests, RequestList& inTransmissionRequests, std::vector<Response>& newResponses)
+    RequestList& activeRequests, InTransList& inTransmissionRequests, std::vector<Response>& newResponses)
 {
     NVTX3_SCOPED_RANGE(populateNewResponses);
     RequestList finishedRequests;
@@ -2204,7 +2233,14 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                inTransmissionRequests.push_back(*it);
+                std::optional<SizeType32> lastBlockId{};
+                auto kvMgr = mModel->getKVCacheManager();
+                if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
+                {
+                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
+                    mModel->terminateRequest(llmReq);
+                }
+                inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
             }
             finishedRequests.push_back(*it);
             it = activeRequests.erase(it);
@@ -2233,7 +2269,7 @@ void Executor::Impl::executionLoop()
     std::chrono::time_point<std::chrono::steady_clock> iterEnd;
     bool firstIteration{true};
     RequestList activeRequests;
-    RequestList inTransmissionRequests;
+    InTransList inTransmissionRequests;
     std::vector<Response> newResponses;
     while (!mShutdown || !activeRequests.empty())
     {
@@ -2243,9 +2279,9 @@ void Executor::Impl::executionLoop()
         RequestList finishedRequests;
         if (!activeRequests.empty())
         {
-            forwardSync(activeRequests);
             finishTimedOutRequests(activeRequests);
             terminateCancelledRequests(activeRequests);
+            forwardSync(activeRequests);
             finishedRequests = populateNewResponses(activeRequests, inTransmissionRequests, newResponses);
             cleanupDynamicLogitsPostProcessors(finishedRequests);
             auto const iterCounter = mModel->getIterCounter();
@@ -2351,9 +2387,10 @@ void Executor::Impl::executionLoop()
     {
         auto const peer = worldConfig.getPipelineParallelism() - 1;
         int64_t numActiveRequests = -1;
-        mCommPipelineParallel->send(&numActiveRequests, 1, mpi::MpiType::kINT64, peer, kMpiTagOffset);
+        mCommPipelineParallel->send(
+            &numActiveRequests, 1, mpi::MpiType::kINT64, peer, mpi::MpiTag::kExecutorNumActiveRequests);
         bool shouldExit = true;
-        mCommPipelineParallel->send(&shouldExit, 1, mpi::MpiType::kBOOL, peer, kMpiTagOffset + 3);
+        mCommPipelineParallel->send(&shouldExit, 1, mpi::MpiType::kBOOL, peer, mpi::MpiTag::kExecutorShouldExit);
     }
     if (mRequestWithIdLeaderThread)
     {
@@ -2406,7 +2443,7 @@ void Executor::Impl::orchSendReqThread()
 
         if (message.id == MpiId::TERMINATION)
         {
-            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, kMPI_ID_TAG);
+            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
             TLLM_LOG_INFO("Orchestrator sendReq thread exiting");
             break;
         }
@@ -2435,16 +2472,18 @@ void Executor::Impl::orchSendReqThread()
             }
             else
             {
-                mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, kMPI_ID_TAG);
-                mOrchLeaderComm->send(packed.data(), packed.size(), mpi::MpiType::kCHAR, mLeaderRank, kMPI_DATA_TAG);
+                mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
+                mOrchLeaderComm->send(
+                    packed.data(), packed.size(), mpi::MpiType::kCHAR, mLeaderRank, mpi::MpiTag::kOrchestratorData);
             }
         }
         else if (message.id == MpiId::CANCEL_REQUEST)
         {
             auto& data = std::get<RequestIdsData>(message.data);
 
-            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, kMPI_ID_TAG);
-            mOrchLeaderComm->send(data.ids.data(), data.ids.size(), mpi::MpiType::kUINT64, mLeaderRank, kMPI_DATA_TAG);
+            mOrchLeaderComm->send(&message.id, 1, mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorId);
+            mOrchLeaderComm->send(
+                data.ids.data(), data.ids.size(), mpi::MpiType::kUINT64, mLeaderRank, mpi::MpiTag::kOrchestratorData);
         }
         else
         {
@@ -2464,13 +2503,13 @@ void Executor::Impl::leaderRecvReqThread()
     {
         if (mRecvPollPeriodMs > 0)
         {
-            mOrchLeaderComm->recvPoll(mOrchRank, kMPI_ID_TAG, mRecvPollPeriodMs);
+            mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kOrchestratorId, mRecvPollPeriodMs);
         }
 
         // Blocking is okay: terminate message is expected to arrive here
         MPI_Message msg = nullptr;
         MPI_Status status;
-        mOrchLeaderComm->mprobe(mOrchRank, kMPI_ID_TAG, &msg, &status);
+        mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kOrchestratorId, &msg, &status);
 
         int32_t count = 0;
         MPICHECK(MPI_Get_count(&status, MPI_UINT64_T, &count)); // NOLINT
@@ -2492,7 +2531,7 @@ void Executor::Impl::leaderRecvReqThread()
         }
         if (mpiId == MpiId::PENDING_REQUEST)
         {
-            mOrchLeaderComm->mprobe(mOrchRank, kMPI_DATA_TAG, &msg, &status);
+            mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kOrchestratorData, &msg, &status);
             MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));                 // NOLINT
             std::vector<char> buffer(count);
             MPICHECK(MPI_Mrecv(buffer.data(), count, MPI_CHAR, &msg, &status)); // NOLINT
@@ -2530,7 +2569,7 @@ void Executor::Impl::leaderRecvReqThread()
         else if (mpiId == MpiId::CANCEL_REQUEST)
         {
             // Prepare receiving data
-            mOrchLeaderComm->mprobe(mOrchRank, kMPI_DATA_TAG, &msg, &status);
+            mOrchLeaderComm->mprobe(mOrchRank, mpi::MpiTag::kOrchestratorData, &msg, &status);
             MPICHECK(MPI_Get_count(&status, MPI_UINT64_T, &count));                          // NOLINT
             std::vector<uint64_t> cancelledReqIds(count);
             MPICHECK(MPI_Mrecv(cancelledReqIds.data(), count, MPI_UINT64_T, &msg, &status)); // NOLINT
@@ -2547,7 +2586,7 @@ void Executor::Impl::leaderRecvReqThread()
 }
 
 // Leader thread sending responses to orchestrator
-void Executor::Impl::leaderSendThread(MpiMessageQueue& sendQueue, int32_t idTag, int32_t dataTag)
+void Executor::Impl::leaderSendThread(MpiMessageQueue& sendQueue, mpi::MpiTag idTag, mpi::MpiTag dataTag)
 {
     tensorrt_llm::common::setThreadName("leaderSend");
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
@@ -2596,7 +2635,7 @@ void Executor::Impl::leaderSendThread(MpiMessageQueue& sendQueue, int32_t idTag,
 #endif // ENABLE_MULTI_DEVICE
 }
 
-void Executor::Impl::orchRecvThread(int32_t idTag, int32_t dataTag)
+void Executor::Impl::orchRecvThread(mpi::MpiTag idTag, mpi::MpiTag dataTag)
 {
     tensorrt_llm::common::setThreadName("orchRecv");
 
@@ -2605,7 +2644,7 @@ void Executor::Impl::orchRecvThread(int32_t idTag, int32_t dataTag)
     {
         if (mRecvPollPeriodMs > 0)
         {
-            mOrchLeaderComm->recvPoll(mOrchRank, kMPI_ID_TAG, mRecvPollPeriodMs);
+            mOrchLeaderComm->recvPoll(mOrchRank, mpi::MpiTag::kOrchestratorId, mRecvPollPeriodMs);
         }
 
         MPI_Message msg = nullptr;

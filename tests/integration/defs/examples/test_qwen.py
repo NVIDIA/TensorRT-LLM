@@ -20,9 +20,15 @@ import os
 import pytest
 from defs.common import (convert_weights, test_multi_lora_support,
                          venv_check_call, venv_mpi_check_call)
-from defs.conftest import (get_device_count, get_device_memory,
+from defs.conftest import (get_device_count, get_device_memory, get_sm_version,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.mark.parametrize(
@@ -94,7 +100,7 @@ def test_llm_qwen_single_gpu_summary(
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--tensorrt_llm_rouge1_threshold=22",
@@ -171,7 +177,7 @@ def test_llm_qwen_moe_single_gpu_summary(
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--tensorrt_llm_rouge1_threshold=22",

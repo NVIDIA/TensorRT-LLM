@@ -62,10 +62,10 @@ using GemmConfig
 std::string gemm_type_to_string(deep_gemm::GemmType gemm_type);
 
 int div_up(int a, int b);
-int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k);
+int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k, bool swap_ab);
 bool is_tma_multicast_legal(int n, int block_n, int num_tma_multicast, int num_sms);
 GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_groups,
-    int num_device_sms, bool is_grouped_contiguous);
+    int num_device_sms, bool is_grouped_contiguous, bool swap_ab);
 } // namespace deep_gemm::jit
 
 namespace deep_gemm::jit
@@ -90,23 +90,46 @@ int div_up(int a, int b)
     return (a + b - 1) / b;
 }
 
-int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128)
+int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128, bool swap_ab = false)
 {
-    int smem_d = block_m * block_n * 2;
-    int smem_a_per_stage = block_m * block_k;
-    int smem_scales_a_per_stage = block_m * 4;
-    int smem_b_per_stage = block_n * block_k;
-    int smem_scales_b = div_up(k, block_k) * 4;
-    int smem_barrier = num_stages * 8 * 2;
+    if (!swap_ab)
+    {
+        int smem_d = block_m * block_n * 2;
+        int smem_a_per_stage = block_m * block_k;
+        int smem_scales_a_per_stage = block_m * 4;
+        int smem_b_per_stage = block_n * block_k;
+        int smem_scales_b = div_up(k, block_k) * 4;
+        int smem_barrier = num_stages * 8 * 2;
 
-    int smem_size = 0;
-    smem_size += smem_d;
-    smem_size += num_stages * smem_a_per_stage;
-    smem_size += num_stages * smem_scales_a_per_stage;
-    smem_size += num_stages * smem_b_per_stage;
-    smem_size += div_up(smem_scales_b * (block_k % block_n == 0 ? 1 : 2), 8) * 8;
-    smem_size += smem_barrier;
-    return smem_size;
+        int smem_size = 0;
+        smem_size += smem_d;
+        smem_size += num_stages * smem_a_per_stage;
+        smem_size += num_stages * smem_scales_a_per_stage;
+        smem_size += num_stages * smem_b_per_stage;
+        smem_size += div_up(smem_scales_b * (block_k % block_n == 0 ? 1 : 2), 8) * 8;
+        smem_size += smem_barrier;
+
+        return smem_size;
+    }
+    else
+    {
+        int smem_d = block_n * block_m * 2;
+        int smem_a_per_stage = block_m * block_k;             // weight
+        int smem_scales_a_per_stage = div_up(k, block_k) * 4; // weight scales
+        int smem_b_per_stage = block_n * block_k;             // act
+        int smem_scales_b = div_up(block_n * 4, 128) * 128;   // act scales,tma 128B alignment
+        int smem_barrier = num_stages * 8 * 2;
+
+        int smem_size = 0;
+        smem_size += smem_d;
+        smem_size += num_stages * smem_a_per_stage;
+        smem_size += num_stages * smem_scales_b;
+        smem_size += num_stages * smem_b_per_stage;
+        smem_size += div_up(smem_scales_a_per_stage, 8) * 8;
+        smem_size += smem_barrier;
+
+        return smem_size;
+    }
 }
 
 bool is_tma_multicast_legal(int n, int block_n, int num_tma_multicast, int num_sms)
@@ -119,7 +142,7 @@ bool is_tma_multicast_legal(int n, int block_n, int num_tma_multicast, int num_s
 }
 
 GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_groups,
-    int num_device_sms, bool is_grouped_contiguous = false)
+    int num_device_sms, bool is_grouped_contiguous = false, bool swap_ab = false)
 {
     // Choose candidate block sizes
     std::vector<int> block_ms;
@@ -196,7 +219,7 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 
     for (int num_stages : stage_candidates)
     {
-        int smem_size = get_smem_size(num_stages, shape_k, best_block_m, best_block_n);
+        int smem_size = get_smem_size(num_stages, shape_k, best_block_m, best_block_n, 128, swap_ab);
         if (smem_size <= sm90_capacity)
         {
             best_num_stages = num_stages;
@@ -208,9 +231,19 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
     // Determine TMA multicast settings
     int best_num_tma_multicast = 1;
 
-    if (shape_m >= 1024 && is_tma_multicast_legal(shape_n, best_block_n, 2, num_device_sms) && num_groups == 1)
+    if (!swap_ab)
     {
-        best_num_tma_multicast = 2;
+        if (shape_m >= 1024 && is_tma_multicast_legal(shape_n, best_block_n, 2, num_device_sms) && num_groups == 1)
+        {
+            best_num_tma_multicast = 2;
+        }
+    }
+    else
+    {
+        if (shape_n >= 1024 && is_tma_multicast_legal(shape_m, best_block_m, 2, num_device_sms) && num_groups == 1)
+        {
+            best_num_tma_multicast = 2;
+        }
     }
 
     return std::make_tuple(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size);

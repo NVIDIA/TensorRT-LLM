@@ -14,14 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include "cuda.h"
-#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -48,22 +50,22 @@ namespace
 {
 
 // Get NCCL unique ID for a group of ranks.
-ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
+ncclUniqueId getUniqueId(std::set<int> const& group)
 {
     auto const rank = COMM_SESSION.getRank();
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     ncclUniqueId id;
     if (rank == *group.begin())
     {
-        NCCLCHECK(ncclGetUniqueId(&id));
+        NCCLCHECK_THROW(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            COMM_SESSION.sendValue(id, *it, 0);
+            COMM_SESSION.sendValue(id, *it, tensorrt_llm::mpi::MpiTag::kDefault);
         }
     }
     else
     {
-        COMM_SESSION.recvValue(id, *group.begin(), 0);
+        COMM_SESSION.recvValue(id, *group.begin(), tensorrt_llm::mpi::MpiTag::kDefault);
     }
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;
@@ -120,7 +122,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
 #endif // _WIN32
-    NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+    NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;

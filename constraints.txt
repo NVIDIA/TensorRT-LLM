@@ -1,0 +1,5 @@
+# These vulnerabilities were inherited from the base image (pytorch:25.06-py3) and should be removed when the base image
+# is updated.
+
+# WAR against https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
+protobuf>=4.25.8

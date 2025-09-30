@@ -60,6 +60,20 @@ public:
 
     CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, char const* name) const;
 
+    CUresult cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, char const* name) const;
+
+    CUresult cuLibraryLoadData(CUlibrary* library, void const* code, CUjit_option* jitOptions, void** jitOptionsValues,
+        unsigned int numJitOptions, CUlibraryOption* libraryOptions, void** libraryOptionValues,
+        unsigned int numLibraryOptions) const;
+
+    CUresult cuLibraryGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUlibrary library, char const* name) const;
+
+    CUresult cuLibraryUnload(CUlibrary library) const;
+
+    CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev) const;
+
+    CUresult cuCtxGetDevice(CUdevice* device) const;
+
     CUresult cuLinkAddFile(CUlinkState state, CUjitInputType type, char const* path, unsigned int numOptions,
         CUjit_option* options, void** optionValues) const;
 
@@ -85,6 +99,8 @@ public:
 
     CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) const;
 
+    CUresult cuOccupancyMaxActiveClusters(int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const;
+
 private:
     void* handle;
     CUDADriverWrapper();
@@ -99,6 +115,13 @@ private:
     CUresult (*_cuModuleLoadData)(CUmodule*, void const*);
     CUresult (*_cuModuleGetFunction)(CUfunction*, CUmodule, char const*);
     CUresult (*_cuModuleGetGlobal)(CUdeviceptr*, size_t*, CUmodule, char const*);
+    CUresult (*_cuLibraryGetKernel)(CUkernel*, CUlibrary, char const*);
+    CUresult (*_cuLibraryLoadData)(
+        CUlibrary*, void const*, CUjit_option*, void**, unsigned int, CUlibraryOption*, void**, unsigned int);
+    CUresult (*_cuLibraryGetGlobal)(CUdeviceptr*, size_t*, CUlibrary, char const*);
+    CUresult (*_cuLibraryUnload)(CUlibrary);
+    CUresult (*_cuKernelSetAttribute)(CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev);
+    CUresult (*_cuCtxGetDevice)(CUdevice* device);
     CUresult (*_cuLinkAddFile)(CUlinkState, CUjitInputType, char const*, unsigned int, CUjit_option*, void**);
     CUresult (*_cuLinkAddData)(
         CUlinkState, CUjitInputType, void*, size_t, char const*, unsigned int, CUjit_option*, void**);
@@ -114,6 +137,7 @@ private:
         CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
     CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
     CUresult (*_cuDeviceGetAttribute)(int*, CUdevice_attribute attrib, CUdevice dev);
+    CUresult (*_cuOccupancyMaxActiveClusters)(int*, CUfunction f, CUlaunchConfig const* config);
 };
 
 template <typename T>
@@ -131,6 +155,16 @@ void checkDriver(
     }
 }
 
+template <typename T>
+void checkDriverExitSafe(T result, char const* const func, char const* const file, int const line)
+{
+    if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED)
+    {
+        throw TllmException(
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %d.", func, result).c_str());
+    }
+}
+
 } // namespace tensorrt_llm::common
 
 /*
@@ -141,6 +175,13 @@ void checkDriver(
     {                                                                                                                  \
         tensorrt_llm::common::checkDriver(                                                                             \
             (stat), *tensorrt_llm::common::CUDADriverWrapper::getInstance(), #stat, __FILE__, __LINE__);               \
+    } while (0)
+
+// Avoid using CUDADriverWrapper when freeing resource, during which the global instance may already be freed.
+#define TLLM_CU_CHECK_FREE_RESOURCE(stat)                                                                              \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        tensorrt_llm::common::checkDriverExitSafe((stat), #stat, __FILE__, __LINE__);                                  \
     } while (0)
 
 #endif // CUDA_DRIVER_WRAPPER_H

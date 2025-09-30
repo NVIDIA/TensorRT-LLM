@@ -466,7 +466,7 @@ __inline__ __device__ float compute_rmsnorm2(float val, float s_variance, DType 
     }
 
 // Quantizes the provided PackedVec into the uint32_t output
-template <class Type, bool UE8M0_SF = false>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF = false>
 __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -475,7 +475,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
 
 // Local maximum value.
 #pragma unroll
-    for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++)
     {
         localMax = __hmax2(localMax, __habs2(vec.elts[i]));
     }
@@ -530,10 +530,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
     }
 
     // Convert the input to float.
-    float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+    float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
 
 #pragma unroll
-    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++)
     {
         if constexpr (std::is_same_v<Type, half>)
         {
@@ -566,6 +566,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int res_offset, uint32_t* scale_out, size_t const scale_out_offset, int first_token)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    constexpr int SF_VEC_SIZE = 16;
     using PackedVec = PackedVec<DType>;
     cudaTriggerProgrammaticLaunchCompletion();
     float sf = *scale;
@@ -649,11 +650,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
             uint8_t* sf_out = nullptr;
             if (threadIdx.x % 8 == 0)
             {
-                sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
-                    FP4QuantizationSFLayout::SWIZZLED);
+                sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim / SF_VEC_SIZE,
+                    scale_out + scale_out_offset, QuantizationSFLayout::SWIZZLED);
             }
-            uint32_t val = cvt_warp_fp16_to_fp4_mc(valout, sf, sf_out);
+            uint32_t val = cvt_warp_fp16_to_fp4_mc<DType, SF_VEC_SIZE>(valout, sf, sf_out);
             MULTIMEM_ST(val, mc_ptr_out + (out_lineoffset + line + g * loop_step0));
         }
     }
@@ -681,6 +682,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         uint4* residual_out, int res_offset, uint32_t* scale_out, size_t const scale_out_offset)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    constexpr int SF_VEC_SIZE = 16;
     using PackedVec = PackedVec<DType>;
     cudaTriggerProgrammaticLaunchCompletion();
     float sf = *scale;
@@ -761,10 +763,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
                     (threadIdx.x + g * loop_step0) * sizeof(int4) / sizeof(DType) + j));
                 i++;
             }
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
-                FP4QuantizationSFLayout::SWIZZLED);
-            mc_ptr_out[out_lineoffset + line + g * loop_step0] = cvt_warp_fp16_to_fp4(valout, sf, sf_out);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim / SF_VEC_SIZE,
+                scale_out + scale_out_offset, QuantizationSFLayout::SWIZZLED);
+            mc_ptr_out[out_lineoffset + line + g * loop_step0]
+                = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(valout, sf, sf_out);
         }
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)

@@ -101,6 +101,7 @@ template void deviceMalloc(half** ptr, size_t size, bool is_random_initialize);
 #ifdef ENABLE_BF16
 template void deviceMalloc(__nv_bfloat16** ptr, size_t size, bool is_random_initialize);
 #endif
+template void deviceMalloc(uint32_t** ptr, size_t size, bool is_random_initialize);
 template void deviceMalloc(uint16_t** ptr, size_t size, bool is_random_initialize);
 template void deviceMalloc(int** ptr, size_t size, bool is_random_initialize);
 template void deviceMalloc(bool** ptr, size_t size, bool is_random_initialize);
@@ -144,6 +145,7 @@ template void deviceFree(half*& ptr);
 template void deviceFree(__nv_bfloat16*& ptr);
 #endif
 template void deviceFree(unsigned short*& ptr);
+template void deviceFree(uint32_t*& ptr);
 template void deviceFree(int*& ptr);
 template void deviceFree(bool*& ptr);
 template void deviceFree(char*& ptr);

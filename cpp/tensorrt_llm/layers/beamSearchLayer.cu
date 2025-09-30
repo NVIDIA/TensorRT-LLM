@@ -18,10 +18,11 @@
 #include "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernelsTemplate.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
+
 #include <limits>
 
 using namespace tensorrt_llm::runtime;
@@ -69,7 +70,8 @@ namespace tensorrt_llm::layers
     }
 
 template <typename T>
-BeamSearchLayer<T>::BeamSearchLayer(DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager)
+BeamSearchLayer<T>::BeamSearchLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+    std::shared_ptr<BufferManager> bufferManager)
     : BaseLayer(decoderDomain, bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -79,7 +81,7 @@ BeamSearchLayer<T>::BeamSearchLayer(DecoderDomain const& decoderDomain, std::sha
     SizeType32 const vocabSize{mDecoderDomain.getVocabSize()};
     TLLM_CHECK_WITH_INFO(beamWidth <= kMaxBeamWidth, "Beam width is larger than the maximum supported (%d > %d)",
         int(beamWidth), int(kMaxBeamWidth));
-    this->mVBWS = decoderDomain.getUseVariableBeamWidthSearch();
+    this->mVBWS = mode.isUseVariableBeamWidthSearch();
 
     allocateBuffer();
     configureBeamSearchLayer();
@@ -106,11 +108,14 @@ void BeamSearchLayer<T>::allocateBuffer()
     mEarlyStoppingHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
     mEarlyStoppingDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<int>::value);
 
-    mBeamWidthArrayHost = mBufferManager->pinnedPool(batchSizeXBeamWidthArraySizeShape, TRTDataType<int>::value);
-    mBeamWidthArrayDevice = mBufferManager->gpu(batchSizeXBeamWidthArraySizeShape, TRTDataType<int>::value);
+    if (this->mVBWS)
+    {
+        mBeamWidthArrayHost = mBufferManager->pinnedPool(batchSizeXBeamWidthArraySizeShape, TRTDataType<int>::value);
+        mBeamWidthArrayDevice = mBufferManager->gpu(batchSizeXBeamWidthArraySizeShape, TRTDataType<int>::value);
 
-    mBeamWidthIn = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
-    mBeamWidthOut = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
+        mBeamWidthIn = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
+        mBeamWidthOut = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -275,6 +280,7 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BeamSearchLayer_setup);
 
     SizeType32 const maxBamWidth{mDecoderDomain.getBeamWidth()};
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBamWidth, "Beam width is larger than the constructed for (%d > %d).",
@@ -293,8 +299,12 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
         mLengthPenaltyDevice, batchSlots, std::make_pair(fltMin, fltMax), "length penalty");
     fillBuffers(setupParams->earlyStopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
         mEarlyStoppingDevice, batchSlots, std::make_pair(-fltEpsilon, int32Max), "early stopping");
-    fillBuffers(setupParams->beamWidthArray, DefaultDecodingParams::getBeamWidthArray(), mBeamWidthArrayHost,
-        mBeamWidthArrayDevice, batchSlots, std::make_pair(-fltEpsilon, kMaxBeamWidth), "beam width array");
+
+    if (this->mVBWS)
+    {
+        fillBuffers(setupParams->beamWidthArray, DefaultDecodingParams::getBeamWidthArray(), mBeamWidthArrayHost,
+            mBeamWidthArrayDevice, batchSlots, std::make_pair(-fltEpsilon, kMaxBeamWidth), "beam width array");
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -305,6 +315,7 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BeamSearchLayer_forwardAsync);
 
     auto ip = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
     auto op = std::dynamic_pointer_cast<BeamSearchOutputs>(baseOutputs);
@@ -333,38 +344,43 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     bh.nByteMaxSharedMemoryPerBlock = this->mByteMaxSharedMemoryPerBlock;
     bh.nByteSharedMemoryStage1 = this->mByteSharedMemoryStage1;
     bh.nByteSharedMemoryStage3 = this->mByteSharedMemoryStage3;
-
     bh.diversityRates = bufferCast<float>(*mBeamSearchDiversityRateDevice);
     bh.lengthPenalties = bufferCast<float>(*mLengthPenaltyDevice);
     bh.earlyStoppings = bufferCast<int>(*mEarlyStoppingDevice);
-    bh.beamWidthArraysHost = bufferCast<int>(*mBeamWidthArrayHost);
-    bh.beamWidthArraysDevice = bufferCast<int>(*mBeamWidthArrayDevice);
 
-    bh.nBeamWidthInHost = bufferCast<int>(*mBeamWidthIn);
-    bh.nBeamWidthOutHost = bufferCast<int>(*mBeamWidthOut);
     if (this->mVBWS)
     {
+        bh.beamWidthArraysHost = bufferCast<int>(*mBeamWidthArrayHost);
+        bh.nBeamWidthInHost = bufferCast<int>(*mBeamWidthIn);
+        bh.nBeamWidthOutHost = bufferCast<int>(*mBeamWidthOut);
         int const* batchSlotsHost = bufferCast<int>(*ip->batchSlots);
         for (int i = 0; i < ip->localBatchSize; ++i)
         {
-            int const slot = batchSlotsHost[i];
-            int const step = ip->beamSearchSteps.value()[slot];
+            auto const slot = batchSlotsHost[i];
+            auto const step = ip->beamSearchSteps.value()[slot];
             // Clamp `step` to [0, kMaxBeamWidthArrayLength - 1], and set `indexInput=0` when step = 0 or 1
-            int const indexInput = std::min(std::max((int) step - 1, 0), (int) kMaxBeamWidthArrayLength - 1);
-            int const indexOutput = std::min((int) step, (int) kMaxBeamWidthArrayLength - 1);
+            auto const indexOutput = std::min(step, static_cast<SizeType32>(kMaxBeamWidthArrayLength) - 1);
+            auto const indexInput = std::max(indexOutput - 1, 0);
             bh.nBeamWidthInHost[i] = bh.beamWidthArraysHost[slot * kMaxBeamWidthArrayLength + indexInput];
             bh.nBeamWidthOutHost[i] = bh.beamWidthArraysHost[slot * kMaxBeamWidthArrayLength + indexOutput];
         }
+        // At present, all requests of a batch must have the same beam width in one generation step (or they will not
+        // be batched together). So, the beam width of the first request is taken here to reshape the buffer.
+        // Corresponding changes must be done if Diverse-Beam-Width-Search (DBWS, requests with diverse beam width in
+        // a batch in one generation step) is supported in the future.
+        op->beamWidth = bh.nBeamWidthOutHost[0];
+    }
+    else
+    {
+        op->beamWidth = bh.nBeamWidth;
     }
 
     bh.inputLengths = bufferCast<SizeType32>(*ip->inputLengths.value());
     bh.endIds = bufferCast<TokenIdType>(*ip->endIds);
     bh.batchSlots = workspace->getDeviceBatchSlotsPtr(); // Device copy of `ip->batchSlots`
-
     bh.logProbsTiled = bufferCastOrNull<float>(op->outputLogProbsTiled);
     bh.sequenceLengths = bufferCast<SizeType32>(*op->sequenceLength.value());
     bh.cumLogProbs = bufferCast<float>(*op->cumLogProbs.value());
-
     bh.outputIdsCBA = op->beamHypotheses->outputIdsCBA;
     bh.logProbsCBA = op->beamHypotheses->logProbsCBA;
     bh.sequenceLengthsCBA = op->beamHypotheses->sequenceLengthsCBA;
@@ -372,10 +388,8 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     bh.normedScoresCBA = op->beamHypotheses->normedScoresCBA;
     bh.numBeamsCBA = op->beamHypotheses->numBeamsCBA;
     bh.minNormedScoresCBA = op->beamHypotheses->minNormedScoresCBA;
-
     bh.batchDones = op->beamHypotheses->batchDones;
     bh.finished = reinterpret_cast<FinishedState*>(bufferCast<FinishedState::UnderlyingType>(*op->finished.value()));
-
     bh.outputIdsPtr = bufferCast<TokenIdType*>(*op->outputIdsPtr);
     bh.parentIdsPtr = bufferCast<TokenIdType*>(*op->parentIdsPtr);
 

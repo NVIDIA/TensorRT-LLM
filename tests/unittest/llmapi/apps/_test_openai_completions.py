@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_completion.py
+
 from typing import List
 
 import openai
@@ -7,6 +8,8 @@ import pytest
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
+from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
+                    make_server_with_custom_sampler_fixture)
 
 
 @pytest.fixture(scope="module")
@@ -14,7 +17,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -29,10 +32,9 @@ def num_postprocess_workers(request):
 @pytest.fixture(scope="module")
 def server(model_name: str, backend: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
+    args = ["--backend", f"{backend}"]
+    if backend == "trt":
+        args.extend(["--max_beam_width", "4"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
@@ -76,6 +78,18 @@ def test_single_completion(client: openai.OpenAI, model_name):
         temperature=0.0,
     )
     assert len(completion.choices[0].text) >= 1
+
+
+def test_single_completion_with_too_long_prompt(client: openai.OpenAI,
+                                                model_name):
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is" * 100,
+        max_tokens=5,
+        temperature=0.0,
+    )
+
+    print(completion)
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -312,3 +326,93 @@ async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
             temperature=0.0,
             stream=False,
             stream_options={"continuous_usage_stats": True})
+
+
+def test_detokenize_single(client: openai.OpenAI, model_name):
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is",
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(detokenize=False),
+    )
+
+    choice = completion.choices[0]
+    assert choice.text == ""
+    assert isinstance(choice.token_ids, list)
+    assert len(choice.token_ids) > 0
+
+    # test using token IDs
+    completion = client.completions.create(
+        model=model_name,
+        prompt=[0, 0, 0, 0, 0],
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(detokenize=True),
+    )
+
+    assert completion.choices[0].token_ids is None
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_streaming(async_client: openai.AsyncOpenAI,
+                                    model_name: str):
+    prompt = "Hello, my name is"
+
+    single_completion = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(detokenize=False),
+    )
+    single_output = single_completion.choices[0].token_ids
+    stream = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+        extra_body=dict(detokenize=False),
+    )
+    tokens: List[int] = []
+
+    async for chunk in stream:
+        assert chunk.choices[0].text == ""
+        assert isinstance(chunk.choices[0].token_ids, list)
+        tokens.extend(chunk.choices[0].token_ids)
+
+    assert tokens == single_output
+
+
+# Use the shared fixture from utils.py
+server_with_custom_sampler = make_server_with_custom_sampler_fixture(
+    'completions')
+
+
+@pytest.mark.asyncio(loop_scope='function')
+@pytest.mark.parametrize(
+    'server_with_custom_sampler',
+    [
+        {
+            'sampler_type': "TorchSampler"
+        },  # torch_sampler
+        {
+            'sampler_type': "TRTLLMSampler"
+        },  # trtllm_sampler
+    ],
+    indirect=True,
+    ids=['torch_sampler', 'trtllm_sampler'])
+async def test_completion_with_logit_bias_effect(
+        server_with_custom_sampler: RemoteOpenAIServer,
+        model_name: str) -> None:
+    '''Test that logit bias affects output as expected for both samplers (completions endpoint).'''
+    client = server_with_custom_sampler.get_async_client()
+    await logit_bias_effect_helper(client, model_name, 'completions')
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_with_invalid_logit_bias(
+        async_client: openai.AsyncOpenAI, model_name: str):
+    """Test with invalid token IDs (non-integer keys)"""
+    await invalid_logit_bias_helper(async_client, model_name, 'completions')

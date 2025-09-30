@@ -16,9 +16,17 @@
 import os
 
 import pytest
+import torch
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
-from defs.conftest import get_device_memory, skip_pre_ada
+from defs.conftest import (get_device_memory, get_sm_version,
+                           skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.fixture(scope="module")
@@ -75,11 +83,17 @@ def _test_llm_multimodal_general(llm_venv,
                                  cpp_e2e=False,
                                  num_beams=1):
 
+    # Empty the torch CUDA cache before each multimodal test to reduce risk of OOM errors.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     world_size = tp_size * pp_size
     print("Locate model checkpoints in test storage...")
     tllm_model_name, model_ckpt_path = multimodal_model_root
 
     if "neva-22b" in tllm_model_name and get_device_memory() < 80000:
+        pytest.skip("GPU memory is insufficient.")
+    if "Mistral-Small" in tllm_model_name and get_device_memory() < 80000:
         pytest.skip("GPU memory is insufficient.")
 
     print("Converting huggingface model into binary format...")
@@ -115,7 +129,7 @@ def _test_llm_multimodal_general(llm_venv,
     mllama_model = 'Llama-3.2' in model_name
     qwen2_vl_model = 'Qwen2-VL' in model_name
     internlm_model = 'internlm-xcomposer2' in model_name
-
+    mistral_model = 'Mistral-Small' in model_name
     if enc_dec_model:
         builder_root = enc_dec_example_root
         if nougat_model:
@@ -133,6 +147,8 @@ def _test_llm_multimodal_general(llm_venv,
     elif internlm_model:
         builder_root, model_type = internlm_example_root, "internlm"
     elif llava_model or vila_model:
+        builder_root, model_type = llama_example_root, "llama"
+    elif mistral_model:
         builder_root, model_type = llama_example_root, "llama"
     elif cogvlm_model:
         builder_root, model_type = cogvlm_example_root, "cogvlm"
@@ -214,7 +230,7 @@ def _test_llm_multimodal_general(llm_venv,
     print("Build LLM engines...")
     model_name = model_name.split('/')[-1]  # Remove HF directory name
     llm_engine_dir = f"{engine_dir}/{model_name}/{world_size}-gpu"
-    if "opt" in model_name or llava_model or vila_model or gpt_model or nemotron_model or phi3_model or phi4_model or qwen2_vl_model:
+    if "opt" in model_name or llava_model or vila_model or gpt_model or nemotron_model or phi3_model or phi4_model or qwen2_vl_model or mistral_model:
         max_input_len_text = 1024
         max_output_len = 200
         if llava_next_model:
@@ -227,7 +243,9 @@ def _test_llm_multimodal_general(llm_venv,
             multimodal_len = 196
         elif phi3_model:
             multimodal_len = 5120
-        elif phi4_model:  # @B: Confirm this.
+        elif phi4_model:
+            multimodal_len = 5120
+        elif mistral_model:
             multimodal_len = 5120
         elif "fuyu" in model_name:
             multimodal_len = 2640
@@ -386,6 +404,7 @@ def _test_llm_multimodal_general(llm_venv,
     elif 'Llama-3.2' in model_name: vision_model_type = 'mllama'
     elif "Qwen2-VL" in model_name: vision_model_type = 'qwen2_vl'
     elif 'internlm' in model_name: vision_model_type = 'internlm-xcomposer2'
+    elif 'Mistral-Small' in model_name: vision_model_type = 'pixtral'
 
     vit_batch_size = batch_size
     if vision_model_type == "llava_next":
@@ -606,23 +625,27 @@ def _test_llm_multimodal_general(llm_venv,
     'blip2-flan-t5-xl',
     'llava-1.5-7b-hf',
     'llava-v1.6-mistral-7b-hf',
-    'llava-v1.6-mistral-7b-hf-vision-trtllm',
+    pytest.param('llava-v1.6-mistral-7b-hf-vision-trtllm',
+                 marks=pytest.mark.skipif(get_device_memory() < 50000,
+                                          reason="Skip due to low memory")),
     'llava-onevision-qwen2-7b-ov-hf',
     'llava-onevision-qwen2-7b-ov-hf-video',
-    'nougat-base',
+    pytest.param('nougat-base', marks=skip_post_blackwell),
     'VILA1.5-3b',
     'cogvlm-chat',
     'fuyu-8b',
-    'deplot',
-    'neva-22b',
+    pytest.param('deplot', marks=skip_post_blackwell),
+    pytest.param('neva-22b',
+                 marks=pytest.mark.skip(reason="RCCA https://nvbugs/5220761")),
     'kosmos-2',
-    'video-neva',
-    'Phi-3-vision-128k-instruct',
-    'Phi-3.5-vision-instruct',
-    'Phi-4-multimodal-instruct',
-    'Llama-3.2-11B-Vision',
+    pytest.param('video-neva', marks=skip_post_blackwell),
+    pytest.param('Phi-3-vision-128k-instruct', marks=skip_post_blackwell),
+    pytest.param('Phi-3.5-vision-instruct', marks=skip_post_blackwell),
+    pytest.param('Phi-4-multimodal-instruct', marks=skip_post_blackwell),
+    pytest.param('Llama-3.2-11B-Vision', marks=skip_post_blackwell),
     'Qwen2-VL-7B-Instruct',
     'internlm-xcomposer2-vl-7b',
+    'Mistral-Small-3.1-24B-Instruct-2503',
 ],
                          indirect=True)
 def test_llm_multimodal_general(llm_venv, llm_root, llm_datasets_root,
@@ -672,8 +695,8 @@ def test_llm_multimodal_general(llm_venv, llm_root, llm_datasets_root,
     'Phi-3-vision-128k-instruct',
     'Phi-3.5-vision-instruct',
     'Phi-4-multimodal-instruct',
-    'Llama-3.2-11B-Vision-Instruct',
-    'Llama-3.2-11B-Vision',
+    pytest.param('Llama-3.2-11B-Vision-Instruct', marks=skip_post_blackwell),
+    pytest.param('Llama-3.2-11B-Vision', marks=skip_post_blackwell),
     'Qwen2-VL-7B-Instruct',
 ],
                          indirect=True)

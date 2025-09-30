@@ -16,6 +16,9 @@ methods:
       kv_cache_quant_algo:
         annotation: Optional[tensorrt_llm.quantization.mode.QuantAlgo]
         default: null
+      mamba_ssm_cache_dtype:
+        annotation: Optional[str]
+        default: null
       pre_quant_scale:
         annotation: bool
         default: false

@@ -18,6 +18,7 @@
 #include "envUtils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -49,6 +50,17 @@ std::optional<size_t> getUInt64Env(char const* name)
     return {val};
 };
 
+std::optional<float> getFloatEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    float const val = std::stof(env);
+    return {val};
+}
+
 std::optional<std::string> getStrEnv(char const* name)
 {
     char const* const env = std::getenv(name);
@@ -60,13 +72,13 @@ std::optional<std::string> getStrEnv(char const* name)
 }
 
 // Returns true if the env variable exists and is set to "1"
-static bool getBoolEnv(char const* name)
+bool getBoolEnv(char const* name)
 {
     char const* env = std::getenv(name);
     return env && env[0] == '1' && env[1] == '\0';
 }
 
-std::string trim(std::string const& str)
+static std::string trim(std::string const& str)
 {
     size_t start = str.find_first_not_of(" \t\n\r");
     size_t end = str.find_last_not_of(" \t\n\r");
@@ -74,7 +86,7 @@ std::string trim(std::string const& str)
 }
 
 // Parse memory size
-size_t parseMemorySize(std::string const& input)
+static size_t parseMemorySize(std::string const& input)
 {
     std::string str = trim(input);
 
@@ -98,11 +110,7 @@ size_t parseMemorySize(std::string const& input)
         throw std::invalid_argument("Invalid number format in memory size: " + input);
     }
 
-    for (char& c : unitPart)
-    {
-        c = std::tolower(c);
-    }
-
+    toLower(unitPart);
     size_t multiplier = 1;
     if (unitPart == "b")
     {
@@ -264,6 +272,12 @@ bool getEnvUseMPIKvCache()
     return useMPIKVCache;
 }
 
+bool getEnvUseNixlKvCache()
+{
+    static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
+    return useNixlKvCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;
@@ -281,16 +295,27 @@ std::string getEnvUCXInterface()
     return ucxInterface;
 }
 
+std::string getEnvNixlInterface()
+{
+    static std::once_flag flag;
+    static std::string nixlInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* nixl_interface = std::getenv("TRTLLM_NIXL_INTERFACE");
+            if (nixl_interface)
+            {
+                nixlInterface = nixl_interface;
+            }
+        });
+    return nixlInterface;
+}
+
 bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
     return disaggLayerwise;
-}
-
-bool getEnvParallelCacheSend()
-{
-    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
-    return parallelCacheSend;
 }
 
 bool getEnvRequestKVCacheConcurrent()
@@ -329,6 +354,12 @@ bool getEnvForceDeterministicMOE()
     return forceDeterministic;
 }
 
+bool getEnvMOEDisableFinalizeFusion()
+{
+    static bool const moeDisableFinalizeFusion = getBoolEnv("TRTLLM_MOE_DISABLE_FINALIZE_FUSION");
+    return moeDisableFinalizeFusion;
+}
+
 bool getEnvForceDeterministicAttention()
 {
     static bool const forceDeterministic
@@ -349,7 +380,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTransferOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
@@ -362,10 +393,16 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
     return useAsyncBuffer;
 }
 
+bool getEnvKVCacheTransferUseSyncBuffer()
+{
+    static bool const useSyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
+    return useSyncBuffer;
+}
+
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(1);
     return maxConcurrenceNum;
 }
 
@@ -395,6 +432,22 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
         });
 
     return memSizeForKVCacheTransferBuffer;
+}
+
+uint16_t getEnvNixlPort()
+{
+    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
+    return nixlPort;
+}
+
+bool getEnvDisaggBenchmarkGenOnly()
+{
+    return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
+}
+
+bool getEnvDisableChunkedAttentionInGenPhase()
+{
+    return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
 }
 
 } // namespace tensorrt_llm::common

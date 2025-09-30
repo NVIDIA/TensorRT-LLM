@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
+#include <cinttypes>
 #include <cstdlib>
 #if !defined(_MSC_VER)
 #include <cxxabi.h>
@@ -57,7 +58,13 @@ std::string TllmException::getTrace() const
 #if defined(_MSC_VER)
     return "";
 #else
-    auto const trace = backtrace_symbols(mCallstack.data(), mNbFrames);
+    auto const trace = std::unique_ptr<char const*, void (*)(char const**)>(
+        const_cast<char const**>(backtrace_symbols(mCallstack.data(), mNbFrames)),
+        [](char const** p) { std::free(p); });
+    if (trace == nullptr)
+    {
+        throw std::bad_alloc();
+    }
     std::ostringstream buf;
     for (auto i = 1; i < mNbFrames; ++i)
     {
@@ -70,7 +77,7 @@ std::string TllmException::getTrace() const
         }
         else
         {
-            buf << fmtstr("%-3d %*p %s", i, VOID_PTR_SZ, mCallstack[i], trace[i]);
+            buf << fmtstr("%-3d %*p %s", i, VOID_PTR_SZ, mCallstack[i], trace.get()[i]);
         }
         if (i < mNbFrames - 1)
             buf << std::endl;
@@ -79,7 +86,6 @@ std::string TllmException::getTrace() const
     if (mNbFrames == MAX_FRAMES)
         buf << std::endl << "[truncated]";
 
-    std::free(trace);
     return buf.str();
 #endif
 }
@@ -99,6 +105,27 @@ std::string TllmException::demangle(char const* name)
     }
     return clearName;
 #endif
+}
+
+RequestSpecificException::RequestSpecificException(
+    std::string const& file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode)
+    : std::runtime_error{fmtstr("%s (Request ID: %" PRIu64 ", Error Code: %u) (%s:%zu)", msg, requestID,
+        static_cast<uint32_t>(errorCode), file.c_str(), line)}
+    , mRequestID{requestID}
+    , mErrorCode{errorCode}
+{
+}
+
+RequestSpecificException::~RequestSpecificException() noexcept = default;
+
+uint64_t RequestSpecificException::getRequestId() const noexcept
+{
+    return mRequestID;
+}
+
+RequestErrorCode RequestSpecificException::getErrorCode() const noexcept
+{
+    return mErrorCode;
 }
 
 } // namespace tensorrt_llm::common

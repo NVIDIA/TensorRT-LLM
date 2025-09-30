@@ -47,7 +47,7 @@ FusedLayernormPlugin::FusedLayernormPlugin(void const* data, size_t length)
     read(d, mType);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -82,9 +82,6 @@ nvinfer1::DimsExprs FusedLayernormPlugin::getOutputDimensions(
         {
             ret.d[di] = inputs[0].d[di];
         }
-        // Div up by 16 as the storage type has 16 FP4 values per element.
-        ret.d[ret.nbDims - 1]
-            = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *ret.d[ret.nbDims - 1], *exprBuilder.constant(16));
         return ret;
     }
 
@@ -105,11 +102,8 @@ nvinfer1::DimsExprs FusedLayernormPlugin::getOutputDimensions(
             = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *ret.d[ret.nbDims - 2], *exprBuilder.constant(128));
         ret.d[ret.nbDims - 2] = exprBuilder.operation(DimensionOperation::kPROD, *dimM, *exprBuilder.constant(128));
         // Hidden size dimension.
-        // Div (rounding up) by 64.
-        // 16 elements share one SF, and we need number of SFs to be multiple of 4.
-        // The output data type is already int32_t (4 SFs), so just need to div (rounding up) by 64.
         ret.d[ret.nbDims - 1]
-            = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *ret.d[ret.nbDims - 1], *exprBuilder.constant(64));
+            = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *ret.d[ret.nbDims - 1], *exprBuilder.constant(16));
         return ret;
     }
     catch (std::exception const& e)

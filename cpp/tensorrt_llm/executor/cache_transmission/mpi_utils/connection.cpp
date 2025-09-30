@@ -29,12 +29,12 @@ MpiConnection::MpiConnection(mpi::MpiComm const* comm, int rank)
 
 void MpiConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-    mComm->send(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
+    mComm->sendRawTag(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
 void MpiConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
-    mComm->recv(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
+    mComm->recvRawTag(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
 MpiConnectionManager::MpiConnectionManager(mpi::MpiComm const* comm)

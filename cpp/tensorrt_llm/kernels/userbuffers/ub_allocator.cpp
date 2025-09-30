@@ -14,47 +14,58 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
+#include "tensorrt_llm/common/opUtils.h"
+#include <set>
+#include <stdexcept>
 
 namespace tensorrt_llm::runtime::ub
 {
 UserBufferAllocator& UserBufferAllocator::Instance()
 {
-    static UserBufferAllocator _;
-    return _;
-}
-
-void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
-{
-    if (!is_initialized())
+    if (use_nccl_symmetric)
     {
-        ub_comm_ = nullptr;
-        world_config_ = world_config;
-        create_communicator_grouped2(&ub_comm_, world_config_);
-        TLLM_CHECK(ub_comm_ != nullptr);
-        is_initialized_ = true;
+        static NCCLUserBufferAllocator _;
+        return _;
+    }
+    else
+    {
+        static UserBufferAllocator _;
+        return _;
     }
 }
 
-bool UserBufferAllocator::is_initialized()
+void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
-    return is_initialized_;
+    if (!isInitialized())
+    {
+        mUbComm = nullptr;
+        mWorldConfig = worldConfig;
+        create_communicator_grouped2(&mUbComm, worldConfig);
+        TLLM_CHECK(mUbComm != nullptr);
+        mIsInitialized = true;
+    }
 }
 
-UBBuffer UserBufferAllocator::register_ub_buffer(size_t bytes)
+bool UserBufferAllocator::isInitialized()
 {
-    TLLM_CHECK(is_initialized());
+    return mIsInitialized;
+}
+
+UBBuffer UserBufferAllocator::registerUBBuffer(size_t bytes)
+{
+    TLLM_CHECK(isInitialized());
     void* addr = nullptr;
     int handle = -1;
-    handle = register_user_buffer_collective((void**) &addr, bytes, ub_comm_);
+    handle = register_user_buffer_collective((void**) &addr, bytes, mUbComm);
     return {addr, handle, bytes};
 }
 
 UBBuffer UserBufferAllocator::allocate(size_t bytes)
 {
-    TLLM_CHECK(is_initialized());
-    auto ub_buffer = register_ub_buffer(bytes);
+    TLLM_CHECK(isInitialized());
+    auto ub_buffer = registerUBBuffer(bytes);
     TLLM_CHECK(!ub_buffer.invalid());
-    buffers_.push_back(ub_buffer);
+    mBuffers.push_back(ub_buffer);
     return ub_buffer;
 }
 
@@ -62,13 +73,177 @@ void UserBufferAllocator::deallocate(void* addr) {}
 
 UBBuffer UserBufferAllocator::get(int idx)
 {
-    TLLM_CHECK(is_initialized() && idx < buffers_.size() && !buffers_[idx].invalid());
-    return buffers_[idx];
+    TLLM_CHECK(isInitialized() && idx < mBuffers.size() && !mBuffers[idx].invalid());
+    return mBuffers[idx];
 }
 
 communicator* UserBufferAllocator::comm()
 {
-    TLLM_CHECK(is_initialized());
-    return ub_comm_;
+    TLLM_CHECK(isInitialized());
+    return mUbComm;
 }
+
+void NCCLUserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
+{
+    if (!isInitialized())
+    {
+        TLLM_LOG_INFO("Initializing NCCLUserBufferAllocator");
+        std::set<int> group;
+        for (int i = 0; i < worldConfig.getSize(); i++)
+        {
+            group.insert(i);
+        }
+        mComm = getComm(group);
+        mIsInitialized = true;
+    }
+}
+
+UBBuffer NCCLUserBufferAllocator::registerUBBuffer(size_t bytes)
+{
+    TLLM_CHECK(isInitialized());
+    UBBuffer ub_buffer;
+
+    auto& ncclHelper = getNCCLHelper();
+    if (!ncclHelper.isLoaded())
+    {
+        TLLM_THROW("NCCL library could not be loaded for dynamic symbol access");
+    }
+
+    auto ncclMemAllocFunc = ncclHelper.getNCCLMemAlloc();
+    auto ncclCommWindowRegisterFunc = ncclHelper.getNCCLCommWindowRegister();
+
+    NCCLCHECK(ncclMemAllocFunc(&ub_buffer.addr, bytes));
+    NCCLCHECK(ncclCommWindowRegisterFunc((*mComm), ub_buffer.addr, bytes, &ub_buffer.window, NCCL_WIN_COLL_SYMMETRIC));
+    ub_buffer.handle = 5;
+    ub_buffer.size = bytes;
+    return ub_buffer;
+}
+
+// Static member definitions
+std::unique_ptr<NCCLHelper> NCCLUserBufferAllocator::mNCCLHelper = nullptr;
+
+NCCLHelper& NCCLUserBufferAllocator::getNCCLHelper()
+{
+    if (!mNCCLHelper)
+    {
+        mNCCLHelper = std::make_unique<NCCLHelper>();
+    }
+    return *mNCCLHelper;
+}
+
+// NCCLHelper implementation
+NCCLHelper::NCCLHelper()
+    : mLibraryHandle(nullptr)
+    , mNCCLCommWindowRegister(nullptr)
+    , mNCCLMemAlloc(nullptr)
+    , mIsLoaded(false)
+{
+    loadNCCLLibrary();
+}
+
+NCCLHelper::~NCCLHelper()
+{
+    if (mLibraryHandle)
+    {
+#ifdef _WIN32
+        FreeLibrary(mLibraryHandle);
+#else
+        dlclose(mLibraryHandle);
+#endif
+        mLibraryHandle = nullptr;
+    }
+}
+
+void NCCLHelper::loadNCCLLibrary()
+{
+    try
+    {
+#ifdef _WIN32
+        char const* libraryNames[] = {"nccl.dll"};
+#else
+        char const* libraryNames[] = {"libnccl.so"};
+#endif
+
+        for (int i = 0; libraryNames[i] != nullptr; ++i)
+        {
+            mLibraryHandle = loadLibraryHandle(libraryNames[i]);
+            if (mLibraryHandle)
+            {
+                TLLM_LOG_INFO("Successfully loaded NCCL library: %s", libraryNames[i]);
+                break;
+            }
+        }
+
+        if (!mLibraryHandle)
+        {
+            TLLM_LOG_WARNING("Failed to load NCCL library");
+            return;
+        }
+
+        // Load the required symbols
+        mNCCLCommWindowRegister
+            = reinterpret_cast<ncclCommWindowRegisterFunc>(getSymbolAddress(mLibraryHandle, "ncclCommWindowRegister"));
+
+        mNCCLMemAlloc = reinterpret_cast<ncclMemAllocFunc>(getSymbolAddress(mLibraryHandle, "ncclMemAlloc"));
+
+        if (mNCCLCommWindowRegister == nullptr)
+        {
+            TLLM_LOG_WARNING("Failed to load ncclCommWindowRegister symbol, NCCL symmetric will not be supported.");
+        }
+
+        if (mNCCLMemAlloc)
+        {
+            mIsLoaded = true;
+        }
+        else
+        {
+            TLLM_LOG_WARNING("Failed to load required NCCL symbols");
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("Exception while loading NCCL library: %s", e.what());
+    }
+}
+
+void* NCCLHelper::loadLibraryHandle(char const* libName)
+{
+#ifdef _WIN32
+    return LoadLibraryA(libName);
+#else
+    return dlopen(libName, RTLD_LAZY | RTLD_GLOBAL);
+#endif
+}
+
+void* NCCLHelper::getSymbolAddress(void* handle, char const* symbolName)
+{
+    if (!handle)
+    {
+        return nullptr;
+    }
+
+#ifdef _WIN32
+    return GetProcAddress(static_cast<HMODULE>(handle), symbolName);
+#else
+    return dlsym(handle, symbolName);
+#endif
+}
+
+NCCLHelper::ncclCommWindowRegisterFunc NCCLHelper::getNCCLCommWindowRegister()
+{
+    return mNCCLCommWindowRegister;
+}
+
+NCCLHelper::ncclMemAllocFunc NCCLHelper::getNCCLMemAlloc()
+{
+    return mNCCLMemAlloc;
+}
+
+bool NCCLHelper::isLoaded() const
+{
+    return mIsLoaded;
+}
+
+bool UserBufferAllocator::use_nccl_symmetric = false;
+
 }; // namespace tensorrt_llm::runtime::ub

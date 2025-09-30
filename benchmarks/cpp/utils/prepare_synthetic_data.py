@@ -1,9 +1,34 @@
 import random
+import warnings
 
 import click
 from utils.utils import (gen_random_tokens, get_norm_dist_lengths,
                          get_unif_dist_lengths, print_text_dataset,
                          text_dataset_dump)
+
+
+def _generate_task_ids_and_lora_config(root_args, num_reqs):
+    """Generate task IDs and determine LoRA configuration based on root_args."""
+    if root_args.rand_task_id is None:
+        task_ids = [root_args.task_id for _ in range(num_reqs)]
+    else:
+        min_id, max_id = root_args.rand_task_id
+        task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
+
+    use_task_ids = root_args.task_id != -1 or root_args.rand_task_id is not None
+
+    # Determine if LoRA should be used (requires both task IDs and lora_dir)
+    use_lora = use_task_ids and root_args.lora_dir is not None
+
+    # Warn if task IDs are specified but no LoRA directory is provided
+    if use_task_ids and not use_lora:
+        warnings.warn(
+            "Task IDs require LoRA directory. Use --lora-dir or omit task IDs.",
+            UserWarning)
+
+    return (task_ids, task_ids if use_task_ids else None, {
+        "lora_dir": root_args.lora_dir
+    } if use_lora else None)
 
 
 @click.command()
@@ -33,7 +58,6 @@ def token_norm_dist(root_args, **kwargs):
     input_ids = []
     input_lens = []
     output_lens = []
-    task_ids = []
 
     input_lens = get_norm_dist_lengths(kwargs['input_mean'],
                                        kwargs['input_stdev'],
@@ -51,11 +75,8 @@ def token_norm_dist(root_args, **kwargs):
     input_ids = gen_random_tokens(input_lens, root_args.tokenizer,
                                   root_args.random_seed)
 
-    if root_args.rand_task_id is None:
-        task_ids = [root_args.task_id for _ in range(num_reqs)]
-    else:
-        min_id, max_id = root_args.rand_task_id
-        task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
+    task_ids, print_task_ids, lora_config = _generate_task_ids_and_lora_config(
+        root_args, num_reqs)
 
     if not root_args.std_out:
         text_dataset_dump(
@@ -71,10 +92,10 @@ def token_norm_dist(root_args, **kwargs):
                 "max_output_len": max_output_len
             }, root_args.output)
     else:
-        print_text_dataset(
-            input_ids,
-            output_lens,
-        )
+        print_text_dataset(input_ids,
+                           output_lens,
+                           task_ids=print_task_ids,
+                           lora_config=lora_config)
 
 
 @click.command()
@@ -104,7 +125,6 @@ def token_unif_dist(root_args, **kwargs):
     input_ids = []
     input_lens = []
     output_lens = []
-    task_ids = []
 
     input_lens = get_unif_dist_lengths(kwargs['input_min'], kwargs['input_max'],
                                        kwargs['num_requests'],
@@ -121,11 +141,8 @@ def token_unif_dist(root_args, **kwargs):
     input_ids = gen_random_tokens(input_lens, root_args.tokenizer,
                                   root_args.random_seed)
 
-    if root_args.rand_task_id is None:
-        task_ids = [root_args.task_id for _ in range(num_reqs)]
-    else:
-        min_id, max_id = root_args.rand_task_id
-        task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
+    task_ids, print_task_ids, lora_config = _generate_task_ids_and_lora_config(
+        root_args, num_reqs)
 
     if not root_args.std_out:
         text_dataset_dump(
@@ -141,7 +158,7 @@ def token_unif_dist(root_args, **kwargs):
                 "max_output_len": max_output_len
             }, root_args.output)
     else:
-        print_text_dataset(
-            input_ids,
-            output_lens,
-        )
+        print_text_dataset(input_ids,
+                           output_lens,
+                           task_ids=print_task_ids,
+                           lora_config=lora_config)

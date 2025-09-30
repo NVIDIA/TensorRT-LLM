@@ -748,13 +748,13 @@ TEST_P(ParamTest, createResponse)
 
 INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,
     testing::Combine(
-        // streaming
-        testing::Values(false, true),
+        // TODO: Support and add coverage for streamLLM
+        testing::Values(false),
         // excludeInputFromOutput
         testing::Values(false, true),
         // returnAllGeneratedTokens
         testing::Values(false, true),
-        // beamWdith
+        // beamWidth
         testing::Values(1, 2),
         // tokensPerIteration
         testing::Values(1, 3),

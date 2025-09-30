@@ -40,14 +40,16 @@ struct Vec2Type<__nv_bfloat16>
 }; // namespace
 
 template <typename T_in, typename T_out, int kProcessRows, typename AccessType>
-__global__ void apply_per_channel_scale(
-    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols)
+__global__ void apply_per_channel_scale(T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows,
+    int cols, int64_t const* num_valid_tokens_ptr)
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     T_in scale[kElems], act_vec[kElems];
-    int col_offset = blockIdx.x * blockDim.x + threadIdx.x;
-    int row_offset = blockIdx.y;
+    int col_offset = blockIdx.y * blockDim.x + threadIdx.x;
+    int row_offset = blockIdx.x;
     if (col_offset * kElems >= cols || row_offset * kProcessRows >= rows)
+        return;
+    if (num_valid_tokens_ptr && (row_offset * kProcessRows >= *num_valid_tokens_ptr))
         return;
     act += row_offset * kProcessRows * cols;
     smoothed_act += row_offset * kProcessRows * cols;
@@ -95,46 +97,46 @@ __global__ void apply_per_channel_scale(
 }
 
 template <typename T_in, typename T_out, int kProcessRows, typename AccessType = float4>
-void apply_per_channel_scale_kernel_launcher_(
-    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, cudaStream_t stream = 0)
+void apply_per_channel_scale_kernel_launcher_(T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale,
+    int rows, int cols, int64_t const* num_valid_tokens_ptr = nullptr, cudaStream_t stream = 0)
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     dim3 block(128);
-    dim3 grid((cols / kElems + block.x - 1) / block.x, (rows + kProcessRows - 1) / kProcessRows);
+    dim3 grid((rows + kProcessRows - 1) / kProcessRows, (cols / kElems + block.x - 1) / block.x);
     apply_per_channel_scale<T_in, T_out, kProcessRows, AccessType>
-        <<<grid, block, 0, stream>>>(smoothed_act, act, per_channel_scale, rows, cols);
+        <<<grid, block, 0, stream>>>(smoothed_act, act, per_channel_scale, rows, cols, num_valid_tokens_ptr);
 }
 
 template <typename T_in, typename T_out>
-void apply_per_channel_scale_kernel_launcher(
-    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, cudaStream_t stream)
+void apply_per_channel_scale_kernel_launcher(T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale,
+    int rows, int cols, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
 {
-    int elems = rows * cols;
+    uint64_t elems = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
     if (elems < 2048 * 2048)
     {
         apply_per_channel_scale_kernel_launcher_<T_in, T_out, 1, float4>(
-            smoothed_act, act, per_channel_scale, rows, cols, stream);
+            smoothed_act, act, per_channel_scale, rows, cols, num_valid_tokens_ptr, stream);
     }
     else if (elems < 4096 * 4096)
     {
         apply_per_channel_scale_kernel_launcher_<T_in, T_out, 4, float4>(
-            smoothed_act, act, per_channel_scale, rows, cols, stream);
+            smoothed_act, act, per_channel_scale, rows, cols, num_valid_tokens_ptr, stream);
     }
     else if (elems < 8192 * 8192)
     {
         apply_per_channel_scale_kernel_launcher_<T_in, T_out, 8, float4>(
-            smoothed_act, act, per_channel_scale, rows, cols, stream);
+            smoothed_act, act, per_channel_scale, rows, cols, num_valid_tokens_ptr, stream);
     }
     else
     {
         apply_per_channel_scale_kernel_launcher_<T_in, T_out, 16, float4>(
-            smoothed_act, act, per_channel_scale, rows, cols, stream);
+            smoothed_act, act, per_channel_scale, rows, cols, num_valid_tokens_ptr, stream);
     }
 }
 
 #define INSTANTIATE_PREQUANT_SCALE(T_in, T_out)                                                                        \
-    template void apply_per_channel_scale_kernel_launcher<T_in, T_out>(                                                \
-        T_out * smoothed_act, const T_in* act, const T_in* per_channel_scale, int rows, int cols, cudaStream_t stream)
+    template void apply_per_channel_scale_kernel_launcher<T_in, T_out>(T_out * smoothed_act, const T_in* act,          \
+        const T_in* per_channel_scale, int rows, int cols, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
 
 INSTANTIATE_PREQUANT_SCALE(half, half);
 #if defined(ENABLE_FP8)

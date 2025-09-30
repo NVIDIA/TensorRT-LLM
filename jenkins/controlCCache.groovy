@@ -1,10 +1,13 @@
 
 import java.lang.InterruptedException
 
-DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504250100-3759"
+DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508130930-6501"
 
-def createKubernetesPodConfig(image)
+def createKubernetesPodConfig(image, arch = "amd64")
 {
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+
     def podConfig = [
         cloud: "kubernetes-cpu",
         namespace: "sw-tensorrt",
@@ -31,24 +34,24 @@ def createKubernetesPodConfig(image)
                     resources:
                       requests:
                         cpu: 2
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: 2
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:
@@ -116,10 +119,10 @@ pipeline {
                               case "Reset":
                                 sh "rm -rf ${CCACHE_DIR}"
                                 sh "mkdir -p ${CCACHE_DIR}"
-                                sh "printf \"max_size=300G\ntemporary_dir=/tmp/ccache\ncompression = true\n\" > ${CCACHE_DIR}/ccache.conf"
+                                sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Config":
-                                sh "printf \"max_size=300G\ntemporary_dir=/tmp/ccache\ncompression = true\n\" > ${CCACHE_DIR}/ccache.conf"
+                                sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Stats":
                                 sh "ccache -sv"

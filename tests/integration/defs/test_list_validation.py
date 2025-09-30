@@ -87,7 +87,7 @@ def validate_perf_tests(perf_test_names) -> bool:
     return passed
 
 
-def test_list_validation(turtle_root, all_pytest_items, trt_config,
+def test_list_validation(test_root, all_pytest_items, trt_config,
                          is_trt_environment):
 
     # Don't run test list validation in TRT environment because TRT uses
@@ -99,13 +99,13 @@ def test_list_validation(turtle_root, all_pytest_items, trt_config,
         return
 
     # Glob all the test list files.
-    test_list_path = os.path.join(turtle_root, "test_lists", "*", "*.txt")
+    test_list_path = os.path.join(test_root, "test_lists", "*", "*.txt")
     all_test_lists = glob.glob(test_list_path)
     assert len(all_test_lists
                ) > 0, f"Cannot find any test lists with path {test_list_path}!"
 
     # Glob all the test db files.
-    test_db_path = os.path.join(turtle_root, "test_lists", "*", "*.yml")
+    test_db_path = os.path.join(test_root, "test_lists", "*", "*.yml")
     all_test_dbs = glob.glob(test_db_path)
     assert len(all_test_dbs
                ) > 0, f"Cannot find any test lists with path {test_db_path}!"

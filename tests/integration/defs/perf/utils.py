@@ -19,14 +19,17 @@ import io
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+import requests
 from _pytest.nodes import Item
 from _pytest.python import Function
-from defs.trt_test_alternative import check_output, print_error, print_info
+from defs.trt_test_alternative import (check_output, popen, print_error,
+                                       print_info)
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -83,7 +86,7 @@ def collect_and_clean_myelin_time(log: str):
 
 class PerfMetricType(str, Enum):
     """
-    An string-enum type to define what kind of perf metric it is. While it is not used by TURTLE, it is used by QA to
+    An string-enum type to define what kind of perf metric it is. It is used by QA to
     set up special threshold criteria for each type of metrics (like >50MB for engine size increase, etc.).
     """
     INFERENCE_TIME = "INFERENCE_TIME"
@@ -99,6 +102,8 @@ class PerfMetricType(str, Enum):
     SEQ_THROUGHPUT = "SEQ_THROUGHPUT"
     SEQ_LATENCY = "SEQ_LATENCY"
     KV_CACHE_SIZE = "KV_CACHE_SIZE"
+    DISAGG_SERVER_E2EL = "DISAGG_SERVER_E2EL"
+    DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
 
 
 class PerfScriptTestCmds(NamedTuple):
@@ -218,13 +223,18 @@ class PerfBenchScriptTestCmds(NamedTuple):
             envs = copy.deepcopy(os.environ)
             prepare_cmds = prepare_cmd_str.split(';')
             for prepare_cmd in prepare_cmds:
-                print(f'Now running prepare data command: "{prepare_cmd}"')
-                cmd = prepare_cmd.split('>')[0]
-                dataset_file = prepare_cmd.split('>')[1].split()[0]
+                print_info(f'Now running prepare data command: "{prepare_cmd}"')
+                if '>' in prepare_cmd:
+                    cmd = prepare_cmd.split('>')[0]
+                    dataset_file = prepare_cmd.split('>')[1].split()[0]
+                else:
+                    cmd = prepare_cmd
+                    dataset_file = None
                 output += subprocess.check_output(cmd.split(),
                                                   env=envs).decode()
-                with open(f"{dataset_file}", 'w+') as f:
-                    f.write(output)
+                if dataset_file:
+                    with open(f"{dataset_file}", 'w+') as f:
+                        f.write(output)
 
         elif cmd_idx == len(self.data_cmds):
             #running build
@@ -246,7 +256,7 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 output += subprocess.check_output(command, env=envs).decode()
         else:
             #running throughput
-            print(f'Now running benchmarking command: "{current_cmd_str}"')
+            print_info(f'Now running benchmarking command: "{current_cmd_str}"')
             command = self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)]
             if self.is_python:
                 if len(mpi_cmd) > 0:
@@ -301,6 +311,68 @@ class PerfBenchScriptTestCmds(NamedTuple):
         return cmd_str
 
 
+class PerfDisaggScriptTestCmds(NamedTuple):
+    ctx_cmd: str
+    gen_cmd: str
+    server_cmd: str
+    client_cmd: List[str]
+    benchmark_cmd: List[str]
+
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(1)
+                if requests.get(url).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        output = ""
+        try:
+            with (  # Start ctx workers
+                    open('output_ctx.log', 'w') as output_ctx,
+                    popen(self.ctx_cmd,
+                          stdout=output_ctx,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as ctx_workers_proc,
+                    # Start gen workers
+                    open('output_gen.log', 'w') as output_gen,
+                    popen(self.gen_cmd,
+                          stdout=output_gen,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as gen_workers_proc,
+                    # Start server
+                    open('output_server.log', 'w') as output_server,
+                    popen(self.server_cmd,
+                          stdout=output_server,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as server_proc):
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=1800)  # 30 minutes for large models
+                check_output(self.client_cmd, env=venv._new_env)
+                output += check_output(self.benchmark_cmd, env=venv._new_env)
+        finally:
+            server_proc.terminate()
+            ctx_workers_proc.terminate()
+            gen_workers_proc.terminate()
+            server_proc.wait()
+            ctx_workers_proc.wait()
+            gen_workers_proc.wait()
+        return output
+
+    def get_cmd_str(self, cmd_idx) -> List[str]:
+        return ["disaggregated server tests, please check config files"]
+
+
 class AbstractPerfScriptTestClass(abc.ABC):
     """
     Abstract class for all script-based perf tests.
@@ -347,13 +419,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
         """
         Get the absolute threshold used to flag a perf regression compared to perf baseline.
         Perf comparison will only fail if it exceeds both relative and absolute thresholds.
-        Note: This is not honored by TURTLE for now, but we can add the support later.
         """
         return 0.0
 
     def get_metric_type(self) -> PerfMetricType:
         """
-        Get the type of perf metric. This does not affect TURTLE for now, but QA uses this field to set up special
+        Get the type of perf metric. QA uses this field to set up special
         threshold criteria depending on the metric type.
         """
         return PerfMetricType.INFERENCE_TIME
@@ -404,6 +475,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         self._gpu_clock_lock = gpu_clock_lock
         tmpDir = temp_wd(self.get_working_dir())
 
+        is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
+            cmd_idx)
+
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -417,15 +491,18 @@ class AbstractPerfScriptTestClass(abc.ABC):
                                 buf), self._gpu_clock_lock, tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
+                            # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
                     else:
                         with contextlib.redirect_stdout(buf), tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
+                            # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    print(buf.getvalue())
+                    if not is_prepare_dataset_cmd:
+                        print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
                 print_info(f"Reusing cached logs for command index {cmd_idx}.")
@@ -457,10 +534,11 @@ class AbstractPerfScriptTestClass(abc.ABC):
         # Only save perf result if the result is valid.
         if self._result_state == "valid":
             # Parse the perf result from the test outputs.
-            if self._config.runtime == 'bench' and cmd_idx == 0:
+            if is_prepare_dataset_cmd:
                 print_info(
                     f"skip writing perf result when calling generating dataset in trtllm-bench"
                 )
+                outputs.pop(cmd_idx)
             else:
                 self._perf_result = self.get_perf_result(outputs)
 
@@ -508,7 +586,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         # Serialize the commands.
         serialized_cmd = self.get_commands().get_cmd_str(cmd_idx)
-
         # Save engine building log + benchmarking log in the csv file.
         raw_result = ""
         if 0 in outputs:
@@ -525,8 +602,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "original_test_name":
             original_test_name
             if original_test_name is not None else full_test_name,
-            "raw_result":
-            raw_result,
             "perf_metric":
             self._perf_result,
             "total_time__sec":
@@ -555,8 +630,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if "csv" in session_data_writer._output_formats:
             csv_name = "perf_script_test_results.csv"
             cvs_result_dict = {**test_description_dict, **test_result_dict}
-            cvs_result_dict["raw_result"] = cvs_result_dict[
-                "raw_result"].replace("\n", "\\n")
+            if "raw_result" in cvs_result_dict:
+                cvs_result_dict["raw_result"] = cvs_result_dict[
+                    "raw_result"].replace("\n", "\\n")
             write_csv(output_dir,
                       csv_name, [cvs_result_dict],
                       list(cvs_result_dict.keys()),

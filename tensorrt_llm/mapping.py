@@ -12,7 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from enum import IntEnum
 from typing import List
+
+import torch
+
+
+class CpType(IntEnum):
+    # CP type for ulysses parallelism
+    ULYSSES = 0
+    # CP type for star attention
+    STAR = 1
+    # CP type for ring attention
+    RING = 2
+    # CP type for helix parallelism
+    HELIX = 3
 
 
 class Mapping(object):
@@ -127,64 +141,77 @@ class Mapping(object):
             attn_tp_size=-1,
             attn_cp_size=-1,
             auto_parallel=False,
-            enable_attention_dp=False):
+            enable_attention_dp=False,
+            enable_lm_head_tp_in_adp=False):
         # set default values for non-moe cases
         # or where only one MOE parallelism size is specified
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
+        cp_type = CpType.ULYSSES if cp_config is None else cp_config.get(
+            "cp_type", CpType.ULYSSES)
+        moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
+
         if moe_tp_size == -1 and moe_ep_size == -1:
-            moe_tp_size = tp_size // moe_cluster_size
+            moe_tp_size = moe_world_size // moe_cluster_size
             moe_ep_size = 1
 
         elif moe_tp_size == -1:
-            moe_tp_size = tp_size // (moe_ep_size * moe_cluster_size)
+            moe_tp_size = moe_world_size // (moe_ep_size * moe_cluster_size)
 
         elif moe_ep_size == -1:
-            moe_ep_size = tp_size // (moe_tp_size * moe_cluster_size)
+            moe_ep_size = moe_world_size // (moe_tp_size * moe_cluster_size)
 
         if attn_tp_size == -1 and attn_cp_size == -1:
-            # fallback to ulysses
-            attn_tp_size = tp_size * cp_size
-            attn_cp_size = 1
+            if cp_type == CpType.ULYSSES:
+                # fallback to ulysses
+                attn_tp_size = tp_size * cp_size
+                attn_cp_size = 1
+            else:
+                # fallback to helix
+                attn_tp_size = tp_size
+                attn_cp_size = cp_size
 
         elif attn_tp_size == -1:
-            attn_tp_size = cp_size * tp_size // attn_cp_size
+            attn_tp_size = (tp_size * cp_size) // attn_cp_size
 
         elif attn_cp_size == -1:
-            attn_cp_size = cp_size * tp_size // attn_tp_size
+            attn_cp_size = (tp_size * cp_size) // attn_tp_size
 
-        if attn_cp_size != 1:
+        if attn_cp_size != 1 and cp_type == CpType.ULYSSES:
             raise ValueError(
-                f"attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
+                f"attn_cp_size must be 1 for now for ulysses, but got {attn_tp_size}, {attn_cp_size}."
             )
 
         if auto_parallel:
-            if tp_size != 1 or pp_size != 1 or tp_size != 1:
+            if tp_size != 1 or pp_size != 1 or cp_size != 1:
                 raise ValueError(
-                    f"When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, but got {tp_size}, {pp_size}, {cp_size}."
-                )
+                    "When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, "
+                    f"but got {tp_size}, {pp_size}, {cp_size}.")
         else:
             if tp_size * pp_size * cp_size != world_size:
                 raise ValueError(
-                    f"world_size must equal to tp_size * pp_size * cp_size, but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
+                    "world_size must equal to tp_size * pp_size * cp_size, "
+                    f"but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
                 )
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
-        if moe_tp_cluster_ep_size != tp_size:
+        if moe_tp_cluster_ep_size != moe_world_size:
             raise ValueError(
-                f"tp_size must equal to moe_tp_size * moe_ep_size * moe_cluster_size, but got {tp_size} != {moe_tp_size} * {moe_ep_size} * {moe_cluster_size}"
-            )
+                "moe_tp_size * moe_ep_size * moe_cluster_size must equal to moe_world_size, "
+                f"but got {moe_tp_cluster_ep_size} != {moe_world_size}")
 
         attn_tp_cp_size = attn_tp_size * attn_cp_size
         if attn_tp_cp_size != tp_size * cp_size:
             raise ValueError(
-                f"tp_size * cp_size must equal to attn_tp_size * attn_cp_size, but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
+                "tp_size * cp_size must equal to attn_tp_size * attn_cp_size, "
+                f"but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
-        if moe_ep_size != 1 and cp_size > 1:
-            raise NotImplementedError("CP don't support MoE tp/ep yet")
+        if moe_ep_size != 1 and cp_size > 1 and cp_type != CpType.HELIX:
+            raise NotImplementedError(
+                f"CP {cp_type} doesn't support MoE tp/ep yet")
 
         self.tp_size = tp_size
         self.cp_size = cp_size
@@ -198,6 +225,9 @@ class Mapping(object):
         self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.enable_attention_dp = enable_attention_dp
+        if enable_lm_head_tp_in_adp:
+            assert enable_attention_dp, "enable_lm_head_tp_in_adp requires enable_attention_dp"
+        self.enable_lm_head_tp_in_adp = enable_lm_head_tp_in_adp
         self.rank = rank
         self.gpus_per_node = gpus_per_node
         self.pp_groups = []
@@ -241,8 +271,10 @@ class Mapping(object):
         for i in range(pp_size):
             for j in range(moe_tp_size):
                 ranks = range(
-                    i * moe_tp_cluster_ep_size + j * moe_cluster_size,
-                    i * moe_tp_cluster_ep_size + (j + 1) * moe_cluster_size)
+                    i * moe_tp_cluster_ep_size +
+                    j * moe_cluster_size * moe_ep_size,
+                    i * moe_tp_cluster_ep_size +
+                    (j + 1) * moe_cluster_size * moe_ep_size)
                 self.moe_cluster_groups.append(list(ranks))
 
         # init moe ep group
@@ -271,6 +303,7 @@ class Mapping(object):
                 and self.moe_ep_size == other.moe_ep_size
                 and self.attn_tp_size == other.attn_tp_size
                 and self.attn_cp_size == other.attn_cp_size
+                and self.cp_config == other.cp_config
                 and self.auto_parallel == other.auto_parallel)
 
     def __hash__(self):
@@ -286,6 +319,8 @@ class Mapping(object):
             self.moe_ep_size,
             self.attn_tp_size,
             self.attn_cp_size,
+            # note: we do not allow updating cp_config after initialization
+            tuple(sorted(self.cp_config.items())),
             self.auto_parallel,
         ))
 
@@ -297,8 +332,7 @@ class Mapping(object):
     def rank(self, rank: int):
         # TODO(qijun): skip check for enable_attention_dp temporarily, will support attention_dp_size
         if not self.enable_attention_dp:
-            if not isinstance(rank,
-                              int) or rank < 0 and rank >= self.world_size:
+            if not isinstance(rank, int) or rank < 0 or rank >= self.world_size:
                 raise ValueError(
                     f"Rank should be an integer between 0 and {self.world_size-1}, but got {rank}."
                 )
@@ -351,16 +385,14 @@ class Mapping(object):
 
     @property
     def moe_cluster_group(self):
-        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size *
-                                       self.moe_ep_size +
-                                       self.moe_tp_rank * self.moe_ep_size +
-                                       self.moe_ep_rank]
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+                                       self.moe_tp_rank]
 
     @property
     def moe_ep_group(self):
-        return self.moe_ep_groups[self.pp_rank * self.moe_cluster_size *
-                                  self.moe_tp_size +
-                                  self.tp_rank * self.moe_cluster_size +
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
+                                  self.moe_cluster_size +
+                                  self.moe_tp_rank * self.moe_cluster_size +
                                   self.moe_cluster_rank]
 
     @property
@@ -371,8 +403,17 @@ class Mapping(object):
     def local_rank(self):
         return self.rank % self.gpus_per_node
 
-    def has_cp(self):
-        return self.cp_size > 1
+    @property
+    def dp_size(self):
+        return self.tp_size if self.enable_attention_dp else 1
+
+    def has_cp_ulysses(self):
+        return self.cp_size > 1 and self.cp_config.get(
+            "cp_type") == CpType.ULYSSES
+
+    def has_cp_helix(self):
+        return self.cp_size > 1 and self.cp_config.get(
+            "cp_type") == CpType.HELIX
 
     def get_node_rank(self, rank: int):
         return rank // self.gpus_per_node
@@ -410,6 +451,29 @@ class Mapping(object):
             p = p - self.world_size
         return p
 
+    def is_last_cp_rank(self):
+        return self.cp_rank == self.cp_size - 1
+
+    def is_first_cp_rank(self):
+        return self.cp_rank == 0
+
+    def has_cp(self):
+        return self.cp_size > 1
+
+    def prev_cp_rank(self):
+        p = self.rank - self.tp_size
+        if p // (self.tp_size * self.cp_size) < self.rank // (self.tp_size *
+                                                              self.cp_size):
+            return p + self.tp_size * self.cp_size
+        return p
+
+    def next_cp_rank(self):
+        p = self.rank + self.tp_size
+        if p // (self.tp_size * self.cp_size) > self.rank // (self.tp_size *
+                                                              self.cp_size):
+            return p - self.tp_size * self.cp_size
+        return p
+
     def has_moe_cluster(self):
         return self.moe_cluster_size > 1
 
@@ -419,16 +483,10 @@ class Mapping(object):
     def has_moe_ep(self):
         return self.moe_ep_size > 1
 
-    # TODO: Add support of uneven/arbitrary layer segmentation
     def pp_layers(self, num_layers: int) -> List[int]:
-        layers_per_pipeline_stage = num_layers // self.pp_size
-        if self.pp_rank == self.pp_size - 1:
-            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
-                                 num_layers)
-        else:
-            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
-                                 (self.pp_rank + 1) * layers_per_pipeline_stage)
-        return list(layers_range)
+        # If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return torch.tensor_split(torch.arange(num_layers),
+                                  self.pp_size)[self.pp_rank].tolist()
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
@@ -454,5 +512,8 @@ class Mapping(object):
             'moe_ep_size': self.moe_ep_size,
             'attn_tp_size': self.attn_tp_size,
             'attn_cp_size': self.attn_cp_size,
+            'cp_config': self.cp_config,
             'auto_parallel': self.auto_parallel,
+            'enable_attention_dp': self.enable_attention_dp,
+            'enable_lm_head_tp_in_adp': self.enable_lm_head_tp_in_adp,
         }

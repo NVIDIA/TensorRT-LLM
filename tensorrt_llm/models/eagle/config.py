@@ -59,7 +59,7 @@ class EagleConfig(LLaMAConfig):
             **kwargs):
         import transformers
         trust_remote_code = kwargs.pop('trust_remote_code', True)
-        speculative_config_or_dir = kwargs.pop('speculative_model', None)
+        speculative_config_or_dir = kwargs.pop('speculative_model_dir', None)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir

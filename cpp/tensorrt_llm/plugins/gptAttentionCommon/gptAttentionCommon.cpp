@@ -46,6 +46,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     int32_t spec_decoding_max_generation_length, bool is_mla_enabled, int q_lora_rank, int kv_lora_rank,
     int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool fuse_fp4_quant, bool skip_attn, int cp_size,
     int cp_rank, std::set<int32_t> cp_group)
+    : mResource{DecoderXQARunner::getResourceGlobal()}
 {
     mLayerIdx = layer_idx;
     mNumHeads = num_heads;
@@ -71,8 +72,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     mMaskType = mask_type;
     mBlockSparseParams = block_sparse_params;
     mType = type;
-    mMultiBlockMode
-        = is_spec_decoding_enabled ? false : true; // set to true in build time to account for enough workspace size
+    mMultiBlockMode = true;
     mEnableXQA = true;
     mKVCacheQuantMode = tc::QuantMode(kv_cache_quant_mode);
     mRemovePadding = remove_input_padding;
@@ -90,6 +90,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     mDenseContextFMHA = dense_context_fmha;
     mPagedContextFMHA = use_paged_context_fmha;
     mFP8ContextFMHA = use_fp8_context_fmha;
+    mFP8AttenOutput = use_fp8_context_fmha;
     mHasFullAttentionMask = has_full_attention_mask;
     mUseKVCache = use_cache;
     mIsSpecDecodingEnabled = is_spec_decoding_enabled;
@@ -106,6 +107,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
 
 // Parameterized constructor
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t length)
+    : mResource{DecoderXQARunner::getResourceGlobal()}
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     unsigned int kvCacheQuantMode;
@@ -152,6 +154,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mDenseContextFMHA);
     read(d, mPagedContextFMHA);
     read(d, mFP8ContextFMHA);
+    read(d, mFP8AttenOutput);
     read(d, mHasFullAttentionMask);
     read(d, mUseKVCache);
     read(d, mIsSpecDecodingEnabled);
@@ -170,8 +173,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
 
     uint32_t decoderXQARunnerResourceSerializedSize;
     read(d, decoderXQARunnerResourceSerializedSize);
-    DecoderXQARunner::getResourceGlobal()->merge(
-        DecoderXQARunner::Resource(d, decoderXQARunnerResourceSerializedSize), /*initialize=*/true);
+    mResource->merge(DecoderXQARunnerResource(d, decoderXQARunnerResourceSerializedSize), /*initialize=*/true);
     d += decoderXQARunnerResourceSerializedSize;
 
     mCpGroup.clear();
@@ -183,7 +185,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     }
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
     TLLM_CHECK_WITH_INFO((smVersion() >= 80) || (mType != nvinfer1::DataType::kBF16),
@@ -213,13 +215,13 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mBlockSparseParams) + sizeof(mPagedKVCache)
         + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
-        + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mHasFullAttentionMask) + sizeof(mUseKVCache)
-        + sizeof(mUnfuseQkvGemm) + sizeof(mUseLognScaling) + sizeof(mIsSpecDecodingEnabled) + sizeof(mUseSpecDecoding)
-        + sizeof(mSpecDecodingIsGenerationLengthVariable) + sizeof(mSpecDecodingMaxGenerationLength)
-        + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mFuseFp4Quant)
-        + sizeof(mSkipAttn) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
-        + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size()
-        + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
+        + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mFP8AttenOutput) + sizeof(mHasFullAttentionMask)
+        + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm) + sizeof(mUseLognScaling) + sizeof(mIsSpecDecodingEnabled)
+        + sizeof(mUseSpecDecoding) + sizeof(mSpecDecodingIsGenerationLengthVariable)
+        + sizeof(mSpecDecodingMaxGenerationLength) + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled)
+        + sizeof(mMLAParams) + sizeof(mFuseFp4Quant) + sizeof(mSkipAttn)
+        + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
+        + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size() + mResource->getSerializationSize();
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -267,6 +269,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mDenseContextFMHA);
     write(d, mPagedContextFMHA);
     write(d, mFP8ContextFMHA);
+    write(d, mFP8AttenOutput);
     write(d, mHasFullAttentionMask);
     write(d, mUseKVCache);
     write(d, mIsSpecDecodingEnabled);
@@ -282,9 +285,9 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mCpRank);
 
     // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
-    uint32_t decoderXQARunnerResourceSerializedSize = DecoderXQARunner::getResourceGlobal()->getSerializationSize();
+    uint32_t decoderXQARunnerResourceSerializedSize = mResource->getSerializationSize();
     write(d, decoderXQARunnerResourceSerializedSize);
-    DecoderXQARunner::getResourceGlobal()->serialize(d, decoderXQARunnerResourceSerializedSize);
+    mResource->serialize(d, decoderXQARunnerResourceSerializedSize);
     d += decoderXQARunnerResourceSerializedSize;
 
     for (auto it = mCpGroup.begin(); it != mCpGroup.end(); ++it)

@@ -23,10 +23,10 @@ namespace tr = tensorrt_llm::runtime;
 namespace torch_ext
 {
 
-NcclCommunicatorOp::NcclCommunicatorOp(int64_t tpSize, int64_t ppSize, int64_t rank)
+NcclCommunicatorOp::NcclCommunicatorOp(int64_t worldSize, int64_t rank)
     : mRank(static_cast<int32_t>(rank))
 {
-    mPipelineComm = std::make_shared<tensorrt_llm::runtime::NcclCommunicator>(tpSize * ppSize, rank);
+    mPipelineComm = std::make_shared<tensorrt_llm::runtime::NcclCommunicator>(worldSize, rank);
 }
 
 void NcclCommunicatorOp::send(th::Tensor tensor, int64_t toRank) const
@@ -48,6 +48,6 @@ void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
 } // namespace torch_ext
 
 static auto trtllmNcclCommunicator = torch::jit::class_<torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
-                                         .def(torch::jit::init<int64_t, int64_t, int64_t>())
+                                         .def(torch::jit::init<int64_t, int64_t>())
                                          .def("send", &torch_ext::NcclCommunicatorOp::send)
                                          .def("recv", &torch_ext::NcclCommunicatorOp::recv);

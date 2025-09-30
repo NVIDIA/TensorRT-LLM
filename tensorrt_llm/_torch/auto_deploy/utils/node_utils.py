@@ -1,5 +1,6 @@
 """Common utils for torch fx graph transformation."""
 
+import operator
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
@@ -7,7 +8,7 @@ import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
-from ..custom_ops.quant import QUANT_OPS
+from .logger import ad_logger
 
 try:
     # import modelopt to get quantize_op
@@ -22,6 +23,9 @@ try:
 except ImportError:
     modelopt_quantize_op = None
     modelopt_dynamic_block_quantize_op = None
+
+OpOrOverload = Union[OpOverloadPacket, OpOverload]
+OperatorLike = Union[OpOrOverload, Callable]
 
 
 @dataclass
@@ -102,31 +106,18 @@ def get_quantization_params_from_linear_node(linear_op: torch.fx.node.Node):
     return input_params, weight_params, output_params
 
 
-def is_match(node: Node, names_to_skip: List[str]):
-    if names_to_skip is None:
-        return False
-    for n in names_to_skip:
-        module_stack = node.meta.get("nn_module_stack", None)
-        if module_stack is None:
-            return False
-        module_stack = list(module_stack.keys())
-        if n in module_stack[-1]:
-            return True
-    return False
-
-
-def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:
-    """Extracts the name of the parameter associated with the given matmul node.
-
-    Args:
-        mm_node: Matmul node in the graph.
-    """
-    # List of nodes allowed in between a get_attr node and the matmul node
-    allowed_ops = {torch.ops.aten.to.dtype}
+def extract_weight_node(mm_node: Node) -> int:
+    """Extracts the weight node from the given linear or BMM node. We assume torch.bmm(activation, weight)"""
 
     def find_get_attr_node(node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
         # If node is a get_attr node return node
+        # List of nodes allowed in between a get_attr node and the matmul node
+        allowed_ops = {
+            torch.ops.aten.to.dtype,
+            torch.ops.aten.view.default,
+        }
+
         if node.op == "get_attr":
             return node
 
@@ -140,17 +131,27 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
                 return result
         return None
 
-    assert is_linear_op(mm_node, include_quantization=True), (
-        f"Expecting linear node, Found: {mm_node}"
-    )
-    # second arg is the weight
     weight_node = mm_node.args[1]
     # for modelopt quantized graph, there will be a quantize_op
     _, weight_params, _ = get_quantization_params_from_linear_node(mm_node)
     weight_node = weight_params.input_node if weight_params else weight_node
 
-    # Find the get_attr node for the weight node so that it can be slice.
-    weight_node = find_get_attr_node(weight_node)
+    return find_get_attr_node(weight_node)
+
+
+def num_users_of_weight_node(mm_node: Node) -> int:
+    """Returns the number of users of the weight node of the given matmul node."""
+    weight_node = extract_weight_node(mm_node)
+    return len(weight_node.users) if weight_node is not None else 0
+
+
+def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:
+    """Extracts the name of the parameter associated with the given matmul node.
+
+    Args:
+        mm_node: Matmul node in the graph.
+    """
+    weight_node = extract_weight_node(mm_node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
 
@@ -175,43 +176,110 @@ def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverl
         raise ValueError(f"Expected OpOverloadPacket or OpOverload, got {type(node)}")
 
 
-def is_op(node: Node, ops: Union[OpOverloadPacket, Iterable[OpOverloadPacket]]) -> bool:
+def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     """Check if the node is a call to one of the ops."""
+    if not isinstance(node, Node):
+        return False
+
     if node.op != "call_function":
         return False
 
-    # check if it's a single op that's provided
-    if isinstance(ops, OpOverloadPacket):
+    # check if it's a single op that's provided by checking if it's iterable
+    if isinstance(ops, OpOverloadPacket) or not isinstance(ops, Iterable):
         ops = [ops]
 
-    # check if it's the op itself instead of an overload
-    if any(node.target == op for op in ops):
-        return True
+    # now iterate through the operator list and see if there is a match
+    is_match = True
+    for op in ops:
+        if node.target == op:
+            break
+        if isinstance(op, OpOverloadPacket):
+            if any(node.target == getattr(op, overload) for overload in op):
+                break
+    else:
+        is_match = False
 
-    # check the overloads
-    return any(node.target == getattr(op, overload) for op in ops for overload in op)
+    return is_match
 
 
-def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
+def filtered_nodes(
+    nodes: Iterable[Node],
+    target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
+    ops: Union[OperatorLike, Iterable[OperatorLike]] = None,
+) -> Iterable[Node]:
+    """Iterate over nodes that are filtered by the given operations or target function.
+
+    This utility function simplifies the common pattern of iterating through nodes
+    and filtering by operation type or custom function.
+
+    Args:
+        nodes: Iterable of nodes to filter (e.g., gm.graph.nodes)
+        target: Either a callable function that takes a Node and returns bool,
+               or operation(s) to match against (deprecated, use ops parameter)
+        ops: Operation(s) to match against (preferred over target for operations)
+
+    Yields:
+        Node: Nodes that match the given operations or target function
+
+    Example:
+        # Using callable function:
+        for node in filtered_nodes(gm.graph.nodes, is_linear_op):
+            # process node
+
+        # Using operations:
+        for node in filtered_nodes(gm.graph.nodes, ops=torch.ops.aten.linear):
+            # process node
+
+        # Using multiple operations:
+        for node in filtered_nodes(gm.graph.nodes, ops=[torch.ops.aten.linear, torch.ops.aten.bmm]):
+            # process node
+    """
+    # Handle the case where target is a callable function
+    if callable(target) and not isinstance(target, (OpOverloadPacket, OpOverload)):
+        for node in nodes:
+            if target(node):
+                yield node
+    else:
+        # Handle the case where target or ops contains operations
+        operations = ops if ops is not None else target
+        for node in nodes:
+            if is_op(node, operations):
+                yield node
+
+
+def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
     Using this function is preferred over `is_op` for linear ops to ensure all variants are covered.
     """
     lin_ops = {
         torch.ops.aten.linear,
-        torch.ops.linear.simple,
+        torch.ops.auto_deploy.torch_linear_simple,
     }
 
-    if include_quantization:
-        lin_ops.update(QUANT_OPS)
     return is_op(node, lin_ops)
+
+
+def is_fake_quantized_linear_op(node: Node) -> bool:
+    quantized_linear_op = {
+        torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+    }
+
+    return is_op(node, quantized_linear_op)
+
+
+def is_bmm_op(node: Node) -> bool:
+    bmm_ops = {torch.ops.aten.bmm}
+
+    return is_op(node, bmm_ops)
 
 
 def is_dist_op(node: Node) -> bool:
     """Check if the node is a distributed op."""
     dist_ops = {
-        torch.ops.dist.all_gather,
-        torch.ops.dist.all_reduce,
+        torch.ops.auto_deploy.torch_dist_all_gather,
+        torch.ops.auto_deploy.torch_dist_all_reduce,
     }
     return is_op(node, dist_ops)
 
@@ -281,7 +349,8 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
-    assert not res_nodes_more_users, f"Unexpected # of users for residuals: {res_nodes_more_users}"
+    if res_nodes_more_users:
+        ad_logger.debug(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)
@@ -307,3 +376,62 @@ def bfs(
                 visited.add(next_node)
                 queue.append(next_node)
     raise RuntimeError(f"Could not find node with target condition {target}.")
+
+
+def extract_output_tuple(node: Node, count: int = 2):
+    """
+    Extract up to `count` outputs from a tuple-producing node.
+    Returns a list of length `count`, with None if an output isn't found.
+    """
+    results = []
+    for idx in range(count):
+        user_node = next(
+            (
+                u
+                for u in node.users
+                if u.op == "call_function" and u.target == operator.getitem and u.args[1] == idx
+            ),
+            None,
+        )
+        results.append(user_node)
+    return results
+
+
+def extract_op_args(node: Node, *arg_names):
+    """
+    Given a call_function node for torch custom op,
+    returns a tuple of values for each name in arg_names, trying in order:
+    1. node.kwargs[name]
+    2. node.args[position_in_schema]
+    3. the schema default
+    """
+    if node.op != "call_function":
+        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
+
+    op = node.target
+    if hasattr(op, "_schemas"):
+        schema = next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        schema = op._schema
+    else:
+        raise RuntimeError(f"No schema found on op {op}")
+    args_meta = schema.arguments
+
+    # name→index in signature, and name→default_value
+    pos = {a.name: i for i, a in enumerate(args_meta)}
+    defs = {a.name: a.default_value for a in args_meta if a.has_default_value}
+
+    args = list(node.args)
+    kwargs = node.kwargs or {}
+
+    def _get(name):
+        if name in kwargs:
+            return kwargs[name]
+        i = pos.get(name)
+        if i is not None and i < len(args):
+            return args[i]
+        if name in defs:
+            return defs[name]
+        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+
+    return [_get(n) for n in arg_names]

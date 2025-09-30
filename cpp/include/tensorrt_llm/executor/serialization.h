@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -35,6 +37,10 @@ struct SocketState;
 class Serialization
 {
 public:
+    // BlockKey (KV cache)
+    static size_t serializedSize(tensorrt_llm::batch_manager::kv_cache_manager::BlockKey const& key);
+    static void serialize(tensorrt_llm::batch_manager::kv_cache_manager::BlockKey const& key, std::ostream& os);
+    static tensorrt_llm::batch_manager::kv_cache_manager::BlockKey deserializeBlockKey(std::istream& is);
     // TimePoint
     [[nodiscard]] static RequestPerfMetrics::TimePoint deserializeTimePoint(std::istream& is);
     static void serialize(RequestPerfMetrics::TimePoint const& tp, std::ostream& os);
@@ -70,6 +76,11 @@ public:
     static void serialize(PromptTuningConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
 
+    // MultimodalInput
+    [[nodiscard]] static MultimodalInput deserializeMultimodalInput(std::istream& is);
+    static void serialize(MultimodalInput const& multimodalInput, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(MultimodalInput const& multimodalInput);
+
     // MropeConfig
     [[nodiscard]] static MropeConfig deserializeMropeConfig(std::istream& is);
     static void serialize(MropeConfig const& config, std::ostream& os);
@@ -89,6 +100,11 @@ public:
     [[nodiscard]] static kv_cache::SocketState deserializeSocketState(std::istream& is);
     static void serialize(kv_cache::SocketState const& state, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(kv_cache::SocketState const& state);
+
+    // AgentState
+    [[nodiscard]] static kv_cache::AgentState deserializeAgentState(std::istream& is);
+    static void serialize(kv_cache::AgentState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::AgentState const& state);
 
     // CacheState
     [[nodiscard]] static kv_cache::CacheState deserializeCacheState(std::istream& is);
@@ -252,6 +268,11 @@ public:
     static void serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os);
     static size_t serializedSize(InflightBatchingStats const& inflightBatchingStats);
 
+    // SpecDecodingStats
+    static SpecDecodingStats deserializeSpecDecodingStats(std::istream& is);
+    static void serialize(SpecDecodingStats const& specDecodingStats, std::ostream& os);
+    static size_t serializedSize(SpecDecodingStats const& specDecodingStats);
+
     // IterationStats
     static IterationStats deserializeIterationStats(std::vector<char>& buffer);
     static IterationStats deserializeIterationStats(std::istream& is);
@@ -285,6 +306,53 @@ public:
     [[nodiscard]] static std::vector<char> serialize(std::vector<RequestStatsPerIteration> const& requestStatsVec);
     [[nodiscard]] static std::vector<RequestStatsPerIteration> deserializeRequestStatsPerIterationVec(
         std::vector<char>& buffer);
+
+    // KVCacheEvent deque
+    [[nodiscard]] static std::vector<char> serialize(std::deque<KVCacheEvent> const& kvCacheEvents);
+    [[nodiscard]] static std::deque<KVCacheEvent> deserializeKVCacheEvents(std::vector<char>& buffer);
+
+    // KVCacheEvent
+    [[nodiscard]] static size_t serializedSize(KVCacheEvent const& event);
+    static void serialize(KVCacheEvent const& event, std::ostream& os);
+    [[nodiscard]] static KVCacheEvent deserializeKVCacheEvent(std::istream& is);
+
+    // KVCacheCreatedData
+    [[nodiscard]] static size_t serializedSize(KVCacheCreatedData const& data);
+    static void serialize(KVCacheCreatedData const& data, std::ostream& os);
+    [[nodiscard]] static KVCacheCreatedData deserializeKVCacheCreatedData(std::istream& is);
+
+    // KVCacheStoredData
+    [[nodiscard]] static size_t serializedSize(KVCacheStoredData const& data);
+    static void serialize(KVCacheStoredData const& data, std::ostream& os);
+    [[nodiscard]] static KVCacheStoredData deserializeKVCacheStoredData(std::istream& is);
+
+    // KVCacheStoredBlockData
+    [[nodiscard]] static size_t serializedSize(KVCacheStoredBlockData const& data);
+    static void serialize(KVCacheStoredBlockData const& data, std::ostream& os);
+    [[nodiscard]] static KVCacheStoredBlockData deserializeKVCacheStoredBlockData(std::istream& is);
+
+    // KVCacheRemovedData
+    [[nodiscard]] static size_t serializedSize(KVCacheRemovedData const& data);
+    static void serialize(KVCacheRemovedData const& data, std::ostream& os);
+    [[nodiscard]] static KVCacheRemovedData deserializeKVCacheRemovedData(std::istream& is);
+
+    // KVCacheEventDiff
+    template <typename T>
+    [[nodiscard]] static size_t serializedSize(KVCacheEventDiff<T> const& data);
+    template <typename T>
+    static void serialize(KVCacheEventDiff<T> const& data, std::ostream& os);
+    template <typename T>
+    [[nodiscard]] static KVCacheEventDiff<T> deserializeKVCacheEventDiff(std::istream& is);
+
+    // KVCacheUpdateData
+    [[nodiscard]] static size_t serializedSize(KVCacheUpdatedData const& data);
+    static void serialize(KVCacheUpdatedData const& data, std::ostream& os);
+    [[nodiscard]] static KVCacheUpdatedData deserializeKVCacheUpdatedData(std::istream& is);
+
+    // UniqueToken
+    [[nodiscard]] static size_t serializedSize(tensorrt_llm::runtime::UniqueToken const& token);
+    static void serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os);
+    [[nodiscard]] static tensorrt_llm::runtime::UniqueToken deserializeUniqueToken(std::istream& is);
 
     // String
     static std::string deserializeString(std::istream& is);

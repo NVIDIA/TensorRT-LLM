@@ -8,7 +8,9 @@
 #SBATCH -e logs/trtllm-bench.err
 #SBATCH -J trtllm-bench
 
-### Run trtllm-bench with pytorch backend on Slurm
+### :title Run trtllm-bench with pytorch backend on Slurm
+### :order 1
+### :section Slurm
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -27,7 +29,7 @@
 #   MOUNT_DIR: the directory to mount in the container
 #   MOUNT_DEST: the destination directory in the container
 #   WORKDIR: the working directory in the container
-#   SOURCE_ROOT: the path to the TensorRT-LLM source
+#   SOURCE_ROOT: the path to the TensorRT LLM source
 #   PROLOGUE: the prologue to run before the script
 #   LOCAL_MODEL: the local model directory to use, NOTE: downloading from HF is
 #      not supported in Slurm mode, you need to download the model and put it in
@@ -74,11 +76,8 @@ srun -l \
 
         # This is optional
         cat > /tmp/pytorch_extra_args.txt << EOF
-pytorch_backend_config:
-    use_cuda_graph: false
-    enable_overlap_scheduler: true
-    cuda_graph_padding_enabled: false
-    print_iter_log: true
+cuda_graph_config: null
+print_iter_log: true
 enable_attention_dp: false
 EOF
 

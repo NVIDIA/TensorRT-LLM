@@ -374,6 +374,13 @@ def smooth_quant_layer_norm(input: Tensor,
             'LayernormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert plg_creator is not None
 
+        output_type = trt.PluginField("out_type_id",
+                                      np.array([int(trt.int8)], np.int32),
+                                      trt.PluginFieldType.INT32)
+        quant_mode = trt.PluginField(
+            "quant_mode",
+            np.array([int(QuantMode.use_smooth_quant(per_token=True))],
+                     np.int32), trt.PluginFieldType.INT32)
         eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
                               trt.PluginFieldType.FLOAT32)
         use_diff_of_squares = trt.PluginField(
@@ -389,8 +396,10 @@ def smooth_quant_layer_norm(input: Tensor,
         pf_type = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection(
-            [eps, use_diff_of_squares, dyn_act_scaling, pf_type])
+        pfc = trt.PluginFieldCollection([
+            eps, use_diff_of_squares, dyn_act_scaling, pf_type, output_type,
+            quant_mode
+        ])
         layernorm_plug = plg_creator.create_plugin("layernorm_quantized", pfc)
         normalized_shape = [normalized_shape] if isinstance(
             normalized_shape, int) else normalized_shape
@@ -598,6 +607,83 @@ def fp8_rowwise_rms_norm(input: Tensor,
         if not default_net().strongly_typed:
             layer.get_output(0).set_dynamic_range(-448, 448)
         _add_plugin_info(layer, plg_creator, "rmsnorm_quantized", pfc)
+        if not dynamic_act_scaling:
+            return _create_tensor(layer.get_output(0), layer)
+
+        return _create_tensor(layer.get_output(0),
+                              layer), _create_tensor(layer.get_output(1), layer)
+
+
+def fp8_rowwise_layer_norm(input: Tensor,
+                           normalized_shape: Union[int, Tuple[int]],
+                           weight: Optional[Tensor] = None,
+                           bias: Optional[Tensor] = None,
+                           scale: Optional[Tensor] = None,
+                           clamp_val: Optional[Tensor] = None,
+                           eps: float = 1e-05,
+                           dynamic_act_scaling: bool = True) -> Tensor:
+    if not default_net().plugin_config.layernorm_quantization_plugin:
+        raise TypeError("Fp8 Rowwise Layer Norm is only supported with plugin")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'LayernormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+
+        output_type = trt.PluginField("out_type_id",
+                                      np.array([int(trt.fp8)], np.int32),
+                                      trt.PluginFieldType.INT32)
+        quant_mode = trt.PluginField(
+            "quant_mode",
+            np.array([int(QuantMode.from_description(use_fp8_rowwise=True))],
+                     np.int32), trt.PluginFieldType.INT32)
+        clamp_enabled = trt.PluginField(
+            "clamp_enabled", np.array([clamp_val is not None], np.int32),
+            trt.PluginFieldType.INT32)
+
+        eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
+                              trt.PluginFieldType.FLOAT32)
+
+        dyn_act_scaling = trt.PluginField(
+            "dyn_act_scaling", np.array([int(dynamic_act_scaling)], np.int32),
+            trt.PluginFieldType.INT32)
+        sum_per_token_pf = trt.PluginField("sum_per_token",
+                                           np.array([int(False)], np.int32),
+                                           trt.PluginFieldType.INT32)
+
+        p_dtype = default_net().plugin_config.layernorm_quantization_plugin
+        pf_type = trt.PluginField(
+            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+            trt.PluginFieldType.INT32)
+
+        pfc = trt.PluginFieldCollection([
+            eps, dyn_act_scaling, sum_per_token_pf, clamp_enabled, quant_mode,
+            pf_type, output_type
+        ])
+
+        layernorm_plug = plg_creator.create_plugin("layernorm_quantized", pfc)
+        normalized_shape = [normalized_shape] if isinstance(
+            normalized_shape, int) else normalized_shape
+        if weight is None:
+            weight = constant(
+                np.ones(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+        if bias is None:
+            bias = constant(
+                np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+        if scale is None:
+            scale = constant(np.ones((1, ), dtype=str_dtype_to_np(p_dtype)))
+
+        # Layer Norm Plugin only supports float32 scale
+        scale = cast(scale, "float32")
+        plug_inputs = [
+            input.trt_tensor, weight.trt_tensor, bias.trt_tensor,
+            scale.trt_tensor
+        ]
+        if clamp_val:
+            plug_inputs += [clamp_val.trt_tensor]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
+        if not default_net().strongly_typed:
+            layer.get_output(0).set_dynamic_range(-448, 448)
+        _add_plugin_info(layer, plg_creator, "layernorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
 
@@ -864,16 +950,18 @@ def symmetric_quantize_last_axis_of_batched_matrix(weight, quant_mode):
     return qweight, scale
 
 
-def preprocess_weights_for_mixed_gemm(tensor: torch.Tensor,
-                                      quant_mode: torch.dtype,
-                                      act_dtype: torch.dtype,
-                                      sm_: int = -1) -> torch.Tensor:
+def preprocess_weights_for_mixed_gemm(
+        tensor: torch.Tensor,
+        quant_mode: torch.dtype,
+        act_dtype: torch.dtype,
+        sm_: int = -1,
+        do_weight_interleave: bool = True) -> torch.Tensor:
     sm_ = sm_ if sm_ > 0 else get_sm_version()
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
     elif sm_ >= 90:
         sm_ = 80
-    if sm_ >= 120:
+    if sm_ > 90:
         sm_ = 80
 
     permutation_map = {
@@ -902,13 +990,12 @@ def preprocess_weights_for_mixed_gemm(tensor: torch.Tensor,
     assert (num_rows % B_ROWS_PER_MMA == 0)
     assert (num_cols % MMA_SHAPE_N == 0)
 
-    row_idx_list = [
-        (row_idx // B_ROWS_PER_MMA) * B_ROWS_PER_MMA +
-        permutation_map[f"{BITS_PER_ELT_A}_{BITS_PER_ELT_B}"][row_idx %
-                                                              B_ROWS_PER_MMA]
-        for row_idx in range(num_rows)
-    ]
-    tensor = tensor[:, row_idx_list, :]
+    if do_weight_interleave:
+        row_idx_list = [(row_idx // B_ROWS_PER_MMA) * B_ROWS_PER_MMA +
+                        permutation_map[f"{BITS_PER_ELT_A}_{BITS_PER_ELT_B}"][
+                            row_idx % B_ROWS_PER_MMA]
+                        for row_idx in range(num_rows)]
+        tensor = tensor[:, row_idx_list, :]
 
     # subbyte_transpose
     original_shape = tensor.shape
@@ -924,40 +1011,61 @@ def preprocess_weights_for_mixed_gemm(tensor: torch.Tensor,
     else:
         tensor = tensor.permute(0, 2, 1).reshape(original_shape)
 
-    # interleave_column_major_tensor
-    interleave = BITS_PER_ELT_A // BITS_PER_ELT_B
-    if interleave > 1 and sm_ < 90:
-        rows_per_tile = 128 * 8 // BITS_PER_ELT_A
-        elts_in_int32 = 32 // BITS_PER_ELT_B
+    if do_weight_interleave:
+        # interleave_column_major_tensor
+        interleave = BITS_PER_ELT_A // BITS_PER_ELT_B
+        if interleave > 1 and sm_ < 90:
+            rows_per_tile = 128 * 8 // BITS_PER_ELT_A
+            elts_in_int32 = 32 // BITS_PER_ELT_B
 
-        assert (num_rows % elts_in_int32 == 0)
-        assert (num_rows % rows_per_tile == 0)
+            assert (num_rows % elts_in_int32 == 0)
+            assert (num_rows % rows_per_tile == 0)
 
-        tensor = tensor.reshape(num_experts, -1, interleave,
-                                num_rows // rows_per_tile,
-                                rows_per_tile * 4 // elts_in_int32)
-        tensor = tensor.permute(0, 1, 3, 2, 4).reshape(original_shape)
+            tensor = tensor.reshape(num_experts, -1, interleave,
+                                    num_rows // rows_per_tile,
+                                    rows_per_tile * 4 // elts_in_int32)
+            tensor = tensor.permute(0, 1, 3, 2, 4).reshape(original_shape)
 
-    # add_bias_and_interleave_quantized_tensor_inplace
-    if BITS_PER_ELT_B == 8:
-        tensor += -256 * (tensor > 127).byte() + 128
-        tensor = tensor.reshape(-1, 4)[:, [0, 2, 1, 3]].reshape(tensor.shape)
-    elif BITS_PER_ELT_B == 4:
-        tensor = tensor.view(torch.uint8)
-        high_tensor = (tensor >> 4).unsqueeze(-1)
-        low_tensor = ((tensor << 4) >> 4).unsqueeze(-1)
-        new_tensor = torch.cat([low_tensor, high_tensor],
-                               dim=-1).reshape(tensor.shape[0], tensor.shape[1],
-                                               -1)
-        new_tensor = new_tensor.reshape(
-            -1, 8)[:, [0, 2, 4, 6, 1, 3, 5, 7]].reshape(new_tensor.shape)
-        new_tensor += -16 * (new_tensor > 7).byte() + 8
-        new_tensor = new_tensor[:, :, 0::2] + new_tensor[:, :, 1::2] * 16
-        tensor = new_tensor.view(torch.int8)
-    else:
-        raise NotImplementedError
+        # add_bias_and_interleave_quantized_tensor_inplace
+        if BITS_PER_ELT_B == 8:
+            tensor += -256 * (tensor > 127).byte() + 128
+            tensor = tensor.reshape(-1, 4)[:,
+                                           [0, 2, 1, 3]].reshape(tensor.shape)
+        elif BITS_PER_ELT_B == 4:
+            tensor = tensor.view(torch.uint8)
+            high_tensor = (tensor >> 4).unsqueeze(-1)
+            low_tensor = ((tensor << 4) >> 4).unsqueeze(-1)
+            new_tensor = torch.cat([low_tensor, high_tensor],
+                                   dim=-1).reshape(tensor.shape[0],
+                                                   tensor.shape[1], -1)
+            new_tensor = new_tensor.reshape(
+                -1, 8)[:, [0, 2, 4, 6, 1, 3, 5, 7]].reshape(new_tensor.shape)
+            new_tensor += -16 * (new_tensor > 7).byte() + 8
+            new_tensor = new_tensor[:, :, 0::2] + new_tensor[:, :, 1::2] * 16
+            tensor = new_tensor.view(torch.int8)
+        else:
+            raise NotImplementedError
 
     return tensor.squeeze(0).contiguous()
+
+
+def get_weight_scale_interleave_factor(interleaved_dim: int,
+                                       group_size: int = 128) -> int:
+    # Calculate the weight_scale interleave factor for W4A8 groupwise MoE quant
+    # only Hopper w4a8 does interleave for weight scale, other arch or Hopper w4a16 default to 1
+    factor = 1
+    if get_sm_version() == 90:
+        if interleaved_dim % (4 * group_size) == 0:
+            factor = 4
+        elif interleaved_dim % (2 * group_size) == 0:
+            factor = 2
+        elif interleaved_dim % group_size == 0:
+            factor = 1
+        else:
+            raise NotImplementedError(
+                f"Interleaved dimension must be a multiple of group_size ({group_size}), received {interleaved_dim}."
+            )
+    return factor
 
 
 def validate_group_size(layer):

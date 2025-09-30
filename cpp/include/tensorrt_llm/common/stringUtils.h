@@ -74,6 +74,28 @@ void printElement(std::ostream& os, std::tuple<Args...> const& t)
     printTupleImpl(os, t, std::index_sequence_for<Args...>{});
 }
 
+class va_list_guard
+{
+public:
+    explicit va_list_guard(va_list& args)
+        : mArgs(args)
+    {
+    }
+
+    ~va_list_guard()
+    {
+        va_end(mArgs);
+    }
+
+    va_list_guard(va_list_guard const&) = delete;
+    va_list_guard& operator=(va_list_guard const&) = delete;
+    va_list_guard(va_list_guard&&) = delete;
+    va_list_guard& operator=(va_list_guard&&) = delete;
+
+private:
+    va_list& mArgs;
+};
+
 } // namespace
 
 // Override operator<< for any tuple
@@ -117,6 +139,8 @@ inline std::string fmtstr(char const* format, ...)
 
     va_list args;
     va_start(args, format);
+    va_list_guard args_guard(args);
+
     fmtstr_(
         format,
         [](void* target, size_t count) -> char*
@@ -131,7 +155,6 @@ inline std::string fmtstr(char const* format, ...)
             return str->data();
         },
         &result, args);
-    va_end(args);
 
     return result;
 }
@@ -186,5 +209,23 @@ inline bool strStartsWith(std::string const& str, std::string const& prefix)
 
 /// @brief Split a string into a set of strings using a delimiter
 std::unordered_set<std::string> str2set(std::string const& input, char delimiter);
+
+/// @brief Convert string to lower-case (inplace)
+inline void toLower(std::string& s)
+{
+    for (char& c : s)
+    {
+        c = std::tolower(static_cast<unsigned char>(c));
+    }
+}
+
+/// @brief Convert string to upper-case (inplace)
+inline void toUpper(std::string& s)
+{
+    for (char& c : s)
+    {
+        c = std::toupper(static_cast<unsigned char>(c));
+    }
+}
 
 } // namespace tensorrt_llm::common

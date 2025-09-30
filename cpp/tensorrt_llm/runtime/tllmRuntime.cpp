@@ -527,7 +527,20 @@ void TllmRuntime::setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& 
             "%s: expected type %d, provided type %d", name.c_str(), static_cast<std::int32_t>(engineDtype),
             static_cast<std::int32_t>(tensorDtype));
 
-        auto const tensorShape = tensor->getShape();
+        auto tensorShape = tensor->getShape();
+
+        // Change shape of `cache_indirection` for Variable-Beam-Width-Search
+        // TODO: remove this hack if beamWidth of each request are passed into GptAttentionPlugin by input tensor
+        if (name == "cache_indirection" && mCurrentBeamWidths.size() > 0)
+        {
+            SizeType32 const beamWidth = getCurrentBeamWidth();
+            if (tensorShape.d[1] != beamWidth)
+            {
+                tensorShape.d[1] = beamWidth;
+                TLLM_LOG_TRACE("Change shape of cache_indirection to %s", ITensor::toString(tensorShape).c_str());
+            }
+        }
+
         auto const setInputShapeSuccess = context.setInputShape(name.c_str(), tensorShape);
         if (!setInputShapeSuccess)
         {

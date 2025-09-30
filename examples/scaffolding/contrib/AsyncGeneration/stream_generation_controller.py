@@ -3,7 +3,8 @@ from enum import Enum
 from typing import List
 
 from tensorrt_llm.scaffolding import Controller, GenerationTask, Task
-from tensorrt_llm.scaffolding.contrib import StreamGenerationTask
+from tensorrt_llm.scaffolding.contrib.AsyncGeneration import \
+    StreamGenerationTask
 
 
 class NativeStreamGenerationController(Controller):

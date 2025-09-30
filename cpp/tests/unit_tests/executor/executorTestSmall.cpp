@@ -1,4 +1,4 @@
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
@@ -6,12 +6,12 @@
 #include "tests/utils/common.h"
 #include "tests/utils/engines.h"
 #include "tests/utils/executorUtils.h"
-#include <tensorrt_llm/batch_manager/trtGptModelInflightBatching.h>
 
 #include "gtest/gtest.h"
 
 #include <random>
 #include <tuple>
+#include <unordered_map>
 
 namespace tensorrt_llm::testing
 {
@@ -92,18 +92,18 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(TrivialConstantDeco
     modelConfig.setPagedContextFMHA(true);
 
     auto const worldConfig = runtime::WorldConfig();
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{};
-    auto kvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig{};
+    auto kvCacheConfig = executor::KvCacheConfig{};
+    kvCacheConfig.setMaxTokens(DecoderTestShared<TLogits>::kKvCacheMaxTokens);
 
-    kvCacheConfig.maxTokens = DecoderTestShared<TLogits>::kKvCacheMaxTokens;
-    optionalParams.kvCacheConfig = kvCacheConfig;
+    auto const executorConfig
+        = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(), kvCacheConfig, true,
+            true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize, params.maxNumTokens, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, false, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(),
+            std::nullopt, 0, executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
+
     auto model = std::make_shared<batch_manager::TrtGptModelInflightBatching>(
-        logger, modelConfig, worldConfig, engine, false, optionalParams);
-    auto const executorConfig = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(),
-        executor::KvCacheConfig{}, true, true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize,
-        params.maxNumTokens, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, 1, std::nullopt,
-        executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
-        executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
+        logger, modelConfig, worldConfig, engine, false, executorConfig, false);
+
     return std::make_unique<DecoderTestShared<TLogits>>(
         logger, rng, std::make_shared<executor::Executor>(model, executorConfig), randomLogits);
 }
@@ -201,5 +201,89 @@ INSTANTIATE_TEST_SUITE_P(Float, DecoderFloatTest, paramGenerator,
                          << info.param.randomSeed;
         return nameStringStream.str();
     });
+
+// Helper function to test calculateCacheSizePerToken with given parameters.
+std::map<runtime::SizeType32, runtime::SizeType32> calculateCacheSizePerTokenHelper(
+    std::vector<runtime::SizeType32> const& maxAttentionWindowVec, runtime::SizeType32 kvFactor = 2,
+    runtime::SizeType32 vocabSize = 32, runtime::SizeType32 nbLayers = 4, runtime::SizeType32 nbAttentionLayers = 4,
+    runtime::SizeType32 nbRnnLayers = 0, runtime::SizeType32 nbHeads = 8, runtime::SizeType32 hiddenSize = 512,
+    bool isCrossAttention = false)
+{
+    // Create minimal ModelConfig for testing.
+    auto modelConfig = runtime::ModelConfig(
+        vocabSize, nbLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, nvinfer1::DataType::kFLOAT);
+    modelConfig.useGptAttentionPlugin(true);
+    modelConfig.setModelVariant(runtime::ModelConfig::ModelVariant::kGpt);
+    modelConfig.setKVCacheType(runtime::ModelConfig::KVCacheType::kPAGED);
+
+    auto const worldConfig = runtime::WorldConfig();
+
+    return batch_manager::TrtGptModelInflightBatching::calculateCacheSizePerTokenForDisagg(
+        modelConfig, worldConfig, maxAttentionWindowVec, isCrossAttention, kvFactor);
+}
+
+// Test for TrtGptModelInflightBatching::calculateCacheSizePerToken function with different layer types.
+TEST(TrtInflightBatchingTest, CalculateCacheSizePerTokenForDisagg)
+{
+    // Common parameters.
+    constexpr runtime::SizeType32 nbLayers = 5;
+    constexpr runtime::SizeType32 hiddenSize = 512;
+    constexpr runtime::SizeType32 kvFactor = 2;
+    constexpr runtime::SizeType32 vocabSize = 32;
+    constexpr runtime::SizeType32 nbHeads = 8;
+    // Test case 1: Single attention window size - attention layers only.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128};
+        constexpr runtime::SizeType32 nbAttentionLayers = 5;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 0;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 1);
+        EXPECT_EQ(result.at(128), nbAttentionLayers * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+
+    // Test case 2: Multiple attention window sizes - attention layers only.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128, 256};
+        constexpr runtime::SizeType32 nbAttentionLayers = 5;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 0;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 2);
+        auto const nbAttentionLayersIn128Window = 3;
+        auto const nbAttentionLayersIn256Window = 2;
+        EXPECT_EQ(result.at(128), nbAttentionLayersIn128Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+        EXPECT_EQ(result.at(256), nbAttentionLayersIn256Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+
+    // Test case 3: Single attention window size - attention and rnn layers.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128};
+        constexpr runtime::SizeType32 nbAttentionLayers = 3;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 2;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 1);
+        EXPECT_EQ(result.at(128), nbAttentionLayers * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+
+    // Test case 4: Multiple attention window sizes - attention and rnn layers.
+    {
+        std::vector<runtime::SizeType32> maxAttentionWindowVec = {128, 256};
+        constexpr runtime::SizeType32 nbAttentionLayers = 3;
+        constexpr runtime::SizeType32 numBytesPerFloatElement = 4;
+        constexpr runtime::SizeType32 nbRnnLayers = 2;
+        auto result = calculateCacheSizePerTokenHelper(maxAttentionWindowVec, kvFactor, vocabSize, nbLayers,
+            nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, false);
+        EXPECT_EQ(result.size(), 2);
+        auto const nbAttentionLayersIn128Window = 2;
+        auto const nbAttentionLayersIn256Window = 1;
+        EXPECT_EQ(result.at(128), nbAttentionLayersIn128Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+        EXPECT_EQ(result.at(256), nbAttentionLayersIn256Window * kvFactor * hiddenSize * numBytesPerFloatElement);
+    }
+}
 
 } // namespace tensorrt_llm::testing

@@ -24,7 +24,11 @@ import sys
 
 import psutil
 import pynvml
-from cuda import cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -176,12 +180,12 @@ def construct_gpu_properties(mako_opts, device_index=0):
             if pci_device_id is not None and chip_name_mapping:
                 entity = str(pci_device_id).lower()
                 if entity in chip_name_mapping:
-                    chip = str(chip_name_mapping[entity]).lower()
+                    chip = str(chip_name_mapping[entity])
+                    full_name = "{} BRING-UP BOARD".format(chip.upper())
                 else:
                     err_msg = r"Could not find a chip name associated with this device id - {}. Chip name won't be reported".format(
                         entity)
                     logger.warning(err_msg)
-            full_name = "{} Bring-up Board".format(chip.upper())
 
         gpu_name = full_name.replace("NVIDIA", "").strip().upper()
         assert gpu_name != "", "device_product_name is empty after removing substring 'NVIDIA' and leading/trailing whitespaces."

@@ -31,11 +31,8 @@ class CudaStream;
 namespace tensorrt_llm::batch_manager
 {
 
-class RuntimeBuffers;
-class DecoderBuffers;
+class DecoderInputBuffers;
 class MedusaBuffers;
-
-namespace tr = tensorrt_llm::runtime;
 
 class HandleContextLogits : Algorithm
 {
@@ -47,10 +44,10 @@ public:
 
     HandleContextLogits() = default;
 
-    tr::SizeType32 operator()(RequestVector const& contextRequests,
-        std::vector<tr::SizeType32> const& numContextLogitsVec, tr::ITensor::SharedPtr const& logits,
-        DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-        tensorrt_llm::runtime::CudaStream const& stream, OptionalRef<MedusaBuffers> medusaBuffers) const;
+    runtime::SizeType32 operator()(DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
+        runtime::ITensor::SharedPtr const& logits, std::vector<runtime::SizeType32> const& numContextLogitsVec,
+        runtime::ModelConfig const& modelConfig, runtime::BufferManager const& manager,
+        OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

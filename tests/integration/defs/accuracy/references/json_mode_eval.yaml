@@ -1,0 +1,10 @@
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 74.00
+  - spec_dec_algo: Eagle
+    accuracy: 74.00
+  - spec_dec_algo: NGram
+    accuracy: 74.00
+deepseek-ai/DeepSeek-V3-Lite:
+  - accuracy: 77.00
+  - spec_dec_algo: MTP
+    accuracy: 77.00

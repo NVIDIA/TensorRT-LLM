@@ -15,25 +15,42 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/generateRequestOptions.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/medusaBuffers.h"
-#include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
-#include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/nvtxUtils.h"
+#pragma once
+
+#include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
+
+#include <memory>
+
+namespace tensorrt_llm::batch_manager
+{
+namespace kv_cache_manager
+{
+class BaseKVCacheManager;
+} // namespace kv_cache_manager
+
+class SequenceSlotManager;
+class BasePeftCacheManager;
+class GenerateRequestOptions;
+} // namespace tensorrt_llm::batch_manager
+
+namespace tensorrt_llm::executor
+{
+struct SpeculativeDecodingFastLogitsInfo;
+} // namespace tensorrt_llm::executor
 
 namespace tensorrt_llm::batch_manager::utils
 {
 
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
-    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> seqSlotManager,
-    SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> kvCacheManager,
-    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
-    std::shared_ptr<BasePeftCacheManager> peftCacheManager);
+    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> const& seqSlotManager,
+    runtime::SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager,
+    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& crossKvCacheManager,
+    std::shared_ptr<BasePeftCacheManager> const& peftCacheManager);
 
-std::optional<GenerateRequestOptions::TensorPtr> targetModelReceiveLogits(
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::ModelConfig const& modelConfig);
+void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype);
 
 } // namespace tensorrt_llm::batch_manager::utils

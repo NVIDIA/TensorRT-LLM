@@ -34,14 +34,18 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_t
     , mDtypeKv(dtypeKv)
     , mDtypeOut(dtypeOut)
 {
-    TLLM_CHECK_WITH_INFO(mSM == kSM_100, "Unsupported architecture");
+    TLLM_CHECK_WITH_INFO(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(
         mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16, "Unsupported Q data type");
-    TLLM_CHECK_WITH_INFO(mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
+    TLLM_CHECK_WITH_INFO(mDtypeKv == DATA_TYPE_E2M1 || mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16
+            || mDtypeKv == DATA_TYPE_BF16,
         "Unsupported Kv data type");
     TLLM_CHECK_WITH_INFO(mDtypeOut == DATA_TYPE_E2M1 || mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16
             || mDtypeOut == DATA_TYPE_BF16,
         "Unsupported Output data type");
+    auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+    mTotalDeviceMemory = totalMemory;
+    TLLM_CHECK_WITH_INFO(mTotalDeviceMemory > 0, "Total device memory is invalid");
     mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
 }
 
@@ -64,6 +68,11 @@ bool TllmGenFmhaRunner::isSupported(TllmGenFmhaRunnerParams const& runnerParams)
 std::pair<bool, std::string> TllmGenFmhaRunner::isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const
 {
     return mKernel->checkIfKernelExist(runnerParams);
+}
+
+size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
+{
+    return mTotalDeviceMemory;
 }
 
 } // namespace kernels

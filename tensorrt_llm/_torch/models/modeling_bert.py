@@ -60,9 +60,9 @@ class BertEmbeddings(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        token_type_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
+        token_type_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
     ):
         assert input_ids is not None
         x = self.word_embeddings(input_ids)
@@ -192,7 +192,6 @@ class BertModel(nn.Module):
         self.model_config = model_config
 
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.add_pooling_layer = add_pooling_layer
 
         self.embedding = BertEmbeddings(config=config)

@@ -6,6 +6,10 @@ import platform
 import signal
 import subprocess
 import sys
+import time
+import warnings
+from collections.abc import Generator
+from typing import List, Optional
 
 import psutil
 
@@ -67,7 +71,9 @@ if is_linux():
 
         return pids
 
-    def cleanup_process_tree(p: subprocess.Popen, has_session=False):
+    def cleanup_process_tree(p: subprocess.Popen,
+                             has_session=False,
+                             verbose_message=False):
         target_pids = set()
         if has_session:
             # Session ID is the pid of the leader process
@@ -81,8 +87,46 @@ if is_linux():
         except psutil.Error:
             pass
 
-        print("Found leftover pids:", target_pids)
-        for pid in target_pids:
+        persist_pids = []
+        if target_pids:
+            # Grace period
+            time.sleep(5)
+
+            lines = []
+            torch_inductors = []
+
+            for pid in sorted(target_pids):
+                try:
+                    sp = psutil.Process(pid)
+                    if verbose_message:
+                        cmdline = sp.cmdline()
+
+                        # Detect repetitive torch inductor worker processes
+                        if len(cmdline) > 3 and \
+                            'python' in cmdline[0] and \
+                            'torch/_inductor/compile_worker/__main__.py' in cmdline[1] and \
+                            '--pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler' == cmdline[2]:
+                            torch_inductors.append(pid)
+                            continue
+
+                        lines.append(f"{pid}: {cmdline}")
+                    persist_pids.append(pid)
+                except psutil.Error:
+                    pass
+
+            if torch_inductors:
+                lines.append(
+                    f"{len(torch_inductors)}*torch inductor workers: {torch_inductors}"
+                )
+
+            if persist_pids:
+                msg = f"Found leftover subprocesses: {persist_pids} launched by {p.args}"
+                if verbose_message:
+                    detail = '\n'.join(lines)
+                    msg = f"{msg}\n{detail}"
+                warnings.warn(msg)
+
+        for pid in persist_pids:
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -147,29 +191,56 @@ elif is_windows():
         p.kill()
 
 
-def call(*popenargs,
-         timeout=None,
-         start_new_session=True,
-         suppress_output_info=False,
-         **kwargs):
+@contextlib.contextmanager
+def popen(*popenargs,
+          start_new_session=True,
+          suppress_output_info=False,
+          **kwargs) -> Generator[subprocess.Popen]:
     if not suppress_output_info:
-        print(f"Start subprocess with call({popenargs}, {kwargs})")
+        print(f"Start subprocess with popen({popenargs}, {kwargs})")
+
     with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
         try:
-            retcode = p.wait(timeout=timeout)
-            if retcode and start_new_session:
-                cleanup_process_tree(p, True)
-            return retcode
+            yield p
+            if start_new_session:
+                cleanup_process_tree(p, True, True)
         except Exception as e:
+            cleanup_process_tree(p, start_new_session)
             if isinstance(e, subprocess.TimeoutExpired):
                 print("Process timed out.")
                 stdout, stderr = p.communicate()
-                if stdout:
-                    print("STDOUT:", stdout.decode('utf-8', errors='replace'))
-                if stderr:
-                    print("STDERR:", stderr.decode('utf-8', errors='replace'))
-            cleanup_process_tree(p, start_new_session)
+                e.output = stdout
+                e.stderr = stderr
             raise
+
+
+def call(*popenargs,
+         timeout: Optional[float] = None,
+         start_new_session=True,
+         suppress_output_info=False,
+         spin_time: float = 1.0,
+         poll_procs: Optional[List[subprocess.Popen]] = None,
+         **kwargs):
+    poll_procs = poll_procs or []
+    if not suppress_output_info:
+        print(f"Start subprocess with call({popenargs}, {kwargs})")
+    with popen(*popenargs,
+               start_new_session=start_new_session,
+               suppress_output_info=True,
+               **kwargs) as p:
+        elapsed_time = 0
+        while True:
+            try:
+                return p.wait(timeout=spin_time)
+            except subprocess.TimeoutExpired as e:
+                elapsed_time += spin_time
+                if timeout is not None and elapsed_time >= timeout:
+                    e.timeout = timeout
+                    raise
+            for p_poll in poll_procs:
+                if p_poll.poll() is None:
+                    continue
+                raise RuntimeError("A sub-process has exited.")
 
 
 def check_call(*popenargs, **kwargs):
@@ -202,9 +273,9 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
             cleanup_process_tree(process, start_new_session)
             raise
         retcode = process.poll()
+        if start_new_session:
+            cleanup_process_tree(process, True, True)
         if retcode:
-            if start_new_session:
-                cleanup_process_tree(process, True)
             raise subprocess.CalledProcessError(retcode,
                                                 process.args,
                                                 output=stdout,

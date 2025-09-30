@@ -18,10 +18,9 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -37,12 +36,29 @@ class GptDecoderBatched;
 class AllReduceBuffers;
 class NcclCommunicator;
 class SpeculativeDecodingMode;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
+
+namespace decoder_batch
+{
+class Input;
+class Output;
+} // namespace decoder_batch
+
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::mpi
 {
 class MpiWaitThread;
 } // namespace tensorrt_llm::mpi
+
+namespace tensorrt_llm::batch_manager
+{
+class BaseCacheTransceiver;
+}
 
 namespace tensorrt_llm::batch_manager
 {
@@ -57,18 +73,17 @@ namespace rnn_state_manager
 {
 class RnnStateManager;
 } // namespace rnn_state_manager
+
 class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
 class DecoderInputBuffers;
 class DecoderOutputBuffers;
-class DecoderBuffers;
 class SlotDecoderBuffers;
 class LlmRequest;
 class RuntimeBuffers;
 class BasePeftCacheManager;
 class GuidedDecoder;
-class BaseCacheTransceiver;
 
 // Algorithms
 class CapacityScheduler;
@@ -102,7 +117,7 @@ class TrtGptModelInflightBatching : public TrtGptModel
     using OffsetTableDimensions = kv_cache_manager::OffsetTableDimensions;
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
-    using KvCacheConfig = kv_cache_manager::KvCacheConfig;
+    using KvCacheConfig = executor::KvCacheConfig;
     using RnnStateManager = rnn_state_manager::RnnStateManager;
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
 
@@ -133,11 +148,30 @@ public:
 
     TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::RawEngine const& rawEngine, bool ctxGenFusion,
-        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams());
+        executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode);
 
     ~TrtGptModelInflightBatching() override;
 
+    /// @brief Calculate the cache size per token for the disaggregated serving.
+    /// @param modelConfig Model configuration.
+    /// @param worldConfig World configuration.
+    /// @param maxAttentionWindowVec Maximum attention window vector. (may have fewer elements than numLayers, in which
+    /// case it cycles)
+    /// @param isCrossAttention Whether the attention is cross attention.
+    /// @param kvFactor KV factor.
+    /// @return Cache size per token for the disaggregated layers. Note that window size is not included in the result
+    /// here.
+    [[nodiscard]] static std::map<SizeType32, SizeType32> calculateCacheSizePerTokenForDisagg(
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& maxAttentionWindowVec, bool isCrossAttention, SizeType32 kvFactor);
+
     void terminateRequest(LlmRequestPtr const& llmRequest, bool pause = false) override;
+
+    /// @brief Terminate request in the next forwardSync call that includes the request.
+    /// @details This function does not terminate requests immediately. It will add the requests to the
+    ///          mReqIdsToTerminate set. The requests will be terminated in the next forwardSync call that
+    ///          includes the request in the batch.
+    void terminateRequestSync(LlmRequestPtr const& llmRequest, executor::FinishReason finishReason) override;
 
     /// @brief Function that waits for the decoding of requests in flight.
     ///        When the requests have finished or using speculative decoding, the state of requests
@@ -185,10 +219,10 @@ public:
         return mIterCounter;
     }
 
-    [[nodiscard]] static bool optionalParamsAreValid(
-        runtime::ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams);
-    [[nodiscard]] static TrtGptModelOptionalParams fixOptionalParams(
-        runtime::ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams);
+    [[nodiscard]] static bool executorConfigIsValid(
+        runtime::ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig);
+    [[nodiscard]] static executor::ExecutorConfig fixExecutorConfig(
+        runtime::ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig);
 
     void prepareDisaggGenInitRequests(RequestList const& activeRequests, RequestVector& newGenReques);
     void checkDisaggGenTransferStatus(RequestList const& activeRequests);
@@ -231,6 +265,10 @@ private:
     //! These blocks become reusable from next step.
     void storeContextBlocks(std::shared_ptr<LlmRequest> const& req);
 
+    //! @brief Store newest kv cache block for reuse.
+    //! The block become reusable from next step.
+    void storeNewBlock(std::shared_ptr<LlmRequest> const& req);
+
     //! @brief Set LayerProfiler to collect performance per layer.
     void setLayerProfiler() override;
 
@@ -258,8 +296,9 @@ private:
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
-    std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
-        SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
+    std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
+        uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory,
+        bool const failFastOnAttentionWindowTooLarge = false);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
     void createRuntimePerfKnobsTensor(executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
@@ -291,7 +330,7 @@ private:
         RequestVector const& contextRequests, RequestVector const& generationRequests, SizeType32 bufferId);
 
     void setupDecoderStep(
-        RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers);
+        RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers& inputBuffers);
     runtime::CudaEvent decoderStepAsync(ScheduledRequests const& scheduledRequests);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
@@ -352,12 +391,16 @@ private:
         return static_cast<bool>(mGuidedDecoder);
     }
 
+    using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
     /// @brief Based on the KV-cache manager's capacity and configuration, we adjust the maximum supported attention
     /// window.
     ///
-    /// @param numPrimaryBlocks The number of blocks in the kv-cache's primary pool.
-    /// @param numTokensPerBlock The number of tokens per kv-cache block.
-    void adjustMaxAttentionWindow(SizeType32 numPrimaryBlocks, SizeType32 numTokensPerBlock);
+    /// @param blocksPerWindow map of window size to number of blocks.
+    /// @param failFastOnAttentionWindowTooLarge if true, the function will report a runtime error if the attention
+    /// window is too large to fit even a single sequence in the KV cache.
+    /// @return pair of new blocks per window and new maxAttentionWindowVec
+    [[nodiscard]] std::pair<BlocksPerWindow, std::vector<SizeType32>> clampWindowSizesToFitAtLeastOneSequence(
+        BlocksPerWindow const& blocksPerWindow, bool const failFastOnAttentionWindowTooLarge = false);
 
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
@@ -439,9 +482,11 @@ private:
     /******************** Components ********************/
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     // Runner for the TRT engine. The engine produces logits.
-    std::shared_ptr<runtime::TllmRuntime> mRuntime;
+    std::unique_ptr<runtime::TllmRuntime> mRuntime;
     // Decoder that generates new tokens from the logits.
-    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
+    std::unique_ptr<runtime::GptDecoderBatched> mDecoder;
+    // Decoder state for all requests
+    std::unique_ptr<runtime::decoder::DecoderState> mDecoderState;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
 
@@ -452,7 +497,7 @@ private:
     // KV cache manager for cross attention in enc-dec models (optional)
     std::shared_ptr<BaseKVCacheManager> mCrossKvCacheManager = nullptr;
     // RNN state manager for recurrent layers (optional)
-    std::shared_ptr<RnnStateManager> mRnnStateManager;
+    std::unique_ptr<RnnStateManager> mRnnStateManager;
     // PEFT cache manager for LoRA tasks (optional)
     std::shared_ptr<BasePeftCacheManager> mPeftCacheManager;
     // BufferManager using a separate stream for async copy operations.
@@ -519,21 +564,20 @@ private:
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
     // Decoder output buffers for each micro batch.
     std::vector<DecoderOutputBuffers> mDecoderOutputBuffers;
-    // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::unique_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
     std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
     // Decoder input for each micro batch.
     std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
-    std::unique_ptr<runtime::decoder_batch::Output> mDecodingOutput;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch
     std::vector<ScheduledRequests> mMicroBatchScheduledRequests;
     // Set of in-flight requests of *all* micro batches
     ReqIdsSet mInflightReqIds;
+    // Requests that should be terminated (requested from outside the model)
+    std::unordered_map<RequestIdType, executor::FinishReason> mReqIdsToTerminate;
     // Requests that the scheduler selected to be paused
     ReqIdsSet mReqIdsToPause;
     // Stats collected in last iteration
@@ -570,7 +614,6 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::AllocateKvCache const> mAllocateKvCache;
     std::unique_ptr<tensorrt_llm::batch_manager::HandleContextLogits const> mHandleContextLogits;
     std::unique_ptr<tensorrt_llm::batch_manager::HandleGenerationLogits const> mHandleGenerationLogits;
-    std::unique_ptr<tensorrt_llm::batch_manager::GenerateRequestOptions const> mGenerateRequestOptions;
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;

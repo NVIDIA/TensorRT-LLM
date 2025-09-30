@@ -19,7 +19,6 @@ import os
 import re
 import shutil
 import subprocess
-import uuid
 from copy import deepcopy
 
 import defs.ci_profiler
@@ -30,20 +29,18 @@ from defs.common import (convert_weights, generate_summary_cmd,
                          venv_check_call, venv_check_output,
                          venv_mpi_check_call)
 # yapf: disable
-from defs.conftest import (evaltool_humaneval_post_process,
-                           evaltool_mmlu_post_process,
-                           evaltool_mtbench_post_process,
-                           evaltool_wikilingua_post_process, get_device_count,
-                           get_device_memory, get_host_total_memory,
+from defs.conftest import (get_device_count, get_device_memory,
+                           get_host_total_memory, get_sm_version,
                            skip_fp8_pre_ada, skip_no_nvls, skip_post_blackwell,
                            skip_pre_ada, skip_pre_blackwell)
-from defs.examples.run_llm_lad_mtbench import run_lad_mtbench
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
-from evaltool.constants import *
 
-LLM_GATE_WAY_CLIENT_ID = os.environ.get("LLM_GATE_WAY_CLIENT_ID")
-LLM_GATE_WAY_TOKEN = os.environ.get("LLM_GATE_WAY_TOKEN")
+# skip trt flow cases on post-Blackwell-Ultra
+# if get_sm_version() >= 103:
+#     pytest.skip(
+#         "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+#         allow_module_level=True)
 
 INPUT_TEXT_1 = "After Washington had returned to Williamsburg, " + \
                "Dinwiddie ordered him to lead a larger force to assist Trent in his work. " + \
@@ -697,6 +694,7 @@ def test_llm_llama_v2_1gpu_sparsity(llama_example_root, llama_model_root,
     ])
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
@@ -895,6 +893,7 @@ def test_llm_llama_v2_gather_logits_2gpu_pp2(llama_example_root,
                         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
 def test_llm_llama_v2_1gpu_auto_parallel(llama_example_root, llama_model_root,
                                          llm_venv, cmodel_dir, engine_dir):
@@ -920,6 +919,7 @@ def test_llm_llama_v2_1gpu_auto_parallel(llama_example_root, llama_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -1074,6 +1074,7 @@ def test_llm_llama_v3_1_autoq_2gpu_mmlu(llama_example_root, llama_model_root,
     check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
@@ -1113,7 +1114,7 @@ def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
 
     print("Run summarize...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--check_accuracy", f"--hf_model_dir={llama_model_root}",
         f"--engine_dir={engine_dir}", f"--num_beams={num_beams}",
         f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
@@ -1210,7 +1211,7 @@ def test_llm_llama_v1_1gpu_paged_kv_cache(llama_example_root, llama_model_root,
 
     print("Run inference")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llama_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", f"--dataset_dir={llm_datasets_root}",
@@ -1630,6 +1631,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("gemm_swiglu_plugin", ["fp8"])
@@ -1705,7 +1707,12 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
 
 @pytest.mark.parametrize(
-    "data_type", ['float16', 'fp8', 'sq_ootb', 'awq', 'int8_wo'],
+    "data_type", [
+        'float16', 'fp8',
+        pytest.param('sq_ootb', marks=skip_post_blackwell),
+        pytest.param('awq', marks=skip_post_blackwell),
+        pytest.param('int8_wo', marks=skip_post_blackwell)
+    ],
     ids=['base_fp16', 'base_fp8', 'base_sq_ootb', 'base_awq', 'base_int8_wo'])
 @pytest.mark.parametrize("lora_data_type", ['float16'], ids=['lora_fp16'])
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-13b-hf'], indirect=True)
@@ -2210,6 +2217,7 @@ def test_llm_llama_code_llama_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2287,6 +2295,7 @@ def test_llm_llama_code_llama_multi_gpus_summary(llama_example_root,
         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2343,6 +2352,7 @@ def test_llm_llama_smooth_quant_1gpu_summary(llama_example_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2392,6 +2402,7 @@ def test_llm_llama_int8_kv_1gpu_summary(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2436,6 +2447,7 @@ def test_llm_llama_int8_sq_ootb_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2495,6 +2507,7 @@ def test_llm_llama_v2_int8sq_2gpu_tp2(data_type, llama_example_root,
                         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2550,6 +2563,7 @@ def test_llm_llama_wo_1gpu_summary(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2874,11 +2888,14 @@ def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
         # check_call(lora_benchmark_cmd, env=envs)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize("qformat", ["fp8", "int4_awq"])
+@pytest.mark.parametrize(
+    "qformat",
+    ["fp8", pytest.param("int4_awq", marks=skip_post_blackwell)])
 @pytest.mark.parametrize(
     "tp_pp_size", [(4, 1), (2, 2)],
     ids=lambda tp_pp_size: f'tp{tp_pp_size[0]}pp{tp_pp_size[1]}')
@@ -2937,773 +2954,6 @@ def test_llm_llama_code_llama_quantization_4gpus_summary(
     venv_mpi_check_call(
         llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
         summary_cmd)
-
-
-@pytest.mark.parametrize("llama_model_root",
-                         ['llama-v2-7b-hf', 'llama-v2-13b-hf'],
-                         indirect=True)
-def test_llama2_single_gpu_lm_eval(llama_example_root, llama_model_root,
-                                   llm_venv, engine_dir, cmodel_dir,
-                                   evaltool_root):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama2",
-                                model_path=llama_model_root,
-                                gpus=1,
-                                tp_size=1,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--gather_context_logits",
-        "--max_batch_size=8",
-        "--max_input_len=4000",
-        "--max_seq_len=4096",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Lm evaluation harness")
-    # start inference server
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        llama_model_root, "-d", evaltool_root, "-m", "256"
-    ]
-    check_call(" ".join(start_inference_server), shell=True)
-
-    task_list = ['wikilingua', 'mmlu']
-    try:
-        for task in task_list:
-            project_id = str(uuid.uuid4())
-            if task == "wikilingua":
-                config_file = EVALTOOL_WIKILINGUA_CONFIG
-                result_file = EVALTOOL_WIKILINGUA_RESULT_FILE
-
-            if task == "mmlu":
-                config_file = EVALTOOL_MMLU_CONFIG
-                result_file = EVALTOOL_MMLU_RESULT_FILE
-
-            # Update config dynamically
-            import yaml
-            with open(config_file, 'r') as f:
-                lm_eval_config = yaml.safe_load(f)
-                lm_eval_config['model']['llm_name'] = llama_model_root
-                lm_eval_config['model']['tokenizer_path'] = model_dir
-
-            config_file = os.path.join(llm_venv.get_working_directory(),
-                                       "lm_eval_config.yaml")
-            with open(config_file, 'w') as f:
-                yaml.dump(lm_eval_config, f)
-
-            # launch evaluation
-            run_cmd = [
-                f"cd {evaltool_root}",
-                "&&",
-                "source .venv/bin/activate",
-                "&&",
-                "python3",
-                f"evaltool/interfaces/cli/main.py",
-                "project",
-                "launch",
-                f"--eval_project_config_file '{config_file}'",
-                "--infra_name local",
-                f"--output_dir '{llm_venv.get_working_directory()}'",
-                f"--project_id {project_id}",
-            ]
-            check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-            # process result
-            result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}"
-            check_call(f"cat {result_path}", shell=True)
-
-            if task == 'mmlu':
-                if '7b' in llama_model_root:
-                    evaltool_mmlu_post_process(result_path, 0.4657, 0.006)
-                elif '13b' in llama_model_root:
-                    evaltool_mmlu_post_process(result_path, 0.5516, 0.006)
-            if task == 'wikilingua':
-                if '7b' in llama_model_root:
-                    evaltool_wikilingua_post_process(result_path, 0.2299,
-                                                     0.0050)
-                elif '13b' in llama_model_root:
-                    evaltool_wikilingua_post_process(result_path, 0.2289, 0.003)
-    finally:
-        # stop the server
-        check_call(f"{EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT}", shell=True)
-
-
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b'], indirect=True)
-def test_llama3_single_gpu_evaltool(llama_example_root, llama_model_root,
-                                    llm_venv, engine_dir, cmodel_dir,
-                                    evaltool_root):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama3",
-                                model_path=llama_model_root,
-                                gpus=1,
-                                tp_size=1,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--gather_context_logits",
-        "--max_batch_size=8",
-        "--max_input_len=4000",
-        "--max_num_tokens=4096",
-        "--max_seq_len=4096",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Lm evaluation harness")
-    # start inference server
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        llama_model_root, "-d", evaltool_root, "-m", "512"
-    ]
-    check_call(" ".join(start_inference_server),
-               shell=True,
-               env=llm_venv._new_env)
-
-    task_list = ['wikilingua', 'mmlu']
-    try:
-        for task in task_list:
-            project_id = str(uuid.uuid4())
-            if task == "wikilingua":
-                config_file = EVALTOOL_WIKILINGUA_CONFIG
-                result_file = EVALTOOL_WIKILINGUA_RESULT_FILE
-
-            if task == "mmlu":
-                config_file = EVALTOOL_MMLU_CONFIG
-                result_file = EVALTOOL_MMLU_RESULT_FILE
-
-            # Update config dynamically
-            import yaml
-            with open(config_file, 'r') as f:
-                lm_eval_config = yaml.safe_load(f)
-                lm_eval_config['model']['llm_name'] = llama_model_root
-                lm_eval_config['model']['tokenizer_path'] = model_dir
-
-            config_file = os.path.join(llm_venv.get_working_directory(),
-                                       "lm_eval_config.yaml")
-            with open(config_file, 'w') as f:
-                yaml.dump(lm_eval_config, f)
-
-            # launch evaluation
-            run_cmd = [
-                f"cd {evaltool_root}",
-                "&&",
-                "source .venv/bin/activate",
-                "&&",
-                "python3",
-                f"evaltool/interfaces/cli/main.py",
-                "project",
-                "launch",
-                f"--eval_project_config_file '{config_file}'",
-                "--infra_name local",
-                f"--output_dir '{llm_venv.get_working_directory()}'",
-                f"--project_id {project_id}",
-            ]
-            check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-            # process result
-            result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}"
-            check_call(f"cat {result_path}", shell=True)
-
-            if task == 'mmlu':
-                evaltool_mmlu_post_process(result_path, 0.6626, 0.006)
-            if task == 'wikilingua':
-                evaltool_wikilingua_post_process(result_path, 0.26088, 0.003)
-    finally:
-        # stop the server
-        check_call(f"{EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT}",
-                   shell=True,
-                   env=llm_venv._new_env)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-70b'], indirect=True)
-def test_llama3_4_gpus_evaltool(llama_example_root, llama_model_root, llm_venv,
-                                engine_dir, cmodel_dir, evaltool_root):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama3",
-                                model_path=llama_model_root,
-                                gpus=4,
-                                tp_size=4,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--gather_context_logits",
-        "--max_batch_size=8",
-        "--max_input_len=5000",
-        "--max_seq_len=8192",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Lm evaluation harness")
-    # start inference server
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        llama_model_root, "-d", evaltool_root, "-m", "512", "-c", "4"
-    ]
-    check_call(" ".join(start_inference_server),
-               shell=True,
-               env=llm_venv._new_env)
-
-    task_list = ['wikilingua', 'mmlu']
-    try:
-        for task in task_list:
-            project_id = str(uuid.uuid4())
-            if task == "wikilingua":
-                config_file = EVALTOOL_WIKILINGUA_CONFIG
-                result_file = EVALTOOL_WIKILINGUA_RESULT_FILE
-
-            if task == "mmlu":
-                config_file = EVALTOOL_MMLU_CONFIG
-                result_file = EVALTOOL_MMLU_RESULT_FILE
-
-            # Update config dynamically
-            import yaml
-            with open(config_file, 'r') as f:
-                lm_eval_config = yaml.safe_load(f)
-                lm_eval_config['model']['llm_name'] = llama_model_root
-                lm_eval_config['model']['tokenizer_path'] = model_dir
-
-            config_file = os.path.join(llm_venv.get_working_directory(),
-                                       "lm_eval_config.yaml")
-            with open(config_file, 'w') as f:
-                yaml.dump(lm_eval_config, f)
-
-            # launch evaluation
-            run_cmd = [
-                f"cd {evaltool_root}",
-                "&&",
-                "source .venv/bin/activate",
-                "&&",
-                "python3",
-                f"evaltool/interfaces/cli/main.py",
-                "project",
-                "launch",
-                f"--eval_project_config_file '{config_file}'",
-                "--infra_name local",
-                f"--output_dir '{llm_venv.get_working_directory()}'",
-                f"--project_id {project_id}",
-            ]
-            check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-            # process result
-            result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}"
-            check_call(f"cat {result_path}", shell=True)
-
-            if task == 'mmlu':
-                evaltool_mmlu_post_process(result_path, 0.7852, 0.006)
-            if task == 'wikilingua':
-                evaltool_wikilingua_post_process(result_path, 0.311, 0.003)
-    finally:
-        # stop the server
-        end_inference_server = [
-            EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT, "-c", "4"
-        ]
-        check_call(" ".join(end_inference_server),
-                   shell=True,
-                   env=llm_venv._new_env)
-
-
-@pytest.mark.parametrize("cor1", [True, False], ids=["default", "cor1"])
-@pytest.mark.parametrize("llama_model_root", ['llama-v3-8b-instruct-hf'],
-                         indirect=True)
-def test_llama3_single_gpu_mtbench(llama_example_root, cor1, llama_model_root,
-                                   llm_venv, engine_dir, cmodel_dir,
-                                   evaltool_root):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama3",
-                                model_path=llama_model_root,
-                                gpus=1,
-                                tp_size=1,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_batch_size=8",
-        "--max_input_len=4096",
-        "--max_seq_len=8192",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("MT-Bench evaluation")
-
-    # start inference server
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        llama_model_root, "-d", evaltool_root, "-m", "1024"
-    ]
-    check_call(" ".join(start_inference_server), shell=True)
-
-    try:
-        project_id = str(uuid.uuid4())
-        config_file = EVALTOOL_MTBENCH_CONFIG
-        result_file = EVALTOOL_MTBENCH_RESULT_FILE
-        model_name = os.path.basename(llama_model_root)
-
-        # Update config dynamically
-        import yaml
-        with open(config_file, 'r') as f:
-            mt_bench_config = yaml.safe_load(f)
-            mt_bench_config['model']['llm_name'] = model_name
-            mt_bench_config['model']['tokenizer_path'] = llama_example_root
-            mt_bench_config['evaluations'][0]['judge_model'][
-                'client_id'] = LLM_GATE_WAY_CLIENT_ID
-            mt_bench_config['evaluations'][0]['judge_model'][
-                'client_secret'] = LLM_GATE_WAY_TOKEN
-
-        config_file = os.path.join(llm_venv.get_working_directory(),
-                                   f"{model_name}_mtbench_config.yaml")
-        with open(config_file, 'w') as f:
-            yaml.dump(mt_bench_config, f)
-
-        # Update resource config
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            "evaltool/interfaces/cli/main.py",
-            "config",
-            "resource",
-            "--resource_config_file examples/resource_configs/resource_local.yaml",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-        # launch evaluation
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            f"evaltool/interfaces/cli/main.py",
-            "project",
-            "launch",
-            f"--eval_project_config_file '{config_file}'",
-            "--infra_name local",
-            f"--output_dir '{llm_venv.get_working_directory()}'",
-            f"--project_id {project_id}",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-    finally:
-        # stop the server
-        check_call(f"{EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT}", shell=True)
-
-    # process result
-    result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}/{model_name}.csv"
-    check_call(f"cat {result_path}", shell=True)
-
-    if '8b' in llama_model_root:
-        evaltool_mtbench_post_process(result_path, 7.8, 0.2)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-70b-instruct'],
-                         indirect=True)
-def test_llama3_4_gpus_mtbench(llama_example_root, llama_model_root, llm_venv,
-                               engine_dir, cmodel_dir, evaltool_root):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    print("Converting weights...")
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama3",
-                                model_path=llama_model_root,
-                                gpus=4,
-                                tp_size=4,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_batch_size=8",
-        "--max_input_len=4096",
-        "--max_seq_len=8192",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("MT-Bench evaluation")
-
-    # start inference server
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        llama_model_root, "-d", evaltool_root, "-m", "1024", "-c", "4"
-    ]
-    check_call(" ".join(start_inference_server),
-               shell=True,
-               env=llm_venv._new_env)
-
-    try:
-        project_id = str(uuid.uuid4())
-        config_file = EVALTOOL_MTBENCH_CONFIG
-        result_file = EVALTOOL_MTBENCH_RESULT_FILE
-        model_name = os.path.basename(llama_model_root)
-
-        # Update config dynamically
-        import yaml
-        with open(config_file, 'r') as f:
-            mt_bench_config = yaml.safe_load(f)
-            mt_bench_config['model']['llm_name'] = model_name
-            mt_bench_config['model']['tokenizer_path'] = llama_example_root
-            mt_bench_config['evaluations'][0]['judge_model'][
-                'client_id'] = LLM_GATE_WAY_CLIENT_ID
-            mt_bench_config['evaluations'][0]['judge_model'][
-                'client_secret'] = LLM_GATE_WAY_TOKEN
-
-        config_file = os.path.join(llm_venv.get_working_directory(),
-                                   f"{model_name}_mtbench_config.yaml")
-        with open(config_file, 'w') as f:
-            yaml.dump(mt_bench_config, f)
-
-        # Update resource config
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            "evaltool/interfaces/cli/main.py",
-            "config",
-            "resource",
-            "--resource_config_file examples/resource_configs/resource_local.yaml",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-        # launch evaluation
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            f"evaltool/interfaces/cli/main.py",
-            "project",
-            "launch",
-            f"--eval_project_config_file '{config_file}'",
-            "--infra_name local",
-            f"--output_dir '{llm_venv.get_working_directory()}'",
-            f"--project_id {project_id}",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-    finally:
-        # stop the server
-        end_inference_server = [
-            EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT, "-c", "4"
-        ]
-        check_call(" ".join(end_inference_server),
-                   shell=True,
-                   env=llm_venv._new_env)
-
-    # process result
-    result_path = f"{llm_venv.get_working_directory()}/{project_id}/{result_file}/{model_name}.csv"
-    check_call(f"cat {result_path}", shell=True)
-
-    if '70B' in llama_model_root:
-        evaltool_mtbench_post_process(result_path, 8.75, 0.2)
-
-
-@pytest.mark.parametrize("llama_model_root", ['llama-v3-8b-instruct-hf'],
-                         indirect=True)
-def test_llama3_lookahead_single_gpu_mtbench(llama_example_root,
-                                             llama_model_root, llm_venv,
-                                             engine_dir, cmodel_dir):
-
-    print("Convert weight...")
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama3",
-                                model_path=llama_model_root,
-                                gpus=1,
-                                tp_size=1,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_batch_size=8",
-        "--max_input_len=4096",
-        "--max_seq_len=8192",
-        "--max_draft_len=83",
-        "--speculative_decoding_mode=lookahead_decoding",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("MT-Bench evaluation")
-    result_path = run_lad_mtbench(engine_dir=engine_dir,
-                                  hf_model_dir=llama_model_root,
-                                  tokenizer_dir=llama_model_root,
-                                  workspace=llm_venv.get_working_directory(),
-                                  lookahead_config='[7,7,7]')
-    evaltool_mtbench_post_process(result_path, 7.8, 0.2)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-70b-instruct'],
-                         indirect=True)
-def test_llama3_lookahead_4_gpus_mtbench(llama_example_root, llama_model_root,
-                                         llm_venv, engine_dir, cmodel_dir):
-
-    print("Convert weight...")
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama3",
-                                model_path=llama_model_root,
-                                gpus=4,
-                                tp_size=4,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_batch_size=8",
-        "--max_input_len=4096",
-        "--max_seq_len=8192",
-        "--max_draft_len=83",
-        "--speculative_decoding_mode=lookahead_decoding",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("MT-Bench evaluation")
-    result_path = run_lad_mtbench(engine_dir=engine_dir,
-                                  hf_model_dir=llama_model_root,
-                                  tokenizer_dir=llama_model_root,
-                                  workspace=llm_venv.get_working_directory(),
-                                  lookahead_config='[7,7,7]',
-                                  device_count=4)
-    evaltool_mtbench_post_process(result_path, 8.75, 0.2)
-
-
-@pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-13b-Instruct'],
-                         indirect=True)
-def test_codellama_13b_humaneval(llama_example_root, code_llama_model_root,
-                                 llm_venv, engine_dir, cmodel_dir,
-                                 evaltool_root):
-
-    print("Build engines...")
-
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama2",
-                                model_path=code_llama_model_root,
-                                gpus=1,
-                                tp_size=1,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_batch_size=8",
-        "--max_input_len=5000",
-        "--max_seq_len=7048",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Human eval")
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        code_llama_model_root, "-d", evaltool_root, "-m", "1024"
-    ]
-    check_call(" ".join(start_inference_server), shell=True)
-
-    try:
-        # Update config dynamically
-        config_file = EVALTOOL_HUMAN_EVAL_CONFIG
-        model_name = os.path.basename(code_llama_model_root)
-
-        import yaml
-        with open(config_file, 'r') as f:
-            humaneval_config = yaml.safe_load(f)
-            humaneval_config['model']['llm_name'] = model_name
-            humaneval_config['model']['tokenizer_path'] = code_llama_model_root
-        config_file = os.path.join(llm_venv.get_working_directory(),
-                                   f"{model_name}_humaneval_config.yaml")
-        with open(config_file, 'w') as f:
-            yaml.dump(humaneval_config, f)
-
-        print("print('Run human eval')")
-        project_id = str(uuid.uuid4())
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            "evaltool/interfaces/cli/main.py",
-            "project",
-            "launch",
-            f"--eval_project_config_file '{config_file}'",
-            "--infra_name local",
-            f"--output_dir '{llm_venv.get_working_directory()}'",
-            f"--project_id {project_id}",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-        result_path = f"{llm_venv.get_working_directory()}/{project_id}/{EVALTOOL_HUMAN_EVAL_RESULT_FILE}"
-        check_call(f"cat {result_path}", shell=True)
-
-        evaltool_humaneval_post_process(result_path, 0.427, 0.02)
-    finally:
-        # stop the server
-        check_call(f"{EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT}", shell=True)
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-34b-Instruct'],
-                         indirect=True)
-def test_codellama_34b_2gpu_humaneval(llama_example_root, code_llama_model_root,
-                                      llm_venv, engine_dir, cmodel_dir,
-                                      evaltool_root):
-
-    print("Build engines...")
-    data_type = "float16"
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model="llama2",
-                                model_path=code_llama_model_root,
-                                gpus=2,
-                                tp_size=2,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_batch_size=8",
-        "--max_input_len=5000",
-        "--max_seq_len=7048",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Human eval")
-    start_inference_server = [
-        EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT, "-e", engine_dir, "-t",
-        code_llama_model_root, "-d", evaltool_root, "-m", "1024", "-c", "2"
-    ]
-    check_call(" ".join(start_inference_server),
-               shell=True,
-               env=llm_venv._new_env)
-
-    try:
-        # Update config dynamically
-        config_file = EVALTOOL_HUMAN_EVAL_CONFIG
-        model_name = os.path.basename(code_llama_model_root)
-
-        import yaml
-        with open(config_file, 'r') as f:
-            humaneval_config = yaml.safe_load(f)
-            humaneval_config['model']['llm_name'] = model_name
-            humaneval_config['model']['tokenizer_path'] = code_llama_model_root
-        config_file = os.path.join(llm_venv.get_working_directory(),
-                                   f"{model_name}_humaneval_config.yaml")
-        with open(config_file, 'w') as f:
-            yaml.dump(humaneval_config, f)
-
-        print("print('Run human eval')")
-        project_id = str(uuid.uuid4())
-        run_cmd = [
-            f"cd {evaltool_root}",
-            "&&",
-            "source .venv/bin/activate",
-            "&&",
-            "python3",
-            "evaltool/interfaces/cli/main.py",
-            "project",
-            "launch",
-            f"--eval_project_config_file '{config_file}'",
-            "--infra_name local",
-            f"--output_dir '{llm_venv.get_working_directory()}'",
-            f"--project_id {project_id}",
-        ]
-        check_call(" ".join(run_cmd), shell=True, executable="/bin/bash")
-
-        result_path = f"{llm_venv.get_working_directory()}/{project_id}/{EVALTOOL_HUMAN_EVAL_RESULT_FILE}"
-        check_call(f"cat {result_path}", shell=True)
-
-        evaltool_humaneval_post_process(result_path, 0.415, 0.02)
-    finally:
-        # stop the server
-        end_inference_server = [
-            EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT, "-c", "2"
-        ]
-        check_call(" ".join(end_inference_server),
-                   shell=True,
-                   env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("llama_model_root",
@@ -3797,9 +3047,11 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
     'Llama-3-8B-Instruct-Gradient-1048k', 'Llama-3-70B-Instruct-Gradient-1048k'
 ],
                          indirect=True)
+@pytest.mark.timeout(10800 if get_sm_version() < 89 else 3600)
 def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
                                             llama_model_root, llm_venv,
-                                            engine_dir, cmodel_dir):
+                                            engine_dir, cmodel_dir,
+                                            timeout_manager):
     "Build & run llama-3-8B-1048k on long context."
     model_name = os.path.basename(llama_model_root)
     dtype = 'float16'
@@ -3808,51 +3060,66 @@ def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
     max_seq_len = 1048576
     max_batch_size = 256
 
+    # Generate evaluation dataset with timeout management
     print("Generate evaluation dataset for passkey.")
-    gen_cmd = [
-        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
-        "--test_case=build_passkey",
-        "--test_level=7",
-    ]
-    venv_check_call(llm_venv, gen_cmd)
+    with timeout_manager.timed_operation("gen"):
+        gen_cmd = [
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
+            "--test_case=build_passkey",
+            "--test_level=7",
+        ]
+        venv_check_call(llm_venv,
+                        gen_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
+    # Convert checkpoint with timeout management
     print("Converting checkpoint...")
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=llama_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=llama_model_root,
-                               data_type=dtype,
-                               tp_size=tp_size,
-                               pp_size=pp_size)
+    with timeout_manager.timed_operation("convert"):
+        ckpt_dir = convert_weights(llm_venv=llm_venv,
+                                   example_root=llama_example_root,
+                                   cmodel_dir=cmodel_dir,
+                                   model=model_name,
+                                   model_path=llama_model_root,
+                                   data_type=dtype,
+                                   tp_size=tp_size,
+                                   pp_size=pp_size,
+                                   timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
     print("Building engines...")
-    build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
-        f"--workers={world_size}", f"--max_seq_len={max_seq_len}",
-        "--max_num_tokens=4096", "--use_paged_context_fmha=enable",
-        f'--max_batch_size={max_batch_size}'
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
+            f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
+            f"--workers={world_size}", f"--max_seq_len={max_seq_len}",
+            "--max_num_tokens=4096", "--use_paged_context_fmha=enable",
+            f'--max_batch_size={max_batch_size}'
+        ]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
+    # Run passkey evaluation with timeout management
     print("Run passkey evaluation...")
-    eval_cmd = [
-        f"{llama_example_root}/../../../eval_long_context.py",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_model_root}",
-        f"--max_input_length={max_seq_len-10}",
-        "--max_tokens_in_paged_kv_cache=1100000",
-        "--task=passkey",
-        "--stop_idx=10",
-        "--enable_chunked_context",
-        "--tensorrt_llm_accuracy_threshold=0.9",
-    ]
+    with timeout_manager.timed_operation("eval"):
+        eval_cmd = [
+            f"{llama_example_root}/../../../eval_long_context.py",
+            f"--engine_dir={engine_dir}",
+            f"--tokenizer_dir={llama_model_root}",
+            f"--max_input_length={max_seq_len-10}",
+            "--max_tokens_in_paged_kv_cache=1100000",
+            "--task=passkey",
+            "--stop_idx=10",
+            "--enable_chunked_context",
+            "--tensorrt_llm_accuracy_threshold=0.9",
+        ]
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        eval_cmd)
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            eval_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -4040,8 +3307,11 @@ def test_llm_llama_1gpu_streaming_llm(llama_example_root, deepseek_model_root,
     assert "上海人工智能实验室" in output, output
 
 
-@pytest.mark.parametrize(
-    "fp8_quant", ['disable_fp8', 'enable_fp8', 'enable_fp8_meta_recipe'])
+@pytest.mark.parametrize("fp8_quant", [
+    'disable_fp8',
+    pytest.param('enable_fp8', marks=skip_post_blackwell),
+    pytest.param('enable_fp8_meta_recipe', marks=skip_post_blackwell)
+])
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
 def test_llm_llama_v3_1_1node_single_gpu(llama_example_root, llama_model_root,
@@ -4140,7 +3410,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
     venv_check_call(llm_venv, summary_cmd)
 
 
-# TODO: remove skip after support fp8 rowwise gemm on B200
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("fp8_quant",
@@ -4157,7 +3427,8 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
                                          llm_venv, cmodel_dir,
                                          mmlu_dataset_root, engine_dir,
-                                         fp8_quant, gemm_allreduce):
+                                         fp8_quant, gemm_allreduce,
+                                         timeout_manager):
     "Run llama3.1 test on 1 node."
     if ("8B" not in llama_model_root) and (get_host_total_memory() < 1000000):
         pytest.skip("Host memory is insufficient.")
@@ -4175,70 +3446,90 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
     if not fp8_quant and "Meta-Llama-3.1-405B" == model_name:
         pytest.skip("Build engine will be OOM on 1 node.")
 
+    # Convert weights with timeout management
     print("Convert weight...")
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model=model_name,
-                                model_path=llama_model_root,
-                                data_type=data_type,
-                                tp_size=tp_size,
-                                pp_size=pp_size,
-                                use_fp8_rowwise=fp8_quant,
-                                load_by_shard=True,
-                                workers=world_size)
+    with timeout_manager.timed_operation("convert"):
+        model_dir = convert_weights(llm_venv=llm_venv,
+                                    example_root=llama_example_root,
+                                    cmodel_dir=cmodel_dir,
+                                    model=model_name,
+                                    model_path=llama_model_root,
+                                    data_type=data_type,
+                                    tp_size=tp_size,
+                                    pp_size=pp_size,
+                                    use_fp8_rowwise=fp8_quant,
+                                    load_by_shard=True,
+                                    workers=world_size,
+                                    timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
     print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--workers={world_size}",
-        f"--max_batch_size={256}",
-        "--use_paged_context_fmha=enable",
-        "--max_num_tokens=4096",
-        "--max_input_len=64000",
-        "--max_seq_len=65000",
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build",
+            f"--checkpoint_dir={model_dir}",
+            f"--output_dir={engine_dir}",
+            f"--workers={world_size}",
+            f"--max_batch_size={256}",
+            "--use_paged_context_fmha=enable",
+            "--max_num_tokens=4096",
+            "--max_input_len=64000",
+            "--max_seq_len=65000",
+        ]
 
-    if gemm_allreduce:
-        build_cmd += [f"--gemm_allreduce_plugin={data_type}"]
+        if gemm_allreduce:
+            build_cmd += [f"--gemm_allreduce_plugin={data_type}"]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
-    gen_cmd = [
-        f"{llama_example_root}/../infinitebench/construct_synthetic_dataset.py",
-        "--test_case=build_passkey",
-        "--test_level=3",
-    ]
+    # Generate dataset with timeout management
+    with timeout_manager.timed_operation("gen"):
+        gen_cmd = [
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
+            "--test_case=build_passkey",
+            "--test_level=3",
+        ]
 
-    venv_check_call(llm_venv, gen_cmd)
+        venv_check_call(llm_venv,
+                        gen_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
+    # Run evaluation with timeout management
     print("Run eval...")
-    eval_cmd = [
-        f"{llama_example_root}/../../../eval_long_context.py",
-        "--task=passkey",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_model_root}",
-        "--stop_idx=6",
-        "--max_input_length=64000",
-        "--enable_chunked_context",
-        "--kv_cache_free_gpu_memory_fraction=0.999",
-        "--max_tokens_in_paged_kv_cache=65064",
-        "--output_dir=64k_context_tp8",
-    ]
+    with timeout_manager.timed_operation("eval"):
+        eval_cmd = [
+            f"{llama_example_root}/../../../eval_long_context.py",
+            "--task=passkey",
+            f"--engine_dir={engine_dir}",
+            f"--tokenizer_dir={llama_model_root}",
+            "--stop_idx=6",
+            "--max_input_length=64000",
+            "--enable_chunked_context",
+            "--kv_cache_free_gpu_memory_fraction=0.999",
+            "--max_tokens_in_paged_kv_cache=65064",
+            "--output_dir=64k_context_tp8",
+        ]
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        eval_cmd)
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            eval_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
+    # Run MMLU with timeout management
     print("Run mmlu...")
-    mmlu_cmd = [
-        "trtllm-eval", f"--model={engine_dir}",
-        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
-        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
-    ]
-    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
+    with timeout_manager.timed_operation("mmlu"):
+        mmlu_cmd = [
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
+        ]
+        check_call(" ".join(mmlu_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -4353,6 +3644,7 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
         check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("low_latency_gemm_plugin", ["fp8"])
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
@@ -4585,6 +3877,7 @@ def test_llm_llama_v2_fp8_2gpu_cp2(data_type, llama_example_root,
 
 
 @skip_pre_ada
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
 def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
@@ -4656,6 +3949,7 @@ def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("code_llama_model_root", ['CodeLlama-7b-Instruct'],
                          indirect=True)
@@ -4785,6 +4079,7 @@ def test_mistral_nemo_fp8_with_bf16_lora(
     )
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b'], indirect=True)
 def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                                 llama_model_root, llm_venv,
@@ -4826,6 +4121,49 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                        tensorrt_llm_rouge1_threshold=15,
                                        dataset_dir=llm_datasets_root,
                                        rouge_dir=llm_rouge_root,
-                                       lookahead_config=[7, 7, 7])
+                                       lookahead_config='[7, 7, 7]')
 
     venv_check_call(llm_venv, summary_cmd)
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_llm_api_lookahead_decoding_1gpu(model_name, model_path):
+    """
+    RCCA: https://nvbugs/5359218
+    """
+    from defs.conftest import llm_models_root
+
+    from tensorrt_llm._tensorrt_engine import LLM
+    from tensorrt_llm.llmapi import (BuildConfig, KvCacheConfig,
+                                     LookaheadDecodingConfig, SamplingParams)
+    build_config = BuildConfig(max_batch_size=128,
+                               max_input_len=2048,
+                               max_seq_len=32768,
+                               max_num_tokens=8192,
+                               max_draft_len=111)
+    build_config.plugin_config.use_paged_context_fmha = True
+    build_config.plugin_config.multiple_profiles = True
+
+    lookahead_config = LookaheadDecodingConfig(max_window_size=8,
+                                               max_ngram_size=3,
+                                               max_verification_set_size=3)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+    llm = LLM(model=f"{llm_models_root()}/{model_path}",
+              kv_cache_config=kv_cache_config,
+              build_config=build_config,
+              speculative_config=lookahead_config,
+              enable_chunked_prefill=True)
+
+    prompt = """Write a C++ program to find the nth Fibonacci number using
+recursion. Now we define a sequence of numbers in which each number is the
+sum of the three preceding ones. The first three numbers are 0, -1, -1.
+Write a program to find the nth number.""" * 200  # around 13k tokens
+
+    sampling_params = SamplingParams(lookahead_config=lookahead_config)
+
+    output = llm.generate(prompt, sampling_params=sampling_params)
+
+    assert output is not None, "No output generated from LLM"

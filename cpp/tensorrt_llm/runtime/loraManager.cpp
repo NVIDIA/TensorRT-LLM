@@ -23,7 +23,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
+#include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <NvInferRuntime.h>
@@ -72,7 +72,7 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
-    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize);
+    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize, ppRank);
     auto const firstLayerId = ppRank * localNumLayers;
 
     auto weightsPointersPtr = bufferCast<int64_t>(*weightsPtrs);
@@ -123,7 +123,8 @@ void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsP
     ModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
+    auto localNbLayers
+        = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     for (auto const& [modId, mod] : mModuleIdToModule)

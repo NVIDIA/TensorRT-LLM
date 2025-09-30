@@ -639,6 +639,7 @@ public:
             benchmarkParams.cudaGraphCacheSize);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
+        executorConfig.setEnableTrtOverlap(benchmarkParams.enableTrtOverlap);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
         executorConfig.setPeftCacheConfig(peftCacheConfig);
         executorConfig.setBatchingType(batchingType);
@@ -828,13 +829,16 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // embeddingBias
         std::nullopt,    // speculativeDecoding
         std::nullopt,    // pTuning
+        std::nullopt,    // multimodalInput
+        std::nullopt,    // multimodalEmbedding
         std::nullopt,    // mRopeConfig
         loraConfig,      // loraConfig
         lookaheadConfig, // lookaheadConfig
         std::nullopt,    // kvCacheRetentionConfig
         std::nullopt,    // logitsPostProcessorName
         std::nullopt,    // logitsPostProcessor
-        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
+        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
+        std::nullopt);   // cacheSaltID
 }
 
 void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngineDir,
@@ -1052,7 +1056,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
 int main(int argc, char* argv[])
 {
     cxxopts::Options options(
-        "TensorRT-LLM BatchManager Benchmark", "TensorRT-LLM BatchManager Benchmark for GPT and GPT-like models.");
+        "TensorRT LLM BatchManager Benchmark", "TensorRT LLM BatchManager Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
     options.add_options()("engine_dir, decoder_engine_dir", "Directory that store the engines of decoder models.",
         cxxopts::value<std::string>());
@@ -1160,6 +1164,7 @@ int main(int argc, char* argv[])
         "Specify how many cuda graphs are cached in the runtime. Larger cache gives better perf, but consumes more GPU "
         "memory.",
         cxxopts::value<SizeType32>()->default_value("0"));
+    options.add_options()("enable_trt_overlap", "Enable TRT Overlap", cxxopts::value<bool>()->default_value("false"));
 
     options.add_options()("enable_context_fmha_fp32_acc", "Enable FMHA runner FP32 accumulation",
         cxxopts::value<bool>()->default_value("false"));
@@ -1412,6 +1417,9 @@ int main(int argc, char* argv[])
 
     // Argument: cuda_graph_cache_size
     benchmarkParams.cudaGraphCacheSize = result["cuda_graph_cache_size"].as<SizeType32>();
+
+    // Argument: enable_trt_overlap
+    benchmarkParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

@@ -107,11 +107,29 @@ if(WIN32)
 endif()
 
 add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
+add_cuda_architectures(${PLUGIN_SHARED_TARGET} 89)
 
 target_include_directories(
   ${PLUGIN_SHARED_TARGET}
   PUBLIC ${CUDA_INSTALL_DIR}/include
+  PUBLIC
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   PRIVATE ${TARGET_DIR})
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_FP4_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(${PLUGIN_SHARED_TARGET}

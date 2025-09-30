@@ -3,6 +3,8 @@ from operator import add
 import torch
 from torch.fx import GraphModule
 
+from .utils import get_arg, is_call_function
+
 
 def recover_pass(gm: GraphModule):
     # Unfuse specific op to make the fusion pass can work properly
@@ -12,12 +14,12 @@ def recover_pass(gm: GraphModule):
     for idx, node in enumerate(graph.nodes):
         node2idx[node] = idx
     for idx, node in enumerate(graph.nodes):
-        if (node.op == "call_function" and node.target
-                == torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default):
-            input = node.args[0]
-            residual = node.args[1]
-            weight = node.args[2]
-            eps = node.args[3]
+        if is_call_function(
+                node, torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default):
+            input = get_arg(node, 0, 'input')
+            residual = get_arg(node, 1, 'residual')
+            weight = get_arg(node, 2, 'weight')
+            eps = get_arg(node, 3, 'eps')
             with graph.inserting_before(node):
                 new_add = graph.call_function(add, (input, residual))
                 new_norm = graph.call_function(

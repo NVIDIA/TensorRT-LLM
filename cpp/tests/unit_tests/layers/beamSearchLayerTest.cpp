@@ -36,12 +36,11 @@ class BeamSearchLayerTest : public BaseSamplingLayerTest<T>
 
     void initLayer(TestSamplingParams const& params) override
     {
-        auto decodingMode = (params.beamWidth > 1) ? tle::DecodingMode::BeamSearch() : tle::DecodingMode::Auto();
-
+        auto decodingMode = tle::DecodingMode::BeamSearch();
         auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
             this->maxBatchSize(), params.beamWidth, this->mVocabSize, this->mVocabSizePadded);
-        this->mSamplingLayer
-            = std::make_shared<tensorrt_llm::layers::BeamSearchLayer<T>>(decodingDomain, this->mBufferManager);
+        this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::BeamSearchLayer<T>>(
+            decodingMode, decodingDomain, this->mBufferManager);
     }
 };
 

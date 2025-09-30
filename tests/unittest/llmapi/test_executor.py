@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import tempfile
 import threading
@@ -9,6 +10,7 @@ import pytest
 import torch
 import zmq
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
@@ -16,7 +18,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationResult, GenerationResultBase,
                                    PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
-from tensorrt_llm.llmapi import LLM, BuildConfig
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
@@ -76,6 +78,7 @@ def llama_7b_tp2_path(engine_path: Path) -> Path:
     return path
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
@@ -88,13 +91,16 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
             executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
         result = executor.generate(prompt_token_ids,
                                    sampling_params=SamplingParams(
-                                       max_tokens=max_tokens, beam_width=2))
+                                       max_tokens=max_tokens,
+                                       n=2,
+                                       use_beam_search=True))
         assert similar(tokenizer.decode(result.outputs[0].token_ids),
                        'E F G H I J K L')
         assert similar(tokenizer.decode(result.outputs[1].token_ids),
                        'E F G H I K L M')
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_sync_generation(llama_7b_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_path)
@@ -163,7 +169,7 @@ def test_invalid_sampling_params():
     with pytest.raises(ValueError):
         # n > beam_width is not possible because n exceeds the number of beam
         # search results
-        SamplingParams(max_tokens=4, n=4, beam_width=3)
+        SamplingParams(max_tokens=4, n=4, best_of=3, use_beam_search=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
@@ -350,6 +356,60 @@ def test_ZeroMqQueue_sync_async():
         push_pipe.put(i)
 
     assert res.result() == 45
+    pool.shutdown()
+    push_pipe.close()
+
+
+def _ZeroMqQueue_serialization_complicated_dataclass(addr: str,
+                                                     iterations: int):
+    pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
+
+    total = 0
+
+    async def task():
+        print(f"running task")
+        for i in range(iterations):
+            print(f"waiting for msg")
+            msg = await pull_pipe.get_async()
+            # print(f"received: {msg}")
+            nonlocal total
+            try:
+                total += msg.prompt_token_ids[0]
+            except Exception as e:
+                print(f"error: {e}")
+
+    print(f"to run task")
+    asyncio.run(task())
+
+    return total
+
+
+def test_ZeroMqQueue_serialization_complicated_dataclass():
+    # sync send message, async recv message
+    push_pipe = ZeroMqQueue(is_async=False, is_server=True)
+    iterations = 2
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    res = pool.submit(_ZeroMqQueue_serialization_complicated_dataclass,
+                      push_pipe.address, iterations)
+
+    TokenRangeRetentionConfig = tllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
+    kvcache_config = tllm.KvCacheRetentionConfig(
+        [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
+        80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
+
+    sampling_params = SamplingParams(max_tokens=4,
+                                     embedding_bias=torch.randn(2, 2))
+
+    for i in range(iterations):
+        request = GenerationRequest(prompt_token_ids=[i],
+                                    sampling_params=sampling_params,
+                                    kv_cache_retention_config=kvcache_config)
+        # print(f"put with msg: {request}")
+        push_pipe.put(request)
+
+    print(res.result())
+    assert res.result() == iterations * (iterations - 1) / 2
     pool.shutdown()
     push_pipe.close()
 

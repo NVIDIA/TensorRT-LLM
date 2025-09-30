@@ -19,4 +19,7 @@ if [[ $ARCH == *"x86_64"* ]] && [[ $SYSTEM_ID == *"rocky"* ]]; then
 	  -y
   curl -L ${GITHUB_URL}/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-linux-${ARCH}.tar.xz | xz -d | tar -x -C /tmp/
   cp /tmp/ccache-${CCACHE_VERSION}-linux-x86_64/ccache /usr/bin/ccache
+  # Clean up temporary files
+  rm -rf /tmp/ccache-${CCACHE_VERSION}-linux-x86_64
+  dnf clean all
 fi

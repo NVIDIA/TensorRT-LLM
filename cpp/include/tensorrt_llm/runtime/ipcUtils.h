@@ -69,6 +69,7 @@ public:
         bool const fakeBuffers = false);
 
     TensorPtr mAllReduceCommPtrs;
+    TensorPtr mFlagPtrs;
     std::vector<runtime::IpcMemory> mIpcMemoryHandles;
 };
 

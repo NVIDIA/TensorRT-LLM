@@ -24,6 +24,7 @@
 using namespace nvinfer1;
 using tensorrt_llm::plugins::RecvPluginCreator;
 using tensorrt_llm::plugins::RecvPlugin;
+using tensorrt_llm::mpi::MpiTag;
 
 static char const* RECV_PLUGIN_VERSION{"1"};
 static char const* RECV_PLUGIN_NAME{"Recv"};
@@ -44,7 +45,7 @@ RecvPlugin::RecvPlugin(void const* data, size_t length)
     read(d, mSrcRank);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -131,7 +132,7 @@ int RecvPlugin::initialize() noexcept
         return 0;
     }
     ncclUniqueId id;
-    COMM_SESSION.recvValue(id, mSrcRank, 0);
+    COMM_SESSION.recvValue(id, mSrcRank, MpiTag::kDefault);
 // Need static connection initialization for accurate KV cache size estimation
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)

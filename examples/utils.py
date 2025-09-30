@@ -82,12 +82,30 @@ def read_decoder_start_token_id(engine_dir):
     return config['pretrained_config']['decoder_start_token_id']
 
 
-def read_model_name(engine_dir: str):
-    engine_version = get_engine_version(engine_dir)
+def read_is_enc_dec(engine_dir: str, is_hf: bool = False):
+    if is_hf:
+        with open(Path(engine_dir) / "config.json", 'r') as f:
+            config = json.load(f)
+        is_enc_dec = config.get('is_encoder_decoder', False)
+    else:
+        is_enc_dec = {'encoder', 'decoder'}.issubset({
+            name
+            for name in os.listdir(engine_dir)
+            if os.path.isdir(os.path.join(engine_dir, name))
+        })
+    return is_enc_dec
 
+
+def read_model_name(engine_dir: str, is_hf: bool = False):
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)
 
+    if is_hf:
+        model_arch = config['architectures'][0]
+        model_version = config.get('model_type', None)
+        return model_arch, model_version
+
+    engine_version = get_engine_version(engine_dir)
     if engine_version is None:
         return config['builder_config']['name'], None
 
@@ -340,7 +358,7 @@ def add_common_args(parser):
         default=None,
         nargs="+",
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
+        'The attention window size that controls the sliding window attention kv cache behavior'
     )
     parser.add_argument(
         '--multi_block_mode',
@@ -421,12 +439,12 @@ def add_common_args(parser):
         "   E.g.: [4, [0], [1], False] for [draft_len, draft_model_device_list, target_model_device_list, use_logits]."
     )
     parser.add_argument(
-        '--prompt_lookup_config',
+        '--ngram_config',
         type=str,
         default=None,
         help=
-        "Configuration of Prompt-Lookup decoding, see `examples/prompt_lookup/README.md` for more information."
-        "   E.g.: [10,2,[0]] for [prompt_lookup_num_tokens, max_matching_ngram_size, device_list].",
+        "Configuration of NGram decoding, see `examples/ngram/README.md` for more information."
+        "   E.g.: [10,2,[0]] for [max_draft_len, max_matching_ngram_size, device_list].",
     )
     parser.add_argument(
         '--medusa_choices',

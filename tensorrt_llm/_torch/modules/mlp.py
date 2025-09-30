@@ -28,6 +28,10 @@ class MLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
+        self.up_lora = LoraLayer(
+            [LoraModuleType.MLP_H_TO_4H],
+            [self.intermediate_size // config.mapping.tp_size])
+
         self.up_proj = Linear(
             self.hidden_size,
             self.intermediate_size,
@@ -38,8 +42,13 @@ class MLP(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.VANILLA),
             quant_config=config.get_quant_config(),
-            skip_create_weights_in_init=config.skip_create_weights_in_init)
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            lora=self.up_lora,
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
+        self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
+                                   [self.hidden_size])
         self.down_proj = Linear(
             self.intermediate_size,
             self.hidden_size,
@@ -48,12 +57,10 @@ class MLP(nn.Module):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
-            skip_create_weights_in_init=config.skip_create_weights_in_init)
-
-        self.up_lora = LoraLayer([LoraModuleType.MLP_H_TO_4H],
-                                 [self.intermediate_size])
-        self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
-                                   [self.hidden_size])
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            lora=self.down_lora,
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
     def forward(
         self,
@@ -84,10 +91,8 @@ class MLP(nn.Module):
             x_up = x_up + x_up_lora
 
         x_act = self.activation(x_up)
-        x_down = self.down_proj(x_act)
-
-        x_down_lora = self.down_lora(x_act, lora_params, self.layer_idx)
-        if x_down_lora is not None:
-            x_down = x_down + x_down_lora
+        x_down = self.down_proj(x_act,
+                                lora_params=lora_params,
+                                layer_idx=self.layer_idx)
 
         return x_down

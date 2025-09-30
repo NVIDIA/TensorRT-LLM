@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -29,7 +30,8 @@ class BeamSearchLayer : public BaseLayer
     using Base = BaseLayer;
 
 public:
-    BeamSearchLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
+    BeamSearchLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
     // Functions called before input data arrives
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
@@ -66,8 +68,8 @@ private:
     TensorPtr mEarlyStoppingDevice;           // [batchSize] gpu
     TensorPtr mBeamWidthArrayHost;            // [batchSize, kMaxBeamWidthArrayLength] cpu
     TensorPtr mBeamWidthArrayDevice;          // [batchSize, kMaxBeamWidthArrayLength] gpu
-    TensorPtr mBeamWidthIn;                   // [batchSize] cpu, the input beamWidth of this step
-    TensorPtr mBeamWidthOut;                  // [batchSize] cpu, the output beamWidth of this step
+    TensorPtr mBeamWidthIn;                   // [batchSize] cpu, the beamWidth of last forward computation
+    TensorPtr mBeamWidthOut;                  // [batchSize] cpu, the beamWidth of next forward computation
 };
 
 } // namespace tensorrt_llm::layers

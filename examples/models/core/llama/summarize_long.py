@@ -45,13 +45,13 @@ def parse_args():
         type=int,
         default=4096,
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
+        'The attention window size that controls the sliding window attention kv cache behavior'
     )
     parser.add_argument(
         '--max_input_len',
         type=int,
         default=6400,
-        help='The max input length TensorRT-LLM engine was built with')
+        help='The max input length TensorRT LLM engine was built with')
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--max_ite', type=int, default=5)
     parser.add_argument(
@@ -97,7 +97,7 @@ def TRTLLaMA(args, config):
     quantization_config = pretrained_config['quantization']
 
     build_config = config['build_config']
-    kv_cache_type = KVCacheType(build_config['kv_cache_type'])
+    kv_cache_type = KVCacheType.from_string(build_config['kv_cache_type'])
     plugin_config = build_config['plugin_config']
 
     dtype = pretrained_config['dtype']
@@ -392,7 +392,7 @@ def main(args):
                         references=[hf_summary[ite][beam_idx][batch_idx]])
 
         for beam_idx in range(args.num_beams):
-            logger.info(f"TensorRT-LLM beam {beam_idx} result")
+            logger.info(f"TensorRT LLM beam {beam_idx} result")
             computed_metrics_tensorrt_llm = metric_tensorrt_llm[
                 beam_idx].compute()
             for key in computed_metrics_tensorrt_llm.keys():

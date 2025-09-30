@@ -81,6 +81,12 @@ CUDADriverWrapper::CUDADriverWrapper()
     *reinterpret_cast<void**>(&_cuLinkCreate) = load_sym(handle, "cuLinkCreate_v2");
     *reinterpret_cast<void**>(&_cuModuleGetFunction) = load_sym(handle, "cuModuleGetFunction");
     *reinterpret_cast<void**>(&_cuModuleGetGlobal) = load_sym(handle, "cuModuleGetGlobal_v2");
+    *reinterpret_cast<void**>(&_cuLibraryGetKernel) = load_sym(handle, "cuLibraryGetKernel");
+    *reinterpret_cast<void**>(&_cuLibraryLoadData) = load_sym(handle, "cuLibraryLoadData");
+    *reinterpret_cast<void**>(&_cuLibraryGetGlobal) = load_sym(handle, "cuLibraryGetGlobal");
+    *reinterpret_cast<void**>(&_cuLibraryUnload) = load_sym(handle, "cuLibraryUnload");
+    *reinterpret_cast<void**>(&_cuKernelSetAttribute) = load_sym(handle, "cuKernelSetAttribute");
+    *reinterpret_cast<void**>(&_cuCtxGetDevice) = load_sym(handle, "cuCtxGetDevice");
     *reinterpret_cast<void**>(&_cuLinkAddFile) = load_sym(handle, "cuLinkAddFile_v2");
     *reinterpret_cast<void**>(&_cuLinkAddData) = load_sym(handle, "cuLinkAddData_v2");
     *reinterpret_cast<void**>(&_cuLaunchCooperativeKernel) = load_sym(handle, "cuLaunchCooperativeKernel");
@@ -89,6 +95,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     *reinterpret_cast<void**>(&_cuTensorMapEncodeTiled) = load_sym(handle, "cuTensorMapEncodeTiled");
     *reinterpret_cast<void**>(&_cuMemcpyDtoH) = load_sym(handle, "cuMemcpyDtoH_v2");
     *reinterpret_cast<void**>(&_cuDeviceGetAttribute) = load_sym(handle, "cuDeviceGetAttribute");
+    *reinterpret_cast<void**>(&_cuOccupancyMaxActiveClusters) = load_sym(handle, "cuOccupancyMaxActiveClusters");
 }
 
 CUDADriverWrapper::~CUDADriverWrapper()
@@ -145,6 +152,41 @@ CUresult CUDADriverWrapper::cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod
 CUresult CUDADriverWrapper::cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, char const* name) const
 {
     return (*_cuModuleGetGlobal)(dptr, bytes, hmod, name);
+}
+
+CUresult CUDADriverWrapper::cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, char const* name) const
+{
+    return (*_cuLibraryGetKernel)(pKernel, library, name);
+}
+
+CUresult CUDADriverWrapper::cuLibraryLoadData(CUlibrary* library, void const* code, CUjit_option* jitOptions,
+    void** jitOptionsValues, unsigned int numJitOptions, CUlibraryOption* libraryOptions, void** libraryOptionValues,
+    unsigned int numLibraryOptions) const
+{
+    return (*_cuLibraryLoadData)(library, code, jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
+        libraryOptionValues, numLibraryOptions);
+}
+
+CUresult CUDADriverWrapper::cuLibraryGetGlobal(
+    CUdeviceptr* dptr, size_t* bytes, CUlibrary library, char const* name) const
+{
+    return (*_cuLibraryGetGlobal)(dptr, bytes, library, name);
+}
+
+CUresult CUDADriverWrapper::cuLibraryUnload(CUlibrary library) const
+{
+    return (*_cuLibraryUnload)(library);
+}
+
+CUresult CUDADriverWrapper::cuKernelSetAttribute(
+    CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev) const
+{
+    return (*_cuKernelSetAttribute)(attrib, val, kernel, dev);
+}
+
+CUresult CUDADriverWrapper::cuCtxGetDevice(CUdevice* device) const
+{
+    return (*_cuCtxGetDevice)(device);
 }
 
 CUresult CUDADriverWrapper::cuLinkAddFile(CUlinkState state, CUjitInputType type, char const* path,
@@ -245,6 +287,12 @@ CUresult CUDADriverWrapper::cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, s
 CUresult CUDADriverWrapper::cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) const
 {
     return (*_cuDeviceGetAttribute)(pi, attrib, dev);
+}
+
+CUresult CUDADriverWrapper::cuOccupancyMaxActiveClusters(
+    int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const
+{
+    return (*_cuOccupancyMaxActiveClusters)(maxActiveClusters, f, config);
 }
 
 } // namespace tensorrt_llm::common

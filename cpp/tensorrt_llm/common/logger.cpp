@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <cuda_runtime.h>
 
@@ -30,19 +31,21 @@ Logger::Logger()
     auto const* levelName = std::getenv("TLLM_LOG_LEVEL");
     if (levelName != nullptr)
     {
-        auto level = [levelName = std::string(levelName)]()
+        auto level = [levelName]()
         {
-            if (levelName == "TRACE")
+            std::string levelNameCap(levelName);
+            toUpper(levelNameCap);
+            if (levelNameCap == "TRACE")
                 return TRACE;
-            if (levelName == "VERBOSE" || levelName == "DEBUG")
+            if (levelNameCap == "VERBOSE" || levelNameCap == "DEBUG")
                 return DEBUG;
-            if (levelName == "INFO")
+            if (levelNameCap == "INFO")
                 return INFO;
-            if (levelName == "WARNING")
+            if (levelNameCap == "WARNING")
                 return WARNING;
-            if (levelName == "ERROR")
+            if (levelNameCap == "ERROR")
                 return ERROR;
-            TLLM_THROW("Invalid log level: %s", levelName.c_str());
+            TLLM_THROW("Invalid log level: %s", levelName);
         }();
         // If TLLM_LOG_FIRST_RANK_ONLY=ON, set LOG LEVEL of other device to ERROR
         if (isFirstRankOnly)

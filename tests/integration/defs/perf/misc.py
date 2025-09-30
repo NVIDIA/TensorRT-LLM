@@ -14,7 +14,7 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Miscellaneous utility code used by trt_test. Should contain all code that is agnostic to remote mode vs local mode of TURTLE.
+Miscellaneous utility code used by trt_test. Should contain all code that is agnostic to remote mode vs local mode.
 """
 import subprocess as sp
 

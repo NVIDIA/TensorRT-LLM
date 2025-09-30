@@ -4,13 +4,14 @@ import json
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple
 
-from tensorrt_llm._torch.pyexecutor.model_engine import \
+from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -59,6 +60,7 @@ class StatsKeeper:
         Register request perf items, used exclusively with LLM API.
         """
         record = self.requests[request_perf_item.request_id]
+        record.id = request_perf_item.request_id
         record.num_input_tokens = request_perf_item.num_input_tokens
         record.start_timestamp = request_perf_item.start_timestamp
         record.register_event(request_perf_item.error,
@@ -70,7 +72,7 @@ class StatsKeeper:
         if request_perf_item.response_is_final:
             self.num_complete = self.num_complete + 1
 
-    def generate_statistics_summary(self) -> None:
+    def generate_statistics_summary(self, max_draft_tokens: int) -> None:
         """Generate summary statistics from internally stored statistics.
 
         Returns:
@@ -88,42 +90,62 @@ class StatsKeeper:
 
         intertoken_avg_latencies = []
         output_tokens = []
-        request_acceptance = []
         total_decoding_iterations = 0
         ttft_times = []
         last_queue_time = 0.0
         queue_time_total = 0.0
 
+        num_draft_tokens = []
+        num_accepted_draft_tokens = []
+        draft_acceptance_rate = []
+        acceptance_length = []
+
         for entry in self.requests.values():
             start_time = min(entry.start_timestamp, start_time)
             end_time = max(entry.end_timestamp, end_time)
             last_queue_time = max(entry.start_timestamp, last_queue_time)
-            request_ar = entry.num_generated_tokens / (entry.decode_iteration +
-                                                       1)
 
             request_latencies.append(entry.end_to_end_latency)
             generation_latencies.append(entry.generation_time)
             generation_throughputs.append(entry.generation_token_throughput)
             ttft_times.append(entry.time_to_first_token)
             intertoken_avg_latencies.append(entry.intertoken_latency)
-            request_acceptance.append(request_ar)
             output_throughput_per_user.append(entry.output_token_throughput)
             total_decoding_iterations += entry.decode_iteration + 1
 
             output_tokens.append(entry.num_total_output_tokens)
             total_input_tokens += entry.num_input_tokens
 
-        global_acceptance_rate = sum(output_tokens) / total_decoding_iterations
+            # For speculative decoding, we need to track the number of draft tokens per request and the number of accepted draft tokens per request
+            if max_draft_tokens > 0:
+                num_draft_tokens.append(max_draft_tokens *
+                                        (entry.decode_iteration + 1))
+                num_accepted_draft_tokens.append(entry.num_total_output_tokens -
+                                                 entry.decode_iteration - 1)
+                draft_acceptance_rate.append(
+                    float(num_accepted_draft_tokens[-1]) /
+                    float(num_draft_tokens[-1]))
+                acceptance_length.append(entry.num_total_output_tokens /
+                                         (entry.decode_iteration + 1))
+
+        global_acceptance_length = sum(
+            output_tokens) / total_decoding_iterations
         queue_time_total = last_queue_time - start_time
-        percentile_request_accept = PercentileStats.from_iterable(
-            request_acceptance) if request_acceptance else None
+
+        num_draft_tokens_percentiles = PercentileStats.from_iterable(
+            num_draft_tokens) if num_draft_tokens else None
+        num_accepted_draft_tokens_percentiles = PercentileStats.from_iterable(
+            num_accepted_draft_tokens) if num_accepted_draft_tokens else None
+        draft_acceptance_rate_percentiles = PercentileStats.from_iterable(
+            draft_acceptance_rate) if draft_acceptance_rate else None
+        acceptance_length_percentiles = PercentileStats.from_iterable(
+            acceptance_length) if acceptance_length else None
 
         stats = BenchmarkStatistics(
             num_requests=num_requests,
             total_latency_ns=end_time - start_time,
             total_output_tokens=sum(output_tokens),
             total_input_tokens=total_input_tokens,
-            acceptance_rate=global_acceptance_rate,
             request_latency_percentiles=PercentileStats.from_iterable(
                 request_latencies),
             tpot_percentiles=PercentileStats.from_iterable(
@@ -137,7 +159,12 @@ class StatsKeeper:
                 generation_latencies),
             token_percentiles=PercentileStats.from_iterable(output_tokens),
             issue_rate_ns=queue_time_total / num_requests,
-            acceptance_percentiles=percentile_request_accept,
+            acceptance_length=global_acceptance_length,
+            num_draft_tokens_percentiles=num_draft_tokens_percentiles,
+            num_accepted_draft_tokens_percentiles=
+            num_accepted_draft_tokens_percentiles,
+            draft_acceptance_rate_percentiles=draft_acceptance_rate_percentiles,
+            acceptance_length_percentiles=acceptance_length_percentiles,
         )
 
         return stats
@@ -162,12 +189,13 @@ class ReportUtility:
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
         """
-        self.raw_statistics = statistics
-        self.statistics = statistics.generate_statistics_summary()
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
         self.logger = logger
         self.kwargs = kwargs
+        self.raw_statistics = statistics
+        self.statistics = statistics.generate_statistics_summary(
+            self.get_max_draft_len())
         self.streaming = streaming
 
     @staticmethod
@@ -220,6 +248,16 @@ class ReportUtility:
             retval[req_id] = output_str
         return dict(sorted(retval.items()))
 
+    def get_request_info(self, tokenizer) -> Dict[int, List[str]]:
+        requests = []
+        for request in self.raw_statistics.requests.values():
+            entry = request.model_dump()
+            entry["output"] = tokenizer.decode(entry["tokens"])
+            entry["output_tokens"] = len(entry["tokens"])
+            entry.pop("tokens")
+            requests.append(entry)
+        return requests
+
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
 
@@ -235,8 +273,24 @@ class ReportUtility:
             },
         }
 
+        # Retrieve KV cache information.
+        kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
+        if isinstance(kv_cache_config, KvCacheConfig):
+            kv_cache_dtype = kv_cache_config.dtype
+            kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
+        elif isinstance(kv_cache_config, dict):
+            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            kv_cache_mem_percent = kv_cache_config.get(
+                "free_gpu_memory_fraction")
+        else:
+            raise ValueError(
+                f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
+
+        kv_cache_mem_percent = kv_cache_mem_percent \
+            if kv_cache_mem_percent is not None else None
+
         # Engine/Backend details
-        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
+        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -264,17 +318,16 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            validate_and_set_kv_cache_quant(
-                model_config,
-                self.kwargs["pytorch_backend_config"].kv_cache_dtype)
+
+            validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
             stats_dict["engine"] |= {
                 "backend":
                 "Pytorch",
                 "dtype":
-                torch_dtype_to_str(
-                    model_config.pretrained_config.torch_dtype
-                    or model_config.pretrained_config.text_config.torch_dtype),
+                torch_dtype_to_str(model_config.torch_dtype
+                                   or model_config.pretrained_config.
+                                   get_text_config().torch_dtype),
                 "kv_cache_dtype":
                 model_config.quant_config.kv_cache_quant_algo,
                 "quantization":
@@ -290,8 +343,7 @@ class ReportUtility:
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
             "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
             "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
-            "kv_cache_percentage":
-            self.rt_cfg.settings_config.kv_cache_percent * 100.0,
+            "kv_cache_percentage": kv_cache_mem_percent,
             "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
@@ -340,9 +392,11 @@ class ReportUtility:
         }
 
         if self.streaming:
+            avg_tpot = self.convert_to_ms(
+                self.statistics.per_user_time_per_output_token_ns)
+
             stats_dict["streaming_metrics"] = {
-                # Token output speed (1 / time-per-output-token)
-                # NOTE: Excludes TTFT by nature of using TPOT.
+                # NOTE: Excludes TTFT by nature as this is a genphase calculation.
                 "token_output_speed_tok_s":
                 self.per_user_generation_token_throughput_s,
                 # Average per request time-to-first-token (TTFT)
@@ -351,8 +405,7 @@ class ReportUtility:
                     self.statistics.per_user_time_to_first_token_ns),
                 # Average per request token time-per-output-token (TPOT)
                 "avg_tpot_ms":
-                self.convert_to_ms(
-                    self.statistics.per_user_time_per_output_token_ns),
+                avg_tpot,
                 # Average per request Time-per-output-token percentiles (TPOT)
                 "tpot_percentiles":
                 self.statistics.tpot_percentiles.model_dump(
@@ -368,7 +421,14 @@ class ReportUtility:
                         k: self.convert_to_ms(v)
                         for k, v in
                         self.statistics.ttft_percentiles.model_dump().items()
-                    }
+                    },
+                "gen_tps_percentiles":
+                self.statistics.generation_tp_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_rate_to_s(v)
+                        for k, v in self.statistics.generation_tp_percentiles.
+                        model_dump().items()
+                    },
             }
 
         spec_decoding, decoding_mode = False, None
@@ -387,9 +447,22 @@ class ReportUtility:
             stats_dict["decoding_stats"] = {
                 "mode":
                 decoding_mode,
-                "acceptance_percentiles":
-                self.statistics.acceptance_percentiles.model_dump(
+                "num_draft_tokens_percentiles":
+                self.statistics.num_draft_tokens_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json')
+                if self.statistics.num_draft_tokens_percentiles else None,
+                "num_accepted_draft_tokens_percentiles":
+                self.statistics.num_accepted_draft_tokens_percentiles.
+                model_dump(exclude_none=True, by_alias=True, mode='json') if
+                self.statistics.num_accepted_draft_tokens_percentiles else None,
+                "draft_acceptance_rate_percentiles":
+                self.statistics.draft_acceptance_rate_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json')
+                if self.statistics.draft_acceptance_rate_percentiles else None,
+                "acceptance_length_percentiles":
+                self.statistics.acceptance_length_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json')
+                if self.statistics.acceptance_length_percentiles else None
             }
         # Dataset metadata
         stats_dict["dataset"] = self.dataset_metadata.model_dump(by_alias=True,
@@ -412,7 +485,7 @@ class ReportUtility:
         decoding = stats_dict.get("decoding_stats", None)
 
         backend_info = ""
-        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
+        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -426,7 +499,7 @@ class ReportUtility:
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
                 f"Engine Directory:\t{engine['engine_dir']}\n"
-                f"TensorRT-LLM Version:\t{engine['version']}\n"
+                f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
                 f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
                 f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
@@ -440,7 +513,7 @@ class ReportUtility:
                 "===========================================================\n"
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
-                f"TensorRT-LLM Version:\t{engine['version']}\n"
+                f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{engine['dtype']}\n"
                 f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
                 f"Quantization:\t\t{engine['quantization']}\n"
@@ -448,6 +521,10 @@ class ReportUtility:
                 # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
                 # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
                 f"\n")
+
+        kv_cache_percentage = world_info.get("kv_cache_percentage", None)
+        if kv_cache_percentage is not None:
+            kv_cache_percentage = f"{kv_cache_percentage * 100.0:.2f}%"
 
         world_info = (
             "===========================================================\n"
@@ -459,7 +536,7 @@ class ReportUtility:
             f"Max Runtime Batch Size: {world_info['max_batch_size']}\n"
             f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"
             f"Scheduling Policy:      {world_info['scheduling_policy']}\n"
-            f"KV Memory Percentage:   {world_info['kv_cache_percentage']:.2f}%\n"
+            f"KV Memory Percentage:   {kv_cache_percentage}\n"
             f"Issue Rate (req/sec):   {world_info['issue_rate']:.4E}\n"
             f"\n")
 
@@ -485,11 +562,12 @@ class ReportUtility:
         perf_stats = (
             f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
-            f"Per User Output Throughput (tokens/sec/user):     {perf['output_throughput_per_user_tok_s']:.4f}\n"
-            f"Per GPU Output Throughput (tokens/sec/gpu):       {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
             f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
+            # Output Throughput includes context/first token.
+            f"Per User Output Throughput [w/ ctx] (tps/user):   {perf['output_throughput_per_user_tok_s']:.4f}\n"
+            f"Per GPU Output Throughput (tps/gpu):              {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
         )
 
         if streaming:
@@ -505,14 +583,21 @@ class ReportUtility:
                 f"[TTFT] {key.upper():<7}: {ttft[key]:.4f}" for key in
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
+            gen_tps_stats = "\n".join(
+                f"[GTPS] {key.upper():<7}: {streaming['gen_tps_percentiles'][key]:.4f}"
+                for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+
             perf_stats += (
-                f"Per User Output Speed [1/TPOT] (tokens/sec/user): {streaming['token_output_speed_tok_s']:.4f}\n"
                 f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
                 f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):                 {streaming['token_output_speed_tok_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
-                f"{ttft_stats}\n")
+                f"{ttft_stats}\n"
+                "\n-- Per-Request Generation Throughput [GTPS] Breakdown (tps/user)\n\n"
+                f"{gen_tps_stats}\n")
 
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"
@@ -521,21 +606,61 @@ class ReportUtility:
         decoding_stats = ""
         if decoding is not None:
             decoding = stats_dict["decoding_stats"]
-            acc = decoding["acceptance_percentiles"]
-            acc_stats = "\n".join(
-                f"[AR] {key.upper():<7}: {acc[key]:.2f}" for key in
-                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+            if self.get_max_draft_len() > 0:
+                num_draft_tokens = decoding["num_draft_tokens_percentiles"]
+                num_draft_tokens_stats = "\n".join(
+                    f"[DT] {key.upper():<7}: {num_draft_tokens[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
 
-            decoding_stats = (
-                "===========================================================\n"
-                f"= DECODING STATISTICS ({decoding['mode']})\n"
-                "===========================================================\n"
-                "\n"
-                "-- Acceptance Rate Details --------------------------------\n\n"
-                "\n"
-                f"{acc_stats}"
-                f"\n"
-                "===========================================================\n")
+                num_accepted_draft_tokens = decoding[
+                    "num_accepted_draft_tokens_percentiles"]
+                num_accepted_draft_tokens_stats = "\n".join(
+                    f"[ADT] {key.upper():<7}: {num_accepted_draft_tokens[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
+
+                draft_acceptance_rate = decoding[
+                    "draft_acceptance_rate_percentiles"]
+                draft_acceptance_rate_stats = "\n".join(
+                    f"[DAR] {key.upper():<7}: {draft_acceptance_rate[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
+
+                acceptance_length = decoding["acceptance_length_percentiles"]
+                acceptance_length_stats = "\n".join(
+                    f"[AL] {key.upper():<7}: {acceptance_length[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
+
+                decoding_stats = (
+                    "===========================================================\n"
+                    f"= DECODING STATISTICS ({decoding['mode']})\n"
+                    "===========================================================\n"
+                    "\n"
+                    "-- Number of Draft Tokens Details --------------------------------\n\n"
+                    "\n"
+                    f"{num_draft_tokens_stats}"
+                    f"\n"
+                    "-- Number of Accepted Draft Tokens Details --------------------------------\n\n"
+                    f"{num_accepted_draft_tokens_stats}"
+                    f"\n"
+                    "-- Draft Acceptance Rate Details --------------------------------\n\n"
+                    f"{draft_acceptance_rate_stats}"
+                    f"\n"
+                    "-- Acceptance Length Details --------------------------------\n\n"
+                    f"{acceptance_length_stats}"
+                    f"\n"
+                    "===========================================================\n"
+                )
 
         logging_info = (f"{backend_info}"
                         f"{request_info}"
@@ -546,3 +671,12 @@ class ReportUtility:
                         f"{self.dataset_metadata.get_summary_for_print()}")
         self.logger.info(logging_info)
         return self.statistics
+
+    def get_max_draft_len(self) -> int:
+        """Get max_draft_len from speculative_config."""
+        # Try to get from speculative_config
+        if ("speculative_config" in self.kwargs
+                and self.kwargs["speculative_config"] is not None):
+            return self.kwargs["speculative_config"].max_draft_len or 0
+
+        return 0

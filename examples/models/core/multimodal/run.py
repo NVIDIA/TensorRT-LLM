@@ -41,7 +41,7 @@ def print_result(model, input_text, output_text, args):
                     0][0].lower()
             elif model.model_type in [
                     'blip2', 'neva', 'phi-3-vision', 'llava_next',
-                    'phi-4-multimodal'
+                    'phi-4-multimodal', 'pixtral'
             ]:
                 assert 'singapore' in output_text[0][0].lower()
             elif model.model_type == 'video-neva':

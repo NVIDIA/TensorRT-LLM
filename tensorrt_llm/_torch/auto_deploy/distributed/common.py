@@ -61,6 +61,13 @@ def broadcast_object_list(object_list, src=0, group=None, device=None):
     return dist.broadcast_object_list(object_list, src=src, group=group, device=device)
 
 
+def all_gather_object(object_list, object, group=None):
+    """Torch's all_gather_object with our default process group."""
+    if group is None:
+        group = DistGroup.get()
+    return dist.all_gather_object(object_list, object, group=group)
+
+
 def get_free_port():
     sock = socket.socket()
     sock.bind(("", 0))
@@ -82,7 +89,7 @@ def get_rank_world_size() -> Tuple[int, int]:
 
 def initialize_or_skip(*args, **kwargs) -> Tuple[int, int]:
     if not dist.is_initialized():
-        initialize(*args, **kwargs)
+        return initialize(*args, **kwargs)
     return get_rank(), get_world_size()
 
 
@@ -94,6 +101,13 @@ def is_ompi():
 def is_torchelastic():
     """Check whether multi-processing was initialized with torchelastic."""
     return "TORCHELASTIC_RUN_ID" in os.environ
+
+
+def cleanup():
+    """Destroy process group when the program exits."""
+    if dist.is_initialized():
+        ad_logger.info("Destroying process group")
+        dist.destroy_process_group()
 
 
 def initialize(rank: int = 0, world_size: int = 1, port: Optional[int] = None) -> Tuple[int, int]:
@@ -122,12 +136,21 @@ def initialize(rank: int = 0, world_size: int = 1, port: Optional[int] = None) -
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
+    os.environ["LOCAL_RANK"] = str(local_rank)
 
     # Necessary to assign a device to each rank.
     torch.cuda.set_device(local_rank)
 
     # We use nccl backend
-    dist.init_process_group("nccl", world_size=world_size, rank=local_rank)
+    dist.init_process_group(
+        "nccl",
+        world_size=world_size,
+        rank=local_rank,
+        device_id=torch.device(local_rank),
+    )
+
+    # Register cleanup function to be called at exit
+    atexit.register(cleanup)
 
     # set a manual seed for reproducibility
     torch.manual_seed(1111)
@@ -146,6 +169,9 @@ def init_and_run_process(job, rank, size, port, **kwargs):
                 kwargs[q].put(None)
                 kwargs[q].close()
         raise e
+    finally:
+        # Make sure to clean up even if an exception occurs
+        cleanup()
 
 
 def _start_multiprocess_job(
@@ -221,6 +247,7 @@ def spawn_multiprocess_job(job: Callable[[int, int], None], size: Optional[int] 
     processes = _start_multiprocess_job(job, size)
     if processes:
         _join_multiprocess_job(processes)
+    cleanup()
 
 
 class MultiProcessExecutor:
@@ -268,3 +295,7 @@ class MultiProcessExecutor:
             q.join_thread()
         self.output_queue.close()
         self.output_queue.join_thread()
+
+        # Make sure all process groups are cleaned up
+        if dist.is_initialized():
+            dist.destroy_process_group()

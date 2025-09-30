@@ -16,22 +16,24 @@ import copy
 import gc
 import inspect
 import json
+import linecache
 import math
 import os
 import struct
+import tempfile
 import trace
 import weakref
 from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
-from functools import partial, wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import nvtx
-from cuda import cuda
 from mpi4py import MPI
+from mpi4py.util import pkl5
 from packaging import version
 
 # isort: off
@@ -117,29 +119,6 @@ def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     return ndarray
 
 
-# ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
-def get_sm_version():
-    # Init
-    err, = cuda.cuInit(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Device
-    err, cuDevice = cuda.cuDeviceGet(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    # Get target architecture
-    err, sm_major = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-    err, sm_minor = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        cuDevice)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"Cuda Error: {err}"
-
-    return sm_major * 10 + sm_minor
-
-
 def trt_version():
     return trt.__version__
 
@@ -202,6 +181,36 @@ _str_to_binding_dtype_dict = dict(
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
+_binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
+
+_binding_dtype_bits = {
+    DataType.INT64: 64,
+    DataType.FLOAT: 32,
+    DataType.INT32: 32,
+    DataType.BF16: 16,
+    DataType.HALF: 16,
+    DataType.BOOL: 8,
+    DataType.FP8: 8,
+    DataType.INT8: 8,
+    DataType.UINT8: 8,
+    DataType.NVFP4: 4,
+}
+
+
+def binding_to_str_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return ret
+
+
+def binding_dtype_size(dtype: DataType):
+    return _binding_dtype_size[dtype]
+
+
+def get_size_in_bytes(num_elements: int, dtype: DataType):
+    total_num_bits = _binding_dtype_bits[dtype] * num_elements
+    assert total_num_bits % 8 == 0, f"Total number of bits {total_num_bits} must be divisible by 8"
+    return total_num_bits // 8
 
 
 def str_dtype_to_binding(dtype):
@@ -462,7 +471,7 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = MPI.COMM_WORLD
+comm = pkl5.Intracomm(MPI.COMM_WORLD)
 
 
 def set_mpi_comm(new_comm):
@@ -475,6 +484,10 @@ def mpi_comm():
 
 
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+
+
+def local_mpi_comm():
+    return local_comm
 
 
 def mpi_rank():
@@ -515,8 +528,13 @@ def mpi_barrier():
         mpi_comm().Barrier()
 
 
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
+
+
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
 
 
 def mpi_allgather(obj):
@@ -531,10 +549,35 @@ def mpi_isend(buf, dest, tag=0):
     return None
 
 
+def mpi_send(buf, dest, tag=0):
+    # send in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().Send(buf, dest, tag=tag)
+    return None
+
+
 def mpi_recv(buf, source, tag):
     # recv in buf-like object (e.g. numpy array)
     if ENABLE_MULTI_DEVICE:
         return mpi_comm().Recv(buf, source, tag=tag)
+    return None
+
+
+def mpi_send_object(obj, dest, tag=0):
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().send(obj, dest=dest, tag=tag)
+
+
+def mpi_isend_object(obj, dest, tag=0):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().isend(obj, dest=dest, tag=tag)
+    return None
+
+
+def mpi_recv_object(source, tag):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().recv(source=source, tag=tag)
     return None
 
 
@@ -642,16 +685,67 @@ def release_gc():
         torch.cuda.ipc_collect()
 
 
+@lru_cache(maxsize=1)
 def get_sm_version():
     prop = torch.cuda.get_device_properties(0)
     return prop.major * 10 + prop.minor
+
+
+@lru_cache(maxsize=1)
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
+def is_trace_enabled(env_var: str):
+    value = os.environ.get(env_var, "-1")
+    if value == "ALL":
+        return True
+    try:
+        return int(value) == global_mpi_rank()
+    except ValueError:
+        return False
 
 
 def trace_func(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        tracer = trace.Trace(trace=1, count=0)
+
+        def globaltrace(frame, why, arg):
+            if why == "call":
+                code = frame.f_code
+                filename = frame.f_globals.get('__file__', None)
+                if filename:
+                    modulename = trace._modname(filename)
+                    if modulename is not None:
+                        ignore_it = tracer.ignore.names(filename, modulename)
+                        if not ignore_it:
+                            print(
+                                f"[rank{rank}] --- path: {filename} , funcname: {code.co_name}"
+                            )
+                            return localtrace
+                else:
+                    return None
+
+        def localtrace(frame, why, arg):
+            if why == "line":
+                filename = frame.f_code.co_filename
+                lineno = frame.f_lineno
+                bname = os.path.basename(filename)
+                print(
+                    f"[rank{rank}] {bname}:{lineno}: {linecache.getline(filename, lineno)}",
+                    end="")
+            return localtrace
+
+        ignoredirs = [
+            os.path.dirname(package.__file__) for package in [os, torch, trace]
+        ]
+        tracer = trace.Trace(trace=1, count=0, ignoredirs=ignoredirs)
+        rank = global_mpi_rank()
+        tracer.globaltrace = globaltrace
+        tracer.localtrace = localtrace
         result = tracer.runfunc(func, *args, **kwargs)
         return result
 
@@ -733,6 +827,26 @@ class QuantModeWrapper:
 
     def __getitem__(self, index):
         return self.objs[index]
+
+
+PYTHON_DEFAULT_GC_THRESHOLDS = gc.get_threshold()
+
+
+@contextmanager
+def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
+    try:
+        if gen0_threshold:
+            gc.set_threshold(gen0_threshold)
+            logger.debug(
+                f'Set Python GC threshold to customized value: {gen0_threshold}'
+            )
+        yield
+    finally:
+        if gen0_threshold:
+            gc.set_threshold(*PYTHON_DEFAULT_GC_THRESHOLDS)
+            logger.debug(
+                f'Reset Python GC thresholds to default value: {PYTHON_DEFAULT_GC_THRESHOLDS}'
+            )
 
 
 @contextmanager
@@ -822,10 +936,13 @@ class TensorWrapper:
         data_ptr: int,
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
+        strides: Optional[Sequence[int]] = None,
     ):
+        assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
+        self.strides = strides
 
     def data_ptr(self):
         return self._data_ptr
@@ -861,10 +978,17 @@ class TensorWrapper:
     @property
     def __cuda_array_interface__(self):
         return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "shape":
+            self.shape,
+            "typestr":
+            torch_dtype_to_np_typestr(self.dtype),
             "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
+            "strides": [
+                i * torch.tensor([], dtype=self.dtype).element_size()
+                for i in self.strides
+            ] if self.strides is not None else None,
+            "version":
+            3,
         }
 
     @staticmethod
@@ -921,10 +1045,15 @@ class KVCacheEventSerializer:
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 
-        return {
+        json_str = {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "window_size": event.window_size,
         }
+        if event.attention_dp_rank is not None:
+            json_str["attention_dp_rank"] = event.attention_dp_rank
+
+        return json_str
 
     @staticmethod
     def _created_to_json(data):
@@ -996,3 +1125,28 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+
+def is_multi_device_enable():
+    """
+    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
+    So we can avoid broadcast calls on single GPU.
+    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
+    ENABLE_MULTI_DEVICE is true by default when building TensorRT LLM so we need to also check
+    the number of devices
+    """
+    return local_mpi_size() > 1
+
+
+def set_prometheus_multiproc_dir() -> object:
+    # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.info(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")

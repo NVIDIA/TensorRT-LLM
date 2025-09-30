@@ -3,8 +3,7 @@ import weakref
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import (Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple,
-                    TypeVar)
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple, TypeVar
 
 import tensorrt as trt
 
@@ -14,9 +13,7 @@ from .network import Network
 
 
 class Layer:
-    '''
-    Layer is a wrapper for TensorRT's ILayer with several python-friendly helper functions.
-    '''
+    """Layer is a wrapper for TensorRT's ILayer with several python-friendly helper functions."""
 
     def __init__(self, network: Network, trt_layer: trt.ILayer):
         self._network = weakref.ref(network)
@@ -30,51 +27,50 @@ class Layer:
         return self._network()
 
     def get_inputs(self, *indices: int):
-        '''
-        Get the input tensors of the layer.
+        """Get the input tensors of the layer.
 
         Parameters:
             idx: the indices of the input tensor, will return all inputs if left empty
 
         Returns:
             List[Tensor]
-        '''
+        """
         from .functional import Tensor
+
         indices = indices if indices else range(self.trt_layer.num_inputs)
 
         ret = []
         for i in indices:
-            assert i < self.trt_layer.num_inputs, f"Invalid input index {i} for layer {self.trt_layer.name}"
+            assert i < self.trt_layer.num_inputs, (
+                f"Invalid input index {i} for layer {self.trt_layer.name}"
+            )
 
             tensor = self.trt_layer.get_input(i)
-            tensor = Tensor(trt_tensor=tensor,
-                            network=self.network,
-                            is_network_input=False)
+            tensor = Tensor(trt_tensor=tensor, network=self.network, is_network_input=False)
             ret.append(tensor)
         return ret
 
     def get_outputs(self, *indices: int):
-        '''
-        Get the output tensor of the layer.
+        """Get the output tensor of the layer.
 
         Parameters:
             idx: the index of the output tensor
 
         Returns:
             List[Tensor]
-        '''
+        """
         from .functional import Tensor
 
         indices = indices if indices else range(self.trt_layer.num_outputs)
 
         ret = []
         for i in indices:
-            assert i < self.trt_layer.num_outputs, f"Invalid output index {i} for layer {self.trt_layer.name}"
+            assert i < self.trt_layer.num_outputs, (
+                f"Invalid output index {i} for layer {self.trt_layer.name}"
+            )
 
             tensor = self.trt_layer.get_output(i)
-            tensor = Tensor(trt_tensor=tensor,
-                            network=self.network,
-                            is_network_input=False)
+            tensor = Tensor(trt_tensor=tensor, network=self.network, is_network_input=False)
             ret.append(tensor)
         return ret
 
@@ -82,10 +78,9 @@ class Layer:
         return self.network.is_removed_layer(self)
 
     def mark_as_removed(self):
-        '''
-        Mark the layer as removed, this will remove the layer from the network.
-        '''
-        # NOTE, since INetwork python API doesn't provide a way to remove a layer, we actually mark the layer as removed in the network.
+        """Mark the layer as removed, this will remove the layer from the network."""
+        # NOTE, since INetwork python API doesn't provide a way to remove a layer, we actually mark
+        # the layer as removed in the network.
         self.network.mark_removed_layer(self)
 
         # remove the FLayerInfo if exists
@@ -101,8 +96,8 @@ class Layer:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.trt_layer, name)
 
-    # Refer to https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html?highlight=elementwise#layers for a complete
-    # list of TRT layers.
+    # Refer to https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html?highlight=elementwise#layers
+    # for a complete list of TRT layers.
     TRT_LAYER_TYPE_TO_LAYER = {
         trt.LayerType.CONVOLUTION: trt.IConvolutionLayer,
         trt.LayerType.ACTIVATION: trt.IActivationLayer,
@@ -153,14 +148,13 @@ class Layer:
     }
 
     if trt_gte(10, 8):
-        TRT_LAYER_TYPE_TO_LAYER[
-            trt.LayerType.DYNAMIC_QUANTIZE] = trt.IQuantizeLayer
+        TRT_LAYER_TYPE_TO_LAYER[trt.LayerType.DYNAMIC_QUANTIZE] = trt.IQuantizeLayer
 
     def as_layer(self) -> Any:
-        '''
-        Convert to a actual TensorRT layer object, such as IPluginV2Layer or IConvolutionLayer so
-        that we can access the actual layer information.
-        '''
+        """Convert to a actual TensorRT layer object.
+
+        This can be IPluginV2Layer or IConvolutionLayer, so that we can access the actual layer information.
+        """
         if self.type in self.TRT_LAYER_TYPE_TO_LAYER:
             # bypass TRT's bug of retrieving a specific ILayer type in TensorRT
             self.trt_layer.__class__ = self.TRT_LAYER_TYPE_TO_LAYER[self.type]
@@ -188,22 +182,27 @@ class _Pattern:
 
 
 class PatternRewriter(_Pattern):
-    '''
-    A pattern rewriter is a class that can match a pattern in the graph and rewrite the matched pattern.
+    """A pattern rewriter is a class that can match a pattern in the graph and rewrite the matched pattern.
 
-    There are two ways to implement a pattern rewriter, either override match() and rewrite() separately, or override match_and_rewrite().
-    '''
+    There are two ways to implement a pattern rewriter, either override match() and rewrite() separately, or
+    override match_and_rewrite().
+    """
 
-    def __init__(self,
-                 name: str,
-                 root_layer: Optional[Set[trt.LayerType]] = None,
-                 separate_match_rewrite=False):
-        '''
+    def __init__(
+        self,
+        name: str,
+        root_layer: Optional[Set[trt.LayerType]] = None,
+        separate_match_rewrite=False,
+    ):
+        """Constructor.
+
         Parameters:
             name: the name of the rewrite pattern
-            root_layer: the root layer types to start the pattern matching, if not provided, the pattern will traverse all the layers in the graph.
-            separate_match_rewrite: if set to True, the pattern should override match() and rewrite() separately, otherwise, the pattern should override match_and_rewrite()
-        '''
+            root_layer: the root layer types to start the pattern matching, if not provided, the pattern
+                will traverse all the layers in the graph.
+            separate_match_rewrite: if set to True, the pattern should override match() and rewrite()
+                separately, otherwise, the pattern should override match_and_rewrite()
+        """
         super().__init__(name)
         self.root_layer = root_layer
         self._separate_match_rewrite = separate_match_rewrite
@@ -219,9 +218,7 @@ class PatternRewriter(_Pattern):
 
 
 class PatternAnalyzer(_Pattern):
-
-    def __init__(self, name: str,
-                 root_layer: Optional[Set[trt.LayerType]]) -> None:
+    def __init__(self, name: str, root_layer: Optional[Set[trt.LayerType]]) -> None:
         super().__init__(name)
         self.root_layer = root_layer
 
@@ -233,16 +230,13 @@ class PatternAnalyzer(_Pattern):
 
 
 class _PatternManager:
-    PatternType = TypeVar('PatternType')
+    PatternType = TypeVar("PatternType")
 
     def __init__(self):
         # records of (benefit, pattern, id)
         self.patterns: Dict[str, Tuple[int, _PatternManager.PatternType]] = {}
 
-    def add(self,
-            label: str,
-            pattern: "_PatternManager.PatternType",
-            benefit: int = 0):
+    def add(self, label: str, pattern: "_PatternManager.PatternType", benefit: int = 0):
         assert label not in self.patterns, f"Pattern {label} already exists"
         self.patterns[label] = (benefit, pattern)
 
@@ -251,18 +245,18 @@ class _PatternManager:
 
 
 class RewritePatternManager(_PatternManager):
-
     def rewrite(self, net: Network, args=None):
         modified = True
-        # TODO: we can optimize this by asking TRT to expose a graph iterator consistent even after the graph is modified
+        # TODO: we can optimize this by asking TRT to expose a graph iterator consistent even after
+        # the graph is modified.
         while modified:
             modified = False
-            # Since the graph iterator is hold by the underlying INetwork, we can only rebuild the graph cache and match the nodes again.
+            # Since the graph iterator is hold by the underlying INetwork, we can only rebuild the
+            # graph cache and match the nodes again.
             for layer in net.get_layers():
                 if layer.is_removed():
                     continue
-                for (profit, pattern) in sorted(self.patterns.values(),
-                                                key=lambda x: x[0]):
+                for profit, pattern in sorted(self.patterns.values(), key=lambda x: x[0]):
                     pattern.args = args
 
                     if pattern.root_layer is not None and layer.type not in pattern.root_layer:
@@ -281,13 +275,11 @@ class RewritePatternManager(_PatternManager):
 
 
 class AnalysisPatternManager(_PatternManager):
-
     def analyze(self, graph: Network, args=None):
         for layer in graph.get_layers():
             if layer.name in graph.removed_layers:
                 continue
-            for (benefit, pattern) in sorted(self.patterns.values(),
-                                             key=lambda x: x[0]):
+            for benefit, pattern in sorted(self.patterns.values(), key=lambda x: x[0]):
                 pattern.args = args
 
                 if pattern.root_layer is not None and layer.type not in pattern.root_layer:
@@ -303,22 +295,25 @@ class AnalysisPatternManager(_PatternManager):
 
 @dataclass
 class FLayerInfo:
-    '''
-    The FLayerInfo is used to track the functional layers in the INetwork, and it is used to help the graph rewriting.
+    """The FLayerInfo is used to track the functional layers in the INetwork and help graph rewriting.
 
     The lifetime of a FLayer is the same as the corresponding plugin instance in the INetwork. Once the
     plugin instance is removed by the graph rewriting, the FLayer will be removed as well.
 
     WHY this is needed?
-    In the current implementation, for functional methods, once it is called in Python, it will lower to a plugin instance in the INetwork. However,
-    the plugin interface is black box with customized logic, we cannot retrieve necessary information from it, this is quite different from ILayer,
-    which provides a set of APIs to retrieve the information. Therefore, we need to record the high level information in the FLayerInfo, and keep
+    In the current implementation, for functional methods, once it is called in Python, it will lower
+    to a plugin instance in the INetwork.
+    However, the plugin interface is black box with customized logic, we cannot retrieve necessary
+    information from it. This is quite different from ILayer, which provides a set of APIs to retrieve
+    the information.
+    Therefore, we need to record the high level information in the FLayerInfo, and keep
     it consistent during the graph rewriting.
-    '''
+    """
+
     layer_kind: str  # the method name in the functional.py
     # Record the raw inputs of the functional layer to be used in the graph rewrite
-    # NOTE: the raw inputs contains both the constants and Tensors, the Tensors will be also updated by graph rewriting
-    # APIs such as `replace_all_uses_with`
+    # NOTE: the raw inputs contains both the constants and Tensors, the Tensors will be also updated by
+    # graph rewriting APIs such as `replace_all_uses_with`
     raw_inputs: Dict[str, Any]
 
     raw_outputs: List[Any] = field(default_factory=list, init=False)
@@ -331,6 +326,7 @@ class FLayerInfo:
 
     def __post_init__(self):
         from .functional import Tensor
+
         assert self.layer_kind
 
         def replace_with_symbols(arg) -> Any:
@@ -357,10 +353,10 @@ class FLayerInfo:
 
             return arg
 
-        self.signature = self.layer_kind, {
-            name: replace_with_symbols(value)
-            for name, value in self.raw_inputs.items()
-        }
+        self.signature = (
+            self.layer_kind,
+            {name: replace_with_symbols(value) for name, value in self.raw_inputs.items()},
+        )
 
         amend_tensor(self.raw_inputs)
 
@@ -371,18 +367,15 @@ class FLayerInfo:
         return self.raw_inputs[name]
 
     def clone_inputs(self):
-        '''
-        Get a shallow copy of the inputs.
-        '''
+        """Get a shallow copy of the inputs."""
         return copy(self.raw_inputs)
 
     def replace_input_with(self, src, dst):
-        '''
-        Replace the input `src` with the input `dst` in the raw_inputs.
+        """Replace the input `src` with the input `dst` in the raw_inputs.
 
         src: Tensor
         dst: Tensor
-        '''
+        """
         from .functional import Tensor
 
         def replace(arg: Any):
@@ -399,21 +392,22 @@ class FLayerInfo:
         replace(self.raw_inputs)
 
     def replace_outputs_uses_with(self, net: Network, new_outs: List[Any]):
-        '''
-        Replace the output users with the new outputs.
+        """Replace the output users with the new outputs.
 
         new_outs: List[Tensor], the new outputs to replace with
-        '''
+        """
         from .functional import Tensor
+
         assert len(self.raw_outputs) == len(new_outs)
         for old_out, new_out in zip(self.raw_outputs, new_outs):
-            assert type(old_out) == type(
-                new_out
-            ), f"rewrite error, the output type {type(old_out)} is different from the new output type {type(new_out)} not match the original output type {type(old_out)}"
+            assert type(old_out) is type(new_out), (
+                f"rewrite error, the output type {type(old_out)} is different from the new output "
+                f"type {type(new_out)} not match the original output type {type(old_out)}"
+            )
 
         def _swap_tensor_info(new, deprecated):
             name = deprecated.trt_tensor.name
-            deprecated.trt_tensor.name = name + '_deprecated'
+            deprecated.trt_tensor.name = name + "_deprecated"
             from .functional import cast
 
             new = cast(new, deprecated.dtype)
@@ -463,13 +457,11 @@ class FLayerInfo:
         return hash(self.signature)
 
     def __repr__(self) -> str:
-        return '<FLayer {}>'.format(self.signature)
+        return "<FLayer {}>".format(self.signature)
 
     @staticmethod
     def _get_spec(arg):
-        '''
-        Get the spec that could impact on the Module's topology in the `forward` method.
-        '''
+        """Get the spec that could impact on the Module's topology in the `forward` method."""
         from .functional import Tensor
 
         # For scalars, we track their value since they are constant
@@ -482,17 +474,17 @@ class FLayerInfo:
             return Tensor
         elif isinstance(arg, (list, tuple)):
             return [FLayerInfo._get_spec(x) for x in arg]
-        # NOTE Free to add more types here is broken, carefully note that, from the engine building angle, all the constants
-        # should be captured while for the network variables, their types as placeholders are enough
+        # NOTE Free to add more types here is broken, carefully note that, from the engine building angle,
+        # all the constants should be captured while for the network variables, their types as placeholders
+        # are enough.
         else:
             raise TypeError(f"unsupported input type detected: {type(arg)}")
 
 
 @dataclass
 class FLayerInfoMemo:
-    '''
-    FLayerInfoMemo holds the FLayer of all the necessary functional layers.
-    '''
+    """FLayerInfoMemo holds the FLayer of all the necessary functional layers."""
+
     data: Dict[str, FLayerInfo] = field(default_factory=dict, init=False)
 
     cur_flayer: ClassVar[Optional[FLayerInfo]] = None
@@ -502,11 +494,8 @@ class FLayerInfoMemo:
         self.data[layer_name] = layer
 
     def create(self, fn: Callable, *args, **kwargs) -> FLayerInfo:
-        '''
-        Add a FLayer to the memo.
-        '''
-        return FLayerInfo(fn.__name__,
-                          self.get_function_arg_dict(fn, *args, **kwargs))
+        """Add a FLayer to the memo."""
+        return FLayerInfo(fn.__name__, self.get_function_arg_dict(fn, *args, **kwargs))
 
     def get(self, layer_name: str) -> Optional[FLayerInfo]:
         return self.data.get(layer_name, None)
@@ -517,29 +506,24 @@ class FLayerInfoMemo:
 
     @staticmethod
     def instance() -> "FLayerInfoMemo":
-        '''
-        A singleton instance of FLayerMemo.
-        '''
+        """A singleton instance of FLayerMemo."""
         from ._common import default_net
+
         return default_net().flayer_memo
 
     @staticmethod
     def get_function_arg_dict(f: Callable, *args, **kwargs):
-        '''
-        Get the input argument dict of a function.
-        '''
+        """Get the input argument dict of a function."""
         sig = inspect.signature(f)
 
         bound_args = sig.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
-        return {k: v for k, v in bound_args.arguments.items() if k != 'self'}
+        return {k: v for k, v in bound_args.arguments.items() if k != "self"}
 
 
 class FLayerScope:
-    '''
-    FLayerScope is used to capture the plugin within a functional method.
-    '''
+    """FLayerScope is used to capture the plugin within a functional method."""
 
     def __init__(self, fn, *args, **kwargs):
         self.layer = FLayerInfoMemo.instance().create(fn, *args, **kwargs)
@@ -552,14 +536,14 @@ class FLayerScope:
     def __exit__(self, exc_type, exc_val, exc_tb):
         FLayerInfoMemo.cur_flayer = None
         if exc_type is None:
-            assert self.layer.layer_name != "", f"FLayer {self.layer.layer_kind} without a plugin name detected"
+            assert self.layer.layer_name != "", (
+                f"FLayer {self.layer.layer_kind} without a plugin name detected"
+            )
             FLayerInfoMemo.instance().add(self.layer.layer_name, self.layer)
 
 
 def record_signature(f):
-    '''
-    Helps to decorate a functional method and record its metadata with a FLayerInfo.
-    '''
+    """Helps to decorate a functional method and record its metadata with a FLayerInfo."""
 
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -577,10 +561,8 @@ _global_analysis_pattern_manager = AnalysisPatternManager()
 
 
 class FuseAttentionWithBiasPass(PatternRewriter):
-
     def __init__(self):
-        super().__init__(name="fuse_attention_with_bias",
-                         separate_match_rewrite=False)
+        super().__init__(name="fuse_attention_with_bias", separate_match_rewrite=False)
 
     @staticmethod
     def is_attention_plugin(layer: Layer) -> bool:
@@ -588,14 +570,15 @@ class FuseAttentionWithBiasPass(PatternRewriter):
             return False
         p = layer.as_layer().plugin
         conds = [
-            p.plugin_namespace == 'tensorrt_llm',
-            p.plugin_type == 'GPTAttention', p.num_outputs == 2
+            p.plugin_namespace == "tensorrt_llm",
+            p.plugin_type == "GPTAttention",
+            p.num_outputs == 2,
         ]
         return all(conds)
 
     @staticmethod
     def is_elementwise_sum(layer: Layer) -> bool:
-        l = layer.as_layer()
+        l = layer.as_layer()  # noqa: E741
         if l.type != trt.LayerType.ELEMENTWISE:
             return False
         return l.op == trt.ElementWiseOperation.SUM
@@ -612,11 +595,11 @@ class FuseAttentionWithBiasPass(PatternRewriter):
             layer = tensor.get_parent()
             if layer is None or depth > max_depth:
                 return False
-            if layer.type == trt.LayerType.CONSTANT and len(
-                    layer.get_inputs()) == 0:
+            if layer.type == trt.LayerType.CONSTANT and len(layer.get_inputs()) == 0:
                 return True
             for _ in layer.get_inputs():
-                if not const_foldable(_, depth + 1): return False
+                if not const_foldable(_, depth + 1):
+                    return False
             return True
 
         for input in layer.get_inputs():
@@ -628,27 +611,26 @@ class FuseAttentionWithBiasPass(PatternRewriter):
 
     def match_and_rewrite(self, layer: Layer) -> bool:
         from tensorrt_llm.network import net_guard
+
         with net_guard(layer.network):
             if not self.is_attention_plugin(layer):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
-            input = plugin_flayer.raw_inputs['qkv']
-            if input is None or isinstance(input, list) or len(
-                    list(input.get_users())) != 1:
+            input = plugin_flayer.raw_inputs["qkv"]
+            if input is None or isinstance(input, list) or len(list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
             if not self.is_elementwise_sum(parent_layer):
                 return False
-            eltwise_const_inputs, eltwise_mutable_inputs = self.get_eltwise_inputs(
-                parent_layer)
-            if len(eltwise_const_inputs) != 1 or len(
-                    eltwise_mutable_inputs) != 1:
+            eltwise_const_inputs, eltwise_mutable_inputs = self.get_eltwise_inputs(parent_layer)
+            if len(eltwise_const_inputs) != 1 or len(eltwise_mutable_inputs) != 1:
                 return False
-            if plugin_flayer.raw_inputs['qkv_bias'] is not None:
+            if plugin_flayer.raw_inputs["qkv_bias"] is not None:
                 return False
-            plugin_flayer.raw_inputs['qkv'] = eltwise_mutable_inputs[0]
-            plugin_flayer.raw_inputs['qkv_bias'] = eltwise_const_inputs[0]
+            plugin_flayer.raw_inputs["qkv"] = eltwise_mutable_inputs[0]
+            plugin_flayer.raw_inputs["qkv_bias"] = eltwise_const_inputs[0]
             from .functional import gpt_attention
+
             new_outputs = gpt_attention(**plugin_flayer.raw_inputs)
             plugin_flayer.replace_outputs_uses_with(layer.network, new_outputs)
         return True
@@ -657,7 +639,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
 def optimize(net):
     patterns = RewritePatternManager()
     patterns.add(
-        label='fuse_attention_with_bias',
+        label="fuse_attention_with_bias",
         pattern=FuseAttentionWithBiasPass(),
     )
     patterns.rewrite(net)

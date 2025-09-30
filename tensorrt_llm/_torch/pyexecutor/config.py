@@ -1,21 +1,15 @@
-import math
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Dict, List, Optional, Union
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
-from ...builder import BuildConfig
+from ...llmapi.llm_args import LoadFormat, SamplerType
 from ...logger import logger
 from ...mapping import Mapping
-from ..speculative import SpecConfig
+from ..model_config import MoeLoadBalancerConfig
 from .resource_manager import BaseResourceManager
-
-
-class LoadFormat(Enum):
-    AUTO = 0
-    # Initialize all weights randomly.
-    DUMMY = 1
 
 
 @dataclass
@@ -39,39 +33,64 @@ class PyTorchConfig:
     # it's hard to capture a single graph with prefill requests since the
     # input shapes are a function of the sequence lengths).
     # Note that each CUDA graph can use up to 200 MB of extra memory.
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
     cuda_graph_batch_sizes: Optional[List[int]] = None
     cuda_graph_max_batch_size: int = 0
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
     # This is usually a net win for performance.
     cuda_graph_padding_enabled: bool = False
-    enable_overlap_scheduler: bool = False
+    disable_overlap_scheduler: bool = False
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
+    moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
+
+    attention_dp_enable_balance: bool = False
+    attention_dp_time_out_iters: int = 50
+    attention_dp_batching_wait_iters: int = 10
+
+    max_num_tokens: int = 8192
+
+    batch_wait_timeout_ms: float = 0
+    # Iterations to wait before scheduling context even if token budget not reached (0 disables).
+    batch_wait_timeout_iters: int = 0
+    # Threshold ratio of max_num_tokens for token accumulation before scheduling context.
+    # Value range: [0, 1] (0 disables).
+    batch_wait_max_tokens_ratio: float = 0.0
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
-    # If true, will iterate over sampling_params of each request and use the
-    # corresponding decoding way, like top-k, top-p, etc.
-    mixed_decoder: bool = False
-    # If true, will use the TRTLLM decoder instead of the PyTorch decoder.
-    # The TRTLLM decoder has a wide coverage of decoding strategies.
-    enable_trtllm_decoder: bool = False
+
+    moe_disable_finalize_fusion: bool = False
+    use_low_precision_moe_combine: bool = False
+
+    sampler_type: SamplerType = SamplerType.auto
+    """
+    The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto.
+    Defaults to auto, which will use TorchSampler unless BeamSearch is requested.
+    """
+
     kv_cache_dtype: str = "auto"
-    use_kv_cache: bool = True
+    mamba_ssm_cache_dtype: str = "auto"
+
     enable_iter_perf_stats: bool = False
+    # If true, enables per request stats per iteration
+    # Must also set enable_iter_perf_stats to true to get request stats
+    enable_iter_req_stats: bool = False
     print_iter_log: bool = False
 
     torch_compile_enabled: bool = False
-    torch_compile_fullgraph: bool = False
+    torch_compile_fullgraph: bool = True
     torch_compile_inductor_enabled: bool = False
+    torch_compile_piecewise_cuda_graph: bool = False
+    torch_compile_piecewise_cuda_graph_num_tokens: Optional[List[int]] = None
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
+    torch_compile_max_num_streams: int = 1
 
     # Enable autotuner only when torch compile is enabled
     # TODO: after it can be work stable in warmup stage
-    autotuner_enabled: bool = True
+    enable_autotuner: bool = True
 
     # If true, enable layerwise nvtx marker
     enable_layerwise_nvtx_marker: bool = False
@@ -79,52 +98,32 @@ class PyTorchConfig:
     # from the model checkpoint.
     load_format: Union[str, LoadFormat] = 'auto'
 
-    def _convert_load_format(self) -> None:
-        if isinstance(self.load_format, LoadFormat):
-            return
-        load_format = self.load_format.upper()
-        if load_format not in LoadFormat.__members__:
-            raise NotImplementedError(f"Invalid LoadFormat: {self.load_format}")
-        self.load_format = LoadFormat[load_format]
+    # If true, enable min-latency mode. Currently only used for Llama4.
+    enable_min_latency: bool = False
+    allreduce_strategy: str = "AUTO"
 
-    def __post_init__(self) -> None:
-        if self.cuda_graph_batch_sizes is not None:
-            assert self.cuda_graph_max_batch_size == 0, (
-                "Please don't set both cuda_graph_batch_sizes "
-                "and cuda_graph_max_batch_size.")
-            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-        else:
-            self.cuda_graph_max_batch_size = self.cuda_graph_max_batch_size or 128
-            if self.cuda_graph_padding_enabled:
-                self.cuda_graph_batch_sizes = [1, 2, 4] + [
-                    i * 8 for i in range(1, 17)
-                ]
-            else:
-                self.cuda_graph_batch_sizes = list(range(1, 32)) + [32, 64, 128]
-            self.cuda_graph_batch_sizes += [
-                2**i for i in range(
-                    8, math.floor(math.log(self.cuda_graph_max_batch_size, 2)))
-            ]
-            self.cuda_graph_batch_sizes = [
-                size for size in self.cuda_graph_batch_sizes
-                if size <= self.cuda_graph_max_batch_size
-            ]
-            if self.cuda_graph_max_batch_size != self.cuda_graph_batch_sizes[
-                    -1]:
-                self.cuda_graph_batch_sizes.append(
-                    self.cuda_graph_max_batch_size)
+    # The iteration interval to create responses under the streaming mode.
+    # TODO: make this a per-request parameter
+    stream_interval: int = 1
 
-        self._convert_load_format()
+    force_dynamic_quantization: bool = False
+
+    # If true, ONLY the vision encoder part of the full model is loaded/executed.
+    mm_encoder_only: bool = False
+
+    # If true, adjust PyTorch CUDA memory fraction to correspond to the
+    # total GPU memory minus the statically allocated engine memory.
+    # If false, set the PyTorch CUDA memory fraction to 1.0.
+    _limit_torch_cuda_mem_fraction: bool = True
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',
     'pytorch_backend_config',
     'max_seq_len',
-    'tokens_per_block',
     'mapping',
     'hf_model_dir',
-    'trt_engine_dir',
+    'mm_encoder_only',
 ]
 
 
@@ -133,12 +132,13 @@ def update_executor_config(
         backend: Optional[str] = None,
         pytorch_backend_config: Optional[PyTorchConfig] = None,
         mapping: Optional[Mapping] = None,
-        build_config: Optional[BuildConfig] = None,
-        speculative_config: Optional[SpecConfig] = None,
+        speculative_config: Optional["DecodingBaseConfig"] = None,
         hf_model_dir: Optional[str] = None,
-        trt_engine_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
-        max_seq_len: Optional[int] = None):
+        max_seq_len: Optional[int] = None,
+        checkpoint_format: Optional[str] = None,
+        checkpoint_loader: Optional[BaseCheckpointLoader] = None,
+        mm_encoder_only: bool = False):
     if backend is None:
         return
 
@@ -152,18 +152,42 @@ def update_executor_config(
     executor_config.pytorch_backend_config = pytorch_backend_config
     executor_config.mapping = mapping
     executor_config.speculative_config = speculative_config
+    executor_config.mm_encoder_only = mm_encoder_only
 
     logger.info(f"{executor_config.pytorch_backend_config}")
 
-    if build_config is not None:
-        # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
-        executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
-
     executor_config.hf_model_dir = hf_model_dir
-    executor_config.trt_engine_dir = trt_engine_dir
 
     if max_input_len is not None:
         executor_config.max_input_len = max_input_len
 
     if max_seq_len is not None:
         executor_config.max_seq_len = max_seq_len
+
+    executor_config.checkpoint_loader = _construct_checkpoint_loader(
+        backend, checkpoint_loader, checkpoint_format)
+
+
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader

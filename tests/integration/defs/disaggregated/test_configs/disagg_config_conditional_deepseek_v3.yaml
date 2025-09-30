@@ -1,0 +1,38 @@
+hostname: localhost
+port: 8000
+model: DeepSeek-V3-Lite/bf16
+backend: "pytorch"
+cuda_graph_config: null
+free_gpu_memory_fraction: 0.15
+conditional_disagg_config:
+  max_local_prefill_length: 100
+disable_overlap_scheduler: True
+enable_autotuner: False
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    enable_block_reuse: True
+    enable_partial_reuse: True
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.15
+  cache_transceiver_config:
+    backend: DEFAULT
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  router:
+    type: kv_cache_aware
+  kv_cache_config:
+    enable_block_reuse: True
+    enable_partial_reuse: True
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.15
+  cache_transceiver_config:
+    backend: DEFAULT
+  urls:
+      - "localhost:8002"

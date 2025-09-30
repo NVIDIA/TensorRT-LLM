@@ -4,15 +4,16 @@ import types
 
 import pytest
 import torch
-from transformers import AutoConfig, AutoModel
+from _model_test_utils import _hf_model_dir_or_hub_id
+from transformers import AutoConfig, AutoModelForCausalLM
 
-from tensorrt_llm._torch.auto_deploy.models.deepseek import (
+from tensorrt_llm._torch.auto_deploy.models.patches.deepseek import (
     deepseek_v3_attention,
     deepseek_v3_moe_exact,
 )
 
 
-def _load_layer_from_model(model_name_or_path, layer_name, num_layers_to_load=1, yarn=False):
+def _load_layer_from_model(model_name_or_path, layer_name):
     """
     Loads a specific layer/module from a model without loading the entire model.
 
@@ -28,14 +29,27 @@ def _load_layer_from_model(model_name_or_path, layer_name, num_layers_to_load=1,
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
 
         # Load a subset of layers of the model and configure yarn
-        config.num_hidden_layers = num_layers_to_load
+        config.num_hidden_layers = 1
         config.use_cache = False
         config.first_k_dense_replace = 0
-        if not yarn:
-            config.rope_scaling = None
+        config.n_routed_experts = 2
+        config.num_experts_per_tok = 1
+        config.n_group = 1
+        config.topk_group = 1
+        config.hidden_size = 8
+        config.moe_intermediate_size = 8
+        config.num_attention_heads = 2
+        config.num_key_value_heads = 2
+        config.qk_nope_head_dim = 4
+        config.qk_rope_head_dim = 2
+        config.v_head_dim = 4
+        config.intermediate_size = 8
+        config.max_position_embeddings = 7
+
+        config.rope_scaling = None
 
         # Build the model architecture (no weights loaded yet)
-        model = AutoModel.from_config(config, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         model.eval()
 
         # Access the specific layer by its name
@@ -59,34 +73,30 @@ def _generate_ds_attention_mask(b, s):
     )
 
 
-# TODO (svelury): update unit test to run fast
-@pytest.mark.skip(reason="TODO: too slow for a unit test")
 @pytest.mark.parametrize(
-    "model_name, module_name, patch, yarn, inputs",
+    "model_name, module_name, patch, inputs",
     [
         pytest.param(
-            "deepseek-ai/DeepSeek-V3",
-            "layers.0.self_attn",
+            _hf_model_dir_or_hub_id("DeepSeek-R1/DeepSeek-R1", "deepseek-ai/DeepSeek-R1"),
+            "model.layers.0.self_attn",
             deepseek_v3_attention,
-            False,
             [
-                torch.randn(2, 6, 7168, dtype=torch.bfloat16),
+                torch.randn(2, 6, 8, dtype=torch.bfloat16),
                 _generate_ds_attention_mask(2, 6),
                 torch.tensor([[0, 1, 2, 3, 4, 5]]),
             ],
         ),  # attention requires  inputs [hidden_states, attention_mask, position_ids]
         pytest.param(
-            "deepseek-ai/DeepSeek-V3",
-            "layers.0.mlp",
+            _hf_model_dir_or_hub_id("DeepSeek-R1/DeepSeek-R1", "deepseek-ai/DeepSeek-R1"),
+            "model.layers.0.mlp",
             deepseek_v3_moe_exact,
-            False,
-            [torch.randn(2, 6, 7168, dtype=torch.bfloat16)],
+            [torch.randn(2, 6, 8, dtype=torch.bfloat16)],
         ),  # moe requires  inputs [hidden_states]
     ],
 )
-def test_module_patches(model_name, module_name, patch, yarn, inputs):
+def test_module_patches(model_name, module_name, patch, inputs):
     # Get module
-    module = _load_layer_from_model(model_name, module_name, 1, yarn)
+    module = _load_layer_from_model(model_name, module_name)
 
     # Pass test inputs to generate reference
     ref, *_ = module(*inputs)

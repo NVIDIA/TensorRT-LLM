@@ -12,20 +12,40 @@
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+
+macro(remove_compile_definition TARGET_NAME DEFINITION)
+  get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
+  if(DEFS)
+    list(REMOVE_ITEM DEFS ${DEFINITION})
+    set_target_properties(${TARGET_NAME} PROPERTIES COMPILE_DEFINITIONS
+                                                    "${DEFS}")
+  endif()
+endmacro()
+
 add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
+
+# If we are using oss cutlass, build an explicit internal test
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(mixtureOfExpertsTest
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+
+  add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+  remove_compile_definition(mixtureOfExpertsInternalTest
+                            USING_OSS_CUTLASS_MOE_GEMM)
+endif()
+
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
-if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
-  add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
-  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
-  # add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
-endif()
+add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+
+add_gtest(fusedMoeCommKernelTest fusedMoeCommKernelTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -60,5 +80,13 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingTest.cpp sampling/samplingTopKTest.cpp
     sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
-
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+
+set(ROUTING_KERNEL_TEST_SRC
+    routing/routingTest.cpp routing/routingLlama4Test.cpp
+    routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
+add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
+
+add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+add_gtest(eaglePackDataTest eaglePackDataTest.cpp)

@@ -5,163 +5,256 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from ...attention_backend.vanilla import repeat_kv
+
+def _apply_logit_softcapping(attn_scores: torch.Tensor, logit_cap: Optional[float]) -> torch.Tensor:
+    """Apply logit softcapping using the formula: logit_cap * tanh(logits / logit_cap)"""
+    if logit_cap is not None and logit_cap > 0.0:
+        return logit_cap * torch.tanh(attn_scores / logit_cap)
+    return attn_scores
 
 
-# Function to apply rotary positional embeddings (RoPE)
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    seq_len: int,
-    head_dim: int,
-    rope_theta: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-):
-    """
-    Apply rotary positional embeddings to query and key tensors.
+def _convert_boolean_mask_to_float(attn_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert boolean attention mask to floating point mask.
     Args:
-        q: Query tensor of shape [batch, n_heads, seq_len, head_dim]
-        k: Key tensor of shape [batch, n_kv_heads, seq_len, head_dim]
-        seq_len: Sequence length
-        head_dim: Dimension of each head
-        rope_theta: Base value for RoPE (default 10000.0)
-        rope_scale: Scaling factor for positions (default 1.0)
+        attn_mask: Boolean tensor where True allows attention, False blocks it
+        dtype: Target dtype for the output mask
     Returns:
-        Tuple of transformed query and key tensors
+        Floating point mask where True -> 1.0, False -> -inf
     """
-    device = q.device
-    original_dtype = q.dtype
-
-    # Apply default values if None
-    theta = 10000.0 if rope_theta is None else rope_theta
-    scale = 1.0 if rope_scale is None else rope_scale
-
-    # Generate position indices
-    position = torch.arange(seq_len, device=device).float()
-    # Apply scaling factor to positions if provided
-    if scale != 1.0:
-        position = position / scale
-
-    # Create the frequency matrix - ensure stable computation in float32
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-    # Compute the product of positions and frequencies
-    # Shape: [seq_len, head_dim/2]
-    freqs = torch.outer(position, inv_freq)
-
-    # Compute the rotation matrix elements: cos and sin
-    # Shape: [seq_len, head_dim/2]
-    emb = torch.cat((freqs, freqs), dim=-1)
-    # Ensure stable computation of sin/cos in float32
-    cos = torch.cos(emb).to(dtype=torch.float32)
-    sin = torch.sin(emb).to(dtype=torch.float32)
-
-    # Reshape for broadcasting
-    # Shape: [1, 1, seq_len, head_dim]
-    cos = cos.view(1, 1, seq_len, head_dim)
-    sin = sin.view(1, 1, seq_len, head_dim)
-
-    # Always compute in float32 for numerical stability
-    q_float = q.to(dtype=torch.float32)
-    k_float = k.to(dtype=torch.float32)
-
-    # For the even indices of the dimension
-    q_embed_even = q_float[..., 0::2]
-    q_embed_odd = q_float[..., 1::2]
-    k_embed_even = k_float[..., 0::2]
-    k_embed_odd = k_float[..., 1::2]
-
-    # Apply the rotation using the identities:
-    # q' = q * cos + rotate(q) * sin
-    # k' = k * cos + rotate(k) * sin
-    # where rotate(x) swaps the even and odd dimensions and negates the odd dimensions
-    q_rotated = torch.cat(
-        [
-            q_embed_even * cos[..., 0::2] - q_embed_odd * sin[..., 0::2],
-            q_embed_odd * cos[..., 1::2] + q_embed_even * sin[..., 1::2],
-        ],
-        dim=-1,
-    )
-
-    k_rotated = torch.cat(
-        [
-            k_embed_even * cos[..., 0::2] - k_embed_odd * sin[..., 0::2],
-            k_embed_odd * cos[..., 1::2] + k_embed_even * sin[..., 1::2],
-        ],
-        dim=-1,
-    )
-
-    # Convert back to the original dtype
-    return q_rotated.to(dtype=original_dtype), k_rotated.to(dtype=original_dtype)
+    if attn_mask.dtype == torch.bool:
+        float_mask = torch.zeros_like(attn_mask, dtype=dtype)
+        float_mask = float_mask.masked_fill(attn_mask, 1.0)  # True -> 1.0
+        float_mask = float_mask.masked_fill(~attn_mask, float("-inf"))  # False -> -inf
+        return float_mask
+    return attn_mask
 
 
-@torch.library.custom_op("attention::fused_mha", mutates_args=())
-def fused_mha(
-    q: torch.Tensor,  # [b, s, n, h_d]
-    k: torch.Tensor,  # [b, s, n, h_d]
-    v: torch.Tensor,  # [b, s, n, h_d]
-    head_dim: int,
-    pos_embd_mode: Optional[str] = None,
-    rope_theta: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Fused MHA+Rope that takes raw input from q, k, v GEMMs.
-    Rope is performed according to the specified rope configuration. No support for caching.
+@torch.library.custom_op("auto_deploy::torch_attention_repeat_kv", mutates_args=())
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    # b, s info
-    b, s = q.shape[:2]
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states.clone()  # Ensure we don't return an alias
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    # Return a contiguous clone to avoid aliasing issues
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim).contiguous()
 
-    # reshapes and transpose to [bnsd] layout
-    q = q.view(b, s, -1, head_dim).transpose(1, 2)
-    k = k.view(b, s, -1, head_dim).transpose(1, 2)
-    v = v.view(b, s, -1, head_dim).transpose(1, 2)
 
-    # some more info
-    num_heads = q.shape[1]
-    num_kv_heads = k.shape[1]
+@repeat_kv.register_fake
+def repeat_kv_fake(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    replicated_shape = (batch, num_key_value_heads * n_rep, slen, head_dim)
+    return torch.empty(replicated_shape, device=hidden_states.device, dtype=hidden_states.dtype)
 
-    # rope embedding
-    if pos_embd_mode == "rope":
-        # Apply rotary positional embeddings
-        q, k = apply_rotary_pos_emb(q, k, s, head_dim, rope_theta, rope_scale)
-    elif pos_embd_mode is not None:
-        raise ValueError(f"Unknown positional embedding mode: {pos_embd_mode}.")
 
-    # repeat kv
-    k = repeat_kv(k, num_heads // num_kv_heads)
-    v = repeat_kv(v, num_heads // num_kv_heads)
+@torch.library.custom_op("auto_deploy::torch_attention_sdpa", mutates_args=())
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """A carbon copy of torch.nn.functional.scaled_dot_product_attention as custom op.
 
-    # Make sure all tensors have the same dtype before attention
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    Using this custom op instead of using the functional directly ensures consistent representation
+    of the vanilla sdpa in a graph.
+    """
 
-    # attention (assumed layout is bnsd)
-    y = torch.nn.functional.scaled_dot_product_attention(
-        query=q,
-        key=k,
-        value=v,
-        is_causal=True,
+    return F.scaled_dot_product_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
     )
 
-    # back to [b, s, n*h_d] layout
-    y = y.transpose(1, 2).contiguous().view(b, s, -1)
 
-    return y
+@scaled_dot_product_attention.register_fake
+def scaled_dot_product_attention_fake(
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
+):
+    """Fake implementation of scaled_dot_product_attention."""
+    return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
-@fused_mha.register_fake
-def fused_mha_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    head_dim: int,
-    pos_embd_mode: Optional[str] = None,
-    rope_theta: Optional[float] = None,
-    rope_scale: Optional[float] = None,
+@torch.library.custom_op("auto_deploy::torch_attention_grouped_sdpa", mutates_args=())
+def grouped_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
 ) -> torch.Tensor:
-    """Fake Fused MHA+Rope that takes raw input from q, k, v GEMMs."""
-    return torch.empty_like(q)
+    """SDPA attention that can handle GQA. Expects bnsd format inputs."""
+    b, n_heads, s_q, head_dim = query.shape  # bnsd format: [batch, num_heads, seq_len, head_dim]
+    _, n_kv_heads, s_k, _ = key.shape  # bnsd format: [batch, num_kv_heads, seq_len, head_dim]
+
+    # Inputs are already in bnsd format, no need to transpose
+    query_t = query  # [b, n_heads, s_q, head_dim]
+    key_t = key  # [b, n_kv_heads, s_k, head_dim]
+    value_t = value  # [b, n_kv_heads, s_k, v_head_dim]
+
+    # Handle GQA by repeating KV if needed
+    if n_heads != n_kv_heads:
+        n_rep = n_heads // n_kv_heads
+        key_t = repeat_kv(key_t, n_rep)
+        value_t = repeat_kv(value_t, n_rep)
+
+    # Set scale
+    if scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    # Compute attention scores: Q @ K^T
+    attn_scores = torch.matmul(query_t, key_t.transpose(-2, -1)) * scale  # [b, n_heads, s_q, s_k]
+
+    # Apply attention mask if provided
+    if attn_mask is not None:
+        # Convert boolean mask to float if needed
+        attn_mask = _convert_boolean_mask_to_float(attn_mask, attn_scores.dtype)
+        attn_scores = attn_scores + attn_mask
+
+    # Apply causal mask if specified and only during the context phase
+    if is_causal and s_q == s_k:  # Only apply causal mask during context processing
+        causal_mask = torch.triu(
+            torch.ones(s_q, s_k, device=query.device, dtype=torch.bool),
+            diagonal=1,  # Use diagonal=1 for standard causal masking
+        )
+        attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    # Apply sliding window mask if specified
+    if sliding_window is not None and sliding_window > 0:
+        # Handle position calculation for both context and generation phases
+        if s_q == s_k:
+            # Context phase: standard position calculation
+            query_positions = torch.arange(s_q, device=query.device)
+            key_positions = torch.arange(s_k, device=query.device)
+        else:
+            # Generation phase: query is at position s_k (after the cache)
+            query_positions = torch.arange(s_k, s_k + s_q, device=query.device)  # [s_k] for s_q=1
+            key_positions = torch.arange(s_k, device=query.device)  # [0,1,2,...,s_k-1]
+
+        # Create position difference matrix: query_pos - key_pos
+        pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)  # [s_q, s_k]
+
+        # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
+        sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window)  # [s_q, s_k]
+        attn_scores.masked_fill_(sliding_window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    # Apply logit softcapping if enabled
+    attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
+
+    # Apply sinks if provided
+    if sinks is not None:
+        # Concatenate sinks to attention scores following the reference implementation
+        # sinks should have n_heads elements, each head gets its own sink value
+        # Expand sinks to [b, n_heads, s_q, 1] - one sink column per head
+        sinks_expanded = sinks.reshape(1, -1, 1, 1).expand(
+            b, n_heads, s_q, 1
+        )  # [b, n_heads, s_q, 1]
+
+        # Concatenate along the key dimension (last dimension)
+        logits_max = torch.max(attn_scores, dim=-1, keepdim=True).values
+        sinks = torch.exp(sinks_expanded - logits_max)
+        unnormalized_scores = torch.exp(attn_scores - logits_max)
+        normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + sinks
+        scores = unnormalized_scores / normalizer
+        # Use only the non-sink portion for computing output
+        # We added exactly 1 column, so remove exactly 1 column
+        attn_out = torch.matmul(scores, value_t)  # [b, n_heads, s_q, v_head_dim]
+    else:
+        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_out = torch.matmul(attn_weights, value_t)  # [b, n_heads, s_q, v_head_dim]
+
+    # Apply dropout if specified
+    if dropout_p > 0.0:
+        attn_out = F.dropout(attn_out, p=dropout_p, training=False)
+
+    # Return in bnsd format (same as input format)
+    return attn_out
+
+
+@grouped_sdpa.register_fake
+def grouped_sdpa_fake(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    sinks=None,
+    sliding_window=None,
+    logit_cap=None,
+):
+    """Fake implementation of grouped SDPA."""
+    return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
+
+
+@torch.library.custom_op("auto_deploy::torch_attention_bsnd_grouped_sdpa", mutates_args=())
+def bsnd_grouped_sdpa(
+    query: torch.Tensor,  # layout: [b, s_q, n, d]
+    key: torch.Tensor,  # layout: [b, s_k, n, d]
+    value: torch.Tensor,  # layout: [b, s_k, n, d]
+    attn_mask: Optional[torch.Tensor] = None,  # layout: [b, n, s_q, s_k]
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
+) -> torch.Tensor:
+    """Attention that assumes the input layout is bsnd.
+
+    Note that attn_mask layout is still assumed to be [b, n, s_q, s_k] and is consistent with the
+    original sdpa op!
+    """
+    # Transpose inputs to bnsd format for grouped_sdpa
+    query = query.transpose(1, 2).contiguous()  # [b, s_q, n, d] -> [b, n, s_q, d]
+    key = key.transpose(1, 2).contiguous()  # [b, s_k, n, d] -> [b, n, s_k, d]
+    value = value.transpose(1, 2).contiguous()  # [b, s_k, n, d] -> [b, n, s_k, d]
+
+    # Call grouped_sdpa with bnsd inputs
+    out = grouped_sdpa(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, sinks, sliding_window, logit_cap
+    )
+    # Transpose back to bsnd format
+    return out.transpose(1, 2).contiguous()
+
+
+@bsnd_grouped_sdpa.register_fake
+def bsnd_grouped_sdpa_fake(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    sinks=None,
+    sliding_window=None,
+    logit_cap=None,
+):
+    """Fake implementation of bnsd grouped SDPA."""
+    return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
 def update_kv_cache(
@@ -188,47 +281,7 @@ def update_kv_cache(
         )
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-@torch.inference_mode()
-def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-
-    q = q.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(q)
-    k = k.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(k)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-@torch.library.custom_op("attention::fused_mla_ref", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_fused_mla_ref", mutates_args=())
 def fused_mla_ref(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -265,22 +318,32 @@ def fused_mla_ref(
     value_states = value_states.transpose(1, 2).view(*bs_view, -1, v_head_dim).contiguous()
 
     if freqs_cis is not None:
-        cos = freqs_cis[0, ...]
-        sin = freqs_cis[1, ...]
-        for idx in range(seq_len.shape[0]):
-            (
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-            ) = apply_rotary_pos_emb_ds(
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
+        cos_base = freqs_cis[0, ...]
+        sin_base = freqs_cis[1, ...]
+        for i in range(seq_len.shape[0]):
+            start = seq_start[i]
+            length = seq_len[i]
+            if q_len == 1:
+                idx = (input_pos[i] + length - 1).item()
+                pos_ids = torch.tensor(idx, device=cos_base.device)
+            else:
+                pos_ids = torch.arange(input_pos[i], input_pos[i] + length, device=cos_base.device)
+
+            cos = cos_base[pos_ids]  # [..., 1, head_dim]
+            sin = sin_base[pos_ids]
+            q_slice = q_pe[start : start + length]
+            k_slice = k_pe[start : start + length]
+
+            q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
+                q_slice,
+                k_slice,
                 cos,
                 sin,
-                torch.arange(input_pos[idx] + seq_len[idx])[-1]
-                if q_len == 1
-                else torch.arange(input_pos[idx] + seq_len[idx]),
                 -2,
             )
+
+            q_pe[start : start + length] = q_rot
+            k_pe[start : start + length] = k_rot
 
     query_states = k_pe.new_empty(*bs_view, num_heads, q_head_dim)  # [b*s,n,d]
     query_states[..., :qk_nope_head_dim] = q_nope
@@ -371,7 +434,7 @@ def fused_mla_ref_fake(
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("deepseek::fused_mla", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_deepseek_fused_mla", mutates_args=())
 def fused_mla(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -394,7 +457,9 @@ def fused_mla(
     k_nope, value_states = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
     kv_seq_len = value_states.shape[-2]
 
-    q_pe, k_pe = apply_rotary_pos_emb_ds(q_pe, k_pe, cos, sin, position_ids)
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    q_pe, k_pe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
 
     query_states = k_pe.new_empty(bs, num_heads, q_len, q_head_dim)
     query_states[:, :, :, :qk_nope_head_dim] = q_nope
@@ -451,3 +516,38 @@ def fused_mla(
 ) -> torch.Tensor:
     v_head_dim = kv.shape[-1] - q_nope.shape[-1]
     return torch.empty_like(kv[..., -v_head_dim:])
+
+
+@torch.library.custom_op("auto_deploy::torch_attention_deepseek_mla", mutates_args=())
+def mla(
+    q_nope: torch.Tensor,  # Down projected q_nope
+    q_pe: torch.Tensor,  # q_pe after applying rope
+    kv: torch.Tensor,  # compressed kv after passing through layernorm
+    pe: torch.Tensor,  # k_pe after applying rope
+    attention_mask: torch.Tensor,  # attention mask
+    softmax_scale: float,  # softmax scale
+) -> torch.Tensor:
+    """
+    Reference implementation for MLA style attention that handles compressed kv.
+    """
+    scores = (
+        torch.einsum("bhsc,btc->bsht", q_nope, kv) + torch.einsum("bhsr,btr->bsht", q_pe, pe)
+    ) * softmax_scale
+    if attention_mask is not None:
+        scores += attention_mask.unsqueeze(1)
+    scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q_nope)
+    attn_output = torch.einsum("bsht,btc->bshc", scores, kv)
+    return attn_output
+
+
+@mla.register_fake
+def mla(
+    q_nope: torch.Tensor,  # Down projected q_nope
+    q_pe: torch.Tensor,  # q_pe after applying rope
+    kv: torch.Tensor,  # compressed kv after passing through layernorm
+    k_pe: torch.Tensor,  # k_pe after applying rope
+    attention_mask: torch.Tensor,  # attention mask
+    softmax_scale: float,  # softmax scale
+) -> torch.Tensor:
+    """MLA style attention that handles compressed kv."""
+    return torch.empty_like(q_nope)

@@ -84,14 +84,19 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr onboardBlocks = true;
 
+    // TODO: Support and add coverage for beamWidth > 1
     auto constexpr beamWidth = 1;
     auto constexpr numBlocksPerBeam = blocksInPrimaryPool / beamWidth;
     auto constexpr maxSequenceLength = tokensPerBlock * numBlocksPerBeam;
     auto const maxAttentionWindowVec = std::vector<BlockManager::SizeType32>{maxAttentionWindow};
 
+    using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+    const BlocksPerWindow blocksPerWindow
+        = {{maxAttentionWindow, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
+
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, maxNumSequences, stream, maxSequenceLength, beamWidth,
-        maxAttentionWindowVec, std::nullopt, dataType, 0, onboardBlocks);
+        blocksPerWindow, maxNumSequences, stream, maxSequenceLength, beamWidth, maxAttentionWindowVec, std::nullopt,
+        dataType, 0, onboardBlocks);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);

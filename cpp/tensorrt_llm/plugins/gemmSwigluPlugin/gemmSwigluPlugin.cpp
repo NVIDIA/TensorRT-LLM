@@ -413,7 +413,7 @@ IPluginV2* GemmSwigluPluginCreator::createPlugin(char const* name, PluginFieldCo
         // GemmSwigluPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
         auto pluginProfiler = mGemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
-        QuantMode quantMode = QuantMode::fromDescription();
+        QuantMode quantMode = QuantMode{};
         auto* obj = new GemmSwigluPlugin(quantMode, type, hasBias, scale_d0, scale_d1, scale_output, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

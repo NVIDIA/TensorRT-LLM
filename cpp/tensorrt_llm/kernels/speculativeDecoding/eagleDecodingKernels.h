@@ -544,7 +544,7 @@ void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeT
 //! \param outputPaths [batchSize, maxDecodingTokens, maxPathLen], on GPU. Output paths.
 //! \param maxPathLen SizeType32. Maximum path len of the draft sequence.
 //! \param stream cuda stream.
-void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
+void invokeCopyOutputTokensIds(runtime::TokenIdType const* const* tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
     runtime::SizeType32 const* topKOffset, runtime::TokenIdType const* pluginInputDraftIdsPtrs,
     runtime::SizeType32 const* pluginInputDraftLens, runtime::SizeType32 const* numValidLogits,
     runtime::TokenIdType* pluginOutputDraftIdsPtrs, runtime::SizeType32* pluginOutputDraftLens,
@@ -552,29 +552,23 @@ void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime:
     runtime::SizeType32 const* inputPaths, runtime::SizeType32* outputPaths, runtime::SizeType32 maxPathLen,
     cudaStream_t stream);
 
-//! \brief Augment seq slots and batch slots from batchSize size to engineBatchSize size.
-//! For seqSlot sets -1 for non-last chunks (chunkedContextNextTokens != -1).
-//! For batchSlots sets -1 for non-last chunks. Copies actual batch slots to the last chunk or gen requests
-//! positions.
+//! \brief Augment seq slots so that non-last chunks are set to -1 (if chunkedContextNextTokens != -1).
 //!
 //! \param augmentedSeqSlots output buffer [engineBatchSize]
-//! \param augmentedBatchSlots output buffer [engineBatchSize]
 //! \param chunkedContextNextTokens input buffer [engineBatchSize], indicator of the not last chunk of the ctx
 //! requests. -1 for gen requests and last chunk, != -1 otherwise.
 //! \param lastDraftLens input buffer [engineBatchSize], number of draft tokens input to the current iteration.
 //! 0 for ctx requests and > 0 for gen requests.
 //! \param seqSlots input buffer [engineBatchSize], address map from local index to global index [0, batchSize]
 //! -> [0, maxBatchSize]
-//! \param batchSlots input buffer [engineBatchSize], address map from local index to global index [0, batchSize]
-//! -> [0, maxBatchSize]
 //! \param engineBatchSize number of sequences processed in the engine.
 //! Includes chunked context reqs that are not in the last chunk.
 //! \param batchSize the number of sequences to be decoded
 //! \param stream cuda stream.
-void invokeAugmentBatchSlots(runtime::SizeType32* augmentedSeqSlots, runtime::SizeType32* augmentedBatchSlots,
+void invokeAugmentBatchSlots(runtime::SizeType32* augmentedSeqSlots,
     runtime::SizeType32 const* chunkedContextNextTokens, runtime::SizeType32 const* lastDraftLens,
-    runtime::SizeType32 const* seqSlots, runtime::SizeType32 const* batchSlots, runtime::SizeType32 engineBatchSize,
-    runtime::SizeType32 batchSize, cudaStream_t stream);
+    runtime::SizeType32 const* seqSlots, runtime::SizeType32 engineBatchSize, runtime::SizeType32 batchSize,
+    cudaStream_t stream);
 
 //! \brief For Eagle-2, set topK tensor according to the max topK value for each request.
 //! And fill the batchSlots for the softMax kernel.
@@ -589,7 +583,7 @@ void invokeAugmentBatchSlots(runtime::SizeType32* augmentedSeqSlots, runtime::Si
 //! \param stream cuda stream
 void invokeSetTopKsFromDyanmicTreeMaxTopK(runtime::SizeType32 layerIdx, runtime::SizeType32 batchSize,
     runtime::SizeType32 numInputLogits, runtime::SizeType32* topKs, runtime::SizeType32* topKOffset,
-    runtime::SizeType32 const dynamicTreeMaxTopK, runtime::SizeType32 const* numValidLogits, cudaStream_t stream);
+    runtime::SizeType32 dynamicTreeMaxTopK, runtime::SizeType32 const* numValidLogits, cudaStream_t stream);
 
 //! \brief For Eagle-2, copy this layer's scores and draft tokenIds to pluginInputAllLayersScores and
 //! pluginInputAllLayersDraftTokenIds. Will also update the pluginOutputAllLayersDraftTokenIdsPredecessor, which record
@@ -622,8 +616,7 @@ void invokeSetTopKsFromDyanmicTreeMaxTopK(runtime::SizeType32 layerIdx, runtime:
 //! The output ids of the first topK sampling.
 //! \param stream cuda stream.
 void invokeCopyScoresAndDraftTokenIds(runtime::SizeType32 layerIdx, runtime::SizeType32 mNumEagleLayers,
-    runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 batchSize,
-    runtime::SizeType32 const dynamicTreeMaxTopK, runtime::SizeType32* topKOffset,
+    runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 batchSize, runtime::SizeType32 dynamicTreeMaxTopK,
     runtime::TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
     runtime::TokenIdType const* pluginInputAllLayersDraftTokenIds,
     runtime::TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
@@ -639,7 +632,7 @@ void invokeCopyScoresAndDraftTokenIds(runtime::SizeType32 layerIdx, runtime::Siz
 //! which is the output of the first topK sampling.
 //! \param prevLayerScores [batchSize, maxDecodingDraftTokens], on GPU. Previous layer's scores.
 //! \param stream cuda stream.
-void invokeUpdateScores(runtime::SizeType32 batchSize, runtime::SizeType32 const dynamicTreeMaxTopK,
+void invokeUpdateScores(runtime::SizeType32 batchSize, runtime::SizeType32 dynamicTreeMaxTopK,
     runtime::SizeType32 maxDecodingDraftTokens, float* curLogProbs, float const* prevLayerScores, cudaStream_t stream);
 
 //! \brief Prepare the input of the second topK sampling.
@@ -656,7 +649,7 @@ void invokeUpdateScores(runtime::SizeType32 batchSize, runtime::SizeType32 const
 //! \param secondTopKOutputIdsPtrs [batchSize], on GPU. The output ids
 //! buffer of the second topK sampling. Each element is a pointer, points to a [maxDecodingDraftTokens] buffer.
 //! \param stream cuda stream.
-void invokeAssembleSecondTopKSamplingInputs(runtime::SizeType32 batchSize, runtime::SizeType32 const dynamicTreeMaxTopK,
+void invokeAssembleSecondTopKSamplingInputs(runtime::SizeType32 batchSize, runtime::SizeType32 dynamicTreeMaxTopK,
     runtime::SizeType32 maxDecodingDraftTokens, float* firstTopKOutputLogProbs, float** secondTopKInputScoresPtrs,
     runtime::TokenIdType* secondTopKOutputIdsFlatten, runtime::TokenIdType** secondTopKOutputIdsPtrs,
     cudaStream_t stream);
@@ -705,7 +698,7 @@ void invokeUpdatePath(runtime::SizeType32 layerIdx, runtime::SizeType32 batchSiz
 //! \param stream cuda stream.
 void invokeUpdateDraftTokensAndLensAndCurScores(runtime::SizeType32 layerIdx, runtime::SizeType32 batchSize,
     runtime::SizeType32 dynamicTreeMaxTopK, runtime::SizeType32 maxDecodingDraftTokens,
-    runtime::TokenIdType** curDraftIds, runtime::TokenIdType const* pluginInputDraftIds,
+    runtime::TokenIdType const* const* curDraftIds, runtime::TokenIdType const* pluginInputDraftIds,
     runtime::SizeType32 const* pluginInputDraftLens, runtime::TokenIdType* pluginOutputDraftIds,
     runtime::SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores,
     cudaStream_t stream);
@@ -725,13 +718,12 @@ void invokeUpdateDraftTokensAndLensAndCurScores(runtime::SizeType32 layerIdx, ru
 //! of the second topK sampling.
 //! \param stream cuda stream.
 void invokeExtractScoresAndRealDraftTokensIds(runtime::SizeType32 batchSize, runtime::SizeType32 dynamicTreeMaxTopK,
-    runtime::SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs,
-    runtime::TokenIdType** secondTopKOutputIdsPtrs, runtime::TokenIdType* firstTopKOutputIds,
+    runtime::SizeType32 maxDecodingDraftTokens, float const* const* secondTopKInputScoresPtrs,
+    runtime::TokenIdType* const* secondTopKOutputIdsPtrs, runtime::TokenIdType* firstTopKOutputIds,
     float* secondTopKOutputLogProbs, cudaStream_t stream);
 
 //! \brief Prepare the input of the thrid topK sampling.
 //! \param batchSize SizeType32. Batch size.
-//! \param dynamicTreeMaxTopK SizeType32. The number of child nodes each draft tokens expands to.
 //! \param maxDecodingDraftTokens SizeType32. Maximum number of decoding draft tokens per step per request.
 //! \param mNumEagleLayers SizeType32. The number of the EagleNets.
 //! \param maxNodesOnFinalTree SizeType32. The maximum number of nodes on the final tree. (exclude the root node)
@@ -745,10 +737,9 @@ void invokeExtractScoresAndRealDraftTokensIds(runtime::SizeType32 batchSize, run
 //! \param thirdTopKOutputIdsPtrs [batchSize], on GPU. The output ids of the third topK sampling. Each element points to
 //! a [maxDecodingDraftTokens] buffer.
 //! \param stream cuda stream.
-void invokeAssembleThridTopKSamplingInputs(runtime::SizeType32 batchSize, runtime::SizeType32 const dynamicTreeMaxTopK,
-    runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 mNumEagleLayers,
-    runtime::SizeType32 const maxNodesOnFinalTree, runtime::SizeType32* thirdTopKs, float* pluginOutputAllLayersScores,
-    float** thirdTopKInputScoresPtrs, runtime::TokenIdType* thirdTopKOutputIds,
+void invokeAssembleThridTopKSamplingInputs(runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingDraftTokens,
+    runtime::SizeType32 mNumEagleLayers, runtime::SizeType32 maxNodesOnFinalTree, runtime::SizeType32* thirdTopKs,
+    float* pluginOutputAllLayersScores, float** thirdTopKInputScoresPtrs, runtime::TokenIdType* thirdTopKOutputIds,
     runtime::TokenIdType** thirdTopKOutputIdsPtrs, cudaStream_t stream);
 
 //! \brief Reconstruct the paths at the final layers.
@@ -766,15 +757,15 @@ void invokeAssembleThridTopKSamplingInputs(runtime::SizeType32 batchSize, runtim
 //! \param newPaths [batchSize, maxDecodingTokens, maxPathLen], on GPU.
 //! This layer's output paths, grows based on the outputs of the third samplinig.
 //! \param stream cuda stream.
-void invokeReconstructFinalPath(runtime::SizeType32 batchSize, runtime::SizeType32 const dynamicTreeMaxTopK,
+void invokeReconstructFinalPath(runtime::SizeType32 batchSize, runtime::SizeType32 dynamicTreeMaxTopK,
     runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 maxPathLen,
-    runtime::SizeType32 mNumEagleLayers, runtime::SizeType32 const maxNodesOnFinalTree,
-    runtime::TokenIdType** thirdTopKOutputIdsPtrs, runtime::TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
-    runtime::SizeType32* newPaths, cudaStream_t stream);
+    runtime::SizeType32 mNumEagleLayers, runtime::SizeType32 maxNodesOnFinalTree,
+    runtime::TokenIdType* const* thirdTopKOutputIdsPtrs,
+    runtime::TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor, runtime::SizeType32* newPaths,
+    cudaStream_t stream);
 
 //! \brief Copy the last layer's selected draft tokens into plugin's output buffer.
 //! \param batchSize SizeType32. Batch size.
-//! \param dynamicTreeMaxTopK SizeType32. The number of child nodes each draft tokens expands to.
 //! \param maxDecodingDraftTokens SizeType32. Maximum number of decoding draft tokens per step per request.
 //! \param mNumEagleLayers SizeType32. The number of the EagleNets.
 //! \param maxNodesOnFinalTree SizeType32. The maximum number of nodes on the final tree. (exclude the root node)
@@ -786,10 +777,9 @@ void invokeReconstructFinalPath(runtime::SizeType32 batchSize, runtime::SizeType
 //! The plugin's output buffer, which saves the output draft tokenIds.
 //! \param pluginOutputDraftLens [batchSize], on GPU. The number of the output draft tokens.
 //! \param stream cuda stream.
-void invokeCopyFinalDraftTokens(runtime::SizeType32 batchSize, runtime::SizeType32 const dynamicTreeMaxTopK,
-    runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 mNumEagleLayers,
-    runtime::SizeType32 const maxNodesOnFinalTree, runtime::TokenIdType** thirdTopKOutputIdsPtrs,
-    runtime::TokenIdType* pluginOutputAllLayersDraftTokenIds, runtime::TokenIdType* pluginOutputDraftTokenIds,
-    runtime::SizeType32* pluginOutputDraftLens, cudaStream_t stream);
+void invokeCopyFinalDraftTokens(runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingDraftTokens,
+    runtime::SizeType32 mNumEagleLayers, runtime::SizeType32 maxNodesOnFinalTree,
+    runtime::TokenIdType const* const* thirdTopKOutputIdsPtrs, runtime::TokenIdType* pluginOutputAllLayersDraftTokenIds,
+    runtime::TokenIdType* pluginOutputDraftTokenIds, runtime::SizeType32* pluginOutputDraftLens, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

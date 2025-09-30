@@ -61,11 +61,8 @@ struct BeamHypotheses
     float const* lengthPenalties{nullptr};          // [BS]
     int const* earlyStoppings{nullptr};             // [BS]
     int const* beamWidthArraysHost{nullptr};        // [BS, kMaxBeamWidthArrayLength]                           for VBWS
-    int const* beamWidthArraysDevice{nullptr};      // [BS, kMaxBeamWidthArrayLength]                           for VBWS
     int* nBeamWidthInHost{nullptr};                 // [BS], cpu                                                for VBWS, beam width of last forward computation
     int* nBeamWidthOutHost{nullptr};                // [BS], cpu                                                for VBWS, beam width of next forward computation
-    int* nBeamWidthInDevice{nullptr};               // [BS]                                                     for VBWS, beam width of last forward computation
-    int* nBeamWidthOutDevice{nullptr};              // [BS]                                                     for VBWS, beam width of next forward computation
 
     // Pointers from input
     int const* inputLengths{nullptr};               // [BS, BM]         %% context_length
@@ -102,6 +99,8 @@ struct BeamHypotheses
     int const* parentIdsUnfinish{nullptr};          // [BS, BM, MSL]   %% self.parent_ids
 
     // clang-format on
+
+    void print();
 };
 
 __inline__ int padToNextPowerOfTwo(int const n)
@@ -131,15 +130,16 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
 void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
     runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream);
 
-template <typename T>
-__global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restrict cumLogProbs,
+__global__ void addCumLogProbs(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
+    FinishedState const* finished, int const* endIds, float const* diversityRates,
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
+
+__global__ void addCumLogProbs(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 
 __global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
     size_t const nBMIn, size_t const nBMOut, size_t const nV);
-
-void printBH(BeamHypotheses const& bh);
 
 void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
 
@@ -153,6 +153,7 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
     {                                                                                                                  \
         printf(#x "=");                                                                                                \
         print_element_(x);                                                                                             \
+        printf("\n");                                                                                                  \
     }
 
 // Host function

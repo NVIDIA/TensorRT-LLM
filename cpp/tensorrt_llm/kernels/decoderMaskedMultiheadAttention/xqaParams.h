@@ -34,6 +34,7 @@ struct XQAParams
     void* output_sf = nullptr;
     void const* qkv = nullptr;
     int32_t const* cache_indir = nullptr;
+    float const* attention_sinks = nullptr;
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;
@@ -42,6 +43,7 @@ struct XQAParams
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
+    int32_t chunked_attention_size = INT_MAX;
     int32_t max_attention_window_size = 0;
     int32_t cyclic_attention_window_size = 0;
     int32_t sink_token_length = 0;
@@ -90,6 +92,8 @@ struct XQAParams
     int max_distance = 0;
     bool multi_block_mode;
     bool multi_query_tokens = false;
+    bool is_spec_dec_tree
+        = true; // by default, XQA spec-dec expect tree-based draft token, only affective when multi_query_tokens = true
 
     float const* logn_scaling_ptr = nullptr; // for logn scaling in XQA
 
@@ -99,6 +103,11 @@ struct XQAParams
                                           // nullptr means no conversion.
     float const* fp4_out_sf_scale = nullptr; // SF scale for FP4 output.
     int32_t start_token_idx_sf = 0;          // The start token index in SF tensor.
+
+    void* quant_q_buffer_ptr = nullptr;
+
+    // for cross attention
+    int32_t const* encoder_input_lengths = nullptr;
 
     cudaStream_t stream = 0;
 
@@ -169,9 +178,15 @@ struct XQAParams
            << "total_num_input_tokens :" << total_num_input_tokens << std ::endl
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
+           << "encoder_input_lengths: " << encoder_input_lengths << std::endl
            << "stream :" << stream;
 
         return ss.str();
+    }
+
+    bool isMLA() const
+    {
+        return head_size == 576 && num_q_heads == 128 && num_kv_heads == 1;
     }
 };
 

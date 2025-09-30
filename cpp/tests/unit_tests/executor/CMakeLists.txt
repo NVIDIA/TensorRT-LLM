@@ -16,12 +16,12 @@ add_gtest(requestTest requestTest.cpp)
 add_gtest(responseTest responseTest.cpp)
 
 add_gtest(executorTestSmall executorTestSmall.cpp)
-target_link_libraries(executorTestSmall PRIVATE modelSpecStatic testingUtils)
+target_link_libraries(executorTestSmall PRIVATE testingUtils)
 
 add_gtest(executorTestSmallArbitraryOutputTensors
           executorTestSmallArbitraryOutputTensors.cpp)
 target_link_libraries(executorTestSmallArbitraryOutputTensors
-                      PRIVATE modelSpecStatic testingUtils)
+                      PRIVATE testingUtils)
 
 add_gtest(executorConfigTest executorConfigTest.cpp)
 add_gtest(executorTensorTest tensorTest.cpp)
@@ -31,3 +31,9 @@ add_gtest(loraConfigTest loraConfigTest.cpp)
 add_gtest(intervalSetTest intervalSetTest.cpp)
 add_gtest(dynamicBatchTunerTest dynamicBatchTunerTest.cpp)
 add_gtest(ucxCommTest ucxCommTest.cpp)
+
+if(NIXL_ROOT)
+  add_gtest(transferAgentTest transferAgentTest.cpp)
+  add_gtest(agentCommTest agentCommTest.cpp)
+  target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
+endif()

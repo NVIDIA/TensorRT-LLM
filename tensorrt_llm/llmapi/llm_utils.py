@@ -5,16 +5,16 @@ import shutil
 import tempfile
 import time
 import weakref
-from argparse import Namespace
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
+import transformers
 from tqdm import tqdm
 
-from .._utils import (global_mpi_rank, mpi_barrier, mpi_broadcast, mpi_rank,
-                      release_gc)
+from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
+                      mpi_broadcast, mpi_rank, release_gc)
 from ..auto_parallel import AutoParallelConfig
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
@@ -22,6 +22,7 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  KvCacheRetentionConfig, SchedulerConfig)
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
+from ..llmapi.llm_args import TrtLlmArgs
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
@@ -29,10 +30,12 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, _ModelFormatKind, _ModelWrapper,
-                       _ParallelConfig, get_model_format,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
@@ -105,14 +108,13 @@ class ModelLoader:
         self._workspace = workspace or tempfile.TemporaryDirectory()
         self.llm_build_stats = llm_build_stats or LlmBuildStats()
 
-        assert self.llm_args.build_config
-        self.build_config = self.llm_args.build_config
-
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
-            self.llm_args.speculative_model
-        ) if self.llm_args.speculative_model is not None else None
-        self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
+            self.llm_args.speculative_model_dir
+        ) if self.llm_args.speculative_model_dir is not None else None
+
+        if isinstance(self.llm_args, TrtLlmArgs):
+            self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
         self.rank = mpi_rank()
         self.global_rank = global_mpi_rank()
         self.mapping = llm_args.parallel_config.to_mapping()
@@ -128,16 +130,21 @@ class ModelLoader:
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
-        self.auto_parallel_config = AutoParallelConfig(
-            world_size=llm_args.parallel_config.world_size if llm_args.
-            parallel_config.auto_parallel else 1)
-        default_config = self.llm_args.auto_parallel_config
-        self.auto_parallel_config.set_defaults(
-            cluster_key=default_config.cluster_key,
-            cluster_info=default_config.cluster_info,
-            same_buffer_io=default_config.same_buffer_io,
-            sharded_io_allowlist=default_config.sharded_io_allowlist,
-        )
+        if isinstance(self.llm_args, TrtLlmArgs):
+            assert self.llm_args.build_config
+            self.build_config = self.llm_args.build_config
+
+            self.auto_parallel_config = AutoParallelConfig(
+                world_size=llm_args.parallel_config.world_size if llm_args.
+                parallel_config.auto_parallel else 1)
+
+            default_config = self.llm_args.auto_parallel_config
+            self.auto_parallel_config.set_defaults(
+                cluster_key=default_config.cluster_key,
+                cluster_info=default_config.cluster_info,
+                same_buffer_io=default_config.same_buffer_io,
+                sharded_io_allowlist=default_config.sharded_io_allowlist,
+            )
 
         self._gather_build_steps()
 
@@ -146,7 +153,7 @@ class ModelLoader:
         if isinstance(self.llm_args.model, Module):
             # Build engine from user provided model
             self._build_pipeline.append(
-                ("Build TensorRT-LLM engine",
+                ("Build TensorRT LLM engine",
                  self._build_engine_from_inmemory_model))
             return
 
@@ -308,11 +315,6 @@ class ModelLoader:
             if tokenizer is not None:
                 tokenizer.save_pretrained(engine_dir)
 
-    @staticmethod
-    def get_model_format(model_dir: str) -> _ModelFormatKind:
-        ''' Get the format of the model.  '''
-        return get_model_format(model_dir)
-
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         model_dir = None
@@ -361,7 +363,11 @@ class ModelLoader:
 
             hf_quant_algo = hf_quant_config.pop("quant_algo", None)
             if hf_quant_algo is not None:
-                hf_quant_algo = QuantAlgo(hf_quant_algo)
+                # fp8_pb_wo from modelopt is the same as fp8_block_scales
+                if hf_quant_algo == "fp8_pb_wo":
+                    hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                else:
+                    hf_quant_algo = QuantAlgo(hf_quant_algo)
                 if quant_config.quant_algo is None:
                     logger.info(
                         f"Setting quant_algo={hf_quant_algo} form HF quant config."
@@ -390,15 +396,18 @@ class ModelLoader:
                     )
             else:
                 if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8
+                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
                 ]:
                     raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                     )
 
             for key, value in hf_quant_config.items():
                 logger.info(f"Setting {key}={value} from HF quant config.")
                 setattr(quant_config, key, value)
+
+            # Update the quant_config in llm_args for pytorch
+            self.llm_args.quant_config = quant_config
 
             return True
 
@@ -418,6 +427,15 @@ class ModelLoader:
                             "weight_block_size"):
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
+                elif hf_quant_config.get("quant_method") == "mxfp4":
+                    from .._torch.model_config import ModelConfig
+                    quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                        self.llm_args.moe_config.backend)
+                    quant_config.group_size = 32
+                    quant_config.exclude_modules = [
+                        'block.*.attn.out', 'block.*.mlp.gate',
+                        'block.*.attn.qkv', 'embedding', 'unembedding'
+                    ]
                 else:
                     raise NotImplementedError(
                         f"Unsupported quantization_config: {hf_quant_config}.")
@@ -433,8 +451,8 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
             self.llm_args.decoding_config.decoding_mode
-            if hasattr(self.llm_args, "speculative_model")
-            and self.llm_args.speculative_model else None)
+            if hasattr(self.llm_args, "speculative_model_dir")
+            and self.llm_args.speculative_model_dir else None)
 
         prequantized = self._update_from_hf_quant_config()
 
@@ -477,7 +495,7 @@ class ModelLoader:
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
                 trust_remote_code=self.llm_args.trust_remote_code,
-                speculative_model=self._speculative_model_dir,
+                speculative_model_dir=self._speculative_model_dir,
                 speculative_config=self.llm_args.speculative_config
                 if not isinstance(self.llm_args.speculative_config,
                                   LookaheadDecodingConfig) else None,
@@ -560,30 +578,41 @@ class ModelLoader:
         self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
-    def load_extra_build_configs_from_engine(
-            model_dir: str) -> Optional[Namespace]:
-        ''' Load the extra build configs from the engine directory, return None if model isn't an engine. '''
-        if ModelLoader.get_model_format(
-                model_dir) is not _ModelFormatKind.TLLM_ENGINE:
-            return None
-
-        with open(Path(model_dir) / "config.json", "r") as f:
-            engine_config = json.load(f)
-
-        build_config = engine_config['build_config']
-        build_config.pop("plugin_config")
-        return Namespace(**build_config)
-
-    @staticmethod
-    def load_hf_tokenizer(
-            model_dir,
-            trust_remote_code: bool = True,
-            use_fast: bool = True) -> Optional[TransformersTokenizer]:
+    def load_hf_tokenizer(model_dir,
+                          trust_remote_code: bool = True,
+                          use_fast: bool = True,
+                          **kwargs) -> Optional[TransformersTokenizer]:
         if (tokenizer := load_hf_tokenizer(model_dir, trust_remote_code,
-                                           use_fast)) is not None:
+                                           use_fast, **kwargs)) is not None:
             return tokenizer
         else:
             logger.warning(f"Failed to load tokenizer from {model_dir}")
+            return None
+
+    @staticmethod
+    def load_hf_generation_config(
+            model_dir, **kwargs) -> Optional[transformers.GenerationConfig]:
+        try:
+            return transformers.GenerationConfig.from_pretrained(
+                model_dir, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf generation config from {model_dir}, encounter error: {e}"
+            )
+            return None
+
+    @staticmethod
+    def load_hf_model_config(
+            model_dir,
+            trust_remote_code: bool = True,
+            **kwargs) -> Optional[transformers.PretrainedConfig]:
+        try:
+            return transformers.PretrainedConfig.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load hf model config from {model_dir}, encounter error: {e}"
+            )
             return None
 
 
@@ -614,10 +643,24 @@ class CachedModelLoader:
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
 
+    def _submit_to_all_workers(
+        self,
+        task: Callable[..., Any],
+        *args,
+        **kwargs,
+    ) -> List[Any]:
+        if self.llm_args.parallel_config.is_multi_gpu:
+            return self.mpi_session.submit_sync(task, *args, **kwargs)
+        else:
+            return [task(*args, **kwargs)]
+
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return Path(self.llm_args.model), None
+
+        if self.llm_args.backend == "_autodeploy":
+            return None, ""
 
         self.engine_cache_stage: Optional[CachedStage] = None
 
@@ -626,14 +669,16 @@ class CachedModelLoader:
         self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
-            if self.llm_args.backend not in ["pytorch", "autodeploy"]:
+            if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                self._hf_model_dir = download_hf_model(
-                    self.model_loader.model_obj.model_name,
-                    self.llm_args.revision)
+                hf_model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=self.model_loader.model_obj.model_name,
+                    revision=self.llm_args.revision)
+                self._hf_model_dir = hf_model_dirs[0]
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
@@ -730,7 +775,8 @@ class CachedModelLoader:
             self._hf_model_dir,
             mapping=self.llm_args.parallel_config.to_mapping(),
             quant_config=self.llm_args.quant_config,
-            dtype=self.llm_args.dtype)
+            dtype=self.llm_args.dtype,
+            trust_remote_code=self.llm_args.trust_remote_code)
 
     def _build_model(self) -> Path:
         model_format = self.llm_args.model_format
@@ -745,6 +791,11 @@ class CachedModelLoader:
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
+
+                    #mpi_session cannot be pickled so remove from self.llm_args
+                    if self.llm_args.mpi_session:
+                        del self.llm_args.mpi_session
+
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
@@ -806,6 +857,17 @@ class CachedModelLoader:
 
     @print_traceback_on_error
     @staticmethod
+    def _node_download_hf_model(
+        model: str,
+        revision: Optional[str] = None,
+    ) -> Optional[Path]:
+        if local_mpi_rank() == 0:
+            return download_hf_model(model, revision)
+        else:
+            return None
+
+    @print_traceback_on_error
+    @staticmethod
     def _node_build_task(
         llm_args: LlmArgs,
         workspace: Optional[str | tempfile.TemporaryDirectory] = None,
@@ -860,12 +922,16 @@ __all__ = [
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
+    'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
+    'UserProvidedDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
     'CalibConfig',
+    'CudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',

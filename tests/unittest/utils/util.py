@@ -1,13 +1,21 @@
 import os
 import unittest
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any, Generator
 
 import pynvml
 import pytest
 import tensorrt as trt
 import torch
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
+
 from parameterized import parameterized
 
 import tensorrt_llm
@@ -66,6 +74,11 @@ def getCUDAVersion():
         print(f"Error getting CUDA version: {e}")
 
 
+def isSM100Family():
+    sm = getSMVersion()
+    return sm == 100 or sm == 103
+
+
 skip_pre_ada = pytest.mark.skipif(
     getSMVersion() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -76,8 +89,10 @@ skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100,
+    getSMVersion() == 100 or getSMVersion() == 103,
     reason="This test is not supported in Blackwell architecture")
+skip_blackwell_geforce = pytest.mark.skipif(
+    getSMVersion() == 120, reason="This test is not supported on SM 120")
 
 # If used together with @parameterized, we have to use unittest.skipIf instead of pytest.mark.skipif
 skip_pre_ada_unittest = unittest.skipIf(
@@ -117,16 +132,15 @@ def skip_fp8_pre_ada(use_fp8):
 
 
 def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
-    if getSMVersion() == 100 and (head_size not in [32, 64, 128]
-                                  and context_fmha_type
-                                  != ContextFMHAType.disabled):
+    if (isSM100Family()) and (head_size not in [32, 64, 128] and
+                              context_fmha_type != ContextFMHAType.disabled):
         pytest.skip(
             "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
         )
 
 
 def skip_fp4_pre_blackwell(use_fp4):
-    if use_fp4 and (getSMVersion() < 100 or getSMVersion() >= 120):
+    if use_fp4 and getSMVersion() < 100:
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
 
 
@@ -171,8 +185,14 @@ def skip_gpu_memory_less_than(required_memory: int):
     )
 
 
-skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1000 * 1000 *
+                                                           1000)
+
+skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1000 * 1000 *
+                                                           1000)
+
+skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
+                                                            1000)
 
 
 def modelopt_installed():
@@ -360,3 +380,69 @@ def similar(a, b, threshold=0.8):
 def get_project_root(test_file: str) -> Path:
     return next(p for p in Path(test_file).resolve().parents
                 if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())
+
+
+@contextmanager
+def default_dtype(dtype: torch.dtype):
+    cur_default = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    yield
+    torch.set_default_dtype(cur_default)
+
+
+def woq_assert_near_eq(ref, act, wTypeId):
+    # match the scale in cpp/tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.cpp
+    if wTypeId == 1:
+        bits_in_type = 8
+    else:
+        bits_in_type = 4
+    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
+
+    max_val = torch.max(abs(ref)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+    torch.testing.assert_close(ref, act, atol=atol, rtol=1e-7)
+
+
+def woq_groupwise_gt_matmul(mat1, ref_torch_weights, bias=None):
+    ref = torch.matmul(mat1, ref_torch_weights)
+    if bias is not None:
+        ref += bias
+    return ref
+
+
+def flatten_list_generator(
+        nested_list: list[Any]) -> Generator[Any, None, None]:
+    if not isinstance(nested_list, list):
+        yield nested_list
+    else:
+        for item in nested_list:
+            yield from flatten_list_generator(item)
+
+
+def flatten_list(nested_list: list[Any]) -> list[Any]:
+    return list(flatten_list_generator(nested_list))
+
+
+def duplicate_list_to_length(list: list[Any], target_length: int) -> list[Any]:
+    if target_length < len(list):
+        return list[:target_length]
+    duplicated_list = list * (target_length // len(list))
+    remain = target_length % len(list)
+    if remain != 0:
+        duplicated_list += list[:remain]
+    return duplicated_list
+
+
+# Check a certain percentage of elements in two tensors are within a tolerance
+def check_accuracy(a, b, atol, rtol, percent):
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    left = torch.abs(a - b)
+    right = atol + rtol * torch.abs(b)
+    count = torch.sum(left > right)
+    mismatch_percent = count / a.numel()
+    if not (mismatch_percent < 1 - percent):
+        raise Exception("Mismatch percentage is %f for rtol %f" %
+                        (mismatch_percent, rtol))

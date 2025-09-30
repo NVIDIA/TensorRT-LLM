@@ -13,5 +13,8 @@ methods:
       regex:
         annotation: Optional[str]
         default: null
+      structural_tag:
+        annotation: Optional[str]
+        default: null
     return_annotation: None
 properties: {}

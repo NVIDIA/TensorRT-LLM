@@ -1,0 +1,40 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/500-feature-request.yml
+name: 🚀 Feature request
+description: Submit a proposal/request for a new TensorRT-LLM feature
+title: "[Feature]: "
+labels: ["feature request"]
+assignees: ["laikhtewari"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: 🚀 The feature, motivation and pitch
+    description: >
+      A clear and concise description of the feature proposal. Please outline the motivation for the proposal. Is your feature request related to a specific problem? e.g., *"I'm working on X and would like Y to be possible"*. If this is related to another GitHub issue, please link here too.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Alternatives
+    description: >
+      A description of any alternative solutions or features you've considered, if any.
+- type: textarea
+  attributes:
+    label: Additional context
+    description: >
+      Add any other context or screenshots about the feature request.
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [documentation](https://nvidia.github.io/TensorRT-LLM/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true

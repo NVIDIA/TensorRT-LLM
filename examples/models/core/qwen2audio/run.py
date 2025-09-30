@@ -122,7 +122,8 @@ class QWenInfer(object):
         num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
         if "kv_cache_type" in config["build_config"]:
-            kv_cache_type = KVCacheType(config["build_config"]["kv_cache_type"])
+            kv_cache_type = KVCacheType.from_string(
+                config["build_config"]["kv_cache_type"])
         else:
             kv_cache_type = KVCacheType.CONTINUOUS
 
@@ -315,7 +316,7 @@ class QWenInfer(object):
                                         stream.cuda_stream)
         stream.synchronize()
         audio_time = profiler.stop("Audio") / run_time
-        logger.info(f"TensorRT-LLM Audio latency: {audio_time:3f} sec ")
+        logger.info(f"TensorRT LLM Audio latency: {audio_time:3f} sec ")
 
         assert ok, "Runtime execution failed for audio session"
 
@@ -566,7 +567,7 @@ class QWenInfer(object):
                             print(f'Output(beam: {beam}): "{output_text}"')
         logger.info(f"Input length={input_lengths[b]}")
         logger.info(f"Output length={output_ids.shape}")
-        logger.info(f"TensorRT-LLM QWen time: {Qwen_time:3f} sec ")
+        logger.info(f"TensorRT LLM QWen time: {Qwen_time:3f} sec ")
         if isinstance(history, list):
             history.append({'role': 'assistant', 'content': output_text})
         return output_text, past_audio_features

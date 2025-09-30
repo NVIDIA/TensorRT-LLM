@@ -16,19 +16,17 @@
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 
-#include "tensorrt_llm/kernels/decodingKernels.h"
-#include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
-#include <memory>
-
 #include <NvInferRuntime.h>
+
+#include <memory>
 
 namespace tle = tensorrt_llm::executor;
 namespace tl = tensorrt_llm::layers;
-namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
 using namespace tensorrt_llm::runtime;
 
@@ -38,11 +36,11 @@ using TensorConstPtr = ITensor::SharedConstPtr;
 using TensorPtr = ITensor::SharedPtr;
 
 template <typename T>
-GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth,
-    size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxNumSequences, size_t maxBeamWidth,
+    size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream,
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
     : mManager{std::make_shared<BufferManager>(stream)}
-    , mMaxBatchSize(maxBatchSize)
+    , mMaxNumSequences(maxNumSequences)
     , mVocabSize(vocabSize)
     , mVocabSizePadded(vocabSizePadded)
     , mDecodingMode{mode}
@@ -50,7 +48,7 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
-        maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
+        maxNumSequences, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
 
     mDecodingLayerWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
@@ -67,7 +65,7 @@ void GptDecoder<T>::disableLookahead(
 
     mDecodingMode = executor::DecodingMode::TopKTopP();
     auto const decodingDomain
-        = tensorrt_llm::layers::DecoderDomain(mMaxBatchSize, 1, mVocabSize, mVocabSizePadded, nullptr);
+        = tensorrt_llm::layers::DecoderDomain(mMaxNumSequences, 1, mVocabSize, mVocabSizePadded, nullptr);
 
     auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
 
@@ -122,8 +120,9 @@ void GptDecoder<T>::disableLookahead(
 
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-    std::optional<DecodingOutput> const& output,
-    std::optional<std::vector<decoder_batch::Request> const> const& requestsOpt)
+    std::optional<DecodingOutput> const& output, std::optional<nvinfer1::DataType> explicitDraftTokensDType,
+    std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt,
+    std::optional<std::vector<tle::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -198,33 +197,25 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         explicitDraftTokensParams->temperature = mSamplingConfig.temperature;
         explicitDraftTokensParams->randomDataSample = output->explicitDraftTokensBuffers->randomDataSample;
         explicitDraftTokensParams->temperatures = output->explicitDraftTokensBuffers->temperatures;
-        TLLM_CHECK(requestsOpt);
-        // Ignore the dtype from all other requests assuming that it is the same for all.
-        explicitDraftTokensParams->dtype = requestsOpt.value()[0].dtype;
+        TLLM_CHECK(explicitDraftTokensDType.has_value());
+        explicitDraftTokensParams->dtype = explicitDraftTokensDType.value();
 
         setupParams->decodingParams = explicitDraftTokensParams;
     }
     else if (mDecodingMode.isLookahead())
     {
-        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Lookahead decoding");
         TLLM_LOG_DEBUG("gptDecoder setup lookahead, batchSize=%d", batchSize);
         auto lookaheadParams = std::make_shared<tl::LookaheadSetupParams>();
 
-        TLLM_CHECK(requestsOpt);
-        auto& requests = requestsOpt.value();
-        lookaheadParams->prompt.resize(0);
-        lookaheadParams->prompt.reserve(batchSize);
-        lookaheadParams->algoConfigs.resize(0);
-        lookaheadParams->algoConfigs.reserve(batchSize);
-        for (size_t bi = 0; bi < batchSize; bi++)
-        {
-            lookaheadParams->prompt.emplace_back(ITensor::slice(requests[bi].ids, 0, requests[bi].inputLen));
-            TLLM_CHECK(requests[bi].lookaheadRuntimeConfig);
-            lookaheadParams->algoConfigs.emplace_back(requests[bi].lookaheadRuntimeConfig.value());
-        }
+        TLLM_CHECK_WITH_INFO(lookaheadPrompt.has_value(), "Lookahead prompt must be provided");
+        lookaheadParams->prompt = lookaheadPrompt.value();
+        TLLM_CHECK_WITH_INFO(lookaheadAlgoConfigs.has_value(), "Lookahead algo configs must be provided");
+        lookaheadParams->algoConfigs = lookaheadAlgoConfigs.value();
+        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Lookahead decoding");
         lookaheadParams->generationLengths = output->lookaheadOutputs->generationLengths;
         lookaheadParams->positionOffsets = output->lookaheadOutputs->positionOffsets;
         lookaheadParams->attentionPackedMasks = output->lookaheadOutputs->packedMasks;
+
         setupParams->decodingParams = std::move(lookaheadParams);
     }
     else if (mDecodingMode.isExternalDraftTokens())
@@ -295,7 +286,7 @@ std::shared_ptr<tl::StopCriteriaDecodingInputs> prepareStopCriteriaInputs(Decodi
 }
 
 void prepareMedusaInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+    DecodingInput const& inputs, size_t maxNumSequences, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -312,7 +303,7 @@ void prepareMedusaInputs(
     {
         std::vector<std::vector<TensorPtr>> medusaLogits;
         auto const batchSize = medusaInputs.medusaLogits.size();
-        medusaLogits.resize(maxBatchSize);
+        medusaLogits.resize(maxNumSequences);
         for (size_t bi = 0; bi < batchSize; ++bi)
         {
             auto const slot = batchSlots[bi];
@@ -383,8 +374,7 @@ void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_pt
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareLookaheadInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareLookaheadInputs(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -422,7 +412,7 @@ void prepareEagleInput(DecodingInput const& inputs, std::shared_ptr<tl::Decoding
 
 template <typename T>
 std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
-    DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
+    DecodingInput const& input, size_t maxNumSequences, tle::DecodingMode const& decodingMode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -439,6 +429,12 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     {
         forwardParams = std::make_shared<tl::DecodingInputs>(input.endIds, input.batchSlots, input.step, ite,
             input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
+
+        if (input.cacheIndirection)
+        {
+            forwardParams->srcCacheIndirection = input.cacheIndirection;
+        }
+        forwardParams->beamSearchSteps = input.generationSteps;
     }
     else if (decodingMode.isMedusa())
     {
@@ -474,26 +470,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     // No logits for explicit draft tokens and eagle
     if (!decodingMode.isExplicitDraftTokens() && !decodingMode.isEagle())
     {
-        if (input.logitsVec)
+        for (auto const& logits : input.logitsVec)
         {
-            std::vector<TensorConstPtr> logitsVec;
-            for (auto const& logits : input.logitsVec.value())
-            {
-                TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
-                logitsVec.push_back(logits);
-            }
-            forwardParams->logitsVec = logitsVec;
+            TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
         }
-        else if (input.logits)
-        {
-            TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
-            forwardParams->logits = input.logits;
-        }
-    }
-
-    if (input.cacheIndirection)
-    {
-        forwardParams->srcCacheIndirection = input.cacheIndirection;
+        forwardParams->logitsVec = input.logitsVec;
     }
 
     if (input.embeddingBias)
@@ -515,30 +496,25 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams->finished = input.finishReasons;
     }
 
-    // Medusa
+    // Speculative decoding
     if (decodingMode.isMedusa())
     {
-        prepareMedusaInputs(input, maxBatchSize, forwardParams);
+        prepareMedusaInputs(input, maxNumSequences, forwardParams);
     }
-
-    // Explicit draft tokens
-    if (decodingMode.isExplicitDraftTokens())
+    else if (decodingMode.isExplicitDraftTokens())
     {
         prepareExplicitDraftTokensInput(input, forwardParams);
     }
-
-    if (decodingMode.isLookahead() && input.lookaheadInputs)
+    else if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
-        prepareLookaheadInputs(input, maxBatchSize, forwardParams);
+        prepareLookaheadInputs(input, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
     }
-
-    if (decodingMode.isExternalDraftTokens())
+    else if (decodingMode.isExternalDraftTokens())
     {
         prepareExternalDraftTokensInputs(input, forwardParams);
     }
-
-    if (decodingMode.isEagle())
+    else if (decodingMode.isEagle())
     {
         prepareEagleInput(input, forwardParams);
     }
@@ -763,7 +739,7 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
+    auto forwardParams = prepareInputs<T>(input, mMaxNumSequences, mDecodingMode);
     auto outputParams = prepareOutputs(output, mDecodingMode);
     mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams, mDecodingLayerWorkspace);
 
@@ -774,7 +750,7 @@ template <typename T>
 void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
+    auto forwardParams = prepareInputs<T>(input, mMaxNumSequences, mDecodingMode);
     auto outputParams = prepareOutputs(output, mDecodingMode);
 
     mDynamicDecodeLayer->forwardSync(outputParams, forwardParams, mDecodingLayerWorkspace);

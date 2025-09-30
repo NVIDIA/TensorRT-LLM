@@ -40,8 +40,8 @@ namespace tensorrt_llm::kernels::speculative_decoding
 template <int32_t BLOCK_SIZE>
 __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots, SizeType32 batchSize, SizeType32 engineBatchSize,
-    SizeType32 numPaths, SizeType32 maxPathLen, bool isPathsSeqSlotIdx)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
+    SizeType32 maxPathLen, bool isPathsSeqSlotIdx)
 {
     // Specialize BlockScan for a 1D block of 128 threads of type int
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
@@ -81,22 +81,7 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
         }
         __syncthreads();
 
-        int32_t pathBatchIdx{batchSlot};
-        if (isPathsSeqSlotIdx)
-        {
-            // If paths tensor is the tensor arranged according to seq slot,
-            // we must find the position of the batchSlots index in the seq slot array.
-            // TODO optimize it.
-            for (int bi = 0; bi < batchSize; ++bi)
-            {
-                auto const seqSlot = seqSlots[bi];
-                if (batchSlot == seqSlot)
-                {
-                    pathBatchIdx = bi;
-                    break;
-                }
-            }
-        }
+        auto const pathBatchIdx = isPathsSeqSlotIdx ? bi : batchSlot;
 
         if (valid)
         {
@@ -117,13 +102,12 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
 
 void invokePackAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots, SizeType32 batchSize, SizeType32 engineBatchSize,
-    SizeType32 numPaths, SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
+    SizeType32 maxPathLen, bool isPathsSeqSlotIdx, cudaStream_t stream)
 {
     constexpr SizeType32 BLOCK_SIZE = 1024;
     packAcceptedPaths<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(acceptedLengthsCumSum, pathsOffsets, acceptedLengths,
-        bestPathIds, paths, batchSlots, seqSlots, batchSize, engineBatchSize, numPaths, maxPathLen,
-        isPathsLinearBatchIdx);
+        bestPathIds, paths, batchSlots, batchSize, engineBatchSize, numPaths, maxPathLen, isPathsSeqSlotIdx);
 }
 
 namespace
@@ -138,8 +122,8 @@ __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdT
     TokenIdType const* targetIds, SizeType32* sequenceLengths, SizeType32* acceptedLengths,
     FinishedState* finishedFinal, SizeType32 const* batchSlots, SizeType32 const* paths, TokenIdType const* endIds,
     T const** medusaLogits, T const** logitsPtrs, SizeType32* curTokensPerStep, SizeType32 const* targetTokensPerStep,
-    SizeType32* bestPathIds, SizeType32 batchSize, SizeType32 vocabSize, SizeType32 maxBatchSize, SizeType32 maxSeqLen,
-    SizeType32 maxDraftPathLen, SizeType32 maxDecodingTokens)
+    SizeType32* bestPathIds, SizeType32 vocabSize, SizeType32 maxSeqLen, SizeType32 maxDraftPathLen,
+    SizeType32 maxDecodingTokens)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
@@ -276,8 +260,8 @@ void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<T> co
     acceptDraftTokensByIdsWithPaths<T, BLOCK_SIZE><<<grid, block, 0, params.stream>>>(params.outputIds, params.draftIds,
         params.targetIds, params.sequenceLengths, params.acceptedLengths, params.finishedFinal, params.batchSlots,
         params.paths, params.endIds, params.medusaLogits, params.logitsPtrs, params.curTokensPerStep,
-        params.targetTokensPerStep, params.bestPathIds, params.batchSize, params.vocabSize, params.maxBatchSize,
-        params.maxSeqLen, params.maxDraftPathLen, params.maxDecodingTokens);
+        params.targetTokensPerStep, params.bestPathIds, params.vocabSize, params.maxSeqLen, params.maxDraftPathLen,
+        params.maxDecodingTokens);
 }
 
 template void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<float> const& params);

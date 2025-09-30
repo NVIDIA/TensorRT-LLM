@@ -12,6 +12,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [CogVLM](#cogvlm)
 - [Deplot](#deplot)
 - [Fuyu](#fuyu)
+- [Gemma3](#gemma3)
 - [InternLM-XComposer2](#internlm-xcomposer2)
 - [InternVL2](#internvl2)
 - [Kosmos-2](#kosmos-2)
@@ -20,6 +21,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [NeVA](#neva)
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
+- [Phi-4-multimodal](#phi-4-multimodal)
 - [Qwen2-VL](#qwen2-vl)
 - [Video NeVA](#video-neva)
 - [Dataset Evaluation](#dataset-evaluation)
@@ -27,7 +29,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [Enabling Embedding Table Offloading](#enabling-embedding-table-offloading)
 
 ## Runtime Modes
-TensorRT-LLM supports three runtime modes for running multimodal models.
+TensorRT LLM supports three runtime modes for running multimodal models.
 - `cpp_llm_only` (default): vision engine runs in python runtime, LLM in pybind C++ runtime
 - `python`: everything runs in python runtime
 - `cpp`: everything runs in C++ runtime
@@ -49,6 +51,7 @@ Not all models supports end-to-end `cpp` mode, the checked ones below are suppor
 - [x] NeVA
 - [ ] Nougat [^1]
 - [ ] Phi-3-Vision [^2]
+- [ ] Phi-4-multimodal
 - [ ] Qwen2-VL [^4]
 - [x] Video-NeVA
 
@@ -350,6 +353,75 @@ Currently, CogVLM only support bfloat16 precision.
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
+## Gemma3
+
+**NOTE: We only support Gemma3 VLMs in Pytorch workflow.**
+
+Gemma3VL decoder requires a custom attention mask while processing images. During the context phase:
+- Text tokens attend to other tokens in a causal fashion (standard autoregressive behavior)
+- Image tokens attend to other tokens in a causal fashion AND attend to other tokens from the same image in a bidirectional manner
+
+**Reference:** [Gemma3 Model Documentation](https://huggingface.co/docs/transformers/en/model_doc/gemma3)
+
+We support this custom mask with FlashInfer attention backend.
+
+### Requirements
+
+To ensure expected behavior with Gemma3VL, the following configurations are **required**:
+- **Attention Backend**: Use the FlashInfer attention backend
+- **Chunked Prefill**: Must be disabled
+- **KV Cache Reuse**: Must be disabled
+
+### Quick Start
+
+#### 1. Download Model Weights
+
+```bash
+export MODEL_NAME="gemma-3-27b-it"
+git clone https://huggingface.co/google/${MODEL_NAME}
+```
+
+#### 2. Interactive Testing
+
+Use the `quickstart_multimodal.py` script for quick testing:
+
+```bash
+python3 examples/llm-api/quickstart_multimodal.py \
+    --model_dir ${MODEL_NAME}/ \
+    --modality image \
+    --image_format pil \
+    --attention_backend FLASHINFER \
+    --disable_kv_cache_reuse
+```
+
+#### 3. Model Serving
+
+Serve the model using `trtllm-serve` with the required llmapi arguments mentioned in a yaml file:
+
+```bash
+# Create the configuration file
+cat > extra-llm-api-options.yaml << 'EOF'
+cuda_graph_config: null
+attn_backend: "FLASHINFER"
+enable_chunked_prefill: false
+kv_cache_config:
+  enable_block_reuse: false
+EOF
+
+# Serve the model
+trtllm-serve ${MODEL_NAME}/ \
+    --backend pytorch \
+    --tp_size 1 \
+    --port 8000 \
+    --max_batch_size 4 \
+    --extra_llm_api_options extra-llm-api-options.yaml
+```
+
+### Supported Model Variants
+
+Currently supported Gemma3 variants: 4B, 12B, 27B
+
+
 ## InternLM-XComposer2
 
 **NOTE: We only support InternLM-XComposer-VL-7b for now**
@@ -520,7 +592,7 @@ Firstly, please install transformers with 4.37.2
 
 ## LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA
 
-[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT. [LLaVA-OneVision](https://huggingface.co/collections/llava-hf/llava-onevision-66bb1e9ce8856e210a7ed1fe) is another extension of LLaVA.
+[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT. [LLaVA-OneVision](https://huggingface.co/collections/llava-hf/llava-onevision-66bb1e9ce8856e210a7ed1fe) is another extension of LLaVA.
 
 1. Download Huggingface model weights. These models have both visual and LLM components
    unlike BLIP2 example which downloads only LLM components from Huggingface.
@@ -829,7 +901,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 
 ## NeVA
 
-[NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/multimodalmodels/neva/index.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
+[NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/multimodal/mllm/neva.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
 
 1. Generate TRT-LLM engine for NVGPT following example in `examples/models/core/gpt/README.md`. To adhere to the NVGPT conventions of the conversion script, some layer keys have to be remapped using `--nemo_rename_key`.
 
@@ -967,7 +1039,51 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
         --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
     ```
+## Phi-4-multimodal
+Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
 
+1. Download Huggingface weights
+
+    ```bash
+    export MODEL_NAME="Phi-4-multimodal-instruct"
+    export HF_DIR="tmp/hf_models/${MODEL_NAME}"
+    export CKPT_DIR="tmp/trt_models/${MODEL_NAME}/fp16/1-gpu"
+    export ENGINE_DIR="tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu"
+    git clone https://huggingface.co/microsoft/${MODEL_NAME} ${HF_DIR}
+
+    ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/phi`.
+    ```bash
+    python ../phi/convert_checkpoint.py \
+        --model_dir ${HF_DIR} \
+        --output_dir ${CKPT_DIR} \
+        --dtype float16
+
+    trtllm-build \
+        --checkpoint_dir  ${CKPT_DIR} \
+        --output_dir ${ENGINE_DIR} \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4608 \
+        --max_multimodal_len 4096
+    ```
+
+3. Generate TensorRT engines for visual components and combine everything into final pipeline.
+*Note: the encoders are not the TRT engines but are pure Pytorch ones*
+
+    ```bash
+    python build_multimodal_engine.py --model_type phi-4-multimodal --model_path ${HF_DIR} --output_dir ${ENGINE_DIR}
+
+    python run.py \
+        --hf_model_dir ${HF_DIR} \
+        --kv_cache_free_gpu_memory_fraction 0.7 \
+        --engine_dir ${ENGINE_DIR} \
+        --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
+        --audio_path=${HF_DIR}/examples/what_is_shown_in_this_image.wav
+    ```
 ## Qwen2-VL
 [Qwen2-VL Family](https://github.com/QwenLM/Qwen2-VL): is the latest version of the vision language models in the Qwen model families. Here we show how to deploy Qwen2-VL 2B and 7B in TensorRT-LLM.
 

@@ -13,7 +13,12 @@ def all_close(
         t1 = (t1,)
     if isinstance(t2, torch.Tensor):
         t2 = (t2,)
-    return all(torch.allclose(a, b, atol=atol, rtol=rtol) for a, b in zip(t1, t2))
+
+    all_close = True
+    for idx, (a, b) in enumerate(zip(t1, t2)):
+        print(f"tensor {idx=}: {a.shape=} {b.shape=}, {a=}, {b=}")
+        all_close &= torch.allclose(a, b, atol=atol, rtol=rtol)
+    return all_close
 
 
 def reset_parameters(model: torch.nn.Module):

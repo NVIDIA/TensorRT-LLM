@@ -5,16 +5,16 @@ import pytest
 import torch
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 MAX_SEQ_LEN = 4096 + 1024
 
 
+@pytest.mark.post_merge
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name",
                          ["llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"],
@@ -27,6 +27,7 @@ MAX_SEQ_LEN = 4096 + 1024
                          ids=["anchor1024", "anchor4096"])
 def test_model(backend, model_name, quant, sp_size, sa_block_size,
                sa_anchor_size):
+    pytest.skip("https://nvbugs/5391679")
     quant_configs = {
         "bf16":
         QuantConfig(),
@@ -54,15 +55,15 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
 
     model_dir = str(llm_models_root() / model_name)
     cp_config = {
-        "cp_type": "star_attention",
+        "cp_type": CpType.STAR,
         "cp_anchor_size": sa_anchor_size,
         "block_size": sa_block_size
     }
     max_batch_size = 20
     max_output_tokens = 128
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-    pytorch_backend_config = PyTorchConfig(
-        attn_backend='FLASHINFER_STAR_ATTENTION')
+    pytorch_backend_options = dict(attn_backend='FLASHINFER_STAR_ATTENTION',
+                                   disable_overlap_scheduler=True)
 
     llm = LLM(model=model_dir,
               backend=backend,
@@ -71,25 +72,26 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
               quant_config=quant_config,
               context_parallel_size=sp_size,
               cp_config=cp_config,
-              pytorch_backend_config=pytorch_backend_config,
+              **pytorch_backend_options,
               max_batch_size=max_batch_size,
               max_input_len=MAX_SEQ_LEN - max_output_tokens,
               max_seq_len=MAX_SEQ_LEN,
               max_num_tokens=(sa_block_size + sa_anchor_size) * max_batch_size)
 
-    contexts, queries, references = [], [], []
+    inputs, references = [], []
     current_file = os.path.abspath(__file__)
     current_dir = os.path.dirname(current_file)
     with open(f'{current_dir}/test_star_attention_input.jsonl', 'r') as f:
         for line in f:
-            prompt = json.loads(line)
-            contexts.append(prompt['input_context'])
-            queries.append(prompt['input_query'])
-            references.append(prompt['outputs'][0])
+            sample = json.loads(line)
+            inputs.append({
+                'prompt': sample['input_context'],
+                'query': sample['input_query']
+            })
+            references.append(sample['outputs'][0])
     with llm:
         outputs = llm.generate(
-            contexts,
-            queries=queries,
+            inputs,
             use_tqdm=True,
             sampling_params=SamplingParams(
                 max_tokens=max_output_tokens,

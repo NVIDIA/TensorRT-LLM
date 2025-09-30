@@ -9,7 +9,7 @@ Unit test should be small, fast, and test only for specific function.
 If you need to run them locally, the only dependencies are `requirements-dev.txt`.
 
 ```bash
-# in tensorrt-llm source repo root dir
+# in TensorRT LLM source repo root dir
 # use editable install, such that your local changes will be used immedietely in the tests w/o another install
 # see https://setuptools.pypa.io/en/latest/userguide/development_mode.html
 pip install -e ./
@@ -55,7 +55,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_cli_flow.py::TestGpt2CnnDailymail::test_auto_dtype"
+pytest "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>
@@ -98,7 +98,7 @@ For more options, refer to pytest --help, paying attention to Custom options add
     When you finish setup the model directory, remember to mount it in the docker container.
 
 
-## 4. C++ runtime test
+## 3. C++ runtime test
 
 TRT-LLM C++ runtime tests are using [google-test](https://github.com/google/googletest) framework, and Pytest is used to run sets of these tests.
 
@@ -107,7 +107,7 @@ Pytest calls these scripts from fixtures prior to launching the test cases.
 
 Details on usage of the resources scripts can be found in the [C++ Test document](../cpp/tests/README.md).
 
-## 5. Performance regression test
+## 4. Performance regression test
 
 For performance regression testing in QA and CI, see the [performance test guide](./integration/README.md).
 
@@ -119,7 +119,7 @@ Due to CI hardware resource limitation, and some cases only run on specific GPUs
 
 In directory `integration/test_lists/test-db`, each yml file corresponds to a GPU type.
 
-In file `jenkins/L0_Test.groovy`, the variable `turtleConfigs` maps yml files to CI stages.
+In file `jenkins/L0_Test.groovy`, the variables `x86TestConfigs`, `SBSATestConfigs`, `x86SlurmTestConfigs` and `SBSASlurmTestConfigs` map yml files to CI stages according to platforms and launch methods.
 
 Currently the yml files are manually maintained, which requires developer to update them when new test cases are added.
 
@@ -133,7 +133,9 @@ The priority is A10 > A30 > L40s > A100 > H100 > B200.
 
 Integrations tests usually run entire workflow, containing checkpoint converting, engine building and evaluating, to check functional and accuracy.
 
-Integration tests are stored in `integration/defs`. Once a new integration test case is added, the yml files must be updated to contain the newly added case. Otherwise, the CI will not be able to collect and run this case.
+Integration tests are stored in [`integration/defs`](./integration/defs). In particular, please see [`integration/defs/accuracy`](./integration/defs/accuracy) for more detailed guidance to add accuracy tests.
+
+Once a new integration test case is added, the yml files must be updated to contain the newly added case. Otherwise, the CI will not be able to collect and run this case.
 
 ## 3. Add a unit test
 
@@ -188,11 +190,11 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[medusa-86]
-  - test_cpp.py::test_model[redrafter-86]
-  - test_cpp.py::test_model[mamba-86]
-  - test_cpp.py::test_model[recurrentgemma-86]
-  - test_cpp.py::test_model[eagle-86]
+  - cpp/test_e2e.py::test_model[medusa-86]
+  - cpp/test_e2e.py::test_model[redrafter-86]
+  - cpp/test_e2e.py::test_model[mamba-86]
+  - cpp/test_e2e.py::test_model[recurrentgemma-86]
+  - cpp/test_e2e.py::test_model[eagle-86]
 ```
 
 2. Copy all items in `tests` field to a text file, for example, `a10_list.txt`. Don't forget to remove extra characters like comments and the dash marks.
@@ -202,11 +204,11 @@ disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[T
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-test_cpp.py::test_model[medusa-86]
-test_cpp.py::test_model[redrafter-86]
-test_cpp.py::test_model[mamba-86]
-test_cpp.py::test_model[recurrentgemma-86]
-test_cpp.py::test_model[eagle-86]
+cpp/test_e2e.py::test_model[medusa-86]
+cpp/test_e2e.py::test_model[redrafter-86]
+cpp/test_e2e.py::test_model[mamba-86]
+cpp/test_e2e.py::test_model[recurrentgemma-86]
+cpp/test_e2e.py::test_model[eagle-86]
 ```
 
 3. Invoke `pytest` with TRT-LLM custom option `--test-list`:
@@ -215,3 +217,25 @@ test_cpp.py::test_model[eagle-86]
 cd tests/integration/defs
 pytest . --test-list="a10_list.txt" --output-dir=/tmp/llm_integration_test
 ```
+
+## 5. Set timeout for some long cases individually
+To set a timeout for specific long-running test cases, follow these steps:
+
+### For CI (test-db YAML files):
+1. Locate the test case line in the corresponding test-db YAML file (e.g., `tests/integration/test_lists/test-db/l0_a10.yml`).
+2. Append `TIMEOUT (...)` to the test case line, as shown below:
+   ```yaml
+   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   ```
+   - Ensure there is **at least one space** before and after the `TIMEOUT` keyword.
+   - The time value inside the parentheses `()` must be a **number** representing the timeout in **minutes**.
+
+### For Local Testing (TXT files):
+1. If you are running the tests locally using a prepared `.txt` file (e.g., `a10_list.txt`), append the `TIMEOUT` setting to the test case line in the same way:
+   ```
+   disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   ```
+
+### Notes:
+- The `TIMEOUT` setting ensures that the test case will be terminated if it exceeds the specified time limit.
+- This setting is useful for preventing long-running or stuck tests from blocking the pipeline or local testing.

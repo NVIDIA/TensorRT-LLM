@@ -88,7 +88,7 @@ private:
 class MaxUtilizationScheduler : public BaseCapacityScheduler
 {
 public:
-    MaxUtilizationScheduler(SizeType32 maxNumRequests, bool manyMicroBatches,
+    MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
@@ -98,8 +98,8 @@ public:
 
 private:
     SizeType32 mMaxNumRequests;
-    /// @brief Boolean that indicates if multiple micro batches might be in flight
-    bool mManyMicroBatches;
+    /// @brief Boolean that indicates if two step lookahead is enabled
+    bool mTwoStepsLookAhead;
 };
 
 /// @brief Schedule requests using the GUARANTEED_NO_EVICT policy
@@ -146,7 +146,7 @@ public:
     constexpr static auto name{"CapacityScheduler"};
 
     explicit CapacityScheduler(SizeType32 maxNumRequests, executor::CapacitySchedulerPolicy capacitySchedulerPolicy,
-        bool hasKvCacheManager, std::optional<bool> manyMicroBatches = std::nullopt,
+        bool hasKvCacheManager, bool twoStepsLookAhead = false,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 

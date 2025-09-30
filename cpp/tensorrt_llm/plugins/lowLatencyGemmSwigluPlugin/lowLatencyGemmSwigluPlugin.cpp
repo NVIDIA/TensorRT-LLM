@@ -17,10 +17,10 @@
  */
 
 #include "lowLatencyGemmSwigluPlugin.h"
+#include "low_latency_gemm_swiglu.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/low_latency_gemm_swiglu.h"
 #include <NvInferRuntime.h>
 #include <NvInferRuntimeBase.h>
 #include <NvInferRuntimePlugin.h>
@@ -159,7 +159,7 @@ LowLatencyGemmSwigluPlugin::LowLatencyGemmSwigluPlugin(
     mPluginProfiler->deserialize(d, mDims, mGemmId);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }

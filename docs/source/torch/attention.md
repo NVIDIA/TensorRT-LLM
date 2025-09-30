@@ -9,14 +9,14 @@ involves a sequence of batched matrix multiplications, a softmax operation, and 
 as described in the [Attention Is All You Need](https://arxiv.org/abs/1706.03762) paper.
 [Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are
 variants of MHA that use fewer KV heads than the number of query heads.
-TensorRT-LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
+TensorRT LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
 The following sections explain how to use these implementations and provide a brief guide on implementing new backends.
 
 ## Attention Backends
 
 
 There are currently three available attention backends: the vanilla backend, the TRT-LLM backend, and the Flashinfer backend.
-You can specify the desired attention backend using `PyTorchConfig.attn_backend`. For instance, to utilize the Flashinfer backend, you can create a `PyTorchConfig` with `attn_backend = "flashinfer"` and then pass it to the `LLM` constructor as follows: `LLM(pytorch_backend_config=pytorch_config)`. This will enable the use of the Flashinfer backend for your model.
+You can specify the desired attention backend using `PyTorchConfig.attn_backend`. For instance, to utilize the Flashinfer backend, you can pass `attn_backend="flashinfer"` to the `LLM` constructor as follows: `LLM(attn_backend="flashinfer")`. This will enable the use of the Flashinfer backend for your model.
 
 The vanilla backend, `VanillaAttention`, is a reference implementation designed primarily for inflight batching and linear KV cache support. While it serves as a useful baseline, it is not recommended for production use due to its limited optimizations.
 
