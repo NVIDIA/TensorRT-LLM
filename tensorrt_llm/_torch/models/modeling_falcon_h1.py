@@ -371,6 +371,8 @@ class FalconH1ForCausalLM(DecoderModelForCausalLM[FalconH1Model, FalconH1Config]
                 # Flatten conv1d weights [out, 1, k] -> [out, k]
                 if nk.endswith('.mamba.conv1d.weight') and v.ndim == 3 and v.shape[1] == 1:
                     v = v.squeeze(1).contiguous()
+                if '.mamba.A' in nk:
+                    v = -torch.exp(v.to(torch.float32))
                 norm[nk] = v
             return norm
 
