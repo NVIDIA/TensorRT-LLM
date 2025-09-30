@@ -1211,6 +1211,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
+        fp8_fmha_for_eagle3: bool = False,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         assert isinstance(
@@ -1293,6 +1294,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if use_nvfp4_output:
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
+            # elif fp8_fmha_for_eagle3:
+            elif self.has_fp8_kv_cache and not self.has_fp8_qdq and out_scale is not None:
+                # Force to use FP8 FMHA for (eagle3 + FP8 target model + BF16/FP16 draft model) in draft layers
+                out_dtype = torch.float8_e4m3fn
             elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
                   or self.has_fp8_rowwise
                   or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache

@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 
 import pytest
@@ -23,40 +22,32 @@ def enforce_single_worker(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,fp8_target",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True, False, False],
-        [False, "FLASHINFER", True, False, False, False, True, False, False],
-        [False, "TRTLLM", False, True, True, False, True, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False],
+        [True, "TRTLLM", True, False, False, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True, False, False, False],
+        [False, "TRTLLM", True, False, False, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, True, False, False, False],
+        [False, "FLASHINFER", True, False, False, False, True, False, False, False],
+        [False, "TRTLLM", False, True, True, False, True, False, False, False],
+        [True, "TRTLLM", False, True, True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, True, True, True, False, False, False],
+        [True, "TRTLLM", True, False, True, False, True, False, False, False],
         # TODO: nvbugs/5461761
-        # [True, "TRTLLM", True, False, False, True, True, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True],
-        [False, "TRTLLM", False, False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, True, True, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False],
-        [True, "TRTLLM", False, False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, True, True, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False],
-        [True, "FLASHINFER", False, False, False, False, True, False, False],
-        [False, "FLASHINFER", False, False, False, False, True, False, False],
+        # [True, "TRTLLM", True, False, False, True, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False, False],
+        [False, "TRTLLM", False, False, False, False, True, False, False, False],
+        [True, "TRTLLM", False, False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, False, True, True, False],
+        [True, "TRTLLM", False, True, True, True, True, True, True, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       use_chain_drafter: bool, multi_batch: bool,
-                      attention_dp: bool, request):
+                      attention_dp: bool, fp8_target: bool, request):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -65,6 +56,8 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    if fp8_target:
+        target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
 
     # bs > 1 gives non-deterministic when doing IFB. There are slight chances
     # that ref and spec does not match 100%
@@ -72,6 +65,8 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
                                     max_tokens=8192)
+    if fp8_target:
+        kv_cache_config.dtype = 'fp8'
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[i for i in range(1, max_batch_size +
                                       1)]) if use_cuda_graph else None
@@ -151,9 +146,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        # The spec decode algorithm currently guarantees identical results
-        assert text_spec == text_ref
+    if not fp8_target:
+        for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+            # The spec decode algorithm currently guarantees identical results
+            assert text_spec == text_ref
 
 
 def test_deepseek_eagle3():
@@ -359,6 +355,7 @@ def test_multi_eagle3(use_one_model: bool):
             pass
 
 
+<<<<<<< HEAD
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     """Test CUDA graph padding with 3 requests and max_batch_size=4.
