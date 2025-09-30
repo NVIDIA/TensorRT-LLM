@@ -114,7 +114,7 @@ public:
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeKv, int numTokensPerPage,
-        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma, bool useBlockSparseAttention) const
+        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024) && (numTokensPerPage <= 128),
@@ -137,14 +137,13 @@ public:
         // Bit 49 - 56: maxNumHeadsQPerKvInCta.
         // Bit 57 - 57: reuseSmemKForV.
         // Bit 58 - 58: uses2CtaMma.
-        // Bit 59 - 59: useBlockSparseAttention.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
             | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(numTokensPerPage >> 3) << 44)
             | (static_cast<uint64_t>(maxNumHeadsQPerKvInCta) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 57)
-            | (static_cast<uint64_t>(uses2CtaMma) << 58) | (static_cast<uint64_t>(useBlockSparseAttention) << 59);
+            | (static_cast<uint64_t>(uses2CtaMma) << 58);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -152,7 +151,7 @@ public:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mMaxNumHeadsQPerKvInCta,
-            kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mUseBlockSparseAttention);
+            kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma);
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
@@ -549,9 +548,6 @@ private:
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
         int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;
 
-        // Use block sparse attention.
-        selectKernelParams.mUseBlockSparseAttention = params.mUseBlockSparseAttention;
-
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
             + std::to_string(static_cast<int>(mDtypeKv)) + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut))
@@ -565,8 +561,7 @@ private:
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(numTokensPerPage) + ", maxNumHeadsQPerKvInCta=" + std::to_string(maxNumHeadsQPerKvInCta)
             + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
-            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
-            + ", useBlockSparseAttention=" + std::to_string(selectKernelParams.mUseBlockSparseAttention);
+            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma);
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
         return std::make_pair(
@@ -574,8 +569,7 @@ private:
                 static_cast<int>(kernelType), static_cast<int>(selectKernelParams.mTileScheduler),
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
-                maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
-                selectKernelParams.mUseBlockSparseAttention),
+                maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma),
             info);
     }
 

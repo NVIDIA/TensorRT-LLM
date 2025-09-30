@@ -333,8 +333,6 @@ struct TllmGenSelectKernelParams
     int mTileSizeKv;
     // Use 2 CTA MMA or not.
     bool mUses2CtaMma;
-    // Use block sparse attention or not.
-    bool mUseBlockSparseAttention;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -348,8 +346,7 @@ struct TllmGenSelectKernelParams
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)
         , mTileSizeKv(128)
-        , mUses2CtaMma(false)
-        , mUseBlockSparseAttention(false){};
+        , mUses2CtaMma(false){};
 };
 
 } // namespace kernels
