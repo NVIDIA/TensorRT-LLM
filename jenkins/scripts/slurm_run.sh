@@ -52,6 +52,7 @@ testCmdLines=(
     "$llmapiLaunchScript"
     "pytest"
     "-v"
+    "-s"
     "--timeout-method=thread"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
@@ -75,7 +76,14 @@ fi
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+if [ "$SLURM_PROCID" -eq 0 ]; then
+    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+    touch "$jobWorkspace/coverage_lock.lock"
+else
+    while [ ! -f "$jobWorkspace/coverage_lock.lock" ]; do
+        sleep 5
+    done
+fi
 testCmdLines+=(
     "--cov=$llmSrcNode/examples/"
     "--cov=$llmSrcNode/tensorrt_llm/"
@@ -104,5 +112,5 @@ trap - ERR
 
 eval $fullCmd
 exitCode=$?
-echo "Rank${SLURM_LOCALID} Pytest exit code: $exitCode"
+echo "Rank${SLURM_PROCID} Pytest exit code: $exitCode"
 exit $exitCode
