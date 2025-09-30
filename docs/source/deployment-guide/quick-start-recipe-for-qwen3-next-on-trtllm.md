@@ -2,13 +2,11 @@
 
 ## Introduction
 
-This deployment guide provides step-by-step instructions for running the Qwen3-Next model using TensorRT LLM, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT LLM parameters, launching the server, and validating inference output.
-
-The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT LLM for model serving.
+This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and tuning guidance will be rolled out in future updates.
 
 ## Prerequisites
 
-* GPU: NVIDIA Hopper or Blackwell Architecture
+* GPU: NVIDIA Hopper Architecture
 * OS: Linux
 * Drivers: CUDA Driver 575 or Later
 * Docker with NVIDIA Container Toolkit installed
@@ -27,6 +25,8 @@ Build and run the docker container. See the [Docker guide](../../../docker/READM
 cd TensorRT-LLM
 
 make -C docker release_build IMAGE_TAG=qwen3-next-local
+
+make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LOCAL_USER=1
 ```
 
 ### Creating the TRT-LLM Server config
