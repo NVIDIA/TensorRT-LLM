@@ -1104,17 +1104,15 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
                                            aux_stream,
                                            layer_idx=layer_idx)
 
-        use_gemma_rms_norm = True
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype,
-                                       use_gemma_rms_norm=use_gemma_rms_norm)
+                                       use_gemma=True)
 
-        self.post_attention_layernorm = RMSNorm(
-            hidden_size=config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-            use_gemma_rms_norm=use_gemma_rms_norm)
+        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                                eps=config.rms_norm_eps,
+                                                dtype=config.torch_dtype,
+                                                use_gemma=True)
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
@@ -1266,17 +1264,15 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                                            aux_stream,
                                            layer_idx=layer_idx)
 
-        use_gemma_rms_norm = True
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype,
-                                       use_gemma_rms_norm=use_gemma_rms_norm)
+                                       use_gemma=True)
 
-        self.post_attention_layernorm = RMSNorm(
-            hidden_size=config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-            use_gemma_rms_norm=use_gemma_rms_norm)
+        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                                eps=config.rms_norm_eps,
+                                                dtype=config.torch_dtype,
+                                                use_gemma=True)
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
@@ -1444,12 +1440,11 @@ class Qwen3NextModel(DecoderModel):
             ) for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
 
-        use_gemma_rms_norm = True
         self.norm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
             eps=pretrained_config.rms_norm_eps,
             dtype=pretrained_config.torch_dtype,
-            use_gemma_rms_norm=use_gemma_rms_norm,
+            use_gemma=True,
         )
 
         self.mamba_metadata: Optional[Mamba2Metadata] = None
