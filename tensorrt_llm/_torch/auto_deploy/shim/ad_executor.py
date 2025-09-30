@@ -326,6 +326,15 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
 
+    # check kvcache config
+    enable_block_reuse = ad_config.kv_cache_config.enable_block_reuse
+    enable_partial_reuse = ad_config.kv_cache_config.enable_partial_reuse
+    if enable_block_reuse or enable_partial_reuse:
+        raise RuntimeError(
+            f"Setting {enable_block_reuse=} and/or {enable_partial_reuse=} to True is NOT supported"
+            " in AutoDeploy. Please set them to False."
+        )
+
     # resource managers
     kv_cache_manager = _CacheManagerWithFakePool(
         ad_config.kv_cache_config,

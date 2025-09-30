@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
+from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
@@ -303,6 +303,14 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     garbage_collection_gen0_threshold: int = Field(default=20000, description="See TorchLlmArgs.")
 
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+
+    # NOTE: we do not support enable_block_reuse and enable_partial_reuse in AutoDeploy yet!
+    kv_cache_config: KvCacheConfig = Field(
+        default_factory=lambda **kwargs: KvCacheConfig(
+            enable_block_reuse=False, enable_partial_reuse=False, **kwargs
+        ),
+        description="KV cache config.",
+    )
 
     @property
     def quant_config(self) -> QuantConfig:
