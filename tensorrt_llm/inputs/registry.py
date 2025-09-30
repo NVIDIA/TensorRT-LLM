@@ -474,8 +474,14 @@ def create_input_processor(
             config = ModelConfig.from_pretrained(model_path_or_dir,
                                                  trust_remote_code=True)
             model_config = config.pretrained_config
-        except (ValueError, EnvironmentError):
+        except (ValueError, EnvironmentError) as e:
             config = None
+            logger.debug(
+                f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
+            )
+    else:
+        logger.debug(
+            f"checkpoint_format={checkpoint_format}; skipping HF config load.")
 
     if model_config is not None:
         try:
