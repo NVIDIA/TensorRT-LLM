@@ -311,6 +311,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_draft: bool = False,
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
+            num_logprobs: int = 0,
             is_first_draft: bool = False,
             **kwargs):
 
@@ -356,6 +357,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             tensorrt_llm.bindings.internal.runtime.
             TaskLayerModuleConfig] | None = None
 
+        self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
@@ -565,6 +567,8 @@ def executor_request_to_llm_request(
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
         return_log_probs=executor_request.output_config.return_log_probs,
+        num_logprobs=executor_request.py_num_logprobs if hasattr(
+            executor_request, "py_num_logprobs") else 0,
         return_context_logits=executor_request.output_config.
         return_context_logits,
         return_perf_metrics=executor_request.output_config.return_perf_metrics,
