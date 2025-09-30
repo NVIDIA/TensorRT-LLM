@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Building from Source Code on Linux &#8212; TensorRT-LLM</title>
+    <title>Building from Source Code on Linux &#8212; TensorRT LLM</title>
   
   
   
@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -139,11 +139,11 @@
       
     
     
-    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -250,11 +250,11 @@
       
     
     
-    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -339,6 +339,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -411,16 +412,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -498,7 +502,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="building-from-source-code-on-linux">
+  <section class="tex2jax_ignore mathjax_ignore" id="building-from-source-code-on-linux">
 <span id="build-from-source-linux"></span><h1>Building from Source Code on Linux<a class="headerlink" href="#building-from-source-code-on-linux" title="Link to this heading">#</a></h1>
 <p>This document provides instructions for building TensorRT LLM from source code on Linux. Building from source is recommended for achieving optimal performance, enabling debugging capabilities, or when you need a different <a class="reference external" href="https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html">GNU CXX11 ABI</a> configuration than what is available in the pre-built TensorRT LLM wheel on PyPI. Note that the current pre-built TensorRT LLM wheel on PyPI is linked against PyTorch 2.7.0 and subsequent versions, which uses the new CXX11 ABI.</p>
 <section id="prerequisites">
@@ -655,11 +659,11 @@ example:</p>
 python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">&quot;80-real;86-real&quot;</span>
 </pre></div>
 </div>
-<p>To use the C++ benchmark scripts under <a class="reference internal" href="#/benchmarks/cpp/"><span class="xref myst">benchmark/cpp</span></a>, for example <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark.cpp</span></code>, add the <code class="docutils literal notranslate"><span class="pre">--benchmarks</span></code> option:</p>
+<p>To use the C++ benchmark scripts under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/benchmarks/cpp/">benchmark/cpp</a>, for example <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark.cpp</span></code>, add the <code class="docutils literal notranslate"><span class="pre">--benchmarks</span></code> option:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--benchmarks
 </pre></div>
 </div>
-<p>Refer to the <a class="reference internal" href="../reference/support-matrix.html#support-matrix-hardware"><span class="std std-ref">Hardware</span></a> section for a list of architectures.</p>
+<p>Refer to the <a class="reference internal" href="../legacy/reference/support-matrix.html#support-matrix-hardware"><span class="std std-ref">Hardware</span></a> section for a list of architectures.</p>
 <section id="building-the-python-bindings-for-the-c-runtime">
 <h4>Building the Python Bindings for the C++ Runtime<a class="headerlink" href="#building-the-python-bindings-for-the-c-runtime" title="Link to this heading">#</a></h4>
 <p>The C++ Runtime can be exposed to Python via bindings. This feature can be turned on through the default build options.</p>
@@ -669,10 +673,10 @@ python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>-
 <p>After installing, the resulting wheel as described above, the C++ Runtime bindings will be available in
 the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.bindings</span></code> package. Running <code class="docutils literal notranslate"><span class="pre">help</span></code> on this package in a Python interpreter will provide on overview of the
 relevant classes. The associated unit tests should also be consulted for understanding the API.</p>
-<p>This feature will not be enabled when <a class="reference internal" href="#link-with-the-tensorrt-llm-c++-runtime"><span class="xref myst"><code class="docutils literal notranslate"><span class="pre">building</span> <span class="pre">only</span> <span class="pre">the</span> <span class="pre">C++</span> <span class="pre">runtime</span></code></span></a>.</p>
+<p>This feature will not be enabled when <a class="reference internal" href="#link-with-the-tensorrt-llm-c-runtime"><code class="docutils literal notranslate"><span class="pre">building</span> <span class="pre">only</span> <span class="pre">the</span> <span class="pre">C++</span> <span class="pre">runtime</span></code></a>.</p>
 </section>
 <section id="linking-with-the-tensorrt-llm-c-runtime">
-<h4>Linking with the TensorRT LLM C++ Runtime<a class="headerlink" href="#linking-with-the-tensorrt-llm-c-runtime" title="Link to this heading">#</a></h4>
+<span id="link-with-the-tensorrt-llm-c-runtime"></span><h4>Linking with the TensorRT LLM C++ Runtime<a class="headerlink" href="#linking-with-the-tensorrt-llm-c-runtime" title="Link to this heading">#</a></h4>
 <p>The <code class="docutils literal notranslate"><span class="pre">build_wheel.py</span></code> script will also compile the library containing the C++ runtime of TensorRT LLM. If Python support and <code class="docutils literal notranslate"><span class="pre">torch</span></code> modules are not required, the script provides the option <code class="docutils literal notranslate"><span class="pre">--cpp_only</span></code> which restricts the build to the C++ runtime only.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">&quot;80-real;86-real&quot;</span><span class="w"> </span>--cpp_only<span class="w"> </span>--clean
 </pre></div>
@@ -882,9 +886,9 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

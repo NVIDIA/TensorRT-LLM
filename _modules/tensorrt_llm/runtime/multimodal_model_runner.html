@@ -8,7 +8,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>tensorrt_llm.runtime.multimodal_model_runner &#8212; TensorRT-LLM</title>
+    <title>tensorrt_llm.runtime.multimodal_model_runner &#8212; TensorRT LLM</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -136,11 +136,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -243,11 +243,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -332,6 +332,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -404,16 +405,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -843,7 +847,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MultimodalModelRunner</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">args</span><span class="p">):</span>
@@ -1031,7 +1035,7 @@
         <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">engine_dir</span><span class="p">,</span> <span class="s1">&#39;llm&#39;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_tokenizer">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_tokenizer">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_tokenizer">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;nougat&#39;</span><span class="p">:</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">NougatTokenizerFast</span>
@@ -1096,7 +1100,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_processor">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_processor">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_processor">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_processor</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">torchvision</span><span class="w"> </span><span class="kn">import</span> <span class="n">transforms</span>
 
@@ -1191,7 +1195,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_image_encoder">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_image_encoder">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_image_encoder">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_image_encoder</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 
         <span class="c1"># Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.</span>
@@ -1268,7 +1272,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_audio_encoder">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_audio_encoder">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_audio_encoder">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_audio_encoder</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;phi-4-multimodal&quot;</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
@@ -1280,7 +1284,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_llm">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_llm">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_llm">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_llm</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
             <span class="n">cross_kv_cache_fraction</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1344,7 +1348,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.video_preprocess">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.video_preprocess">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.video_preprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">video_preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">video_path</span><span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">decord</span><span class="w"> </span><span class="kn">import</span> <span class="n">VideoReader</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">video_path</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
@@ -1382,7 +1386,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.preprocess">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">,</span>
                    <span class="n">other_audio_inputs</span><span class="p">):</span>
         <span class="n">audio</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1822,7 +1826,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.tokenizer_image_token">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token">[docs]</a>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">tokenizer_image_token</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span>
                               <span class="n">pre_prompt</span><span class="p">,</span>
@@ -1865,7 +1869,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.split_prompt_by_images">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.split_prompt_by_images">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.split_prompt_by_images">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">split_prompt_by_images</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">):</span>
         <span class="n">batch_splits</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tensor</span><span class="p">:</span>
@@ -1889,7 +1893,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.prepare_position_ids_for_cogvlm">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.prepare_position_ids_for_cogvlm">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.prepare_position_ids_for_cogvlm">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_position_ids_for_cogvlm</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
         <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
         <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
@@ -1905,7 +1909,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.generate">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.generate">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.generate">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">pre_prompt</span><span class="p">,</span>
                  <span class="n">post_prompt</span><span class="p">,</span>
@@ -2140,7 +2144,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_visual_features">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_visual_features">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_visual_features">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">):</span>
         <span class="n">visual_features</span> <span class="o">=</span> <span class="p">{</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vision_input_names</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
@@ -2195,7 +2199,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_audio_features">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_audio_features">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_audio_features">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_audio_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">audio</span><span class="p">,</span> <span class="n">other_audio_inputs</span><span class="p">):</span>
         <span class="n">tmp_features</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">audio_model</span><span class="o">.</span><span class="n">encoder</span><span class="p">(</span>
             <span class="n">audio</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">audio_precision</span><span class="p">)),</span>
@@ -2206,7 +2210,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_fake_prompts_vila">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts_vila">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts_vila">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">setup_fake_prompts_vila</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span>
                                 <span class="n">split_input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
         <span class="c1"># visual_features (num_images, feature_len, token_embed)</span>
@@ -2268,7 +2272,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_fake_prompts">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">setup_fake_prompts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">pre_input_ids</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">,</span>
                            <span class="n">input_lengths</span><span class="p">):</span>
         <span class="c1"># Assemble fake prompts which points to image embedding actually</span>
@@ -2341,7 +2345,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_rope_index">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_rope_index">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_rope_index">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_rope_index</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">,</span>
@@ -2512,7 +2516,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_fake_prompts_qwen2vl">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts_qwen2vl">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts_qwen2vl">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">setup_fake_prompts_qwen2vl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
                                    <span class="n">vision_grid_thws</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
                                    <span class="n">input_lengths</span><span class="p">):</span>
@@ -2585,7 +2589,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_fuyu">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_fuyu">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_fuyu">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_fuyu</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">image_patches_indices</span><span class="p">):</span>
         <span class="n">res_input_ids</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">cur_input_ids</span><span class="p">,</span> <span class="n">cur_image_patches_indices</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
@@ -2606,7 +2610,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_pixtral">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_pixtral">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_pixtral">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_pixtral</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
         <span class="c1"># input_ids obtained from processor has token_ids for text as well as image tokens</span>
         <span class="c1"># where each image token is represented by the same image_token_index.</span>
@@ -2626,7 +2630,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_llava_next">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_llava_next">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_llava_next">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_llava_next</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span>
                                  <span class="n">post_prompt</span><span class="p">):</span>
         <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[]</span>
@@ -2642,7 +2646,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_phi3">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_phi3">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_phi3">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_phi3</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">audio_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
                            <span class="n">num_img_tokens</span><span class="p">,</span> <span class="n">num_aud_tokens</span><span class="p">):</span>
         <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
@@ -2680,7 +2684,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_table</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
         <span class="n">hidden_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">tp_size</span>
         <span class="k">if</span> <span class="n">prompt_table</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -2731,7 +2735,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.load_test_data">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">load_test_data</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image_path</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">video_path</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">load_images</span><span class="p">(</span><span class="n">image_paths</span><span class="p">):</span>
@@ -2888,7 +2892,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.load_test_audio">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_audio">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_audio">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">load_test_audio</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">audio_path</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s2">&quot;phi-4-multimodal&quot;</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
@@ -2900,7 +2904,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_inputs">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_inputs">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">setup_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">raw_image</span><span class="p">,</span> <span class="n">raw_audio</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">..tools.multimodal_builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">compute_rotary_pos_emb</span>
         <span class="n">other_vision_inputs</span> <span class="o">=</span> <span class="p">{}</span>
@@ -3287,7 +3291,7 @@
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.run">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.run">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.run">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">,</span> <span class="n">input_audio</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">):</span>
         <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">processed_image</span><span class="p">,</span> <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">,</span> <span class="n">other_audio_inputs</span><span class="p">,</span> <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_inputs</span><span class="p">(</span>
             <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">,</span> <span class="n">input_audio</span><span class="p">)</span>
@@ -3413,9 +3417,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

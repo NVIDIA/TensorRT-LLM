@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>TensorRT LLM Benchmarking &#8212; TensorRT-LLM</title>
+    <title>TensorRT LLM Benchmarking &#8212; TensorRT LLM</title>
   
   
   
@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -139,11 +139,11 @@
       
     
     
-    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -250,11 +250,11 @@
       
     
     
-    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -339,6 +339,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -411,16 +412,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -495,7 +499,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="tensorrt-llm-benchmarking">
+  <section class="tex2jax_ignore mathjax_ignore" id="tensorrt-llm-benchmarking">
 <span id="perf-benchmarking"></span><h1>TensorRT LLM Benchmarking<a class="headerlink" href="#tensorrt-llm-benchmarking" title="Link to this heading">#</a></h1>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
@@ -503,14 +507,14 @@
 Expect breaking API changes.</p>
 </div>
 <p>TensorRT LLM provides the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI, a packaged benchmarking utility that aims to make it
-easier for users to reproduce our officially published <a class="reference internal" href="#./perf-overview.md#throughput-measurements"><span class="xref myst">performance overview</span></a>. <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> provides the follows:</p>
+easier for users to reproduce our officially published <a class="reference internal" href="perf-overview.html#throughput-measurements"><span class="std std-ref">performance overview</span></a>. <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> provides the follows:</p>
 <ul class="simple">
 <li><p>A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.</p></li>
 <li><p>An entirely Python workflow for benchmarking.</p></li>
 <li><p>Ability to benchmark various flows and features within TensorRT LLM.</p></li>
 </ul>
-<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> executes all benchmarks using [in-flight batching] – for more information see
-the <a class="reference internal" href="../advanced/gpt-attention.html#in-flight-batching"><span class="std std-ref">in-flight batching section</span></a> that describes the concept
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> executes all benchmarks using <code class="docutils literal notranslate"><span class="pre">in-flight</span> <span class="pre">batching</span></code> – for more information see
+the <a class="reference internal" href="../features/attention.html#inflight-batching"><span class="std std-ref">in-flight batching section</span></a> that describes the concept
 in further detail.</p>
 <section id="before-benchmarking">
 <h2>Before Benchmarking<a class="headerlink" href="#before-benchmarking" title="Link to this heading">#</a></h2>
@@ -560,7 +564,7 @@ in further detail.</p>
 <h4>Validated Networks for Benchmarking<a class="headerlink" href="#validated-networks-for-benchmarking" title="Link to this heading">#</a></h4>
 <p>While <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> should be able to run any network that TensorRT LLM supports, the following are the list
 that have been validated extensively and is the same listing as seen on the
-<a class="reference internal" href="#./perf-overview.md"><span class="xref myst">Performance Overview</span></a> page.</p>
+<a class="reference internal" href="perf-overview.html"><span class="std std-doc">Performance Overview</span></a> page.</p>
 <ul class="simple">
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-7b-hf">meta-llama/Llama-2-7b-hf</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-70b-hf">meta-llama/Llama-2-70b-hf</a></p></li>
@@ -592,8 +596,8 @@ Export your token in the <code class="docutils literal notranslate"><span class=
 <li><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">NVFP4</span></code></p></li>
 </ul>
-<p>For more information about quantization, refer to <a class="reference internal" href="../reference/precision.html"><span class="std std-doc">Numerical Precision</span></a> and
-the <a class="reference internal" href="../reference/precision.html#support-matrix"><span class="std std-ref">support matrix</span></a> of the supported quantization methods for each network.</p>
+<p>For more information about quantization, refer to <a class="reference internal" href="../features/quantization.html"><span class="std std-doc">Quantization</span></a> and
+the <a class="reference internal" href="../features/quantization.html#model-supported-matrix"><span class="std std-ref">support matrix</span></a> of the supported quantization methods for each network.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>Although TensorRT LLM supports more quantization modes than listed above, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> currently only configures for
@@ -672,11 +676,8 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 </section>
 <section id="running-with-the-pytorch-workflow">
 <h3>Running with the PyTorch Workflow<a class="headerlink" href="#running-with-the-pytorch-workflow" title="Link to this heading">#</a></h3>
-<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. The <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the
-dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described <a class="reference internal" href="#other-build-modes"><span class="xref myst">above</span></a>).
-Note that CUDA graph is enabled by default. You can add additional pytorch config with
-<code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> followed by the path to a YAML file. For more details, please refer to the
-help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
+<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. The <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described above).</p>
+<p>Note that CUDA graph is enabled by default. You can add additional pytorch config with <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> followed by the path to a YAML file. For more details, please refer to the help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>The command below specifies the <code class="docutils literal notranslate"><span class="pre">--model_path</span></code> option. The model path is optional and used only when you want to run a locally
@@ -696,7 +697,7 @@ for build heuristics.</p>
 <span class="o">===========================================================</span>
 Model:<span class="w">                  </span>meta-llama/Llama-3.1-8B
 Model<span class="w"> </span>Path:<span class="w">             </span>/Ckpt/Path/To/Llama-3.1-8B
-TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.17.0
+TensorRT<span class="w"> </span>LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.17.0
 Dtype:<span class="w">                  </span>bfloat16
 KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">         </span>None
 Quantization:<span class="w">           </span><span class="nv">FP8</span>
@@ -812,7 +813,7 @@ Each subdirectory should contain the LoRA adapter files for that specific task.<
 <h4>Running multi-modal models in the PyTorch Workflow<a class="headerlink" href="#running-multi-modal-models-in-the-pytorch-workflow" title="Link to this heading">#</a></h4>
 <p>To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.</p>
 <p>First, prepare the dataset:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">./</span><span class="n">benchmarks</span><span class="o">/</span><span class="n">cpp</span><span class="o">/</span><span class="n">prepare_dataset</span><span class="o">.</span><span class="n">py</span> \
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">./</span><span class="n">benchmarks</span><span class="o">/</span><span class="n">cpp</span><span class="o">/</span><span class="n">prepare_dataset</span><span class="o">.</span><span class="n">py</span> \
   <span class="o">--</span><span class="n">tokenizer</span> <span class="n">Qwen</span><span class="o">/</span><span class="n">Qwen2</span><span class="o">-</span><span class="n">VL</span><span class="o">-</span><span class="mi">2</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span> \
   <span class="o">--</span><span class="n">stdout</span> \
   <span class="n">dataset</span> \
@@ -834,7 +835,7 @@ the <code class="docutils literal notranslate"><span class="pre">prompt</span></
 </pre></div>
 </div>
 <p>Run the benchmark:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">trtllm</span><span class="o">-</span><span class="n">bench</span> <span class="o">--</span><span class="n">model</span> <span class="n">Qwen</span><span class="o">/</span><span class="n">Qwen2</span><span class="o">-</span><span class="n">VL</span><span class="o">-</span><span class="mi">2</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span> \
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">trtllm</span><span class="o">-</span><span class="n">bench</span> <span class="o">--</span><span class="n">model</span> <span class="n">Qwen</span><span class="o">/</span><span class="n">Qwen2</span><span class="o">-</span><span class="n">VL</span><span class="o">-</span><span class="mi">2</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span> \
   <span class="n">throughput</span> \
   <span class="o">--</span><span class="n">dataset</span> <span class="n">mm_data</span><span class="o">.</span><span class="n">jsonl</span> \
   <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> \
@@ -922,7 +923,7 @@ checkpoint. For the Llama-3.1 models, TensorRT LLM provides the following checkp
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-70B-Instruct-FP8</span></code></a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-405B-Instruct-FP8</span></code></a></p></li>
 </ul>
-<p>To understand more about how to quantize your own checkpoints, refer to ModelOpt <a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/getting_started/3_quantization.html">documentation</a>.</p>
+<p>To understand more about how to quantize your own checkpoints, refer to ModelOpt <a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/deployment/1_tensorrt_llm.html">documentation</a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizes the <code class="docutils literal notranslate"><span class="pre">hf_quant_config.json</span></code> file present in the pre-quantized checkpoints above. The configuration
 file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">TensorRT Model Optimizer</a>
 and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
@@ -978,12 +979,13 @@ follow when a checkpoint does not specify a KV cache quantization algorithm:</p>
 </div>
 <p>If you would like to force the KV cache quantization, you can specify the following in the YAML file to force the precision
 when the checkpoint precision is <code class="docutils literal notranslate"><span class="pre">null</span></code>:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;fp8&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
 </pre></div>
 </div>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
-<p>The two valid values for <code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code> are <code class="docutils literal notranslate"><span class="pre">auto</span></code> and <code class="docutils literal notranslate"><span class="pre">fp8</span></code>.</p>
+<p>The two valid values for <code class="docutils literal notranslate"><span class="pre">kv_cache_config.dtype</span></code> are <code class="docutils literal notranslate"><span class="pre">auto</span></code> and <code class="docutils literal notranslate"><span class="pre">fp8</span></code>.</p>
 </div>
 </section>
 </section>
@@ -1155,9 +1157,9 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

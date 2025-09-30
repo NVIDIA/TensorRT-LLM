@@ -8,7 +8,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>tensorrt_llm.layers.embedding &#8212; TensorRT-LLM</title>
+    <title>tensorrt_llm.layers.embedding &#8212; TensorRT LLM</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -136,11 +136,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -243,11 +243,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -332,6 +332,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -404,16 +405,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -523,7 +527,7 @@
 
 
 <div class="viewcode-block" id="Embedding">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Embedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    The embedding layer takes input indices (x) and the embedding lookup table (weight) as input.</span>
@@ -571,7 +575,7 @@
         <span class="p">})</span>
 
 <div class="viewcode-block" id="Embedding.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
         <span class="c1"># The embedding weight is padded to the multiple of 8.</span>
         <span class="c1"># The reason is that when lm_head and vocab_embedding are using the same embedding weight,</span>
@@ -596,7 +600,7 @@
 
 
 <div class="viewcode-block" id="Embedding.weight_loader">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding.weight_loader">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding.weight_loader">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">weight_loader</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">param</span><span class="p">:</span> <span class="n">Parameter</span><span class="p">,</span>
                       <span class="n">loaded_weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
         <span class="c1"># use_parallel_embedding</span>
@@ -611,7 +615,7 @@
 
 
 <div class="viewcode-block" id="Embedding.postprocess">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding.postprocess">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding.postprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">weights</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{}</span>
@@ -622,7 +626,7 @@
 
 
 <div class="viewcode-block" id="PromptTuningEmbedding">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PromptTuningEmbedding">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PromptTuningEmbedding">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PromptTuningEmbedding</span><span class="p">(</span><span class="n">Embedding</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    PromptTuningEmbedding handles fine-tuned prompts with virtual tokens. At runtime,</span>
@@ -648,7 +652,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">=</span> <span class="n">vocab_size</span>
 
 <div class="viewcode-block" id="PromptTuningEmbedding.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PromptTuningEmbedding.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PromptTuningEmbedding.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">task_vocab_size</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">            Pass all tokens through both normal and prompt embedding tables.</span>
@@ -702,7 +706,7 @@
 
 
 <div class="viewcode-block" id="LabelEmbedding">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">LabelEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -721,14 +725,14 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">num_classes</span> <span class="o">=</span> <span class="n">num_classes</span>
 
 <div class="viewcode-block" id="LabelEmbedding.token_drop">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding.token_drop">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding.token_drop">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">token_drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">labels</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">force_drop_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
         <span class="n">labels</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">force_drop_ids</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_classes</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">labels</span></div>
 
 
 <div class="viewcode-block" id="LabelEmbedding.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">labels</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">force_drop_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">force_drop_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_drop</span><span class="p">(</span><span class="n">labels</span><span class="p">,</span> <span class="n">force_drop_ids</span><span class="p">)</span>
@@ -739,7 +743,7 @@
 
 
 <div class="viewcode-block" id="get_1d_sincos_pos_embed_from_grid">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_1d_sincos_pos_embed_from_grid">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_1d_sincos_pos_embed_from_grid">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_1d_sincos_pos_embed_from_grid</span><span class="p">(</span><span class="n">embed_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pos</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
     <span class="k">if</span> <span class="n">embed_dim</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;embed_dim must be divisible by 2&quot;</span><span class="p">)</span>
@@ -761,7 +765,7 @@
 
 
 <div class="viewcode-block" id="get_2d_sincos_pos_embed_from_grid">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_2d_sincos_pos_embed_from_grid">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_2d_sincos_pos_embed_from_grid">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_2d_sincos_pos_embed_from_grid</span><span class="p">(</span><span class="n">embed_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">grid</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]):</span>
     <span class="k">if</span> <span class="n">embed_dim</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;embed_dim must be divisible by 2&quot;</span><span class="p">)</span>
@@ -778,7 +782,7 @@
 
 
 <div class="viewcode-block" id="get_2d_sincos_pos_embed">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_2d_sincos_pos_embed">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_2d_sincos_pos_embed">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_2d_sincos_pos_embed</span><span class="p">(</span>
     <span class="n">embed_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">grid_size</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
@@ -813,7 +817,7 @@
 
 
 <div class="viewcode-block" id="SD3PatchEmbed">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.SD3PatchEmbed">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.SD3PatchEmbed">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SD3PatchEmbed</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    2D Image to Patch Embedding with support for SD3 cropping.</span>
@@ -888,7 +892,7 @@
                 <span class="sa">f</span><span class="s2">&quot;Unsupported pos_embed_type: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">pos_embed_type</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="SD3PatchEmbed.cropped_pos_embed">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.SD3PatchEmbed.cropped_pos_embed">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.SD3PatchEmbed.cropped_pos_embed">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">cropped_pos_embed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Crops positional embeddings for SD3 compatibility.&quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pos_embed_max_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -925,7 +929,7 @@
 
 
 <div class="viewcode-block" id="SD3PatchEmbed.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.SD3PatchEmbed.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.SD3PatchEmbed.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latent</span><span class="p">):</span>
         <span class="c1"># [TODO] to support height and width for runtime</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pos_embed_max_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -963,7 +967,7 @@
 
 
 <div class="viewcode-block" id="get_timestep_embedding">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_timestep_embedding">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_timestep_embedding">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_timestep_embedding</span><span class="p">(</span>
     <span class="n">timesteps</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
     <span class="n">embedding_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1019,7 +1023,7 @@
 
 
 <div class="viewcode-block" id="TimestepEmbedding">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.TimestepEmbedding">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.TimestepEmbedding">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">TimestepEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1070,7 +1074,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">post_act</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="n">post_act_fn</span><span class="p">]</span>
 
 <div class="viewcode-block" id="TimestepEmbedding.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.TimestepEmbedding.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.TimestepEmbedding.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sample</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">condition</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">sample</span> <span class="o">=</span> <span class="n">sample</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">cond_proj</span><span class="p">(</span><span class="n">condition</span><span class="p">)</span>
@@ -1089,7 +1093,7 @@
 
 
 <div class="viewcode-block" id="Timesteps">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Timesteps">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Timesteps">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Timesteps</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1104,7 +1108,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">scale</span> <span class="o">=</span> <span class="n">scale</span>
 
 <div class="viewcode-block" id="Timesteps.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Timesteps.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Timesteps.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timesteps</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
         <span class="n">t_emb</span> <span class="o">=</span> <span class="n">get_timestep_embedding</span><span class="p">(</span>
             <span class="n">timesteps</span><span class="p">,</span>
@@ -1119,7 +1123,7 @@
 
 
 <div class="viewcode-block" id="PixArtAlphaTextProjection">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PixArtAlphaTextProjection">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PixArtAlphaTextProjection">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PixArtAlphaTextProjection</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Projects caption embeddings. Also handles dropout for classifier-free guidance.</span>
@@ -1155,7 +1159,7 @@
                                   <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PixArtAlphaTextProjection.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PixArtAlphaTextProjection.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PixArtAlphaTextProjection.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caption</span><span class="p">):</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear_1</span><span class="p">(</span><span class="n">caption</span><span class="p">)</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">act_1</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -1166,7 +1170,7 @@
 
 
 <div class="viewcode-block" id="CombinedTimestepTextProjEmbeddings">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepTextProjEmbeddings">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepTextProjEmbeddings">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CombinedTimestepTextProjEmbeddings</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1190,7 +1194,7 @@
                                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="CombinedTimestepTextProjEmbeddings.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepTextProjEmbeddings.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepTextProjEmbeddings.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timestep</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">pooled_projection</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
         <span class="n">timesteps_proj</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">time_proj</span><span class="p">(</span><span class="n">timestep</span><span class="p">)</span>
         <span class="n">timesteps_emb</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">timestep_embedder</span><span class="p">(</span>
@@ -1206,7 +1210,7 @@
 
 
 <div class="viewcode-block" id="CombinedTimestepLabelEmbeddings">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepLabelEmbeddings">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepLabelEmbeddings">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CombinedTimestepLabelEmbeddings</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1230,7 +1234,7 @@
                                              <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="CombinedTimestepLabelEmbeddings.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepLabelEmbeddings.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepLabelEmbeddings.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">timestep</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">class_labels</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
@@ -1354,9 +1358,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       
