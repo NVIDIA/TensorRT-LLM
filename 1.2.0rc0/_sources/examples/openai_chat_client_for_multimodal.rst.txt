@@ -1,0 +1,10 @@
+OpenAI Chat Client for Multimodal
+=================================
+Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
+
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/560ded5450b79efde720162fc397d7efa59aae6d/examples/serve/openai_chat_client_for_multimodal.py.
+
+.. literalinclude:: ../../../examples/serve/openai_chat_client_for_multimodal.py
+    :lines: 2-114
+    :language: python
+    :linenos:

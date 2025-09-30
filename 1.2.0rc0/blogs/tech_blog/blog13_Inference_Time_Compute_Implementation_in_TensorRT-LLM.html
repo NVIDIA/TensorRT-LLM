@@ -1,0 +1,1086 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Inference Time Compute Implementation in TensorRT LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html" />
+    <link rel="prev" title="Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.2.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Inference Time Compute Implementation in TensorRT LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="inference-time-compute-implementation-in-tensorrt-llm">
+<h1>Inference Time Compute Implementation in TensorRT LLM<a class="headerlink" href="#inference-time-compute-implementation-in-tensorrt-llm" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM Team and UCSD Hao AI Lab</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#inference-time-compute-implementation-in-tensorrt-llm">Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation）</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-content"><span class="xref myst">Table of Content</span></a></p></li>
+<li><p><a class="reference internal" href="#background-and-motivation">Background and Motivation</a></p></li>
+<li><p><a class="reference internal" href="#introduction-for-scaffolding"><span class="xref myst">Introduction for Scaffolding: A Framework for inference-time compute</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#scaffolding-core-feature"><span class="xref myst">Core Features</span></a></p></li>
+<li><p><a class="reference internal" href="#scaffolding-architecture"><span class="xref myst">Architecture</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#scaffolding-architecture-worker"><span class="xref myst">Worker</span></a></p></li>
+<li><p><a class="reference internal" href="#scaffolding-architecture-controller"><span class="xref myst">Controller</span></a></p></li>
+<li><p><a class="reference internal" href="#scaffolding-architecture-scaffoldingllm"><span class="xref myst">ScaffoldingLlm</span></a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#example-for-scaffolding"><span class="xref myst">An Example: Implement Dynasor on Scaffolding</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#dynasor-introduction"><span class="xref myst">Introduction for Dynasor</span></a></p></li>
+<li><p><a class="reference internal" href="#dynasor-cot-implement-in-scaffolding"><span class="xref myst">Implement Dynasor-CoT in Scaffolding</span></a></p></li>
+<li><p><a class="reference internal" href="#dynasor-cot-based-majority-vote-in-scaffolding"><span class="xref myst">Implement Dynasor-CoT based Majority Voting in Scaffolding</span></a></p></li>
+<li><p><a class="reference internal" href="#dynasor-acknowledgements"><span class="xref myst">Acknowledgements</span></a></p></li>
+<li><p><a class="reference internal" href="#dynasor-reference"><span class="xref myst">Reference</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#scaffolding-feature-list"><span class="xref myst">Feature List on Scaffolding</span></a></p></li>
+<li><p><a class="reference internal" href="#scaffolding-future-work"><span class="xref myst">Future Work</span></a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="background-and-motivation">
+<h2>Background and Motivation<a class="headerlink" href="#background-and-motivation" title="Link to this heading">#</a></h2>
+<p>Inference-time compute, also known as test-time scaling, is increasingly important. Beyond simply increasing output length, workflows such as best-of-N and Monte Carlo Tree Search (MCTS) offer additional capabilities for optimizing inference. Further, most of the workflows of agentic or multi-agent are logically similar to these methods of inference-time compute, except that they use more complex tools and context engineering. However, how to conveniently define these methods while achieving excellent inference performance has become a new problem. Because good performance requires careful asynchronous scheduling, but writing asynchronous scheduling programs is not easy for algorithm engineers. When considering the use of external tools and token budget management, the problem becomes even more complex.</p>
+<p>LLM inference frameworks such as TensorRT LLM,vLLM and SGLang provide high performance for inference of generation models or reward models, but they are only for single request inference. Popular Agent frameworks such as LangChain and Dify focus on enabling users to develop agents as simply as possible. But precisely because of this, they may have difficulty completing many inference-time compute methods that require precise definition and developments.</p>
+<p>So we want to build a good framework to support users in exploring and deploying more inference-time compute methods. It should provide a modular infrastructure and fill the gap in balancing usability and performance for inference-time compute.</p>
+</section>
+<section id="introduction-for-scaffolding-a-framework-for-inference-time-compute">
+<h2>Introduction for Scaffolding: A Framework for inference-time compute<a class="headerlink" href="#introduction-for-scaffolding-a-framework-for-inference-time-compute" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> is a framework for inference-time compute with high performance. It makes it easy for users to integrate various methods (CoT, majority vote, best of N, MCTS) and execution backends (TRTLLM/Openai API/Tools) and also allows users to develop customized features such as token budget.</p>
+<section id="core-features">
+<h3>Core Features<a class="headerlink" href="#core-features" title="Link to this heading">#</a></h3>
+<p>The core features including:</p>
+<p>Decouple inference-time compute method and execution backend. Provides <code class="docutils literal notranslate"><span class="pre">Controller</span></code> concept for users to define the method, <code class="docutils literal notranslate"><span class="pre">Worker</span></code> concept to develop execution backend and <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> to provide API for users to integrate <code class="docutils literal notranslate"><span class="pre">Controller</span></code> and <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and run the request.</p>
+<p>Make the inference-time compute method modular and reusable. An inference time compute method can be
+composed of multiple modules. In scaffolding, <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can be constructed by a series of <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code>, then users can flexibly assemble and replace the <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code>.</p>
+<p>Provides sufficient concurrency to achieve good performance while ease of use. Concurrency is the key for performance. <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> provides three levels of concurrency. The first level is that the different requests to a <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> instance can be concurrent. The second level is that the multiple <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code> can be concurrent.The third level is that the multiply Tasks which yielded from <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can be concurrent.</p>
+</section>
+<section id="architecture">
+<h3>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> consists of three core components. Let’s first briefly introduce these components. The <code class="docutils literal notranslate"><span class="pre">Worker</span></code> class is the backend that execute a single task, such as sending an inference request to an LLM inference framework or service, or completing a call to an external tool. The <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class focuses on defining the workflow of a inference-time compute method. The <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> class is responsible for integrating the two and completing the entire task.</p>
+<p>This is the call sequence diagram of <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code>:</p>
+<div align="center">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
+</div>
+<p align="center"><sub><em>Figure 1. Scaffolding Sequence</em></sub></p>
+<p>Here we can focus on two points. First, <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> provides users with the interface. Second, the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> does not directly call the Worker.</p>
+<p>Next, we will introduce the code of the core components.</p>
+<section id="worker">
+<h4>Worker<a class="headerlink" href="#worker" title="Link to this heading">#</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Worker</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run_task</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="n">Task</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TaskStatus</span><span class="p">:</span>
+        <span class="n">worker_cls</span> <span class="o">=</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">task</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">worker_cls</span><span class="o">.</span><span class="n">task_handlers</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">TaskStatus</span><span class="o">.</span><span class="n">WORKER_NOT_SUPPORTED</span>
+        <span class="k">return</span> <span class="k">await</span> <span class="n">worker_cls</span><span class="o">.</span><span class="n">task_handlers</span><span class="p">[</span><span class="nb">type</span><span class="p">(</span><span class="n">task</span><span class="p">)](</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">)</span>
+
+    <span class="n">task_handlers</span> <span class="o">=</span> <span class="p">{}</span>
+</pre></div>
+</div>
+<p>The core interface of <code class="docutils literal notranslate"><span class="pre">Worker</span></code> is <code class="docutils literal notranslate"><span class="pre">run_task()</span></code>, which accepts a <code class="docutils literal notranslate"><span class="pre">Task</span></code>, executes it, and writes the result to the appropriate field. It should be noted that <code class="docutils literal notranslate"><span class="pre">run_task()</span></code> is an asynchronous function and it can be concurrently and asynchronously called with python asyncio.</p>
+</section>
+<section id="controller">
+<h4>Controller<a class="headerlink" href="#controller" title="Link to this heading">#</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">Controller</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">task_collections</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">clone</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
+        <span class="n">task</span> <span class="o">=</span> <span class="n">GenerationTask</span><span class="o">.</span><span class="n">create_from_prompt</span><span class="p">(</span><span class="n">prompt</span><span class="p">)</span>
+
+        <span class="k">yield from</span> <span class="bp">self</span><span class="o">.</span><span class="n">process</span><span class="p">([</span><span class="n">task</span><span class="p">],</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">task</span><span class="o">.</span><span class="n">create_scaffolding_output</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">process</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tasks</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Task</span><span class="p">],</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span>
+</pre></div>
+</div>
+<p>Its two core interfaces are <code class="docutils literal notranslate"><span class="pre">generate()</span></code> and <code class="docutils literal notranslate"><span class="pre">process()</span></code>. <code class="docutils literal notranslate"><span class="pre">generate()</span></code> is the entry point for <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> to invoke. In the default implementation of <code class="docutils literal notranslate"><span class="pre">generate()</span></code>, it produces a <code class="docutils literal notranslate"><span class="pre">Task</span></code> and then invokes <code class="docutils literal notranslate"><span class="pre">process()</span></code>. The <code class="docutils literal notranslate"><span class="pre">process()</span></code> is the most important part of every <code class="docutils literal notranslate"><span class="pre">Contronller</span></code> class, as it defines the implementation the workflow of this inference-time compute method.</p>
+<p>Let’s go into a specific subclass of <code class="docutils literal notranslate"><span class="pre">Controller</span></code> to see how <code class="docutils literal notranslate"><span class="pre">process()</span></code> is implemented.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">NativeGenerationController</span><span class="p">(</span><span class="n">Controller</span><span class="p">):</span>
+
+    <span class="k">class</span><span class="w"> </span><span class="nc">WorkerTag</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+        <span class="n">GENERATION</span> <span class="o">=</span> <span class="s2">&quot;generation&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">process</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tasks</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Task</span><span class="p">],</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">task</span> <span class="ow">in</span> <span class="n">tasks</span><span class="p">:</span>
+            <span class="n">task</span><span class="o">.</span><span class="n">worker_tag</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">WorkerTag</span><span class="o">.</span><span class="n">GENERATION</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="nb">setattr</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+            <span class="n">task</span><span class="o">.</span><span class="n">streaming</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">streaming</span>
+
+        <span class="k">yield</span> <span class="n">tasks</span>
+</pre></div>
+</div>
+<p>Essentially, <code class="docutils literal notranslate"><span class="pre">process()</span></code> is an iterator in python that can return a list of tasks using yield statement. When the iterator is re-entered, that is, when the yield statement ends, the <code class="docutils literal notranslate"><span class="pre">Tasks</span></code> have been completed. That means the result of the <code class="docutils literal notranslate"><span class="pre">Task</span></code> has been written into its result field. Then the <code class="docutils literal notranslate"><span class="pre">process()</span></code> can proceed to the next steps.</p>
+<p>From here we can see that the implement of the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can focus on the design of the workflow. It does not directly call the <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and does not need to care about how these tasks are completed. And that is how <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> decouple inference-time compute method and execution backend.</p>
+<p>Also, <code class="docutils literal notranslate"><span class="pre">Controller</span></code> makes the inference-time compute method modular and reusable. It only requires the <code class="docutils literal notranslate"><span class="pre">sub-Controller</span></code> to be a member of class, and then the <code class="docutils literal notranslate"><span class="pre">process()</span></code> function of the <code class="docutils literal notranslate"><span class="pre">sub-Controller</span></code> is called using the “yield from” statement.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">yield from</span> <span class="bp">self</span><span class="o">.</span><span class="n">reward_controller</span><span class="o">.</span><span class="n">process</span><span class="p">(</span><span class="n">generation_tasks</span><span class="p">,</span>
+                                                <span class="o">**</span><span class="n">reward_kwargs</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For the concurrency with ease of use, <code class="docutils literal notranslate"><span class="pre">Controller</span></code> provides two ways. As the code above shows, the yield statement yield a list of <code class="docutils literal notranslate"><span class="pre">Task</span></code>. So the first one is that the multiple Tasks in a yield statement is executed in parallel. The second way is for the multiple <code class="docutils literal notranslate"><span class="pre">sub-Controller</span></code> which can be executed in parallel. <code class="docutils literal notranslate"><span class="pre">Controller</span></code> provides syntactic sugar called <code class="docutils literal notranslate"><span class="pre">ParallelProcess</span></code>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">generation_controllers</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">generation_controller</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">sample_num</span><span class="p">)</span>
+        <span class="p">]</span>
+        <span class="n">generation_kwargs_list</span> <span class="o">=</span> <span class="p">[</span><span class="n">generation_kwargs</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">sample_num</span><span class="p">)]</span>
+        <span class="n">generation_tasks</span> <span class="o">=</span> <span class="p">[</span><span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">task</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">sample_num</span><span class="p">)]</span>
+
+        <span class="k">yield</span> <span class="n">ParallelProcess</span><span class="p">(</span><span class="n">generation_controllers</span><span class="p">,</span>
+                              <span class="p">[[</span><span class="n">t</span><span class="p">]</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">generation_tasks</span><span class="p">],</span>
+                              <span class="n">generation_kwargs_list</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="scaffoldingllm">
+<h4>ScaffoldingLlm<a class="headerlink" href="#scaffoldingllm" title="Link to this heading">#</a></h4>
+<p>With <code class="docutils literal notranslate"><span class="pre">Controller</span></code> and <code class="docutils literal notranslate"><span class="pre">Worker</span></code>, we still need something that can combine them together, that is the <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> class.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm_worker</span> <span class="o">=</span> <span class="n">TRTLLMWorker</span><span class="o">.</span><span class="n">init_with_new_llm</span><span class="p">(</span>
+    <span class="n">args</span><span class="o">.</span><span class="n">model_dir</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+    <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">prototype_controller</span> <span class="o">=</span> <span class="n">NativeGenerationController</span><span class="p">(</span><span class="n">sampling_params</span><span class="o">=</span><span class="p">{</span>
+    <span class="s2">&quot;temperature&quot;</span><span class="p">:</span> <span class="mf">0.9</span><span class="p">,</span>
+    <span class="s2">&quot;max_tokens&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="p">,</span>
+<span class="p">})</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">ScaffoldingLlm</span><span class="p">(</span>
+    <span class="n">prototype_controller</span><span class="p">,</span>
+    <span class="p">{</span><span class="n">NativeGenerationController</span><span class="o">.</span><span class="n">WorkerTag</span><span class="o">.</span><span class="n">GENERATION</span><span class="p">:</span> <span class="n">llm_worker</span><span class="p">},</span>
+<span class="p">)</span>
+<span class="n">results</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Users need to first create instances of <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and <code class="docutils literal notranslate"><span class="pre">Controller</span></code>, and map them by <code class="docutils literal notranslate"><span class="pre">WorkerTag</span></code> to create the <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> class. Then call the generate interface of <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> to get the final result.</p>
+<p><code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> also provides async interface.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">async</span> <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">prompt</span><span class="p">):</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;&gt;&gt;&gt;&quot;</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Therefore, an instance of ScaffoldingLlm supports concurrent execution of multiple requests.</p>
+<p>Let’s make a summary of the overall implementation of <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code>. If users want to implement a new inference-time compute method, users can develop a new <code class="docutils literal notranslate"><span class="pre">Controller</span></code>. They can also call some existing <code class="docutils literal notranslate"><span class="pre">Controllers</span></code> as its <code class="docutils literal notranslate"><span class="pre">sub-Controller</span></code>. If users want to implement a new backend, users can either create a new <code class="docutils literal notranslate"><span class="pre">Worker</span></code> or add a new <code class="docutils literal notranslate"><span class="pre">Task</span></code> handler to an existing <code class="docutils literal notranslate"><span class="pre">Worker</span></code>.  As for <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlM</span></code>, we have hidden many complex implementations, such as async scheduling within <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlM</span></code>, and users do not need to modify the code of <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlM</span></code>.</p>
+</section>
+</section>
+</section>
+<section id="an-example-implement-dynasor-cot-on-scaffolding">
+<h2>An Example: Implement Dynasor-CoT on Scaffolding<a class="headerlink" href="#an-example-implement-dynasor-cot-on-scaffolding" title="Link to this heading">#</a></h2>
+<p>Dynasor-CoT
+<a href="https://arxiv.org/abs/2412.20993">
+<img src="https://img.shields.io/badge/arXiv-2412.20993-b31b1b.svg?style=plastic" alt="arXiv" style="vertical-align: text-top;">
+</a>
+is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT) inference. This chapter discusses how inference-time compute methods can be smoothly integrated into the TRT-LLM Scaffolding framework, using Dynasor-CoT as an example.</p>
+<div align="center">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_demo.gif" alt="Dynasor Demo" width="900px">
+</div>
+<p align="center"><sub><em>Figure 2. Demo of DeepSeek-R1-Distill-Qwen-7B achieving a 5.74x speedup compared to the baseline when using Dynasor-CoT on MATH500</em></sub></p>
+<section id="introduction-for-dynasor-cot">
+<h3>Introduction for Dynasor-CoT<a class="headerlink" href="#introduction-for-dynasor-cot" title="Link to this heading">#</a></h3>
+<section id="motivation-of-dynasor-cot">
+<h4>Motivation of Dynasor-CoT<a class="headerlink" href="#motivation-of-dynasor-cot" title="Link to this heading">#</a></h4>
+<p>LLM reasoning is highly token-inefficient, often requiring far more tokens to achieve the same accuracy as non-reasoning models. A major source of this inefficiency is that reasoning models tend to <strong>self-doubt</strong>; they often reach the correct answer early but then engage in extended verification behaviors like double-checking and reassessment.</p>
+<p>For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, Deepseek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.</p>
+<div align="center">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_hesitation.png" alt="Motivation" width="900px">
+</div>
+<p align="center"><sub><em>Figure 2. An example answer from reasoning model (Deepseek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
+</section>
+<section id="the-probe-technique">
+<h4>The “Probe” technique<a class="headerlink" href="#the-probe-technique" title="Link to this heading">#</a></h4>
+<p>Dynasor-CoT uses a <strong>“Probe-In-The-Middle”</strong> (or “probe” for short) technique, which prompts reasoning models to output early-stage results during intermediate steps of reasoning. Imagine you’re in a math exam working on a hard problem. When time is up, you’re forced to write down your final answer, regardless of how confident you are.</p>
+<p>More specifically, a probe is an extra generation request with an eliciting prompt appended to the intermediate reasoning tokens. One effective eliciting prompt is: <code class="docutils literal notranslate"><span class="pre">Oh,</span> <span class="pre">I</span> <span class="pre">suddenly</span> <span class="pre">got</span> <span class="pre">the</span> <span class="pre">answer</span> <span class="pre">to</span> <span class="pre">the</span> <span class="pre">whole</span> <span class="pre">problem,</span> <span class="pre">Final</span> <span class="pre">Answer:</span> <span class="pre">boxed{</span></code>. Figure 3 shows an analysis comparing the accuracy of directly asking versus probing the model. Taking AMC23 as an example, reasoning models frequently arrive at correct answers early (median: 830 tokens) but continue generating unnecessary tokens due to self-doubt (median: 2.7K tokens).</p>
+<div align="center">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_pressure_testing.png" alt="Dynasor Demo" width="900px">
+</div>
+<p align="center"><sub><em>Figure 3. DeepSeek-R1's performance on AMC23 and AIME24 at varying token budgets. (Left) Standard reasoning with late answer outputs. (Right) Early answer extraction using the Probe-In-The-Middle technique, demonstrating equivalent accuracy with a 50% token reduction. The greener regions in the right panels suggest the model knows the answers much earlier than it reveals in standard reasoning.</em></sub></p>
+</section>
+<section id="how-it-speeds-up-inference">
+<h4>How it speeds up inference<a class="headerlink" href="#how-it-speeds-up-inference" title="Link to this heading">#</a></h4>
+<p>Instead of generating a fixed number of tokens or waiting for a stop token, Dynasor-CoT <strong>probes the model regularly</strong> (e.g., every 32, 64, or 128 tokens) and <strong>terminates the process</strong> early once a consistent answer is formed across recent probes. This avoids unnecessary computation, directly reducing latency.</p>
+<p>Figure 4 provides an illustration:</p>
+<ul class="simple">
+<li><p><strong>Case 1</strong>: All three probe requests yield the same answer, “3159.”, indicating high certainty. The process can exit early.</p></li>
+<li><p><strong>Case 2</strong>: Early-stage answers are inconsistent, indicating low confidence, so generation continues.</p></li>
+<li><p><strong>Case 3</strong>: The model generates special tokens such as “wait” or “hmm,” signaling hesitation; generation continues.</p></li>
+</ul>
+<div align="center">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_dynasor_illustration.jpg" alt="Dynasor Illustration" width="900px">
+</div>
+<p align="center"><sub><em>Figure 4. Illustration of Dynasor-CoT. Case 1: early exit due to consistent early-stage results. Case 2: continue generation due to inconsistent early-stage results. Case 3: responses containing hesitation words (e.g., wait) are discarded.</em></sub></p>
+</section>
+</section>
+<section id="implement-dynasor-cot-in-scaffolding">
+<h3>Implement Dynasor-CoT in Scaffolding<a class="headerlink" href="#implement-dynasor-cot-in-scaffolding" title="Link to this heading">#</a></h3>
+<p>A key difference between inference-time compute methods like Dynasor-CoT and a normal LLM generation request is that the generation process can consist of multiple smaller, user-defined tasks. The results of these tasks can dynamically control the overall logic—for example, by determining whether to expand the scope of subsequent generation or to terminate the process entirely. In a single Dynasor-CoT request, generation proceeds chunk by chunk, with additional “probe” tasks running in parallel with the main generation. Once a consistent answer is formed across recent probes, the process terminates early.</p>
+<p><code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> provides a good solution for customizing these kinds of data flows. Within a <code class="docutils literal notranslate"><span class="pre">Controller</span></code>, we can customize the data flow logic by defining how and when these smaller tasks are submitted. To implement Dynasor-CoT, we simply inherit from the base <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class and override the <code class="docutils literal notranslate"><span class="pre">process()</span></code> function to customize how it yields tasks. We don’t need to worry about how these tasks are executed because the inference-time compute methods and the execution backend are modularized and decoupled in Scaffolding. These tasks are submitted to <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code>, which then dispatches workers to complete them.</p>
+<p>Let’s start the implementation by inheriting the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class and adding the necessary parameters for Dynasor-CoT.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">DynasorGenerationController</span><span class="p">(</span><span class="n">Controller</span><span class="p">):</span>
+
+    <span class="k">class</span><span class="w"> </span><span class="nc">WorkerTag</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+        <span class="n">GENERATION</span> <span class="o">=</span> <span class="s2">&quot;generation_with_dynasor_cot&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">generation_dir</span><span class="p">,</span>
+        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span>
+        <span class="n">certainty_threshold</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
+        <span class="n">chunk_size</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+        <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">generation_dir</span> <span class="o">=</span> <span class="n">generation_dir</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="n">max_tokens</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">certainty_threshold</span> <span class="o">=</span> <span class="n">certainty_threshold</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">chunk_size</span> <span class="o">=</span> <span class="n">chunk_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">uncertain_words</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;wait&quot;</span><span class="p">,</span> <span class="s2">&quot;hold&quot;</span><span class="p">,</span> <span class="s2">&quot;but&quot;</span><span class="p">,</span> <span class="s2">&quot;okay&quot;</span><span class="p">,</span> <span class="s2">&quot;no&quot;</span><span class="p">,</span> <span class="s2">&quot;hmm&quot;</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">probe_suffix</span> <span class="o">=</span> <span class="s2">&quot;... Oh, I suddenly got the answer to the whole problem, **Final Answer**</span><span class="se">\n\n\\</span><span class="s2">[ </span><span class="se">\\</span><span class="s2">boxed{&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">answer_suffix</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\n\n</span><span class="s2">... Oh, I have got the answer to the whole problem</span><span class="se">\n</span><span class="s2">**Final Answer:**</span><span class="se">\n\\</span><span class="s2">[</span><span class="se">\n</span><span class="s2"> </span><span class="se">\\</span><span class="s2">boxed{&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">answer_suffix_with_marker</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\n\n</span><span class="s2">...&lt;/think&gt;</span><span class="se">\n</span><span class="s2"> Oh, I have got the answer to the whole problem</span><span class="se">\n</span><span class="s2">**Final Answer:**</span><span class="se">\n\\</span><span class="s2">[</span><span class="se">\n</span><span class="s2"> </span><span class="se">\\</span><span class="s2">boxed{&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">generation_dir</span><span class="p">,</span>
+            <span class="n">legacy</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">padding_side</span><span class="o">=</span><span class="s1">&#39;left&#39;</span><span class="p">,</span>
+            <span class="n">truncation_side</span><span class="o">=</span><span class="s1">&#39;left&#39;</span><span class="p">,</span>
+            <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">use_fast</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">streaming</span> <span class="o">=</span> <span class="n">streaming</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">process()</span></code> function, as mentioned before, is the core method within the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class. Here, we can customize our data flow by specifying the logic for yielding tasks. For Dynasor-CoT, we have two different kinds of tasks:</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">proposer_task</span></code>: Handles the main content generation, producing self.chunk_size tokens based on the previous content.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">probe_task</span></code>: Elicits an early-stage answer by generating 20 tokens from the same content.</p></li>
+</ol>
+<p>The code below creates these two types of tasks.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="k">def</span><span class="w"> </span><span class="nf">process</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tasks</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">GenerationTask</span><span class="p">],</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="c1"># Start with the initial prompt provided by the first task.</span>
+        <span class="n">initial_prompt</span> <span class="o">=</span> <span class="n">tasks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">input_str</span>
+
+        <span class="n">proposer_task</span> <span class="o">=</span> <span class="n">GenerationTask</span><span class="p">()</span>
+        <span class="n">proposer_task</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_size</span>
+        <span class="n">proposer_task</span><span class="o">.</span><span class="n">temperature</span> <span class="o">=</span> <span class="mf">0.6</span>
+        <span class="n">proposer_task</span><span class="o">.</span><span class="n">top_p</span> <span class="o">=</span> <span class="mf">0.95</span>
+        <span class="n">proposer_task</span><span class="o">.</span><span class="n">worker_tag</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">WorkerTag</span><span class="o">.</span><span class="n">GENERATION</span>
+
+        <span class="n">probe_task</span> <span class="o">=</span> <span class="n">GenerationTask</span><span class="p">()</span>
+        <span class="n">probe_task</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="mi">20</span>
+        <span class="n">probe_task</span><span class="o">.</span><span class="n">temperature</span> <span class="o">=</span> <span class="mf">0.6</span>
+        <span class="n">probe_task</span><span class="o">.</span><span class="n">top_p</span> <span class="o">=</span> <span class="mf">0.95</span>
+        <span class="n">probe_task</span><span class="o">.</span><span class="n">worker_tag</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">WorkerTag</span><span class="o">.</span><span class="n">GENERATION</span>
+
+        <span class="n">probe_answers</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">probe_responses</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="n">initial_prompt_token_num</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">initial_prompt</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">))</span>
+        <span class="n">probe_suffix_token_num</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">probe_suffix</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">))</span>
+
+        <span class="n">current_prompt</span> <span class="o">=</span> <span class="n">initial_prompt</span>
+</pre></div>
+</div>
+<p>To prevent extra latency, the <code class="docutils literal notranslate"><span class="pre">proposer_task</span></code> should not be blocked by the <code class="docutils literal notranslate"><span class="pre">probe_task</span></code>. Scaffolding’s task-level concurrency handles this perfectly. We can yield <code class="docutils literal notranslate"><span class="pre">proposer_task</span></code> and <code class="docutils literal notranslate"><span class="pre">probe_task</span></code> in a single list. Multiple tasks yielded together in the same list will be batched and executed in parallel.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="k">yield</span><span class="p">[</span><span class="n">proposer_task</span><span class="p">,</span> <span class="n">probe_task</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>In the following <code class="docutils literal notranslate"><span class="pre">for</span></code> loop, each iteration performs these steps:</p>
+<ol class="arabic simple">
+<li><p><strong>Submit</strong> both a proposer task and a probe task by yielding them. We don’t need to worry about execution details, as they are handled by <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code>, which binds the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> and <code class="docutils literal notranslate"><span class="pre">Workers</span></code> together behind the scenes.</p></li>
+<li><p><strong>Evaluate</strong> the probe response after the tasks return, checking for consistency over several rounds (using <code class="docutils literal notranslate"><span class="pre">certainty_threshold</span></code>).</p></li>
+<li><p><strong>Finalize</strong> the answer and return if it is consistent. Otherwise, append the new tokens from the proposer task and proceed to the next iteration.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="c1"># Iterate over generation rounds until the maximum tokens limit is reached.</span>
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">initial_prompt_token_num</span> <span class="o">+</span> <span class="n">probe_suffix_token_num</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_size</span><span class="p">):</span>
+            <span class="n">proposer_task</span><span class="o">.</span><span class="n">input_str</span> <span class="o">=</span> <span class="n">current_prompt</span>
+            <span class="n">probe_task</span><span class="o">.</span><span class="n">input_str</span> <span class="o">=</span> <span class="n">current_prompt</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">probe_suffix</span>
+
+            <span class="c1"># For the probe task, append the suffix to force a chain-of-thought leading to an answer.</span>
+            <span class="k">yield</span> <span class="p">[</span><span class="n">proposer_task</span><span class="p">,</span> <span class="n">probe_task</span><span class="p">]</span>
+
+            <span class="c1"># Retrieve the output from the probe task.</span>
+            <span class="n">probe_text</span> <span class="o">=</span> <span class="n">probe_task</span><span class="o">.</span><span class="n">output_str</span>
+
+            <span class="c1"># Extract the potential answer from the probe response.</span>
+            <span class="n">answer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">obtain_answer</span><span class="p">(</span><span class="n">probe_text</span><span class="p">)</span>
+            <span class="n">probe_answers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">answer</span><span class="p">)</span>
+            <span class="n">probe_responses</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">probe_text</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">should_early_stop</span><span class="p">(</span><span class="n">probe_answers</span><span class="p">,</span> <span class="n">probe_responses</span><span class="p">):</span>
+                <span class="n">tasks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">result</span> <span class="o">=</span> <span class="n">probe_task</span><span class="o">.</span><span class="n">result</span>
+                <span class="c1"># If the current prompt indicates the chain-of-thought phase has ended, use one type of suffix.</span>
+                <span class="k">if</span> <span class="s2">&quot;&lt;/think&gt;&quot;</span> <span class="ow">in</span> <span class="n">current_prompt</span><span class="p">:</span>
+                    <span class="n">tasks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">output_str</span> <span class="o">=</span> <span class="p">(</span><span class="n">current_prompt</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">answer_suffix</span> <span class="o">+</span>
+                                        <span class="n">probe_answers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="s2">&quot;}</span><span class="se">\n\\</span><span class="s2">]&quot;</span><span class="p">)</span>
+                    <span class="k">return</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="c1"># Otherwise, use the suffix with marker to transition clearly.</span>
+                    <span class="n">tasks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">output_str</span> <span class="o">=</span> <span class="p">(</span><span class="n">current_prompt</span> <span class="o">+</span>
+                                        <span class="bp">self</span><span class="o">.</span><span class="n">answer_suffix_with_marker</span> <span class="o">+</span>
+                                        <span class="n">probe_answers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="s2">&quot;}</span><span class="se">\n\\</span><span class="s2">]&quot;</span><span class="p">)</span>
+                    <span class="k">return</span>
+
+            <span class="c1"># If the answer is not deemed confident, perform another round of generation.</span>
+            <span class="c1"># Append the newly generated text from the proposer to the current prompt for the next iteration.</span>
+            <span class="n">current_prompt</span> <span class="o">+=</span> <span class="n">proposer_task</span><span class="o">.</span><span class="n">output_str</span>
+
+        <span class="c1"># If the maximum token limit is reached without satisfying the certainty condition,</span>
+        <span class="c1"># output the accumulated prompt as the final output.</span>
+        <span class="n">tasks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">result</span> <span class="o">=</span> <span class="n">proposer_task</span><span class="o">.</span><span class="n">result</span>
+        <span class="n">tasks</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">output_str</span> <span class="o">=</span> <span class="n">current_prompt</span>
+        <span class="k">return</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">probe_task</span></code> can utilize prefix kvcache reuse to enhance inference performance. TensorRT LLM enables the kvcache of an in-progress request to be reused by other requests, so <code class="docutils literal notranslate"><span class="pre">probe_task</span></code> can <code class="docutils literal notranslate"><span class="pre">proposer_task</span></code>’s kvcache even though the <code class="docutils literal notranslate"><span class="pre">proposer_task</span></code> is in a continuous running state.</p>
+<p>Now we have implemented a <code class="docutils literal notranslate"><span class="pre">Controller</span></code> for Dynasor-CoT. Here is an example of how to use it:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">dynasor_generation_controller</span> <span class="o">=</span> <span class="n">DynasorGenerationController</span><span class="p">(</span>
+    <span class="c1"># Parameters for DynasorGenerationController</span>
+    <span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">ScaffoldingLlm</span><span class="p">(</span>
+    <span class="n">prototype_controller</span><span class="o">=</span><span class="n">dynasor_generation_controller</span><span class="p">,</span> 
+    <span class="c1"># other parameters for ScaffoldingLLM</span>
+    <span class="p">)</span>
+<span class="n">results</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="implement-dynasor-cot-based-majority-voting-in-scaffolding">
+<h3>Implement Dynasor-CoT based Majority Voting in Scaffolding<a class="headerlink" href="#implement-dynasor-cot-based-majority-voting-in-scaffolding" title="Link to this heading">#</a></h3>
+<p>Scaffolding is designed to be modular and reusable. We can assemble methods just like LEGO building blocks. For instance, to implement Dynasor-CoT-based Majority Voting, we can simply stack our <code class="docutils literal notranslate"><span class="pre">DynasorGenerationController</span></code> with a <code class="docutils literal notranslate"><span class="pre">MajorityVoteController</span></code>.</p>
+<p>Once a controller for majority voting is built, no further implementation is needed. We can directly stack the two controllers as shown below.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">dynasor_generation_controller</span> <span class="o">=</span> <span class="n">DynasorGenerationController</span><span class="p">(</span>
+    <span class="c1"># Parameters for DynasorGenerationController</span>
+    <span class="p">)</span>
+
+<span class="n">majority_vote_controller</span> <span class="o">=</span> <span class="n">MajorityVoteController</span><span class="p">(</span>
+    <span class="n">generation_controller</span><span class="o">=</span><span class="n">dynasor_generation_controller</span><span class="p">,</span> <span class="c1"># stack here</span>
+    <span class="c1"># Other parameters for MajorityVoteController</span>
+    <span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">ScaffoldingLlm</span><span class="p">(</span>
+    <span class="n">prototype_controller</span><span class="o">=</span><span class="n">majority_vote_controller</span><span class="p">,</span> <span class="c1"># Expose the outermost controller to ScaffoldingLlm</span>
+    <span class="c1"># other parameters for ScaffoldingLLM</span>
+    <span class="p">)</span>
+<span class="n">results</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="acknowledgements">
+<h3>Acknowledgements<a class="headerlink" href="#acknowledgements" title="Link to this heading">#</a></h3>
+<p>This work demonstrates an outstanding example of cross-team collaboration between the TensorRT LLM and UCSD Hao AI Lab. We sincerely appreciate the support from everyone who contributed to making this happen.</p>
+</section>
+<section id="reference">
+<h3>Reference<a class="headerlink" href="#reference" title="Link to this heading">#</a></h3>
+<p>[1] Y. Fu*, J. Chen*, Y. Zhuang, Z. Fu, I. Stoica, and H. Zhang, “Dynasor: More Efficient Chain-of-Thought Through Certainty Probing,” Hao-AI-Lab Blog, Feb. 16, 2025. [Online]. Available: https://hao-ai-lab.github.io/blogs/dynasor-cot/</p>
+</section>
+</section>
+<section id="feature-list-on-scaffolding">
+<h2>Feature List on Scaffolding<a class="headerlink" href="#feature-list-on-scaffolding" title="Link to this heading">#</a></h2>
+<p>You can customize your own <code class="docutils literal notranslate"><span class="pre">Controller</span></code>, <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and <code class="docutils literal notranslate"><span class="pre">Task</span></code>, however, we have provided a foundational set with commonly used functionality that you can use.</p>
+<p><code class="docutils literal notranslate"><span class="pre">Worker</span></code>: TensorRT LLM, OpenaiAPI, MCP;</p>
+<p><code class="docutils literal notranslate"><span class="pre">Task</span></code>: Generation, Reward, ToolCall;</p>
+<p><code class="docutils literal notranslate"><span class="pre">Controller</span></code>: MajorityVote, PRMReward, BestOfN, MCTS;</p>
+</section>
+<section id="future-work">
+<h2>Future Work<a class="headerlink" href="#future-work" title="Link to this heading">#</a></h2>
+<p>The future work is divided into two parts.</p>
+<p>The first part is to enable <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> to support more inference-time compute methods, especially the methods of agentic and multi-agent system.</p>
+<p>The second part is that we hope to find more opportunities to optimize TensorRT LLM based on <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> workloads. For examples, in terms of kvcache prefix reuse, <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> can identify which parts are system prompts, which parts are likely to be reused in the subsequent requests of the agent task, and which parts cannot be reused and can be evicted immediately.</p>
+<p>Finally, what we want to emphasize is that we welcome and look forward to more people joining our open source community. You can find these issues in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=state%3Aopen%20label%3AScaffolding">TensorRT LLM GitHub issues with Scaffolding tag</a>.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-and-motivation">Background and Motivation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction-for-scaffolding-a-framework-for-inference-time-compute">Introduction for Scaffolding: A Framework for inference-time compute</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#core-features">Core Features</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#worker">Worker</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#controller">Controller</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#scaffoldingllm">ScaffoldingLlm</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#an-example-implement-dynasor-cot-on-scaffolding">An Example: Implement Dynasor-CoT on Scaffolding</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction-for-dynasor-cot">Introduction for Dynasor-CoT</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-of-dynasor-cot">Motivation of Dynasor-CoT</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#the-probe-technique">The “Probe” technique</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#how-it-speeds-up-inference">How it speeds up inference</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implement-dynasor-cot-in-scaffolding">Implement Dynasor-CoT in Scaffolding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implement-dynasor-cot-based-majority-voting-in-scaffolding">Implement Dynasor-CoT based Majority Voting in Scaffolding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgements">Acknowledgements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reference">Reference</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-list-on-scaffolding">Feature List on Scaffolding</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 29, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

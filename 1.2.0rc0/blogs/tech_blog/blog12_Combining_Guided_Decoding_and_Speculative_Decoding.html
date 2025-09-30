@@ -1,0 +1,1019 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Inference Time Compute Implementation in TensorRT LLM" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html" />
+    <link rel="prev" title="Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)" href="blog11_GPT_OSS_Eagle3.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.2.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">
+<h1>Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly<a class="headerlink" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly" title="Link to this heading">#</a></h1>
+<p><em>By NVIDIA TensorRT LLM Team and the XGrammar Team</em></p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#background-and-challenges">Background and Challenges</a></p>
+<ul>
+<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
+<li><p><a class="reference internal" href="#guided-decoding">Guided Decoding</a></p></li>
+<li><p><a class="reference internal" href="#speculative-decoding">Speculative Decoding</a></p></li>
+<li><p><a class="reference internal" href="#two-challenges">Two Challenges</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#trace-grammar-state-for-draft-token-proposal-and-rejection">Trace Grammar State for Draft Token Proposal and Rejection</a></p>
+<ul>
+<li><p><a class="reference internal" href="#target-model">Target Model</a></p></li>
+<li><p><a class="reference internal" href="#draft-model">Draft Model</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#make-grammar-computation-capturable-by-cuda-graph">Make Grammar Computation Capturable by CUDA Graph</a></p>
+<ul>
+<li><p><a class="reference internal" href="#cuda-callback">CUDA Callback</a></p></li>
+<li><p><a class="reference internal" href="#integration-to-tensorrt-llm-python-runtime">Integration to TensorRT LLM Python Runtime</a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-compatibility-grammar-computation">CUDA Graph Compatibility: Grammar Computation</a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-compatibility-mask-applying-kernel">CUDA Graph Compatibility: Mask Applying Kernel</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-data-race-between-host-and-cuda-callback">Troubleshooting: Data Race between Host and CUDA Callback</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex">Troubleshooting: Deadlock by GIL and CUDA Mutex</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#performance-and-analysis">Performance and Analysis</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgements">Acknowledgements</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="background-and-challenges">
+<h2>Background and Challenges<a class="headerlink" href="#background-and-challenges" title="Link to this heading">#</a></h2>
+<section id="motivation">
+<h3>Motivation<a class="headerlink" href="#motivation" title="Link to this heading">#</a></h3>
+<p>As part of our effort to bridge gaps in feature combinations, we enabled guided decoding with many important LLM inference features in TensorRT LLM over the last two months:</p>
+<ul class="simple">
+<li><p>Overlap scheduler: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6000">PR 6000</a></p></li>
+<li><p>CUDA graph padding: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6774">PR 6774</a></p></li>
+<li><p>Disaggregated serving: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6704">PR 6704</a></p></li>
+<li><p>Speculative decoding (two-model implementation): <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6300">PR 6300</a></p></li>
+<li><p>Speculative decoding (one-model implementation): <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6948">PR 6948</a></p></li>
+</ul>
+<p>More complicated (higher-order) combinations are also supported; for example, we can run DeepSeek-R1 with guided decoding, overlap scheduler, CUDA graph, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md">attention data parallelism (ADP)</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md">multiple token prediction (MTP)</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md">disaggregated serving</a>​ all enabled.</p>
+<p>Among all these tasks, combining guided decoding with one-model speculative decoding is the most challenging one, and it achieves the best performance for low-latency or throughput&#64;latency scenarios. This blog post shares the overall design, implementation details, and performance analysis.</p>
+</section>
+<section id="guided-decoding">
+<h3>Guided Decoding<a class="headerlink" href="#guided-decoding" title="Link to this heading">#</a></h3>
+<p>Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to a user-specified grammar (e.g., JSON schema), which is particularly useful for LLM agents. For example, guided decoding can help an LLM generate function arguments that strictly conform to function signatures. Thus, the LLM can correctly call external tools and integrate the tool calling results for a better response.</p>
+<p>For a request at the prefill phase, guided decoding creates an initial grammar state (i.e., grammar compilation), and generates a mask tensor indicating which tokens from the vocabulary are allowed for the first generated token (i.e., mask gen). At each generation phase, guided decoding advances the grammar state based on the last generated token (i.e., grammar advance), and generates a mask tensor for the next token. The mask will be applied to the logits to mask out the disallowed tokens before sampling (i.e., mask applying), which ensures the next token is amenable to the grammar constraints.</p>
+<p>TensorRT LLM integrates third-party grammar backends (e.g., <a class="reference external" href="https://github.com/mlc-ai/xgrammar">XGrammar</a>, <a class="reference external" href="https://github.com/guidance-ai/llguidance">LLGuidance</a>) for the grammar computation. Currently, these grammar backends are implemented on CPU, so the grammar computation introduces significant CPU overhead. Fortunately, this can be overlapped with the GPU computation, achieving <a class="reference external" href="https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar">near-zero overhead</a>. The core idea is that at every iteration, we should first launch the model forward to make the GPU busy, and then compute grammar compilation/advance and mask gen on CPU. Once both the computations finish, the mask can be applied to the logits before sampling.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_constrained_decoding_pipeline_overlap.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: Top: guided decoding timeline without overlapping. Bottom: guided decoding timeline with overlapping. (This figure is from the XGrammar paper.)</em></sub></p>
+</section>
+<section id="speculative-decoding">
+<h3>Speculative Decoding<a class="headerlink" href="#speculative-decoding" title="Link to this heading">#</a></h3>
+<p>Speculative decoding is a crucial feature in low-latency or throughput&#64;latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward. Compared with normal LLM inference where each model forward generates a single token, speculative decoding offers the potential to generate more tokens per iteration by leveraging more computation. This improves the arithmetic intensity and reduces the required number of iterations.</p>
+<p>TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage. There are ongoing efforts to close the gaps between the two implementations.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_one_model_vs_two_model.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2: Top: GPU timeline of one-model speculative decoding. Bottom: GPU timeline of two-model speculative decoding.</em></sub></p>
+</section>
+<section id="two-challenges">
+<h3>Two Challenges<a class="headerlink" href="#two-challenges" title="Link to this heading">#</a></h3>
+<p>When combining guided decoding and speculative decoding, two challenges arise. First, at each generation iteration, speculative decoding proposes multiple draft tokens, some of which might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down into two views:</p>
+<ul class="simple">
+<li><p>For the target model, guided decoding should advance the grammar state and generate the mask for every draft token. If some draft tokens are rejected, guided decoding should rollback the grammar state to the last accepted token.</p></li>
+<li><p>For the draft model, without grammar constraints, some draft tokens may violate the grammar and thus be forcefully rejected in the verification step. Clearly, this hurts the acceptance rate. Hence, guided decoding should also intervene on the logits for every draft token generation if possible.</p>
+<ul>
+<li><p>Some speculative algorithms propose draft tokens recurrently by computing logits and sampling (e.g., the standard draft-target model, EAGLE or MTP), similarly to a standard LLM. In that case, guided decoding can apply grammar constraints in a similar mask gen and applying way.</p></li>
+<li><p>Some drafting algorithms work without logits sampling, which require other ways to apply the grammar constraints.</p></li>
+</ul>
+</li>
+</ul>
+<p>Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step <span class="math notranslate nohighlight">\(i\)</span>, there are two event waits:</p>
+<ul class="simple">
+<li><p>The host waits for the <em>token event</em> that indicates the readiness of CPU tokens from step <span class="math notranslate nohighlight">\(i-1\)</span>.</p></li>
+<li><p>The model forward stream waits for the <em>mask event</em> that indicates the readiness of GPU masks from step <span class="math notranslate nohighlight">\(i\)</span>.</p></li>
+</ul>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps.png" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3: The CPU-GPU synchronization for multiple model forwards.</em></sub></p>
+<p>Note that in the two-model implementation, the sampling is excluded from the CUDA graphs for better flexibility (Figure 2). From the CPU perspective, this offers a timing for the grammar computation. In particular, the mask event wait can be inserted between the CUDA graph replay and sampling, effectively making the GPU wait for the GPU masks asynchronously copied from CPU.</p>
+<p>However, the CUDA graph of the one-model implementation contains multiple forwards, inevitably including the sampling operations. Hence, there is no timing for the grammar computation. The most outstanding problem is that when replaying the CUDA graph, the mask event wait cannot be inserted before sampling. An alternative is capturing the events and waits in the CUDA graph, but it is still ineffective because the grammar computation is on CPU and thus not capturable. Once such a CUDA graph is launched to replay, the GPU does not wait for any newly recorded events, so it is impossible to block the GPU for the readiness of masks.</p>
+</section>
+</section>
+<section id="trace-grammar-state-for-draft-token-proposal-and-rejection">
+<h2>Trace Grammar State for Draft Token Proposal and Rejection<a class="headerlink" href="#trace-grammar-state-for-draft-token-proposal-and-rejection" title="Link to this heading">#</a></h2>
+<section id="target-model">
+<h3>Target Model<a class="headerlink" href="#target-model" title="Link to this heading">#</a></h3>
+<p>For a target model forward, a request should have one new token and multiple draft tokens from the last verification step and drafter, respectively. For each token in the sequence, guided decoding should advance the grammar state and fill the mask tensor. Before sampling, the masks should be applied to the corresponding logits. After verification, the grammar state should be rolled back by the number of rejected tokens.</p>
+<p>Compared to guided decoding with non-speculative decoding, the rollback operation is newly introduced. Thankfully, it has built-in support by grammar backends like <a class="reference external" href="https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350">XGrammar</a> and <a class="reference external" href="https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366">LLGuidance</a>.</p>
+<p>Before proceeding to the draft model view, note that the LLM can generate correct outputs as long as we apply grammar constraints on the target model, because any draft tokens violating the grammar will be forcefully rejected by the verification step. However, this hurts the acceptance rate.</p>
+</section>
+<section id="draft-model">
+<h3>Draft Model<a class="headerlink" href="#draft-model" title="Link to this heading">#</a></h3>
+<p>As aforementioned, we can apply grammar constraints for draft tokens in a similar mask gen and applying way for speculative algorithms based on recurrent logits sampling. Specifically, for the first drafting step, guided decoding advances the grammar state using the last new token. For the following drafting steps, the grammar state is advanced using the last draft token. Each step should fill and apply the mask to the corresponding draft model logits before sampling.</p>
+<p>After the drafting process, the grammar state should be rolled back to the original state, so that the subsequent target model forward can have the correct grammar state. If the draft and target models share the same vocabulary, then the grammar computation is exactly the same so the masks can be reused.</p>
+<p>One special case is EAGLE3, whose draft model has a <a class="reference external" href="https://github.com/SafeAILab/EAGLE/blob/58d1de099fe315645a82fe002e46586d54efe405/eagle/traineagle3/config.json#L22-L23">pruned vocabulary</a> compared to the target model. For instance, LLaMA 3.1 has a 128k vocabulary size, while the corresponding EAGLE3 drafter has a vocabulary containing the most frequent 32k tokens. This saves some computation of the lm_head GEMM. Note that grammar is built on the target model’s vocabulary, so the produced mask cannot be directly applied to the logits of the draft model. EAGLE3 provides a special <a class="reference external" href="https://github.com/SafeAILab/EAGLE/blob/d7161f9f94aaa345654d9b4045931145811d4d03/eagle/traineagle3/cnets.py#L673-L681">d2t</a> tensor that maps draft token IDs to target token IDs. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7481">PR 7481</a> fuses this d2t mapping to the mask applying kernel.</p>
+<blockquote>
+<div><p><strong>Note:</strong> Here we focus on the chain-based speculative algorithms. A tree-based algorithm would further complicate the implementation; in particular, guided decoding should traverse the drafting tree, advance and rollback grammar states accordingly.</p>
+</div></blockquote>
+</section>
+</section>
+<section id="make-grammar-computation-capturable-by-cuda-graph">
+<h2>Make Grammar Computation Capturable by CUDA Graph<a class="headerlink" href="#make-grammar-computation-capturable-by-cuda-graph" title="Link to this heading">#</a></h2>
+<section id="cuda-callback">
+<h3>CUDA Callback<a class="headerlink" href="#cuda-callback" title="Link to this heading">#</a></h3>
+<p>CUDA graph can help eliminate the CPU overhead, which is an important technique in the LLM inference systems, especially for the generation phase. As aforementioned, the one-model speculative decoding implementation launches a single CUDA graph to compute multiple draft and target model forwards. This makes the CPU-GPU synchronization challenging: the sampling operation depends on masks computed on CPU, but the GPU is not able to wait for the readiness of any CPU computation once the CUDA graph is launched.</p>
+<p>CUDA callback <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g05841eaa5f90f27124241baafb3e856f"><code class="docutils literal notranslate"><span class="pre">cudaLaunchHostFunc</span></code></a> can launch a host function to a CUDA stream. (The host function should not call any CUDA API.) This has two crucial implications:</p>
+<ul class="simple">
+<li><p>CUDA events and event waits can be inserted before and after the host functions, which can be used to synchronize the CPU and GPU computation.</p></li>
+<li><p>The host functions can be captured and replayed by CUDA graph.</p></li>
+</ul>
+<p>Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step <span class="math notranslate nohighlight">\(i\)</span>:</p>
+<ul class="simple">
+<li><p>The grammar stream:</p>
+<ul>
+<li><p>waits for the <em>token event</em> that indicates the readiness of CPU tokens from step <span class="math notranslate nohighlight">\(i-1\)</span>;</p></li>
+<li><p>performs grammar advance and mask gen (CUDA callback);</p></li>
+<li><p>asynchronously copies the CPU masks to GPU;</p></li>
+<li><p>records the <em>mask event</em>.</p></li>
+</ul>
+</li>
+<li><p>The model forward stream:</p>
+<ul>
+<li><p>computes model forward using the last GPU tokens;</p></li>
+<li><p>waits for the <em>mask event</em> that indicates the readiness of GPU masks;</p></li>
+<li><p>applies the mask to logits and then samples new tokens;</p></li>
+<li><p>asynchronously copies the GPU tokens to CPU;</p></li>
+<li><p>records the <em>token event</em>.</p></li>
+</ul>
+</li>
+</ul>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps_by_cuda_callback.png" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4: The CPU-GPU synchronization for multiple model forwards by CUDA callback.</em></sub></p>
+</section>
+<section id="integration-to-tensorrt-llm-python-runtime">
+<h3>Integration to TensorRT LLM Python Runtime<a class="headerlink" href="#integration-to-tensorrt-llm-python-runtime" title="Link to this heading">#</a></h3>
+<p>We surveyed some off-the-shelf Python bindings implementations of <code class="docutils literal notranslate"><span class="pre">cudaLaunchHostFunc</span></code>, but it turned out that they do not work well with CUDA graph (e.g., CUDA-Python <a class="reference external" href="https://github.com/NVIDIA/cuda-python/issues/790">Issue 790</a>, cupy <a class="reference external" href="https://github.com/cupy/cupy/issues/9274">Issue 9274</a>). The probable reason is that the intermediate wrapper data structures are released once the callback is executed; hence, even though the callback is captured by CUDA graph, it cannot be replayed multiple times.</p>
+<p>We implement our own bindings to <code class="docutils literal notranslate"><span class="pre">cudaLaunchHostFunc</span></code> — <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L76"><code class="docutils literal notranslate"><span class="pre">launch_hostfunc</span></code></a>. Specifically, <code class="docutils literal notranslate"><span class="pre">launch_hostfunc</span></code> packs the Python function and arguments to an <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L33">intermediate data structure</a> and calls <code class="docutils literal notranslate"><span class="pre">cudaLaunchHostFunc</span></code> to launch a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L49">trampoline function</a> to a CUDA stream. The trampoline function unpacks the intermediate data structure and invokes the Python function with the arguments. Note that <code class="docutils literal notranslate"><span class="pre">launch_hostfunc</span></code> offers great flexibility — it can launch an arbitrary Python function (without any CUDA API calls) as a CUDA callback. Hence, the grammar computation logics can still be implemented in Python.</p>
+<p>When CUDA graph is capturing, <code class="docutils literal notranslate"><span class="pre">launch_hostfunc</span></code> does not release the intermediate data structure, so it is accessible during CUDA graph replay. The intermediate data structures can be manually released via <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L97"><code class="docutils literal notranslate"><span class="pre">free_hostfunc_user_data</span></code></a>; otherwise, they are automatically cleaned up when the Python interpreter exists. If CUDA graph is disabled (e.g., prefill phase), the intermediate data structure should be released promptly to avoid memory leak. Specifically, the trampoline function automatically releases it once the callback finishes execution.</p>
+<p>In Python, we provide a decorator <code class="docutils literal notranslate"><span class="pre">hostfunc</span></code> which casts an arbitrary Python function to a CUDA callback. For example, run the below code snippet:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.hostfunc</span><span class="w"> </span><span class="kn">import</span> <span class="n">hostfunc</span>
+
+<span class="nd">@hostfunc</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">increase</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+    <span class="n">x</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+
+<span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="n">stream</span><span class="p">):</span>
+    <span class="n">increase</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+    <span class="n">increase</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+        <span class="n">g</span><span class="o">.</span><span class="n">replay</span><span class="p">()</span>
+
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The output would look like:</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>tensor([20, 20, 20, 20, 20, 20, 20, 20, 20, 20], dtype=torch.int32)
+</pre></div>
+</div>
+<p>Note that the CUDA graph increases the tensor twice, and it is replayed for ten times, so the tensor should be totally increased by 20 times. Clearly, the output validates that the CUDA graph capture and replay are successful.</p>
+<p>As the final step, we implemented a variant of <code class="docutils literal notranslate"><span class="pre">GuidedDecoder</span></code> — <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405"><code class="docutils literal notranslate"><span class="pre">CapturableGuidedDecoder</span></code></a>. It reuses most logics from <code class="docutils literal notranslate"><span class="pre">GuidedDecoder</span></code>, but the grammar computation and some auxiliary methods are decorated by <code class="docutils literal notranslate"><span class="pre">hostfunc</span></code>, making it capturable by CUDA graph.</p>
+</section>
+<section id="cuda-graph-compatibility-grammar-computation">
+<h3>CUDA Graph Compatibility: Grammar Computation<a class="headerlink" href="#cuda-graph-compatibility-grammar-computation" title="Link to this heading">#</a></h3>
+<p>Once captured, CUDA graph can be launched to run the same GPU kernels as many times as needed. Note that the replayed kernels are always executed using the fixed input and output memory addresses. By filling input buffers with new data, we can run the same work on new data. This pattern also applies to CUDA callback, except that the input and output buffers are on CPU.</p>
+<p>Guided decoder manages the below buffers and resources:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20">Request states</a>: All the necessary request information affecting grammar computation, including the user-specified grammar, the last new token and draft tokens.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L167-L168">Grammar states</a>: The grammar states managed by grammar backends. By leveraging the grammar backends, guided decoder advances grammar states and fills mask tensors.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L419-L422">New tokens tensor</a>: The tensor values are copied from the newly computed GPU tokens, and used to update the last new token or draft tokens of the request states.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L175-L177">Mask tensor</a>: The tensor values are filled according to the grammar states and then copied to GPU masks, which will be used to apply to logits.</p></li>
+</ul>
+<p>The buffers are stored in fixed memories, and the resources are accessed via fixed pointers. This makes grammar computation compatible with CUDA graph. The buffers and resources are connected via slot IDs. In the runtime, each request is assigned with an exclusive slot ID (0 &lt;= slot ID &lt; <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>) upon the first scheduling. The slot ID is occupied until the request is finished and removed from the scheduler.</p>
+<p>When the runtime schedules a new batch of requests, the guided decoder updates the request states on the host. After that, all the other operations (grammar compilation/advance, mask gen, buffer copying, etc.) happen on CUDA streams and should be capturable by CUDA graph. More specifically, buffer copying should be asynchronous, and the other CPU computation should be CUDA callbacks.</p>
+</section>
+<section id="cuda-graph-compatibility-mask-applying-kernel">
+<h3>CUDA Graph Compatibility: Mask Applying Kernel<a class="headerlink" href="#cuda-graph-compatibility-mask-applying-kernel" title="Link to this heading">#</a></h3>
+<p>The mask applying kernel takes a batch of logits and masks as the input, and modifies the logits in-place. Specifically, the masked-out (disallowed by grammar) token logits are assigned a value of negative infinity, so that they are impossible to be sampled as the next tokens.</p>
+<p>Note that currently CUDA graph is enabled for the generation phase only, and the draft length is fixed for all requests. This greatly simplifies the effort for CUDA graph compatibility. Given a <code class="docutils literal notranslate"><span class="pre">batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_draft_tokens</span></code>, the logits tensor is of shape <code class="docutils literal notranslate"><span class="pre">(batch_size</span> <span class="pre">*</span> <span class="pre">(1</span> <span class="pre">+</span> <span class="pre">max_num_draft_tokens),</span> <span class="pre">vocab_size)</span></code>. Clearly, we can fill the first <code class="docutils literal notranslate"><span class="pre">(batch_size</span> <span class="pre">*</span> <span class="pre">(1</span> <span class="pre">+</span> <span class="pre">max_num_draft_tokens))</span></code> rows of the mask tensor accordingly, and pass the mask tensor address to the kernel.</p>
+<p>Some requests may have no grammar constraints. For such requests, we can fill the corresponding masks with all ones (allowed by grammar) so the logits will not be modified by the kernel, but this causes unnecessary computation. To resolve this, a token-level mask tensor is introduced. The tensor values are filled with zeros for requests without grammar constraints. The kernel reads these mask values and skips the rows with mask values being zero.</p>
+</section>
+<section id="troubleshooting-data-race-between-host-and-cuda-callback">
+<h3>Troubleshooting: Data Race between Host and CUDA Callback<a class="headerlink" href="#troubleshooting-data-race-between-host-and-cuda-callback" title="Link to this heading">#</a></h3>
+<p>Similar to GPU kernels, CUDA callbacks are asynchronously executed on CUDA streams. Note that both normal host functions and CUDA callbacks can access the same CPU memory addresses, so it can easily cause a data race.</p>
+<p>In the initial implementation, <code class="docutils literal notranslate"><span class="pre">CapturableGuidedDecoder</span></code> directly reads request states from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/scheduler.py#L18"><code class="docutils literal notranslate"><span class="pre">ScheduledRequests</span></code></a>. However, the <code class="docutils literal notranslate"><span class="pre">ScheduledRequests</span></code> is shared through an executor iteration and thus probably modified by other executor components. This creates a potential data race scenario:</p>
+<ul class="simple">
+<li><p>Guided decoder launches a CUDA callback, which will read some request states from <code class="docutils literal notranslate"><span class="pre">ScheduledRequests</span></code>;</p></li>
+<li><p>Some other executor components inplace modify <code class="docutils literal notranslate"><span class="pre">ScheduledRequests</span></code>;</p></li>
+<li><p>The CUDA callback is executed, reading some modified request states from <code class="docutils literal notranslate"><span class="pre">ScheduledRequests</span></code>.</p></li>
+</ul>
+<p>Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20"><code class="docutils literal notranslate"><span class="pre">GuidedRequest</span></code></a>. It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then accessed only via CUDA callbacks. This prevents potential data race within an executor iteration.</p>
+<p>When overlap scheduler is enabled, another data race scenario exists between executor iterations:</p>
+<ul class="simple">
+<li><p>Iteration <span class="math notranslate nohighlight">\(i\)</span> launches CUDA callbacks, which will read request states from a fixed address;</p></li>
+<li><p>Iteration <span class="math notranslate nohighlight">\(i+1\)</span> updates the request states;</p></li>
+<li><p>Iteration <span class="math notranslate nohighlight">\(i\)</span>’s CUDA callbacks are executed, reading request states updated by iteration <span class="math notranslate nohighlight">\(i+1\)</span>.</p></li>
+</ul>
+<p>Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417">queue</a> is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existence of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.</p>
+</section>
+<section id="troubleshooting-deadlock-by-gil-and-cuda-mutex">
+<h3>Troubleshooting: Deadlock by GIL and CUDA Mutex<a class="headerlink" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex" title="Link to this heading">#</a></h3>
+<p>After the first version was implemented, the program intermittently encountered a hang issue when <code class="docutils literal notranslate"><span class="pre">CapturableGuidedDecoder</span></code> is enabled. By checking out the callstack, we found that it was hanging on completely irrelevant kernel launches or some other CUDA API calls. With further investigation, we discovered that the hang issue was caused by a deadlock between the Python GIL and a CUDA mutex.</p>
+<p>As documented, a CUDA callback must not make any CUDA API calls. This implies that the CUDA callback execution and CUDA API calls compete for the same mutex. Note that the trampoline function needs to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L52">acquire the GIL</a> before calling the Python code. Hence, when executing Python code by a CUDA callback, it acquires a CUDA mutex and then the GIL. In the meanwhile, the Python main thread may hold the GIL and make CUDA API calls, so it acquires the GIL and then the CUDA mutex. The two threads acquire the two locks in opposite orders, which creates a deadlock pattern.</p>
+<p>This deadlock can be resolved if the Python main thread can release the GIL for CUDA API calls. TensorRT LLM Python runtime is built on PyTorch. Thankfully, PyTorch releases the GIL for most CUDA API calls, even including PyTorch custom operators. However, we find two exceptions in PyTorch 2.8. When creating a device tensor using a shape depending on data from another device tensor, it triggers an implicit and synchronized D2H copy, and this D2H copy is executed with GIL being held (<a class="reference external" href="https://github.com/pytorch/pytorch/issues/163062">Issue 163062</a>). This can be reproduced by the below code snippet:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">100</span><span class="p">,</span> <span class="p">(</span><span class="mi">100</span><span class="p">,),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">max</span><span class="p">(),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The other case is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> kernels are called with GIL being held (<a class="reference external" href="https://github.com/pytorch/pytorch/issues/163061">Issue 163061</a>), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operators and disable <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> when using CUDA callback to Python code (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/7871">PR 7871</a>), until these issues are fixed by PyTorch.</p>
+<p>Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and released GIL properly (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6948">PR 6948</a>).</p>
+<p>After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; even without the context of CUDA callback, this is beneficial for multi-threading performance. However, we acknowledge the limitation that it is difficult to make sure that every such place has been properly handled, and that future code changes do not introduce any risks.</p>
+<blockquote>
+<div><p><strong>Note:</strong> Theoretically, the GIL-free Python (<a class="reference external" href="https://peps.python.org/pep-0703">PEP 703</a>) could be another remedy.</p>
+</div></blockquote>
+</section>
+</section>
+<section id="performance-and-analysis">
+<h2>Performance and Analysis<a class="headerlink" href="#performance-and-analysis" title="Link to this heading">#</a></h2>
+<p>We benchmark the performance of guided decoding on two datasets <a class="reference external" href="https://huggingface.co/datasets/NousResearch/json-mode-eval">JSON Mode Eval</a> and <a class="reference external" href="https://huggingface.co/datasets/epfl-dlab/JSONSchemaBench">JSON Schema Bench</a>. The models are <a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct">LLaMA 3.1 8B</a> and <a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct">LLaMA 3.3 70B</a>, the GPUs are H200 and the grammar backend is XGrammar.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_mode_eval_llama_3.1_8b.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_mode_eval_llama_3.3_70b.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
+<p>Figures 5 and 6 present the Pareto curves on JSON Mode Eval for LLaMA 3.1 8B and LLaMA 3.3 70B, respectively. Speculative decoding achieves significant speedup for low-latency or throughput&#64;latency scenarios. In particular, the speedup can be up to ~2x for batch size 1. The one-model EAGLE3 implementation is more performant than the two-model EAGLE3, and this performance gap is amplified for small models. This is reasonable, because the one-model implementation captures more workloads into a single CUDA graph, which results in less (if any) exposed CPU overhead.</p>
+<p>Note that although NGram is a two-model implementation, it performs surprisingly well. This is because JSON Mode Eval is an information extraction task. Each prompt contains the JSON schema and all the information required by the response, so the NGram has a high acceptance rate on this dataset.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_schema_bench_llama_3.1_8b.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_schema_bench_llama_3.3_70b.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 8: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
+<p>Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achieves the best performance across almost all scenarios. Note that the NGram becomes less performant since the task is no longer an information extraction task, although the JSON schemas are still present in the prompts.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Dataset</p></th>
+<th class="head text-center"><p>Model</p></th>
+<th class="head text-center"><p>EAGLE3</p></th>
+<th class="head text-center"><p>EAGLE3 w/o draft</p></th>
+<th class="head text-center"><p>NGram</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>JSON Mode Eval</p></td>
+<td class="text-center"><p>LLaMA 3.1 8B</p></td>
+<td class="text-center"><p>2.86</p></td>
+<td class="text-center"><p>2.65</p></td>
+<td class="text-center"><p>2.59</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>JSON Mode Eval</p></td>
+<td class="text-center"><p>LLaMA 3.3 70B</p></td>
+<td class="text-center"><p>2.72</p></td>
+<td class="text-center"><p>2.60</p></td>
+<td class="text-center"><p>2.44</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>JSON Schema Bench</p></td>
+<td class="text-center"><p>LLaMA 3.1 8B</p></td>
+<td class="text-center"><p>2.55</p></td>
+<td class="text-center"><p>2.33</p></td>
+<td class="text-center"><p>1.89</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>JSON Schema Bench</p></td>
+<td class="text-center"><p>LLaMA 3.3 70B</p></td>
+<td class="text-center"><p>2.50</p></td>
+<td class="text-center"><p>2.30</p></td>
+<td class="text-center"><p>1.87</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p align="center"><sub><em>Table 1: Average acceptance lengths per iteration for EAGLE3 and NGram. The acceptance length includes the golden token. The draft length is 3. "EAGLE3 w/o draft" means the draft model does not apply grammar constraints.</em></sub></p>
+<p>Table 1 lists the average acceptance lengths per iteration. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:</p>
+<ul class="simple">
+<li><p>In the drafting loop, the extra mask applying kernels slightly contribute to the GPU time.</p></li>
+<li><p>If the drafting forwards are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the GPU timeline.</p></li>
+</ul>
+<p>These extra overheads could partially offset the benefits from the improved acceptance.</p>
+</section>
+<section id="acknowledgements">
+<h2>Acknowledgements<a class="headerlink" href="#acknowledgements" title="Link to this heading">#</a></h2>
+<p>This work demonstrates an outstanding example of cross-team collaboration between the TensorRT LLM and XGrammar teams. We sincerely appreciate the support from everyone who contributed to making this happen.</p>
+<p>We acknowledge that it is built on top of the tremendous existing foundations from the community. In particular, some designs were inspired by vLLM <a class="reference external" href="https://github.com/vllm-project/vllm/pull/14702">PR 14702</a> and SGLang <a class="reference external" href="https://github.com/sgl-project/sglang/pull/6499">PR 6499</a>. In addition, special thanks go to the authors who proposed the speculative algorithms like EAGLE/MTP, and the grammar backend projects like XGrammar/LLGuidance.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog11_GPT_OSS_Eagle3.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Inference Time Compute Implementation in TensorRT LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-and-challenges">Background and Challenges</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation">Motivation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#guided-decoding">Guided Decoding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#speculative-decoding">Speculative Decoding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#two-challenges">Two Challenges</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#trace-grammar-state-for-draft-token-proposal-and-rejection">Trace Grammar State for Draft Token Proposal and Rejection</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#target-model">Target Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-model">Draft Model</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#make-grammar-computation-capturable-by-cuda-graph">Make Grammar Computation Capturable by CUDA Graph</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-callback">CUDA Callback</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#integration-to-tensorrt-llm-python-runtime">Integration to TensorRT LLM Python Runtime</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-compatibility-grammar-computation">CUDA Graph Compatibility: Grammar Computation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-compatibility-mask-applying-kernel">CUDA Graph Compatibility: Mask Applying Kernel</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-data-race-between-host-and-cuda-callback">Troubleshooting: Data Race between Host and CUDA Callback</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex">Troubleshooting: Deadlock by GIL and CUDA Mutex</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-and-analysis">Performance and Analysis</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgements">Acknowledgements</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 29, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
