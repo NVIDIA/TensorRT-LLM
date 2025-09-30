@@ -283,10 +283,12 @@ class GenerationResultBase:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
 
-        if response_tensors.additional_context_outputs is not None:
+        if getattr(response_tensors, 'additional_context_outputs',
+                   None) is not None:
             output.additional_context_outputs = response_tensors.additional_context_outputs
 
-        if response_tensors.additional_generation_outputs is not None:
+        if getattr(response_tensors, 'additional_generation_outputs',
+                   None) is not None:
             output.additional_generation_outputs = response_tensors.additional_generation_outputs
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
