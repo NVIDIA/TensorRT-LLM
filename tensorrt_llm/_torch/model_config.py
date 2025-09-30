@@ -524,12 +524,13 @@ class ModelConfig(Generic[TConfig]):
             )
 
         # For kv cache size calculation: set size_per_head
+        head_size = None
         head_dim_names = ["head_size", "head_dim"]
         for head_dim_name in head_dim_names:
             if head_dim_name in self.pretrained_config:
                 head_size = getattr(self.pretrained_config, head_dim_name)
                 break
-        else:
+        if head_size is None:
             logger.warning(
                 f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
             )
