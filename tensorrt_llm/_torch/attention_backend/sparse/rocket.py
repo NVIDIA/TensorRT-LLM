@@ -1,5 +1,4 @@
 import math
-from collections import deque
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -14,7 +13,8 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
 from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata, repeat_kv)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
+                                                             KVCacheManager)
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -889,15 +889,12 @@ class RocketKVCacheManager(KVCacheManager):
                         dtype=torch.bfloat16)
             for _ in range(self.num_local_layers)
         ]
-        self.base_kt_block_offsets = torch.arange(self.num_blocks,
-                                                  device="cpu",
-                                                  dtype=torch.int32)
         self.max_kt_blocks_per_seq = self.num_blocks
 
         # Block manager to manage the KT cache blocks for each request. Different layers share the
         # same block ids.
-        self.paged_kt_block_ids = dict()
-        self.free_blocks = deque(range(self.num_blocks))
+        self.kt_cache_manager = BlockManager(num_layers, self.num_blocks,
+                                             self.kt_tokens_per_block)
 
     def add_dummy_requests(
         self,
@@ -923,32 +920,21 @@ class RocketKVCacheManager(KVCacheManager):
                 request_id = req.py_request_id
                 kt_token_num = math.ceil(req.max_beam_num_tokens /
                                          self.page_size)
-                self.add_kt_tokens(request_id, kt_token_num)
+                self.kt_cache_manager.add_tokens(request_id, kt_token_num)
         return requests
 
     def get_kt_buffers(self, layer_idx: int):
         return self.kt_cache_pool_per_layer[layer_idx]
 
     def get_kt_block_offsets(self, request_ids: List[int]) -> torch.Tensor:
-        kt_block_offsets = torch.empty(
-            [len(request_ids), self.max_kt_blocks_per_seq],
-            device="cpu",
-            dtype=torch.int32)
-        for i in range(len(request_ids)):
-            block_ids = self.paged_kt_block_ids[request_ids[i]]
-            block_num = len(block_ids)
-            kt_block_offsets[i, 0:block_num].copy_(
-                self.base_kt_block_offsets[torch.tensor(block_ids,
-                                                        dtype=torch.int32,
-                                                        device="cpu")])
-        return kt_block_offsets
+        return self.kt_cache_manager.get_block_offsets(request_ids)
 
     def prepare_resources(self, scheduled_batch):
         super().prepare_resources(scheduled_batch)
         for req in scheduled_batch.all_requests():
             request_id = req.py_request_id
             kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
-            self.add_kt_tokens(request_id, kt_token_num)
+            self.kt_cache_manager.add_tokens(request_id, kt_token_num)
 
     def update_resources(self,
                          scheduled_batch,
@@ -959,51 +945,16 @@ class RocketKVCacheManager(KVCacheManager):
                 seq_len = request.get_num_tokens(0)
                 rewind_len = max(seq_len - 1 - self.prompt_budget, 0)
                 self.rewind_kv_cache(request, rewind_len)
-                self.rewind_kt_cache(request, rewind_len)
-
-    def rewind_kt_cache(self, request, rewind_len):
-        request_id = request.py_request_id
-        num_tokens = request.max_beam_num_tokens
-        updated_kt_token_num = math.ceil(num_tokens -
-                                         rewind_len / self.page_size)
-        page_count_needed = self.compute_page_count(updated_kt_token_num,
-                                                    self.kt_tokens_per_block)
-        num_rewind_pages = len(
-            self.paged_kt_block_ids[request_id]) - page_count_needed
-        if num_rewind_pages > 0:
-            self._free_kt_pages(
-                self.paged_kt_block_ids[request_id][-num_rewind_pages:])
-            self.paged_kt_block_ids[request_id] = self.paged_kt_block_ids[
-                request_id][:-num_rewind_pages]
+                # get the rewind length for kt cache
+                num_tokens = request.max_beam_num_tokens
+                updated_kt_token_num = num_tokens - rewind_len
+                rewind_len = (math.ceil(num_tokens / self.page_size) -
+                              math.ceil(updated_kt_token_num / self.page_size))
+                self.kt_cache_manager.rewind_cache(request, rewind_len)
 
     def free_resources(self, request):
         super().free_resources(request)
-        request_id = request.py_request_id
-        self._free_kt_pages(self.paged_kt_block_ids[request_id])
-        del self.paged_kt_block_ids[request_id]
-
-    def add_kt_tokens(self, request_id: int, kt_token_num: int):
-        if kt_token_num > 0:
-            page_count_needed = self.compute_page_count(
-                kt_token_num, self.kt_tokens_per_block)
-            if request_id not in self.paged_kt_block_ids:
-                self.paged_kt_block_ids[request_id] = []
-            if len(self.paged_kt_block_ids[request_id]) < page_count_needed:
-                new_page = self._allocate_kt_pages(
-                    page_count_needed -
-                    len(self.paged_kt_block_ids[request_id]))
-                self.paged_kt_block_ids[request_id].extend(new_page)
-
-    def _allocate_kt_pages(self, page_count: int) -> list:
-        assert len(self.free_blocks) >= page_count, "Not enough pages."
-        pages = [self.free_blocks.popleft() for _ in range(page_count)]
-        return pages
-
-    def _free_kt_pages(self, page_list: list):
-        self.free_blocks.extend(page_list)
-
-    def compute_page_count(self, token_count: int, tokens_per_page: int) -> int:
-        return (token_count + tokens_per_page - 1) // tokens_per_page
+        self.kt_cache_manager.free_resources(request)
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,

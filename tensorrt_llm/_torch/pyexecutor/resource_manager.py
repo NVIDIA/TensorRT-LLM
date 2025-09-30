@@ -2,7 +2,7 @@ import copy
 import enum
 import math
 from abc import ABC, abstractmethod
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
                     Union)
 
@@ -1198,6 +1198,79 @@ class SlotManager:
             self.remove_slot(rid)
         assert len(self.slot_mapping) == 0 and len(
             self.free_slots) == self.max_num_requests
+
+
+class BlockManager:
+
+    def __init__(self, num_layers: int, num_blocks: int, tokens_per_block: int):
+        self.num_layers = num_layers
+        self.num_blocks = num_blocks
+        self.tokens_per_block = tokens_per_block
+        self.max_blocks_per_seq = self.num_blocks
+
+        self.base_block_offsets = torch.arange(self.num_blocks,
+                                               device="cpu",
+                                               dtype=torch.int32)
+
+        self.block_ids = dict()
+        self.free_blocks = deque(range(self.num_blocks))
+
+    def add_tokens(self, request_id: int, num_tokens: int):
+        if num_tokens > 0:
+            block_count_needed = self.compute_block_count(
+                num_tokens, self.tokens_per_block)
+            if request_id not in self.block_ids:
+                self.block_ids[request_id] = []
+            if len(self.block_ids[request_id]) < block_count_needed:
+                new_blocks = self._allocate_blocks(
+                    block_count_needed - len(self.block_ids[request_id]))
+                self.block_ids[request_id].extend(new_blocks)
+
+    def get_block_offsets(self, request_ids: List[int]) -> torch.Tensor:
+        kt_block_offsets = torch.empty(
+            [len(request_ids), self.max_blocks_per_seq],
+            device="cpu",
+            dtype=torch.int32)
+        for i in range(len(request_ids)):
+            block_ids = self.block_ids[request_ids[i]]
+            block_num = len(block_ids)
+            kt_block_offsets[i, 0:block_num].copy_(
+                self.base_block_offsets[torch.tensor(block_ids,
+                                                     dtype=torch.int32,
+                                                     device="cpu")])
+        return kt_block_offsets
+
+    def compute_block_count(self, token_count: int,
+                            tokens_per_page: int) -> int:
+        return (token_count + tokens_per_page) // tokens_per_page
+
+    def free_resources(self, request: LlmRequest):
+        request_id = request.py_request_id
+        self._free_blocks(self.block_ids[request_id])
+        del self.block_ids[request_id]
+
+    def rewind_cache(self, request: LlmRequest, rewind_len: int):
+        if rewind_len == 0:
+            return
+        request_id = request.py_request_id
+        num_tokens = request.max_beam_num_tokens
+        updated_kt_token_num = num_tokens - rewind_len
+        block_count_needed = self.compute_block_count(updated_kt_token_num,
+                                                      self.tokens_per_block)
+        num_rewind_pages = len(self.block_ids[request_id]) - block_count_needed
+        if num_rewind_pages > 0:
+            self._free_blocks(self.block_ids[request_id][-num_rewind_pages:])
+            self.block_ids[request_id] = self.block_ids[
+                request_id][:-num_rewind_pages]
+        return
+
+    def _allocate_blocks(self, block_count: int) -> list:
+        assert len(self.free_blocks) >= block_count, "Not enough blocks."
+        blocks = [self.free_blocks.popleft() for _ in range(block_count)]
+        return blocks
+
+    def _free_blocks(self, block_list: list):
+        self.free_blocks.extend(block_list)
 
 
 class ResourceManager:
