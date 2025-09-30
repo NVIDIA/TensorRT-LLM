@@ -719,7 +719,8 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
     def post_load_weights(self, module: Linear):
         super().post_load_weights(module)
-        if is_sm_100f():
+        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm):
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transfromed_scale = transform_sf_into_required_layout(
