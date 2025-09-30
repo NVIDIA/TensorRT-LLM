@@ -207,6 +207,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     # TODO: discuss what to do with this once we fully transition to the new inference optimizer
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
+        # TODO: maybe don't do this and rely on slot_idx instead??
         if self.attn_backend == "triton" or self.attn_backend == "torch":
             self.attn_page_size = self.max_seq_len
         return self
