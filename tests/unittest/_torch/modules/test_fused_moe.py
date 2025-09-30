@@ -644,6 +644,7 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5550283")
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
