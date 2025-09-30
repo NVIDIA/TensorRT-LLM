@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Release Notes &#8212; TensorRT-LLM</title>
+    <title>Release Notes &#8212; TensorRT LLM</title>
   
   
   
@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -69,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -137,11 +137,11 @@
       
     
     
-    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -248,11 +248,11 @@
       
     
     
-    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -337,6 +337,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -409,16 +410,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -493,13 +497,212 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="release-notes">
+  <section class="tex2jax_ignore mathjax_ignore" id="release-notes">
 <span id="id1"></span><h1>Release Notes<a class="headerlink" href="#release-notes" title="Link to this heading">#</a></h1>
 <p>All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our <a class="reference external" href="https://forums.developer.nvidia.com/">NVIDIA Developer Forum</a>.</p>
-<section id="tensorrt-llm-release-0-21-0">
-<h2>TensorRT-LLM Release 0.21.0<a class="headerlink" href="#tensorrt-llm-release-0-21-0" title="Link to this heading">#</a></h2>
+<section id="tensorrt-llm-release-1-0">
+<h2>TensorRT-LLM Release 1.0<a class="headerlink" href="#tensorrt-llm-release-1-0" title="Link to this heading">#</a></h2>
+<p>TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now stable and the default experience, and the LLM API is now stable. For more details on new developments in 1.0, please see below.</p>
 <section id="key-features-and-enhancements">
 <h3>Key Features and Enhancements<a class="headerlink" href="#key-features-and-enhancements" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Model Support</strong></p>
+<ul>
+<li><p>Add Mistral3.1 VLM model support</p></li>
+<li><p>Add TensorRT-Engine Qwen3 (dense) model support</p></li>
+<li><p>Add phi-4-multimodal model support</p></li>
+<li><p>Add EXAONE 4.0 model support</p></li>
+<li><p>Add Qwen3 MoE support to TensorRT backend</p></li>
+</ul>
+</li>
+<li><p><strong>Features</strong></p>
+<ul>
+<li><p>Add support for sm121</p></li>
+<li><p>Add LoRA support for Gemma3</p></li>
+<li><p>Support PyTorch LoRA adapter eviction</p></li>
+<li><p>Add LoRA support for PyTorch backend in trtllm-serve</p></li>
+<li><p>Add support of scheduling attention dp request</p></li>
+<li><p>Remove padding of FusedMoE in attention DP</p></li>
+<li><p>Support torch compile for attention dp</p></li>
+<li><p>Add KV events support for sliding window attention</p></li>
+<li><p>Add TRTLLM MoE nvfp4 cubins for mid-high concurrency; attention_dp for TRTLLM MoE</p></li>
+<li><p>Add Piecewise CUDA Graph support for MLA</p></li>
+<li><p>Support mutliCtasKvMode for high-throughput MLA kernels</p></li>
+<li><p>Enable kvcache to be reused during request generation</p></li>
+<li><p>Add ADP schedule balance optimization</p></li>
+<li><p>Add chunked prefill support for MLA (Blackwell)</p></li>
+<li><p>Enable Multi-block mode for Hopper spec dec XQA kernel</p></li>
+<li><p>Add vLLM KV Pool support for XQA kernel</p></li>
+<li><p>Allow sending more than 2GiB through MPI by using mpi4py.util.pkl5</p></li>
+<li><p>Add support for fused gate_up_proj scales for FP8 blockwise</p></li>
+<li><p>Support FP8 row-wise dense GEMM in torch flow</p></li>
+<li><p>Enable fp8 SwiGLU to minimize host overhead</p></li>
+<li><p>Add Deepseek R1 FP8 Support on Blackwell</p></li>
+<li><p>Add support for MXFP8xMXFP4 in pytorch</p></li>
+<li><p>Support nvfp4 model and fp8 kv cache for MLA chunked prefill (Blackwell)</p></li>
+<li><p>Opensource MOE MXFP8-MXFP4 implementation</p></li>
+<li><p>Add support for Modelopt fp8_pb_wo quantization scheme</p></li>
+<li><p>Support deepEP fp4 post quant all2all dispatch</p></li>
+<li><p>Fuse w4a8 moe pre-quant scale on Hopper</p></li>
+<li><p>Support Weight-Only-Quantization in PyTorch Workflow</p></li>
+<li><p>Add support for per expert activation scaling factors</p></li>
+<li><p>Add ReDrafter support for Qwen</p></li>
+<li><p>Enable CUDA Graph for Nemotron-H</p></li>
+<li><p>Add support for YARN in NemotronNAS models</p></li>
+<li><p>Switch to internal version of MMProjector in Gemma3</p></li>
+<li><p>Disable add special tokens for Llama3.3 70B</p></li>
+<li><p>Auto-enable ngram with concurrency &lt;= 32</p></li>
+<li><p>Support turning on/off spec decoding dynamically</p></li>
+<li><p>Support structural tag in C++ runtime and upgrade xgrammar to 0.1.21</p></li>
+<li><p>Add support for external multimodal embeddings</p></li>
+<li><p>Add support for disaggregation with pp with pytorch backend</p></li>
+<li><p>Add status tags to LLM API reference</p></li>
+<li><p>Support JSON Schema in OpenAI-Compatible API</p></li>
+<li><p>Support chunked prefill on spec decode 2 model</p></li>
+<li><p>Add KV cache reuse support for multimodal models</p></li>
+<li><p>Support nanobind bindings</p></li>
+<li><p>Add support for two-model engine KV cache reuse</p></li>
+<li><p>Add Eagle-3 support for qwen3 dense model</p></li>
+<li><p>Migrate Eagle-3 and draft/target speculation to Drafter</p></li>
+<li><p>Enable guided decoding with overlap scheduler</p></li>
+<li><p>Support n-gram speculative decoding with disagg</p></li>
+<li><p>Add beam search support to the PyTorch Workflow</p></li>
+<li><p>Add LLGuidance Support for PyTorch Backend</p></li>
+<li><p>Add NGrams V2 support</p></li>
+<li><p>Add MTP support for Online EPLB</p></li>
+<li><p>Support disaggregated serving in TRTLLM Sampler</p></li>
+<li><p>Add core infrastructure to enable loading of custom checkpoint formats</p></li>
+<li><p>Support TRTLLM_DEEP_EP_TOKEN_LIMIT to allow run deep-ep on memory-constrained GPUs</p></li>
+<li><p>Use huge page mapping for host accessible memory on GB200</p></li>
+<li><p>Add user-provided speculative decoding support</p></li>
+<li><p>Add streaming scaffolding_llm.generate_async support</p></li>
+<li><p>Detokenize option in /v1/completions request</p></li>
+<li><p>Integrate TRT-LLM Gen FP4 block scale MoE with Pytorch workflow kernel autotuner</p></li>
+<li><p>Remove support for llmapi + TRT backend in Triton</p></li>
+<li><p>Add request_perf_metrics to triton LLMAPI backend</p></li>
+<li><p>Add support for Triton request cancellation</p></li>
+</ul>
+</li>
+<li><p>Benchmark:</p>
+<ul>
+<li><p>Add support for benchmarking individual gemms in MOE benchmark (#6080)</p></li>
+<li><p>Add speculative metrics for trtllm-bench</p></li>
+<li><p>Add the ability to write a request timeline for trtllm-bench</p></li>
+<li><p>Add no_kv_cache_reuse option and streaming support for trtllm-serve bench</p></li>
+<li><p>Add latency support for trtllm-bench</p></li>
+<li><p>Add Acceptance Rate calculation to benchmark_serving</p></li>
+<li><p>Add wide-ep benchmarking scripts</p></li>
+<li><p>Update trtllm-bench to support new Pytorch default</p></li>
+<li><p>Add support for TRTLLM CustomDataset</p></li>
+<li><p>Make benchmark_serving part of the library</p></li>
+</ul>
+</li>
+<li><p>Documentation:</p>
+<ul>
+<li><p>Refactored the doc structure to focus on the PyTorch workflow.</p></li>
+<li><p>Improved the LLMAPI and API reference documentation. Stable APIs are now protected and will remain consistent in subsequent versions following v1.0.</p></li>
+<li><p>Removed legacy documentation related to the TensorRT workflow.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="infrastructure-changes">
+<h3>Infrastructure Changes<a class="headerlink" href="#infrastructure-changes" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>The base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:25.06-py3</span></code>.</p></li>
+<li><p>The base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:25.06-py3</span></code>.</p></li>
+<li><p>The dependent NVIDIA ModelOpt version is updated to 0.33.</p></li>
+<li><p>The dependent xgrammar version is updated to 0.1.21.</p></li>
+<li><p>The dependent transformers version is updated to 4.53.1.</p></li>
+</ul>
+</section>
+<section id="api-changes">
+<h3>API Changes<a class="headerlink" href="#api-changes" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>BREAKING CHANGE</strong> Promote PyTorch to be the default LLM backend</p></li>
+<li><p><strong>BREAKING CHANGE</strong> Change default backend to PyTorch in trtllm-serve</p></li>
+<li><p><strong>BREAKING CHANGE</strong> Unify KvCacheConfig in LLM class for pytorch backend</p></li>
+<li><p><strong>BREAKING CHANGE</strong> Rename cuda_graph_config padding_enabled field</p></li>
+<li><p><strong>BREAKING CHANGE</strong> Rename mixed_sampler to enable_mixed_sampler</p></li>
+<li><p><strong>BREAKING CHANGE</strong> Rename LLM.autotuner_enabled to enable_autotuner</p></li>
+<li><p>Add back allreduce_strategy parameter into TorchLlmArgs</p></li>
+<li><p>Add LLmArgs option to force using dynamic quantization</p></li>
+<li><p>Change default LoRA cache sizes and change peft_cache_config cache size fields to take effect when not explicitly set in lora_config</p></li>
+<li><p>Remove deprecated LoRA LLM args, that are already specified in lora_config</p></li>
+<li><p>Add request_perf_metrics to LLMAPI</p></li>
+<li><p>Remove batch_manager::KvCacheConfig and use executor::KvCacheConfig instead</p></li>
+<li><p>Remove TrtGptModelOptionalParams</p></li>
+<li><p>Remove ptuning knobs from TorchLlmArgs</p></li>
+</ul>
+</section>
+<section id="fixed-issues">
+<h3>Fixed Issues<a class="headerlink" href="#fixed-issues" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Fix illegal memory access in MLA (#6437)</p></li>
+<li><p>Fix nemotronNAS loading for TP&gt;1 (#6447)</p></li>
+<li><p>Fix wide EP when using DeepEP with online EPLB (#6429)</p></li>
+<li><p>Fix bugs caused by None attention_bias during Qwen3 model convert engine (#6344)</p></li>
+<li><p>Fix PD + MTP + overlap scheduler accuracy issue (#6136)</p></li>
+<li><p>Fix bug of Qwen3 when using fp4 on sm120 (#6065)</p></li>
+<li><p>Fix TMA error with GEMM+AR on TP=2 (#6075)</p></li>
+<li><p>Fix scaffolding aime test in test_e2e (#6140)</p></li>
+<li><p>Fix KV Cache overrides in trtllm-bench (#6103)</p></li>
+<li><p>Fix MOE benchmark to rotate buffers to prevent L2 cache reuse (#4135)</p></li>
+<li><p>Fix eagle3 two model disaggregated serving test (#6014)</p></li>
+<li><p>Fix chunked prefill + overlap scheduling (#5761)</p></li>
+<li><p>Fix mgmn postprocess error (#5835)</p></li>
+<li><p>Fallback to cubins for fp8 fmha kernels on Ada (#5779)</p></li>
+<li><p>Fix disagg + speculative decoding (#5558)</p></li>
+<li><p>Fix test_generate_with_seed CI failure. (#5772)</p></li>
+<li><p>Fix prompt adapter TP2 case (#5782)</p></li>
+<li><p>Fix disaggregate serving with attention DP (#4993)</p></li>
+<li><p>Fix a quote error introduced in #5534 (#5816)</p></li>
+<li><p>Fix the accuracy issue when reduce_fusion is enabled for GEMMA model. (#5801)</p></li>
+<li><p>Fix lost requests for disaggregated serving (#5815)</p></li>
+<li><p>Update unit tests: skip all_close assert for dropout in attention, increase tolerance for rope op test (#5855)</p></li>
+<li><p>Fix GEMM+AR fusion on blackwell (#5563)</p></li>
+<li><p>Fix llama4 multimodal support (#5809)</p></li>
+<li><p>Fix Llama4 Scout FP4 crash issue (#5925)</p></li>
+<li><p>Fix max batch size and max tokens in kv cache estimations for Nemotron-H (#5371)</p></li>
+<li><p>Fix moe regression for sm120 (#5823)</p></li>
+<li><p>Fix Qwen2.5VL FP8 support (#5029)</p></li>
+<li><p>Fix the illegal memory access issue in moe gemm on SM120 (#5636)</p></li>
+<li><p>Fix tileN cannot % 16==0 &amp; support sm89 deepgemm bmm (#5531)</p></li>
+<li><p>Fix incremental detokenization (#5825)</p></li>
+<li><p>Fix MoE workspace info by storing Torch tensor itself instead of data_ptr (#5900)</p></li>
+<li><p>Fix mistral unit tests due to transformers upgrade (#5904)</p></li>
+<li><p>Fix the Llama3.1 405B hanging issue. (#5698) (#5925)</p></li>
+<li><p>Fix Gemma3 unit tests due to transformers upgrade (#5921)</p></li>
+<li><p>Fix alltoall for llama4 (apply_router_weight_on_input=True) (#5902)</p></li>
+<li><p>Remove SpecConfig and fix thread leak issues (#5931)</p></li>
+<li><p>Fast redux detection in trtllm gen routing kernel (#5941)</p></li>
+<li><p>Fix cancel request logic (#5800)</p></li>
+<li><p>Fix errors in wide-ep scripts (#5992)</p></li>
+<li><p>Fix error in post-merge-tests (#5949)</p></li>
+<li><p>Fix missing arg to alltoall_prepare_maybe_dispatch (#5669)</p></li>
+<li><p>Fix attention DP doesn’t work with embedding TP (#5642)</p></li>
+<li><p>Fix broken cyclic reference detect (#5417)</p></li>
+<li><p>Fix permission for local user issues in NGC docker container. (#5373)</p></li>
+<li><p>Fix mtp vanilla draft inputs (#5568)</p></li>
+<li><p>Fix mPtrExpertCounts allocation in MoE TRT-LLM backend (nvfp4) (#5519)</p></li>
+<li><p>Fix block scale fp8 support for deepseek v3 on Blackwell. (#5514)</p></li>
+<li><p>Fix the issue MoE autotune fallback failed to query default heuristic (#5520)</p></li>
+<li><p>Fix the unexpected keyword argument ‘streaming’ (#5436)</p></li>
+</ul>
+</section>
+<section id="known-issues">
+<h3>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>When using disaggregated serving with pipeline parallelism and KV cache reuse, a hang can occur. This will be fixed in a future release. In the meantime, disabling KV cache reuse will fix this issue.</p></li>
+<li><p>Running multi-node cases where each node has just a single GPU is known to fail. This will be addressed in a future release.</p></li>
+<li><p>For the Llama 3.x and Llama 4 models, there is an issue with pipeline parallelism when using FP8 and NVFP4 weights. As a workaround, you can set the environment variable <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">TRTLLM_LLAMA_EAGER_FUSION_DISABLED=1</span></code>.</p></li>
+</ul>
+</section>
+</section>
+<section id="tensorrt-llm-release-0-21-0">
+<h2>TensorRT-LLM Release 0.21.0<a class="headerlink" href="#tensorrt-llm-release-0-21-0" title="Link to this heading">#</a></h2>
+<section id="id2">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>Model Support</strong></p>
 <ul>
@@ -546,8 +749,8 @@
 </li>
 </ul>
 </section>
-<section id="infrastructure-changes">
-<h3>Infrastructure Changes<a class="headerlink" href="#infrastructure-changes" title="Link to this heading">#</a></h3>
+<section id="id3">
+<h3>Infrastructure Changes<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:25.05-py3</span></code>.</p></li>
 <li><p>The base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:25.05-py3</span></code>.</p></li>
@@ -557,8 +760,8 @@
 <li><p>The dependent NCCL version is updated to 2.27.5.</p></li>
 </ul>
 </section>
-<section id="api-changes">
-<h3>API Changes<a class="headerlink" href="#api-changes" title="Link to this heading">#</a></h3>
+<section id="id4">
+<h3>API Changes<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Set _AutoDeployLlmArgs as primary config object</p></li>
 <li><p>Removed decoder request from decoder interface</p></li>
@@ -567,8 +770,8 @@
 <li><p>Moved allreduce_strategy from committed api to reference</p></li>
 </ul>
 </section>
-<section id="fixed-issues">
-<h3>Fixed Issues<a class="headerlink" href="#fixed-issues" title="Link to this heading">#</a></h3>
+<section id="id5">
+<h3>Fixed Issues<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed disaggregated service hang when MNNVL two-shot AllReduce is enabled (#4678)</p></li>
 <li><p>Fixed EP load balancer with MTP layer and route offset by EP rank (#4767)</p></li>
@@ -583,8 +786,8 @@
 <li><p>Fixed one-off attention window size for Gemma3 1B (#5564)</p></li>
 </ul>
 </section>
-<section id="known-issues">
-<h3>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading">#</a></h3>
+<section id="id6">
+<h3>Known Issues<a class="headerlink" href="#id6" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>accuracy/test_cli_flow::TestGpt2::test_beam_search_large is broken.</p></li>
 <li><p>Enabling disaggregated serving, MTP, and the overlap scheduler at the same time can lead to accuracy problems.</p></li>
@@ -594,8 +797,8 @@
 </section>
 <section id="tensorrt-llm-release-0-20-0">
 <h2>TensorRT-LLM Release 0.20.0<a class="headerlink" href="#tensorrt-llm-release-0-20-0" title="Link to this heading">#</a></h2>
-<section id="id2">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
+<section id="id7">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id7" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>Model Support</strong></p>
 <ul>
@@ -650,8 +853,8 @@
 <li><p>Enabled overlap scheduler in TRT workflow via executor API</p></li>
 </ul>
 </section>
-<section id="id3">
-<h3>Infrastructure Changes<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
+<section id="id8">
+<h3>Infrastructure Changes<a class="headerlink" href="#id8" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>TRT-LLM team formally releases docker image on <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC</a></strong>.</p></li>
 <li><p>The pre-built TensorRT-LLM wheel on PyPI is linked against PyTorch 2.7.0 now, which uses the CXX11 ABI</p></li>
@@ -666,8 +869,8 @@
 <li><p>Downgrade gcc toolset version from 13 to 11</p></li>
 </ul>
 </section>
-<section id="id4">
-<h3>API Changes<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
+<section id="id9">
+<h3>API Changes<a class="headerlink" href="#id9" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[Breaking Change]:Enable scheduling overlap by default</p></li>
 <li><p>Remove deprecated GptSession/V1 from TRT workflow</p></li>
@@ -676,8 +879,8 @@
 <li><p>Introduced multimodal embedding field in LlmRequest</p></li>
 </ul>
 </section>
-<section id="id5">
-<h3>Fixed Issues<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<section id="id10">
+<h3>Fixed Issues<a class="headerlink" href="#id10" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fix hang bug when context server doesn’t have enough capacity for KV Cache (#3095)</p></li>
 <li><p>Fix C++ decoder synchronization in PyTorch (#3106)</p></li>
@@ -688,8 +891,8 @@
 <li><p>Reset planned states to avoid memory leak in TrtllmAttentionWrapper (#4227)</p></li>
 </ul>
 </section>
-<section id="id6">
-<h3>Known Issues<a class="headerlink" href="#id6" title="Link to this heading">#</a></h3>
+<section id="id11">
+<h3>Known Issues<a class="headerlink" href="#id11" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>multi-GPU model support on RTX Pro 6000</p></li>
 </ul>
@@ -697,8 +900,8 @@
 </section>
 <section id="tensorrt-llm-release-0-19-0">
 <h2>TensorRT-LLM Release 0.19.0<a class="headerlink" href="#tensorrt-llm-release-0-19-0" title="Link to this heading">#</a></h2>
-<section id="id7">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id7" title="Link to this heading">#</a></h3>
+<section id="id12">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id12" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>The C++ runtime is now open sourced.</strong></p></li>
 <li><p><strong>PyTorch workflow</strong></p>
@@ -803,8 +1006,8 @@
 <li><p>Enhanced the integrated robustness of scaffolding via <code class="docutils literal notranslate"><span class="pre">init.py</span></code>.</p></li>
 </ul>
 </section>
-<section id="id8">
-<h3>API Changes<a class="headerlink" href="#id8" title="Link to this heading">#</a></h3>
+<section id="id13">
+<h3>API Changes<a class="headerlink" href="#id13" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Exposed <code class="docutils literal notranslate"><span class="pre">kc_cache_retention_config</span></code> from C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API to the LLM API.</p></li>
 <li><p>Moved <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> arguments to <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code>.</p></li>
@@ -816,8 +1019,8 @@
 <li><p>Redesigned the multi‑stream API for DeepSeek.</p></li>
 </ul>
 </section>
-<section id="id9">
-<h3>Fixed Issues<a class="headerlink" href="#id9" title="Link to this heading">#</a></h3>
+<section id="id14">
+<h3>Fixed Issues<a class="headerlink" href="#id14" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed misused length argument of PluginField. Thanks to the contribution from &#64;jl749 in #2712. This also fixes #2685.</p></li>
 <li><p>Fixed a Llama-3.2 SmoothQuant convert checkpoint issue. (#2677)</p></li>
@@ -827,50 +1030,10 @@
 <li><p>Removed the necessary of <code class="docutils literal notranslate"><span class="pre">--extra-index-url</span> <span class="pre">https://pypi.nvidia.com</span></code> when running <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">tensorrt-llm</span></code>.</p></li>
 </ul>
 </section>
-<section id="id10">
-<h3>Infrastructure Changes<a class="headerlink" href="#id10" title="Link to this heading">#</a></h3>
+<section id="id15">
+<h3>Infrastructure Changes<a class="headerlink" href="#id15" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The dependent NVIDIA ModelOpt version is updated to 0.27.</p></li>
-</ul>
-</section>
-<section id="id11">
-<h3>Known Issues<a class="headerlink" href="#id11" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p>The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> for optimal support on SBSA platforms.</p></li>
-</ul>
-</section>
-</section>
-<section id="tensorrt-llm-release-0-18-2">
-<h2>TensorRT-LLM Release 0.18.2<a class="headerlink" href="#tensorrt-llm-release-0-18-2" title="Link to this heading">#</a></h2>
-<section id="id12">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id12" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p>This update addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit https://www.nvidia.com/en-us/security/.</p></li>
-</ul>
-</section>
-</section>
-<section id="tensorrt-llm-release-0-18-1">
-<h2>TensorRT-LLM Release 0.18.1<a class="headerlink" href="#tensorrt-llm-release-0-18-1" title="Link to this heading">#</a></h2>
-<section id="id13">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id13" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p><strong>The 0.18.x series of releases builds upon the 0.17.0 release, focusing exclusively on dependency updates without incorporating features from the previous 0.18.0.dev pre-releases. These features will be included in future stable releases</strong>.</p></li>
-</ul>
-</section>
-<section id="id14">
-<h3>Infrastructure Changes<a class="headerlink" href="#id14" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p>The dependent <code class="docutils literal notranslate"><span class="pre">transformers</span></code> package version is updated to 4.48.3.</p></li>
-</ul>
-</section>
-</section>
-<section id="tensorrt-llm-release-0-18-0">
-<h2>TensorRT-LLM Release 0.18.0<a class="headerlink" href="#tensorrt-llm-release-0-18-0" title="Link to this heading">#</a></h2>
-<section id="id15">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id15" title="Link to this heading">#</a></h3>
-<ul class="simple">
-<li><p><strong>Features that were previously available in the 0.18.0.dev pre-releases are not included in this release</strong>.</p></li>
-<li><p>[BREAKING CHANGE] Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.</p></li>
 </ul>
 </section>
 <section id="id16">
@@ -879,8 +1042,48 @@
 <li><p>The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> for optimal support on SBSA platforms.</p></li>
 </ul>
 </section>
+</section>
+<section id="tensorrt-llm-release-0-18-2">
+<h2>TensorRT-LLM Release 0.18.2<a class="headerlink" href="#tensorrt-llm-release-0-18-2" title="Link to this heading">#</a></h2>
 <section id="id17">
-<h3>Infrastructure Changes<a class="headerlink" href="#id17" title="Link to this heading">#</a></h3>
+<h3>Key Features and Enhancements<a class="headerlink" href="#id17" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>This update addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit https://www.nvidia.com/en-us/security/.</p></li>
+</ul>
+</section>
+</section>
+<section id="tensorrt-llm-release-0-18-1">
+<h2>TensorRT-LLM Release 0.18.1<a class="headerlink" href="#tensorrt-llm-release-0-18-1" title="Link to this heading">#</a></h2>
+<section id="id18">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id18" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>The 0.18.x series of releases builds upon the 0.17.0 release, focusing exclusively on dependency updates without incorporating features from the previous 0.18.0.dev pre-releases. These features will be included in future stable releases</strong>.</p></li>
+</ul>
+</section>
+<section id="id19">
+<h3>Infrastructure Changes<a class="headerlink" href="#id19" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>The dependent <code class="docutils literal notranslate"><span class="pre">transformers</span></code> package version is updated to 4.48.3.</p></li>
+</ul>
+</section>
+</section>
+<section id="tensorrt-llm-release-0-18-0">
+<h2>TensorRT-LLM Release 0.18.0<a class="headerlink" href="#tensorrt-llm-release-0-18-0" title="Link to this heading">#</a></h2>
+<section id="id20">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id20" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Features that were previously available in the 0.18.0.dev pre-releases are not included in this release</strong>.</p></li>
+<li><p>[BREAKING CHANGE] Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.</p></li>
+</ul>
+</section>
+<section id="id21">
+<h3>Known Issues<a class="headerlink" href="#id21" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> for optimal support on SBSA platforms.</p></li>
+</ul>
+</section>
+<section id="id22">
+<h3>Infrastructure Changes<a class="headerlink" href="#id22" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:25.03-py3</span></code>.</p></li>
 <li><p>The base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:25.03-py3</span></code>.</p></li>
@@ -892,8 +1095,8 @@
 </section>
 <section id="tensorrt-llm-release-0-17-0">
 <h2>TensorRT-LLM Release 0.17.0<a class="headerlink" href="#tensorrt-llm-release-0-17-0" title="Link to this heading">#</a></h2>
-<section id="id18">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id18" title="Link to this heading">#</a></h3>
+<section id="id23">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id23" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>Blackwell support</strong></p>
 <ul>
@@ -926,23 +1129,23 @@
 <li><p>Added token-aligned arbitrary output tensors support for the C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API.</p></li>
 </ul>
 </section>
-<section id="id19">
-<h3>API Changes<a class="headerlink" href="#id19" title="Link to this heading">#</a></h3>
+<section id="id24">
+<h3>API Changes<a class="headerlink" href="#id24" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] KV cache reuse is enabled automatically when <code class="docutils literal notranslate"><span class="pre">paged_context_fmha</span></code> is enabled.</p></li>
 <li><p>Added <code class="docutils literal notranslate"><span class="pre">--concurrency</span></code> support for the <code class="docutils literal notranslate"><span class="pre">throughput</span></code> subcommand of <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>.</p></li>
 </ul>
 </section>
-<section id="id20">
-<h3>Known Issues<a class="headerlink" href="#id20" title="Link to this heading">#</a></h3>
+<section id="id25">
+<h3>Known Issues<a class="headerlink" href="#id25" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Need <code class="docutils literal notranslate"><span class="pre">--extra-index-url</span> <span class="pre">https://pypi.nvidia.com</span></code> when running <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">tensorrt-llm</span></code> due to new third-party dependencies.</p></li>
 <li><p>The PYPI SBSA wheel is incompatible with PyTorch 2.5.1 due to a break in the PyTorch ABI/API, as detailed in the related <a class="reference external" href="https://github.com/pytorch/pytorch/issues/144966">GitHub issue</a>.</p></li>
 <li><p>The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> for optimal support on SBSA platforms.</p></li>
 </ul>
 </section>
-<section id="id21">
-<h3>Fixed Issues<a class="headerlink" href="#id21" title="Link to this heading">#</a></h3>
+<section id="id26">
+<h3>Fixed Issues<a class="headerlink" href="#id26" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed incorrect LoRA output dimension. Thanks for the contribution from &#64;akhoroshev in #2484.</p></li>
 <li><p>Added NVIDIA H200 GPU into the <code class="docutils literal notranslate"><span class="pre">cluster_key</span></code> for auto parallelism feature. (#2552)</p></li>
@@ -951,8 +1154,8 @@
 <li><p>Fixed Deepseek-V2 model accuracy.</p></li>
 </ul>
 </section>
-<section id="id22">
-<h3>Infrastructure Changes<a class="headerlink" href="#id22" title="Link to this heading">#</a></h3>
+<section id="id27">
+<h3>Infrastructure Changes<a class="headerlink" href="#id27" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:25.01-py3</span></code>.</p></li>
 <li><p>The base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:25.01-py3</span></code>.</p></li>
@@ -964,8 +1167,8 @@
 </section>
 <section id="tensorrt-llm-release-0-16-0">
 <h2>TensorRT-LLM Release 0.16.0<a class="headerlink" href="#tensorrt-llm-release-0-16-0" title="Link to this heading">#</a></h2>
-<section id="id23">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id23" title="Link to this heading">#</a></h3>
+<section id="id28">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id28" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Added guided decoding support with XGrammar backend.</p></li>
 <li><p>Added quantization support for RecurrentGemma. Refer to <code class="docutils literal notranslate"><span class="pre">examples/recurrentgemma/README.md</span></code>.</p></li>
@@ -992,8 +1195,8 @@
 <li><p>[BREAKING CHANGE] Removed NVIDIA V100 GPU support.</p></li>
 </ul>
 </section>
-<section id="id24">
-<h3>API Changes<a class="headerlink" href="#id24" title="Link to this heading">#</a></h3>
+<section id="id29">
+<h3>API Changes<a class="headerlink" href="#id29" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] Removed <code class="docutils literal notranslate"><span class="pre">enable_xqa</span></code> argument from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p></li>
 <li><p>[BREAKING CHANGE] Chunked context is enabled by default when KV cache and paged context FMHA is enabled on non-RNN based models.</p></li>
@@ -1012,8 +1215,8 @@
 <li><p>Added Stable Diffusion XL support. Refer to <code class="docutils literal notranslate"><span class="pre">examples/sdxl/README.md</span></code>. Thanks for the contribution from &#64;Zars19 in #1514.</p></li>
 </ul>
 </section>
-<section id="id25">
-<h3>Fixed Issues<a class="headerlink" href="#id25" title="Link to this heading">#</a></h3>
+<section id="id30">
+<h3>Fixed Issues<a class="headerlink" href="#id30" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed unnecessary batch logits post processor calls. (#2439)</p></li>
 <li><p>Fixed a typo in the error message. (#2473)</p></li>
@@ -1021,8 +1224,8 @@
 <li><p>Fixed <code class="docutils literal notranslate"><span class="pre">sampling_params</span></code> to only be setup if <code class="docutils literal notranslate"><span class="pre">end_id</span></code> is None and <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> is not None in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> API. Thanks to the contribution from &#64;mfuntowicz in #2573.</p></li>
 </ul>
 </section>
-<section id="id26">
-<h3>Infrastructure Changes<a class="headerlink" href="#id26" title="Link to this heading">#</a></h3>
+<section id="id31">
+<h3>Infrastructure Changes<a class="headerlink" href="#id31" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Updated the base Docker image for TensorRT-LLM to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:24.11-py3</span></code>.</p></li>
 <li><p>Updated the base Docker image for TensorRT-LLM Backend to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:24.11-py3</span></code>.</p></li>
@@ -1032,8 +1235,8 @@
 <li><p>Updated to ModelOpt v0.21 for Linux platform, while v0.17 is still used on Windows platform.</p></li>
 </ul>
 </section>
-<section id="id27">
-<h3>Known Issues<a class="headerlink" href="#id27" title="Link to this heading">#</a></h3>
+<section id="id32">
+<h3>Known Issues<a class="headerlink" href="#id32" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>There is a known AllReduce performance issue on AMD-based CPU platforms on NCCL 2.23.4, which can be workarounded by <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">NCCL_P2P_LEVEL=SYS</span></code>.</p></li>
 </ul>
@@ -1041,8 +1244,8 @@
 </section>
 <section id="tensorrt-llm-release-0-15-0">
 <h2>TensorRT-LLM Release 0.15.0<a class="headerlink" href="#tensorrt-llm-release-0-15-0" title="Link to this heading">#</a></h2>
-<section id="id28">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id28" title="Link to this heading">#</a></h3>
+<section id="id33">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id33" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Added support for EAGLE. Refer to <code class="docutils literal notranslate"><span class="pre">examples/eagle/README.md</span></code>.</p></li>
 <li><p>Added functional support for GH200 systems.</p></li>
@@ -1077,8 +1280,8 @@
 <li><p>Added support for a <code class="docutils literal notranslate"><span class="pre">gpt_variant</span></code> argument to the <code class="docutils literal notranslate"><span class="pre">examples/gpt/convert_checkpoint.py</span></code> file. This enhancement enables checkpoint conversion with more GPT model variants. Thanks to the contribution from &#64;tonylek in #2352.</p></li>
 </ul>
 </section>
-<section id="id29">
-<h3>API Changes<a class="headerlink" href="#id29" title="Link to this heading">#</a></h3>
+<section id="id34">
+<h3>API Changes<a class="headerlink" href="#id34" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] Moved the flag <code class="docutils literal notranslate"><span class="pre">builder_force_num_profiles</span></code> in <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command to the <code class="docutils literal notranslate"><span class="pre">BUILDER_FORCE_NUM_PROFILES</span></code> environment variable.</p></li>
 <li><p>[BREAKING CHANGE] Modified defaults for <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> class so that they are aligned with the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
@@ -1089,8 +1292,8 @@
 <li><p>Exposed <code class="docutils literal notranslate"><span class="pre">--trust_remote_code</span></code> argument to the OpenAI API server. (#2357)</p></li>
 </ul>
 </section>
-<section id="id30">
-<h3>Model Updates<a class="headerlink" href="#id30" title="Link to this heading">#</a></h3>
+<section id="id35">
+<h3>Model Updates<a class="headerlink" href="#id35" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Added support for Llama 3.2 and llama 3.2-Vision model. Refer to <code class="docutils literal notranslate"><span class="pre">examples/mllama/README.md</span></code> for more details on the llama 3.2-Vision model.</p></li>
 <li><p>Added support for Deepseek-v2. Refer to <code class="docutils literal notranslate"><span class="pre">examples/deepseek_v2/README.md</span></code>.</p></li>
@@ -1103,8 +1306,8 @@
 <li><p>Added support for LLaVA-OneVision model. Refer to “LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA” section in <code class="docutils literal notranslate"><span class="pre">examples/multimodal/README.md</span></code>.</p></li>
 </ul>
 </section>
-<section id="id31">
-<h3>Fixed Issues<a class="headerlink" href="#id31" title="Link to this heading">#</a></h3>
+<section id="id36">
+<h3>Fixed Issues<a class="headerlink" href="#id36" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed a slice error in forward function. (#1480)</p></li>
 <li><p>Fixed an issue that appears when building BERT. (#2373)</p></li>
@@ -1116,8 +1319,8 @@
 <li><p>Fixed a PDL typo in <code class="docutils literal notranslate"><span class="pre">docs/source/performance/perf-benchmarking.md</span></code>, thanks &#64;MARD1NO for pointing it out in #2425.</p></li>
 </ul>
 </section>
-<section id="id32">
-<h3>Infrastructure Changes<a class="headerlink" href="#id32" title="Link to this heading">#</a></h3>
+<section id="id37">
+<h3>Infrastructure Changes<a class="headerlink" href="#id37" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:24.10-py3</span></code>.</p></li>
 <li><p>The base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:24.10-py3</span></code>.</p></li>
@@ -1136,8 +1339,8 @@
 </section>
 <section id="tensorrt-llm-release-0-14-0">
 <h2>TensorRT-LLM Release 0.14.0<a class="headerlink" href="#tensorrt-llm-release-0-14-0" title="Link to this heading">#</a></h2>
-<section id="id33">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id33" title="Link to this heading">#</a></h3>
+<section id="id38">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id38" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Enhanced the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class in the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html">LLM API</a>.</p>
 <ul>
@@ -1155,8 +1358,8 @@
 <li><p>NVIDIA Volta GPU support is deprecated and will be removed in a future release.</p></li>
 </ul>
 </section>
-<section id="id34">
-<h3>API Changes<a class="headerlink" href="#id34" title="Link to this heading">#</a></h3>
+<section id="id39">
+<h3>API Changes<a class="headerlink" href="#id39" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] The default <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> of the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command is set to <code class="docutils literal notranslate"><span class="pre">2048</span></code>.</p></li>
 <li><p>[BREAKING CHANGE] Remove <code class="docutils literal notranslate"><span class="pre">builder_opt</span></code> from the <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> class and the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
@@ -1164,16 +1367,16 @@
 <li><p>Added <code class="docutils literal notranslate"><span class="pre">isParticipant</span></code> method to the C++ <code class="docutils literal notranslate"><span class="pre">Executor</span></code> API to check if the current process is a participant in the executor instance.</p></li>
 </ul>
 </section>
-<section id="id35">
-<h3>Model Updates<a class="headerlink" href="#id35" title="Link to this heading">#</a></h3>
+<section id="id40">
+<h3>Model Updates<a class="headerlink" href="#id40" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Added support for NemotronNas, see <code class="docutils literal notranslate"><span class="pre">examples/nemotron_nas/README.md</span></code>.</p></li>
 <li><p>Added support for Deepseek-v1, see <code class="docutils literal notranslate"><span class="pre">examples/deepseek_v1/README.md</span></code>.</p></li>
 <li><p>Added support for Phi-3.5 models, see <code class="docutils literal notranslate"><span class="pre">examples/phi/README.md</span></code>.</p></li>
 </ul>
 </section>
-<section id="id36">
-<h3>Fixed Issues<a class="headerlink" href="#id36" title="Link to this heading">#</a></h3>
+<section id="id41">
+<h3>Fixed Issues<a class="headerlink" href="#id41" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed a typo in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/model_weights_loader.py</span></code>, thanks to the contribution from &#64;wangkuiyi in #2152.</p></li>
 <li><p>Fixed duplicated import module in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/runtime/generation.py</span></code>, thanks to the contribution from &#64;lkm2835 in #2182.</p></li>
@@ -1185,20 +1388,20 @@
 <li><p>Fixed lookahead batch layout for <code class="docutils literal notranslate"><span class="pre">numNewTokensCumSum</span></code>. (#2263)</p></li>
 </ul>
 </section>
-<section id="id37">
-<h3>Infrastructure Changes<a class="headerlink" href="#id37" title="Link to this heading">#</a></h3>
+<section id="id42">
+<h3>Infrastructure Changes<a class="headerlink" href="#id42" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The dependent ModelOpt version is updated to v0.17.</p></li>
 </ul>
 </section>
-<section id="id38">
-<h3>Documentation<a class="headerlink" href="#id38" title="Link to this heading">#</a></h3>
+<section id="id43">
+<h3>Documentation<a class="headerlink" href="#id43" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>&#64;Sherlock113 added a <a class="reference external" href="https://www.bentoml.com/blog/tuning-tensor-rt-llm-for-optimal-serving-with-bentoml">tech blog</a> to the latest news in #2169, thanks for the contribution.</p></li>
 </ul>
 </section>
-<section id="id39">
-<h3>Known Issues<a class="headerlink" href="#id39" title="Link to this heading">#</a></h3>
+<section id="id44">
+<h3>Known Issues<a class="headerlink" href="#id44" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Replit Code is not supported with the transformers 4.45+</p></li>
 </ul>
@@ -1206,8 +1409,8 @@
 </section>
 <section id="tensorrt-llm-release-0-13-0">
 <h2>TensorRT-LLM Release 0.13.0<a class="headerlink" href="#tensorrt-llm-release-0-13-0" title="Link to this heading">#</a></h2>
-<section id="id40">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id40" title="Link to this heading">#</a></h3>
+<section id="id45">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id45" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Supported lookahead decoding (experimental), see <code class="docutils literal notranslate"><span class="pre">docs/source/speculative_decoding.md</span></code>.</p></li>
 <li><p>Added some enhancements to the <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code> (a unified checkpoint converter, see <code class="docutils literal notranslate"><span class="pre">docs/source/architecture/model-weights-loader.md</span></code>).</p>
@@ -1240,8 +1443,8 @@
 <li><p>Supported decoder with encoder input features for the C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API.</p></li>
 </ul>
 </section>
-<section id="id41">
-<h3>API Changes<a class="headerlink" href="#id41" title="Link to this heading">#</a></h3>
+<section id="id46">
+<h3>API Changes<a class="headerlink" href="#id46" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] Set <code class="docutils literal notranslate"><span class="pre">use_fused_mlp</span></code> to <code class="docutils literal notranslate"><span class="pre">True</span></code> by default.</p></li>
 <li><p>[BREAKING CHANGE] Enabled <code class="docutils literal notranslate"><span class="pre">multi_block_mode</span></code> by default.</p></li>
@@ -1260,14 +1463,14 @@
 </li>
 </ul>
 </section>
-<section id="id42">
-<h3>Model Updates<a class="headerlink" href="#id42" title="Link to this heading">#</a></h3>
+<section id="id47">
+<h3>Model Updates<a class="headerlink" href="#id47" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Supported Gemma 2, see “Run Gemma 2” section in <code class="docutils literal notranslate"><span class="pre">examples/gemma/README.md</span></code>.</p></li>
 </ul>
 </section>
-<section id="id43">
-<h3>Fixed Issues<a class="headerlink" href="#id43" title="Link to this heading">#</a></h3>
+<section id="id48">
+<h3>Fixed Issues<a class="headerlink" href="#id48" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed an accuracy issue when enabling remove padding issue for cross attention. (#1999)</p></li>
 <li><p>Fixed the failure in converting qwen2-0.5b-instruct when using <code class="docutils literal notranslate"><span class="pre">smoothquant</span></code>. (#2087)</p></li>
@@ -1278,8 +1481,8 @@
 <li><p>Fixed the default factory for <code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code>. (#1323)</p></li>
 </ul>
 </section>
-<section id="id44">
-<h3>Infrastructure Changes<a class="headerlink" href="#id44" title="Link to this heading">#</a></h3>
+<section id="id49">
+<h3>Infrastructure Changes<a class="headerlink" href="#id49" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:24.07-py3</span></code>.</p></li>
 <li><p>Base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:24.07-py3</span></code>.</p></li>
@@ -1292,8 +1495,8 @@
 </section>
 <section id="tensorrt-llm-release-0-12-0">
 <h2>TensorRT-LLM Release 0.12.0<a class="headerlink" href="#tensorrt-llm-release-0-12-0" title="Link to this heading">#</a></h2>
-<section id="id45">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id45" title="Link to this heading">#</a></h3>
+<section id="id50">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id50" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Supported LoRA for MoE models.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code> is enabled for LLaMA family models (experimental), see <code class="docutils literal notranslate"><span class="pre">docs/source/architecture/model-weights-loader.md</span></code>.</p></li>
@@ -1311,8 +1514,8 @@
 <li><p>Added the flag <code class="docutils literal notranslate"><span class="pre">--fast_build</span></code> to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command (experimental).</p></li>
 </ul>
 </section>
-<section id="id46">
-<h3>API Changes<a class="headerlink" href="#id46" title="Link to this heading">#</a></h3>
+<section id="id51">
+<h3>API Changes<a class="headerlink" href="#id51" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] <code class="docutils literal notranslate"><span class="pre">max_output_len</span></code> is removed from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command, if you want to limit sequence length on engine build stage, specify <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>.</p></li>
 <li><p>[BREAKING CHANGE] The <code class="docutils literal notranslate"><span class="pre">use_custom_all_reduce</span></code> argument is removed from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p></li>
@@ -1323,8 +1526,8 @@
 <li><p>Added a version API to the C++ library, a <code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/executor/version.h</span></code> file is going to be generated.</p></li>
 </ul>
 </section>
-<section id="id47">
-<h3>Model Updates<a class="headerlink" href="#id47" title="Link to this heading">#</a></h3>
+<section id="id52">
+<h3>Model Updates<a class="headerlink" href="#id52" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Supported LLaMA 3.1 model.</p></li>
 <li><p>Supported Mamba-2 model.</p></li>
@@ -1334,8 +1537,8 @@
 <li><p>Added LLaVa-1.6 (LLaVa-NeXT) multimodal support, see “LLaVA, LLaVa-NeXT and VILA” section in <code class="docutils literal notranslate"><span class="pre">examples/multimodal/README.md</span></code>.</p></li>
 </ul>
 </section>
-<section id="id48">
-<h3>Fixed Issues<a class="headerlink" href="#id48" title="Link to this heading">#</a></h3>
+<section id="id53">
+<h3>Fixed Issues<a class="headerlink" href="#id53" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed wrong pad token for the CodeQwen models. (#1953)</p></li>
 <li><p>Fixed typo in <code class="docutils literal notranslate"><span class="pre">cluster_infos</span></code> defined in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/auto_parallel/cluster_info.py</span></code>, thanks to the contribution from &#64;saeyoonoh in #1987.</p></li>
@@ -1348,8 +1551,8 @@
 <li><p>Fixed the engine build failure when deduced <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> is not an integer. (#2018)</p></li>
 </ul>
 </section>
-<section id="id49">
-<h3>Infrastructure Changes<a class="headerlink" href="#id49" title="Link to this heading">#</a></h3>
+<section id="id54">
+<h3>Infrastructure Changes<a class="headerlink" href="#id54" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:24.07-py3</span></code>.</p></li>
 <li><p>Base Docker image for TensorRT-LLM Backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:24.07-py3</span></code>.</p></li>
@@ -1359,8 +1562,8 @@
 <li><p>The dependent ModelOpt version is updated to v0.15.0.</p></li>
 </ul>
 </section>
-<section id="id50">
-<h3>Known Issues<a class="headerlink" href="#id50" title="Link to this heading">#</a></h3>
+<section id="id55">
+<h3>Known Issues<a class="headerlink" href="#id55" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>On Windows, installation of TensorRT-LLM may succeed, but you might hit <code class="docutils literal notranslate"><span class="pre">OSError:</span> <span class="pre">exception:</span> <span class="pre">access</span> <span class="pre">violation</span> <span class="pre">reading</span> <span class="pre">0x0000000000000000</span></code> when importing the library in Python.</p></li>
 </ul>
@@ -1368,8 +1571,8 @@
 </section>
 <section id="tensorrt-llm-release-0-11-0">
 <h2>TensorRT-LLM Release 0.11.0<a class="headerlink" href="#tensorrt-llm-release-0-11-0" title="Link to this heading">#</a></h2>
-<section id="id51">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id51" title="Link to this heading">#</a></h3>
+<section id="id56">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id56" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Supported very long context for LLaMA (see “Long context evaluation” section in <code class="docutils literal notranslate"><span class="pre">examples/llama/README.md</span></code>).</p></li>
 <li><p>Low latency optimization</p>
@@ -1414,8 +1617,8 @@
 <li><p>Add HuggingFace model zoo from the community, thanks to the contribution from &#64;matichon-vultureprime in #1674.</p></li>
 </ul>
 </section>
-<section id="id52">
-<h3>API Changes<a class="headerlink" href="#id52" title="Link to this heading">#</a></h3>
+<section id="id57">
+<h3>API Changes<a class="headerlink" href="#id57" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command</p>
 <ul>
@@ -1491,8 +1694,8 @@
 <li><p>[BREAKING CHANGE] Removed <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> Python bindings.</p></li>
 </ul>
 </section>
-<section id="id53">
-<h3>Model Updates<a class="headerlink" href="#id53" title="Link to this heading">#</a></h3>
+<section id="id58">
+<h3>Model Updates<a class="headerlink" href="#id58" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Supported Jais, see <code class="docutils literal notranslate"><span class="pre">examples/jais/README.md</span></code>.</p></li>
 <li><p>Supported DiT, see <code class="docutils literal notranslate"><span class="pre">examples/dit/README.md</span></code>.</p></li>
@@ -1507,8 +1710,8 @@
 <li><p>Supported phi 3 vision multimodal.</p></li>
 </ul>
 </section>
-<section id="id54">
-<h3>Fixed Issues<a class="headerlink" href="#id54" title="Link to this heading">#</a></h3>
+<section id="id59">
+<h3>Fixed Issues<a class="headerlink" href="#id59" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed brokens outputs for the cases when batch size is larger than 1. (#1539)</p></li>
 <li><p>Fixed <code class="docutils literal notranslate"><span class="pre">top_k</span></code> type in <code class="docutils literal notranslate"><span class="pre">executor.py</span></code>, thanks to the contribution from &#64;vonjackustc in #1329.</p></li>
@@ -1542,8 +1745,8 @@
 <li><p>Fixed dead link, thanks to the help from &#64;DefTruth, &#64;buvnswrn and &#64;sunjiabin17 in: https://github.com/triton-inference-server/tensorrtllm_backend/pull/478, https://github.com/triton-inference-server/tensorrtllm_backend/pull/482 and https://github.com/triton-inference-server/tensorrtllm_backend/pull/449.</p></li>
 </ul>
 </section>
-<section id="id55">
-<h3>Infrastructure Changes<a class="headerlink" href="#id55" title="Link to this heading">#</a></h3>
+<section id="id60">
+<h3>Infrastructure Changes<a class="headerlink" href="#id60" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:24.05-py3</span></code>.</p></li>
 <li><p>Base Docker image for TensorRT-LLM backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:24.05-py3</span></code>.</p></li>
@@ -1553,8 +1756,8 @@
 <li><p>The dependent ModelOpt version is updated to v0.13.0.</p></li>
 </ul>
 </section>
-<section id="id56">
-<h3>Known Issues<a class="headerlink" href="#id56" title="Link to this heading">#</a></h3>
+<section id="id61">
+<h3>Known Issues<a class="headerlink" href="#id61" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>In a conda environment on Windows, installation of TensorRT-LLM may succeed. However, when importing the library in Python, you may receive an error message of <code class="docutils literal notranslate"><span class="pre">OSError:</span> <span class="pre">exception:</span> <span class="pre">access</span> <span class="pre">violation</span> <span class="pre">reading</span> <span class="pre">0x0000000000000000</span></code>. This issue is under investigation.</p></li>
 </ul>
@@ -1568,8 +1771,8 @@
 <li><p>TensorRT-LLM supports TensorRT 10.0.1 and NVIDIA NGC 24.03 containers.</p></li>
 </ul>
 </section>
-<section id="id57">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id57" title="Link to this heading">#</a></h3>
+<section id="id62">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id62" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The Python high level API</p>
 <ul>
@@ -1604,8 +1807,8 @@
 </li>
 </ul>
 </section>
-<section id="id58">
-<h3>API Changes<a class="headerlink" href="#id58" title="Link to this heading">#</a></h3>
+<section id="id63">
+<h3>API Changes<a class="headerlink" href="#id63" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>[BREAKING CHANGE] Set the default <code class="docutils literal notranslate"><span class="pre">tokens_per_block</span></code> argument of the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command to 64 for better performance.</p></li>
 <li><p>[BREAKING CHANGE] Migrated enc-dec models to the unified workflow.</p></li>
@@ -1622,8 +1825,8 @@
 <li><p>Deprecated <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> and <code class="docutils literal notranslate"><span class="pre">TrtGptModelV1</span></code>.</p></li>
 </ul>
 </section>
-<section id="id59">
-<h3>Model Updates<a class="headerlink" href="#id59" title="Link to this heading">#</a></h3>
+<section id="id64">
+<h3>Model Updates<a class="headerlink" href="#id64" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Support DBRX</p></li>
 <li><p>Support Qwen2</p></li>
@@ -1640,8 +1843,8 @@
 <li><p>Support RecurrentGemma</p></li>
 </ul>
 </section>
-<section id="id60">
-<h3>Fixed Issues<a class="headerlink" href="#id60" title="Link to this heading">#</a></h3>
+<section id="id65">
+<h3>Fixed Issues<a class="headerlink" href="#id65" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><ul>
 <li><p>Fixed some unexpected behaviors in beam search and early stopping, so that the outputs are more accurate.</p></li>
@@ -1659,8 +1862,8 @@
 <li><p>Fixed MMHA relative position calculation error in <code class="docutils literal notranslate"><span class="pre">gpt_attention_plugin</span></code> for enc-dec models. (#1343)</p></li>
 </ul>
 </section>
-<section id="id61">
-<h3>Infrastructure changes<a class="headerlink" href="#id61" title="Link to this heading">#</a></h3>
+<section id="id66">
+<h3>Infrastructure changes<a class="headerlink" href="#id66" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Base Docker image for TensorRT-LLM is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/pytorch:24.03-py3</span></code>.</p></li>
 <li><p>Base Docker image for TensorRT-LLM backend is updated to <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tritonserver:24.03-py3</span></code>.</p></li>
@@ -1672,14 +1875,14 @@
 </section>
 <section id="tensorrt-llm-release-0-9-0">
 <h2>TensorRT-LLM Release 0.9.0<a class="headerlink" href="#tensorrt-llm-release-0-9-0" title="Link to this heading">#</a></h2>
-<section id="id62">
-<h3>Announcements<a class="headerlink" href="#id62" title="Link to this heading">#</a></h3>
+<section id="id67">
+<h3>Announcements<a class="headerlink" href="#id67" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>TensorRT-LLM requires TensorRT 9.3 and 24.02 containers.</p></li>
 </ul>
 </section>
-<section id="id63">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id63" title="Link to this heading">#</a></h3>
+<section id="id68">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id68" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>[BREAKING CHANGES]</strong> TopP sampling optimization with deterministic AIR TopP algorithm is enabled by default</p></li>
 <li><p><strong>[BREAKING CHANGES]</strong> Added support for embedding sharing for Gemma</p></li>
@@ -1731,8 +1934,8 @@
 </li>
 </ul>
 </section>
-<section id="id64">
-<h3>API Changes<a class="headerlink" href="#id64" title="Link to this heading">#</a></h3>
+<section id="id69">
+<h3>API Changes<a class="headerlink" href="#id69" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Added C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API</p></li>
 <li><p>Added Python bindings</p></li>
@@ -1757,8 +1960,8 @@
 <li><p>Added support for the <code class="docutils literal notranslate"><span class="pre">StreamingLLM</span></code> feature. Enable it by setting <code class="docutils literal notranslate"><span class="pre">LLM(streaming_llm=...)</span></code>.</p></li>
 </ul>
 </section>
-<section id="id65">
-<h3>Model Updates<a class="headerlink" href="#id65" title="Link to this heading">#</a></h3>
+<section id="id70">
+<h3>Model Updates<a class="headerlink" href="#id70" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Added support for distil-whisper</p></li>
 <li><p>Added support for HuggingFace StarCoder2</p></li>
@@ -1773,8 +1976,8 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">openai-triton</span></code> examples are not supported on Windows.</p></li>
 </ul>
 </section>
-<section id="id66">
-<h3>Fixed Issues<a class="headerlink" href="#id66" title="Link to this heading">#</a></h3>
+<section id="id71">
+<h3>Fixed Issues<a class="headerlink" href="#id71" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed a weight-only quant bug for Whisper to make sure that the <code class="docutils literal notranslate"><span class="pre">encoder_input_len_range</span></code> is not <code class="docutils literal notranslate"><span class="pre">0</span></code>. (#992)</p></li>
 <li><p>Fixed an issue that log probabilities in Python runtime are not returned. (#983)</p></li>
@@ -1795,8 +1998,8 @@
 </section>
 <section id="tensorrt-llm-release-0-8-0">
 <h2>TensorRT-LLM Release 0.8.0<a class="headerlink" href="#tensorrt-llm-release-0-8-0" title="Link to this heading">#</a></h2>
-<section id="id67">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id67" title="Link to this heading">#</a></h3>
+<section id="id72">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id72" title="Link to this heading">#</a></h3>
 <ul>
 <li><p>Chunked context support (see docs/source/advanced/gpt-attention.md#chunked-context)</p></li>
 <li><p>LoRA support for C++ runtime (see docs/source/lora.md)</p></li>
@@ -1847,8 +2050,8 @@
 </li>
 </ul>
 </section>
-<section id="id68">
-<h3>Model Updates<a class="headerlink" href="#id68" title="Link to this heading">#</a></h3>
+<section id="id73">
+<h3>Model Updates<a class="headerlink" href="#id73" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Phi-1.5/2.0</p></li>
 <li><p>Mamba support (see examples/mamba/README.md)</p>
@@ -1862,7 +2065,7 @@
 <li><p>Skywork model support</p></li>
 <li><p>Add example for multimodal models (BLIP with OPT or T5, LlaVA)</p></li>
 </ul>
-<p>Refer to the <a class="reference internal" href="reference/support-matrix.html#support-matrix-software"><span class="std std-ref">Software</span></a> section for a list of supported models.</p>
+<p>Refer to the <a class="reference internal" href="legacy/reference/support-matrix.html#support-matrix-software"><span class="std std-ref">Software</span></a> section for a list of supported models.</p>
 <ul class="simple">
 <li><p>API</p>
 <ul>
@@ -1916,8 +2119,8 @@
 </section>
 <section id="tensorrt-llm-release-0-7-1">
 <h2>TensorRT-LLM Release 0.7.1<a class="headerlink" href="#tensorrt-llm-release-0-7-1" title="Link to this heading">#</a></h2>
-<section id="id69">
-<h3>Key Features and Enhancements<a class="headerlink" href="#id69" title="Link to this heading">#</a></h3>
+<section id="id74">
+<h3>Key Features and Enhancements<a class="headerlink" href="#id74" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Speculative decoding (preview)</p></li>
 <li><p>Added a Python binding for <code class="docutils literal notranslate"><span class="pre">GptManager</span></code></p></li>
@@ -1937,11 +2140,11 @@
 <li><p>Enable split-k for weight-only cutlass kernel when SM&gt;=75</p></li>
 </ul>
 </li>
-<li><p>Added <a class="reference internal" href="performance/perf-benchmarking.html#workflow"><span class="std std-ref">Workflow</span></a> documentation</p></li>
+<li><p>Added <a class="reference internal" href="legacy/performance/perf-benchmarking.html#workflow"><span class="std std-ref">Workflow</span></a> documentation</p></li>
 </ul>
 </section>
-<section id="id70">
-<h3>Model Updates<a class="headerlink" href="#id70" title="Link to this heading">#</a></h3>
+<section id="id75">
+<h3>Model Updates<a class="headerlink" href="#id75" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>BART and mBART support in encoder-decoder models</p></li>
 <li><p>FairSeq Neural Machine Translation (NMT) family</p></li>
@@ -1953,8 +2156,8 @@
 <li><p>Baichuan FP8 quantization support</p></li>
 </ul>
 </section>
-<section id="id71">
-<h3>Fixed Issues<a class="headerlink" href="#id71" title="Link to this heading">#</a></h3>
+<section id="id76">
+<h3>Fixed Issues<a class="headerlink" href="#id76" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Fixed tokenizer usage in <code class="docutils literal notranslate"><span class="pre">quantize.py</span></code> <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/issues/288">#288</a></p></li>
 <li><p>Fixed LLaMa with LoRA error</p></li>
@@ -1963,8 +2166,8 @@
 <li><p>Fixed CodeLlama SQ accuracy issue</p></li>
 </ul>
 </section>
-<section id="id72">
-<h3>Known Issues<a class="headerlink" href="#id72" title="Link to this heading">#</a></h3>
+<section id="id77">
+<h3>Known Issues<a class="headerlink" href="#id77" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The hang reported in issue <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/issues/149">#149</a> has not been reproduced by the TensorRT-LLM team. If it is caused by a bug in TensorRT-LLM, that bug may be present in that release.</p></li>
 </ul>
@@ -2003,7 +2206,7 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-21-0">TensorRT-LLM Release 0.21.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-1-0">TensorRT-LLM Release 1.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-features-and-enhancements">Key Features and Enhancements</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#infrastructure-changes">Infrastructure Changes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#api-changes">API Changes</a></li>
@@ -2011,7 +2214,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#known-issues">Known Issues</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-20-0">TensorRT-LLM Release 0.20.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-21-0">TensorRT-LLM Release 0.21.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Key Features and Enhancements</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Infrastructure Changes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">API Changes</a></li>
@@ -2019,119 +2222,127 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Known Issues</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-19-0">TensorRT-LLM Release 0.19.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-20-0">TensorRT-LLM Release 0.20.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id10">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id10">Fixed Issues</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id11">Known Issues</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-18-2">TensorRT-LLM Release 0.18.2</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-19-0">TensorRT-LLM Release 0.19.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id12">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id13">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id14">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id15">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id16">Known Issues</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-18-2">TensorRT-LLM Release 0.18.2</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id17">Key Features and Enhancements</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-18-1">TensorRT-LLM Release 0.18.1</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id13">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id14">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id18">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id19">Infrastructure Changes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-18-0">TensorRT-LLM Release 0.18.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id15">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id16">Known Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id17">Infrastructure Changes</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-17-0">TensorRT-LLM Release 0.17.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id18">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id19">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id20">Known Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id21">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id20">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id21">Known Issues</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id22">Infrastructure Changes</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-16-0">TensorRT-LLM Release 0.16.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-17-0">TensorRT-LLM Release 0.17.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id23">Key Features and Enhancements</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id24">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id25">Known Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id26">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id27">Infrastructure Changes</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-16-0">TensorRT-LLM Release 0.16.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id28">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id29">API Changes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#model-updates">Model Updates</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id25">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id26">Infrastructure Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id27">Known Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id30">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id31">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id32">Known Issues</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-15-0">TensorRT-LLM Release 0.15.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id28">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id29">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id30">Model Updates</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id31">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id32">Infrastructure Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#documentation">Documentation</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-14-0">TensorRT-LLM Release 0.14.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id33">Key Features and Enhancements</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id34">API Changes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id35">Model Updates</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id36">Fixed Issues</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id37">Infrastructure Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id38">Documentation</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id39">Known Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#documentation">Documentation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-14-0">TensorRT-LLM Release 0.14.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id38">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id39">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id40">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id41">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id42">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id43">Documentation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id44">Known Issues</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-13-0">TensorRT-LLM Release 0.13.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id40">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id41">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id42">Model Updates</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id43">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id44">Infrastructure Changes</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-12-0">TensorRT-LLM Release 0.12.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id45">Key Features and Enhancements</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id46">API Changes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id47">Model Updates</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id48">Fixed Issues</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id49">Infrastructure Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id50">Known Issues</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-12-0">TensorRT-LLM Release 0.12.0</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id50">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id51">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id52">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id53">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id54">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id55">Known Issues</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-11-0">TensorRT-LLM Release 0.11.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id51">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id52">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id53">Model Updates</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id54">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id55">Infrastructure Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id56">Known Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id56">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id57">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id58">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id59">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id60">Infrastructure Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id61">Known Issues</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-10-0">TensorRT-LLM Release 0.10.0</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#announcements">Announcements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id57">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id58">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id59">Model Updates</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id60">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id61">Infrastructure changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id62">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id63">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id64">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id65">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id66">Infrastructure changes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-9-0">TensorRT-LLM Release 0.9.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id62">Announcements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id63">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id64">API Changes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id65">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id67">Announcements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id68">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id69">API Changes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id70">Model Updates</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations">Limitations</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id66">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id71">Fixed Issues</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-8-0">TensorRT-LLM Release 0.8.0</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id67">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id68">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id72">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id73">Model Updates</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-release-0-7-1">TensorRT-LLM Release 0.7.1</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id69">Key Features and Enhancements</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id70">Model Updates</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id71">Fixed Issues</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id72">Known Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id74">Key Features and Enhancements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id75">Model Updates</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id76">Fixed Issues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id77">Known Issues</a></li>
 </ul>
 </li>
 </ul>
@@ -2228,9 +2439,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

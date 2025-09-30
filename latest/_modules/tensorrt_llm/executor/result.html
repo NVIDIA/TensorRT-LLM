@@ -8,7 +8,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>tensorrt_llm.executor.result &#8212; TensorRT-LLM</title>
+    <title>tensorrt_llm.executor.result &#8212; TensorRT LLM</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -136,11 +136,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -243,11 +243,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -332,6 +332,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -404,16 +405,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -714,6 +718,7 @@
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span>
 
     <span class="nd">@property</span>
+    <span class="c1"># TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">mm_embedding_handle</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_mm_embedding_handle</span>
 
@@ -741,22 +746,36 @@
         <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">cum_log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">cum_log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
 
-        <span class="k">if</span> <span class="n">logprobs_result</span><span class="p">:</span>
+        <span class="c1"># prompt logprobs handling</span>
+        <span class="k">if</span> <span class="n">logprobs_result</span> <span class="ow">and</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># both backends</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span>
+        <span class="c1"># generation logprobs handling (provenance varies by backend)</span>
+        <span class="k">if</span> <span class="n">logprobs_result</span> <span class="ow">and</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">generation</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># TRT backend</span>
             <span class="c1"># update logprobs from ResponseWrapper (TRT top logprobs WAR)</span>
             <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span>
             <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">generation</span>
-        <span class="k">elif</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># handle logprobs directly from response tensors</span>
+        <span class="k">elif</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>  <span class="c1"># PyTorch backend</span>
+            <span class="c1"># handle logprobs directly from response tensors given by sampler</span>
             <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+            <span class="c1"># In streaming mode, since out-of-order responses are not possible,</span>
+            <span class="c1"># each streamed response_tensors.log_probs[src_idx]</span>
+            <span class="c1"># contains a streamwise monotonically growing list of logprobs.</span>
+            <span class="c1"># so we need to accumulate only the new ones unique to that particular streamed response</span>
+            <span class="k">assert</span> <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">&lt;=</span> <span class="nb">len</span><span class="p">(</span>
+                <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
+            <span class="p">),</span> <span class="p">(</span><span class="sa">f</span><span class="s2">&quot;_last_logprobs_len (</span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="si">}</span><span class="s2">) &gt; log_probs length (&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">])</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">][</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="p">:]</span>
             <span class="c1"># overcome some WAR in the cpp executor</span>
             <span class="k">if</span> <span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">!=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">CANCELLED</span><span class="p">:</span>
+                <span class="c1"># Check if logprobs is a list (not a dict or other structure)</span>
                 <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">:</span>
                     <span class="c1"># LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.</span>
                     <span class="c1"># Therefore, we treat extra logprobs/logits as expected and only consume what&#39;s needed.</span>
                     <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
                 <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span> <span class="o">==</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span>
+
         <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">generation_logits</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span><span class="p">[</span>
                 <span class="n">src_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
@@ -866,6 +885,17 @@
             <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;mm_embedding_handle&#39;</span>
                        <span class="p">)</span> <span class="ow">and</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_mm_embedding_handle</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
+                    <span class="p">],</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_hashes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">DisaggregatedParams</span><span class="p">(</span>
+                        <span class="n">multimodal_embedding_handles</span><span class="o">=</span><span class="p">[</span>
+                            <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handle</span>
+                        <span class="p">],</span>
+                        <span class="n">multimodal_hashes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span><span class="p">)</span>
 
             <span class="c1"># Processing background errors here ASAF during generation.</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">and</span> <span class="p">(</span>
@@ -1016,6 +1046,12 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">weakref</span><span class="o">.</span><span class="n">ReferenceType</span><span class="p">[</span>
             <span class="s2">&quot;GenerationExecutor&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="n">executor</span><span class="p">)</span> <span class="k">if</span> <span class="n">executor</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_aborted</span> <span class="o">=</span> <span class="kc">False</span>
+
+        <span class="c1"># Pipelined multimodal hashes from request to result</span>
+        <span class="n">mm_hashes</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+            <span class="nb">getattr</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">generation_request</span><span class="p">,</span> <span class="s2">&quot;multimodal_params&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+                    <span class="s2">&quot;multimodal_input&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="s2">&quot;multimodal_hashes&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_multimodal_hashes</span> <span class="o">=</span> <span class="n">mm_hashes</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_id</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1195,7 +1231,12 @@
     <span class="n">output_token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LogProbsResult</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Compute top-K logprobs and ranks for each token position.</span>
+<span class="sd">    Compute top-K logprobs from logits when engine doesn&#39;t provide them directly.</span>
+
+<span class="sd">    Used for post-processing logits into logprobs.</span>
+<span class="sd">    - Prompt logprobs (from context_logits): always used.</span>
+<span class="sd">    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn&#39;t compute them in sampler (e.g., TRT).</span>
+<span class="sd">    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.</span>
 
 <span class="sd">    Returns:</span>
 <span class="sd">        LogProbsResult, a NamedTuple containing:</span>
@@ -1385,9 +1426,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

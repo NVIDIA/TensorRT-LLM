@@ -8,7 +8,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>tensorrt_llm.models.modeling_utils &#8212; TensorRT-LLM</title>
+    <title>tensorrt_llm.models.modeling_utils &#8212; TensorRT LLM</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -136,11 +136,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -243,11 +243,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -332,6 +332,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -404,16 +405,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -583,7 +587,7 @@
 
 
 <div class="viewcode-block" id="SpeculativeDecodingMode">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.SpeculativeDecodingMode">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SpeculativeDecodingMode</span><span class="p">(</span><span class="n">IntFlag</span><span class="p">):</span>
     <span class="c1"># [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/runtime/speculativeDecodingMode.h</span>
     <span class="n">NONE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
@@ -597,7 +601,7 @@
     <span class="n">AUTO</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
 
 <div class="viewcode-block" id="SpeculativeDecodingMode.from_arguments">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.SpeculativeDecodingMode.from_arguments">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode.from_arguments">[docs]</a>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_arguments</span><span class="p">(</span><span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -625,7 +629,7 @@
 
 
 <div class="viewcode-block" id="QuantConfig">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.models.QuantConfig">[docs]</a>
 <span class="nd">@dataclasses</span><span class="o">.</span><span class="n">dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">QuantConfig</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
@@ -734,7 +738,7 @@
             <span class="k">return</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="QuantConfig.is_module_excluded_from_quantization">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.is_module_excluded_from_quantization">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.models.QuantConfig.is_module_excluded_from_quantization">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_module_excluded_from_quantization</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Check if the module is excluded from quantization.</span>
 
@@ -752,7 +756,7 @@
 
 
 <div class="viewcode-block" id="QuantConfig.from_dict">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.from_dict">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.models.QuantConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;QuantConfig&#39;</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Create a QuantConfig instance from a dict.</span>
@@ -768,7 +772,7 @@
 
 
 <div class="viewcode-block" id="QuantConfig.to_dict">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.to_dict">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.models.QuantConfig.to_dict">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Dump a QuantConfig instance to a dict.</span>
 
@@ -876,7 +880,7 @@
 
 
 <div class="viewcode-block" id="PretrainedConfig">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PretrainedConfig</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -971,7 +975,7 @@
                 <span class="k">raise</span> <span class="n">err</span>
 
 <div class="viewcode-block" id="PretrainedConfig.create_runtime_defaults">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.create_runtime_defaults">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.create_runtime_defaults">[docs]</a>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">create_runtime_defaults</span><span class="p">(</span>
             <span class="n">defaults</span><span class="p">:</span> <span class="s2">&quot;RuntimeDefaultsIn&quot;</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">RuntimeDefaults</span><span class="p">]:</span>
@@ -994,14 +998,14 @@
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
 
 <div class="viewcode-block" id="PretrainedConfig.set_if_not_exist">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.set_if_not_exist">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.set_if_not_exist">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_if_not_exist</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
             <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.from_dict">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.from_dict">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="c1"># Maybe we need AutoConfig for this</span>
@@ -1012,7 +1016,7 @@
 
 
 <div class="viewcode-block" id="PretrainedConfig.to_dict">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.to_dict">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.to_dict">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">output</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">)</span>
 
@@ -1025,7 +1029,7 @@
 
 
 <div class="viewcode-block" id="PretrainedConfig.from_json_file">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.from_json_file">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.from_json_file">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
@@ -1044,21 +1048,21 @@
 
 
 <div class="viewcode-block" id="PretrainedConfig.from_checkpoint">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.from_checkpoint">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.from_checkpoint">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="s1">&#39;config.json&#39;</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.to_json_file">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.to_json_file">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.to_json_file">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">to_json_file</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">,</span> <span class="s1">&#39;w&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">to_dict</span><span class="p">(),</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.to_layer_quant_config">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.to_layer_quant_config">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.to_layer_quant_config">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">to_layer_quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
@@ -1089,26 +1093,26 @@
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">_get_quant_cfg</span><span class="p">(</span><span class="n">module_name</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PretrainedConfig.set_rank">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.set_rank">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.set_rank">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.get_config_group">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.get_config_group">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.get_config_group">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_config_group</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group_cls</span><span class="p">:</span> <span class="s2">&quot;Type[CG]&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;CG&quot;</span><span class="p">:</span>
         <span class="n">cfg</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">group_cls</span><span class="o">.</span><span class="n">keys</span><span class="p">()}</span>
         <span class="k">return</span> <span class="n">group_cls</span><span class="p">(</span><span class="o">**</span><span class="n">cfg</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.has_config_group">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.has_config_group">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.has_config_group">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">has_config_group</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group_cls</span><span class="p">:</span> <span class="s2">&quot;Type[CG]&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;bool&quot;</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">all</span><span class="p">(</span><span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">group_cls</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.for_each_rank">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.for_each_rank">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.for_each_rank">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">for_each_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;Generator[Self, None, None]&quot;</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">):</span>
             <span class="n">config_copy</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
@@ -1237,7 +1241,7 @@
 
 
 <div class="viewcode-block" id="PretrainedModel">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PretrainedModel</span><span class="p">(</span><span class="n">Module</span><span class="p">,</span>
                       <span class="n">GenerationMixin</span><span class="p">,</span>
                       <span class="n">TopModelMixin</span><span class="p">,</span>
@@ -1258,7 +1262,7 @@
             <span class="bp">self</span><span class="p">,</span> <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PretrainedModel.release">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.release">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.release">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">release_gc</span><span class="p">()</span></div>
 
@@ -1267,7 +1271,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
 
 <div class="viewcode-block" id="PretrainedModel.check_config">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.check_config">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.check_config">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="si">}</span><span class="s2"> is an abstract class. Only classes inheriting this class can be called.&quot;</span>
@@ -1275,14 +1279,14 @@
 
 
 <div class="viewcode-block" id="PretrainedModel.from_config">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.from_config">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.from_config">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedModel.from_checkpoint">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.from_checkpoint">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.from_checkpoint">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_checkpoint</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
@@ -1325,7 +1329,7 @@
 
 
 <div class="viewcode-block" id="PretrainedModel.load">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.load">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.load">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">from_pruned</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="n">required_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
@@ -1367,7 +1371,7 @@
 
 
 <div class="viewcode-block" id="PretrainedModel.save_checkpoint">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.save_checkpoint">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.save_checkpoint">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">save_checkpoint</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">,</span> <span class="n">save_config</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
         <span class="c1"># multiple ranks could share same config.json, so adding a save_config parameter to let user avoiding writing config.json in all ranks</span>
         <span class="n">rank</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
@@ -1389,7 +1393,7 @@
 
 
 <div class="viewcode-block" id="PretrainedModel.prepare_inputs">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.prepare_inputs">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.prepare_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">max_batch_size</span><span class="p">,</span>
@@ -1537,7 +1541,7 @@
 
 
 <div class="viewcode-block" id="PretrainedModel.quantize">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.quantize">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.quantize">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
@@ -2541,7 +2545,7 @@
                 <span class="n">log</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">config_path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">output_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
     <span class="k">if</span> <span class="n">log</span><span class="p">:</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Saving TensorRT-LLM configuration to </span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Saving TensorRT LLM configuration to </span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
     <span class="n">config_path</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="n">config_path</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">(),</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">))</span>
 
@@ -2661,9 +2665,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

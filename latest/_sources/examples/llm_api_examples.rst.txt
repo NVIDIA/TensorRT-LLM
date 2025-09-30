@@ -23,6 +23,7 @@ _____________
    llm_multilora
    llm_speculative_decoding
    llm_kv_cache_connector
+   llm_kv_cache_offloading
    llm_runtime
    llm_sampling
 

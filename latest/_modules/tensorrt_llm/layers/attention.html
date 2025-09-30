@@ -8,7 +8,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>tensorrt_llm.layers.attention &#8212; TensorRT-LLM</title>
+    <title>tensorrt_llm.layers.attention &#8212; TensorRT LLM</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -136,11 +136,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -243,11 +243,11 @@
       
     
     
-    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -332,6 +332,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -404,16 +405,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -543,7 +547,7 @@
 
 
 <div class="viewcode-block" id="make_causal_mask">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.make_causal_mask">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.make_causal_mask">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">make_causal_mask</span><span class="p">(</span><span class="n">bsz</span><span class="p">,</span> <span class="n">tgt_len</span><span class="p">,</span> <span class="n">past_key_values_length</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
     <span class="n">_range</span> <span class="o">=</span> <span class="n">arange</span><span class="p">(</span><span class="n">start</span><span class="o">=</span><span class="n">constant</span><span class="p">(</span><span class="n">int32_array</span><span class="p">(</span><span class="mi">0</span><span class="p">)),</span>
                     <span class="n">end</span><span class="o">=</span><span class="n">tgt_len</span><span class="p">,</span>
@@ -565,7 +569,7 @@
 
 
 <div class="viewcode-block" id="compute_relative_bias">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.compute_relative_bias">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.compute_relative_bias">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">compute_relative_bias</span><span class="p">(</span><span class="n">query_length</span><span class="p">,</span>
                           <span class="n">key_length</span><span class="p">,</span>
                           <span class="n">num_buckets</span><span class="p">,</span>
@@ -632,7 +636,7 @@
 
 
 <div class="viewcode-block" id="AttentionMaskParams">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionMaskParams">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionMaskParams">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionMaskParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -648,7 +652,7 @@
 
 
 <div class="viewcode-block" id="AttentionParams">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -695,7 +699,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">long_mscale</span> <span class="o">=</span> <span class="mf">1.0</span>
 
 <div class="viewcode-block" id="AttentionParams.fill_attention_const_params_for_rope">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_rope">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_rope">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">fill_attention_const_params_for_rope</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
             <span class="n">embed_positions</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -714,7 +718,7 @@
 
 
 <div class="viewcode-block" id="AttentionParams.fill_attention_const_params_for_long_rope">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_long_rope">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_long_rope">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">fill_attention_const_params_for_long_rope</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span> <span class="n">embed_positions</span><span class="p">,</span> <span class="n">long_rope_embed_positions</span><span class="p">,</span> <span class="n">rotary_inv_freq</span><span class="p">,</span>
             <span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span><span class="p">,</span>
@@ -732,7 +736,7 @@
 
 
 <div class="viewcode-block" id="AttentionParams.is_valid_cross_attn">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid_cross_attn">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid_cross_attn">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_valid_cross_attn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">do_cross_attention</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">do_cross_attention</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_input_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -743,7 +747,7 @@
 
 
 <div class="viewcode-block" id="AttentionParams.is_valid">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">,</span>
                  <span class="n">use_kv_cache</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
@@ -772,7 +776,7 @@
 
 
 <div class="viewcode-block" id="SpecDecodingParams">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.SpecDecodingParams">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.SpecDecodingParams">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SpecDecodingParams</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -793,7 +797,7 @@
 
 
 <div class="viewcode-block" id="MropeParams">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.MropeParams">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.MropeParams">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MropeParams</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -807,7 +811,7 @@
 
 
 <div class="viewcode-block" id="KeyValueCacheParams">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">KeyValueCacheParams</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -841,7 +845,7 @@
         <span class="c1"># self.past_key_value_length = past_key_value_length</span>
 
 <div class="viewcode-block" id="KeyValueCacheParams.get_first_past_key_value">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_first_past_key_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
@@ -849,14 +853,14 @@
 
 
 <div class="viewcode-block" id="KeyValueCacheParams.fill_none_tensor_list">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.fill_none_tensor_list">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.fill_none_tensor_list">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">fill_none_tensor_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">list_size</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">list_size</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KeyValueCacheParams.is_valid">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.is_valid">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.is_valid">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_past_key_value_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -874,7 +878,7 @@
 
 
 <div class="viewcode-block" id="BlockSparseAttnParams">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BlockSparseAttnParams">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BlockSparseAttnParams">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">BlockSparseAttnParams</span><span class="p">:</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -890,7 +894,7 @@
 
 
 <div class="viewcode-block" id="Attention">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Attention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1123,7 +1127,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_kv</span> <span class="o">=</span> <span class="n">skip_cross_kv</span>
 
 <div class="viewcode-block" id="Attention.create_attention_const_params">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.create_attention_const_params">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.create_attention_const_params">[docs]</a>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">create_attention_const_params</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="c1"># get rotary parameters.</span>
@@ -1286,7 +1290,7 @@
 
 
 <div class="viewcode-block" id="Attention.fill_attention_params">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.fill_attention_params">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.fill_attention_params">[docs]</a>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">fill_attention_params</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_rope</span><span class="p">():</span>
@@ -1329,7 +1333,7 @@
         <span class="k">return</span> <span class="n">attention_output_orig_quant_scale</span>
 
 <div class="viewcode-block" id="Attention.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
@@ -2138,7 +2142,7 @@
 
 
 <div class="viewcode-block" id="Attention.set_rel_attn_table">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.set_rel_attn_table">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.set_rel_attn_table">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_rel_attn_table</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">,</span> <span class="n">precomputed_relative_attention</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rel_attn_table</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
                                                <span class="n">max_seq_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
@@ -2148,7 +2152,7 @@
 
 
 <div class="viewcode-block" id="Attention.postprocess">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.postprocess">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.postprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 
         <span class="k">if</span> <span class="n">tllm_key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;kv_cache_scaling_factor&quot;</span><span class="p">):</span>
@@ -2176,7 +2180,7 @@
 
 
 <div class="viewcode-block" id="BertAttention">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">BertAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -2264,7 +2268,7 @@
                                             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="BertAttention.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -2397,7 +2401,7 @@
 
 
 <div class="viewcode-block" id="CogVLMAttention">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CogVLMAttention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -2456,7 +2460,7 @@
                                    <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
 
 <div class="viewcode-block" id="CogVLMAttention.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -2568,7 +2572,7 @@
 
 
 <div class="viewcode-block" id="DeepseekV2Attention">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DeepseekV2Attention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -2711,7 +2715,7 @@
         <span class="p">})</span>
 
 <div class="viewcode-block" id="DeepseekV2Attention.weight_loader">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.weight_loader">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.weight_loader">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">weight_loader</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">param</span><span class="p">:</span> <span class="n">Parameter</span><span class="p">,</span>
                       <span class="n">loaded_weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
         <span class="c1"># use_parallel_embedding</span>
@@ -2726,7 +2730,7 @@
 
 
 <div class="viewcode-block" id="DeepseekV2Attention.postprocess">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.postprocess">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.postprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">split_matrix_tp</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">idx</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
@@ -2803,7 +2807,7 @@
 
 
 <div class="viewcode-block" id="DeepseekV2Attention.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -2958,7 +2962,7 @@
 
 
 <div class="viewcode-block" id="DiffusersAttention">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DiffusersAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -3222,7 +3226,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">norm_added_k</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="DiffusersAttention.joint_attn_forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention.joint_attn_forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention.joint_attn_forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">joint_attn_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                            <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                            <span class="n">encoder_hidden_states</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -3366,7 +3370,7 @@
 
 
 <div class="viewcode-block" id="DiffusersAttention.forward">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention.forward">[docs]</a>
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention.forward">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">encoder_hidden_states</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -3494,9 +3498,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

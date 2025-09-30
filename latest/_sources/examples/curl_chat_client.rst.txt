@@ -2,7 +2,7 @@ Curl Chat Client
 ================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/curl_chat_client.sh.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/560ded5450b79efde720162fc397d7efa59aae6d/examples/serve/curl_chat_client.sh.
 
 .. literalinclude:: ../../../examples/serve/curl_chat_client.sh
     :lines: 1-11

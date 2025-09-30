@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Speculative Decoding &#8212; TensorRT-LLM</title>
+    <title>Speculative Decoding &#8212; TensorRT LLM</title>
   
   
   
@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -139,11 +139,11 @@
       
     
     
-    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -246,11 +246,11 @@
       
     
     
-    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -335,6 +335,7 @@
 <li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2 current active"><a class="current reference internal" href="#">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -407,16 +408,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -496,14 +500,14 @@
                   
   <section id="speculative-decoding">
 <h1>Speculative Decoding<a class="headerlink" href="#speculative-decoding" title="Link to this heading">#</a></h1>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_speculative_decoding.py">NVIDIA/TensorRT-LLM</a>.</p>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/560ded5450b79efde720162fc397d7efa59aae6d/examples/llm-api/llm_speculative_decoding.py">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
 <span class="linenos"> 2</span>
 <span class="linenos"> 3</span><span class="kn">import</span><span class="w"> </span><span class="nn">click</span>
 <span class="linenos"> 4</span>
 <span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 6</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">,</span> <span class="n">MTPDecodingConfig</span><span class="p">,</span>
-<span class="linenos"> 7</span>                                 <span class="n">NGramDecodingConfig</span><span class="p">)</span>
+<span class="linenos"> 6</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
+<span class="linenos"> 7</span>                                 <span class="n">MTPDecodingConfig</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">)</span>
 <span class="linenos"> 8</span>
 <span class="linenos"> 9</span><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
 <span class="linenos">10</span>    <span class="s2">&quot;What is the capital of France?&quot;</span><span class="p">,</span>
@@ -534,58 +538,61 @@
 <span class="linenos">35</span>        <span class="n">speculative_model_dir</span><span class="o">=</span><span class="s2">&quot;yuhuili/EAGLE3-LLaMA3.1-Instruct-8B&quot;</span><span class="p">,</span>
 <span class="linenos">36</span>        <span class="n">eagle3_one_model</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="linenos">37</span>
-<span class="linenos">38</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-<span class="linenos">39</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span>
-<span class="linenos">40</span>        <span class="n">speculative_config</span><span class="o">=</span><span class="n">spec_config</span><span class="p">,</span>
-<span class="linenos">41</span>    <span class="p">)</span>
-<span class="linenos">42</span>
-<span class="linenos">43</span>    <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">:</span>
-<span class="linenos">44</span>        <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">10</span><span class="p">))</span>
-<span class="linenos">45</span>        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
-<span class="linenos">46</span>
-<span class="linenos">47</span>
-<span class="linenos">48</span><span class="k">def</span><span class="w"> </span><span class="nf">run_ngram</span><span class="p">():</span>
-<span class="linenos">49</span>    <span class="n">spec_config</span> <span class="o">=</span> <span class="n">NGramDecodingConfig</span><span class="p">(</span>
-<span class="linenos">50</span>        <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
-<span class="linenos">51</span>        <span class="n">max_matching_ngram_size</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
-<span class="linenos">52</span>        <span class="n">is_keep_all</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">53</span>        <span class="n">is_use_oldest</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">54</span>        <span class="n">is_public_pool</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">55</span>    <span class="p">)</span>
-<span class="linenos">56</span>
-<span class="linenos">57</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-<span class="linenos">58</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span>
-<span class="linenos">59</span>        <span class="n">speculative_config</span><span class="o">=</span><span class="n">spec_config</span><span class="p">,</span>
-<span class="linenos">60</span>        <span class="c1"># ngram doesn&#39;t work with overlap_scheduler</span>
-<span class="linenos">61</span>        <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">62</span>    <span class="p">)</span>
-<span class="linenos">63</span>
-<span class="linenos">64</span>    <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">:</span>
-<span class="linenos">65</span>        <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">10</span><span class="p">))</span>
-<span class="linenos">66</span>        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
-<span class="linenos">67</span>
-<span class="linenos">68</span>
-<span class="linenos">69</span><span class="nd">@click</span><span class="o">.</span><span class="n">command</span><span class="p">()</span>
-<span class="linenos">70</span><span class="nd">@click</span><span class="o">.</span><span class="n">argument</span><span class="p">(</span><span class="s2">&quot;algo&quot;</span><span class="p">,</span>
-<span class="linenos">71</span>                <span class="nb">type</span><span class="o">=</span><span class="n">click</span><span class="o">.</span><span class="n">Choice</span><span class="p">([</span><span class="s2">&quot;MTP&quot;</span><span class="p">,</span> <span class="s2">&quot;EAGLE3&quot;</span><span class="p">,</span> <span class="s2">&quot;DRAFT_TARGET&quot;</span><span class="p">,</span> <span class="s2">&quot;NGRAM&quot;</span><span class="p">]))</span>
-<span class="linenos">72</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--model&quot;</span><span class="p">,</span>
-<span class="linenos">73</span>              <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
-<span class="linenos">74</span>              <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-<span class="linenos">75</span>              <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Path to the model or model name.&quot;</span><span class="p">)</span>
-<span class="linenos">76</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">algo</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-<span class="linenos">77</span>    <span class="n">algo</span> <span class="o">=</span> <span class="n">algo</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
-<span class="linenos">78</span>    <span class="k">if</span> <span class="n">algo</span> <span class="o">==</span> <span class="s2">&quot;MTP&quot;</span><span class="p">:</span>
-<span class="linenos">79</span>        <span class="n">run_MTP</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
-<span class="linenos">80</span>    <span class="k">elif</span> <span class="n">algo</span> <span class="o">==</span> <span class="s2">&quot;EAGLE3&quot;</span><span class="p">:</span>
-<span class="linenos">81</span>        <span class="n">run_Eagle3</span><span class="p">()</span>
-<span class="linenos">82</span>    <span class="k">elif</span> <span class="n">algo</span> <span class="o">==</span> <span class="s2">&quot;NGRAM&quot;</span><span class="p">:</span>
-<span class="linenos">83</span>        <span class="n">run_ngram</span><span class="p">()</span>
-<span class="linenos">84</span>    <span class="k">else</span><span class="p">:</span>
-<span class="linenos">85</span>        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Invalid algorithm: </span><span class="si">{</span><span class="n">algo</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">86</span>
-<span class="linenos">87</span>
-<span class="linenos">88</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
-<span class="linenos">89</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">38</span>    <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">)</span>
+<span class="linenos">39</span>
+<span class="linenos">40</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+<span class="linenos">41</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span>
+<span class="linenos">42</span>        <span class="n">speculative_config</span><span class="o">=</span><span class="n">spec_config</span><span class="p">,</span>
+<span class="linenos">43</span>        <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">kv_cache_config</span><span class="p">,</span>
+<span class="linenos">44</span>    <span class="p">)</span>
+<span class="linenos">45</span>
+<span class="linenos">46</span>    <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">:</span>
+<span class="linenos">47</span>        <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">10</span><span class="p">))</span>
+<span class="linenos">48</span>        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+<span class="linenos">49</span>
+<span class="linenos">50</span>
+<span class="linenos">51</span><span class="k">def</span><span class="w"> </span><span class="nf">run_ngram</span><span class="p">():</span>
+<span class="linenos">52</span>    <span class="n">spec_config</span> <span class="o">=</span> <span class="n">NGramDecodingConfig</span><span class="p">(</span>
+<span class="linenos">53</span>        <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
+<span class="linenos">54</span>        <span class="n">max_matching_ngram_size</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
+<span class="linenos">55</span>        <span class="n">is_keep_all</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">56</span>        <span class="n">is_use_oldest</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">57</span>        <span class="n">is_public_pool</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">58</span>    <span class="p">)</span>
+<span class="linenos">59</span>
+<span class="linenos">60</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+<span class="linenos">61</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span>
+<span class="linenos">62</span>        <span class="n">speculative_config</span><span class="o">=</span><span class="n">spec_config</span><span class="p">,</span>
+<span class="linenos">63</span>        <span class="c1"># ngram doesn&#39;t work with overlap_scheduler</span>
+<span class="linenos">64</span>        <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">65</span>    <span class="p">)</span>
+<span class="linenos">66</span>
+<span class="linenos">67</span>    <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">:</span>
+<span class="linenos">68</span>        <span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">10</span><span class="p">))</span>
+<span class="linenos">69</span>        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+<span class="linenos">70</span>
+<span class="linenos">71</span>
+<span class="linenos">72</span><span class="nd">@click</span><span class="o">.</span><span class="n">command</span><span class="p">()</span>
+<span class="linenos">73</span><span class="nd">@click</span><span class="o">.</span><span class="n">argument</span><span class="p">(</span><span class="s2">&quot;algo&quot;</span><span class="p">,</span>
+<span class="linenos">74</span>                <span class="nb">type</span><span class="o">=</span><span class="n">click</span><span class="o">.</span><span class="n">Choice</span><span class="p">([</span><span class="s2">&quot;MTP&quot;</span><span class="p">,</span> <span class="s2">&quot;EAGLE3&quot;</span><span class="p">,</span> <span class="s2">&quot;DRAFT_TARGET&quot;</span><span class="p">,</span> <span class="s2">&quot;NGRAM&quot;</span><span class="p">]))</span>
+<span class="linenos">75</span><span class="nd">@click</span><span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">&quot;--model&quot;</span><span class="p">,</span>
+<span class="linenos">76</span>              <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
+<span class="linenos">77</span>              <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+<span class="linenos">78</span>              <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Path to the model or model name.&quot;</span><span class="p">)</span>
+<span class="linenos">79</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">algo</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="linenos">80</span>    <span class="n">algo</span> <span class="o">=</span> <span class="n">algo</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
+<span class="linenos">81</span>    <span class="k">if</span> <span class="n">algo</span> <span class="o">==</span> <span class="s2">&quot;MTP&quot;</span><span class="p">:</span>
+<span class="linenos">82</span>        <span class="n">run_MTP</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+<span class="linenos">83</span>    <span class="k">elif</span> <span class="n">algo</span> <span class="o">==</span> <span class="s2">&quot;EAGLE3&quot;</span><span class="p">:</span>
+<span class="linenos">84</span>        <span class="n">run_Eagle3</span><span class="p">()</span>
+<span class="linenos">85</span>    <span class="k">elif</span> <span class="n">algo</span> <span class="o">==</span> <span class="s2">&quot;NGRAM&quot;</span><span class="p">:</span>
+<span class="linenos">86</span>        <span class="n">run_ngram</span><span class="p">()</span>
+<span class="linenos">87</span>    <span class="k">else</span><span class="p">:</span>
+<span class="linenos">88</span>        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Invalid algorithm: </span><span class="si">{</span><span class="n">algo</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">89</span>
+<span class="linenos">90</span>
+<span class="linenos">91</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+<span class="linenos">92</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -718,9 +725,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

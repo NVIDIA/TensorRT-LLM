@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Overview &#8212; TensorRT-LLM</title>
+    <title>Overview &#8212; TensorRT LLM</title>
   
   
   
@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=13237357" />
-    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=95073da6" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
   <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc5" />
+  <meta name="docsearch:version" content="1.2.0rc0" />
 
 
   </head>
@@ -139,11 +139,11 @@
       
     
     
-    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a></div>
     
@@ -250,11 +250,11 @@
       
     
     
-    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
-    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
   
   
-    <p class="title logo__title">TensorRT-LLM</p>
+    <p class="title logo__title">TensorRT LLM</p>
   
 </a>
 
@@ -339,6 +339,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -411,16 +412,19 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -495,7 +499,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="overview">
+  <section class="tex2jax_ignore mathjax_ignore" id="overview">
 <span id="product-overview"></span><h1>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h1>
 <section id="about-tensorrt-llm">
 <h2>About TensorRT LLM<a class="headerlink" href="#about-tensorrt-llm" title="Link to this heading">#</a></h2>
@@ -506,7 +510,7 @@
 <section id="architected-on-pytorch">
 <h3>🔥 <strong>Architected on Pytorch</strong><a class="headerlink" href="#architected-on-pytorch" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM provides a high-level Python <a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-llm-api"><span class="std std-ref">LLM API</span></a> that supports a wide range of inference setups - from single-GPU to multi-GPU or multi-node deployments. It includes built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a> and the <a class="reference external" href="https://github.com/triton-inference-server/server">Triton Inference Server</a>.</p>
-<p>TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native architecture allows developers to experiment with the runtime or extend functionality. Several popular models are also pre-defined and can be customized using <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/tensorrt_llm/_torch/models/modeling_deepseekv3.py">native PyTorch code</a>, making it easy to adapt the system to specific needs.</p>
+<p>TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native architecture allows developers to experiment with the runtime or extend functionality. Several popular models are also pre-defined and can be customized using <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/tensorrt_llm/_torch/models/modeling_deepseekv3.py">native PyTorch code</a>, making it easy to adapt the system to specific needs.</p>
 </section>
 <section id="state-of-the-art-performance">
 <h3>⚡ <strong>State-of-the-Art Performance</strong><a class="headerlink" href="#state-of-the-art-performance" title="Link to this heading">#</a></h3>
@@ -519,16 +523,19 @@
 <section id="comprehensive-model-support">
 <h3>🎯 <strong>Comprehensive Model Support</strong><a class="headerlink" href="#comprehensive-model-support" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM supports the latest and most popular LLM architectures:</p>
-<ul class="simple">
-<li><p><strong>Language Models</strong>: GPT-OSS, Deepseek-R1/V3, Llama 3/4, Qwen2/3, Gemma 3, Phi 4…</p></li>
-<li><p><strong>Multi-modal Models</strong>: LLaVA-NeXT, Qwen2-VL, VILA, Llama 3.2 Vision…</p></li>
-</ul>
+</section>
+<section id="fp4-support">
+<h3>FP4 Support<a class="headerlink" href="#fp4-support" title="Link to this heading">#</a></h3>
+<p><a class="reference external" href="https://www.nvidia.com/en-us/data-center/dgx-b200/">NVIDIA B200 GPUs</a> , when used with TensorRT LLM, enable seamless loading of model weights in the new <a class="reference external" href="https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4">FP4 format</a>, allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.</p>
+</section>
+<section id="fp8-support">
+<h3>FP8 Support<a class="headerlink" href="#fp8-support" title="Link to this heading">#</a></h3>
 <p>TensorRT LLM strives to support the most popular models on <strong>Day 0</strong>.</p>
 </section>
 <section id="advanced-optimization-production-features">
 <h3>🚀 <strong>Advanced Optimization &amp; Production Features</strong><a class="headerlink" href="#advanced-optimization-production-features" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p><strong>In-Flight Batching &amp; Paged Attention</strong>: <a class="reference internal" href="features/attention.html#inflight-batching"><span class="std std-ref">In-flight Batching</span></a> eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.</p></li>
+<li><p><strong>In-Flight Batching &amp; Paged Attention</strong>: <a class="reference internal" href="legacy/advanced/gpt-attention.html#inflight-batching"><span class="std std-ref">In-flight Batching</span></a> eliminates wait times by dynamically managing request execution, processing context and generation phases together for maximum GPU utilization and reduced latency.</p></li>
 <li><p><strong>Multi-GPU Multi-Node Inference</strong>: Seamless distributed inference with tensor, pipeline, and expert parallelism across multiple GPUs and nodes through the Model Definition API.</p></li>
 <li><p><strong>Advanced Quantization</strong>:</p>
 <ul>
@@ -616,6 +623,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architected-on-pytorch">🔥 <strong>Architected on Pytorch</strong></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#state-of-the-art-performance">⚡ <strong>State-of-the-Art Performance</strong></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#comprehensive-model-support">🎯 <strong>Comprehensive Model Support</strong></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp4-support">FP4 Support</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-support">FP8 Support</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-optimization-production-features">🚀 <strong>Advanced Optimization &amp; Production Features</strong></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#latest-gpu-architecture-support">🔧 <strong>Latest GPU Architecture Support</strong></a></li>
 </ul>
@@ -715,9 +724,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 15, 2025.</p>
+  <p>Last updated on September 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
   
 </div></div>
       

@@ -1,6 +1,14 @@
 API Reference
 -------------
 
+.. note::
+    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.
+
+    1. :tag:`stable` - The item is stable and will keep consistent.
+    2. :tag:`prototype` - The item is a prototype and is subject to change.
+    3. :tag:`beta` - The item is in beta and approaching stability.
+    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.
+
 .. autoclass:: tensorrt_llm.llmapi.LLM
     :members:
     :undoc-members:
@@ -280,7 +288,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: parse_obj,model_rebuild,schema_json,model_computed_fields,parse_raw,validate,model_extra,dict,schema,model_fields_set,model_post_init,model_validate_json,model_dump,model_parametrized_name,model_validate,model_json_schema,model_validate_strings,model_construct,parse_file,from_orm,copy,model_config,model_copy,json,construct,model_dump_json,update_forward_refs,model_fields
+    :exclude-members: json,validate,model_dump_json,parse_obj,model_extra,model_post_init,model_dump,copy,model_fields_set,model_copy,model_computed_fields,model_parametrized_name,model_validate_json,dict,model_construct,model_fields,model_config,parse_file,construct,schema,model_validate_strings,model_validate,schema_json,model_rebuild,from_orm,update_forward_refs,parse_raw,model_json_schema
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -289,7 +297,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: parse_obj,model_rebuild,schema_json,model_computed_fields,parse_raw,validate,model_extra,dict,schema,model_fields_set,model_post_init,model_validate_json,model_dump,model_parametrized_name,model_validate,model_json_schema,model_validate_strings,model_construct,parse_file,from_orm,copy,model_config,model_copy,json,construct,model_dump_json,update_forward_refs,model_fields
+    :exclude-members: json,validate,model_dump_json,parse_obj,model_extra,model_post_init,model_dump,copy,model_fields_set,model_copy,model_computed_fields,model_parametrized_name,model_validate_json,dict,model_construct,model_fields,model_config,parse_file,construct,schema,model_validate_strings,model_validate,schema_json,model_rebuild,from_orm,update_forward_refs,parse_raw,model_json_schema
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
