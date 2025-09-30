@@ -165,6 +165,7 @@ class SpecMetadata:
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
     all_rank_num_tokens: Optional[List[int]] = None
+
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
     # The number of extra kv tokens

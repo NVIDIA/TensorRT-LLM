@@ -473,34 +473,34 @@ class CutlassFusedMoE(MoE):
                       1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_tp_rank_num_tokens_padded = [max(all_rank_num_tokens)
-                                             ] * len(all_rank_num_tokens)
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+                                          ] * len(all_rank_num_tokens)
         else:
-            all_tp_rank_num_tokens_padded = all_rank_num_tokens
+            all_rank_num_tokens_padded = all_rank_num_tokens
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 output_dtype,
-                all_rank_num_tokens=all_tp_rank_num_tokens_padded,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
             outputs = self.reducescatter_or_allreduce(
                 outputs,
-                all_rank_num_tokens=all_tp_rank_num_tokens_padded,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
         else:
             if self.use_dp:
                 all_rank_chunk_size_list = [
                     self.split_chunk(val, num_chunks)
-                    for val in all_tp_rank_num_tokens_padded
+                    for val in all_rank_num_tokens_padded
                 ]
-                all_tp_rank_num_tokens_list = [[
+                all_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
                 chunk_size_list = all_rank_chunk_size_list[self.rank]
             else:
-                all_tp_rank_num_tokens_list = [None] * num_chunks
+                all_rank_num_tokens_list = [None] * num_chunks
                 chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
 
             x_list = x.split(chunk_size_list)
@@ -514,14 +514,14 @@ class CutlassFusedMoE(MoE):
                 return self.forward_chunk(
                     x_,
                     router_logits_,
-                    all_rank_num_tokens=all_tp_rank_num_tokens_list[idx]
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
                     if self.use_dp else None,
                     use_dp_padding=use_dp_padding)
 
             def _reducescatter_or_allreduce(x_, idx):
                 return self.reducescatter_or_allreduce(
                     x_,
-                    all_rank_num_tokens=all_tp_rank_num_tokens_list[idx],
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
                     use_dp_padding=use_dp_padding)
 
             outputs_list = []
