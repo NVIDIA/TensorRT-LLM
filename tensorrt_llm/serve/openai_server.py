@@ -50,7 +50,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_harmony_post_processor, chat_harmony_streaming_post_processor,
     chat_response_post_processor, chat_stream_post_processor,
     completion_response_post_processor, completion_stream_post_processor)
-from tensorrt_llm.serve.responses_utils import ConversationHistoryStore
+from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
+                                                ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
@@ -163,11 +164,7 @@ class OpenAIServer:
             assert isinstance(self.llm, MultimodalEncoder), "llm must be a MultimodalEncoder for multimodal encoder"
             self.register_mm_encoder_routes()
 
-        @self.app.middleware("http")
-        async def add_process_time_header(raw_request: Request, call_next):
-            raw_request.state.server_arrival_time = get_steady_clock_now_in_seconds()
-            response = await call_next(raw_request)
-            return response
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
 
 
     async def await_disconnected(self, raw_request: Request, promise):
@@ -271,7 +268,7 @@ class OpenAIServer:
     async def health(self) -> Response:
         return Response(status_code=200)
 
-    async def health_generate(self) -> Response:
+    async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
         try:
             # Create a minimal chat request
@@ -283,10 +280,8 @@ class OpenAIServer:
                 temperature=0.0 # Deterministic output
             )
 
-            mock_request = None
-
             # Call the chat completion logic
-            response = await self.openai_chat(health_request, mock_request)
+            response = await self.openai_chat(health_request, raw_request)
 
             # Check if the response indicates success (status code 200)
             if response.status_code == 200:
@@ -302,7 +297,7 @@ class OpenAIServer:
                 return Response(status_code=500, content="Generation health check failed")
 
         except Exception as e:
-            logger.error(f"Health generate check encountered exception: {e}", exc_info=True)
+            logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500, content=f"Generation health check failed: {str(e)}")
 
     async def version(self) -> JSONResponse:
@@ -431,6 +426,8 @@ class OpenAIServer:
                 pp_results = first_response.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(first_response, args)
                 for pp_res in pp_results:
                     yield pp_res
+                # Making sure we can handling the situation where there is only one response
+                res = first_response
                 async for res in promise:
                     pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                     for pp_res in pp_results:

@@ -30,7 +30,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 DisaggregatedParams,
                                                 ErrorResponse)
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
+from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+                                                get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -137,11 +138,7 @@ class OpenAIDisaggServer:
 
         self.app = FastAPI(lifespan=lifespan)
 
-        @self.app.middleware("http")
-        async def add_process_time_header(raw_request: Request, call_next):
-            raw_request.state.server_arrival_time = get_steady_clock_now_in_seconds()
-            response = await call_next(raw_request)
-            return response
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):

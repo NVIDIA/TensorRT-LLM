@@ -1672,8 +1672,8 @@ public:
         {
             return false;
         }
-        auto const currentTime = getSteadyClockNow();
-        auto const elapsed = (std::chrono::duration_cast<Duration>(currentTime - mStartTime));
+        auto const currentTime = std::chrono::steady_clock::now();
+        auto const elapsed = (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - mStartTime));
         TLLM_LOG_DEBUG("Checked timeOut for request %ld with allotted Time %ld after time %ld and got %d", mRequestId,
             mAllottedTimeMs->count(), elapsed.count(), (elapsed >= mAllottedTimeMs));
 
@@ -2153,7 +2153,7 @@ private:
             // arrivalTime is assumed to be recorded at the rank 0, so no need to convert it to global clock
             mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getSteadyClockNow());
         }
-        mStartTime = getSteadyClockNow();
+        mStartTime = std::chrono::steady_clock::now();
     }
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
