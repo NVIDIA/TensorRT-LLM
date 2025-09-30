@@ -44,7 +44,7 @@ def test_dynamic_spec_decode(enforce_single_worker,
         model=target_model_dir,
         attn_backend="TRTLLM",
         disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
+        cuda_graph_config=None,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         # This max_seq_len is larger than the one specified
@@ -78,10 +78,19 @@ def test_dynamic_spec_decode(enforce_single_worker,
                 continue
 
             mock_should_use_spec_decode.call_count += 1
-            # Turn off spec decode when we've called it 5 times.
-            # In the current case, at the 5th call, there are 2 accepted draft tokens,
-            # so we can have better coverage for the switching between spec decode on and off.
-            if mock_should_use_spec_decode.call_count > 5:
+            print("mock_should_use_spec_decode.call_count: ",
+                  mock_should_use_spec_decode.call_count)
+            # Turn spec decoding on/off alternately.
+            # When call_count % 4 is 0 or 1, spec decoding is on.
+            # When call_count % 4 is 2 or 3, spec decoding is off.
+            # By doing this, we can cover all the cases of dynamic spec decoding.
+            # 1. Using spec decoding in iteration i, then using spec decoding in iteration i+1.
+            # 2. Using spec decoding in iteration i, then not using spec decoding in iteration i+1.
+            # 3. Not using spec decoding in iteration i, then using spec decoding in iteration i+1.
+            # 4. Not using spec decoding in iteration i, then not using spec decoding in iteration i+1.
+            if mock_should_use_spec_decode.call_count % 4 > 2:
+                return True
+            else:
                 return False
         return True
 
@@ -90,6 +99,24 @@ def test_dynamic_spec_decode(enforce_single_worker,
     # Reset mock state before using it
     mock_should_use_spec_decode.reset_mock()
     mock_should_use_spec_decode.call_count = 0
+
+    with patch(
+            'tensorrt_llm._torch.speculative.model_drafter.ModelDrafter.should_use_spec_decode',
+            mock_should_use_spec_decode):
+        num_tokens = 0
+        num_drafted = 0
+        num_accepted = 0
+        for output in llm_spec.generate_async(
+                llm_spec.tokenizer.encode("The future of AI is"),
+                sampling_params=SamplingParams(max_tokens=128, temperature=0),
+                streaming=True):
+            new_tokens = output.outputs[0].token_ids
+            num_drafted += max_draft_len
+            num_accepted += len(new_tokens) - num_tokens - 1
+            num_tokens = len(new_tokens)
+
+        accept_rate = num_accepted / num_drafted
+        print("accept_rate: ", accept_rate)
 
     with patch(
             'tensorrt_llm._torch.speculative.model_drafter.ModelDrafter.should_use_spec_decode',

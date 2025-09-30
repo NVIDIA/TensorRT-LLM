@@ -958,6 +958,7 @@ class TorchSampler(Sampler):
             num_accepted = self.process_draft_tokens(req, new_tokens)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
+                req.py_num_accepted_draft_tokens_last_iter = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
             else:
                 req.py_num_accepted_draft_tokens = 0

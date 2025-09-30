@@ -972,6 +972,13 @@ class PyExecutor:
                 self.active_requests, self.max_batch_size,
                 self.model_engine.max_num_tokens,
                 self.model_engine.spec_config.max_draft_len)
+
+            print("use_spec_decode: ", self.use_spec_decode)
+            if not self.use_spec_decode:
+                self.drafter.skip_spec_decode_cnt += 1
+
+            print("skip_spec_decode_cnt: ", self.drafter.skip_spec_decode_cnt)
+
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
             # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.

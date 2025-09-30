@@ -358,6 +358,7 @@ def create_py_executor(
             else:
                 use_chain_drafter = False
 
+            print("use_chain_drafter: ", use_chain_drafter)
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 

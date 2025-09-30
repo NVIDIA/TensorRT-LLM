@@ -297,6 +297,7 @@ class PyTorchModelEngine(ModelEngine):
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
         self.enable_spec_decode = self.is_spec_decode
+        self.skip_spec_decode_cnt = 0
         self.is_draft_model = is_draft_model
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(

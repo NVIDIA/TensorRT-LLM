@@ -76,6 +76,8 @@ class ModelDrafter(Drafter):
             assert guided_decoder is None
             assert spec_config._allow_greedy_draft_tokens
 
+        self.skip_spec_decode_cnt = 0
+
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
         """Create a draft request with common parameters."""
@@ -89,7 +91,7 @@ class ModelDrafter(Drafter):
             return_perf_metrics=request.return_perf_metrics,
             is_streaming=False,
             exclude_last_generation_logits=
-            True,  # prepare_draft_tokens uses overlap scheduling
+            False,  # prepare_draft_tokens uses overlap scheduling
             is_draft=True,
             # NB: self.sampler is shared with PyExecutor
             return_generation_logits=self.sampler.should_provide_draft_probs(
@@ -147,6 +149,10 @@ class ModelDrafter(Drafter):
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
                                               request.get_tokens(0))
 
+        print("skip_spec_decode_cnt: ", self.skip_spec_decode_cnt)
+        print("num_accepted_tokens: ",
+              request.py_num_accepted_draft_tokens_last_iter)
+
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
             # This is the first time the draft model is seeing this request.
@@ -155,6 +161,14 @@ class ModelDrafter(Drafter):
             assert num_draft_tokens == 0
             return self._create_context_request(request, input_tokens)
 
+        elif self.skip_spec_decode_cnt > 0:
+            recompute_num_tokens = request.py_num_accepted_draft_tokens_last_iter + self.skip_spec_decode_cnt if self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
+            ) else self.skip_spec_decode_cnt
+            print("recompute_num_tokens: ", recompute_num_tokens)
+            draft_request = self._create_accepted_tokens_request(
+                request, input_tokens, recompute_num_tokens)
+            self.skip_spec_decode_cnt = 0
+            return draft_request
         # No tokens accepted - generation request. This only applies to speculation algorithms
         # that need to recompute KV cache for accepted tokens like eagle3.
         elif num_accepted_tokens == 0 or not self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
