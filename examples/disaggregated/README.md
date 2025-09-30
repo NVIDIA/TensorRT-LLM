@@ -202,14 +202,14 @@ Additionally, we offer a fully executable script—please refer to [Disaggregate
 
 ## Mixed Precision Context and Generation
 
-In disaggregated serving, the context (prefill) workers and generation (decode) workers have different performance characteristics: prefill workers are typically compute-bound while decode workers are memory-bound. By running these workers with different precisions, you can optimize resource utilization and maximize overall throughput.
+In disaggregated serving, the context (prefill) workers and generation (decode) workers have different performance characteristics: prefill workers are typically compute-bound while decode workers are memory-bound. By running these workers with different precisions, we offer better functional support and an additional avenue to optimize resource utilization.
 
 ### Prerequisites
 
 To enable mixed precision serving, you'll need:
 1. A quantized checkpoint created with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
 2. The original unquantized checkpoint
-3. Both checkpoints must use the same KV cache dtype to ensure compatibility when transferring KV cache between context and generation servers
+3. Both checkpoints must use the same KV cache dtype to ensure compatibility during transfer
 
 ### Example (BF 16 Prefill, FP 8 Decode)
 
