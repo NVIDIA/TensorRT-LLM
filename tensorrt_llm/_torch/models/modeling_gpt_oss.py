@@ -146,8 +146,7 @@ class MLPBlock(torch.nn.Module):
             out_features=pretrained_config.num_local_experts,
             bias=True,
             dtype=pretrained_config.torch_dtype,
-            use_custom_cublas_mm=
-            False,  # TODO: check perf & cublass mm can not support bias.
+            use_custom_cublas_mm=True,
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(

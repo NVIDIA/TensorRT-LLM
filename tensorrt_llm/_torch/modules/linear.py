@@ -1590,7 +1590,7 @@ class Linear(nn.Module):
         weights_loading_config: Optional[WeightsLoadingConfig] = None,
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
-        use_custom_cublas_mm: bool = False,
+        use_custom_cublas_mm: bool = True,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
