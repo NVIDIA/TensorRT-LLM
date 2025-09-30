@@ -371,3 +371,4 @@ test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[qwen2.5-vl-7b-instru
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-0.8-video] SKIP (https://nvbugs/5547434)
 cpp/test_e2e.py::test_benchmarks[gpt-80] SKIP (https://nvbugs/5550689)
 cpp/test_e2e.py::test_benchmarks[bart-90] SKIP (https://nvbugs/5550689)
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3[cutlass] SKIP (https://nvbugs/5545286)
