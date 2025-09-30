@@ -347,7 +347,7 @@ def _grouped_attn_pattern_6(q, k, v, attn_mask, dropout_p, scale):
 
 
 def _grouped_attn_replacement_6(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False, scale=scale
     )
 
@@ -366,7 +366,7 @@ def _grouped_attn_pattern_7(q, k, v, attn_mask, dropout_p, scale):
 
 
 def _grouped_attn_replacement_7(q, k, v, attn_mask, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True, scale=scale
     )
 
@@ -385,7 +385,7 @@ def _grouped_attn_pattern_8(q, k, v, dropout_p, scale):
 
 
 def _grouped_attn_replacement_8(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False, scale=scale
     )
 
@@ -404,7 +404,7 @@ def _grouped_attn_pattern_9(q, k, v, dropout_p, scale):
 
 
 def _grouped_attn_replacement_9(q, k, v, dropout_p, scale):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True, scale=scale
     )
 
@@ -423,7 +423,7 @@ def _grouped_attn_pattern_10(q, k, v, n_rep, dropout_p):
 
 
 def _grouped_attn_replacement_10(q, k, v, n_rep, dropout_p):
-    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(
+    return torch.ops.auto_deploy.torch_attention.default(
         q,
         k,
         v,
