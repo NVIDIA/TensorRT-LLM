@@ -915,6 +915,7 @@ def test_llm_return_logprobs(prompt_logprobs: Optional[int],
         (2, None, True, False),  # prompt_logprobs with context_logits
         (2, None, False, False),  # prompt_logprobs only
         (2, 1, False, False),  # both prompt and generation logprobs
+        (2, 3, False, False),  # both prompt and generation logprobs
     ])
 def test_llm_return_logprobs_streaming(prompt_logprobs, logprobs,
                                        return_context_logits,
