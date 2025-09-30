@@ -579,10 +579,10 @@ def default_multimodal_input_loader(
             # Check if mdata is a MultimodalData
             if isinstance(mdata,
                           dict) and "modality" in mdata and "data" in mdata:
-                modality = mdata["modality"]
+                mdata_modality = mdata["modality"]
                 if modality == "multiple_image":
-                    modality = "image"
-                mm_data_tracker.add_data(modality, mdata["data"])
+                    mdata_modality = "image"
+                mm_data_tracker.add_data(mdata_modality, mdata["data"])
             else:
                 # Add embeddings to the tracker for placeholder handling
                 mm_data_tracker.add_data(mdata["modality"],
