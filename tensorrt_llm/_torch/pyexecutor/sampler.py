@@ -1090,8 +1090,7 @@ class TorchSampler(Sampler):
         num_accepted = num_initially_accepted
         for i in range(num_accepted):
             new_token = request.py_draft_tokens[i]
-            new_tokens_tensor[num_accepted, request.seq_slot,
-                              self.BEAM] = new_token
+            new_tokens_tensor[i, request.seq_slot, self.BEAM] = new_token
             request.add_new_token(new_token, self.BEAM)
             stop = self._handle_stop_criteria(request, new_token)
             if stop:
@@ -1100,7 +1099,8 @@ class TorchSampler(Sampler):
         if sample_last:
             new_token = sample_rejected(draft_probs, target_probs, generator,
                                         num_accepted)
-            new_tokens_tensor[i, request.seq_slot, self.BEAM] = new_token
+            new_tokens_tensor[num_accepted, request.seq_slot,
+                              self.BEAM] = new_token
             request.add_new_token(new_token, self.BEAM)
         else:
             new_token = add_token(request,
