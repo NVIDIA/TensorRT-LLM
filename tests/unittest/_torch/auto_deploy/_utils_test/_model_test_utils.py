@@ -446,6 +446,40 @@ _SMALL_MODEL_CONFIGS = {
             "vision_config": {"num_hidden_layers": 2},
         },
     },
+    "ibm-ai-platform/Bamba-9B-v2": {
+        "llm_models_subdir": "Bamba-9B-v2",
+        "model_kwargs": {
+            "torch_dtype": "bfloat16",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "mamba_chunk_size": 64,
+            "mamba_d_conv": 2,
+            "mamba_d_head": 16,
+            "mamba_d_state": 64,
+            "mamba_expand": 1,
+            "mamba_n_groups": 1,
+            "mamba_n_heads": 4,
+            "model_type": "bamba",
+            "num_hidden_layers": 10,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
+    "nvidia/NVIDIA-Nemotron-Nano-12B-v2": {
+        "llm_models_subdir": "NVIDIA-Nemotron-Nano-12B-v2",
+        "model_kwargs": {
+            "torch_dtype": "bfloat16",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "mamba_head_dim": 40,
+            "mamba_num_heads": 4,
+            "n_groups": 2,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 9,
+            "num_key_value_heads": 2,
+            "ssm_state_size": 32,
+        },
+    },
 }
 
 

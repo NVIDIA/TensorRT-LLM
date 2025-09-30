@@ -161,6 +161,7 @@ def prepare_flashinfer_metadata(
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for flashinfer attention.
@@ -213,7 +214,7 @@ def prepare_flashinfer_metadata(
 # As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
@@ -414,8 +415,8 @@ class FlashInferAttention(AttentionDescriptor):
         else:
             scale = source_attn_node.kwargs.get("scale", None)
 
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
         return [

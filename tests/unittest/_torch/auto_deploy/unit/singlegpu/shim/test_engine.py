@@ -52,7 +52,7 @@ def get_inference_model(cache_seq_interface):
 def test_engine(engine_cls: Type[ADEngine], attn_backend: str, attn_page_size: int):
     """Test the SimpleEngine functionality."""
 
-    seed = 1234  # Set random seed for model param init
+    seed = 42  # Set random seed for model param init
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

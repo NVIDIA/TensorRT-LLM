@@ -181,6 +181,7 @@ def prepare_fused_mla_metadata(
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
     num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)

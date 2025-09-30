@@ -277,6 +277,8 @@ def test_llama_7b_multi_lora_tp2():
         LLM,
         enable_lora=True,
         build_config=BuildConfig(lora_config=lora_config),
+        lora_config=lora_config,
+        tensor_parallel_size=2,
         fast_build=True,
         kv_cache_config=global_kv_cache_config)
 
