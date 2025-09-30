@@ -111,6 +111,10 @@ class GPUClockLock:
         self._is_monitoring = False
         self._state_data = []
 
+        # Fields for clock locking
+        self._original_clocks = {}
+        self._clocks_locked = False
+
     def get_os_properties(self):
         return self._os_properties
 
@@ -136,8 +140,91 @@ class GPUClockLock:
         """
         Get the target GPU clocks (sm_clk and mem_clk) for the first GPU in the list.
         """
-        # We don't set gpu clock currently, so let it return None.
+        if self._gpu_handles and len(self._gpu_handles) > 0:
+            try:
+                # Get maximum supported clocks for the first GPU
+                handle = self._gpu_handles[0]
+                max_sm_clk = pynvml.nvmlDeviceGetMaxClockInfo(
+                    handle, pynvml.NVML_CLOCK_SM)
+                max_mem_clk = pynvml.nvmlDeviceGetMaxClockInfo(
+                    handle, pynvml.NVML_CLOCK_MEM)
+                return (max_sm_clk, max_mem_clk)
+            except pynvml.NVMLError as e:
+                print_warning(f"Failed to get max clock info: {e}")
+                return None
         return None
+
+    def _lock_gpu_clocks(self):
+        """
+        Lock GPU clocks to maximum supported frequencies for consistent performance.
+        """
+        if self._mobile_disable_clock_locking:
+            print_info("Clock locking disabled for mobile/Jetson devices")
+            return
+
+        if not self._gpu_handles:
+            print_warning("No GPU handles available for clock locking")
+            return
+
+        target_clocks = self.get_target_gpu_clocks()
+        if not target_clocks:
+            print_warning("Could not determine target GPU clocks")
+            return
+
+        target_sm_clk, target_mem_clk = target_clocks
+
+        for gpu_idx, handle in enumerate(self._gpu_handles):
+            try:
+                # Store original clocks for restoration later
+                original_sm_clk = pynvml.nvmlDeviceGetApplicationsClock(
+                    handle, pynvml.NVML_CLOCK_SM)
+                original_mem_clk = pynvml.nvmlDeviceGetApplicationsClock(
+                    handle, pynvml.NVML_CLOCK_MEM)
+                self._original_clocks[gpu_idx] = (original_sm_clk,
+                                                  original_mem_clk)
+
+                # Set application clocks to maximum supported values
+                pynvml.nvmlDeviceSetApplicationsClocks(handle, target_mem_clk,
+                                                       target_sm_clk)
+                print_info(
+                    f"GPU {gpu_idx}: Locked clocks to SM={target_sm_clk}MHz, MEM={target_mem_clk}MHz"
+                )
+
+            except pynvml.NVMLError as e:
+                print_warning(f"Failed to lock clocks for GPU {gpu_idx}: {e}")
+                # Try to continue with other GPUs
+                continue
+
+        self._clocks_locked = True
+
+    def _unlock_gpu_clocks(self):
+        """
+        Restore GPU clocks to their original values.
+        """
+        if not self._clocks_locked or not self._gpu_handles:
+            return
+
+        for gpu_idx, handle in enumerate(self._gpu_handles):
+            try:
+                if gpu_idx in self._original_clocks:
+                    original_sm_clk, original_mem_clk = self._original_clocks[
+                        gpu_idx]
+                    pynvml.nvmlDeviceSetApplicationsClocks(
+                        handle, original_mem_clk, original_sm_clk)
+                    print_info(
+                        f"GPU {gpu_idx}: Restored clocks to SM={original_sm_clk}MHz, MEM={original_mem_clk}MHz"
+                    )
+                else:
+                    # Reset to default clocks if we don't have original values
+                    pynvml.nvmlDeviceResetApplicationsClocks(handle)
+                    print_info(f"GPU {gpu_idx}: Reset clocks to default")
+
+            except pynvml.NVMLError as e:
+                print_warning(
+                    f"Failed to restore clocks for GPU {gpu_idx}: {e}")
+
+        self._clocks_locked = False
+        self._original_clocks = {}
 
     def __enter__(self):
         """
@@ -154,6 +241,10 @@ class GPUClockLock:
                 for gpu_id in self._gpu_id_list
             ]
             print_info(f"Reinitialized GPU handles: {self._gpu_handles}")
+
+        # Lock GPU clocks for consistent performance
+        self._lock_gpu_clocks()
+
         self.start_monitor()
         return self
 
@@ -165,6 +256,10 @@ class GPUClockLock:
         - Validate gpu monitoring result.
         """
         self.stop_monitor()
+
+        # Restore original GPU clocks
+        self._unlock_gpu_clocks()
+
         self.validate_gpu_monitoring_data()
         print_info("gpu clock lock exit!!!")
 
@@ -233,8 +328,8 @@ class GPUClockLock:
         Call when the session finishes. Reset GPU clocks back to its original state.
         """
         # Revert clocks back to normal if all tests have finished.
-        # Set current clock value back to session entry clock.
-        #self.release_clock()
+        self._unlock_gpu_clocks()
+
         if self._nvml_initialized:
             pynvml.nvmlShutdown()
             self._nvml_initialized = False
