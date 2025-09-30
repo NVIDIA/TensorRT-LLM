@@ -31,7 +31,7 @@ make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LO
 
 ### Creating the TRT-LLM Server config
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server and populate it with the following recommended performance settings. Note that we should set kv_cache_reuse to false. 
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server. Note that we should set kv_cache_reuse to false. 
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
