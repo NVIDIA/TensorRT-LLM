@@ -25,7 +25,8 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-audio]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image_audio]
-  - accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
+  # MMMU sanity check
+  - accuracy/test_llm_api_pytorch.py::TestQwen2_5_VL_7B::test_auto_dtype
 - condition:
     ranges:
       system_gpu_count:
