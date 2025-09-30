@@ -235,7 +235,7 @@ struct BatchedGemmData
         void const* mPtrBias{nullptr};
 
         // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
-        // TensorRT LLM API requires a scaling factor on the device.
+        // TensorRT-LLM API requires a scaling factor on the device.
         // scaleC = dequantA * dequantB * quantC,
         // where dequantA is global dequantization scaling factor of A
         //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
@@ -250,7 +250,7 @@ struct BatchedGemmData
         float const* mPtrScaleC{nullptr};
 
         // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
-        // TensorRT LLM API requires a scaling factor on the device.
+        // TensorRT-LLM API requires a scaling factor on the device.
         // scaleGate = dequantA * dequantB,
         // where dequantA is global dequantization scaling factor of A
         //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
@@ -507,8 +507,25 @@ public:
             throw std::invalid_argument("Invalid combination of options");
         }
 
-        int32_t const numCtasTile
+        if (batchM)
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
+        }
+        else
+        {
+            numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
+        }
+
+        int32_t numCtasTile
             = batchM ? gemm::divUp(options.mN, options.mTileN) : gemm::divUp(options.mM, options.mTileM);
+        if (batchM)
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimY);
+        }
+        else
+        {
+            numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimX);
+        }
         int32_t const numCtasInner = options.mNumSlicesForSplitK;
         return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
     }
@@ -531,7 +548,6 @@ private:
     // Aligns the pointer to the alignment
     template <typename Dtype>
     inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
-
     // Returns the size of the workspace buffers in bytes
     std::vector<size_t> getWorkspaceSizesInBytes(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
@@ -792,7 +808,9 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         cuModuleUnload(cuModule);
     }
 #else
-    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);
+    config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid,
+        /* cluster */ {},
+        /* instanceId */ config.mInstanceIdx);
 #endif
 
     return 0;
