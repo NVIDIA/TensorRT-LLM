@@ -1,10 +1,10 @@
-# Quick Start Recipe for Qwen3 Next on TensorRT-LLM
+# Quick Start Recipe for Qwen3 Next on TensorRT LLM
 
 ## Introduction
 
-This deployment guide provides step-by-step instructions for running the Qwen3-Next model using TensorRT-LLM, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT-LLM parameters, launching the server, and validating inference output.
+This deployment guide provides step-by-step instructions for running the Qwen3-Next model using TensorRT LLM, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT LLM parameters, launching the server, and validating inference output.
 
-The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT-LLM for model serving.
+The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT LLM for model serving.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ### Run Docker Container
 
-Run the docker container using the TensorRT-LLM NVIDIA NGC image.
+Run the docker container using the TensorRT LLM NVIDIA NGC image.
 
 ```shell
 docker run --rm -it \
@@ -42,11 +42,11 @@ Note:
 * The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
 * See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
 
 ### Creating the TRT-LLM Server config
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings. Note that we should set kv_cache_reuse to false. 
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server and populate it with the following recommended performance settings. Note that we should set kv_cache_reuse to false. 
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
@@ -105,7 +105,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--backend pytorch`
 
-* **Description:** Tells TensorRT-LLM to use the **pytorch** backend.
+* **Description:** Tells TensorRT LLM to use the **pytorch** backend.
 
 #### `--max_batch_size`
 
@@ -121,7 +121,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--trust_remote_code`
 
-* **Description:** Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 
 #### Extra LLM API Options (YAML Configuration)
@@ -159,7 +159,7 @@ See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/ref
 
 ### Basic Test
 
-Start a new terminal on the host to test the TensorRT-LLM server you just launched.
+Start a new terminal on the host to test the TensorRT LLM server you just launched.
 
 You can query the health/readiness of the server using:
 
@@ -205,7 +205,7 @@ Here is an example response:
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
 
 ```shell
 cat <<'EOF' > bench.sh
