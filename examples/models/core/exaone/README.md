@@ -32,6 +32,13 @@ See the LLaMA example [`examples/models/core/llama`](../llama) for details.
   * INT4 AWQ & W4A8 AWQ
 
 ## Supported Models
+
+**Note:**  
+- **EXAONE-3.0** and **EXAONE-Deep** are supported using the [TRT Flow](#trt-flow).  
+- **EXAONE-4.0** is supported using the [PyTorch flow](#pytorch-flow).  
+
+Please refer to the corresponding sections below for usage instructions and examples for each model.
+
 ### EXAONE-3.0
 
 Download the HuggingFace FP32 checkpoints of EXAONE-3.0 model. We support EXAONE-3.0 families but here, we only use the `EXAONE-3.0-7.8B-Instruct` model for the example.
@@ -71,7 +78,9 @@ SWA currently does not support kv_cache_reuse. Please make sure to disable KV ca
 
 The output will be like:
 ```bash
-TODO: Fill this with real HF checkpoints output
+[0] Prompt: 'Hello, my name is', Generated text: " [Your Name], and I'm a [Your Profession]. I'm here to learn and share with you.\n\nBest regards,\n[Your Name]\n\nThis letter is concise, professional, and clearly states who you are and what you're here for. It's a good starting point"
+[1] Prompt: 'The capital of France is', Generated text: ' Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris.\n\nThe capital of France is Paris'
+[2] Prompt: 'The future of AI is', Generated text: ' not just about technology but also about how we choose to use it. We must ensure that AI is developed and deployed in a way that benefits all of humanity, not just a select few. This means prioritizing ethical considerations, transparency, and accountability in AI development. It also means involving diverse stakeholders in the conversation about AI'
 ```
 
 #### PyTorch flow Quantization
