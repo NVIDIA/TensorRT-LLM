@@ -892,9 +892,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
         # Use full k-padding for float tensors, half for already-packed uint8
-        k_pad = self.k_alignment if w1_weight.dtype in (
-            torch.bfloat16, torch.float16,
-            torch.float32) else self.k_alignment // 2
+        k_pad = self.k_alignment // 2 if w1_weight.dtype == torch.uint8 else self.k_alignment
         # n is halved per-branch because we concatenate w1/w3 along N later
         n_pad = self.n_alignment // 2
         w1_weight_shard = shard_and_pad_tensor(w1_weight,
@@ -956,9 +954,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         """
         device = dst_w2_weight.device
         assert device.type == "cuda"
-        k_pad = self.k_alignment if w2_weight.dtype in (
-            torch.bfloat16, torch.float16,
-            torch.float32) else self.k_alignment // 2
+        k_pad = self.k_alignment // 2 if w2_weight.dtype == torch.uint8 else self.k_alignment
         w2_weight_shard = shard_and_pad_tensor(w2_weight,
                                                1,
                                                self.n_alignment,
