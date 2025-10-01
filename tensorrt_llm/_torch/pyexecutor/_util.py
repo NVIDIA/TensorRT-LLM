@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
-from transformers import AutoTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
@@ -13,8 +12,6 @@ from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.inputs.registry import (create_input_processor,
-                                          create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SpeculativeConfig,
@@ -159,23 +156,17 @@ class KvCacheCreator:
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return requests
 
-        model_name_or_path = getattr(self._model_engine.model, "name_or_path",
-                                     None)
-        assert model_name_or_path is not None, "Could not determine model name or path"
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        input_processor = create_input_processor(model_name_or_path, tokenizer)
+        input_processor = self._model_engine.input_processor
         if not (hasattr(input_processor, "get_dummy_prompt")):
             logger.warning("The input processor of the model does not have the method [get_dummy_prompt] implemented." \
             "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
             "the image encoder")
             return requests
-        text_prompt = input_processor.get_dummy_prompt(input_seq_len,
-                                                       {'image': 1})
-        max_beam_width = self._max_beam_width
-        input_processor_with_hash = create_input_processor_with_hash(
-            input_processor)
-        prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-            text_prompt, None)
+        prompt = input_processor.get_dummy_prompt(input_seq_len)
+
+        prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
+            prompt, None)
+
         multimodal_input = extra_processed_inputs.get('multimodal_input')
         multimodal_data = extra_processed_inputs.get('multimodal_data')
 
@@ -198,7 +189,7 @@ class KvCacheCreator:
                                      max_tokens=1,
                                      streaming=False,
                                      sampling_config=trtllm.SamplingConfig(
-                                         beam_width=max_beam_width, ),
+                                         beam_width=self._max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1,
                                      multimodal_input=req_mm_input)
