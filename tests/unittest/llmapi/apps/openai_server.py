@@ -16,7 +16,6 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
-    MAX_SERVER_START_WAIT_S = 600  # wait for server to start for 600 seconds
 
     def __init__(self,
                  model: str,
@@ -26,11 +25,13 @@ class RemoteOpenAIServer:
                  host: str = "localhost",
                  env: Optional[dict] = None,
                  rank: int = -1,
-                 extra_config: Optional[dict] = None) -> None:
+                 extra_config: Optional[dict] = None,
+                 max_server_start_wait_s: int = 600) -> None:
         self.host = host
         self.port = port if port is not None else find_free_port()
         self.rank = rank if rank != -1 else os.environ.get("SLURM_PROCID", 0)
         self.extra_config_file = None
+        self.timeout = max_server_start_wait_s
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
         if cli_args:
             args += cli_args
@@ -51,8 +52,7 @@ class RemoteOpenAIServer:
                                      env=env,
                                      stdout=sys.stdout,
                                      stderr=sys.stderr)
-        self._wait_for_server(url=self.url_for("health"),
-                              timeout=self.MAX_SERVER_START_WAIT_S)
+        self._wait_for_server(url=self.url_for("health"), timeout=self.timeout)
 
     def __enter__(self):
         return self
