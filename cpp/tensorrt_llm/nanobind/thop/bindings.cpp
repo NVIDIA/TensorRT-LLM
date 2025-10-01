@@ -41,21 +41,17 @@ void initBindings(nb::module_& m)
         nb::arg("rotary_inv_freq") = std::nullopt, nb::arg("rotary_cos_sin") = std::nullopt,
         nb::arg("latent_cache") = std::nullopt, nb::arg("q_pe") = std::nullopt,
         nb::arg("block_ids_per_seq") = std::nullopt, nb::arg("attention_sinks") = std::nullopt, nb::arg("is_fused_qkv"),
-        nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"), nb::arg("layer_idx"), nb::arg("num_heads"),
-        nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block") = std::nullopt,
-        nb::arg("max_num_requests"), nb::arg("max_context_length"), nb::arg("attention_window_size"),
-        nb::arg("sink_token_length"), nb::arg("beam_width"), nb::arg("mask_type"), nb::arg("quant_mode"),
-        nb::arg("q_scaling"), nb::arg("position_embedding_type"), nb::arg("rotary_embedding_dim"),
-        nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"), nb::arg("rotary_embedding_scales"),
-        nb::arg("rotary_embedding_max_position_info"), nb::arg("use_paged_context_fmha"),
-        nb::arg("attention_input_type") = std::nullopt, nb::arg("is_mla_enable"),
+        nb::arg("update_kv_cache"), nb::arg("attention_config_params"), nb::arg("tokens_per_block") = std::nullopt,
+        nb::arg("q_scaling"), nb::arg("rotary_embedding_int_params"), nb::arg("rotary_embedding_base"),
+        nb::arg("rotary_embedding_scales"), nb::arg("rotary_embedding_max_position_info"),
+        nb::arg("use_paged_context_fmha"), nb::arg("attention_input_type") = std::nullopt, nb::arg("is_mla_enable"),
         nb::arg("chunked_prefill_buffer_batch_size") = std::nullopt, nb::arg("q_lora_rank") = std::nullopt,
         nb::arg("kv_lora_rank") = std::nullopt, nb::arg("qk_nope_head_dim") = std::nullopt,
         nb::arg("qk_rope_head_dim") = std::nullopt, nb::arg("v_head_dim") = std::nullopt,
         nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
         nb::arg("mla_tensor_params"), nb::arg("attention_chunk_size") = std::nullopt,
         nb::arg("softmax_stats_tensor") = std::nullopt, nb::arg("spec_decoding_bool_params"),
-        nb::arg("spec_decoding_tensor_params"), "Multi-head attention operation",
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_attention_params") = std::nullopt,
+        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::thop

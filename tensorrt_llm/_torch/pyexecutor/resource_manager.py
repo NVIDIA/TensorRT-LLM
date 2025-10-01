@@ -3,7 +3,7 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -163,6 +163,7 @@ class KVCacheManager(BaseResourceManager):
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -277,11 +278,7 @@ class KVCacheManager(BaseResourceManager):
             # Standard case: use original Python implementation
             self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
                 kv_cache_config=kv_cache_config,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
                 mapping=mapping,
-                dtype=dtype,
-                kv_factor=self.kv_factor,
             )
             blocks_per_window = {
                 self.max_attention_window_vec[0]:
@@ -563,31 +560,71 @@ class KVCacheManager(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
-    def calculate_max_num_blocks(self,
-                                 kv_cache_config: KvCacheConfigCpp,
-                                 head_dim: int,
-                                 tokens_per_block: int,
-                                 mapping: Mapping,
-                                 dtype: DataType,
-                                 kv_factor: int = 2):
-        free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
-                             if kv_cache_config.free_gpu_memory_fraction
-                             is not None else 0.9)
+    @staticmethod
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+                                 **kwargs):
+        # get kv cache dtype bytes
+        mem_per_token = 2
+        quant_config = model_config.quant_config
+        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            mem_per_token = 1
 
-        cache_size_per_token = kv_factor * sum(
-            self.num_kv_heads_per_layer) * head_dim
+        # get num key value heads
+        config = model_config.pretrained_config
+        num_key_value_heads = getattr(config, 'num_key_value_heads',
+                                      config.num_attention_heads)
+        if isinstance(num_key_value_heads, Iterable):
+            num_key_value_heads = sum(num_key_value_heads) / len(
+                num_key_value_heads)
 
-        if dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                         DataType.FLOAT, DataType.NVFP4):
-            raise ValueError(f'Cannot support {dtype} KV cache.')
+        # get head dim
+        mla = hasattr(config, "kv_lora_rank")
+        if mla:
+            head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+            kv_factor = 1
+        else:
+            tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+            head_dim = getattr(config, "head_dim", None)
+            if not isinstance(head_dim, int):
+                head_dim = config.hidden_size // config.num_attention_heads
+            head_dim = head_dim * num_key_value_heads // tp_size
+            kv_factor = 2
+
+        # provide at least 1 layer to prevent division by zero cache size
+        num_attention_layers = max(
+            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        mem_per_token *= num_attention_layers * head_dim
+
+        # K and V
+        mem_per_token *= kv_factor
+        return mem_per_token
+
+    def get_cache_bytes_per_token(self):
+        cache_size_per_token = self.kv_factor * sum(
+            self.num_kv_heads_per_layer) * self.head_dim
+
+        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
+                              DataType.FLOAT, DataType.NVFP4):
+            raise ValueError(f'Cannot support {self.dtype} KV cache.')
 
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       dtype)
-        if dtype == DataType.NVFP4:
+                                                       self.dtype)
+        if self.dtype == DataType.NVFP4:
             cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+        return cache_size_bytes_per_token
+
+    def calculate_max_num_blocks(self, kv_cache_config: KvCacheConfigCpp,
+                                 mapping: Mapping):
+        tokens_per_block = self.tokens_per_block
+        free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
+                             if kv_cache_config.free_gpu_memory_fraction
+                             is not None else 0.9)
+
+        cache_size_bytes_per_token = self.get_cache_bytes_per_token()
 
         free_mem, total_mem = torch.cuda.mem_get_info()
 

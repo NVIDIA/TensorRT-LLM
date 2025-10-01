@@ -213,6 +213,17 @@ def get_size_in_bytes(num_elements: int, dtype: DataType):
     return total_num_bits // 8
 
 
+def next_power_of_two(x):
+    """
+    get next power of two
+    """
+    if x <= 0:
+        return 1
+    if (x & (x - 1)) == 0:
+        return x
+    return 1 << x.bit_length()
+
+
 def str_dtype_to_binding(dtype):
     ret = _str_to_binding_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
