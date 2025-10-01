@@ -977,7 +977,8 @@ class MLA(nn.Module):
                 )
                 self.v_b_proj_dequant = nn.Parameter(
                     torch.empty(
-                        (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
+                        (self.num_heads_tp_cp, self.v_head_dim,
+                         self.kv_lora_rank),
                         dtype=self.dtype,
                     ),
                     requires_grad=False,
@@ -1184,8 +1185,9 @@ class MLA(nn.Module):
         )
 
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
-        compiled_copy_(k[..., :self.qk_nope_head_dim],
-                       k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim))
+        compiled_copy_(
+            k[..., :self.qk_nope_head_dim],
+            k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim))
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
@@ -1342,7 +1344,8 @@ class MLA(nn.Module):
                                                  self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
             chunked_k = compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp, -1)),
+                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp,
+                                                     -1)),
                 dim=-1)
             chunked_k = chunked_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
@@ -1399,7 +1402,8 @@ class MLA(nn.Module):
 
         k_nope = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = compiled_cat((k_nope, k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1)
+        k = compiled_cat((k_nope, k_pe.expand(-1, self.num_heads_tp, -1)),
+                         dim=-1)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
