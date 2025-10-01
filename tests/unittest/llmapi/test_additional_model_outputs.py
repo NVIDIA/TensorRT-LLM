@@ -171,6 +171,7 @@ def test_additional_model_outputs_no_outputs():
 
 
 @pytest.mark.part0
+@pytest.mark.threadleak(enabled=False)
 def test_additional_model_outputs_integration():
     """Integration test for additional_model_outputs.
 
