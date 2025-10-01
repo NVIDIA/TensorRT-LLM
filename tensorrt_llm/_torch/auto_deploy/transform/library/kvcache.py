@@ -306,6 +306,13 @@ class ResizeKVCache(BaseTransform):
 
         cm.resize_cache(new_num_pages)
 
+        # Log the final cache size for performance measurement, do not remove this log.
+        final_cache_size_bytes = cm.current_cache_size_bytes()
+        final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
+        self._log_info(
+            f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
+        )
+
         # Free memory
         torch.cuda.empty_cache()
 
