@@ -1069,13 +1069,36 @@ class TestMoeFp4:
                               routing_info,
                               use_autotune=True,
                               use_topk_as_input=False)
-        if intermediate_size >= 256:
-            self.run_moe_fp8_fp4_test(num_tokens,
-                                      hidden_size,
-                                      intermediate_size,
-                                      routing_info,
-                                      use_autotune=True,
-                                      use_topk_as_input=False)
+
+    @pytest.mark.parametrize("num_tokens", [1])
+    @pytest.mark.parametrize("hidden_size", [1024])
+    @pytest.mark.parametrize("intermediate_size", [384])
+    @pytest.mark.parametrize(
+        "routing_info",
+        [
+            pytest.param(
+                {
+                    "num_experts": 72,
+                    "top_k": 6,
+                    "padding": 8,
+                    "n_groups": 1,
+                    "top_k_groups": 1,
+                    "routed_scaling": 2.5,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.DeepSeekV3
+                },
+                id="RoutingDSlite"),
+        ],
+    )
+    def test_autotune_fp8_fp4(self, num_tokens, hidden_size, intermediate_size,
+                              routing_info):
+
+        self.run_moe_fp8_fp4_test(num_tokens,
+                                  hidden_size,
+                                  intermediate_size,
+                                  routing_info,
+                                  use_autotune=True,
+                                  use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [1, 150])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1120,6 +1143,33 @@ class TestMoeFp4:
                               routing_info,
                               use_autotune=False,
                               use_topk_as_input=use_topk_as_input)
+
+    @pytest.mark.parametrize("num_tokens", [1])
+    @pytest.mark.parametrize("hidden_size", [1024])
+    @pytest.mark.parametrize("intermediate_size", [1024])
+    @pytest.mark.parametrize(
+        "routing_info",
+        [
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 4,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_topk_4"),
+        ],
+    )
+    @pytest.mark.parametrize("use_topk_as_input", [False, True],
+                             ids=["use_score_as_input", "use_topk_as_input"])
+    def test_no_autotune_fp8_fp4(self, num_tokens, hidden_size,
+                                 intermediate_size, routing_info,
+                                 use_topk_as_input):
+
         self.run_moe_fp8_fp4_test(num_tokens,
                                   hidden_size,
                                   intermediate_size,
