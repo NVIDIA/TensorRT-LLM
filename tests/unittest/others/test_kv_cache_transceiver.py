@@ -9,7 +9,8 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -203,3 +204,4 @@ def test_cancel_request_in_transmission(attention_type):
 
     # Block the main thread due to the async operation
     time.sleep(2)
+    assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR

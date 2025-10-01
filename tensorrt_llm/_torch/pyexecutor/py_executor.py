@@ -1661,35 +1661,29 @@ class PyExecutor:
 
         return ctx_transmission_reqs
 
-    def _check_request_error_state(self):
-        error_requests = []
-        for req in self.active_requests:
-            if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
-                error_requests.append(req)
+    def _get_disagg_reqs_in_error_state(self):
+        return [
+            req for req in self.active_requests
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        ]
 
-        return error_requests
+    def _check_cache_transfer_errors(self, error_msg_prefix: str):
+        """Common helper to check for and handle cache transfer errors."""
+        error_requests = self._get_disagg_reqs_in_error_state()
+        if error_requests:
+            self._handle_errors(
+                f"Error in kv cache transfer for {error_msg_prefix}",
+                requests=error_requests)
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
         self.kv_cache_transceiver.check_context_transfer_status(atLeastNum)
-
-        # Check if any request is in error state
-        error_requests = self._check_request_error_state()
-        if len(error_requests) > 0:
-            self._handle_errors(
-                f"Error in kv cache transfer for context requests",
-                requests=error_requests)
+        self._check_cache_transfer_errors("context requests")
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
-
-        # Check if any request is in error state
-        error_requests = self._check_request_error_state()
-        if len(error_requests) > 0:
-            self._handle_errors(
-                f"Error in kv cache transfer for generation requests",
-                requests=error_requests)
+        self._check_cache_transfer_errors("generation requests")
 
     def _forward_step(self,
                       scheduled_requests,

@@ -270,7 +270,7 @@ public:
         auto future = promise.get_future();
         {
             {
-                std::unique_lock lkResp(mSenderMutex);
+                std::scoped_lock lkResp(mSenderMutex);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
             }
@@ -385,7 +385,8 @@ public:
         std::scoped_lock lkResp(mSenderMutex);
         auto it = mReadyResponses.find(llmRequest.mRequestId);
         // If the request is not the current request and already in the ready queue, we can cancel it.
-        if (it != mReadyResponses.end() && (!isSending() || getCurrentRequestId() != llmRequest.mRequestId))
+        if (it != mReadyResponses.end()
+            && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
         {
             mCancelledRequests.insert(llmRequest.mRequestId);
             isCancelled = true;
@@ -406,7 +407,7 @@ public:
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-            if (agentConnectionManager != nullptr)
+            if (agentConnectionManager)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
@@ -526,6 +527,7 @@ private:
                 // TODO: if the generation does not require the kv cache, the request will
                 // not be removed from mCancelledRequests. This should be handled by timeout.
                 auto it = mReadyResponses.find(mCurrentRequest.value());
+                TLLM_CHECK(it != mReadyResponses.end());
                 {
                     std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
@@ -628,7 +630,7 @@ private:
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
     {
         {
-            std::unique_lock lkResp(mSenderMutex);
+            std::scoped_lock lkResp(mSenderMutex);
             mReadyResponses.erase(it);
         }
         if (mReadyResponses.empty())
@@ -645,7 +647,7 @@ private:
 
     [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
     {
-        std::unique_lock lk(mSenderMutex);
+        std::scoped_lock lk(mSenderMutex);
         return mReadyResponses.find(getCurrentRequestId());
     }
 
@@ -699,7 +701,7 @@ public:
             auto promise = std::make_unique<std::promise<void>>();
             auto future = promise->get_future();
             TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
-            std::string processInfo = "default";
+            std::string processInfo = kDefaultProcessInfo;
             if (common::getEnvRequestKVCacheConcurrent())
             {
                 processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
@@ -783,7 +785,7 @@ public:
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         std::optional<size_t> cacheBufferId = std::nullopt;
-        if (agentConnectionManager != nullptr)
+        if (agentConnectionManager)
         {
             cacheBufferId = agentConnectionManager->getCacheTransBufferManager()->assignBufferIndexForRecv();
             TLLM_CHECK(cacheBufferId.has_value());
@@ -806,7 +808,7 @@ public:
             auto const* connection = counterPartConnections[i];
             // if Manager is agentConnectionManager, then send request info to agent
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-            if (agentConnectionManager != nullptr)
+            if (agentConnectionManager)
             {
                 // TODO: index -> validConnectionIdx conversion
                 auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
@@ -831,7 +833,7 @@ public:
     {
         std::scoped_lock<std::mutex> lock(mProcessIoResouceMutex);
         TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
-        std::string processString = "default";
+        std::string processString = kDefaultProcessInfo;
         if (common::getEnvRequestKVCacheConcurrent())
         {
             processString = llmRequest.getDataTransceiverState().getCommState()->toString();
@@ -860,7 +862,7 @@ public:
     bool cancelRequest(LlmRequest const& llmRequest)
     {
 
-        std::string processInfo = "default";
+        std::string processInfo = kDefaultProcessInfo;
         if (common::getEnvRequestKVCacheConcurrent())
         {
             processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
@@ -895,7 +897,7 @@ public:
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-            if (agentConnectionManager != nullptr)
+            if (agentConnectionManager)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
@@ -1059,6 +1061,7 @@ private:
     }
 
     int mDeviceId{-1};
+    static constexpr char const* kDefaultProcessInfo = "default";
     std::vector<std::future<void>> mRequestFutures;
     std::unordered_map<std::string, std::unique_ptr<AsyncResource>> mInstanceToAsyncResource;
     executor::kv_cache::ConnectionManager* mManager;
