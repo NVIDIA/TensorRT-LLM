@@ -171,7 +171,6 @@ def test_additional_model_outputs_no_outputs():
 
 
 @pytest.mark.part0
-@pytest.mark.threadleak(enabled=False)
 def test_additional_model_outputs_integration():
     """Integration test for additional_model_outputs.
 
@@ -211,43 +210,45 @@ def test_additional_model_outputs_integration():
     config = DummyConfig()
     max_beam_width = 1
 
-    # Generate outputs
-    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    with llm:
+        # Generate outputs
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
 
-    # Verify outputs
-    assert len(outputs) == num_prompts
-    for i in range(num_prompts):
-        output = outputs[i]
-        assert len(output.outputs) == 1
-        sequence = output.outputs[0]
+        # Verify outputs
+        assert len(outputs) == num_prompts
+        for i in range(num_prompts):
+            output = outputs[i]
+            assert len(output.outputs) == 1
+            sequence = output.outputs[0]
 
-        # Check that additional outputs are present
-        assert sequence.additional_context_outputs is not None
-        assert sequence.additional_generation_outputs is not None
+            # Check that additional outputs are present
+            assert sequence.additional_context_outputs is not None
+            assert sequence.additional_generation_outputs is not None
 
-        # Check that the requested outputs are present
-        assert "context_output" in sequence.additional_context_outputs
-        assert "generation_output" in sequence.additional_generation_outputs
+            # Check that the requested outputs are present
+            assert "context_output" in sequence.additional_context_outputs
+            assert "generation_output" in sequence.additional_generation_outputs
 
-        # Verify tensor shapes are reasonable
-        context_output = sequence.additional_context_outputs["context_output"]
-        generation_output = sequence.additional_generation_outputs[
-            "generation_output"]
+            # Verify tensor shapes are reasonable
+            context_output = sequence.additional_context_outputs[
+                "context_output"]
+            generation_output = sequence.additional_generation_outputs[
+                "generation_output"]
 
-        # Verify that the outputs are tensors
-        assert isinstance(context_output, torch.Tensor)
-        assert isinstance(generation_output, torch.Tensor)
+            # Verify that the outputs are tensors
+            assert isinstance(context_output, torch.Tensor)
+            assert isinstance(generation_output, torch.Tensor)
 
-        # Verify context output shape
-        assert context_output.dim() == 2
-        assert context_output.shape[0] == prompt_lens[i]
-        assert context_output.shape[1] == config.hidden_size
+            # Verify context output shape
+            assert context_output.dim() == 2
+            assert context_output.shape[0] == prompt_lens[i]
+            assert context_output.shape[1] == config.hidden_size
 
-        # Verify generation output shape
-        assert generation_output.dim() == 3
-        assert generation_output.shape[0] == num_generated_tokens
-        assert generation_output.shape[1] == max_beam_width
-        assert generation_output.shape[2] == config.hidden_size
+            # Verify generation output shape
+            assert generation_output.dim() == 3
+            assert generation_output.shape[0] == num_generated_tokens
+            assert generation_output.shape[1] == max_beam_width
+            assert generation_output.shape[2] == config.hidden_size
 
 
 if __name__ == "__main__":
