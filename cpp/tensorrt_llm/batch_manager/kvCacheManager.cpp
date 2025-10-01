@@ -156,6 +156,53 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
+std::string printBlockKey(BlockKey const& blockKey)
+{
+    std::stringstream out;
+    bool firstIteration = true;
+    for (auto uniqueToken : blockKey.uniqueTokens)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+            out << "[";
+	}
+	else
+	{
+            out << " ";
+	}
+	if (blockKey.usesExtraIds)
+	{
+            out << "(" << uniqueToken.tokenId << "," << uniqueToken.tokenExtraId << ")";
+	}
+	else
+	{
+            out << uniqueToken.tokenId;
+	}
+    }
+    out << "]";
+    return out.str();
+}
+
+std::string printBlockKeys(std::vector<BlockKey> const& blockKeys)
+{
+    std::stringstream out;
+    bool firstIteration = true;
+    for (auto const& blockKey : blockKeys)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+	}
+	else
+	{
+            out << ", ";
+	}
+        out << printBlockKey(blockKey);
+    }
+    return out.str();
+}
+
 } // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -412,6 +459,56 @@ KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensP
     , mCacheType(cacheType)
     , mTokensPerBlock(tokensPerBlock)
 {
+}
+
+std::string KVCachePromptLookup::printPrompt(LlmRequest const& llmRequest)
+{
+    std::stringstream out;
+    auto constexpr beamIdx = 0;
+    auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
+        ? llmRequest.getUniqueTokens(beamIdx)
+        : *(llmRequest.getEncoderUniqueTokens().value());
+    bool firstIteration = true;
+    for (auto token : uniqueTokens)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+	}
+	else
+	{
+            out << " ";
+	}
+        out << token.tokenId;
+    }
+    return out.str();
+}
+
+std::string KVCachePromptLookup::printNodes(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& nodeInfos)
+{
+    std::stringstream out;
+    bool firstIteration = true;
+    for (auto const& nodeInfo : nodeInfos)
+    {
+	auto const [partialMatch,nuMatched,matchedNode] = nodeInfo;
+	if (firstIteration)
+	{
+	    firstIteration = false;
+	}
+	else
+	{
+            out << ", ";
+	}
+	if (matchedNode != nullptr)
+	{
+            out << printBlockKey(matchedNode->getBlockKey());
+	}
+	else
+	{
+            out << "nil";
+	}
+    }
+    return out.str();
 }
 
 std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const
@@ -1163,7 +1260,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
-	    auto prevNumMatchedTokens = numMatchedTokens;
             numMatchedTokens += numMatched > 0 ? numMatched : matchingNode->getUniqueTokens().size();
             if (perBlockRetentions[bi].retentionPriority.has_value()
                 && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
@@ -1276,9 +1372,12 @@ void WindowBlockManager::refreshBlocks()
 void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
+    TLLM_LOG_DEBUG("BlockManager::addSequence - prompt = " + mLookup->printPrompt(llmRequest));
+
     // Lookup prompt nodes once for all window block managers
     // TODO: Should this be inputLength - 1, or should caller do the subtraction? Leaning towards caller doing subtraction
     auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength - 1, true, mEnablePartialReuse, false);
+    TLLM_LOG_DEBUG("BlockManager::addSequence - nodes = " + mLookup->printNodes(matchedPromptNodes));
     // Find kv cache blocks to reuse for each window manager
     mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedPromptNodes);
 }
@@ -1585,7 +1684,9 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // Create nodes if no match is found.
     if (storeBlocksForReuse)
     {
+        TLLM_LOG_DEBUG("BlockManager::releaseBlocks - prompt = " + mLookup->printPrompt(llmRequest.value()));
         auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, true, mEnablePartialReuse, true);
+        TLLM_LOG_DEBUG("BlockManager::releaseBlocks - nodes = " + mLookup->printNodes(matchedPromptNodes));
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
@@ -1629,6 +1730,10 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 
     // Lookup prompt nodes once for all window block managers
     auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, false, false, true);
+    printf("BlockManager::storeNewBlock - nodes = ");
+    fflush(stdout);
+    mLookup->printNodes(matchedPromptNodes);
+    printf("\n");
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);

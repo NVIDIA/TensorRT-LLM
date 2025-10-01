@@ -61,6 +61,7 @@ class BlockManager;
 class KVCacheManager;
 class KVCacheTransferManager;
 class WindowBlockManager;
+class GenerationRequest;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
@@ -273,6 +274,10 @@ public:
     //! \param allowPartiallyFilledBlock Allow last block in prompt to have less than tokensPerBlock tokens.
     //! \param enablePartialReuse Allow matching tokens to be copied from block that does not match entire prompt.
     [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool createNodes);
+
+    // Debugging functions
+    std::string printNodes(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& nodeInfos);
+    std::string printPrompt(LlmRequest const& llmRequest);
 
 private:
     // Root of search structure
