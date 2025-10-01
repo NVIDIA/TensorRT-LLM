@@ -1875,8 +1875,8 @@ class Linear(nn.Module):
             "_USE_FLASHINFER_TRTLLM_ALLREDUCE", "0") == "1"
         self.flashinfer_vllm = self.use_flashinfer_allreduce and os.getenv(
             "_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1"
-        print(f"flashinfer_trtllm: {self.flashinfer_trtllm}")
-        print(f"flashinfer_vllm: {self.flashinfer_vllm}")
+        # print(f"flashinfer_trtllm: {self.flashinfer_trtllm}")
+        # print(f"flashinfer_vllm: {self.flashinfer_vllm}")
 
         if self.flashinfer_trtllm:
             self.flash_infer_all_reduce = FlashInferAllReduce(
