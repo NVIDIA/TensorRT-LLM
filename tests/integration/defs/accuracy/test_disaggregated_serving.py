@@ -230,11 +230,17 @@ def launch_disaggregated_llm(
                          streaming: bool):
             kwargs = {}
             if sampling_params is not None:
-                kwargs.update(max_tokens=sampling_params.max_tokens,
-                              temperature=sampling_params.temperature,
-                              top_p=sampling_params.top_p,
-                              stop=sampling_params.stop,
-                              seed=sampling_params.seed)
+                kwargs.update(
+                    max_tokens=sampling_params.max_tokens,
+                    # NB: 'LLM' (cf. SamplingParams) and OpenAI API
+                    #     defaults differ (top_p=0 vs. top_p=1).
+                    # FIXME: Because 'LLM' does not permit expressly setting
+                    #     top_p=0, diverting to temperature=0.
+                    temperature=(sampling_params.temperature
+                                 if sampling_params.top_p is not None else 0),
+                    top_p=sampling_params.top_p,
+                    stop=sampling_params.stop,
+                    seed=sampling_params.seed)
                 if (guided_decoding_params :=
                         sampling_params.guided_decoding) is not None:
                     extra_body = {}
