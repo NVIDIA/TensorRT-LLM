@@ -2,7 +2,6 @@ import math
 import os
 import platform
 import threading
-from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -19,7 +18,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
-from .communicator import TorchDist
+from .communicator import TorchDist, get_torch_dist_flashinfer_vllm_comm
 
 try:
     import flashinfer.comm as flashinfer_comm
@@ -58,44 +57,6 @@ def get_flashinfer_allreduce_workspace(mapping: Mapping, max_num_tokens: int,
                 f"FlashInferAllReduce.init: {mapping.rank} {mapping.tp_size} {max_num_tokens} {hidden_dim}"
             )
     return flashinfer_allreduce_workspaces[mapping]
-
-
-def get_flashinfer_vllm_allreduce_workspace(mapping: Mapping):
-    if not hasattr(_thread_local,
-                   f'flashinfer_vllm_allreduce_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local,
-                f'flashinfer_vllm_allreduce_workspaces_{mapping.pp_rank}', {})
-
-    flashinfer_vllm_allreduce_workspaces = getattr(
-        _thread_local,
-        f'flashinfer_vllm_allreduce_workspaces_{mapping.pp_rank}')
-
-    if mapping not in flashinfer_vllm_allreduce_workspaces:
-        max_size = 8192 * 8192 * 2  # 2 bytes for bfloat16
-        meta_ptrs = flashinfer_comm.create_shared_buffer(
-            flashinfer_comm.vllm_meta_size() + max_size, dist.group.WORLD)
-
-        # Create rank data buffer (8MB as in test)
-        rank_data = torch.empty(8 * 1024 * 1024,
-                                dtype=torch.uint8,
-                                device=f"cuda:{mapping.local_rank}")
-
-        # Create buffer pointers for IPC communication
-        buffer_ptrs = flashinfer_comm.create_shared_buffer(
-            max_size, dist.group.WORLD)
-
-        # Initialize custom allreduce
-        fa = flashinfer_comm.vllm_init_custom_ar(ipc_tensors=meta_ptrs,
-                                                 rank_data=rank_data,
-                                                 rank=mapping.rank,
-                                                 full_nvlink=True)
-
-        # Register buffer - this is crucial!
-        flashinfer_comm.vllm_register_buffer(fa, buffer_ptrs)
-        flashinfer_vllm_allreduce_workspaces[mapping] = SimpleNamespace(
-            fa=fa, buffer_ptrs=buffer_ptrs, meta_ptrs=meta_ptrs)
-
-    return flashinfer_vllm_allreduce_workspaces[mapping]
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -911,22 +872,10 @@ class FlashInferVLLMAllReduce(nn.Module):
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
-        global _RANK_DIST_INITIALIZED
-
         self.mapping = mapping
         self.dtype = dtype
 
-        if not _RANK_DIST_INITIALIZED:
-            TorchDist(mapping)
-            _RANK_DIST_INITIALIZED = True
-
-        # Create IPC workspace for vLLM allreduce
-        max_size = 8192 * 8192 * 2  # 2 bytes for bfloat16
-
-        self.workspace = get_flashinfer_vllm_allreduce_workspace(mapping)
-
-        # Create registration buffer for allreduce operations
-        self.reg_buffer_size = max_size
+        self.reg_buffer_size = 8192 * 8192 * 2
 
     def forward(
         self,
@@ -947,13 +896,15 @@ class FlashInferVLLMAllReduce(nn.Module):
         input_tensor = input.contiguous()
         output_tensor = torch.empty_like(input_tensor)
 
+        workspace = get_torch_dist_flashinfer_vllm_comm()
+
         try:
             # Perform vLLM custom allreduce
             flashinfer_comm.vllm_all_reduce(
-                self.workspace.fa,
+                workspace.fa,
                 input_tensor,
                 output_tensor,
-                self.workspace.buffer_ptrs[self.mapping.rank],
+                workspace.buffer_ptrs[self.mapping.rank],
                 self.reg_buffer_size,
                 36,  # CTA upper bounds: 36 as mentioned in the API
             )
@@ -962,24 +913,3 @@ class FlashInferVLLMAllReduce(nn.Module):
             raise
 
         return output_tensor
-
-    def destroy(self):
-        """Clean up vLLM resources"""
-        try:
-            # Clean up vLLM resources
-            flashinfer_comm.vllm_dispose(self.workspace.fa)
-
-            # Free shared buffers
-            flashinfer_comm.free_shared_buffer(self.workspace.buffer_ptrs,
-                                               dist.group.WORLD)
-            flashinfer_comm.free_shared_buffer(self.workspace.meta_ptrs,
-                                               dist.group.WORLD)
-        except Exception as e:
-            logger.error(f"Error during FlashInferVLLMAllReduce cleanup: {e}")
-
-    # def __del__(self):
-    #     """Destructor to ensure cleanup"""
-    #     try:
-    #         self.destroy()
-    #     except:
-    #         pass
