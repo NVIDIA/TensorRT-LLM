@@ -28,7 +28,6 @@ def baseline(gathered_o, gathered_stats, kv_lora_rank, scale):
     global_max = gathered_stats[..., 0].max(dim=0, keepdim=True)[0]
     # [cp_size, num_tokens, num_heads]
     corrected_max = gathered_stats[..., 0] - global_max
-    corrected_max = corrected_max * scale
     corrected_max_exp = torch.exp(corrected_max)
     corrected_sum = gathered_stats[..., 1] * corrected_max_exp
     global_sum = corrected_sum.sum(dim=0, keepdim=True)
@@ -40,7 +39,7 @@ def baseline(gathered_o, gathered_stats, kv_lora_rank, scale):
     corrected_o = gathered_o_fp32 * correction
     # [num_tokens, num_heads * kv_lora_rank] (bf16)
     corrected_o = corrected_o.view(*gathered_o.shape[:-1], -1).sum(dim=0)
-    return corrected_o.to(gathered_o.dtype)
+    return corrected_o.to(gathered_o.dtype) * scale
 
 
 class TestHelixPostProcess(unittest.TestCase):
