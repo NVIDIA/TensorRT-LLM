@@ -47,6 +47,7 @@ stream_interval: 20
 num_postprocess_workers: 4
 kv_cache_config:
     enable_block_reuse: false
+    free_gpu_memory_fraction: 0.6
 EOF
 ```
 
@@ -60,10 +61,10 @@ trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
     --host 0.0.0.0 \
     --port 8000 \
     --backend pytorch \
-    --max_batch_size 1 \
+    --max_batch_size 720 \
     --max_num_tokens 4096 \
-    --kv_cache_free_gpu_memory_fraction 0.6 \
     --tp_size 4 \
+    --pp_size 1 \
     --ep_size 4 \
     --trust_remote_code \
     --extra_llm_api_options ${EXTRA_LLM_API_FILE}
