@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Type
 
 
 @dataclass
@@ -104,17 +105,21 @@ class DeepSeekR1Parser(BaseReasoningParser):
 
 
 class ReasoningParserFactory:
-    parsers: dict[str, BaseReasoningParser] = {
+    parsers: dict[str, Type[BaseReasoningParser]] = {
         "deepseek-r1": DeepSeekR1Parser,
         "qwen3": DeepSeekR1Parser,
     }
 
     @staticmethod
     def create_reasoning_parser(reasoning_parser: str) -> BaseReasoningParser:
-        if reasoning_parser not in ReasoningParserFactory.parsers:
-            raise ValueError(f"Invalid reasoning_parser: {reasoning_parser}")
-        reasoning_parser_class = ReasoningParserFactory.parsers.get(
-            reasoning_parser.lower())
-        if reasoning_parser == "deepseek-r1":
-            return reasoning_parser_class(reasoning_at_start=True)
-        return reasoning_parser_class()
+        try:
+            reasoning_parser_class = ReasoningParserFactory.parsers[
+                reasoning_parser.lower()]
+            if reasoning_parser == "deepseek-r1":
+                return reasoning_parser_class(reasoning_at_start=True)
+            return reasoning_parser_class()
+        except Exception as e:
+            raise ValueError(
+                f"Invalid reasoning parser: {reasoning_parser}\n"
+                f"Supported parsers: {list(ReasoningParserFactory.parsers.keys())}"
+            ) from e
