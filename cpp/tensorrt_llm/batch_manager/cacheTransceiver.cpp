@@ -49,6 +49,9 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <cstddef>
 #include <numeric>
 #include <unordered_set>
@@ -117,6 +120,21 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
+    // Broadcast rank 0 UUID to all other ranks
+    if (worldConfig.getRank() == 0)
+    {
+        boost::uuids::random_generator uuidGen;
+        mUuid = boost::uuids::to_string(uuidGen());
+        std::vector<char> uuidVec(mUuid.begin(), mUuid.end());
+        mMpiGroupComm->bcast(uuidVec, 0);
+        mUniqueIdServer = std::make_unique<UniqueIdServer>();
+    }
+    else
+    {
+        std::vector<char> uuidVec;
+        mMpiGroupComm->bcast(uuidVec, 0);
+        mUuid.assign(uuidVec.begin(), uuidVec.end());
+    }
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isTensorParallel())
     {
@@ -199,9 +217,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
 
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+    mCacheSender
+        = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(), mUuid);
     mCacheReceiver
-        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter(), mUuid);
 
     initializeCommState();
 }

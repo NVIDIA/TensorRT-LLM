@@ -26,6 +26,8 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <set>
+#include <thread>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
@@ -42,6 +44,102 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+
+struct UniqueIdSendMessage
+{
+public:
+    UniqueIdSendMessage(RequestIdType generationRequestId, std::string const& serverUuid)
+        : mGenerationRequestId(generationRequestId)
+        , mServerUuid(serverUuid)
+    {
+    }
+
+    serializedSize() const
+    {
+        return sizeof(RequestIdType) + mServerUuid.size();
+    }
+
+    void serialize(std::ostream& os) const
+    {
+        os.write(reinterpret_cast<char const*>(&mGenerationRequestId), sizeof(RequestIdType));
+        os.write(mServerUuid.c_str(), mServerUuid.size());
+    }
+
+    static UniqueIdSendMessage deserialize(std::istream& is)
+    {
+        is.read(reinterpret_cast<char*>(&mGenerationRequestId), sizeof(RequestIdType));
+        mServerUuid.resize(is.readsome());
+        is.read(mServerUuid.data(), mServerUuid.size());
+        return UniqueIdSendMessage(mGenerationRequestId, mServerUuid);
+    }
+
+    RequestIdType mGenerationRequestId;
+    std::string mServerUuid;
+};
+
+class UniqueIdGenerator
+{
+public:
+    static int get()
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mReleasedIds.empty())
+        {
+            int id = *mReleasedIds.begin();
+            mReleasedIds.erase(mReleasedIds.begin());
+            return id;
+        }
+        return mNextId++;
+    }
+
+    static void release(int id)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (id < mNextId)
+        {
+            mReleasedIds.insert(id);
+        }
+    }
+
+private:
+    static std::mutex mMutex;
+    static int mNextId;
+    static std::set<int> mReleasedIds;
+};
+
+class UniqueIdServer
+{
+public:
+    UniqueIdServer()
+    {
+        mThread = std::thread(
+            [this]()
+            {
+                int id = UniqueIdGenerator::get();
+                while (true)
+                {
+                    int command;
+                    mpi::MpiComm::session().sendRecv(
+                        &id, &command, 1, mpi::MpiType::kINT32, 0, mpi::MpiTag::kUNIQUE_ID_TAG);
+                    if (command != 0)
+                    {
+                        UniqueIdGenerator::release(command);
+                    }
+                    else
+                    {
+                        id = UniqueIdGenerator::get();
+                    }
+                }
+            });
+    }
+
+private:
+    std::thread mThread;
+};
+
+inline std::mutex UniqueIdGenerator::mMutex;
+inline int UniqueIdGenerator::mNextId = 1;
+inline std::set<int> UniqueIdGenerator::mReleasedIds;
 
 class CacheTransceiverFactory
 {
@@ -132,6 +230,8 @@ private:
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
+    std::string mUuid;
+    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
 };
 
 } // namespace tensorrt_llm::batch_manager
