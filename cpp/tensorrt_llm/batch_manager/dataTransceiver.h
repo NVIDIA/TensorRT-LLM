@@ -83,7 +83,7 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
         runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        LlmRequest const* llmRequest = nullptr, bool recordTiming = false, int32_t uniqueId = -1)
         : mConnections(std::move(connections))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
@@ -92,6 +92,7 @@ public:
         , mRequest(llmRequest)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
+        , mUniqueId(uniqueId)
     {
         TLLM_CHECK(!mConnections.empty());
         if (recordTiming)
@@ -139,6 +140,11 @@ public:
         return mLastBlockKey;
     }
 
+    [[nodiscard]] int32_t getUniqueId() const
+    {
+        return mUniqueId;
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
@@ -149,6 +155,7 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    int32_t mUniqueId{-1};
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
@@ -166,6 +173,7 @@ struct TransceiverTag
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
     static constexpr int32_t kREADY_SIGNAL_TAG{42};
+    static constexpr int32_t kUNIQUE_ID_TAG{42};
 };
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
@@ -174,21 +182,25 @@ class RequestInfo
 {
 public:
     /// @brief Constructor.
-    /// @param requestId The ID used in the context phase of the current request.
+    /// @param requestId The ID used in the generation phase of the current request.
     /// @param transState The state of the data transceiver.
-    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
+    /// @param serverUuid The generation server UUID.
+    RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
+        executor::DataTransceiverState transState, std::string const& serverUuid);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey);
+    RequestInfo(LlmRequest::RequestIdType contextRequestId, LlmRequest::RequestIdType generationRequestId,
+        executor::DataTransceiverState transState, int32_t indexFromEnd, BlockKey const& lastBlockKey,
+        std::string const& serverUuid);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
     /// @param rhs The right operand of the operator.
     [[nodiscard]] bool operator==(RequestInfo const& rhs) const;
 
-    /// @brief Return the ID used in the context phase of the current request.
+    /// @brief Return the ID used in the generation phase of the current request.
     /// @return The request ID.
-    [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
+    [[nodiscard]] LlmRequest::RequestIdType getContextRequestId() const noexcept;
+    [[nodiscard]] LlmRequest::RequestIdType getGenerationRequestId() const noexcept;
 
     [[nodiscard]] int32_t getIndexFromEnd() const noexcept
     {
@@ -202,6 +214,13 @@ public:
     [[nodiscard]] BlockKey const& getLastBlockKey() const noexcept
     {
         return mLastBlockKey;
+    }
+
+    /// @brief Return the server UUID.
+    /// @return The server UUID.
+    [[nodiscard]] std::string const& getServerUuid() const noexcept
+    {
+        return mServerUuid;
     }
 
     /// @brief Serialization.
@@ -219,8 +238,9 @@ public:
     [[nodiscard]] static std::size_t serializedSize(RequestInfo const& requestInfo);
 
 private:
-    // The ID used in the context phase of the current request.
-    LlmRequest::RequestIdType mRequestId;
+    // The ID used in the generation phase of the current request.
+    LlmRequest::RequestIdType mContextRequestId;
+    LlmRequest::RequestIdType mGenerationRequestId;
     // Index from end indicating how many trailing blocks to transfer (index+1)
     int32_t mIndexFromEnd{0};
 
@@ -229,6 +249,9 @@ private:
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
+
+    // The server UUID.
+    std::string mServerUuid;
 };
 
 class CacheSender
@@ -236,7 +259,7 @@ class CacheSender
 public:
     /// @brief Constructor.
     CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid);
 
     CacheSender() = default;
 
@@ -291,7 +314,7 @@ class CacheReceiver
 public:
     /// @brief Constructor.
     CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter, std::string const& serverUuid);
 
     CacheReceiver() = default;
 
