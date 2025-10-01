@@ -21,7 +21,7 @@ from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import llm_models_root
-from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
 def _hf_model_dir_or_hub_id(
@@ -118,4 +118,9 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
                            tokenizer=self.MODEL_PATH,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            sampling_params = SamplingParams(temperature=0.0,
+                                             top_k=None,
+                                             top_p=None)
             task.evaluate(llm, sampling_params=sampling_params)
