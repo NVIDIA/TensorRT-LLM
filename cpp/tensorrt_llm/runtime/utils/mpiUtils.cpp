@@ -333,6 +333,22 @@ void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int des
     TLLM_LOG_DEBUG("end MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
 }
 
+void MpiComm::sendRecv(
+    void const* sendbuf, void* recvbuf, int sendCount, int recvCount, MpiType dtype, int dest, MpiTag tag) const
+{
+    TLLM_LOG_DEBUG(
+        "start MPI_Sendrecv with dest %d, tag %d, sendCount %d, recvCount %d", dest, tag, sendCount, recvCount);
+#if ENABLE_MULTI_DEVICE
+    MPI_Status status{};
+    invokeChunked(MPI_Sendrecv, sendbuf, sendCount, getMpiDtype(dtype), dest, static_cast<int>(tag), recvbuf, recvCount,
+        getMpiDtype(dtype), dest, static_cast<int>(tag), mComm, &status);
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG(
+        "end MPI_Sendrecv with dest %d, tag %d, sendCount %d, recvCount %d", dest, tag, sendCount, recvCount);
+}
+
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
     couldUseMPI();

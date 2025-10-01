@@ -29,6 +29,8 @@
 #include <mutex>
 #include <optional>
 #include <pybind11/pybind11.h>
+#include <set>
+#include <thread>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/custom_class.h>
 #include <torch/python.h>
@@ -144,6 +146,38 @@ public:
         TLLM_THROW("Input arguments only supported in mpi");
     }
 
+    template <typename T>
+    void bcast(std::vector<T>& vec, int root) const
+    {
+        if (isMpi())
+        {
+            mMpiComm->bcast(vec, root);
+        }
+        else
+        {
+            // // Broadcast size
+            // int64_t vecSize = (getRank() == root) ? static_cast<int64_t>(vec.size()) : 0;
+            // std::vector<at::Tensor> sizeTensor = {tensorrt_llm::pg_utils::wrap_tensor(vecSize)};
+            // c10d::BroadcastOptions opts;
+            // opts.rootRank = root;
+            // PGCHECK_THROW(mPgComm->broadcast(sizeTensor, opts)->wait());
+
+            // // Resize
+            // if (getRank() != root)
+            // {
+            //     vec.resize(vecSize);
+            // }
+            // if (vecSize == 0)
+            // {
+            //     return;
+            // }
+
+            // // Broadcast data
+            // std::vector<at::Tensor> dataTensor = {tensorrt_llm::pg_utils::wrap_tensor(vec)};
+            // PGCHECK_THROW(mPgComm->broadcast(dataTensor, opts)->wait());
+        }
+    }
+
     CacheTransceiverComm split(int color, int key)
     {
         if (isMpi())
@@ -178,6 +212,108 @@ private:
     std::shared_ptr<mpi::MpiComm const> mMpiComm;
     c10::intrusive_ptr<c10d::ProcessGroup> mPgComm;
 };
+
+struct UniqueIdSendMessage
+{
+public:
+    UniqueIdSendMessage(RequestIdType generationRequestId, std::string const& serverUuid)
+        : mGenerationRequestId(generationRequestId)
+        , mServerUuid(serverUuid)
+    {
+    }
+
+    size_t serializedSize() const
+    {
+        return sizeof(RequestIdType) + sizeof(size_t) + mServerUuid.size();
+    }
+
+    void serialize(std::ostream& os) const
+    {
+        os.write(reinterpret_cast<char const*>(&mGenerationRequestId), sizeof(RequestIdType));
+        size_t size = mServerUuid.size();
+        os.write(reinterpret_cast<char const*>(&size), sizeof(size_t));
+        os.write(mServerUuid.c_str(), size);
+    }
+
+    static UniqueIdSendMessage deserialize(std::istream& is)
+    {
+        RequestIdType generationRequestId;
+        std::string serverUuid;
+        is.read(reinterpret_cast<char*>(&generationRequestId), sizeof(RequestIdType));
+        size_t size;
+        is.read(reinterpret_cast<char*>(&size), sizeof(size_t));
+        serverUuid.resize(size);
+        is.read(serverUuid.data(), size);
+        return UniqueIdSendMessage(generationRequestId, serverUuid);
+    }
+
+    RequestIdType mGenerationRequestId;
+    std::string mServerUuid;
+};
+
+class UniqueIdGenerator
+{
+public:
+    static int get()
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mReleasedIds.empty())
+        {
+            int id = *mReleasedIds.begin();
+            mReleasedIds.erase(mReleasedIds.begin());
+            return id;
+        }
+        return mNextId++;
+    }
+
+    static void release(int id)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (id < mNextId)
+        {
+            mReleasedIds.insert(id);
+        }
+    }
+
+private:
+    static int mNextId;
+    static std::set<int> mReleasedIds;
+    static std::mutex mMutex;
+};
+
+class UniqueIdServer
+{
+public:
+    UniqueIdServer()
+    {
+        mThread = std::thread(
+            [this]()
+            {
+                int id = UniqueIdGenerator::get();
+                while (true)
+                {
+                    int command;
+                    mpi::MpiComm::session().sendRecv(
+                        &id, &command, 1, 1, mpi::MpiType::kINT32, 0, mpi::MpiTag::kUNIQUE_ID_TAG);
+                    if (command != 0)
+                    {
+                        UniqueIdGenerator::release(command);
+                    }
+                    else
+                    {
+                        id = UniqueIdGenerator::get();
+                    }
+                }
+            });
+    }
+
+private:
+    std::thread mThread;
+};
+
+inline std::mutex UniqueIdGenerator::mMutex;
+inline int UniqueIdGenerator::mNextId = 1;
+inline std::set<int> UniqueIdGenerator::mReleasedIds;
 
 class CacheTransceiverFactory
 {
@@ -275,6 +411,8 @@ private:
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
+    std::string mUuid;
+    std::unique_ptr<UniqueIdServer> mUniqueIdServer;
 };
 
 } // namespace tensorrt_llm::batch_manager
