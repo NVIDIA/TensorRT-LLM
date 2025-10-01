@@ -15,6 +15,8 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+import flashinfer.comm as flashinfer_comm
+
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
@@ -429,6 +431,32 @@ class MultiHandleWrapper:
                 raise RuntimeError(f"Asynchronous operation failed: {e}") from e
 
 
+class FlashInferVLLMComm:
+
+    def __init__(self, mapping: Mapping, group):
+        max_size = 8192 * 8192 * 2  # 2 bytes for bfloat16
+        self.meta_ptrs = flashinfer_comm.create_shared_buffer(
+            flashinfer_comm.vllm_meta_size() + max_size, group)
+
+        # Create rank data buffer (8MB as in test)
+        self.rank_data = torch.empty(8 * 1024 * 1024,
+                                     dtype=torch.uint8,
+                                     device=f"cuda:{mapping.local_rank}")
+
+        # Create buffer pointers for IPC communication
+        self.buffer_ptrs = flashinfer_comm.create_shared_buffer(max_size, group)
+
+        # Initialize custom allreduce
+        self.fa = flashinfer_comm.vllm_init_custom_ar(
+            ipc_tensors=self.meta_ptrs,
+            rank_data=self.rank_data,
+            rank=mapping.rank,
+            full_nvlink=True)
+
+        # Register buffer - this is crucial!
+        flashinfer_comm.vllm_register_buffer(self.fa, self.buffer_ptrs)
+
+
 class TorchDist(Distributed):
 
     @property
@@ -452,6 +480,9 @@ class TorchDist(Distributed):
 
         init_pg(torch.distributed.group.WORLD, self.local_comm,
                 torch_pybind11_abi())
+        
+        self._flashinfer_vllm_comm = FlashInferVLLMComm(mapping,
+                                                        self.cpu_tp_group)
 
     def setup_local_comm(self):
         self._get_cluster_info()
@@ -812,6 +843,7 @@ class PPCommTorch:
 
 
 _pp_comm = None
+_torch_dist_tp_comm = None
 
 
 def init_pp_comm(mapping):
@@ -833,3 +865,13 @@ def pp_recv(tensor):
 def pp_send(tensor):
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)
+
+
+def init_torch_dist_tp_comm(mapping):
+    """Initialize TorchDistTPComm once at startup"""
+    global _torch_dist_tp_comm
+    _torch_dist_tp_comm = TorchDist(mapping)
+
+
+def get_torch_dist_flashinfer_vllm_comm():
+    return _torch_dist_tp_comm._flashinfer_vllm_comm
