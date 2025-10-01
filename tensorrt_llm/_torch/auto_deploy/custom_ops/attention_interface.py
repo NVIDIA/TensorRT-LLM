@@ -155,10 +155,19 @@ class SequenceInfo:
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
 
+        # cache_loc requires some special treatment due to block reuse. Note that the constraint for
+        # cache_loc with block_reuse is as follows:
+        # 0<= max(cache_loc) < num_pages
+        # len(cache_loc) <= max_num_cache_loc_assignments
+        max_num_cache_loc_assignments = (
+            max_seq_len_adjusted // self.page_size + 1
+        ) * self.max_batch_size
+
         # log parameters
         ad_logger.info(
             f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.page_size=}, "
-            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}"
+            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}, "
+            f"{max_num_cache_loc_assignments=}"
         )
 
         # indicator if extra args are activated that are needed for cached attention backends
@@ -178,7 +187,7 @@ class SequenceInfo:
             # TENSOR FIELDS FOR CACHED ATTENTION
             "seq_len": torch.empty(self.max_batch_size, dtype=torch.int),
             "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
-            "cache_loc": torch.empty(self.num_pages, dtype=torch.int),
+            "cache_loc": torch.empty(max_num_cache_loc_assignments, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
             "slot_idx": torch.empty(self.max_batch_size, dtype=torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
@@ -382,7 +391,8 @@ class SequenceInfo:
     def num_pages(self, value):
         self._num_pages = value
         # update the cache_loc tensor
-        self._args_device["cache_loc"].resize_(value)
+        if self._args_device["cache_loc"].numel() < value:
+            self._args_device["cache_loc"].resize_(value)
 
     @property
     def is_paged(self) -> bool:
@@ -630,8 +640,15 @@ class SequenceInfo:
                 self._extra_args[name] = None
 
     def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
-        """Get un unoccupied value from the range indicated by max_val."""
-        free_values = set(range(max_val)) - occupied
+        """Get un unoccupied value from the range indicated by max_val.
+
+        In addition, this function performs a sanity check to ensure that no value in the occupied
+        set is out of bounds.
+        """
+        full_range = set(range(max_val))
+        free_values = full_range - occupied
+        out_of_range = occupied - full_range
+        assert not out_of_range, f"Out of range values: {out_of_range}"
         return free_values.pop() if free_values else 0
 
     @nvtx_range("ad_nest_sequences")

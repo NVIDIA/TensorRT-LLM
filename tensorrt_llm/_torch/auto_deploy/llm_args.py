@@ -304,11 +304,9 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
 
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
-    # NOTE: we do not support enable_block_reuse and enable_partial_reuse in AutoDeploy yet!
+    # NOTE: we do not support enable_partial_reuse in AutoDeploy yet!
     kv_cache_config: KvCacheConfig = Field(
-        default_factory=lambda **kwargs: KvCacheConfig(
-            enable_block_reuse=False, enable_partial_reuse=False, **kwargs
-        ),
+        default_factory=lambda **kwargs: KvCacheConfig(enable_partial_reuse=False, **kwargs),
         description="KV cache config.",
     )
 

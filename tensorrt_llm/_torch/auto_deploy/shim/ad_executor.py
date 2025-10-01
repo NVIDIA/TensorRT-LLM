@@ -191,7 +191,8 @@ class ADEngine(ModelEngine):
         # look at context requests first
         for request in context_requests:
             # store input ids and pos of first token in sequence
-            input_ids.append(request.get_tokens(0))
+            # NOTE: input_pos > 0 may indicate block reuse --> hence we need to slice the input_ids
+            input_ids.append(request.get_tokens(0)[request.context_current_position :])
             input_pos.append(request.context_current_position)
 
             request.py_batch_idx = request.seq_slot
@@ -326,16 +327,31 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
 
-    # check kvcache config
+    # check kvcache config for partial block reuse
+    # NOTE: partial reuse is not supported since the KVCacheManager will copy the partial block to a
+    # new block internally. Since AD only uses the page assignment functionality of the
+    # KVCacheManager with an internally-managed cache pool, this copy to a new block has no effect
+    # in AD. Full block reuse on the other hand is supported since the KVCacheManager will just
+    # point to the existing block.
     enable_block_reuse = ad_config.kv_cache_config.enable_block_reuse
     enable_partial_reuse = ad_config.kv_cache_config.enable_partial_reuse
-    if enable_block_reuse or enable_partial_reuse:
+    if enable_block_reuse and enable_partial_reuse:
         raise RuntimeError(
-            f"Setting {enable_block_reuse=} and/or {enable_partial_reuse=} to True is NOT supported"
-            " in AutoDeploy. Please set them to False."
+            f"enable_block_reuse with {enable_partial_reuse=} set to True is NOT supported"
+            " in AutoDeploy. Please set it to False."
+        )
+
+    # TODO: detect whether SSM layer is present in the model and raise an error or disable block
+    # reuse with a warning --> see https://github.com/NVIDIA/TensorRT-LLM/issues/7142. For now, we
+    # just emit a general warning.
+    if enable_block_reuse:
+        ad_logger.warning(
+            f"{enable_block_reuse=} is enabled. Note that this is not supported for SSM layers and"
+            " may lead to incorrect results if the model contains SSM layers."
         )
 
     # resource managers
+    ad_logger.info(f"{ad_config.kv_cache_config=}")
     kv_cache_manager = _CacheManagerWithFakePool(
         ad_config.kv_cache_config,
         num_blocks=engine.cache_seq_interface.info.num_pages,
