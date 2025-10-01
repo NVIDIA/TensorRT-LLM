@@ -179,6 +179,21 @@ l0_dgx_h100:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
+      backend: pytorch
+      auto_trigger: qwen3_next
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestQwen3NextThinking::test_auto_dtype[tp4ep4]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
       backend: cpp
       auto_trigger: others
       orchestrator: mpi
