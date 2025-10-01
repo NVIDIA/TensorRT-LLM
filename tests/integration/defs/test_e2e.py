@@ -2049,6 +2049,41 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         _check_mem_usage(running_log, [25.2, 0, 0, 0])
 
 
+@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
+    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
+     "EAGLE3-LLaMA3.1-Instruct-8B"),
+])
+def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
+                                                     model_name, model_path,
+                                                     eagle_model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--prompt",
+            "You are a good assistant. Please tell me the capital of France is",
+            "--spec_decode_max_draft_len",
+            "3",
+            "--spec_decode_algo",
+            "eagle3",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--draft_model_dir",
+            f"{llm_models_root()}/{eagle_model_path}",
+            "--disable_kv_cache_reuse",
+            "--disable_overlap_scheduler",
+            "--eagle_choices",
+            "[[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [2, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]]",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [25.2, 0, 0, 0])
+
+
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
 ])

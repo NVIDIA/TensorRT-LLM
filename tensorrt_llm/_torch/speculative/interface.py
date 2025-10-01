@@ -117,14 +117,21 @@ class SpeculativeDecodingMode(IntEnum):
         is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
         use_chain_drafter: bool,
+        is_spec_dec_tree: bool,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
-        return self.is_eagle3_one_model() or (
-            self.is_eagle3() and spec_resource_manager.is_first_draft
-            and is_trtllm_attention and use_chain_drafter and is_draft_model)
+        return (
+            self.is_eagle3_one_model()  # one model
+            or (self.is_eagle3() and spec_resource_manager.is_first_draft
+                and is_trtllm_attention and use_chain_drafter and is_draft_model
+                )  # two model + the first drafter + use_chain_drafter
+            or (
+                self.is_eagle3() and is_spec_dec_tree and is_trtllm_attention
+            )  # two model + non-linear tree (static tree or dynamic tree) (both target model and drafter model) + trtllm attention backend
+        )
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
@@ -140,8 +147,10 @@ class SpecMetadata:
     """
     # The max number of requests in a single batch.
     max_num_requests: int
-    # The max number of draft tokens.
+    # The number of draft layers. (Also the number of draft tokens for the linear tree.)
     max_draft_len: int
+    # The max number of draft tokens for the static tree and dynamic tree   .
+    max_total_draft_tokens: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -177,9 +186,13 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree is a tree or a chain (linear tree)
-    is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
+    # NOTE: For the linear tree, though it can be treated as a special case of static tree.
+    # NOTE: But we do not set `is_spec_dec_tree` to True for this cases.
+    # NOTE: i.e., for the linear tree, is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
+    # whether the spec-dec mode is a tree (can be static tree or dynamic tree).
+    is_spec_dec_tree: bool = False
+    # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
     def __post_init__(self):

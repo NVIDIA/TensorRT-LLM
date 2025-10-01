@@ -1027,8 +1027,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
             self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
 
-    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
-                              is_spec_dec_dynamic_tree, max_draft_tokens):
+    def update_spec_dec_param(self, scheduled_requests,
+                              is_spec_decoding_enabled, spec_metadata,
+                              spec_tree_manager, max_draft_len,
+                              max_total_draft_tokens):
         # spec_dec mode should only be enabled for pre-Blackwell machines and when there's a spec-dec tree.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and get_sm_version(
         ) < 100
@@ -1036,64 +1038,130 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
 
-        self.is_spec_dec_tree = is_spec_dec_tree
-        self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        self.is_spec_dec_tree = False if spec_tree_manager is None else True
+        self.is_spec_dec_dynamic_tree = False if spec_tree_manager is None else spec_tree_manager.use_dynamic_tree
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
-            self.spec_decoding_position_offsets = torch.empty(
-                [self.max_num_requests, max_draft_tokens + 1],
+            self.spec_decoding_position_offsets = torch.zeros(
+                [self.max_num_requests, max_total_draft_tokens + 1],
                 dtype=torch.int,
                 device='cuda',
             )
 
-            self.spec_decoding_packed_mask = torch.empty(
+            self.spec_decoding_packed_mask = torch.zeros(
                 [
-                    self.max_num_requests, max_draft_tokens + 1,
-                    math.ceil(max_draft_tokens / 32)
+                    self.max_num_requests, max_total_draft_tokens + 1,
+                    math.ceil(max_total_draft_tokens / 32)
                 ],
                 dtype=torch.int,
                 device='cuda',
             )
 
-            self.spec_decoding_generation_lengths = torch.empty(
+            self.spec_decoding_generation_lengths = torch.zeros(
                 [self.max_num_requests],
                 dtype=torch.int,
                 device='cuda',
             )
 
-            if self.is_spec_dec_dynamic_tree:
-                assert False, "currently dynamic tree is not supported"
+            # Prepare the spec-dec mask, position offset and generation length for static tree of dynamic tree.
+            if self.is_spec_dec_tree or self.is_spec_dec_dynamic_tree:
+                assert spec_metadata.spec_dec_mode.is_eagle3(
+                ), "Tree decoding is only supported for Eagle3 now"
+                # If is the drafter model
+                if spec_metadata.is_draft_model:
+                    # Layer cur_draft_layer_idx already executed, we are now preparing the spec-dec params for executing cur_draft_layer_idx + 1 layer.
+                    cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
+
+                    # If is the dynamic tree
+                    if self.is_spec_dec_dynamic_tree:
+                        # TODO: add dynamic tree logic
+                        assert False, "Dynamic tree is not supported yet"
+                    # If is the static tree
+                    else:
+                        # For the first drafter layer, we treat it as a chunked prefill.
+                        # It takes the accepted tokens + new generated tokens as input.
+                        if cur_draft_layer_idx == 0:
+                            # In fact, the drafter model calls 'fmha_v2' or 'xqa' at this time.
+                            self.generate_spec_decoding_position_offsets(
+                                max_total_draft_tokens=max_draft_len)
+                            self.generate_spec_decoding_packed_mask(
+                                max_total_draft_tokens=max_draft_len)
+                            self.generate_spec_decoding_generation_length(
+                                max_total_draft_tokens=max_draft_len)
+                        else:
+                            num_process_draft_tokens = spec_tree_manager.get_cumulative_draft_lens(
+                                cur_draft_layer_idx - 1)
+
+                            self.spec_decoding_position_offsets[:, :num_process_draft_tokens].copy_(
+                                spec_tree_manager.spec_dec_position_offsets[
+                                    0:, 1:1 + num_process_draft_tokens] -
+                                1,  # Exclude the root node
+                                non_blocking=True)
+                            self.spec_decoding_packed_mask[:, :
+                                                           num_process_draft_tokens, :].copy_(
+                                                               spec_tree_manager
+                                                               .
+                                                               spec_dec_pack_mask[
+                                                                   0:, 1:
+                                                                   num_process_draft_tokens
+                                                                   + 1, :] / 2,
+                                                               non_blocking=True
+                                                           )
+                            self.spec_decoding_generation_lengths[:].fill_(
+                                num_process_draft_tokens)
+
+                # If is the target model
+                else:
+                    # If is the dynamic tree
+                    if self.is_spec_dec_dynamic_tree:
+                        # TODO: add dynamic tree logic
+                        assert False, "Dynamic tree is not supported yet"
+                    # If is the static tree
+                    else:
+                        self.spec_decoding_position_offsets[
+                            :,
+                        ].copy_(
+                            spec_tree_manager.spec_dec_position_offsets[0:, :],
+                            non_blocking=True)
+                        self.spec_decoding_packed_mask[:, :, :].copy_(
+                            spec_tree_manager.spec_dec_pack_mask[0:, :, :],
+                            non_blocking=True)
+                        self.spec_decoding_generation_lengths[:].fill_(
+                            spec_tree_manager.max_total_draft_tokens + 1)
             else:
+                # Prepare for the linear-tree.
                 # Populate the mask that won't change during inference phase.
                 self.generate_spec_decoding_position_offsets(
-                    max_draft_tokens=max_draft_tokens)
+                    max_total_draft_tokens=max_total_draft_tokens)
                 self.generate_spec_decoding_packed_mask(
-                    max_draft_tokens=max_draft_tokens)
+                    max_total_draft_tokens=max_total_draft_tokens)
                 self.generate_spec_decoding_generation_length(
-                    max_draft_tokens=max_draft_tokens)
+                    max_total_draft_tokens=max_total_draft_tokens)
 
-    def generate_spec_decoding_position_offsets(self, max_draft_tokens):
-        assert not self.is_spec_dec_tree, "only chained/linear tree is supported now"
-        position_offset = torch.arange(max_draft_tokens + 1,
+    def generate_spec_decoding_position_offsets(self, max_total_draft_tokens):
+        position_offset = torch.arange(max_total_draft_tokens + 1,
                                        dtype=torch.int,
                                        device='cpu',
                                        pin_memory=True)
 
         # fill all the batches with same position offset
-        self.spec_decoding_position_offsets.copy_(position_offset,
-                                                  non_blocking=True)
+        self.spec_decoding_position_offsets[:, :max_total_draft_tokens +
+                                            1].copy_(position_offset,
+                                                     non_blocking=True)
 
-    def generate_spec_decoding_packed_mask(self, max_draft_tokens):
-        assert not self.is_spec_dec_tree, "only chained/linear tree is supported now"
-        dummy_idx = torch.arange(max_draft_tokens + 1)
+    def generate_spec_decoding_packed_mask(self, max_total_draft_tokens):
+        # TODO: fix this limitation
+        assert max_total_draft_tokens < 32, "max_total_draft_tokens should be less than 32, will be fixed later"
+        dummy_idx = torch.arange(max_total_draft_tokens + 1)
         spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
-        self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
-                                                      non_blocking=True)
+        self.spec_decoding_packed_mask[:, :max_total_draft_tokens + 1,
+                                       0].copy_(spec_decoding_packed_mask,
+                                                non_blocking=True)
 
-    def generate_spec_decoding_generation_length(self, max_draft_tokens):
+    def generate_spec_decoding_generation_length(self, max_total_draft_tokens):
         spec_decoding_generation_length = torch.full((self.max_num_requests, ),
-                                                     max_draft_tokens + 1)
+                                                     max_total_draft_tokens + 1)
         self.spec_decoding_generation_lengths[:self.max_num_requests].copy_(
             spec_decoding_generation_length, non_blocking=True)
 

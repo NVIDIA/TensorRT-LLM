@@ -329,8 +329,10 @@ class AttentionMetadata:
             setattr(self, f, v)
         self._saved_tensors.clear()
 
-    def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
-                              is_spec_dec_dynamic_tree, max_draft_tokens):
+    def update_spec_dec_param(self, scheduled_requests,
+                              is_spec_decoding_enabled, spec_metadata,
+                              spec_tree_manager, max_draft_len,
+                              max_total_draft_tokens):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """

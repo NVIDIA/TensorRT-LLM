@@ -12,8 +12,7 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
@@ -46,7 +45,8 @@ class ModelDrafter(Drafter):
         self,
         spec_config: "DecodingBaseConfig",
         draft_model_engine: "ModelEngine",
-        max_draft_tokens: int,
+        max_draft_len: int,
+        max_total_draft_tokens: int,
         draft_seq_slot_manager: SeqSlotManager,
         sampler: Sampler,
         spec_resource_manager: Optional[BaseResourceManager] = None,
@@ -57,8 +57,11 @@ class ModelDrafter(Drafter):
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
-        if max_draft_tokens < 0:
-            raise ValueError("max_draft_tokens must be >= 0")
+        if max_draft_len < 0:
+            raise ValueError("max_draft_len must be >= 0")
+        if max_total_draft_tokens < 0:
+            raise ValueError("max_total_draft_tokens must be >= 0")
+        assert max_draft_len <= max_total_draft_tokens
 
         # Model and resource management
         self.draft_model_engine = draft_model_engine
@@ -67,7 +70,8 @@ class ModelDrafter(Drafter):
 
         # Configuration
         self.spec_config = spec_config
-        self.max_draft_tokens = max_draft_tokens
+        self.max_draft_len = max_draft_len
+        self.max_total_draft_tokens = max_total_draft_tokens
         # Sampling
         self.sampler = sampler
         self.guided_decoder = guided_decoder
@@ -77,6 +81,10 @@ class ModelDrafter(Drafter):
             # TODO: enable sampling/guided decoding on static draft loop
             assert guided_decoder is None
             assert spec_config._allow_greedy_draft_tokens
+
+        self.spec_tree_manager = None
+        if self.spec_resource_manager is not None:
+            self.spec_tree_manager = self.spec_resource_manager.spec_tree_manager
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
@@ -148,9 +156,9 @@ class ModelDrafter(Drafter):
         Create a chunked context request for accepted tokens.
         Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
         """
-        # Pad input_tokens to max_draft_tokens
+        # Pad input_tokens to max_draft_len
         input_tokens.extend(
-            0 for _ in range(self.max_draft_tokens - num_accepted_tokens))
+            0 for _ in range(self.max_draft_len - num_accepted_tokens))
         new_request = self._create_draft_request(request, input_tokens)
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
@@ -333,6 +341,8 @@ class ModelDrafter(Drafter):
                                              num_context_logits_prefix_sum,
                                              resource_manager)
         except Exception as e:
+            traceback.print_exc()
+            str(e)
             logger.error(f"Error in sampling: {str(e)}")
             return None
 
@@ -345,18 +355,12 @@ class ModelDrafter(Drafter):
             if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
-    def update_cur_draft_layer_idx(
-            self,
-            cur_draft_layer_idx: int,
-            resource_manager: Optional[ResourceManager] = None):
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_resource_manager is None:
-            return None
-
-        spec_tree_manager = spec_resource_manager.spec_tree_manager
-        if spec_tree_manager is not None:
-            spec_tree_manager.cur_draft_layer_idx = cur_draft_layer_idx
+    def update_cur_draft_layer_idx(self, cur_draft_layer_idx: int):
+        """
+        Update the current draft layer index in spec tree manager.
+        """
+        if self.spec_tree_manager is not None:
+            self.spec_tree_manager.cur_draft_layer_idx = cur_draft_layer_idx
 
     def update_requests(
             self,
@@ -378,7 +382,16 @@ class ModelDrafter(Drafter):
                 self.draft_seq_slot_manager.free_resources(req)
                 continue
 
-            target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
+            # linear-tree
+            if self.spec_tree_manager is None:
+                target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
+            # static tree or dynamic tree
+            else:
+                num_draft_tokens_cur_draft_layer = self.spec_tree_manager.get_current_layer_draft_len(
+                    self.spec_tree_manager.cur_draft_layer_idx - 1)
+                target_model_req.py_draft_tokens.extend(
+                    req.get_tokens(0)[-num_draft_tokens_cur_draft_layer:])
+
             target_model_req.py_draft_logits = req.py_result.generation_logits  # forwards Nones
             if req.state != LlmRequestState.GENERATION_COMPLETE and len(
                     target_model_req.py_draft_tokens
@@ -457,9 +470,10 @@ class ModelDrafter(Drafter):
         if has_draft_tokens:
             # We already updated the target state, so the new_tokens_lens should be all ones.
             new_tokens_lens = torch.ones(batch_size, device=device)
-            next_draft_tokens = torch.zeros(batch_size,
-                                            self.max_draft_tokens,
-                                            device=device)
+            next_draft_tokens = torch.zeros(
+                batch_size,
+                self.max_total_draft_tokens,  # wy: (?)
+                device=device)
 
         # Create a new SampleStateTensorsMTP object with the additional fields
         updated_tensors = SampleStateTensorsMTP(
@@ -543,7 +557,7 @@ class ModelDrafter(Drafter):
             outputs_host = outputs.host.new_tokens
             outputs.sampler_event.synchronize()
 
-        for token_idx in range(self.max_draft_tokens):
+        for token_idx in range(self.max_total_draft_tokens):  # wy: (?)
             for req_idx, req in enumerate(draft_batch.all_requests()):
                 target_model_req = req_id_to_old_request[req.py_request_id]
                 if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
@@ -560,24 +574,26 @@ class ModelDrafter(Drafter):
 
     def process_dynamic_draft_outputs(
             self,
-            outputs: Any,
+            previous_draft_state: SampleState,
             req_id_to_old_request: Dict[int, LlmRequest],
             resource_manager: Optional[ResourceManager] = None) -> None:
         """
         Process outputs from dynamic draft loop, update target requests, and clean up resources.
         """
-        self.update_requests(outputs, resource_manager)
-        self.process_decoded_tokens(outputs.scheduled_requests,
+        self.update_requests(previous_draft_state, resource_manager)
+        self.process_decoded_tokens(previous_draft_state.scheduled_requests,
                                     req_id_to_old_request)
 
     def _execute_draft_iteration(
-            self, draft_batch: ScheduledRequests,
-            resource_manager: ResourceManager,
-            previous_draft_state: Optional[SampleState],
-            cur_draft_layer_idx: int) -> Tuple[Any, Optional[SampleState]]:
-        self.update_cur_draft_layer_idx(
-            cur_draft_layer_idx, resource_manager
-        )  # Update the current draft layer index in the resource manager.
+        self,
+        draft_batch: ScheduledRequests,
+        resource_manager: ResourceManager,
+        previous_draft_state: Optional[SampleState],
+        cur_draft_layer_idx: int,
+    ) -> Tuple[Any, Optional[SampleState]]:
+
+        # Update the current draft layer index in the resource manager.
+        self.update_cur_draft_layer_idx(cur_draft_layer_idx)
         """Forward pass through the draft model."""
         outputs = self.forward_draft_model(
             draft_batch,
@@ -631,7 +647,7 @@ class ModelDrafter(Drafter):
         previous_draft_state = initial_draft_state
 
         # Generate remaining draft tokens iteratively
-        for i in range(self.max_draft_tokens - 1):
+        for i in range(self.max_draft_len - 1):
             if len(draft_batch.generation_requests) == 0:
                 break
 
@@ -693,7 +709,7 @@ class ModelDrafter(Drafter):
 
         # Initial forward pass
         self.update_cur_draft_layer_idx(
-            0, resource_manager
+            cur_draft_layer_idx=0
         )  # Update the current draft layer index in the resource manager.
         outputs = self.forward_draft_model(draft_batch,
                                            resource_manager,
@@ -707,7 +723,7 @@ class ModelDrafter(Drafter):
                 target_inputs,
                 outputs,
                 draft_position=0,
-                draft_length=self.max_draft_tokens,
+                draft_length=self.max_draft_len,  # wy: (?)
                 draft_batch=draft_batch,
                 req_id_to_old_request=req_id_to_old_request)
 
@@ -776,7 +792,7 @@ class ModelDrafter(Drafter):
                 return
 
             self.update_cur_draft_layer_idx(
-                0, resource_manager
+                cur_draft_layer_idx=0
             )  # Update the current draft layer index in the resource manager.
             # Initial forward pass. May do the complete drafting loop
             # if use_static_draft_loop is set.
@@ -803,9 +819,12 @@ class ModelDrafter(Drafter):
                 None, sample_state)
 
             # Final cleanup
+            self.update_cur_draft_layer_idx(
+                cur_draft_layer_idx=self.max_draft_len)
             if previous_draft_state is not None:
                 self.process_dynamic_draft_outputs(previous_draft_state,
-                                                   req_id_to_old_request)
+                                                   req_id_to_old_request,
+                                                   resource_manager)
 
         except Exception as e:
             traceback.print_exc()

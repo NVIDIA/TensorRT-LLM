@@ -345,7 +345,8 @@ def create_py_executor(
                 use_chain_drafter = (
                     guided_decoding_config is None
                     and draft_spec_config._allow_greedy_draft_tokens
-                    and pytorch_backend_config.attn_backend == "TRTLLM")
+                    and pytorch_backend_config.attn_backend == "TRTLLM"
+                    and spec_config.is_linear_tree)
             else:
                 use_chain_drafter = False
 
@@ -355,7 +356,7 @@ def create_py_executor(
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import \
                         ChainDrafter
-
+                    assert spec_config.is_linear_tree, "ChainDrafter only supports linear tree now"
                     return ChainDrafter(spec_config.max_draft_len, model)
             else:
                 drafting_loop_wrapper = None
@@ -396,11 +397,11 @@ def create_py_executor(
     if not pytorch_backend_config.disable_overlap_scheduler:
         model_engine_max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_draft_len
+            model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
-        model_engine_max_seq_len += spec_config.max_draft_len
+        model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -470,7 +471,8 @@ def create_py_executor(
                     "vocab_size_padded": model_engine.model.vocab_size_padded
                 }
                 if spec_config is not None:
-                    kwargs["max_num_draft_tokens"] = spec_config.max_draft_len
+                    kwargs[
+                        "max_num_draft_tokens"] = spec_config.max_total_draft_tokens
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):

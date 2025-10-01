@@ -92,11 +92,11 @@ class ModelEngine(ABC):
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
-                                   max_draft_len: int,
+                                   max_total_draft_tokens: int,
                                    enable_padding: bool) -> list[int]:
     # This is the largest possible batch size for a pure decoding batch.
     max_cuda_graph_bs = min(max_batch_size,
-                            int(max_num_tokens / (1 + max_draft_len)))
+                            int(max_num_tokens / (1 + max_total_draft_tokens)))
 
     result = []
     # This function assumes cuda_graph_batch_sizes is sorted
@@ -159,11 +159,13 @@ class PyTorchModelEngine(ModelEngine):
             ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+        self.original_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         # The draft model won't have any draft tokens attached to
         # generation requests when we invoke it autoregressively
         if spec_config is not None and is_draft_model:
             spec_config.max_draft_len = 0
+            spec_config.max_total_draft_tokens = 0
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
         self.enable_spec_decode = self.is_spec_decode
@@ -269,7 +271,7 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
-            max_num_draft_tokens = self.original_max_draft_len * batch_size
+            max_num_draft_tokens = self.original_max_total_draft_tokens * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -289,9 +291,11 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_draft_len = spec_config.max_draft_len
+            self.max_total_draft_tokens = spec_config.max_total_draft_tokens
         else:
             self.without_logits = False
             self.max_draft_len = 0
+            self.max_total_draft_tokens = 0
 
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
@@ -312,7 +316,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
-            self.max_num_tokens, self.original_max_draft_len,
+            self.max_num_tokens, self.original_max_total_draft_tokens,
             self._cuda_graph_padding_enabled
         ) if pytorch_backend_config.cuda_graph_batch_sizes else []
 
@@ -353,7 +357,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def runtime_draft_len(self):
-        return self.max_draft_len if self.enable_spec_decode else 0
+        return self.max_total_draft_tokens if self.enable_spec_decode else 0
 
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
@@ -460,6 +464,8 @@ class PyTorchModelEngine(ModelEngine):
 
         def get_num_extra_decoding_steps():
             if isinstance(self.model, ChainDrafter):
+                # We should use max_draft_len instead of max_total_draft_tokens here,
+                # because max_draft_len indicates the real number of draft layers.
                 return self.model.max_draft_len
             else:
                 assert not self.model_is_wrapped, (
@@ -597,7 +603,7 @@ class PyTorchModelEngine(ModelEngine):
                               num_ctx_requests + num_gen_tokens)),
                     token_nums=[1] * num_gen_tokens,
                     is_gen=True,
-                    max_num_draft_tokens=self.max_draft_len,
+                    max_num_draft_tokens=self.max_total_draft_tokens,
                     use_mrope=self.use_mrope)
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
@@ -612,7 +618,7 @@ class PyTorchModelEngine(ModelEngine):
 
         curr_max_num_tokens = min(
             kv_cache_manager.get_num_available_tokens(
-                self.original_max_draft_len), self.max_num_tokens,
+                self.original_max_total_draft_tokens), self.max_num_tokens,
             self.batch_size * (self.max_seq_len - 1))
 
         def get_autotune_warmup_request():
@@ -695,11 +701,11 @@ class PyTorchModelEngine(ModelEngine):
         cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                         reverse=True)
         # Create CUDA graphs for different draft lengths
-        draft_lengths = [self.max_draft_len]
+        draft_lengths = [self.max_total_draft_tokens]
         # For non-draft model, we also capture the CUDA graph instance for draft length 0,
         # so that when we disable spec decode at runtime, we can still run the captured graph.
         # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-        if (not self.is_draft_model and self.max_draft_len > 0
+        if (not self.is_draft_model and self.max_total_draft_tokens > 0
                 and not self.spec_config.spec_dec_mode.use_one_engine()
                 # Assume that speculation is always on if the user didn't give us a max_concurrency
                 # value. This will save on memory.
@@ -707,7 +713,7 @@ class PyTorchModelEngine(ModelEngine):
             draft_lengths.append(0)
         if self.is_spec_decode and self.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
-            draft_lengths.append(self.original_max_draft_len)
+            draft_lengths.append(self.original_max_total_draft_tokens)
 
         for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
@@ -934,7 +940,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
-            # be prepared in advance by using the max_draft_len. But we need to use
+            # be prepared in advance by using the max_total_draft_tokens. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
             # correct position ids. And to avoid blocking the async data transfer,
             # we need to preprocess the inputs in forward to update the position_ids and
@@ -1089,7 +1095,8 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+            cache_indirection_buffer: Optional[torch.Tensor] = None,
+            resource_manager: Optional[ResourceManager] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1209,6 +1216,12 @@ class PyTorchModelEngine(ModelEngine):
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
             ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
+        spec_resource_manager, spec_tree_manager = None, None
+        if spec_config is not None:
+            spec_resource_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            spec_tree_manager = spec_resource_manager.spec_tree_manager
+
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
@@ -1244,10 +1257,23 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num,
-                              past_seen_token_num + 1 + num_draft_tokens)))
+
+                if spec_tree_manager is None:
+                    position_ids.extend(
+                        list(
+                            range(past_seen_token_num,
+                                  past_seen_token_num + 1 + num_draft_tokens)))
+                else:
+                    # for tree spec decoding
+                    cur_position_ids = [past_seen_token_num
+                                        ] * (1 + num_draft_tokens)
+                    slot_idx = request.py_seq_slot if spec_tree_manager.use_dynamic_tree else 0
+                    cur_position_ids = [
+                        pos + offset for pos, offset in zip(
+                            cur_position_ids, spec_tree_manager.
+                            spec_dec_position_offsets[slot_idx, :].tolist())
+                    ]
+                    position_ids.extend(cur_position_ids)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
@@ -1294,6 +1320,8 @@ class PyTorchModelEngine(ModelEngine):
             draft_lens.append(0)
             begin_compute = len(
                 all_prompt_tokens) - self.original_max_draft_len - 1
+            # We use 'original_max_draft_len' here but no 'original_max_total_draft_tokens' because for the first draft layer,
+            # the input tokens are the draft tokens that accepted by the target model and padded to 'max_draft_len' length.
             end_compute = begin_compute + self.original_max_draft_len + 1
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
             position_ids.extend(
@@ -1334,13 +1362,83 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
-                position_ids.append(past_seen_token_num)
-                num_cached_tokens_per_seq.append(past_seen_token_num)
+
+                # num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
-                sequence_lengths.append(1)
                 num_accepted_draft_tokens.append(0)
-                gather_ids.append(len(position_ids) - 1)
+                # For the two-model + static/dynamic tree.
+                # During the generation phase of the drafter model, the request will be treated as a normal generation request.
+                if self.is_draft_model and spec_tree_manager is not None and spec_tree_manager.cur_draft_layer_idx > 0:
+                    # prepare input for the `cur_draft_layer_idx` layer. `cur_draft_layer_idx` has not been executed yet.
+                    # 1) Prepare 'input_ids'
+                    # Get the draft layer id to be executed.
+                    cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
+                    # How many draft tokens have been generated after executing the `cur_draft_layer_idx - 1` layer.
+                    cumulative_draft_lens = spec_tree_manager.get_cumulative_draft_lens(
+                        cur_draft_layer_idx - 1)
+                    # How many draft tokens are generated in the `cur_draft_layer_idx - 1` layer.
+                    cur_layer_draft_len = spec_tree_manager.get_current_layer_draft_len(
+                        cur_draft_layer_idx - 1)
+
+                    # How many historical draft tokens need to be extracted from the request.get_tokens(0).
+                    historical_draft_tokens_len = cumulative_draft_lens - cur_layer_draft_len
+                    assert historical_draft_tokens_len >= 0
+
+                    num_cached_tokens_per_seq.append(
+                        past_seen_token_num - historical_draft_tokens_len)
+
+                    cumulative_draft_tokens = []
+                    # Because we need all the draft tokens that have been generated in this iteration as input,
+                    # and these "historical" draft tokens exist in the request tokens, we need to extract them.
+                    if historical_draft_tokens_len > 0:
+                        cumulative_draft_tokens.extend(
+                            request.get_tokens(0)
+                            [-historical_draft_tokens_len:])
+
+                    # Extend `cur_draft_layer_idx - 1` layer's draft tokens, which store in the new_tokens_device
+                    # TODO: .cpu() may have performance issue.
+
+                    cumulative_draft_tokens.extend(
+                        new_tokens_device.reshape(
+                            -1, spec_tree_manager.max_total_draft_tokens + 1,
+                            1)[request.py_seq_slot, :cur_layer_draft_len,
+                               0].cpu().tolist())
+
+                    assert len(cumulative_draft_tokens) == cumulative_draft_lens
+                    input_ids.extend(cumulative_draft_tokens)
+
+                    # 2) Prepare position_ids
+                    # TODO: .cpu() may have performance issue.
+                    position_ids_start_value = past_seen_token_num - historical_draft_tokens_len
+                    slot_idx = request.py_seq_slot if spec_tree_manager.use_dynamic_tree else 0
+                    cur_position_ids = spec_tree_manager.spec_dec_position_offsets[
+                        slot_idx, 1:cumulative_draft_lens +
+                        1].cpu().tolist()  # '+1' is to skip the root node
+                    position_ids.extend([
+                        position_ids_start_value + i - 1
+                        for i in cur_position_ids
+                    ]  # '-1' is one offset to the root node
+                                        )
+
+                    # 3) Prepare sequence_lengths
+                    sequence_lengths.append(cumulative_draft_lens)
+
+                    # 4) Prepare gather_ids
+                    # Although we take all "historical" draft tokens as input, only some of them will be expanded in the next drafter layer.
+                    # We only need to gather_ids these draft tokens.
+                    cur_gather_ids = spec_tree_manager.get_gather_ids(
+                        cur_draft_layer_idx)
+                    position_start_offset = len(
+                        position_ids) - cumulative_draft_lens - 1
+                    gather_ids.extend(
+                        [position_start_offset + i for i in cur_gather_ids])
+
+                else:
+                    num_cached_tokens_per_seq.append(past_seen_token_num)
+                    position_ids.append(past_seen_token_num)
+                    sequence_lengths.append(1)
+                    gather_ids.append(len(position_ids) - 1)
 
                 # Multimodal
                 multimodal_params = MultimodalParams(
@@ -1541,8 +1639,11 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.num_chunked_ctx_requests = 0
         if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend):
-            attn_metadata.num_contexts += len(extend_requests)
-            attn_metadata.num_chunked_ctx_requests = len(extend_requests)
+            # For the linear-tree, we will use fmha_v2 for the target model in generation phase.
+            # But for the static/dynamic tree, we will use xqa for the target model in generation phase.
+            if spec_tree_manager is None:
+                attn_metadata.num_contexts += len(extend_requests)
+                attn_metadata.num_chunked_ctx_requests = len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
@@ -2098,14 +2199,14 @@ class PyTorchModelEngine(ModelEngine):
         return lora_params
 
     @nvtx_range("_prepare_inputs")
-    def _prepare_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+    def _prepare_inputs(self,
+                        scheduled_requests: ScheduledRequests,
+                        kv_cache_manager: KVCacheManager,
+                        attn_metadata: AttentionMetadata,
+                        spec_metadata: Optional[SpecMetadata] = None,
+                        new_tensors_device: Optional[SampleStateTensors] = None,
+                        cache_indirection_buffer: Optional[torch.Tensor] = None,
+                        resource_manager: Optional[ResourceManager] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -2117,7 +2218,8 @@ class PyTorchModelEngine(ModelEngine):
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
                                            new_tensors_device,
-                                           cache_indirection_buffer)
+                                           cache_indirection_buffer,
+                                           resource_manager)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -2139,14 +2241,16 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
                                                        is None)
+
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped)
+                self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
             attn_metadata.update_spec_dec_param(
-                is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
-                spec_metadata.is_spec_dec_dynamic_tree,
-                self.original_max_draft_len)
+                scheduled_requests, is_spec_dec_mode, spec_metadata,
+                spec_resource_manager.spec_tree_manager,
+                self.original_max_draft_len,
+                self.original_max_total_draft_tokens)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -2183,7 +2287,7 @@ class PyTorchModelEngine(ModelEngine):
 
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer)
+                new_tensors_device, cache_indirection_buffer, resource_manager)
 
             self.iter_counter += 1
 
