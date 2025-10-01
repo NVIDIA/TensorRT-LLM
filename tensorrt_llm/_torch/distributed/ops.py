@@ -829,22 +829,6 @@ class FlashInferAllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = self.all_reduce_params
 
-        # Validate required parameters
-        if not hasattr(all_reduce_params,
-                       'fusion_op') or all_reduce_params.fusion_op is None:
-            logger.warning("fusion_op is None, using NONE as default")
-            all_reduce_params.fusion_op = flashinfer_comm.AllReduceFusionOp.NONE
-
-        if not hasattr(all_reduce_params,
-                       'strategy') or all_reduce_params.strategy is None:
-            logger.warning("strategy is None, using TWOSHOT as default")
-            all_reduce_params.strategy = flashinfer_comm.AllReduceStrategyType.TWOSHOT
-
-        if not hasattr(all_reduce_params,
-                       'config_mode') or all_reduce_params.config_mode is None:
-            logger.warning("config_mode is None, using USE_MEMCPY as default")
-            all_reduce_params.config_mode = flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY
-
         try:
             flashinfer_comm.trtllm_custom_all_reduce(
                 inp=input,
@@ -855,7 +839,7 @@ class FlashInferAllReduce(nn.Module):
                 fusion_op_code=all_reduce_params.fusion_op,
                 strategy_code=all_reduce_params.strategy,
                 config_code=all_reduce_params.config_mode,
-                launch_with_pdl=False,
+                launch_with_pdl=True,
                 flag_value=_GLOBAL_FLAG_VALUE,
                 peer_comm_buffer_ptrs=self.peer_comm_buffer_ptrs,
                 peer_barrier_ptrs_in=self.peer_barrier_ptrs_in,

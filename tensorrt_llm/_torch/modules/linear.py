@@ -1824,9 +1824,10 @@ class Linear(nn.Module):
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
-        use_flashinfer_allreduce: bool = False,
+        use_flashinfer_allreduce: bool = True,
     ):
-        from ..distributed import AllReduce, FlashInferAllReduce
+        from ..distributed import (AllReduce, FlashInferAllReduce,
+                                   FlashInferVLLMAllReduce)
 
         super().__init__()
         self.has_bias = bias
@@ -1870,15 +1871,24 @@ class Linear(nn.Module):
                                     dtype=self.dtype) if reduce_output else None
 
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
-        if use_flashinfer_allreduce:
+        self.flashinfer_trtllm = self.use_flashinfer_allreduce and os.getenv(
+            "_USE_FLASHINFER_TRTLLM_ALLREDUCE", "0") == "1"
+        self.flashinfer_vllm = self.use_flashinfer_allreduce and os.getenv(
+            "_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1"
+        print(f"flashinfer_trtllm: {self.flashinfer_trtllm}")
+        print(f"flashinfer_vllm: {self.flashinfer_vllm}")
+
+        if self.flashinfer_trtllm:
             self.flash_infer_all_reduce = FlashInferAllReduce(
                 mapping=self.mapping,
                 hidden_dim=self.out_features,
                 strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
                 dtype=self.dtype) if reduce_output else None
-            # self.flash_infer_vllm_all_reduce = FlashInferVLLMAllReduce(
-            #     mapping=self.mapping,
-            #     dtype=self.dtype) if reduce_output else None
+
+        if self.flashinfer_vllm:
+            self.flash_infer_all_reduce = FlashInferVLLMAllReduce(
+                mapping=self.mapping,
+                dtype=self.dtype) if reduce_output else None
 
         self._weights_created = False
         self.reduce_output = reduce_output
@@ -2015,10 +2025,15 @@ class Linear(nn.Module):
                 bias = None if fuse_bias else bias
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
 
-                if self.use_flashinfer_allreduce and output.size(0) == 150:
+                if self.flashinfer_trtllm and output.size(0) == 150:
                     output = self.flash_infer_all_reduce(
                         output,
-                        all_reduce_params=all_reduce_params,
+                        all_reduce_params=None,
+                    )
+                elif self.flashinfer_vllm and output.size(0) == 150:
+                    output = self.flash_infer_all_reduce(
+                        output,
+                        all_reduce_params=None,
                     )
                 else:
                     output = self.all_reduce(
