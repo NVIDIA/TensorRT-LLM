@@ -140,3 +140,67 @@ def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Op
             scales[name] = args[3 + i]
 
     return scales
+
+
+def unpack_uint8_to_int4_weight_2d(
+    packed_weight: torch.Tensor, weights_scaling_factor: torch.Tensor
+) -> torch.Tensor:
+    """
+    Reverse of `modelopt.torch.export.quant_utils.pack_int4_in_uint8` for the 2D case.
+    Args:
+      packed_weight: (out_dim//2, in_dim), uint8
+      weights_scaling_factor: (out_dim, in_dim//block_size)  [used for shape/block inference]
+    Returns:
+      int8 weights in [-8,7], shape (out_dim, in_dim)
+    """
+    assert packed_weight.dim() == 2
+    assert packed_weight.dtype == torch.uint8
+
+    out_half, in_dim = packed_weight.shape
+    out_dim = out_half * 2
+    block_size = in_dim // weights_scaling_factor.shape[-1]
+    assert in_dim % block_size == 0
+
+    # inverse of: reshaped = int8_tensor.T.reshape(in_dim, out_dim//2, 2)
+    pw = packed_weight.T.contiguous()  # (in_dim, out_dim//2)
+
+    low = (pw & 0x0F).to(torch.int16)
+    high = ((pw >> 4) & 0x0F).to(torch.int16)
+
+    low = torch.where(low >= 8, low - 16, low).to(torch.int8)
+    high = torch.where(high >= 8, high - 16, high).to(torch.int8)
+
+    rebuilt = torch.stack([low, high], dim=-1)  # (in_dim, out_dim//2, 2)
+    int8_T = rebuilt.reshape(in_dim, out_dim)  # (in_dim, out_dim)
+    int8_W = int8_T.T.contiguous()  # (out_dim, in_dim)
+    return int8_W
+
+
+# copied from modelopt.torch.export.quant_utils.pack_int4_in_uint8
+def pack_int4_in_uint8(weight, weights_scaling_factor):
+    """Packs the INT4 weights into uint8 tensor."""
+    out_dim = weight.shape[-2]
+    assert out_dim % 2 == 0, f"Cannot pack weight. Out dimension {out_dim} is not an even number."
+    in_dim = weight.shape[-1]
+    block_size = weight.shape[-1] // weights_scaling_factor.shape[-1]
+    int8_tensor = (
+        (weight / weights_scaling_factor[..., :, torch.arange(in_dim) // block_size])
+        .round()
+        .clamp(-8, 7)
+        .to(torch.int8)
+    )
+    # -- Handle the MoE (3D) case vs. the 2D case --
+    if int8_tensor.dim() == 3:
+        transpose = int8_tensor.permute(0, 2, 1)
+        transpose = transpose.reshape(-1, in_dim, out_dim // 2, 2)
+        val0 = transpose[..., 0] & 0x0F
+        val1 = transpose[..., 1] & 0x0F
+        packed_byte = val0 | (val1 << 4)
+        return packed_byte.permute(0, 2, 1).contiguous().view(torch.uint8)
+    else:
+        # 2D weights: shape typically (out_dim, in_dim)
+        reshaped = int8_tensor.T.reshape(in_dim, out_dim // 2, 2)
+        val0 = reshaped[..., 0] & 0x0F
+        val1 = reshaped[..., 1] & 0x0F
+        packed_byte = val0 | (val1 << 4)
+        return packed_byte.T.contiguous().view(torch.uint8)
