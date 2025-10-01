@@ -25,6 +25,18 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
 
+class LazyConfigDict(dict):
+
+    def __getitem__(self, key):
+        import tensorrt_llm._torch.configs as configs
+        return getattr(configs, super().__getitem__(key))
+
+
+_CONFIG_REGISTRY: dict[str,
+                       type[transformers.PretrainedConfig]] = LazyConfigDict(
+                           deepseek_v32="DeepseekV3Config", )
+
+
 @dataclass
 class MoeLoadBalancerConfig:
     num_slots: Optional[int] = None
@@ -418,16 +430,33 @@ class ModelConfig(Generic[TConfig]):
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
             if checkpoint_dir is not None:
-                pretrained_config = transformers.AutoConfig.from_pretrained(
+                config_dict, _ = transformers.PretrainedConfig.get_config_dict(
                     checkpoint_dir,
-                    trust_remote_code=trust_remote_code,
+                    **kwargs,
                 )
+                model_type = config_dict.get("model_type")
+                if model_type in _CONFIG_REGISTRY:
+                    config_class = _CONFIG_REGISTRY[model_type]
+                    pretrained_config = config_class.from_pretrained(
+                        checkpoint_dir,
+                        **kwargs,
+                    )
+                    if model_type == "deepseek_v32":
+                        kwargs['sparse_attention_config'] = \
+                            DSASparseAttentionConfig(index_n_heads=pretrained_config.index_n_heads,
+                                                    index_head_dim=pretrained_config.index_head_dim,
+                                                    index_topk=pretrained_config.index_topk)
+                else:
+                    pretrained_config = transformers.AutoConfig.from_pretrained(
+                        checkpoint_dir,
+                        trust_remote_code=trust_remote_code,
+                    )
 
-                # Find the cache path by looking for the config.json file which should be in all
-                # huggingface models
-                model_dir = Path(
-                    transformers.utils.hub.cached_file(checkpoint_dir,
-                                                       'config.json')).parent
+                    # Find the cache path by looking for the config.json file which should be in all
+                    # huggingface models
+                    model_dir = Path(
+                        transformers.utils.hub.cached_file(checkpoint_dir,
+                                                        'config.json')).parent
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -449,9 +478,6 @@ class ModelConfig(Generic[TConfig]):
         elif (quant_config_file := model_dir / 'dtypes.json').exists():
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend)
-
-        if pretrained_config.model_type == "deepseek_v32":
-            kwargs['sparse_attention_config'] = DSASparseAttentionConfig()
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

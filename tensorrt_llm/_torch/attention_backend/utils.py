@@ -1,5 +1,7 @@
 from typing import Optional, Type
 
+import torch
+
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
@@ -50,10 +52,12 @@ def create_attention(
     qk_rope_head_dim: Optional[int] = None,
     qk_nope_head_dim: Optional[int] = None,
     v_head_dim: Optional[int] = None,
+    hidden_size: Optional[int] = None,
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
     attention_chunk_size: Optional[int] = None,
     sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+    dtype: Optional[torch.dtype] = None,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -73,6 +77,7 @@ def create_attention(
             qk_nope_head_dim=qk_nope_head_dim,
             v_head_dim=v_head_dim,
             predicted_tokens_per_seq=predicted_tokens_per_seq,
+            hidden_size=hidden_size,
         )
     else:
         mla_params = None
@@ -89,4 +94,5 @@ def create_attention(
         skip_create_weights_in_init=skip_create_weights_in_init,
         attention_chunk_size=attention_chunk_size,
         sparse_attention_config=sparse_attention_config,
+        dtype=dtype,
     )

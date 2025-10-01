@@ -227,6 +227,12 @@ class DSASparseAttentionConfig(SparseAttentionBaseConfig):
     Configuration for DeepSeek Sparse Attention.
     """
     algorithm: ClassVar[str] = "dsa"
+    index_n_heads: Optional[int] = Field(
+        default=64, description="The number of heads for the indexer.")
+    index_head_dim: Optional[int] = Field(
+        default=128, description="The dimension of the indexer heads.")
+    index_topk: Optional[int] = Field(default=2048,
+                                      description="The topk for the indexer.")
 
     @classmethod
     def from_dict(cls, data: dict):

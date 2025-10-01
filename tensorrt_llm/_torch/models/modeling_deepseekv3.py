@@ -383,7 +383,12 @@ class DeepseekV3WeightLoader:
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
+                elif names[-1] == "indexer":
+                    continue
                 else:
+                    if "indexer" in names:
+                        names.remove("mqa")
+                        name = '.'.join(names)
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
@@ -1550,3 +1555,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+
+@register_auto_model("DeepseekV32ForCausalLM")
+class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
+
+    def load_weights(self, weights: Dict):
+        weight_loader = DeepseekV3WeightLoader(self)
+        weight_loader.load_weights(weights)

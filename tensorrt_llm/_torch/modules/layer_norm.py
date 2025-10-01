@@ -88,7 +88,7 @@ class LayerNorm(nn.Module):
 
         hidden_states = nn.functional.layer_norm(
             hidden_states,
-            hidden_states.shape[-1],
+            (hidden_states.shape[-1], ),
             weight=self.weight,
             bias=self.bias,
             eps=self.variance_epsilon,

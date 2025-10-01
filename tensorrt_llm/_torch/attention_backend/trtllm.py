@@ -1293,9 +1293,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         if self.sparse_attention_config is not None:
             sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                q, k, metadata)
+                q, k, metadata, **kwargs)
             sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                q, k, metadata)
+                q, k, metadata, **kwargs)
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),

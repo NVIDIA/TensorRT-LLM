@@ -1,12 +1,19 @@
 import math
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm._torch.attention_backend.interface import (
+    MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.modules.layer_norm import LayerNorm
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
                                                              KVCacheManager)
@@ -30,7 +37,99 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super().prepare()
 
 
-class DSATrtllmAttention(TrtllmAttention):
+class Indexer(nn.Module):
+
+    def __init__(self, quant_config: Optional[QuantConfig],
+                 pos_embd_params: Optional[PositionalEmbeddingParams],
+                 mla_params: Optional[MLAParams],
+                 skip_create_weights_in_init: bool,
+                 sparse_attention_config: "SparseAttentionConfig",
+                 dtype: Optional[torch.dtype]):
+        super().__init__()
+        self.hidden_size = mla_params.hidden_size
+        self.q_lora_rank = mla_params.q_lora_rank
+        self.rope_dim = mla_params.qk_rope_head_dim
+        self.n_heads = sparse_attention_config.index_n_heads  # 64
+        self.head_dim = sparse_attention_config.index_head_dim  # 128
+        self.index_topk = sparse_attention_config.index_topk  # 2048
+
+        self.wq_b = Linear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            dtype=dtype,
+            quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
+        self.wk = Linear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            dtype=dtype,
+            quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
+        self.k_norm = LayerNorm(hidden_size=self.head_dim,
+                                eps=1e-6,
+                                dtype=torch.float32)
+        self.weights_proj = Linear(
+            self.hidden_size,
+            self.n_heads,
+            bias=False,
+            dtype=torch.get_default_dtype(),
+            quant_config=None,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
+
+        self.rotary_emb = RotaryEmbedding(
+            pos_embd_params.rope,
+            head_dim=self.rope_dim,
+            is_neox=pos_embd_params.is_neox,
+        )
+
+        self.softmax_scale = self.head_dim**-0.5
+        self.scale_fmt = "ue8m0"
+        self.quant_block_size = 128
+
+    def forward(self,
+                q: torch.Tensor,
+                k: torch.Tensor,
+                metadata: TrtllmAttentionMetadata,
+                hidden_states: Optional[torch.Tensor] = None,
+                qr: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.Tensor] = None):
+        q = self.wq_b(qr)
+        q = q.view(-1, self.n_heads, self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+
+        k = self.wk(hidden_states)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+
+        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
+
+        # we only quant q here since k quant is fused with cache insertion
+        q = q.view(-1, self.head_dim)
+        q_fp8, q_scale = fp8_utils.per_token_quant_and_transform(
+            q, self.quant_block_size, scale_ue8m0=self.scale_fmt == "ue8m0")
+        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_heads, 1)
+
+        weights = self.weights_proj(hidden_states)
+        weights = weights.unsqueeze(
+            -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
+        weights = weights.squeeze(-1)
+
+        # TODO: DeepGEMM MQA and TopK
+
+        return None, None
+
+
+class DSATrtllmAttention(TrtllmAttention, nn.Module):
     Metadata = DSAtrtllmAttentionMetadata
 
     def __init__(
@@ -41,31 +140,52 @@ class DSATrtllmAttention(TrtllmAttention):
             num_kv_heads: Optional[int] = None,
             quant_config: Optional[QuantConfig] = None,
             q_scaling: Optional[float] = None,
+            pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+            mla_params: Optional[MLAParams] = None,
+            skip_create_weights_in_init: bool = False,
+            attention_chunk_size: Optional[int] = None,
             sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+            dtype: Optional[torch.dtype] = None,
             **kwargs):
-        super().__init__(layer_idx,
-                         num_heads,
-                         head_dim,
-                         sparse_attention_config=sparse_attention_config,
-                         num_kv_heads=num_kv_heads,
-                         quant_config=quant_config,
-                         q_scaling=q_scaling,
-                         **kwargs)
+        TrtllmAttention.__init__(
+            self,
+            layer_idx,
+            num_heads,
+            head_dim,
+            sparse_attention_config=sparse_attention_config,
+            num_kv_heads=num_kv_heads,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            attention_chunk_size=attention_chunk_size,
+            **kwargs)
+        nn.Module.__init__(self)
+
+        self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
+                               skip_create_weights_in_init,
+                               sparse_attention_config, dtype)
 
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
+        hidden_states: Optional[torch.Tensor] = None,
+        qr: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        pass
+        return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
 
     def sparse_kv_predict(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
+        hidden_states: Optional[torch.Tensor] = None,
+        qr: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return None, None
@@ -117,17 +237,18 @@ class DSACacheManager(KVCacheManager):
             max_beam_width=max_beam_width,
             **kwargs,
         )
-        self.page_size = sparse_attn_config.page_size
-        self.prompt_budget = sparse_attn_config.prompt_budget
         self.max_batch_size = max_batch_size
+        self.quant_block_size = 128
+        self.head_dim = sparse_attn_config.index_head_dim
 
         # Per layer low rank cache pool
         self.num_blocks = self.blocks_in_primary_pool
         self.low_rank_cache_pool_per_layer = [
             torch.empty(
-                (self.num_blocks, tokens_per_block, num_kv_heads, head_dim * 2),
+                (self.num_blocks, tokens_per_block, 1,
+                 self.head_dim + self.head_dim // self.quant_block_size * 4),
                 device="cuda",
-                dtype=torch.bfloat16) for _ in range(self.num_local_layers)
+                dtype=torch.uint8) for _ in range(self.num_local_layers)
         ]
         self.max_low_rank_blocks_per_seq = self.num_blocks
 
@@ -188,8 +309,10 @@ class DSACacheManager(KVCacheManager):
         self.low_rank_cache_manager.free_resources(request)
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 tokens_per_block: int, mapping: Mapping):
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping):
+        sparse_attn_config = model_config.sparse_attention_config
+        quant_block_size = 128
+
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -198,18 +321,11 @@ class DSACacheManager(KVCacheManager):
             mem_per_token = 1
 
         # get num key value heads
-        config = model_config.pretrained_config
-        num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                      config.num_attention_heads)
-        if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
+        num_key_value_heads = 1
 
         # get head dim
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        head_dim = getattr(config, "head_dim", None)
-        if not isinstance(head_dim, int):
-            head_dim = config.hidden_size // config.num_attention_heads
+        head_dim = sparse_attn_config.index_head_dim
         head_dim = head_dim * num_key_value_heads // tp_size
 
         # provide at least 1 layer to prevent division by zero cache size
@@ -217,15 +333,15 @@ class DSACacheManager(KVCacheManager):
             len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
         mem_per_token *= num_attention_layers * head_dim
 
-        # K and V
-        # 2 for K and V, xxx for low rank cache
-        kv_factor = 2
+        # 1 for K, others for low rank cache
+        kv_factor = 1 + (head_dim + head_dim // quant_block_size * 4) / head_dim
         mem_per_token *= kv_factor
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
-        # 2 for K and V, xxx for low rank cache
-        kv_factor = self.kv_factor
+        # 1 for K, others for low rank cache
+        kv_factor = self.kv_factor + (self.head_dim + self.head_dim //
+                                      self.quant_block_size * 4) / self.head_dim
         cache_size_per_token = math.ceil(
             kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 

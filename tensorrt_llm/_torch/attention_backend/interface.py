@@ -651,3 +651,4 @@ class MLAParams:
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
     chunked_prefill_buffer_batch_size: int = 1
+    hidden_size: int = 0
