@@ -32,11 +32,11 @@ class Eagle3ResourceManager(BaseResourceManager):
                  max_num_tokens: int):
         self.dtype = dtype
         self.max_draft_len = config.max_draft_len
+        self.max_total_draft_tokens = config.max_total_draft_tokens
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
         self.slot_manager = SlotManager(max_num_requests)
-        self.max_total_draft_tokens = config.max_total_draft_tokens
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,

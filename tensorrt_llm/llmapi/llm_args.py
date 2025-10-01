@@ -357,6 +357,8 @@ class _ModelFormatKind(Enum):
 
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
+    # The number of draft tokens in the draft tokens tree.
+    max_total_draft_tokens: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
     # PyTorch only.
@@ -436,6 +438,12 @@ class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
 
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            setattr(self, attr_name, attr_value)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -454,8 +462,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     use_dynamic_tree: Optional[bool] = False
     # The topK value for each layer when enable dynamic tree.
     dynamic_tree_max_topK: Optional[int] = None
-    # The number of draft tokens in the draft tokens tree.
-    max_total_draft_tokens: Optional[int] = None
     # The number of eagle layer. will not be used in pytorch flow, just for compatibility with TRT flow
     num_eagle_layers: Optional[int] = None
     # The number of non-leaves in each layer.
@@ -490,7 +496,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
         # Checks whether the input eagle choices is valid
         # and reset the max_draft_len and num_eagle_layers if necessary
         if self.eagle_choices is not None:
-            # If eagle_choices is provided, use_dynamic_tree will not be used
+            # If eagle_choices is provided, use_dynamic_tree should not be used
             assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
 
             # Get num_eagle_layers from eagle_choices
@@ -512,6 +518,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
             assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
             assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
             assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+
+        if self.eagle3_one_model:
+            assert self.is_linear_tree, "Eagle3 one-model does not support tree decoding now. Please use Eagle3 two-model."
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -561,11 +570,23 @@ class EagleDecodingConfig(DecodingBaseConfig):
             return len(self.eagle3_layers_to_capture)
         return 3
 
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        if self.eagle_choices is None and self.use_dynamic_tree is None:
+            return True
+        return False
+
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
     # Cannot use real type annotations due to circular imports
     drafter: object  # Type is Drafter
     resource_manager: object = None  # Type is Optional[ResourceManager]
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            setattr(self, attr_name, attr_value)
+        self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -599,6 +620,12 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_use_oldest: bool = True
     is_public_pool: bool = True
 
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            setattr(self, attr_name, attr_value)
+        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -610,6 +637,12 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            setattr(self, attr_name, attr_value)
+        self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -640,11 +673,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
     BEGIN_THINKING_PHASE_TOKEN: int = 128798
     END_THINKING_PHASE_TOKEN: int = 128799
 
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            setattr(self, attr_name, attr_value)
+            if attr_name == 'num_nextn_predict_layers':
+                self.max_draft_len = attr_value
+                self.max_total_draft_tokens = attr_value  # Current MTP only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
-        out = cls(**data)
-        out.max_draft_len = out.num_nextn_predict_layers
-        return out
+        return cls(**data)
 
     decoding_type: ClassVar[str] = "MTP"
 
@@ -677,6 +716,12 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
     Attributes that are inherited from the base class are ignored.
     """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            setattr(self, attr_name, attr_value)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Auto only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1020,6 +1065,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 
     def __init__(self, **data):
         super().__init__(**data)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only support linear tree
         self._check_fields()
 
     def calculate_speculative_resource(self):

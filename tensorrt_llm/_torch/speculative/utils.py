@@ -42,7 +42,8 @@ def get_spec_metadata(spec_config,
             is_mtp_eagle=False,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
             eagle_choices=spec_config.eagle_choices,
-            is_spec_dec_tree=spec_config.eagle_choices is not None,
+            is_spec_dec_tree=spec_config.eagle_choices is not None
+            or spec_config.use_dynamic_tree,
             is_spec_dec_dynamic_tree=spec_config.use_dynamic_tree,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -143,6 +144,7 @@ def get_spec_drafter(model_engine,
         return ModelDrafter(spec_config,
                             draft_model_engine,
                             spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens,
                             SeqSlotManager(max_num_requests),
                             sampler,
                             spec_resource_manager=spec_resource_manager,

@@ -202,10 +202,10 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_len
+                num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_len
+            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
 
         if self._dummy_reqs is None:
@@ -751,6 +751,8 @@ def create_py_executor_instance(
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
+        max_total_draft_tokens=spec_config.max_total_draft_tokens
+        if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
@@ -767,13 +769,8 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
-    max_total_draft_tokens = 0
-    if speculative_config is None:
-        max_total_draft_tokens = 0
-    elif hasattr(speculative_config, 'max_total_draft_tokens'):
-        max_total_draft_tokens = speculative_config.max_total_draft_tokens
-    else:
-        max_total_draft_tokens = max_draft_len
+    max_total_draft_tokens = (0 if speculative_config is None else
+                              speculative_config.max_total_draft_tokens)
 
     return TorchSampler.Args(
         max_seq_len=max_seq_len,

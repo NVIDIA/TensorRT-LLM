@@ -229,10 +229,9 @@ def test_static_tree_verification_for_target_model():
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
     )
-    input_request.py_draft_tokens = torch.tensor(
-        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
-        dtype=torch.int,
-        device='cpu')  # all draft tokens
+    input_request.py_draft_tokens = [
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    ]
     # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
     input_new_tokens = torch.tensor(
         [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0],
@@ -274,10 +273,9 @@ def test_static_tree_verification_for_target_model():
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
     )
-    input_request.py_draft_tokens = torch.tensor(
-        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
-        dtype=torch.int,
-        device='cpu')  # all draft tokens, [max_total_draft_tokens]
+    input_request.py_draft_tokens = [
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    ]
     # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
     input_new_tokens = torch.tensor(
         [11, 15, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112
@@ -319,10 +317,9 @@ def test_static_tree_verification_for_target_model():
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
     )
-    input_request.py_draft_tokens = torch.tensor(
-        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
-        dtype=torch.int,
-        device='cpu')  # all draft tokens, [max_total_draft_tokens]
+    input_request.py_draft_tokens = [
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    ]
     # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
     input_new_tokens = torch.tensor(
         [11, 14, 102, 103, 20, 105, 106, 107, 108, 109, 110, 111, 112

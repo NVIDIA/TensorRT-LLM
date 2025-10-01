@@ -93,7 +93,8 @@ class CUDAGraphRunner:
     @property
     def max_possible_draft_len(self):
         engine = self._get_engine()
-        return (engine.original_max_draft_len if self.enable_spec_decode else 0)
+        return (engine.original_max_total_draft_tokens
+                if self.enable_spec_decode else 0)
 
     def get_graph_key(
             self,
@@ -102,10 +103,12 @@ class CUDAGraphRunner:
         engine = self._get_engine()
         if engine.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
+            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
+            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = engine.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft)
         else:
-            draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
+            draft_len = self.spec_config.max_total_draft_tokens if self.enable_spec_decode else 0
             key = (batch_size, draft_len, False)
         return key
 
@@ -344,7 +347,7 @@ class CUDAGraphRunner:
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
-                max_num_draft_tokens=engine.max_draft_len,
+                max_num_draft_tokens=engine.max_total_draft_tokens,
                 use_mrope=engine.use_mrope,
                 max_beam_width=engine.max_beam_width)[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True
