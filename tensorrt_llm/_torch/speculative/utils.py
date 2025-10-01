@@ -27,6 +27,20 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
         )
+    if spec_config.spec_dec_mode.is_mtp_eagle():
+        return Eagle3SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            layers_to_capture=None,
+            is_mtp_eagle=True,
+        )
     if spec_config.spec_dec_mode.is_eagle3():
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,

@@ -36,7 +36,13 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
         self.slot_manager = SlotManager(max_num_requests)
-        self.max_total_draft_tokens = config.max_total_draft_tokens
+        # This class is reused by MTP_EAGLE
+        from ...llmapi.llm_args import EagleDecodingConfig
+
+        if isinstance(config, EagleDecodingConfig):
+            self.max_total_draft_tokens = config.max_total_draft_tokens
+        else:
+            self.max_total_draft_tokens = self.max_draft_len
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
@@ -52,7 +58,9 @@ class Eagle3ResourceManager(BaseResourceManager):
         # whether the next draft forward is the first
         self.is_first_draft = True
         self.spec_tree_manager = None
-        if config.eagle_choices is not None:
+
+        if isinstance(config,
+                      EagleDecodingConfig) and config.eagle_choices is not None:
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
                 use_dynamic_tree=config.use_dynamic_tree,
