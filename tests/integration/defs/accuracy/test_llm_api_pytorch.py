@@ -3426,7 +3426,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
-                  moe_backend="TRITON")
+                  moe_config=MoeConfig(backend="TRITON"))
         with llm:
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)
