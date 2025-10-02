@@ -28,6 +28,6 @@ jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
 ruff==0.9.4
-lm_eval[api]==0.4.8
+lm_eval[api]==0.4.9
 docstring_parser
 genai-perf==0.0.13

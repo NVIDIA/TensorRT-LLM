@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import json
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Iterable, List, Optional, Union
@@ -107,6 +108,24 @@ class Evaluator(ABC):
         profiler.reset("trtllm exec")
 
         score = self.compute_score(results, references, *zip(*auxiliaries))
+
+        from dataclasses import asdict
+        num_repeats = 100
+        with open("bench_requests.jsonl", "w") as f:
+            for i, output in enumerate(outputs * num_repeats):
+                bench_request = {
+                    "task_id": i,
+                    "prompt": output.prompt,
+                    "input_ids": output.prompt_token_ids,
+                    "output_tokens": output.sampling_params.max_tokens
+                }
+                guided_decoding_params = output.sampling_params.guided_decoding
+                if guided_decoding_params is not None:
+                    bench_request["guided_decoding_params"] = asdict(
+                        guided_decoding_params)
+                f.write(json.dumps(bench_request))
+                f.write("\n")
+
         return score
 
     @staticmethod

@@ -9,7 +9,8 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ..attention_backend.trtllm import TrtllmAttention
-from ..pyexecutor.guided_decoder import GuidedDecoder
+from ..pyexecutor.guided_decoder import (TRTLLM_DISABLE_DRAFT_GUIDED_DECODING,
+                                         GuidedDecoder)
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
@@ -28,15 +29,20 @@ if TYPE_CHECKING:
 
 # Place the tool function here to avoid circular import
 def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
-                           input_tokens: torch.Tensor) -> torch.Tensor:
+                           request: LlmRequest) -> List[int]:
     """
     Can be used to modify prompts for speculative algorithms that need to update tokens
     before drafting.
     """
+    draft_input_tokens = request.get_tokens(0)
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         # EAGLE3 always throws away the first token when processing draft inputs
-        return input_tokens[1:]
-    return input_tokens
+        draft_input_tokens = draft_input_tokens[1:]
+    if request.is_context_init_state:
+        # A draft request's prompt is its target request's prompt adding the first golden token.
+        # Add a fake golden token here since the real one has not been generated.
+        draft_input_tokens.append(0)
+    return draft_input_tokens
 
 
 class ModelDrafter(Drafter):
@@ -70,7 +76,10 @@ class ModelDrafter(Drafter):
         self.max_draft_tokens = max_draft_tokens
         # Sampling
         self.sampler = sampler
-        self.guided_decoder = guided_decoder
+        if TRTLLM_DISABLE_DRAFT_GUIDED_DECODING:
+            self.guided_decoder = None
+        else:
+            self.guided_decoder = guided_decoder
 
         self.use_static_draft_loop = draft_model_engine.model_is_wrapped
         if self.use_static_draft_loop:
@@ -163,7 +172,7 @@ class ModelDrafter(Drafter):
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
-                                              request.get_tokens(0))
+                                              request)
 
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
@@ -235,9 +244,8 @@ class ModelDrafter(Drafter):
                 # We hit this path if we're doing chunked prefill. The target model processed
                 # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
                 # for the draft model too.
-                all_tokens = request.get_tokens(0)
                 input_tokens = get_draft_model_prompt(
-                    self.spec_config.spec_dec_mode, all_tokens)
+                    self.spec_config.spec_dec_mode, request)
 
                 new_request = self._create_context_request(
                     request, input_tokens)

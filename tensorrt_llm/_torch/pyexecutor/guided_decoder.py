@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from queue import Queue
 from typing import Iterable, List, Optional, Tuple
@@ -14,6 +15,9 @@ from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)
 from .llm_request import LlmRequest
 from .scheduler import ScheduledRequests
+
+TRTLLM_DISABLE_DRAFT_GUIDED_DECODING = os.environ.get(
+    "TRTLLM_DISABLE_DRAFT_GUIDED_DECODING", "0") == "1"
 
 
 @dataclass(slots=True)
@@ -492,6 +496,9 @@ class CapturableGuidedDecoder(GuidedDecoder):
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
                         draft_step: int = 0) -> None:
+        if TRTLLM_DISABLE_DRAFT_GUIDED_DECODING:
+            if draft_step > 0:
+                return
         batch_size = len(self.requests)
         assert new_tokens.size(0) == batch_size
         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
@@ -531,6 +538,16 @@ class CapturableGuidedDecoder(GuidedDecoder):
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
                             draft_step: int = 0) -> None:
+        if TRTLLM_DISABLE_DRAFT_GUIDED_DECODING:
+            if draft_step == 0:
+                with torch.cuda.stream(self.stream):
+                    torch.cuda.current_stream().wait_event(self.token_event)
+                    self.fetch_draft_batch(draft_step=draft_step)
+                    self.rollback_rejected_tokens()
+                    self.bitmask_event.record()
+                torch.cuda.current_stream().wait_event(self.bitmask_event)
+            return
+
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
