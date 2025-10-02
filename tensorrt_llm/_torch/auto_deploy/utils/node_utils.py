@@ -239,6 +239,11 @@ def filtered_nodes(
         for node in nodes:
             if target(node):
                 yield node
+    elif isinstance(target, Iterable) and all(isinstance(t, Callable) for t in target):
+        for node in nodes:
+            for t in target:
+                if t(node):
+                    yield node
     else:
         # Handle the case where target or ops contains operations
         operations = ops if ops is not None else target
