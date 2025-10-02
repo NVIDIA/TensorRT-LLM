@@ -567,4 +567,17 @@ bool CacheTransceiver::checkGenTransferComplete() const
     return mRequesterFutures.empty();
 }
 
+bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
+{
+    if (llmRequest->isContextOnlyRequest())
+    {
+        return mCacheSender->cancelRequest(*llmRequest);
+    }
+    else if (llmRequest->isGenerationOnlyRequest())
+    {
+        return mCacheReceiver->cancelRequest(*llmRequest);
+    }
+    return false;
+}
+
 } // namespace tensorrt_llm::batch_manager

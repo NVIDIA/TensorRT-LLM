@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, local_mpi_size
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -32,7 +32,7 @@ class AlltoallMethodType(IntEnum):
     NotEnabled = 0
     # MNNVL
     MNNVL = 1
-    # DeepEP intranode or internode: no CUDA Graphs support, IBGDA is required by internode
+    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
     DeepEP = 2
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 3
@@ -100,6 +100,8 @@ class WideEPMoE(MoE):
         self.layer_load_balancer = None
         self.repeat_idx = 0
         self.repeat_count = 1
+
+        self.use_cuda_graph = model_config.use_cuda_graph
 
         moe_load_balancer_config = model_config.moe_load_balancer
         init_expert_size_per_partition = moe_load_balancer_config.num_local_slots if moe_load_balancer_config else self.num_experts // self.ep_size
@@ -212,6 +214,9 @@ class WideEPMoE(MoE):
                         str(
                             min(model_config.max_num_tokens,
                                 self.moe_max_num_tokens))))
+                # Set nvshmem queue pair depth larger than the number of on-flight WRs (ref: https://github.com/deepseek-ai/DeepEP/issues/427)
+                os.environ['NVSHMEM_QP_DEPTH'] = str(
+                    2 * (self.deep_ep_max_num_tokens + 1))
                 self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(
                     model_config.mapping)
                 self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens,
@@ -253,6 +258,25 @@ class WideEPMoE(MoE):
     def select_alltoall_method_type(mapping: Mapping, top_k: int,
                                     dtype: torch.dtype,
                                     use_cuda_graph: bool) -> AlltoallMethodType:
+
+        # Check if DeepEP is feasible for the given number of ranks
+        # DeepEP supports two modes:
+        # 1. Intranode: Single node with 2, 4, or 8 ranks
+        # 2. Internode: 2, 4, 8, or 16 nodes with 8 ranks per node
+        def is_deepep_feasible(num_ranks: int) -> bool:
+            NUM_INTRANODE_SUPPORTED_RANKS = {2, 4, 8}
+            REQUIRED_LOCAL_MPI_SIZE = 8
+            NUM_INTERNODE_SUPPORTED_RDMA_RANKS = {2, 4, 8, 16}
+            mpi_size = local_mpi_size()
+            # Intranode cases
+            if num_ranks == mpi_size and num_ranks in NUM_INTRANODE_SUPPORTED_RANKS:
+                return True
+            # Internode cases
+            if mpi_size != REQUIRED_LOCAL_MPI_SIZE:
+                return False
+            num_rdma_nodes = num_ranks // mpi_size
+            return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
+
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             return AlltoallMethodType[all2all_method_type]
@@ -274,12 +298,10 @@ class WideEPMoE(MoE):
 
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
-                if use_cuda_graph:
-                    # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
-                    return AlltoallMethodType.DeepEPLowLatency
-                else:
-                    # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
+                # Choose DeepEP if feasible
+                if is_deepep_feasible(mapping.moe_ep_size):
                     return AlltoallMethodType.DeepEP
+                return AlltoallMethodType.DeepEPLowLatency
 
         return AlltoallMethodType.NotEnabled
 
@@ -546,7 +568,7 @@ class WideEPMoE(MoE):
                 if not use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots, token_final_scales, self.num_slots,
-                        self.expert_size_per_partition * self.mapping.moe_ep_rank)
+                        self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
                     padded, x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                         x, None, recv_topk_idx, token_final_scales)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
@@ -634,7 +656,7 @@ class WideEPMoE(MoE):
                     x_sf = x_sf.view(torch.float32)
                 (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                     self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots, token_final_scales, self.num_slots,
-                    self.expert_size_per_partition * self.mapping.moe_ep_rank)
+                    self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
                 padded, x, x_sf, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                     x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
