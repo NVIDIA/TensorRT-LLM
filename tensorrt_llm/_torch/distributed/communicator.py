@@ -401,7 +401,8 @@ class FlashInferVLLMComm:
         # Create rank data buffer (8MB as in test)
         self.rank_data = torch.empty(8 * 1024 * 1024,
                                      dtype=torch.uint8,
-                                     device=f"cuda:{mapping.local_rank}")
+                                     device=f"cuda:{mapping.local_rank}",
+                                     pin_memory=True)
 
         # Create buffer pointers for IPC communication
         self.buffer_ptrs = flashinfer_comm.create_shared_buffer(max_size, group)
@@ -435,8 +436,11 @@ class TorchDist(Distributed):
         self.device_cp_group = dist.new_group(mapping.cp_group, backend="nccl")
         self.cpu_cp_group = dist.new_group(mapping.cp_group, backend="gloo")
 
-        self._flashinfer_vllm_comm = FlashInferVLLMComm(mapping,
-                                                        self.cpu_tp_group)
+        if os.getenv("_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1":
+            self._flashinfer_vllm_comm = FlashInferVLLMComm(
+                mapping, self.cpu_tp_group)
+        else:
+            self._flashinfer_vllm_comm = None
 
     def broadcast_tp(self, obj, root=0):
         if root not in self.mapping.tp_group:
