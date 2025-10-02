@@ -166,19 +166,16 @@ class FalconH1AttentionDecoderLayer(nn.Module):
         # Multiplying K by key_multiplier is equivalent to setting q_scaling = 1 / key_multiplier
         q_scaling = 1.0 / key_multiplier if key_multiplier not in (0.0, None) else 1.0
 
-        # Build RoPE params equivalent to vLLM
-        rope = RopeParams.from_config(config)
-        head_dim = (config.hidden_size // config.num_attention_heads
-                    if not hasattr(config, "head_dim") or not isinstance(getattr(config, "head_dim"), int)
-                    else getattr(config, "head_dim"))
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         if hasattr(config, "partial_rotary_factor"):
-            rotary_dim = int(head_dim * getattr(config, "partial_rotary_factor"))
+            rotary_dim = head_dim * config.partial_rotary_factor
         elif hasattr(config, "attn_rotary_emb"):
-            rotary_dim = int(getattr(config, "attn_rotary_emb"))
+            rotary_dim = config.attn_rotary_emb
         else:
             rotary_dim = head_dim
-        rope.dim = rotary_dim
+        rope = RopeParams.from_config(config)
         rope.theta = getattr(config, "rope_theta", 1e11)
+        rope.dim = rotary_dim
         rope.max_positions = max_position_embeddings
 
         pos_embd_params = PositionalEmbeddingParams(
@@ -237,10 +234,10 @@ class FalconH1ParallelHybridLayer(DecoderLayer):
                                         dtype=config.torch_dtype)
 
         # Multipliers (default to 1.0 if missing)
-        self.register_buffer("_ssm_in_mul", torch.tensor(getattr(config, "ssm_in_multiplier", 1.0), dtype=torch.float32), persistent=False)
-        self.register_buffer("_ssm_out_mul", torch.tensor(getattr(config, "ssm_out_multiplier", 1.0), dtype=torch.float32), persistent=False)
-        self.register_buffer("_attn_in_mul", torch.tensor(getattr(config, "attention_in_multiplier", 1.0), dtype=torch.float32), persistent=False)
-        self.register_buffer("_attn_out_mul", torch.tensor(getattr(config, "attention_out_multiplier", 1.0), dtype=torch.float32), persistent=False)
+        self.ssm_in_multiplier = getattr(config, "ssm_in_multiplier", 1.0)
+        self.ssm_out_multiplier = getattr(config, "ssm_out_multiplier", 1.0)
+        self.attn_in_multiplier = getattr(config, "attention_in_multiplier", 1.0)
+        self.attn_out_multiplier = getattr(config, "attention_out_multiplier", 1.0)
 
     def forward(self,
                 position_ids: torch.IntTensor,
@@ -252,16 +249,16 @@ class FalconH1ParallelHybridLayer(DecoderLayer):
 
         # Attention branch
         attn_hidden, _ = self.self_attn(position_ids=position_ids,
-                                        hidden_states=hidden_states * self._attn_in_mul,
+                                        hidden_states=hidden_states * self.attn_in_multiplier,
                                         attn_metadata=attn_metadata)
 
         # Mamba branch
-        mamba_hidden, _ = self.mamba(hidden_states=hidden_states * self._ssm_in_mul,
+        mamba_hidden, _ = self.mamba(hidden_states=hidden_states * self.ssm_in_multiplier,
                                      attn_metadata=attn_metadata,
                                      mamba_metadata=kwargs.get(
                                          "mamba_metadata"))
 
-        hidden_states = attn_hidden * self._attn_out_mul + mamba_hidden * self._ssm_out_mul
+        hidden_states = attn_hidden * self.attn_out_multiplier + mamba_hidden * self.ssm_out_multiplier
         hidden_states = hidden_states + residual
 
         # FFN
