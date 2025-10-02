@@ -898,23 +898,20 @@ void WindowBlockManager::startScheduling()
     }
 }
 
-void WindowBlockManager::claimLeafBlock(BlockPtr const& block, std::optional<executor::RetentionPriority> priority,
-    std::optional<std::chrono::milliseconds> durationMs)
+void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 {
     // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
     // This is so it can check if the parent should be queued for eviction.
-    mEvictionPolicy->claimBlock(block, priority, durationMs);
     block->freeLeafBlock();
 }
 
-void WindowBlockManager::freeChildren(
-    BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
+void WindowBlockManager::freeChildren(BlockPtr const& block)
 {
     // Free all descendants of block
     for (auto const& p : block->getNextBlocks())
     {
         auto childBlock = p.second;
-        freeChildren(childBlock, priority, durationMs);
+        freeChildren(childBlock);
     }
 
     // Free block
@@ -922,8 +919,7 @@ void WindowBlockManager::freeChildren(
     {
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
-
-    claimLeafBlock(block, priority, durationMs);
+    freeLeafBlock(block);
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
@@ -963,12 +959,9 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         block = offloadBlock;
     }
 
-    // Ensure that returned block is a leaf block by freeing all it's children.
-    // Most blocks returned by mEvictionPolicy->getFreeBlock will be leaf blocks,
-    // but there are situations where they are not. One example is when a primary
-    // block has children in secondary memory and offloading is not possible
-    // because there are no free secondary blocks.
-    freeChildren(block, priority, durationMs);
+    // Removes children of the block from the search tree
+    freeChildren(block);
+    mEvictionPolicy->claimBlock(block, priority, durationMs);
 
     // Deal with invalidating block save for reuse for the sequence
     if (mBlockToSequence.count(block->getBlockId()) > 0)
@@ -1214,7 +1207,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 else
                 {
                     // Leaf block that nobody is using. Make block private and reuse
-                    claimLeafBlock(
+                    freeLeafBlock(matchingBlock);
+                    mEvictionPolicy->claimBlock(
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);

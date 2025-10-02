@@ -864,8 +864,7 @@ private:
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
-    void freeChildren(BlockPtr const& block, executor::RetentionPriority priority,
-        std::optional<std::chrono::milliseconds> durationMs);
+    void freeChildren(BlockPtr const& block);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
@@ -874,9 +873,8 @@ private:
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    //! \brief Free block from previous block and claim it from free blocks list.
-    void claimLeafBlock(BlockPtr const& block, std::optional<executor::RetentionPriority> priority = std::nullopt,
-        std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
+    //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
+    void freeLeafBlock(BlockPtr const& block);
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
