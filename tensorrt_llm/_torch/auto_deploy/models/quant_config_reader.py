@@ -83,6 +83,8 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
+    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+
     def read_config(self, config: Dict) -> Dict:
         producer = config.get("producer", {}).get("name")
         # sanity check
@@ -91,7 +93,10 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
 
         quant_config = config.get("quantization", {})
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
-        quant_config.setdefault("exclude_modules", ["lm_head", "model.embed_tokens"])
+        excludes = quant_config.get("exclude_modules", [])
+        quant_config["exclude_modules"] = excludes + [
+            n for n in self._ALWAYS_EXCLUDE if n not in excludes
+        ]
         # Update dtype
         if quant_config.get("quant_algo") == "NVFP4":
             quant_config["torch_dtype"] = "float16"

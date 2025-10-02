@@ -211,9 +211,8 @@ def run_disaggregated_test(example_dir,
             for _ in range(num_iters):
                 client_cmd = [
                     'python3', f'{client_dir}/disagg_client.py', '-c',
-                    f'{example_dir}/disagg_config.yaml', '-p',
-                    f'{client_dir}/{prompt_file}', '--ignore-eos',
-                    '--server-start-timeout',
+                    f'{config_file}', '-p', f'{client_dir}/{prompt_file}',
+                    '--ignore-eos', '--server-start-timeout',
                     str(server_start_timeout)
                 ]
                 if prompt_file == "long_prompts.json":
