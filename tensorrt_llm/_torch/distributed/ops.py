@@ -876,6 +876,7 @@ class FlashInferVLLMAllReduce(nn.Module):
         self.dtype = dtype
 
         self.reg_buffer_size = 8192 * 8192 * 2
+        self.workspace = get_torch_dist_flashinfer_vllm_comm()
 
     def forward(
         self,
@@ -896,15 +897,13 @@ class FlashInferVLLMAllReduce(nn.Module):
         input_tensor = input.contiguous()
         output_tensor = torch.empty_like(input_tensor)
 
-        workspace = get_torch_dist_flashinfer_vllm_comm()
-
         try:
             # Perform vLLM custom allreduce
             flashinfer_comm.vllm_all_reduce(
-                workspace.fa,
+                self.workspace.fa,
                 input_tensor,
                 output_tensor,
-                workspace.buffer_ptrs[self.mapping.rank],
+                self.workspace.buffer_ptrs[self.mapping.rank],
                 self.reg_buffer_size,
                 36,  # CTA upper bounds: 36 as mentioned in the API
             )
