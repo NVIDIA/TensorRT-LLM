@@ -242,7 +242,6 @@ class MoE(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
-        **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
@@ -275,7 +274,6 @@ class MoE(nn.Module):
                 output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
-                **kwargs,
             )
 
     @property
@@ -301,6 +299,12 @@ class MoE(nn.Module):
     def has_nvfp4(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
+        )
+
+    @property
+    def has_w4a8_nvfp4_fp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
         )
 
     @property
