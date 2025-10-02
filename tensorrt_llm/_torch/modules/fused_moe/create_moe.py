@@ -41,6 +41,7 @@ def get_moe_cls(
                 quant_config.quant_mode.has_fp8_block_scales()
                 or quant_config.quant_mode.has_nvfp4()
                 or quant_config.quant_mode.has_w4a16_mxfp4()
+                or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
                 or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
                 or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
             return TRTLLMGenFusedMoE
