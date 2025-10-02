@@ -442,8 +442,7 @@ class FlashInferVLLMComm:
         # Create rank data buffer (8MB as in test)
         self.rank_data = torch.empty(8 * 1024 * 1024,
                                      dtype=torch.uint8,
-                                     device=f"cuda:{mapping.local_rank}",
-                                     pin_memory=True)
+                                     device=f"cuda:{mapping.local_rank}")
 
         # Create buffer pointers for IPC communication
         self.buffer_ptrs = flashinfer_comm.create_shared_buffer(max_size, group)
@@ -875,8 +874,11 @@ def pp_send(tensor):
 def init_torch_dist_tp_comm(mapping):
     """Initialize TorchDistTPComm once at startup"""
     global _torch_dist_tp_comm
-    _torch_dist_tp_comm = TorchDist(mapping)
+    if _torch_dist_tp_comm is None:
+        _torch_dist_tp_comm = TorchDist(mapping)
 
 
 def get_torch_dist_flashinfer_vllm_comm():
-    return _torch_dist_tp_comm._flashinfer_vllm_comm
+    if _torch_dist_tp_comm is not None:
+        return _torch_dist_tp_comm._flashinfer_vllm_comm
+    return None
