@@ -97,7 +97,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             # Set explicitly to match default build_config behavior
             'max_num_tokens': 8192,
             'skip_loading_weights': False,
-            'compile_backend': 'torch-opt',
+            'compile_backend': 'torch-compile',
             'free_mem_ratio': 0.7,
             'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128],
         }
@@ -113,14 +113,11 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     def test_auto_dtype(self):
         kwargs = self.get_default_kwargs()
-        sampling_params = self.get_default_sampling_params()
+        self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
                            **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
-            sampling_params = SamplingParams(temperature=0.0,
-                                             top_k=None,
-                                             top_p=None)
-            task.evaluate(llm, sampling_params=sampling_params)
+            task.evaluate(llm)

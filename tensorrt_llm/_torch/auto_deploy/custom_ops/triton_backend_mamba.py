@@ -242,7 +242,8 @@ class TritonBackendSSM(AttentionDescriptor):
             ssm_state_size = max(1, B_fake.shape[-1])
 
         def _get_ssm_cache(si: SequenceInfo):
-            return torch.empty(
+            # Initialize to zeros so brand-new sequences start from a clean state.
+            return torch.zeros(
                 si.max_batch_size,
                 num_heads,
                 head_dim,
