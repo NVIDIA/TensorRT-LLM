@@ -10,7 +10,7 @@ from torch.fx import GraphModule, Node
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ...custom_ops.attention_interface import AttentionDescriptor, Constant
+from ...custom_ops.attention_interface import AttentionDescriptor, Constant, SequenceInfo
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -193,12 +193,17 @@ def forward_with_prepare_metadata(gm: GraphModule, **cm_kwargs):
     if hasattr(gm, "_prepare_metadata_info"):
         # collect args+constant args
         args = [cm_kwargs[k] for k in gm._prepare_metadata_info["arg_names"]]
+        # NOTE: temp test
+        args[2] = SequenceInfo._get_sanitized_seq_len(args[0], args[2])
         const_args = gm._prepare_metadata_info["const_args"]
 
         # run prepare_metadata function and add to kwargs
         metadata = gm._prepare_metadata_info["get_metadata"](*args, *const_args)
         return_names = gm._prepare_metadata_info["return_names"]
         cm_kwargs.update({k: v for k, v in zip(return_names, metadata)})
+    import torch._subclasses
+
+    torch._subclasses.FakeTensorMode._allow_non_fake_inputs = True
 
     return gm.factory_model.forward(**cm_kwargs)
 

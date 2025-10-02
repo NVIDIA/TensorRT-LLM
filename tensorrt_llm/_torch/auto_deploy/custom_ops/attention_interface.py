@@ -476,6 +476,7 @@ class SequenceInfo:
         b, s = input_ids.shape[:2]
         if s > 1:
             num_seq = torch.sum(seq_len > 0)
+            num_seq = num_seq.item()
             assert seq_len[num_seq:].sum() == 0, "seq_len should be zero-padded"
         else:
             num_seq = b
