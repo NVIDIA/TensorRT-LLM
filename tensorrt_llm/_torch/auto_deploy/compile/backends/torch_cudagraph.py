@@ -7,6 +7,8 @@ import torch.nn as nn
 from torch.cuda import CUDAGraph
 from torch.utils._pytree import TreeSpec, tree_flatten
 
+from tensorrt_llm._torch.autotuner import autotune
+
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import BackendCompiler, BackendRegistry, _flatten_args
@@ -54,7 +56,7 @@ class CapturedGraph(nn.Module):
     def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
         # warm-up and invoke autotuner
-        with CudaGraphWarmUpPhase():
+        with CudaGraphWarmUpPhase(), autotune():
             for _ in range(3):
                 self.model(*args, **kwargs)
 
