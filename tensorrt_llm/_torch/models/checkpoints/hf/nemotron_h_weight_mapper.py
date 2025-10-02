@@ -34,7 +34,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             if "A_log" in key:
                 key = key.replace("A_log", "A")
 
-            if "_scale" in key and weights[name].dim() == 0:
+            if "_scale" in key:
                 new_weights[key] = weights[name]
             elif "A" in key:
                 w = split(weights[name], tp_size, tp_rank)

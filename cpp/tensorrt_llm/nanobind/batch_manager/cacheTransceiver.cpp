@@ -25,6 +25,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
 
@@ -71,6 +72,11 @@ public:
     {
         NB_OVERRIDE_PURE(checkGenTransferComplete);
     }
+
+    bool cancelRequest(tb::LlmRequest* llmRequest) override
+    {
+        NB_OVERRIDE_PURE(cancelRequest, llmRequest);
+    }
 };
 } // namespace
 
@@ -82,7 +88,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
-        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
+        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
@@ -90,11 +97,11 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 
     nb::class_<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
-                 runtime::WorldConfig, nvinfer1::DataType, executor::kv_cache::CacheState::AttentionType,
-                 std::optional<executor::CacheTransceiverConfig>>(),
+                 runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
+                 executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
-            nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("dtype"), nb::arg("attention_type"),
-            nb::arg("cache_transceiver_config") = std::nullopt);
+            nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
+            nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt);
 
     nb::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), nb::arg("cache_manager"),

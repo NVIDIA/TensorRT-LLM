@@ -8,7 +8,6 @@ import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
-from ..custom_ops.quant import QUANT_BMM_OPS, QUANT_LINEAR_OPS
 from .logger import ad_logger
 
 try:
@@ -152,9 +151,6 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
-    assert is_linear_op(mm_node, include_quantization=True) or is_bmm_op(mm_node), (
-        f"Expecting linear or bmm node, Found: {mm_node}"
-    )
     weight_node = extract_weight_node(mm_node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
@@ -251,7 +247,7 @@ def filtered_nodes(
                 yield node
 
 
-def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
+def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
     Using this function is preferred over `is_op` for linear ops to ensure all variants are covered.
@@ -261,19 +257,22 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
         torch.ops.auto_deploy.torch_linear_simple,
     }
 
-    if include_quantization:
-        lin_ops.update(QUANT_LINEAR_OPS)
     return is_op(node, lin_ops)
 
 
-def is_bmm_op(node: Node, include_quantization: bool = False) -> bool:
-    """Check if the node is a distributed op."""
-    dist_ops = {torch.ops.aten.bmm}
+def is_fake_quantized_linear_op(node: Node) -> bool:
+    quantized_linear_op = {
+        torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+    }
 
-    if include_quantization:
-        dist_ops.update(QUANT_BMM_OPS)
+    return is_op(node, quantized_linear_op)
 
-    return is_op(node, dist_ops)
+
+def is_bmm_op(node: Node) -> bool:
+    bmm_ops = {torch.ops.aten.bmm}
+
+    return is_op(node, bmm_ops)
 
 
 def is_dist_op(node: Node) -> bool:

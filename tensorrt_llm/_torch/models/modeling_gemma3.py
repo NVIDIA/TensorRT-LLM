@@ -7,6 +7,7 @@ from transformers import Gemma3TextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -15,12 +16,10 @@ from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
@@ -52,7 +51,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
         return super().forward(input_ids) * self.embed_scale
 
 
-class Gemma3Attention(Attention):
+class Gemma3Attention(QKNormRoPEAttention):
 
     def __init__(
         self,
@@ -82,20 +81,13 @@ class Gemma3Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
         )
-        self.q_norm = RMSNorm(hidden_size=config.head_dim,
-                              eps=config.rms_norm_eps,
-                              dtype=config.torch_dtype)
-        self.k_norm = RMSNorm(hidden_size=config.head_dim,
-                              eps=config.rms_norm_eps,
-                              dtype=config.torch_dtype)
-        self.aux_stream = torch.cuda.Stream()
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     @torch.inference_mode()
     def forward(
@@ -120,33 +112,6 @@ class Gemma3Attention(Attention):
                                attention_window_size=self.attention_window_size,
                                attention_mask_data=attention_mask_data,
                                **kwargs)
-
-    def apply_qk_norm(self, q, k):
-
-        def q_l2norm():
-            return self.q_norm(q.reshape(-1, self.head_dim)).reshape(
-                -1, self.q_size)
-
-        def k_l2norm():
-            return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
-                -1, self.kv_size)
-
-        q, k = maybe_execute_in_parallel(
-            q_l2norm,
-            k_l2norm,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
-        return q, k
-
-    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
-                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
-        # Gemma3 applies QK norm before RoPE.
-        q, k, v = self.split_qkv(q, k, v)
-        q, k = self.apply_qk_norm(q, k)
-        return super().apply_rope(q, k, v, position_ids)
 
 
 # This function is written to be compatible with TRTLLM's GatedMLP class.

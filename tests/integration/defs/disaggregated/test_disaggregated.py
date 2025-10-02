@@ -87,6 +87,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
         "ctxpp4_genpp4":
         (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
+        "ctxpp4_gentp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -149,6 +151,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
          ),
+        "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -205,9 +211,8 @@ def run_disaggregated_test(example_dir,
             for _ in range(num_iters):
                 client_cmd = [
                     'python3', f'{client_dir}/disagg_client.py', '-c',
-                    f'{example_dir}/disagg_config.yaml', '-p',
-                    f'{client_dir}/{prompt_file}', '--ignore-eos',
-                    '--server-start-timeout',
+                    f'{config_file}', '-p', f'{client_dir}/{prompt_file}',
+                    '--ignore-eos', '--server-start-timeout',
                     str(server_start_timeout)
                 ]
                 if prompt_file == "long_prompts.json":
@@ -580,6 +585,52 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
+                                            disaggregated_example_root,
+                                            llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=llm_venv._new_env
+                           | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           cwd=llm_venv.get_working_directory())
+    assert os.path.isdir(output_path)
+    send_file = os.path.join(output_path, "rank_0_send.csv")
+    recv_file = os.path.join(output_path, "rank_1_recv.csv")
+    assert os.path.exists(send_file)
+    assert os.path.exists(recv_file)
+    with open(send_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        assert lines[0].startswith(
+            "RequestID,Delay(ms),Duration(ms),Bandwidth(Gbps)")
+        # get a send sample and match the recv
+        sample = lines[1].split(',')
+        assert len(sample) >= 4
+    with open(recv_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        matched = False
+        for line in lines:
+            sample_recv = line.split(',')
+            if sample_recv[0] == sample[0]:
+                matched = True
+                assert float(sample_recv[1]) <= float(sample[1])
+                break
+        assert matched
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
                                       disaggregated_example_root,
                                       llama_model_root):
@@ -776,6 +827,27 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+#tiny llama pp4 will have uneven layer per pp. pp4
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_gentp4",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -838,6 +910,29 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_mtp",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    #add one mtp layer, pp rank0 will have 15 layer, pp rank 1 will have 16 layers.
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
@@ -1302,7 +1397,7 @@ def get_config_for_benchmark(model_root, backend):
             "num_instances": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "disable_overlap_scheduler": True,
@@ -1318,7 +1413,7 @@ def get_config_for_benchmark(model_root, backend):
             "pipeline_parallel_size": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
                 "max_tokens_in_buffer": 512,

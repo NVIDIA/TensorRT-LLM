@@ -491,15 +491,12 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            mrope_position_deltas = torch.zeros(
-                1, device="cuda", dtype=torch.int32) if use_mrope else None
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
-                             mrope_position_deltas=mrope_position_deltas,
                              encoder_input_tokens=encoder_input_tokens)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
@@ -520,6 +517,20 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(max_num_draft_tokens):
                         self.impl.add_token(req_id)
 
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
+            if use_mrope:
+                dummy_mrope_position_ids = torch.arange(
+                    0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
+                req.py_multimodal_data = {
+                    "mrope_config": {
+                        "mrope_position_ids": dummy_mrope_position_ids
+                    }
+                }
+                if is_gen:
+                    dummy_mrope_position_deltas = torch.zeros(
+                        1, dtype=torch.int32).unsqueeze(0)
+                    req.py_multimodal_data["mrope_config"][
+                        "mrope_position_deltas"] = dummy_mrope_position_deltas
             requests.append(req)
         return requests
 
@@ -534,8 +545,15 @@ class KVCacheManager(BaseResourceManager):
         for request in scheduled_batch.context_requests:
             self.impl.store_context_blocks(request)
 
-    def free_resources(self, request: LlmRequest):
-        self.impl.remove_sequence(request.py_request_id, request)
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        return self.impl.remove_sequence(request.py_request_id, request,
+                                         pin_on_release)
+
+    def store_blocks_for_reuse(self,
+                               request: LlmRequest,
+                               pin_blocks: bool = False):
+        return self.impl.store_blocks_for_reuse(request.py_request_id, request,
+                                                pin_blocks)
 
     @staticmethod
     def calculate_scaling_factor_size_bytes(
@@ -582,7 +600,7 @@ class KVCacheManager(BaseResourceManager):
             if kv_cache_config.free_gpu_memory_fraction is not None:
                 max_tokens = min(kv_cache_config.max_tokens, max_tokens)
                 logger.warning(
-                    f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {kv_cache_config.max_tokens}, respectively). The smaller value will be used.'
+                    f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 32)} of total memory {total_mem / (1<<32)}, respectively). The smaller value will be used.'
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens
@@ -632,6 +650,12 @@ class KVCacheManager(BaseResourceManager):
                                                window_size)
         assert len(result) == 1
         return result[0]
+
+    def unpin_blocks_by_id(self, kv_cache_block_id: int):
+        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+
+    def get_last_block_id(self, request_id: int) -> int:
+        return self.impl.get_last_block_id(request_id)
 
     def get_batch_cache_indices(
         self,
@@ -994,6 +1018,9 @@ class KVCacheManager(BaseResourceManager):
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
 
+    def pin_blocks(self, request_id: int):
+        self.impl.pin_blocks(request_id)
+
     def _set_temp_attention_window_inputs(
             self) -> Optional[TempAttentionWindowInputs]:
         """
@@ -1041,6 +1068,13 @@ class SlotManager:
         if request_id in self.slot_mapping:
             slot = self.slot_mapping.pop(request_id)
             self.free_slots.add(slot)
+
+    def shutdown(self):
+        req_ids_list = list(self.slot_mapping.keys())
+        for rid in req_ids_list:
+            self.remove_slot(rid)
+        assert len(self.slot_mapping) == 0 and len(
+            self.free_slots) == self.max_num_requests
 
 
 class ResourceManager:

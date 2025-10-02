@@ -163,7 +163,6 @@ class Llama4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         skip_attn_scaling: bool = False,
     ):
@@ -176,14 +175,14 @@ class Llama4Attention(Attention):
             q = self._attention_scaling(q, position_ids)
 
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.forward_impl(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        attention_mask,
-                                        None,
-                                        None,
-                                        mrope_config,
+        attn_output = self.forward_impl(q=q,
+                                        k=k,
+                                        v=v,
+                                        attn_metadata=attn_metadata,
+                                        attention_mask=attention_mask,
+                                        attention_window_size=None,
+                                        attention_mask_data=None,
+                                        mrope_config=None,
                                         attention_sinks=None)
 
         if isinstance(attn_output, tuple):
@@ -201,7 +200,6 @@ class Llama4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -213,7 +211,6 @@ class Llama4Attention(Attention):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 attention_mask=attention_mask,
-                mrope_config=mrope_config,
                 all_reduce_params=all_reduce_params,
                 lora_params=lora_params,
                 **kwargs,
@@ -223,7 +220,6 @@ class Llama4Attention(Attention):
                                       hidden_states=hidden_states,
                                       attn_metadata=attn_metadata,
                                       attention_mask=attention_mask,
-                                      mrope_config=mrope_config,
                                       all_reduce_params=all_reduce_params)
 
 
@@ -315,23 +311,19 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              all_rank_max_num_tokens,
                               cutlass_min_latency_mode):
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(
-            hidden_states,
-            router_logits,
-            do_finalize=not cutlass_min_latency_mode,
-            all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+        routed_output = self.experts(hidden_states,
+                                     router_logits,
+                                     do_finalize=not cutlass_min_latency_mode,
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=False)
         return routed_output
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
-        all_rank_max_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -339,8 +331,7 @@ class Llama4MoE(nn.Module):
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, all_rank_max_num_tokens,
-            cutlass_min_latency_mode)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -427,11 +418,12 @@ class Llama4DecoderLayer(DecoderLayer):
                 overridden_tp_size=1 if self.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
-
+            # TODO(TRTLLM-7809): Fix fusion with PP>1
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+            ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+            )
+            self.fusion_config.POST_MLP_FUSION = self.fusion_config.PRE_MLP_FUSION
+
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -445,9 +437,9 @@ class Llama4DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+            ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+            )
+            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -542,7 +534,6 @@ class Llama4DecoderLayer(DecoderLayer):
         hidden_states = self.feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_feed_forward_allreduce),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
@@ -572,7 +563,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
@@ -781,7 +773,8 @@ class LlamaDecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
@@ -1005,7 +998,8 @@ class Llama4VisionEncoder(nn.Module):
                  **kwargs):
         super().__init__()
         self.pretrained_config = model_config.pretrained_config
-        self.device = f"cuda:{model_config.mapping.rank}"
+        # TODO: use config.mapping.get_local_rank() instead
+        self.device = f"cuda:{torch.cuda.current_device()}"
 
         self.dtype = self.pretrained_config.text_config.torch_dtype
 
@@ -1280,7 +1274,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 ]
 
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embeds)
+                                                     input_ids, mm_embeds,
+                                                     **kwargs)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

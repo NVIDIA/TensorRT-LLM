@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+import xgrammar
 from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
@@ -19,7 +20,8 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -84,18 +86,14 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
-class StructuralTag(OpenAIBaseModel):
-    begin: str
-    schema_: Optional[dict[str, Any]] = Field(alias="schema")
-    end: str
-
-
 class ResponseFormat(OpenAIBaseModel):
     # type must be one of "text", "json", "json_object", or "structural_tag"
-    type: Literal["text", "json", "json_object", "structural_tag"]
+    type: Literal["text", "json", "json_object", "regex", "ebnf",
+                  "structural_tag"]
     schema: Optional[dict] = None
-    structures: Optional[List[StructuralTag]] = None
-    triggers: Optional[List[str]] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    format: Optional[xgrammar.structural_tag.Format] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -192,6 +190,10 @@ def _response_format_to_guided_decoding_params(
         return GuidedDecodingParams(json=response_format.schema)
     elif response_format.type == "json_object":
         return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "regex":
+        return GuidedDecodingParams(regex=response_format.regex)
+    elif response_format.type == "ebnf":
+        return GuidedDecodingParams(grammar=response_format.ebnf)
     elif response_format.type == "structural_tag":
         return GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,
@@ -252,9 +254,9 @@ class CompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = Field(
         default=None,
         description=
-        ("Similar to chat completion, this parameter specifies the format of "
-         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'}, {'type': 'json'} are "
-         "supported."),
+        ("Similar to chat completion, this parameter specifies the format of output. "
+         "{'type': 'text'}, {'type': 'json'}, {'type': 'json_object'}, {'type': 'regex'}, "
+         "{'type': 'ebnf'}, {'type': 'structural_tag'} are supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
@@ -497,7 +499,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[int] = None
+    logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_completion_tokens: Optional[int] = Field(default=None,
                                                  validation_alias='max_tokens')
@@ -592,10 +594,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    cache_salt: Optional[str] = Field(
+        default=None,
+        description=
+        ("If specified, KV cache will be salted with the provided string "
+         "to limit the kv cache reuse on with the requests having the same string."
+         ))
+
     # doc: end-chat-completion-extra-params
 
-    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
-
+    def to_sampling_params(self,
+                           vocab_size: int = 32000,
+                           gather_generation_logits: bool = False,
+                           backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
             max_tokens=self.max_completion_tokens,
@@ -631,10 +642,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
-
-            # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=bool(self.logprobs),
         )
+        if self.logprobs:
+            logprobs = 1 if not self.top_logprobs else self.top_logprobs
+            if backend == "pytorch":
+                sampling_params.logprobs = logprobs
+            else:
+                if gather_generation_logits:
+                    sampling_params.logprobs = logprobs
+                elif self.top_logprobs:
+                    raise ValueError(
+                        "`gather_generation_logits` must be `True` to use `top_logprobs`"
+                    )
+                else:
+                    sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode='before')
@@ -659,9 +680,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        top_logprobs = data.get("top_logprobs")
-        if top_logprobs is not None and top_logprobs > 0:
-            raise ValueError("top_logprobs is not supported")
+        if (top_logprobs := data.get("top_logprobs")) is not None:
+            if top_logprobs < 0:
+                raise ValueError("top_logprobs must be positive or zero")
+            if not data.get("logprobs"):
+                raise ValueError(
+                    "logprobs must be true when using top_logprobs")
         return data
 
     @model_validator(mode="before")
@@ -670,6 +694,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
         return data
+
+    @field_validator("cache_salt")
+    @classmethod
+    def check_cache_salt_support(cls, v):
+        if v is not None:
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError(
+                    "Parameter 'cache_salt' must be a non-empty string if provided."
+                )
+        return v
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

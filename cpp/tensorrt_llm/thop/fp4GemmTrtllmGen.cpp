@@ -40,7 +40,7 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
     auto eltType = tg::Dtype::E2m1;
 
     tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options
-        = {.eltType = eltType, .outputType = outDtype, .deepSeekFp8 = false};
+        = {.eltTypeA = eltType, .outputType = outDtype, .deepSeekFp8 = false};
 
     tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
 

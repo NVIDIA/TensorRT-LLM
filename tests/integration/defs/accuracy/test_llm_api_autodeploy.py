@@ -44,7 +44,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             'skip_loading_weights': False,
             'compile_backend': 'torch-opt',
             'free_mem_ratio': 0.7,
-            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256]
+            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
         }
 
     def get_default_sampling_params(self):

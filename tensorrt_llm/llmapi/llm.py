@@ -9,15 +9,17 @@ import weakref
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
 
+import transformers
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.inputs.data import TextPrompt
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
+from ..bindings import steady_clock_now
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
@@ -27,7 +29,8 @@ from ..executor.postproc_worker import PostprocParams
 from ..executor.utils import (create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
-                      create_input_processor_with_hash, prompt_inputs)
+                      create_input_processor_with_hash, get_cache_salt_id,
+                      prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -208,6 +211,8 @@ class BaseLLM:
                 self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
+            self._hf_model_config = None
+            self._generation_config = None
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
@@ -325,6 +330,7 @@ class BaseLLM:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt: Optional[str] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -339,7 +345,7 @@ class BaseLLM:
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
-
+            cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
@@ -348,13 +354,19 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
-        sampling_params = self._prepare_sampling_params(sampling_params)
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
 
+        sampling_params = self._prepare_sampling_params(sampling_params)
+        cache_salt_id = get_cache_salt_id(
+            cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
         is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
         is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+        is_mm_disagg = disaggregated_params is not None and disaggregated_params.multimodal_embedding_handles is not None
+
         if is_ctx_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
@@ -379,8 +391,31 @@ class BaseLLM:
         query_token_ids = None
         multimodal_params = None
 
-        if "prompt_token_ids" in inputs:
-            # TODO: if specify prompt_token_ids, the mm hashing is not supported yet
+        if is_mm_disagg:
+            if not self.input_processor.support_mm_disagg:
+                raise ValueError(
+                    "Multimodal disaggregated inference is not supported for this model"
+                )
+            mm_handles = disaggregated_params.multimodal_embedding_handles
+            prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
+                inputs, mm_handles)
+            prompt = inputs.get("prompt", None)
+            query_token_ids = inputs.get("query_token_ids", None)
+            if is_gen_only:
+                # TODO: support generation-only mode for multimodal disaggregated inference
+                # Need to set multimodal_params = None; but not tested yet
+                raise ValueError(
+                    "Multimodal disaggregated inference is not supported for generation-only mode"
+                )
+            else:
+                mm_hashes = disaggregated_params.multimodal_hashes
+                multimodal_input = MultimodalInput.from_components(
+                    mm_hashes, mm_token_positions, mm_token_length)
+                multimodal_params = MultimodalParams(
+                    multimodal_input=multimodal_input,
+                    multimodal_data={"multimodal_embedding": mm_handles})
+
+        elif "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
@@ -444,6 +479,8 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time,
         )
 
         return RequestOutput._from_generation_result(result, prompt,
@@ -527,19 +564,15 @@ class BaseLLM:
             self,
             sampling_params: Optional[SamplingParams] = None) -> SamplingParams:
         if sampling_params is None:
-            if self.tokenizer is None:
-                raise ValueError(
-                    "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
-                )
-            sampling_params = SamplingParams(end_id=self.tokenizer.eos_token_id,
-                                             pad_id=self.tokenizer.pad_token_id)
-        elif isinstance(sampling_params, SamplingParams):
+            sampling_params = SamplingParams()
+        if isinstance(sampling_params, SamplingParams):
             if sampling_params.end_id is None:
                 if self.tokenizer is None:
                     raise ValueError(
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
-                sampling_params._setup(self.tokenizer)
+                sampling_params._setup(self.tokenizer, self._hf_model_config,
+                                       self._generation_config)
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
@@ -565,16 +598,6 @@ class BaseLLM:
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            # TODO: remove these checks after PyTorch backend
-            # fully support TopK prompt and generation logprobs.
-            if sampling_params.prompt_logprobs:
-                raise ValueError(
-                    f"`prompt_logprobs` in sampling_params is not supported in the PyTorch backend yet. Received `prompt_logprobs={sampling_params.prompt_logprobs}`. Please unset this field."
-                )
-            if sampling_params.logprobs and sampling_params.logprobs > 1:
-                raise ValueError(
-                    f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
-                )
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
@@ -698,6 +721,14 @@ class BaseLLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
+    def _try_load_generation_config(
+            self) -> Optional[transformers.GenerationConfig]:
+        return ModelLoader.load_hf_generation_config(self.args.model)
+
+    def _try_load_hf_model_config(
+            self) -> Optional[transformers.PretrainedConfig]:
+        return ModelLoader.load_hf_model_config(self.args.model)
+
     @set_api_status("beta")
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
@@ -732,7 +763,7 @@ class BaseLLM:
 
 @append_docstring(TRT_LLM_DOCSTRING)
 class _TrtLLM(BaseLLM):
-    """LLM class is the main class for running a LLM model using TensorRT-LLM backend.
+    """LLM class is the main class for running a LLM model using TensorRT LLM backend.
 
     Parameters:
 """
@@ -790,9 +821,11 @@ class _TrtLLM(BaseLLM):
         if self._engine_dir is not None:
             self.args.model = self._engine_dir
 
-        # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
+        # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
+        self._hf_model_config = self._try_load_hf_model_config()
+        self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
@@ -955,9 +988,11 @@ class _TorchLLM(BaseLLM):
         super()._build_model()
         assert self._engine_dir is None
 
-        # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
+        # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
+        self._hf_model_config = self._try_load_hf_model_config()
+        self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor

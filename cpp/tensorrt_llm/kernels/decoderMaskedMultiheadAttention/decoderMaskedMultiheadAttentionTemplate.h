@@ -1363,7 +1363,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps = min(timestep, static_cast<unsigned>(cyclic_kv_cache_len));
+        auto const max_timesteps
+            = min(timestep, min(chunked_attention_size, static_cast<unsigned>(cyclic_kv_cache_len)));
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -2612,7 +2613,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             __shared__ typename BlockReduce::TempStorage temp_storage;
             // Obtain a segment of consecutive items that are blocked across threads (final_max from above)
             // Compute the block-wide max for thread0
-            final_max = BlockReduce(temp_storage).Reduce(thread_partial_max, cub::Max(), gridDim.z);
+            final_max = BlockReduce(temp_storage).Reduce(thread_partial_max, cuda::maximum(), gridDim.z);
 
             __shared__ float final_max_smem;
             if (tidx == 0)

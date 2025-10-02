@@ -161,10 +161,6 @@ def _register_fake():
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
 
-    @torch.library.register_fake("trtllm::logits_bitmask")
-    def _(logits: List[torch.Tensor], bitmask: List[torch.Tensor]):
-        pass
-
     @torch.library.register_fake("trtllm::fp4_quantize")
     def _(
         input: torch.Tensor,
@@ -492,17 +488,36 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
-    def _(router_logits, topk):
+    def _(router_logits, topk, output_dtype: torch.dtype = None):
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
+        output_dtype = output_dtype or torch.float32
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
-                                                            dtype=torch.float32)
+                                                            dtype=output_dtype)
 
     @torch.library.register_fake("trtllm::default_moe_routing_op")
-    def _(router_logits, topk):
+    def _(router_logits, topk, output_dtype: torch.dtype = None):
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
+        output_dtype = output_dtype or torch.float32
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
-                                                            dtype=torch.float32)
+                                                            dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::alltoall_helix")
+    def _(input_list, group, num_lists):
+        num_ranks = len(group)
+        len(input_list) // num_ranks
+        return [
+            input_list[i].new_empty((num_ranks, ) + i.shape)
+            for i in range(0, len(input_list), num_ranks)
+        ]
+
+    @torch.library.register_fake("trtllm::tinygemm2")
+    def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+        # input [M, K], weight [N, K], bias [N]
+        # Output should be [M, N]
+        m = input.shape[0]
+        n = weight.shape[0]
+        return input.new_empty((m, n), dtype=input.dtype)

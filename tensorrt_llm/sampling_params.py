@@ -8,6 +8,7 @@ import torch
 from pydantic import BaseModel
 
 from tensorrt_llm.bindings import executor as tllme
+from tensorrt_llm.logger import logger
 
 
 @dataclass(slots=True, kw_only=True)
@@ -339,10 +340,21 @@ class SamplingParams:
     def _need_return_generation_logits(self) -> bool:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
-    def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
+    def _setup(
+        self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
+    ) -> "SamplingParams":
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
+            # kimi_k2 model uses the eos_token_id in generation config
+            if (
+                hf_model_config is not None
+                and hf_model_config.model_type == "kimi_k2"
+                and generation_config is not None
+                and isinstance(generation_config.eos_token_id, int)
+            ):
+                self.end_id = generation_config.eos_token_id
+
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
@@ -449,6 +461,20 @@ class SamplingParams:
 
         if is_pytorch_backend:
             config_kwargs["return_log_probs"] = bool(self.logprobs)
+            if self.prompt_logprobs and not self.return_context_logits:
+                logger.info(
+                    "Since prompt_logprobs is requested but return_context_logits is False, "
+                    "internally enabling context logits for prompt logprobs computation. "
+                    "context logits will be dropped after computation as the user didn't explicitly request them."
+                )
+                # TODO: Find a more elegant way to do this.
+                # NOTE: This is an internal hack, so we can entirely avoid introducing
+                # `prompt_logprobs` into the executor bindings and further into
+                # model engine / sampler.
+                # This is because, prompt_logprobs is a derived quantity from
+                # context logits, and the capability to post-compute it
+                # already exists in the worker. (see _get_logprobs in worker.py)
+                config_kwargs["return_context_logits"] = True
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
 

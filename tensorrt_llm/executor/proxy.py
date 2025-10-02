@@ -21,7 +21,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -120,7 +120,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
-            is_server=True, name="worker_init_status_queue")
+            is_server=True,
+            socket_type=zmq.ROUTER,
+            name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -180,8 +182,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
+            # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
+            #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
             if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
+                    res,
+                    ErrorResponse) or (isinstance(res, PostprocWorker.Output)
+                                       and res.is_final):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
@@ -320,6 +326,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         while True:
             if self.worker_init_status_queue.poll(1):
                 ready_signal, error_trace = self.worker_init_status_queue.get()
+                # Send ACK to the worker
+                self.worker_init_status_queue.put("ACK")
+                logger.info("get signal from executor worker")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -351,7 +360,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None)
+            self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
         if not self.workers_started:

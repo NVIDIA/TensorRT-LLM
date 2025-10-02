@@ -68,6 +68,11 @@ public:
     {
         PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, checkGenTransferComplete);
     }
+
+    bool cancelRequest(tb::LlmRequest* llmRequest) override
+    {
+        PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, cancelRequest, llmRequest);
+    }
 };
 } // namespace
 
@@ -79,7 +84,8 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
-        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
+        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
 
     py::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
@@ -87,11 +93,11 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
 
     py::classh<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
         .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
-                 runtime::WorldConfig, nvinfer1::DataType, executor::kv_cache::CacheState::AttentionType,
-                 std::optional<executor::CacheTransceiverConfig>>(),
+                 runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
+                 executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>>(),
             py::arg("cache_manager"), py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"),
-            py::arg("tokens_per_block"), py::arg("world_config"), py::arg("dtype"), py::arg("attention_type"),
-            py::arg("cache_transceiver_config") = std::nullopt);
+            py::arg("tokens_per_block"), py::arg("world_config"), py::arg("attention_layer_num_per_pp"),
+            py::arg("dtype"), py::arg("attention_type"), py::arg("cache_transceiver_config") = std::nullopt);
 
     py::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
         .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), py::arg("cache_manager"),
