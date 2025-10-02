@@ -83,6 +83,13 @@ public:
         int const lda, void const* B, int const ldb, void* C, int const ldc, float f_alpha, float f_beta,
         cublasLtMatmulAlgo_t const& algo, bool hasAlgo, bool usingCublasLt);
 
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+    /********************** FP4 GEMMs **********************/
+    void Fp4Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
+        void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+        void const* b_sf, float const* alpha, float const* beta);
+#endif
+
     void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         void const* A, int const lda, const int64_t strideA, void const* B, int const ldb, const int64_t strideB,
         void* C, int const ldc, const int64_t strideC, int const batchCount, float const f_alpha = 1.0f,
@@ -119,6 +126,9 @@ public:
 #endif
 #ifdef ENABLE_FP8
     void setFP8GemmConfig(cudaDataType_t outputType = CUDA_R_16F);
+#endif
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+    void setFP4GemmConfig(cudaDataType_t outputType = CUDA_R_16BF);
 #endif
 
     void setStream(cudaStream_t stream);
