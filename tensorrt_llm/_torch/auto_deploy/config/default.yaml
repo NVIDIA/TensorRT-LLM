@@ -72,8 +72,10 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    use_sharding_from_factory: false
-    support_partial_config: false
+    # sharding_source: ['factory', 'custom', 'heuristic']
+    sharding_source: ['heuristic']
+    support_partial_config: true
+    # custom_sharding_config: 'tp_sharding.yaml'
     sharding_dims: ['tp', 'ep', 'bmm']
     requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.

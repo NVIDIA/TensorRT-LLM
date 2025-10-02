@@ -132,6 +132,16 @@ class TransformInfo(BaseModel):
         "tensors in the graph and it preserves the has_valid_shapes flag of the last transform.",
     )
 
+    # overload += operator to concatenate TransformInfo objects
+    def __iadd__(self, other: "TransformInfo") -> "TransformInfo":
+        # since TransformInfo is frozen, instead, we return a new TransformInfo object
+        return TransformInfo(
+            skipped=self.skipped & other.skipped,
+            num_matches=self.num_matches + other.num_matches,
+            is_clean=self.is_clean & other.is_clean,
+            has_valid_shapes=self.has_valid_shapes & other.has_valid_shapes,
+        )
+
 
 TransformHistory = Dict[str, TransformInfo]
 

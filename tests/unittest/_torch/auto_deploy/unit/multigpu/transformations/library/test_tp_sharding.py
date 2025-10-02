@@ -193,12 +193,13 @@ def _run_job(
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
+    sharding_source = ["factory"] if from_config else ["heuristic"]
     gm_transformed = InferenceOptimizer(
         None,
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "sharding_source": sharding_source,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -338,13 +339,14 @@ def _run_pattern_detection_job(
                         )
                     )
 
+    sharding_source = ["factory"] if from_config else ["heuristic"]
     # get detected transformations
     optimizer = InferenceOptimizer(
         None,
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "sharding_source": sharding_source,
             },
         },
     )

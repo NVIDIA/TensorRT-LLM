@@ -1,14 +1,17 @@
 """Sharding config definitions for the inference optimizer."""
 
+import json
 import math
 import operator
 from abc import ABC, abstractmethod
-from enum import IntEnum
+from enum import Enum, IntEnum
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import torch
 import torch.nn as nn
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch.fx import GraphModule, Node
 
@@ -834,6 +837,22 @@ def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
     return EPShardingInfo
 
 
+class ShardingSource(Enum):
+    """Enum for sharding source."""
+
+    HEURISTIC = "heuristic"
+    FACTORY = "factory"
+    CUSTOM = "custom"
+
+
+class ShardingDim(Enum):
+    """Enum for sharding dimension."""
+
+    TP = "tp"
+    EP = "ep"
+    BMM = "bmm"
+
+
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
@@ -841,9 +860,12 @@ class ShardingConfig(BaseModel):
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
     predefined_config: Optional[Dict[str, Any]] = None
+    custom_sharding_config: Optional[Dict[str, Any]] = None
     simple_shard_only: bool = Field(default=False)
-    use_sharding_from_factory: bool = False
     support_partial_config: bool = False
+    sharding_source: List[ShardingSource] = Field(
+        default_factory=lambda: [ShardingSource.HEURISTIC]
+    )
     sharding_dims: List[str] = Field(default_factory=list)
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
@@ -858,6 +880,37 @@ class ShardingConfig(BaseModel):
         if self.predefined_config is not None:
             self.validate_config()
         return self
+
+    def read_custom_sharding_config(self, config_path: str) -> bool:
+        """Read the custom sharding config from the given path.
+
+        Supports both JSON and YAML file formats. The format is auto-detected
+        based on the file extension (.json, .yaml, .yml).
+        """
+        path = Path(config_path)
+
+        if not path.exists():
+            ad_logger.warning(f"Sharding config file not found: {config_path}")
+            return False
+
+        with open(config_path, "r") as f:
+            if path.suffix.lower() in [".yaml", ".yml"]:
+                self.custom_sharding_config = yaml.safe_load(f)
+            elif path.suffix.lower() == ".json":
+                self.custom_sharding_config = json.load(f)
+            else:
+                ad_logger.warning(f"Unsupported sharding config file format: {path.suffix}")
+        return True
+
+    def append_TP(self, tp_transform: TPShardingInfo) -> bool:
+        """Append a TP transform only if that node was
+        not sharded before. Do not overwrite existing transforms.
+        """
+        for existing_transform in self.tp_transforms:
+            if existing_transform.target_node == tp_transform.target_node:
+                return False
+        self.tp_transforms.append(tp_transform)
+        return True
 
     def validate_config(self) -> bool:
         if self.factory_source != ShardingConfigSource.HUGGINGFACE:
