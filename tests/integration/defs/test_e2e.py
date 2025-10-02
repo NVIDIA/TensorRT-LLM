@@ -1870,6 +1870,12 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('DeepSeek-R1-Distill-Qwen-32B',
                  'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
                  marks=skip_pre_blackwell),
+    pytest.param('GPT-OSS-20B',
+                'gpt_oss/gpt-oss-20b',
+                marks=skip_pre_blackwell),
+    pytest.param('GPT-OSS-120B',
+                'gpt_oss/gpt-oss-120b',
+                marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
