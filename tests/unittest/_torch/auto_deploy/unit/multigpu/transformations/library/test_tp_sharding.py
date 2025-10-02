@@ -1,5 +1,6 @@
 """Tests for basic graph sharding."""
 
+# add to the path directory 4 directories up
 from functools import partial
 from typing import Type
 
@@ -200,6 +201,8 @@ def _run_job(
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_source": sharding_source,
+                "support_partial_config": False,
+                "sharding_dims": ["tp"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -347,6 +350,8 @@ def _run_pattern_detection_job(
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_source": sharding_source,
+                "support_partial_config": False,
+                "sharding_dims": ["tp"],
             },
         },
     )
@@ -414,4 +419,4 @@ def test_sharding_pattern_detection(
 
 
 if __name__ == "__main__":
-    _run_pattern_detection_job(nn.Linear, False, 0, 8, False)
+    _run_pattern_detection_job(MLP, True, 0, 8, True)

@@ -893,13 +893,17 @@ class ShardingConfig(BaseModel):
             ad_logger.warning(f"Sharding config file not found: {config_path}")
             return False
 
-        with open(config_path, "r") as f:
-            if path.suffix.lower() in [".yaml", ".yml"]:
-                self.custom_sharding_config = yaml.safe_load(f)
-            elif path.suffix.lower() == ".json":
-                self.custom_sharding_config = json.load(f)
-            else:
-                ad_logger.warning(f"Unsupported sharding config file format: {path.suffix}")
+        try:
+            with open(config_path, "r") as f:
+                if path.suffix.lower() in [".yaml", ".yml"]:
+                    self.custom_sharding_config = yaml.safe_load(f)
+                elif path.suffix.lower() == ".json":
+                    self.custom_sharding_config = json.load(f)
+                else:
+                    ad_logger.warning(f"Unsupported sharding config file format: {path.suffix}")
+        except Exception as e:
+            ad_logger.warning(f"Failed to read sharding config file: {e}")
+            return False
         return True
 
     def append_TP(self, tp_transform: TPShardingInfo) -> bool:

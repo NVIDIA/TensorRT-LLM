@@ -267,4 +267,6 @@ def run_sharding_pattern_detection_test(
     print("detected_set", detected_set)
     print("expected_set", expected_set)
 
-    assert detected_set == expected_set, "Expected sharding pattern does not match detected pattern"
+    assert detected_set == expected_set, (
+        f"Expected sharding pattern does not match detected pattern: {detected_set} != {expected_set}"
+    )

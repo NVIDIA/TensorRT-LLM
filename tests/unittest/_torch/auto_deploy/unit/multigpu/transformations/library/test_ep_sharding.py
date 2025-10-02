@@ -52,6 +52,7 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
                 "stage": "sharding",
                 "sharding_source": ["heuristic"],
                 "sharding_dims": ["ep"],
+                "support_partial_config": False,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -119,6 +120,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
             "detect_sharding": {
                 "stage": "sharding",
                 "sharding_source": ["heuristic"],
+                "support_partial_config": False,
             },
         },
     )
