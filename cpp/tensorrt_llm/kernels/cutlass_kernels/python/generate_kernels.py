@@ -693,24 +693,25 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
-                                                     arch,
-                                                     act_type,
-                                                     weight_type,
-                                                     act_type,
-                                                     act_type,
-                                                     otype,
-                                                     quant_op,
-                                                     epi_tag,
-                                                     cta_shape_mnk,
-                                                     warp_shape,
-                                                     stages,
-                                                     cga_shape,
-                                                     mainloop_schedule,
-                                                     epi_schedule,
-                                                     epi_fusion,
-                                                     is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
-                                                     swap_ab=swap_ab)
+            moe_gemm_operation = TrtLlm_GemmLauncher(
+                GemmKind.Grouped,
+                arch,
+                act_type,
+                weight_type,
+                act_type,
+                act_type,
+                otype,
+                quant_op,
+                epi_tag,
+                cta_shape_mnk,
+                warp_shape,
+                stages,
+                cga_shape,
+                mainloop_schedule,
+                epi_schedule,
+                epi_fusion,
+                is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
+                swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
