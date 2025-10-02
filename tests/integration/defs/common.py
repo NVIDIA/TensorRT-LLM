@@ -1003,31 +1003,24 @@ def test_llm_torch_multi_lora_support(
             f"Inference completed in {(inference_end - inference_start):.2f} seconds."
         )
 
-        for i, output in enumerate(outputs):
+        # Validate exact outputs
+        print("Validating exact outputs...")
+        assert len(outputs) == len(expected_outputs), \
+            f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
+
+        for i, (output, expected) in enumerate(zip(outputs, expected_outputs)):
             actual_text = output.outputs[0].text
             print(f"Prompt {i+1}: {input_prompts[i]}")
             print(
                 f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}"
             )
+            print(f"Expected: {expected}")
             print(f"Actual: {actual_text}")
             print("-" * 50)
 
-        # Validate exact outputs
-        # print("Validating exact outputs...")
-        # assert len(outputs) == len(expected_outputs), \
-        #     f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
-
-        # for i, (output, expected) in enumerate(zip(outputs, expected_outputs)):
-        #     actual_text = output.outputs[0].text
-        #     print(f"Prompt {i+1}: {input_prompts[i]}")
-        #     print(f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}")
-        #     print(f"Expected: {expected}")
-        #     print(f"Actual: {actual_text}")
-        #     print("-" * 50)
-
-        #     # Exact string comparison
-        #     assert actual_text == expected, \
-        #         f"Output {i+1} mismatch:\nExpected: {expected!r}\nActual: {actual_text!r}"
+            # Exact string comparison
+            assert actual_text == expected, \
+                f"Output {i+1} mismatch:\nExpected: {expected!r}\nActual: {actual_text!r}"
 
     total_time = time.time() - start_time
     print(f"Total test execution time: {total_time:.2f} seconds")
