@@ -998,6 +998,7 @@ class Llama4VisionEncoder(nn.Module):
                  **kwargs):
         super().__init__()
         self.pretrained_config = model_config.pretrained_config
+        # TODO: use config.mapping.get_local_rank() instead
         self.device = f"cuda:{torch.cuda.current_device()}"
 
         self.dtype = self.pretrained_config.text_config.torch_dtype

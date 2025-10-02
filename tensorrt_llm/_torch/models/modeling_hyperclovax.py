@@ -726,6 +726,7 @@ class HCXVisionModel:
         self.vision_config = self.pretrained_config.vision_config
 
         model_path = self.pretrained_config._name_or_path
+        # TODO: use config.mapping.get_local_rank() instead
         self.device = f"cuda:{torch.cuda.current_device()}"
 
         hf_model_config = AutoConfig.from_pretrained(model_path,

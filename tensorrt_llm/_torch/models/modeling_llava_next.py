@@ -295,6 +295,7 @@ class LlavaNextVisionModel(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.pretrained_config = model_config.pretrained_config
+        # TODO: use config.mapping.get_local_rank() instead
         self.device = f"cuda:{torch.cuda.current_device()}"
         model_path = self.pretrained_config._name_or_path
 
