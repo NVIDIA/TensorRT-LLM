@@ -19,6 +19,7 @@ class SpeculativeDecodingMode(IntEnum):
     NGRAM = auto()
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -54,6 +55,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
+
+    def is_save_hidden_states(self):
+        return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
@@ -99,8 +103,9 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided() or self.is_mtp_eagle()
+        return self.is_eagle3(
+        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
+        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

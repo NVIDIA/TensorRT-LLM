@@ -98,6 +98,7 @@ class SpeculativeDecodingMode(IntFlag):
     EAGLE = auto()
     NGRAM = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     AUTO = auto()
 
     @staticmethod
@@ -120,6 +121,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.USER_PROVIDED
         elif args.speculative_decoding_mode == "auto":
             return SpeculativeDecodingMode.AUTO
+        elif args.speculative_decoding_mode == "save_hidden_states":
+            return SpeculativeDecodingMode.SAVE_HIDDEN_STATES
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
