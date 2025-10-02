@@ -2030,7 +2030,7 @@ class Linear(nn.Module):
                         output,
                         all_reduce_params=None,
                     )
-                elif self.flashinfer_vllm and output.size(0) == 150:
+                elif self.flashinfer_vllm and output.size(0) <= 256:
                     output = self.flash_infer_all_reduce(
                         output,
                         all_reduce_params=None,
