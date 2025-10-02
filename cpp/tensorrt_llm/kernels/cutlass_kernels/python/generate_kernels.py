@@ -915,7 +915,8 @@ if __name__ == "__main__":
         # Only w4a8fp8 and not wfp4afp8
         return (op.act_type != op.weight_type) and (
             op.gemm_kind == GemmKind.Grouped) and (op.act_type != DataType.e4m3
-                                                   or op.weight_type != e2m1)                             
+                                                   or op.weight_type != e2m1)
+
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
     GROUP_SIZE = 8
     op_groups = dict()

@@ -223,8 +223,8 @@ protected:
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
         bool should_skip_unsupported_fp4 = (getSMVersion() < 100) && ANY_FP4;
-        bool should_skip_unsupported_sm120 = (getSMVersion() >= 120) && !ANY_FPX;
-        return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4 || should_skip_unsupported_sm120;
+        // bool should_skip_unsupported_sm120 = (getSMVersion() >= 120) && !ANY_FPX;
+        return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
     static void SetUpTestCase()
@@ -254,7 +254,7 @@ protected:
         assert(mBufferManager);
 
         int sm = getSMVersion();
-        if (sm >= 100 && sm < 120)
+        if (sm >= 100)
         {
             mDeviceMinimumAlignment
                 = std::max(MINIMUM_ALIGNMENT_CONST, int64_t(WEIGHT_ELEM_PER_BYTE * 32 / sizeof(WeightStorage)));
