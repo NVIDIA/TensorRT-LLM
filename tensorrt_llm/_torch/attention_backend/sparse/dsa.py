@@ -7,6 +7,7 @@ import torch.nn as nn
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm.deep_gemm import fp8_mqa_logits
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -26,6 +27,49 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
+
+
+def compute_cu_seqlen_kv_bounds_nocache(
+    seq_lens: torch.Tensor,
+    num_contexts: int,
+    num_ctx_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute attention window bounds for batched sequences with causal attention.
+
+    Args:
+        seq_lens: Sequence lengths [num_contexts], dtype=torch.int32
+        num_contexts: Number of sequences in the batch
+        num_ctx_tokens: Total number of tokens across all sequences
+
+    Returns:
+        cu_seqlen_ks: Start index in KV for each token [num_ctx_tokens]
+        cu_seqlen_ke: End index (exclusive) in KV for each token [num_ctx_tokens]
+    """
+    device = seq_lens.device
+    # Cumulative sequence offsets: where each sequence starts
+    cu_seq_offsets = torch.cat([
+        torch.zeros(1, device=device, dtype=torch.int32),
+        torch.cumsum(seq_lens, dim=0)
+    ])  # [num_contexts + 1]
+
+    # Map each token to its batch: [0,0,...,0, 1,1,...,1, ..., B-1,B-1,...,B-1]
+    batch_ids = torch.repeat_interleave(
+        torch.arange(num_contexts, device=device, dtype=torch.int32),
+        seq_lens
+    )  # [num_ctx_tokens]
+
+    # Each token's KV window starts at its sequence's start
+    cu_seqlen_ks = cu_seq_offsets[batch_ids]  # [num_ctx_tokens]
+
+    # Compute local position within each sequence (0-based)
+    global_positions = torch.arange(num_ctx_tokens, device=device, dtype=torch.int32)
+    local_positions = global_positions - torch.repeat_interleave(cu_seq_offsets[:-1], seq_lens)
+
+    # Causal: token at local position j attends to [seq_start, seq_start + j + 1)
+    cu_seqlen_ke = cu_seqlen_ks + local_positions + 1  # [num_ctx_tokens]
+
+    return cu_seqlen_ks, cu_seqlen_ke
 
 
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
@@ -90,6 +134,67 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128
+        # TODO: add indexer kv_cache support
+
+    def sparse_attn_indexer(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        num_ctx_tokens = metadata.num_ctx_tokens
+        num_tokens = metadata.num_tokens
+
+        has_decode = num_generations > 0
+        has_prefill = num_contexts > 0
+        num_decode_tokens = num_tokens - num_ctx_tokens
+
+        # TODO: quant to FP8 and store into kv cache
+        topk_indices_buffer = torch.empty((hidden_states.shape[0], self.index_topk), dtype=torch.int32, device=hidden_states.device)
+        topk_indices_buffer[:hidden_states.shape[0]] = -1
+
+        if has_prefill:
+            k = torch.view(-1, self.head_dim)
+            k_fp8 = fp8_utils.per_token_quant_and_transform(k, self.quant_block_size, scale_ue8m0=self.scale_fmt == "ue8m0")
+            # Compute attention window bounds for each query token in batched sequences
+            # cu_seqlen_ks[i]: start index in global KV for query token i
+            # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
+            seq_lens = metadata.seq_lens_cuda[:num_contexts].to(torch.int32)
+
+            # FIXME: better way to retrieve cu_seqlen_ks and cu_seqlen_ke from kv cache or attn metadata?
+            cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(seq_lens, num_contexts, num_ctx_tokens)
+
+            logits = fp8_mqa_logits(
+                q_fp8[:num_ctx_tokens, ...],
+                k_fp8,
+                weights[:num_ctx_tokens, ...],
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
+            topk_indices = logits.topk(min(self.index_topk, logits.shape[-1]),
+                                    dim=-1)[1]
+            topk_indices -= cu_seqlen_ks[:, None]
+            mask_lo = topk_indices >= 0
+            mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:, None] < 0
+            mask = torch.full_like(topk_indices,
+                                False,
+                                dtype=torch.bool,
+                                device=topk_indices.device)
+            mask = mask_lo & mask_hi
+            topk_indices = topk_indices.masked_fill(~mask, -1)
+            topk_indices_buffer[:num_ctx_tokens, :topk_indices.
+                                shape[-1]] = topk_indices.to(dtype=torch.int32)
+
+        if has_decode:
+            # TODO: decoder pass
+            pass
+
+        return topk_indices_buffer
 
     def forward(self,
                 q: torch.Tensor,
@@ -124,9 +229,10 @@ class Indexer(nn.Module):
             -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
         weights = weights.squeeze(-1)
 
-        # TODO: DeepGEMM MQA and TopK
+        topk_indices_buffer = self.sparse_attn_indexer(q_fp8, k, metadata)
+        # TODO: from topk_indices_buffer ([num_tokens, index_topk]), retrieve sparse_attn_indices, sparse_attn_offsets
 
-        return None, None
+        return None, None # sparse_attn_indices, sparse_attn_offsets
 
 
 class DSATrtllmAttention(TrtllmAttention, nn.Module):
