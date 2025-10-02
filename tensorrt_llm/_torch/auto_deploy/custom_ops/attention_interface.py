@@ -157,7 +157,7 @@ class SequenceInfo:
 
         # cache_loc requires some special treatment due to block reuse. Note that the constraint for
         # cache_loc with block_reuse is as follows:
-        # 0<= max(cache_loc) < num_pages
+        # 0 <= cache_loc < num_pages
         # len(cache_loc) <= max_num_cache_loc_assignments
         max_num_cache_loc_assignments = (
             max_seq_len_adjusted // self.page_size + 1
