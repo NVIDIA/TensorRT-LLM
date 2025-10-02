@@ -29,7 +29,7 @@ def calculate_tile_tokens_dim(
     # For 128-256 tokens per expert, use 192 tokens per CTA tile.
     if num_tokens_per_expert > 128 and num_tokens_per_expert < 256:
         tile_tokens_dim = 192
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    # Cap to 8-max_tile_tokens_dim tokens per CTA tile as it's the range supported by the kernel.
     tile_tokens_dim = min(max(tile_tokens_dim, 8), max_tile_tokens_dim)
 
     return tile_tokens_dim
