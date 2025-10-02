@@ -300,9 +300,7 @@ class FalconH1Model(DecoderModel):
 
         self.mamba_metadata: Optional[Mamba2Metadata] = None
 
-        # TODO: simplify?
-        embed_mul = getattr(config, "embedding_multiplier", 1.0)
-        self.register_buffer("_embed_mul", torch.tensor(embed_mul, dtype=torch.float32), persistent=False)
+        self.embedding_multiplier = getattr(config, "embedding_multiplier", 1.0)
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
@@ -324,7 +322,7 @@ class FalconH1Model(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds * self._embed_mul
+        hidden_states = inputs_embeds * self.embedding_multiplier
 
         for layer in self.layers:
             hidden_states = layer(position_ids,
