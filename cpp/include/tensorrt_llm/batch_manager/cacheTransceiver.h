@@ -71,6 +71,8 @@ public:
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
+
+    virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -110,6 +112,8 @@ public:
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
+
+    virtual bool cancelRequest(LlmRequest* llmRequest) override;
 
 private:
     void initializeCommState();
