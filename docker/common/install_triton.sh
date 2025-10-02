@@ -14,6 +14,13 @@ install_boost() {
 }
 
 install_triton_deps() {
+  DATACENTER_GPU_MANAGER_VER="-4-cuda${CUDA_VER}"
+  # For CUDA 12.9
+  NVCC_VERSION_OUTPUT=$(nvcc --version)
+  if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) == "12.9" ]]; then
+    DATACENTER_GPU_MANAGER_VER="=1:3.3.6"
+  fi
+
   apt-get update \
     && apt-get install -y --no-install-recommends \
       pigz \
@@ -23,7 +30,7 @@ install_triton_deps() {
       python3-build \
       libb64-dev \
       libarchive-dev \
-      datacenter-gpu-manager-4-cuda${CUDA_VER} \
+      datacenter-gpu-manager${DATACENTER_GPU_MANAGER_VER} \
     && install_boost \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
