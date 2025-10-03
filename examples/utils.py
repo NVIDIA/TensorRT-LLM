@@ -304,6 +304,7 @@ def add_common_args(parser):
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
+    parser.add_argument('--prompt_ignore_length', type=int, default=0)
     parser.add_argument('--min_p', type=float, default=0.0)
     parser.add_argument('--beam_search_diversity_rate', type=float, default=0.0)
     parser.add_argument('--random_seed', type=int, default=0)
