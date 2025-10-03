@@ -433,6 +433,23 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
+    @staticmethod
+    def warmup_with_kv_cache_cleanup(method):
+
+        @functools.wraps(method)
+        def wrapper(self, resource_manager: ResourceManager, *args, **kwargs):
+            result = method(self, resource_manager, *args, **kwargs)
+            # Zero the KV cache; NaNs may be introduced during warmup
+            kv_cache_manager = resource_manager.get_resource_manager(
+                self.kv_cache_manager_key)
+            if kv_cache_manager is not None:
+                buffer = kv_cache_manager.get_unique_primary_pool()
+                buffer.zero_()
+                torch.cuda.synchronize()
+            return result
+
+        return wrapper
+
     @contextlib.contextmanager
     def no_cuda_graph(self):
         _run_cuda_graphs = self.cuda_graph_runner.enabled
@@ -443,6 +460,7 @@ class PyTorchModelEngine(ModelEngine):
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @with_warmup_flag
+    @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -491,13 +509,6 @@ class PyTorchModelEngine(ModelEngine):
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
                 # Also, the sequence length is limited by the max_position_embeddings.
                 token_num = max(1, min(available_tokens, self.max_seq_len - 1))
-                model_config = self.model.model_config.pretrained_config
-                max_position_embeddings = getattr(model_config,
-                                                  'max_position_embeddings',
-                                                  None)
-                if max_position_embeddings is not None:
-                    token_num = min(token_num,
-                                    max_position_embeddings - draft_len)
 
                 assert token_num > num_extra_decoding_steps, (
                     "Cannot fuse drafting loop. We do not have enough KV cache space "
@@ -846,6 +857,14 @@ class PyTorchModelEngine(ModelEngine):
             inferred_max_seq_len = self.model.infer_max_seq_len()
         else:
             inferred_max_seq_len = self._infer_max_seq_len_from_config()
+
+        if self.is_spec_decode:
+            # spec verification may process `max_draft_len` tokens ahead of current token, which may exceed
+            # above `inferred_max_seq_len` and lead to NaN or illegal memory access in positional embedding
+            assert (
+                self.spec_config.max_draft_len < inferred_max_seq_len
+            ), f"{self.spec_config.max_draft_len} should be less than {inferred_max_seq_len}"
+            inferred_max_seq_len -= self.spec_config.max_draft_len
 
         if self.max_seq_len is None:
             logger.info(
