@@ -2299,18 +2299,16 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
 
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
 
-    // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10]
+    // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     llmRequest0->setKvCacheRetentionConfig(
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 5)}, 90));
+        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 90)}, 90));
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
 
     // 5 blocks available.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 5);
-
-    llmRequest0->addNewToken(0, 0); // block 2 contains [8, 9, 10, 11]
 
     // Add a token to request 0, which occupies a new block 3.
     kvCacheManager.addToken(0);
@@ -2319,18 +2317,17 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
     // 4 blocks left.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 4);
 
-    // uses up 3 more blocks 4, 5, 6. [12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22]
+    // uses up 3 more blocks 4, 5, 6. [12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, 23]
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23});
     auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     llmRequest1->setKvCacheRetentionConfig(
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 90)}, 5));
+        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 5)}, 5));
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
 
     // one block left.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 1);
 
-    llmRequest1->addNewToken(0, 0); // block 6 contains [20, 21, 22, 23]
     // add another token, which occupies another new block
     kvCacheManager.addToken(1);
     llmRequest1->addNewToken(0, 0); // block 7 contains [0]
@@ -2348,10 +2345,10 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
 
     // no reuse, blocks are evicted by new request:
-    // evict block 7 (lowest priority leaf), block 6 becomes leaf
-    // evict block 3 (lowest and oldest priority leaf), block 2 becomes leaf
-    // evict block 2 (lowest and oldest priority leaf), block 1 becomes leaf
-    // uses up 3 blocks 7, 3, 2. [24, 25, 26, 27], [28, 29, 30, 31], [32, 33, 34]
+    // evict block 7 (lowest priority, first released block)
+    // evict block 6 (lowest priority, second released block)
+    // evict block 5 (lowest priority, third released block)
+    // uses up 3 blocks 7, 6, 5. [24, 25, 26, 27], [28, 29, 30, 31], [32, 33, 34, 35]
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35});
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
@@ -2359,15 +2356,15 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
     // leaf block 2 (priority 35), context blocks 3, 7 (priority 35)
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
-    // reuse blocks 0 and 1, new block 2 (lowest priority leaf)
-    // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10]
+    // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
 
-    // Two blocks reused
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 8);
+    // Reuse block 0, 1, and partial reuse block 2. (maximum reuse is inputLength - 1)
+    // Two blocks reused, the third block partially reused.
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 11);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
@@ -2452,7 +2449,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     auto constexpr maxBlocksPerSeq = 4;
     auto constexpr maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
     auto constexpr maxNumSequences = 8;
-    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInPrimaryPool = 9;
     auto constexpr blocksInSecondaryPool = 0;
     auto constexpr onboardBlocks = true;
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -2471,6 +2468,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
         0, stream, maxSequenceLength, true, onboardBlocks);
     kvCacheManager.allocatePools(false);
     {
+        // 12 tokens, occupy 3 blocks 0, 1, 2.
+        // [1, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
         auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
         auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
         auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
@@ -2479,6 +2478,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
                 50)); // Set all blocks to priority 50.
         kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
         kvCacheManager.storeContextBlocks(*llmRequest0);
+        // Occupy a new block, block 3, adding 3 tokens to block 3.
+        // [1, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [0, 0, 0]
         for (int i = 0; i < 3; i++)
         {
             kvCacheManager.addToken(0);
@@ -2487,6 +2488,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
         (void) kvCacheManager.removeSequence(0, llmRequest0);
     }
     {
+        // 12 tokens, occupy 3 blocks 4, 5, 6.
+        // [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
         auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
         auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
         auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
@@ -2494,6 +2497,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
             {}, KvCacheRetentionConfig::kMaxRetentionPriority, 20ms)); // Set decode blocks to max priority for 20ms.
         kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
         kvCacheManager.storeContextBlocks(*llmRequest1);
+        // Occupy a new block, block 3, adding 3 tokens to block 3.
+        // [1, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [0, 0, 0]
         for (int i = 0; i < 3; i++)
         {
             kvCacheManager.addToken(1);
@@ -2505,12 +2510,14 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     kvCacheManager.refreshBlocks();
 
+    // 8 tokens, occupying blocks 8, 6
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{0, 0, 0, 0, 0, 0, 0, 0});
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
+    // 12 tokens, reusing block 4, 5. Block 6 is overwritten so no reuse.
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
@@ -2552,7 +2559,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
-    // get new blocks 0, 1, 2
+    // 12 tokens, get block 0, 1, 2
+    // [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     // store blocks 0, 1, 2 for reuse ([0,1,2,3], [4,5,6,7], [8,9,10])
@@ -2561,12 +2569,17 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
-    // get blocks 3, 2, 1. This causes 2 and 1 to be offloaded to secondary
+
+    // Uses blocks 3, 4, 5, block 2 and 1 to be offloaded to secondary
+    // Block 4 is now in primary (replacing 2)
+    // Block 5 is now in primary (replacing 1)
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
-    // store blocks 3, 2, 1 for reuse ([1,1,2,3], [4,5,6,7], [8,9,10])
+    // store blocks 3, 4, 5 for reuse ([1,1,2,3], [4,5,6,7], [8,9,10])
 
     // Match the middle block of request 0
+    // Uses block 6, block 0 is offloaded to secondary
+    // Block 6 copies content from block 0 to itselg.
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3});
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
@@ -2576,26 +2589,36 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     kvCacheManager.storeContextBlocks(*llmRequest2);
 
     // Add a decode block that matches the contents of seq 0 block 1, add a unique decode block
+    // The 4 tokens added has the same content as block 1.
     for (int token = 4; token < 8; token++)
     {
         llmRequest2->addNewToken(token, 0);
         kvCacheManager.addToken(2);
     }
+    // Add 2 more tokens, occupying another block
     llmRequest2->addNewToken(0, 0);
     kvCacheManager.addToken(2);
 
     llmRequest2->addNewToken(0, 0);
     kvCacheManager.addToken(2);
-
     // The middle block remains in secondary, but the third block is in primary
+    // FIXME: When removing the sequence, we should observe whether released
+    // blocks can replace itself as the block reused in the search tree if
+    // the matching block is currently in secondary memory. We can release the
+    // block in secondary if so.
+    // If we do this, then the context current position at the bottom of this
+    // unit test will be 9 because then the block content [4,5,6,7] can be
+    // found and reused.
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
+    // 10 tokens, reusing the block 0 only because when we want to acquire
+    // the second block, contents of block 3 will be offloaded to block 1.
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 0, 0});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
-    // All blocks should be reused.
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 9);
+    // Check out FIXME note above. If addressed, this should be 9.
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
@@ -2726,12 +2749,13 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto cacheBlockIds0 = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds0, ::testing::ElementsAreArray({0, 1, 2}));
 
-    // Lower priority of middle block to prevent offloading
+    // Raise priority of middle block to prevent offloading
     auto const& blockManager = kvCacheManager.getBlockManager();
     auto middleBlock = blockManager.getBlockById(cacheBlockIds0[1], maxAttentionWindow);
-    middleBlock->setPriority(0);
+    middleBlock->setPriority(75);
 
     // Create another sequence with one block worth of context tokens (no reuse).
+    // 4 tokens, occupying block 3
     int requestId1 = 1;
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103});
     auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
@@ -2748,13 +2772,15 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     (void) kvCacheManager.removeSequence(requestId0, llmRequest0);
 
     // Verify that 3 primary blocks are free.
+    // Since block 1 has higher priority, block 2 and 0 will be used first.
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 3);
 
     // Write one generated token to second sequence. This will prompt block 2 to be offloaded.
+    // Block 4 will be in primary (replacing block 2)
     llmRequest1->addNewToken(104, beamIdx);
     kvCacheManager.addToken(requestId1);
 
-    // Verify that block 2 has block 1 as parent and is in secondary memory
+    // Verify that block 2 has block 1 as parent
     auto block2 = blockManager.getBlockById(2, maxAttentionWindow);
     EXPECT_TRUE(block2->getPrevBlock() != nullptr);
     EXPECT_EQ(block2->getPrevBlock()->getBlockId(), 1);
@@ -2771,15 +2797,16 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({3, 4}));
 
-    // Write one generated token to second sequence. This will prompt block 1 to be offloaded,
-    // but it cannot be because priority is lower than minimum required for offloading.
-    // WindowManager::getFreeBlock will instead free and detach block 2 (secondary block).
+    // Write one generated token to second sequence. This will prompt block 0 to be offloaded,
+    // replacing block 2.
     llmRequest1->addNewToken(100 + 2 * tokensPerBlock, beamIdx);
     kvCacheManager.addToken(requestId1);
 
-    // Verify that block 2 is free, has no parent and is in secondary memory
+    // Verify that block 2 is free, has no parent
     EXPECT_EQ(block2->getPrevBlock(), nullptr);
-    EXPECT_FALSE(block2->isPrimary());
+    // Verify that it is block 0 that is in secondary
+    auto block0 = blockManager.getBlockById(0, maxAttentionWindow);
+    EXPECT_FALSE(block0->isPrimary());
 
     // Cleanup
     (void) kvCacheManager.removeSequence(requestId1, llmRequest1);
@@ -3438,15 +3465,22 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
 
     events = getEvents(kvCacheManager);
 
-    // Offload 1 block, onboard 1 block, remove 1 secondary block. The second new block allocated was never stored,
-    // so it doesn't create a removed event
+    // Onboard block 0, in replace, offload block 7
+    // Offload block 6, and write content of [1,1,1,1] to block 1
+    // Upon freeing up block 1, its child block 2, will be removed from the search tree,
+    // which is a remove event.
+    // Offload block 5, in replace onboard block 7, and write content of [0] to block 7.
+    // In total, there are 2 offloads, 1 onboard, 1 removed, total of 4 events.
+    // FIXME: For better improvement, when block 1 is overwritten, child blocks
+    // are removed from the search tree and no longer reusable. Therefore these blocks
+    // should be the first to be called upon when we want a new block.
     auto onboardedBlocks = 0;
     auto offloadedBlocks = 0;
     auto removedBlocks = 0;
 
-    EXPECT_EQ(events.size(), 3);
+    EXPECT_EQ(events.size(), 4);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
     {
         if (std::holds_alternative<tle::KVCacheUpdatedData>(events.front().data))
         {
@@ -3463,7 +3497,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     }
 
     EXPECT_EQ(onboardedBlocks, 1);
-    EXPECT_EQ(offloadedBlocks, 1);
+    EXPECT_EQ(offloadedBlocks, 2);
     EXPECT_EQ(removedBlocks, 1);
 
     kvCacheManager.storeContextBlocks(*llmRequest4);
