@@ -438,6 +438,7 @@ void KVCacheBlock::setLookupNode(LookupNodePtr lookupNode, BlockPtr block)
 	TLLM_CHECK_WITH_INFO(getBlockId() == block->getBlockId(), "blockIds differ");
         mLookupNode = lookupNode;
         lookupNode->setBlock(mWindowSize, block);
+        mBlockKey = lookupNode->getBlockKey();
     }
     else
     {
@@ -446,6 +447,7 @@ void KVCacheBlock::setLookupNode(LookupNodePtr lookupNode, BlockPtr block)
             mLookupNode->setBlock(mWindowSize, nullptr);
         }
         mLookupNode = nullptr;
+        mBlockKey = BlockKey();
     }
 }
 
@@ -1685,7 +1687,12 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     if (storeBlocksForReuse)
     {
         TLLM_LOG_DEBUG("BlockManager::releaseBlocks - prompt = " + mLookup->printPrompt(llmRequest.value()));
-        auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, true, mEnablePartialReuse, true);
+        // Looking for an exact match, but the last block can be partially filled.
+        auto constexpr allowPartiallyFilledBlock = true;
+        auto constexpr enablePartialMatch = false;
+        // Inserting, create node if not found
+        auto constexpr createNodeIfNotFound = true;
+        auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, allowPartiallyFilledBlock, enablePartialMatch, createNodeIfNotFound);
         TLLM_LOG_DEBUG("BlockManager::releaseBlocks - nodes = " + mLookup->printNodes(matchedPromptNodes));
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
