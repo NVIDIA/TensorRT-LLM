@@ -3550,6 +3550,7 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH,
                  max_num_tokens=16384,
+                 enable_chunked_prefill=True,
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
