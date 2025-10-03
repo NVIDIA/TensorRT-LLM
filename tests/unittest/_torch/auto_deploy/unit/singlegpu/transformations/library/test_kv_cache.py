@@ -188,7 +188,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
         cm.info.nest_sequences(x, input_pos=input_pos)
 
         # Use the cm.args as is - it already contains the correct position_ids
-        y = gm(*cm.args)
+        y = gm(**cm.named_args)
 
         # Unnest the output sequences
         return torch.stack(cm.info.unnest_sequences(y))
@@ -217,5 +217,5 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model
-    exported_gm = torch_export_to_gm(gm, args=cm.args)
+    exported_gm = torch_export_to_gm(gm, args=(), kwargs=cm.named_args)
     assert exported_gm is not None
