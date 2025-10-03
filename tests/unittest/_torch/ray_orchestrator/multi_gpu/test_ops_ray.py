@@ -213,7 +213,7 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
     }
 
     try:
-        ray.init(**ray_init_args)
+        ray.init(address="local", **ray_init_args)
 
         master_port = get_free_port()
         runtime_env = ray.runtime_env.RuntimeEnv()
@@ -288,7 +288,7 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
     }
 
     try:
-        ray.init(**ray_init_args)
+        ray.init(address="local", **ray_init_args)
 
         master_port = get_free_port()
         runtime_env = ray.runtime_env.RuntimeEnv()
@@ -348,7 +348,7 @@ def test_allreduce_pg_op(seq_len, hidden_size):
     }
 
     try:
-        ray.init(**ray_init_args)
+        ray.init(address="local", **ray_init_args)
 
         master_port = get_free_port()
         runtime_env = ray.runtime_env.RuntimeEnv()

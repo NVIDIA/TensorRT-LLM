@@ -56,14 +56,19 @@ class RayExecutor(GenerationExecutor):
             "ignore_reinit_error": True,
             "runtime_env": runtime_env
         }
-        try:
-            ray.init(address="auto", **ray_init_args)
-            logger.info(f"Attached to an existing Ray cluster.")
-        except ConnectionError:
-            logger.info(f"Ray cluster not found, starting a new one.")
 
-        if not ray.is_initialized():
-            ray.init(**ray_init_args)
+        if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
+            try:
+                ray.init(address="auto", **ray_init_args)
+                logger.info(f"Attached to an existing Ray cluster.")
+            except ConnectionError:
+                logger.info(f"Ray cluster not found, starting a new one.")
+
+            if not ray.is_initialized():
+                ray.init(**ray_init_args)
+                self.has_start_local_cluser = True
+        else:
+            ray.init(address="local", **ray_init_args)
             self.has_start_local_cluser = True
 
         self.world_size = model_world_size
