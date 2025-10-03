@@ -40,7 +40,6 @@ class Eagle3ResourceManager(BaseResourceManager):
         # Reserve one more slot for the dummy request.
         slot_size = self.max_seq_len + 1
         self.slot_manager = SlotManager(slot_size)
-
         # This class is reused by MTP_EAGLE
         from ...llmapi.llm_args import EagleDecodingConfig
 
