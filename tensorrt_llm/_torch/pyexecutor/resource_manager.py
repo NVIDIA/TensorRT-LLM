@@ -1058,6 +1058,13 @@ class SlotManager:
                 raise ValueError(f"Request {request.request_id} has no slot id")
 
     def add_slot(self, request_id: int):
+        if request_id in self.slot_mapping:
+            # CUDA graph dummy request could be added for different batches,
+            # but we only need to reserve slot for it once.
+            from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+            assert request_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+            return self.slot_mapping[request_id]
+
         if len(self.free_slots) == 0:
             raise ValueError("No free slots")
         slot = self.free_slots.pop()
