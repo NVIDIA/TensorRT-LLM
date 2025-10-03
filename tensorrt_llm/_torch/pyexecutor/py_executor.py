@@ -12,6 +12,8 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
+
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
@@ -19,7 +21,6 @@ except ImportError:
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
-from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -254,6 +255,7 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
 
         # request fetcher initialization
+        self._set_global_steady_clock_offset()
         self.executor_request_queue = ExecutorRequestQueue(
             dist=self.dist,
             enable_attention_dp=self.enable_attention_dp,
@@ -291,7 +293,6 @@ class PyExecutor:
                 raise NotImplementedError(
                     "Drafting is not supported for selected executor loop. "
                     "Please disable disagg/pipeline parallelism scheduler.")
-            self.draft_seq_slot_manager = SeqSlotManager(max_num_sequences)
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
         self.max_seq_len = max_seq_len
 
@@ -364,6 +365,25 @@ class PyExecutor:
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
+
+    def _set_global_steady_clock_offset(self):
+        assert self.global_rank >= 0, "rank should be >= 0"
+
+        # Sync all ranks
+        self.dist.barrier()
+        # Immediately take the local steady clock timestamp
+        local_timestamp = get_steady_clock_now_in_seconds()
+        all_rank_timestamps = self.dist.allgather(local_timestamp)
+        if self.global_rank == 0:
+            logger.info(
+                f"global_steady_clock_offset at each rank: {[local_timestamp - ts for ts in all_rank_timestamps]}"
+            )
+        # Compute the steady clock offset between rank 0 and current rank
+        global_steady_clock_offset = all_rank_timestamps[0] - local_timestamp
+        LlmRequest.global_steady_clock_offset = global_steady_clock_offset
+        logger.info(
+            f"Setting global_steady_clock_offset: {global_steady_clock_offset} seconds for rank {self.global_rank}"
+        )
 
     def __enter__(self):
         return self
@@ -1984,7 +2004,8 @@ class PyExecutor:
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            if request.return_perf_metrics:
+            # Skip active requests that are not scheduled
+            if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.model_engine.iter_counter)
 
             request_done = False

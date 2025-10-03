@@ -235,6 +235,7 @@ class ModelFactory(ABC):
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
             self._load_checkpoint(model, device)
+        ad_logger.info("Loading and initializing weights. Done.")
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):

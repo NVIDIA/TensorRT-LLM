@@ -110,6 +110,20 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
             && tileSize == mOptions.tileSize)
         {
+            auto sm = configs[i].mSm;
+            if (sm != SmVersion::Sm100f)
+            {
+                int smVersion = tensorrt_llm::common::getSMVersion();
+                if (smVersion == 100 && sm != SmVersion::Sm100a)
+                {
+                    continue;
+                }
+                else if (smVersion == 103 && sm != SmVersion::Sm103a)
+                {
+                    continue;
+                }
+            }
+
             // FIXME: Disable split-k for now.
             if (options.mClusterDimZ != 1)
             {

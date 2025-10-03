@@ -35,7 +35,12 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
-        self.slot_manager = SlotManager(max_num_requests)
+        
+        # There could be dummy request for padding batch when using CUDA graph.
+        # Reserve one more slot for the dummy request.
+        slot_size = self.max_seq_len + 1
+        self.slot_manager = SlotManager(slot_size)
+
         # This class is reused by MTP_EAGLE
         from ...llmapi.llm_args import EagleDecodingConfig
 
@@ -52,9 +57,9 @@ class Eagle3ResourceManager(BaseResourceManager):
             dtype=self.dtype,
             device='cuda')
         # sequence length, only used for metadata preparation
-        self.seq_lens = {i: 0 for i in range(max_num_requests)}
+        self.seq_lens = {i: 0 for i in range(slot_size)}
         # start indices of each slot
-        self.start_indices = {i: 0 for i in range(max_num_requests)}
+        self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
         self.is_first_draft = True
         self.spec_tree_manager = None
