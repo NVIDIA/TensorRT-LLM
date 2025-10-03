@@ -1,3 +1,6 @@
+# Portions of this code were derived from the vLLM project:
+# https://github.com/vllm-project/vllm/blob/a903669e10cc98507fa5c2ae099b7161f7140cf7/vllm/model_executor/models/falcon_h1.py
+
 import re
 from typing import Optional
 
