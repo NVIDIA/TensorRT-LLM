@@ -232,11 +232,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 10Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 5Gi
+                        memory: 10Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
