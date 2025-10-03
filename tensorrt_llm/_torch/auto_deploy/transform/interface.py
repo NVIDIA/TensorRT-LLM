@@ -20,6 +20,7 @@ from ..transformations._graph import (
     canonicalize_graph,
     lift_to_meta,
     named_graphmodules,
+    placeholders_on_meta,
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
@@ -448,7 +449,7 @@ class BaseTransform(ABC):
         if not self.config.run_graph_cleanup:
             return info
 
-        use_meta = isinstance(gm, GraphModule) and has_any_meta_tensor(gm)
+        use_meta = isinstance(gm, GraphModule) and placeholders_on_meta(gm)
 
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):

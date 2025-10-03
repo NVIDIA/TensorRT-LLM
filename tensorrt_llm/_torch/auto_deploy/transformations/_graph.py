@@ -307,3 +307,34 @@ def add_graph_input(
 
     # return new node...
     return in_node
+
+
+def placeholders_on_meta(gm: GraphModule) -> bool:
+    """
+    Return True if every placeholder node in the graph is on the meta device.
+    """
+
+    def _is_meta_tensor(t) -> bool:
+        if t is None:
+            return False
+        # First check device.type == 'meta'
+        dev = getattr(t, "device", None)
+        if getattr(dev, "type", None) == "meta":
+            return True
+        # Fallback for objects with .is_meta attribute
+        return bool(getattr(t, "is_meta", False))
+
+    for n in gm.graph.nodes:
+        if n.op != "placeholder":
+            continue
+        val = n.meta.get("val", None)
+
+        # If placeholder packs multiple values, find the first tensor-like leaf
+        t = val
+        if isinstance(val, (list, tuple)):
+            t = next((x for x in val if hasattr(x, "device") or hasattr(x, "is_meta")), None)
+
+        if not _is_meta_tensor(t):
+            return False
+
+    return True
