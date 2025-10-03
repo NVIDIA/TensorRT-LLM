@@ -1190,8 +1190,18 @@ def build_mllama_engine(args):
     model = MllamaForConditionalGeneration.from_pretrained(args.model_path,
                                                            torch_dtype='auto',
                                                            device_map='auto')
-    wrapper = MLLaMAVisionWrapper(model.vision_model,
-                                  model.multi_modal_projector)
+
+    # Check if the model structure is updated to transformers >= 4.52.0
+    if hasattr(model, 'model') and hasattr(model.model, 'vision_model'):
+        vision_model = model.model.vision_model
+        multi_modal_projector = model.model.multi_modal_projector
+    else:
+        # transformers < 4.52.0
+        vision_model = model.vision_model
+        multi_modal_projector = model.multi_modal_projector
+
+    wrapper = MLLaMAVisionWrapper(vision_model, multi_modal_projector)
+
     model_dtype = model.dtype
     image = Image.new('RGB', [2048, 2688])  # dummy image
     inputs = processor(images=image,

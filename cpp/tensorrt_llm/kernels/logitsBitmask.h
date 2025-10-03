@@ -29,5 +29,9 @@ template <typename T>
 void invokeLogitsBitmask(
     T** logits, uint32_t const** bitmask, int32_t batchSize, int32_t vocabSizePadded, cudaStream_t stream);
 
+template <typename T>
+void invokeContiguousLogitsBitmask(T* logits, uint32_t const* bitmask, int32_t const* tokenMask, int32_t const* d2t,
+    int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream);
+
 } // namespace kernels
 } // namespace tensorrt_llm

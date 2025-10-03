@@ -215,9 +215,13 @@ class PixtralVisionModel(torch.nn.Module):
         patch_embeds = torch.cat(flattened_embeds, dim=0)
         patch_embeds = self.ln_pre(patch_embeds)
 
-        position_ids = transformers.models.pixtral.modeling_pixtral.position_ids_in_meshgrid(
-            patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
-        )
+        # The `position_ids_in_meshgrid` code does not look at the inputs' device to create the
+        # `position_ids`, so it ends up defaulting to CPU, which will incur an H2D copy later down
+        # the line. We therefore use this `torch.device` context manager here.
+        with torch.device(device=pixel_values.device):
+            position_ids = transformers.models.pixtral.modeling_pixtral.position_ids_in_meshgrid(
+                patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
+            )
         position_embeddings = self._patch_positional_embedding(patch_embeds, position_ids)
 
         attn_metadata = self._prepare_attn_metadata(

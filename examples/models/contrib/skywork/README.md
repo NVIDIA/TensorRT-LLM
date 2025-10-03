@@ -3,11 +3,11 @@
 This document elaborates how to build the [Skywork](https://huggingface.co/Skywork/) model to runnable engines on single GPU node and perform a summarization task using these engines.
 
 ## Overview
-The TensorRT-LLM Skywork implementation is based on the LLaMA model. The implementation can
+The TensorRT LLM Skywork implementation is based on the LLaMA model. The implementation can
 be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-The TensorRT-LLM Skywork example code lies in [`examples/models/contrib/skywork`](./):
+The TensorRT LLM Skywork example code lies in [`examples/models/contrib/skywork`](./):
 
-* [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT-LLM checkpoint.
+* [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT LLM checkpoint.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -19,7 +19,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-This section gives a whole process where we convert HF models, build TensorRT-LLM engines and ultimately perform summarization.
+This section gives a whole process where we convert HF models, build TensorRT LLM engines and ultimately perform summarization.
 
 ### 1. Clone Code and Weights from Huggingface
 
@@ -78,7 +78,7 @@ trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/bf16 \
 
 ### 4. Summarization using the Engines
 
-After building TRT engines, we can use them to perform various tasks. TensorRT-LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
+After building TRT engines, we can use them to perform various tasks. TensorRT LLM provides handy code to run summarization on [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset and get [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores. The `ROUGE-1` score can be used to validate model implementations.
 
 ```bash
 # fp16

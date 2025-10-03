@@ -30,7 +30,7 @@
             --dtype float16
     ```
 
-- Build TensorRT-LLM engine
+- Build TensorRT LLM engine
 
     NOTE: `max_prompt_embedding_table_size = query_token_num * max_batch_size`, therefore, if you change `max_batch_size`, `--max_prompt_embedding_table_size` must be reset accordingly.
     ```bash

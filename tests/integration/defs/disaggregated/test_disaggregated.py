@@ -17,10 +17,12 @@ import os
 import re
 import subprocess
 import tempfile
+from typing import Callable
 
 import pytest
 import yaml
-from defs.conftest import llm_models_root, skip_arm, skip_no_hopper
+from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
+                           skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
 
 from tensorrt_llm.logger import logger
@@ -33,6 +35,117 @@ def cleanup_output_files():
             os.remove(file)
         except FileNotFoundError:
             pass
+
+
+def validate_timing_metrics(perf_metrics_item, request_context=""):
+    """
+    Helper function to validate timing metrics relationships.
+
+    Args:
+        perf_metrics_item: A single performance metrics item from the /perf_metrics endpoint
+        request_context: String context for error messages (e.g., "request 1", "streaming")
+    """
+    # Validate basic structure
+    required_keys = [
+        "ctx_server", "gen_server", "ctx_perf_metrics", "gen_perf_metrics",
+        "disagg_server_arrival_time", "disagg_server_first_token_time"
+    ]
+    for key in required_keys:
+        assert key in perf_metrics_item, f"Missing key: {key} in {request_context}"
+
+    assert perf_metrics_item["ctx_perf_metrics"][
+        "ctx_request_id"] == perf_metrics_item["gen_perf_metrics"][
+            "ctx_request_id"]
+
+    # Extract timing metrics
+    ctx_metrics = perf_metrics_item["ctx_perf_metrics"]["perf_metrics"][
+        "timing_metrics"]
+    gen_metrics = perf_metrics_item["gen_perf_metrics"]["perf_metrics"][
+        "timing_metrics"]
+    disagg_arrival = perf_metrics_item["disagg_server_arrival_time"]
+    disagg_first_token = perf_metrics_item["disagg_server_first_token_time"]
+
+    # Validate disaggregated server timing metrics
+    assert disagg_arrival is not None, f"disagg_server_arrival_time is None in {request_context}"
+    assert disagg_first_token is not None, f"disagg_server_first_token_time is None in {request_context}"
+    assert isinstance(
+        disagg_arrival,
+        (int, float
+         )), f"disagg_server_arrival_time is not numeric in {request_context}"
+    assert isinstance(
+        disagg_first_token, (int, float)
+    ), f"disagg_server_first_token_time is not numeric in {request_context}"
+    assert disagg_arrival > 0, f"disagg_server_arrival_time is not positive in {request_context}"
+    assert disagg_first_token > 0, f"disagg_server_first_token_time is not positive in {request_context}"
+    assert disagg_arrival <= disagg_first_token, f"disagg_server_arrival_time > disagg_server_first_token_time in {request_context}"
+
+    # Validate server-level timing metrics for context server
+    ctx_server_arrival = ctx_metrics.get("server_arrival_time")
+    ctx_server_first_token = ctx_metrics.get("server_first_token_time")
+    assert ctx_server_arrival is not None, f"ctx server_arrival_time is None in {request_context}"
+    assert ctx_server_first_token is not None, f"ctx server_first_token_time is None in {request_context}"
+    assert isinstance(
+        ctx_server_arrival,
+        (int,
+         float)), f"ctx server_arrival_time is not numeric in {request_context}"
+    assert isinstance(
+        ctx_server_first_token,
+        (int, float
+         )), f"ctx server_first_token_time is not numeric in {request_context}"
+    assert ctx_server_arrival <= ctx_server_first_token, f"ctx server_arrival_time > server_first_token_time in {request_context}"
+    assert ctx_metrics["last_token_time"] - ctx_server_first_token < 1e-3
+
+    # Validate server-level timing metrics for generation server
+    gen_server_arrival = gen_metrics.get("server_arrival_time")
+    gen_server_first_token = gen_metrics.get("server_first_token_time")
+    assert gen_server_arrival is not None, f"gen server_arrival_time is None in {request_context}"
+    assert gen_server_first_token is not None, f"gen server_first_token_time is None in {request_context}"
+    assert isinstance(
+        gen_server_arrival,
+        (int,
+         float)), f"gen server_arrival_time is not numeric in {request_context}"
+    assert isinstance(
+        gen_server_first_token,
+        (int, float
+         )), f"gen server_first_token_time is not numeric in {request_context}"
+    assert gen_server_arrival <= gen_server_first_token, f"gen server_arrival_time > server_first_token_time in {request_context}"
+
+    # Validate timing relationships between different levels
+    # Disaggregated server should receive request before individual servers
+    assert disagg_arrival <= ctx_server_arrival, f"disagg_arrival > ctx_server_arrival in {request_context}"
+    assert disagg_arrival <= gen_server_arrival, f"disagg_arrival > gen_server_arrival in {request_context}"
+
+    # Context should complete before generation starts
+    assert ctx_server_first_token <= gen_server_arrival, f"ctx_server_first_token > gen_server_arrival in {request_context}"
+
+    # Validate internal timing consistency
+    ctx_arrival_time = ctx_metrics["arrival_time"]
+    ctx_first_token_time = ctx_metrics["first_token_time"]
+    gen_arrival_time = gen_metrics["arrival_time"]
+    gen_first_token_time = gen_metrics["first_token_time"]
+
+    assert ctx_arrival_time <= ctx_first_token_time, f"ctx arrival_time > first_token_time in {request_context}"
+    assert gen_arrival_time <= gen_first_token_time, f"gen arrival_time > first_token_time in {request_context}"
+
+    # Test KV cache transfer timing (if present)
+    if "kv_cache_transfer_start" in gen_metrics and "kv_cache_transfer_end" in gen_metrics:
+        kv_start = gen_metrics["kv_cache_transfer_start"]
+        kv_end = gen_metrics["kv_cache_transfer_end"]
+        assert gen_metrics["kv_cache_size"] > 0
+        assert kv_start <= kv_end, f"kv_cache_transfer_start > kv_cache_transfer_end in {request_context}"
+        assert gen_arrival_time <= kv_start, f"gen_arrival_time > kv_cache_transfer_start in {request_context}"
+        assert kv_end <= gen_metrics[
+            "first_scheduled_time"], f"kv_cache_transfer_end > first_scheduled_time in {request_context}"
+
+    return True
+
+
+def get_disagg_server_url_from_cfg(config_file: str) -> str:
+    with open(config_file, 'r') as file:
+        config = yaml.safe_load(file)
+    server_host = config.get('hostname', 'localhost')
+    server_port = config.get('port', 8000)
+    return f"http://{server_host}:{server_port}"
 
 
 def get_test_config(test_desc, example_dir, test_root):
@@ -57,6 +170,7 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
         (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
         "load_balance":
@@ -76,6 +190,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
         "ctxpp4_genpp4":
         (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
+        "ctxpp4_gentp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -138,6 +254,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
          ),
+        "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -152,7 +272,8 @@ def run_disaggregated_test(example_dir,
                            num_iters=5,
                            env=None,
                            cwd=None,
-                           prompt_file="prompts.json"):
+                           prompt_file="prompts.json",
+                           extra_endpoints_test: Callable[[str], None] = None):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
@@ -172,6 +293,7 @@ def run_disaggregated_test(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
+    server_url = get_disagg_server_url_from_cfg(config_file)
 
     try:
         with (  # Start workers
@@ -192,9 +314,8 @@ def run_disaggregated_test(example_dir,
             for _ in range(num_iters):
                 client_cmd = [
                     'python3', f'{client_dir}/disagg_client.py', '-c',
-                    f'{example_dir}/disagg_config.yaml', '-p',
-                    f'{client_dir}/{prompt_file}', '--ignore-eos',
-                    '--server-start-timeout',
+                    f'{config_file}', '-p', f'{client_dir}/{prompt_file}',
+                    '--ignore-eos', '--server-start-timeout',
                     str(server_start_timeout)
                 ]
                 if prompt_file == "long_prompts.json":
@@ -231,6 +352,9 @@ def run_disaggregated_test(example_dir,
                 # Skip output verification for long prompts test
                 if prompt_file == "long_prompts.json":
                     continue
+
+                if extra_endpoints_test is not None:
+                    extra_endpoints_test(server_url)
 
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
@@ -513,6 +637,87 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
+                                    disaggregated_example_root,
+                                    llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    def extra_endpoints_test(server_url: str):
+        import json
+        import urllib.request
+
+        with urllib.request.urlopen(f"{server_url}/perf_metrics",
+                                    timeout=10) as resp:
+            assert resp.status == 200
+            perf_metrics = json.load(resp)
+        assert len(perf_metrics) > 0
+        item = perf_metrics[0]
+
+        # Use helper function to validate all timing metrics comprehensively
+        validate_timing_metrics(item, "perf_metrics test")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           extra_endpoints_test=extra_endpoints_test)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
+                                            disaggregated_example_root,
+                                            llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=llm_venv._new_env
+                           | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           cwd=llm_venv.get_working_directory())
+    assert os.path.isdir(output_path)
+    send_file = os.path.join(output_path, "rank_0_send.csv")
+    recv_file = os.path.join(output_path, "rank_1_recv.csv")
+    assert os.path.exists(send_file)
+    assert os.path.exists(recv_file)
+    with open(send_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        assert lines[0].startswith(
+            "RequestID,Delay(ms),Duration(ms),Bandwidth(Gbps)")
+        # get a send sample and match the recv
+        sample = lines[1].split(',')
+        assert len(sample) >= 4
+    with open(recv_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        matched = False
+        for line in lines:
+            sample_recv = line.split(',')
+            if sample_recv[0] == sample[0]:
+                matched = True
+                assert float(sample_recv[1]) <= float(sample[1])
+                break
+        assert matched
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
                                       disaggregated_example_root,
                                       llama_model_root):
@@ -709,6 +914,27 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+#tiny llama pp4 will have uneven layer per pp. pp4
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_gentp4",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -771,6 +997,29 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_mtp",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    #add one mtp layer, pp rank0 will have 15 layer, pp rank 1 will have 16 layers.
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
@@ -1270,6 +1519,9 @@ def get_config_for_benchmark(model_root, backend):
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
+    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
+    ) != 90:
+        pytest.skip("The test should only run on Hopper")
     nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
     ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
     temp_dir = tempfile.TemporaryDirectory()

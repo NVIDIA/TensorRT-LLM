@@ -78,9 +78,11 @@ public:
     bool isSupported();
 
     // Run the XQA kernel.
-    void run(XQAParams const& params, KVLinearBuffer const& kv_cache_buffer);
+    void run(XQAParams const& params, KVLinearBuffer const& kv_cache_buffer,
+        KVLinearBuffer const& kv_cache_block_scales_buffer);
 
-    void run(XQAParams const& params, KVBlockArray const& kv_cache_buffer);
+    void run(
+        XQAParams const& params, KVBlockArray const& kv_cache_buffer, KVBlockArray const& kv_cache_block_scales_buffer);
 
     int getWorkspaceAlignment();
 
@@ -104,7 +106,8 @@ private:
 
 protected:
     template <typename T, typename KVCacheBuffer>
-    void runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buffer);
+    void runImpl(
+        XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer);
 };
 
 constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;

@@ -435,7 +435,7 @@ class RemoteMpiCommSessionServer():
                 f"RemoteMpiCommSessionServer received all results, sending to client\n",
                 "green")
             try:
-                self.queue.put_noblock(self.results)
+                self.queue.put_noblock(self.results, retry=2)
             except zmq.ZMQError as e:
                 # The client could be shutdown first.
                 if e.errno == zmq.EAGAIN:

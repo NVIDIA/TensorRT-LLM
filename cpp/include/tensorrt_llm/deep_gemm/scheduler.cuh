@@ -379,7 +379,7 @@ struct GroupedMaskedScheduler
     }
 };
 
-// Need to keep the same as the one in tests/unittest/_torch/thop/deep_gemm_tests.py
+// Need to keep the same as the one in tests/unittest/_torch/thop/parallel/deep_gemm_tests.py
 template <typename T_offset, typename T_index>
 __host__ __device__ __forceinline__ T_offset compute_padded_offset(T_offset offset, T_index problem_idx)
 {

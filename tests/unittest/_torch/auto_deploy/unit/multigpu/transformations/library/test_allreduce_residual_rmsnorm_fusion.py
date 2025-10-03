@@ -8,9 +8,7 @@ from torch.export import export
 from tensorrt_llm._torch.auto_deploy.distributed import common as dist
 from tensorrt_llm._torch.auto_deploy.distributed.trtllm import is_trtllm_op_available
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library.collectives import (
-    fuse_allreduce_residual_rmsnorm,
-)
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
@@ -65,14 +63,21 @@ def _test_allreduce_fusion(port: int):
     original_outputs, residual_original = gm(x, residual)
 
     # Fuse ops
-    fuse_allreduce_residual_rmsnorm(gm)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_allreduce_residual_rmsnorm": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
 
     # Run the fused graph
-    fused_outputs, residual_fused = gm(x, residual)
+    fused_outputs, residual_fused = gm_transformed(x, residual)
 
     # Check if fused node in the graph
     has_fused_node = False
-    for node in gm.graph.nodes:
+    for node in gm_transformed.graph.nodes:
         if is_op(node, torch.ops.dist.fused_allreduce_residual_rmsnorm):
             has_fused_node = True
     assert has_fused_node, "Fused node not found."
@@ -86,8 +91,8 @@ def _test_allreduce_fusion(port: int):
     )
 
     # check if we can still export the model as expected
-    export(gm, args=args)
-    torch_export_to_gm(gm, args=args)
+    export(gm_transformed, args=args)
+    torch_export_to_gm(gm_transformed, args=args)
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())

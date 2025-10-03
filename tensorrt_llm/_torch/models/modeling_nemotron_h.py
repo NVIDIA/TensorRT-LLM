@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Optional
 
 import torch
@@ -221,7 +222,9 @@ class NemotronHModel(DecoderModel):
             )
 
         if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            self.mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests)
+            self.mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests,
+                chunk_size=self.model_config.pretrained_config.chunk_size)
         self.mamba_metadata.prepare(attn_metadata)
 
         if inputs_embeds is None:
@@ -253,7 +256,7 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
 
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                k.replace('model.layers.backbone', 'model')
+                re.sub(r'(model\.layers\.)?backbone', 'model', k)
                 for k in model_config.quant_config.exclude_modules
             ]
 

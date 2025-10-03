@@ -48,7 +48,7 @@ class Backend:
         self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
-        self.capture_num_tokens = capture_num_tokens or []
+        self.capture_num_tokens = sorted(capture_num_tokens or [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self.no_optimization = False
         # We only need to create aux streams.

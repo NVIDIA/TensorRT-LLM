@@ -16,7 +16,6 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
-from .sampler import Sampler, TorchSampler
 
 SHUTDOWN_REQUEST_ID = -1
 
@@ -303,12 +302,13 @@ class ExecutorRequestQueue:
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
-    def fetch_new_requests(self, num_active_requests: int) -> List[LlmRequest]:
+    def fetch_new_requests(
+            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
 
         if self.enable_attention_dp:
-            return self._fetch_new_requests_attention_dp(num_active_requests)
+            return self._fetch_new_requests_attention_dp(activate_requests)
         else:
-            return self._fetch_new_requests_attention_tp(num_active_requests)
+            return self._fetch_new_requests_attention_tp(len(activate_requests))
 
     def _fetch_new_requests_attention_tp(
             self, num_active_requests: int) -> List[LlmRequest]:
@@ -327,13 +327,18 @@ class ExecutorRequestQueue:
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self, num_active_requests: int) -> List[LlmRequest]:
+            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
-        responses_list = self.dist.tp_allgather(num_active_requests)
-        for num_active_requests in responses_list:
+        all_ranks_num_active_tokens = []
+        num_active_tokens = sum(
+            [req.py_orig_prompt_len for req in activate_requests])
+        responses_list = self.dist.tp_allgather(
+            [len(activate_requests), num_active_tokens])
+        for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
+            all_ranks_num_active_tokens.append(num_active_tokens)
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
@@ -347,7 +352,8 @@ class ExecutorRequestQueue:
 
         # Schedule attention dp requests
         all_ranks_new_requests = self._schedule_attention_dp_requests(
-            new_requests, all_ranks_num_active_requests)
+            new_requests, all_ranks_num_active_requests,
+            all_ranks_num_active_tokens)
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
         # Update performance metrics
@@ -365,7 +371,8 @@ class ExecutorRequestQueue:
 
     def _schedule_attention_dp_requests(
             self, new_requests: List[RequestQueueItem],
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
         """Schedule attention dp requests."""
 
         # Map from ranks to new requests
@@ -412,7 +419,7 @@ class ExecutorRequestQueue:
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
             remaining_unscheduled, all_ranks_new_requests,
-            all_ranks_num_active_requests)
+            all_ranks_num_active_requests, all_ranks_num_active_tokens)
 
         return all_ranks_new_requests
 
@@ -470,7 +477,8 @@ class ExecutorRequestQueue:
     def _balance_requests_across_ranks(
             self, new_requests: List[RequestQueueItem],
             all_ranks_new_requests: Dict[int, List[RequestQueueItem]],
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
         """Balance requests across ranks for attention DP."""
         if new_requests:
             # Balance context tokens across ranks using heap
@@ -479,7 +487,7 @@ class ExecutorRequestQueue:
                 ['num_tokens', 'num_requests', 'rank', 'request_list'])
 
             all_ranks_new_requests_heap = [
-                HeapVal(0, val, tp_rank, [])
+                HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
@@ -504,6 +512,7 @@ class ExecutorRequestQueue:
 
             # Distribute requests across ranks
             for req_item in new_requests:
+
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 token_count = len(
                     getattr(req_item.request, 'input_token_ids',
@@ -587,6 +596,72 @@ class ExecutorRequestQueue:
                     self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                         child_id)
 
+    # Note: Helix parallelism is a decode-only feature run with disaggregated serving. This function gets called on gen server
+    # during initialization of a new request.
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem],
+                              tokens_per_block: int):
+        req_with_children = []
+        num_cp_ranks = self.dist.cp_size
+        curr_cp_rank = self.dist.cp_rank
+
+        # For each request, partition the input_token_ids into blocks and then partition blocks across CP ranks.
+        # Currently, the partitioning is such that contiguous blocks are assigned to the same CP rank (as opposed
+        # to round-robin).
+        for req_item in new_requests:
+            all_input_ids = torch.tensor(req_item.request.input_token_ids,
+                                         dtype=torch.int64).unsqueeze(0)
+            input_len = all_input_ids.shape[-1]
+
+            num_total_blocks = (input_len + tokens_per_block -
+                                1) // tokens_per_block
+            if num_total_blocks < num_cp_ranks:
+                raise ValueError(
+                    f"There aren't enough tokens to get at least one block per CP rank. num_total_blocks {num_total_blocks} < num_cp_ranks {num_cp_ranks}. Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
+                )
+
+            # Padding to ensure torch.stack used with torch.tensor_split works properly.
+            padding_len = 0
+            if input_len % tokens_per_block != 0:
+                padding_len = tokens_per_block - (input_len % tokens_per_block)
+                padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
+                all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
+            all_position_ids = torch.arange(0,
+                                            input_len + padding_len,
+                                            dtype=torch.int64).unsqueeze(0)
+
+            input_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_input_ids.split(tokens_per_block, dim=-1)),
+                num_cp_ranks)
+            position_id_blocks_per_rank = torch.tensor_split(
+                torch.stack(all_position_ids.split(tokens_per_block, dim=-1)),
+                num_cp_ranks)
+
+            # Get the input_ids and position_ids for this rank.
+            input_ids_this_rank = input_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+            position_ids_this_rank = position_id_blocks_per_rank[
+                curr_cp_rank].flatten().tolist()
+
+            # Undo the padding. Only last rank's last block will be padded right now
+            # given contiguous block assignment.
+            if curr_cp_rank == num_cp_ranks - 1 and padding_len > 0:
+                input_ids_this_rank = input_ids_this_rank[:-padding_len]
+                position_ids_this_rank = position_ids_this_rank[:-padding_len]
+
+            req = executor_request_to_llm_request(
+                req_id=req_item.id,
+                executor_request=req_item.request,
+                child_req_ids=req_item.child_req_ids,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits(),
+                input_token_ids=input_ids_this_rank,
+                position_ids=position_ids_this_rank,
+            )
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
+
     @nvtx_range("_merge_requests")
     def _merge_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
@@ -595,20 +670,24 @@ class ExecutorRequestQueue:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == CpType.RING:
-                raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.HELIX:
+                # Take the usual route below.
+                return self._merge_helix_requests(
+                    new_requests,
+                    tokens_per_block=cp_config['tokens_per_block'])
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
-        else:
-            req_with_children = []
-            for req_item in new_requests:
-                req = executor_request_to_llm_request(
-                    req_item.id, req_item.request, req_item.child_req_ids,
-                    self._should_exclude_last_generation_logits())
-                req_with_children.append(req)
-                if req.child_requests:
-                    req_with_children.extend(req.child_requests)
-            return req_with_children
+                raise NotImplementedError(
+                    f'Unsupported cp type {cp_type.name}.')
+
+        req_with_children = []
+        for req_item in new_requests:
+            req = executor_request_to_llm_request(
+                req_item.id, req_item.request, req_item.child_req_ids,
+                self._should_exclude_last_generation_logits())
+            req_with_children.append(req)
+            if req.child_requests:
+                req_with_children.extend(req.child_requests)
+        return req_with_children
 
     def _merge_star_attention_requests(
             self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
@@ -707,21 +786,19 @@ class ExecutorRequestQueue:
 
     def set_exclude_last_generation_logits(self,
                                            disable_overlap_scheduler: bool,
-                                           sampler: Sampler) -> None:
+                                           pp_size: int) -> None:
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that handles on the 1st generated token
         # - 2nd time as a generation request that handles on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async (TorchSampler is an anomaly that instead does that on
-        # update_requests), every update_request doesn't handle the newest token, but one
+        # sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required, when not using TorchSampler.
-        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and not isinstance(
-            sampler, TorchSampler)
+        # getter is required.
+        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and pp_size == 1
 
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits

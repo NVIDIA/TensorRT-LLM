@@ -153,6 +153,83 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 
     return {valueE2M1, scaleFP8SF};
 }
+
+at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<at::Tensor> const& tokensPerBatch)
+{
+    CHECK_TH_CUDA(input);
+    CHECK_CONTIGUOUS(input);
+
+    auto const& inputShape = input.sizes();
+    auto const& rank = inputShape.size();
+
+    TORCH_CHECK(rank >= 2 && rank <= 3);
+
+    // Calculate batch and token numbers
+    int64_t batch_size = 1;
+    int64_t token_num = 1;
+    int64_t hidden_size = inputShape[rank - 1];
+
+    if (rank == 2)
+    {
+        // [token_num, hidden_size]
+        token_num = inputShape[0];
+        batch_size = 1;
+    }
+    else if (rank == 3)
+    {
+        // [batch, token_num, hidden_size]
+        batch_size = inputShape[0];
+        token_num = inputShape[1];
+    }
+
+    // Create output tensor with same dimensions as input, but last dimension size is 1
+    std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+    outputShape[rank - 1] = 1;
+
+    at::Tensor globalScale = at::detail::empty_cuda(outputShape, torch::kFloat32, input.device(), std::nullopt);
+
+    // Get multi-processor count
+    static int multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+
+    // Prepare tokensPerBatch pointer - should have shape (batch_size)
+    int const* tokensPerBatchPtr = nullptr;
+    if (tokensPerBatch.has_value())
+    {
+        CHECK_TH_CUDA(tokensPerBatch.value());
+        CHECK_CONTIGUOUS(tokensPerBatch.value());
+
+        auto const& tokensShape = tokensPerBatch.value().sizes();
+        TORCH_CHECK(tokensShape.size() == 1, "tokensPerBatch should have exactly 1 dimension");
+        TORCH_CHECK(tokensShape[0] == batch_size, "tokensPerBatch first dimension must match input batch size");
+
+        tokensPerBatchPtr = tokensPerBatch.value().data_ptr<int>();
+    }
+
+    // Call corresponding kernel based on input data type
+    if (input.scalar_type() == at::ScalarType::Half)
+    {
+        tensorrt_llm::kernels::computePerTokenGlobalScaleForFP4Quantization<half>(batch_size, token_num, hidden_size,
+            reinterpret_cast<half const*>(input.data_ptr()), tokensPerBatchPtr, globalScale.data_ptr<float>(),
+            multiProcessorCount, at::cuda::getCurrentCUDAStream(input.get_device()));
+    }
+    else if (input.scalar_type() == at::ScalarType::BFloat16)
+    {
+#ifdef ENABLE_BF16
+        tensorrt_llm::kernels::computePerTokenGlobalScaleForFP4Quantization<__nv_bfloat16>(batch_size, token_num,
+            hidden_size, reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()), tokensPerBatchPtr,
+            globalScale.data_ptr<float>(), multiProcessorCount, at::cuda::getCurrentCUDAStream(input.get_device()));
+#else
+        C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to compute global scale for bf16 tensor.");
+#endif
+    }
+    else
+    {
+        C10_THROW_ERROR(
+            NotImplementedError, "calculate_nvfp4_global_scale only supports input tensor with dtypes fp16/bf16.");
+    }
+
+    return globalScale;
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -161,9 +238,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True) "
         "-> (Tensor, Tensor)");
+    m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_quantize", TORCH_FN(torch_ext::fp4_quantize));
+    m.impl("calculate_nvfp4_global_scale", TORCH_FN(torch_ext::calculate_nvfp4_global_scale));
 }

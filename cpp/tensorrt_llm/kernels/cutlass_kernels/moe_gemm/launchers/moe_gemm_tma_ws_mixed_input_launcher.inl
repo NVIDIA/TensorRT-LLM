@@ -65,8 +65,9 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-namespace cutlass_kernels
+namespace cutlass_kernels_oss
 {
+using namespace tensorrt_llm::kernels::cutlass_kernels;
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
@@ -187,37 +188,34 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     hw_info.device_id = 0;
     hw_info.sm_count = sm_count_;
 
+    arguments = Args{cutlass::gemm::GemmUniversalMode::kGrouped,
+        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
+            reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
+            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
+            reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
+            reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+            reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
+        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
+            reinterpret_cast<StrideC*>(hopper_inputs.stride_c), reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
+            reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
+        hw_info};
+
     assert(group_size == int(inputs.groupwise_quant_group_size));
     if (workspace_size != nullptr)
     {
-        const Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
-            {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-            {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
-                reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
-                reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-                hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
-            {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
-                reinterpret_cast<ElementD**>(hopper_inputs.ptr_d), hopper_inputs.stride_d},
-            hw_info};
-        *workspace_size = gemm.get_workspace_size(args);
+        *workspace_size = gemm.get_workspace_size(arguments);
         return;
     }
-
-    arguments = Args{cutlass::gemm::GemmUniversalMode::kGrouped,
-        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
-            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
-            reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-            hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
-        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
-            reinterpret_cast<ElementD**>(hopper_inputs.ptr_d), hopper_inputs.stride_d},
-        hw_info};
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
     {
         TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
             gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
     }
+
+    // This is not initialized during workspace size calculation so check after
+    TLLM_CHECK_WITH_INFO(hopper_inputs.swap_ab, "swap_ab must be true for mixed dtype WS grouped GEMM");
 
     auto can_implement = gemm.can_implement(arguments);
     if (can_implement != cutlass::Status::kSuccess)
@@ -246,6 +244,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     return;
 }
 
-} // namespace cutlass_kernels
+} // namespace cutlass_kernels_oss
 } // namespace kernels
 } // namespace tensorrt_llm

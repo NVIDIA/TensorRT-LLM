@@ -88,6 +88,7 @@ class LoraConfig(DictConversion):
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
     max_loras: Optional[int] = None
     max_cpu_loras: Optional[int] = None
+    swap_gate_up_proj_lora_b_weight: bool = True
 
     def __post_init__(self):
         assert self.lora_ckpt_source in [

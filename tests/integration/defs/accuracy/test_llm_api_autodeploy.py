@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -22,17 +24,27 @@ from ..conftest import llm_models_root
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
+def _hf_model_dir_or_hub_id(
+    hf_model_subdir: str,
+    hf_hub_id: str,
+) -> str:
+    llm_models_path = llm_models_root()
+    if llm_models_path and os.path.isdir(
+        (model_fullpath := os.path.join(llm_models_path, hf_model_subdir))):
+        return str(model_fullpath)
+    else:
+        return hf_hub_id
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
+    MODEL_PATH = _hf_model_dir_or_hub_id("llama-3.1-model/Meta-Llama-3.1-8B",
+                                         MODEL_NAME)
 
     def get_default_kwargs(self):
         return {
             'skip_tokenizer_init': False,
             'trust_remote_code': True,
-            'kv_cache_config': {
-                'enable_block_reuse': False,
-            },
             'max_batch_size': 512,
             # 131072 is the max seq len for the model
             'max_seq_len': 8192,
@@ -42,7 +54,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             'skip_loading_weights': False,
             'compile_backend': 'torch-opt',
             'free_mem_ratio': 0.7,
-            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256]
+            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
         }
 
     def get_default_sampling_params(self):

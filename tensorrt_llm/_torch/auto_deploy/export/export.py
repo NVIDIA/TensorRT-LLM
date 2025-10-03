@@ -18,7 +18,7 @@ from ..transformations._graph import (
 )
 from ..utils.logger import ad_logger
 from ..utils.node_utils import is_op
-from .interface import ExportPatchRegistry, apply_export_patches
+from .interface import apply_export_patches
 
 try:
     from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
@@ -229,20 +229,9 @@ def torch_export_to_gm(
         patch_list: Optional list of patch names to apply with default settings.
                    Cannot be used together with patch_configs.
     """
-    # Validate that both patch_configs and patch_list are not provided simultaneously
-    if patch_configs is not None and patch_list is not None:
-        raise ValueError("Cannot specify both patch_configs and patch_list. Use only one.")
-
-    # Handle patch configuration
-    if patch_list is not None:
-        # Convert patch_list to patch_configs format
-        patch_configs = {patch_name: {} for patch_name in patch_list}
-    elif patch_configs is None:
-        # Default patch configurations - apply all registered patches with default settings
-        patch_configs = {patch_name: {} for patch_name in ExportPatchRegistry.list_patches()}
 
     # run export with patches and lifted to meta
-    with apply_export_patches(patch_configs), lift_to_meta(model) as state_dict:
+    with apply_export_patches(patch_configs, patch_list), lift_to_meta(model) as state_dict:
         # clean up args, kwargs and move to correct device
         args, kwargs = tree_to((args, kwargs or {}), device="meta")
 

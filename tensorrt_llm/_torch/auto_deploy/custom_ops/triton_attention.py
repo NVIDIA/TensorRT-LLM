@@ -290,8 +290,10 @@ def prepare_fused_mha_metadata(
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
+    # TODO: maybe use slot_idx instead of pages_per_seq??
     num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
     seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
@@ -307,7 +309,7 @@ def prepare_fused_mha_metadata(
 # SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
     return (
@@ -406,8 +408,8 @@ class TritonAttention(AttentionDescriptor):
 
         # do a sanity check on the scale if it is not None, we only support the default scale
         # of 1/sqrt(head_dim) and so we should do an approximate check for that one
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float, Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=} is not a float. Using default scale instead.")
             scale = None
         # Get sinks and sliding_window from args or kwargs
         sinks = extract_op_args(source_attn_node, "sinks")[0]

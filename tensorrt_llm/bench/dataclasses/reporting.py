@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple
 
-from tensorrt_llm._torch.pyexecutor.model_engine import \
+from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
@@ -273,6 +273,22 @@ class ReportUtility:
             },
         }
 
+        # Retrieve KV cache information.
+        kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
+        if isinstance(kv_cache_config, KvCacheConfig):
+            kv_cache_dtype = kv_cache_config.dtype
+            kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
+        elif isinstance(kv_cache_config, dict):
+            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            kv_cache_mem_percent = kv_cache_config.get(
+                "free_gpu_memory_fraction")
+        else:
+            raise ValueError(
+                f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
+
+        kv_cache_mem_percent = kv_cache_mem_percent \
+            if kv_cache_mem_percent is not None else None
+
         # Engine/Backend details
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
@@ -302,15 +318,6 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            kv_cache_config = self.kwargs.get("kv_cache_config",
-                                              KvCacheConfig())
-            if isinstance(kv_cache_config, KvCacheConfig):
-                kv_cache_dtype = kv_cache_config.dtype
-            elif isinstance(kv_cache_config, dict):
-                kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            else:
-                raise ValueError(
-                    f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
 
             validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
@@ -336,8 +343,7 @@ class ReportUtility:
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
             "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
             "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
-            "kv_cache_percentage":
-            self.rt_cfg.settings_config.kv_cache_percent * 100.0,
+            "kv_cache_percentage": kv_cache_mem_percent,
             "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
@@ -493,7 +499,7 @@ class ReportUtility:
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
                 f"Engine Directory:\t{engine['engine_dir']}\n"
-                f"TensorRT-LLM Version:\t{engine['version']}\n"
+                f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
                 f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
                 f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
@@ -507,7 +513,7 @@ class ReportUtility:
                 "===========================================================\n"
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
-                f"TensorRT-LLM Version:\t{engine['version']}\n"
+                f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{engine['dtype']}\n"
                 f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
                 f"Quantization:\t\t{engine['quantization']}\n"
@@ -515,6 +521,10 @@ class ReportUtility:
                 # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
                 # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
                 f"\n")
+
+        kv_cache_percentage = world_info.get("kv_cache_percentage", None)
+        if kv_cache_percentage is not None:
+            kv_cache_percentage = f"{kv_cache_percentage * 100.0:.2f}%"
 
         world_info = (
             "===========================================================\n"
@@ -526,7 +536,7 @@ class ReportUtility:
             f"Max Runtime Batch Size: {world_info['max_batch_size']}\n"
             f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"
             f"Scheduling Policy:      {world_info['scheduling_policy']}\n"
-            f"KV Memory Percentage:   {world_info['kv_cache_percentage']:.2f}%\n"
+            f"KV Memory Percentage:   {kv_cache_percentage}\n"
             f"Issue Rate (req/sec):   {world_info['issue_rate']:.4E}\n"
             f"\n")
 

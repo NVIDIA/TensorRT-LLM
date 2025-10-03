@@ -203,7 +203,7 @@ static GemmAllReducePluginOptions deserializeOptions(void const*& data, size_t l
 
     TLLM_CHECK_WITH_INFO(end == begin + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (end - begin));
 

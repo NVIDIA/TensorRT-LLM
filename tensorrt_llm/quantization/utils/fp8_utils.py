@@ -476,7 +476,7 @@ def per_token_quant_and_transform(
     scale_k = ceil_div(k, quant_group_size)
     m_padded = align(m, alignment)
     scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.zeros((scale_k_padded // 4, m_padded),
+    output_scale = torch.empty((scale_k_padded // 4, m_padded),
                                dtype=torch.int32,
                                device='cuda')
 
