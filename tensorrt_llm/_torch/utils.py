@@ -312,3 +312,53 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
 # It's here so that unit tests can mock it and turn it off.
 def _get_allow_chain_drafter() -> bool:
     return True
+
+
+_buffer_pool = None
+
+
+def set_shared_pool(buffer_pool):
+    """Sets the global memory pool for buffer allocation.
+
+    Args:
+        buffer_pool: A CUDA memory pool object to use for allocations.
+    """
+    global _buffer_pool
+    _buffer_pool = buffer_pool
+
+
+def get_shared_pool():
+    """Retrieves the current global memory pool.
+
+    Returns:
+        The current memory pool, or None if not set.
+    """
+    global _buffer_pool
+    return _buffer_pool
+
+
+@contextlib.contextmanager
+def set_shared_mem_pool(mem_pool) -> contextlib.AbstractContextManager:
+    """Temporarily sets a preferred memory pool and restores the previous one on exit.
+
+    This context manager allows temporarily switching to a different memory pool
+    for CUDA graph operations, ensuring the original pool is restored even if
+    an exception occurs.
+
+    Args:
+        mem_pool: The memory pool to use within the context.
+
+    Yields:
+        None
+
+    Example:
+        >>> with set_shared_mem_pool(graph_pool):
+        ...     # Allocations within this block use graph_pool
+        ...     tensor = allocate_buffer(...)
+    """
+    old_buffer_pool = get_shared_pool()
+    set_shared_pool(mem_pool)
+    try:
+        yield
+    finally:
+        set_mem_pool(old_buffer_pool)
