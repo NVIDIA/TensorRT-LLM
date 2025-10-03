@@ -40,6 +40,7 @@ struct TestSamplingParams
     std::vector<float> repetitionPenalties;
     std::vector<float> presencePenalties;
     std::vector<float> frequencyPenalties;
+    std::vector<runtime::SizeType32> promptIgnoreLengths;
     std::vector<runtime::SizeType32> minLengths;
     std::vector<float> decay;
     std::vector<float> minTopP;
