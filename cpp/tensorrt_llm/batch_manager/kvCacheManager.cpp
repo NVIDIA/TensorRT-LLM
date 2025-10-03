@@ -941,8 +941,6 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
         && mOnboardBlocks)
     {
-        // If we're swapping a block to secondary memory, maintain the prior priority values.
-        mEvictionPolicy->claimBlock(block);
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
@@ -955,12 +953,17 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
                 mWindowSize);
         }
-        mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
+        // Update the block as a secondary block (maintaining its priority)
+        mEvictionPolicy->claimBlock(block);
+        // Release the block into secondary block queue
+        mEvictionPolicy->releaseBlock(block);
+        // We have the offloaded block as the block to use now.
         block = offloadBlock;
     }
 
     // Removes children of the block from the search tree
     freeChildren(block);
+    // Claim the block in primary block queue
     mEvictionPolicy->claimBlock(block, priority, durationMs);
 
     // Deal with invalidating block save for reuse for the sequence
