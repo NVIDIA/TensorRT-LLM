@@ -86,6 +86,10 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
+            # SSMs do not support cache reuse.
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
             # Keep max_batch_size as in the PyTorch test to avoid OOM
             "max_batch_size": 128,
             # Model context length is 8K
