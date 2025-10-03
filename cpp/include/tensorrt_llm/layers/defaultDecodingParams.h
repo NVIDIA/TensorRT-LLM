@@ -56,6 +56,11 @@ public:
         return 1;
     }
 
+    [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getPromptIgnoreLength()
+    {
+        return 0;
+    }
+
     [[nodiscard]] __host__ __device__ static constexpr uint64_t getSeed()
     {
         return 0;
