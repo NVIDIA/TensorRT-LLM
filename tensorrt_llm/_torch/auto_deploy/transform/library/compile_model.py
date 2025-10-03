@@ -3,7 +3,7 @@ from typing import List, Literal, Optional, Tuple, Type
 from pydantic import Field
 from torch.fx import GraphModule
 
-from ...compile import compile_and_capture
+from ...compile import CompileBackendRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
@@ -47,16 +47,15 @@ class CompileModel(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         cm.info.set_generate_only_batch()
-        egm_compiled = compile_and_capture(
+
+        compiler_cls = CompileBackendRegistry.get(self.config.compile_backend)
+        egm_compiled = compiler_cls(
             gm,
-            self.config.compile_backend,
             args=cm.args,
-            dynamic_shapes=cm.dynamic_shapes,
-            compiler_kwargs={
-                "cuda_graph_batch_sizes": self.config.cuda_graph_batch_sizes,
-                "num_batched_inputs": self.config.num_batched_inputs,
-            },
-        )
+            max_batch_size=cm.info.max_batch_size,
+            **self.config.model_dump(),
+        ).compile()
+
         cm.info.reset()
 
         # store info object about the transform
