@@ -101,6 +101,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+    using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
     using CacheSaltIDType = runtime::CacheSaltIDType;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
@@ -1255,7 +1256,7 @@ public:
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.firstScheduledTime = getSteadyClockNow();
         }
     }
 
@@ -1689,22 +1690,22 @@ public:
         mDecodingIter = iter;
     }
 
-    void setKvCacheTransferStart(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferStart(TimePoint const& time)
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferStart = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
     }
 
-    void setKvCacheTransferEnd(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferEnd(TimePoint const& time)
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferStart()
+    TimePoint getKvCacheTransferStart()
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferStart;
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferEnd()
+    TimePoint getKvCacheTransferEnd()
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
@@ -1788,7 +1789,7 @@ public:
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
             TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
-                std::chrono::duration<float>(std::chrono::steady_clock::now() - mStartTime).count());
+                std::chrono::duration<float>(getSteadyClockNow() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
@@ -1826,10 +1827,9 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
-        auto const currentTokenTime = std::chrono::steady_clock::now();
-
         if (!mPerfMetrics.firstIter)
         {
+            auto const currentTokenTime = getSteadyClockNow();
             mPerfMetrics.firstIter = iter;
             mPerfMetrics.timingMetrics.firstTokenTime = currentTokenTime;
         }
@@ -1838,6 +1838,7 @@ public:
 
         if (isFinished())
         {
+            auto const currentTokenTime = getSteadyClockNow();
             mPerfMetrics.lastIter = iter;
             mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
@@ -1863,6 +1864,15 @@ public:
         return mUseDraftModel;
     }
 
+    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // time point
+    [[nodiscard]] TimePoint getSteadyClockNow() const
+    {
+        const TimePoint time_point = std::chrono::steady_clock::now();
+
+        return maybeToGlobalSteadyClock(time_point);
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1881,6 +1891,9 @@ public:
 
     // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
+
+    // The offset between local steady clock and global steady clock (at rank 0)
+    inline static std::optional<Duration> mGlobalSteadyClockOffset{std::nullopt};
 
 protected:
     bool mIsStreaming;
@@ -2137,7 +2150,8 @@ private:
 
         if (mReturnPerfMetrics)
         {
-            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(std::chrono::steady_clock::now());
+            // arrivalTime is assumed to be recorded at the rank 0, so no need to convert it to global clock
+            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getSteadyClockNow());
         }
         mStartTime = std::chrono::steady_clock::now();
     }
@@ -2166,6 +2180,18 @@ private:
         tensor->unsqueeze(0);
 
         return tensor;
+    }
+
+    TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point) const
+    {
+        if (mGlobalSteadyClockOffset.has_value())
+        {
+            return time_point + *mGlobalSteadyClockOffset;
+        }
+        else
+        {
+            return time_point;
+        }
     }
 };
 
