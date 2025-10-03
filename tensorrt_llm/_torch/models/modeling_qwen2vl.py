@@ -96,7 +96,8 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True):
         self.model_config = model_config
-        self.tokenizer = tokenizer
+        self.tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+            model_path)
         self.use_fast = True
         self.model_path = model_path
         self.processor = AutoProcessor.from_pretrained(
