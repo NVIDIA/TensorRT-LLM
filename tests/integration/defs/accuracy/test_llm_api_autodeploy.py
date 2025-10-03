@@ -21,7 +21,7 @@ from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import llm_models_root
-from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
 def _hf_model_dir_or_hub_id(
@@ -43,18 +43,18 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self):
         return {
-            'skip_tokenizer_init': False,
-            'trust_remote_code': True,
-            'max_batch_size': 512,
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "max_batch_size": 512,
             # 131072 is the max seq len for the model
-            'max_seq_len': 8192,
+            "max_seq_len": 8192,
             # max num tokens is derived in the build_config, which is not used by AutoDeploy llmargs.
             # Set it explicitly here to 8192 which is the default in build_config.
-            'max_num_tokens': 8192,
-            'skip_loading_weights': False,
-            'compile_backend': 'torch-opt',
-            'free_mem_ratio': 0.7,
-            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+            "max_num_tokens": 8192,
+            "skip_loading_weights": False,
+            "compile_backend": "torch-opt",
+            "free_mem_ratio": 0.7,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
         }
 
     def get_default_sampling_params(self):
@@ -76,3 +76,44 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
+
+
+class TestNemotronH(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            # Keep max_batch_size as in the PyTorch test to avoid OOM
+            "max_batch_size": 128,
+            # Model context length is 8K
+            "max_seq_len": 8192,
+            # Set explicitly to match default build_config behavior
+            "max_num_tokens": 8192,
+            "skip_loading_weights": False,
+            "compile_backend": "torch-opt",
+            "free_mem_ratio": 0.7,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_auto_dtype(self):
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
