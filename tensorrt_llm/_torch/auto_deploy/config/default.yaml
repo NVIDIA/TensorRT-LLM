@@ -94,16 +94,13 @@ transforms:
   ############################################################################################
   fuse_gemms:
     stage: post_load_fusion
-    enabled: true # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-    run_shape_prop: true
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_fp4_gemms:
     stage: post_load_fusion
-    enabled: true # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-    run_shape_prop: true
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_fp8_gemms:
     stage: post_load_fusion
-    enabled: true # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-    run_shape_prop: true
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: torch
@@ -112,7 +109,7 @@ transforms:
     backend: trtllm
   fuse_moe:
     stage: post_load_fusion
-    enabled: true # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   # TODO (lucaslie): add backend selection as part of configurable inference optimizers
@@ -122,6 +119,7 @@ transforms:
     # check if we can fuse rmsnorm
     stage: post_load_fusion
     backend: flashinfer
+    requires_shape_prop: true
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
