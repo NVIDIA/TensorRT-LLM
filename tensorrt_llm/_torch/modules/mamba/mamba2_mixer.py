@@ -131,7 +131,8 @@ class Mamba2Mixer(nn.Module):
                         requires_grad=False))
 
         # norm (only create if mamba_rms_norm is True)
-        mamba_rms_norm = getattr(config.pretrained_config, 'mamba_rms_norm', True)
+        mamba_rms_norm = getattr(config.pretrained_config, 'mamba_rms_norm',
+                                 True)
         if mamba_rms_norm:
             self.norm = RMSNormGated(
                 self.tp_d_inner,
