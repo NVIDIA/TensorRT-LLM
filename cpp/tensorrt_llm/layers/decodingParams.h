@@ -128,11 +128,12 @@ public:
 class PenaltySetupParams : public BaseSetupParams
 {
 public:
-    OptVec<float> temperature;             // [1] or [setupBatchSize]
-    OptVec<runtime::SizeType32> minLength; // [1] or [setupBatchSize]
-    OptVec<float> repetitionPenalty;       // [1] or [setupBatchSize]
-    OptVec<float> presencePenalty;         // [1] or [setupBatchSize]
-    OptVec<float> frequencyPenalty;        // [1] or [setupBatchSize]
+    OptVec<float> temperature;                      // [1] or [setupBatchSize]
+    OptVec<runtime::SizeType32> minLength;          // [1] or [setupBatchSize]
+    OptVec<float> repetitionPenalty;                // [1] or [setupBatchSize]
+    OptVec<float> presencePenalty;                  // [1] or [setupBatchSize]
+    OptVec<float> frequencyPenalty;                 // [1] or [setupBatchSize]
+    OptVec<runtime::SizeType32> promptIgnoreLength; // [1] or [setupBatchSize]
 };
 
 // Ban words layer
