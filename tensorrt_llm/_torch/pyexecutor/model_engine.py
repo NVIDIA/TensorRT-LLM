@@ -12,7 +12,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch._dynamo.config
-from transformers import AutoTokenizer
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
@@ -174,8 +173,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.input_processor = create_input_processor(model_path, tokenizer)
+        self.input_processor = create_input_processor(model_path, None)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
