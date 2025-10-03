@@ -1057,6 +1057,18 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.RenormalizeNaive
                 },
                 id="RoutingRenormalizeNaive"),
+            pytest.param(
+                {
+                    "num_experts": 512,
+                    "top_k": 10,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_qwen_next"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
