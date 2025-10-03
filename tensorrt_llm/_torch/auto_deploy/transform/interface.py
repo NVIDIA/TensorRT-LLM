@@ -24,7 +24,6 @@ from ..transformations._graph import (
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
-from ..utils.module import has_any_meta_tensor
 from ..utils.sharding_utils import ShardingConfig
 
 
@@ -419,7 +418,7 @@ class BaseTransform(ABC):
         is_clean = info.is_clean
         has_valid_shapes = is_clean and info.has_valid_shapes
 
-        use_meta = isinstance(gm, GraphModule) and has_any_meta_tensor(gm)
+        use_meta = isinstance(gm, GraphModule) and placeholders_on_meta(gm)
 
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
