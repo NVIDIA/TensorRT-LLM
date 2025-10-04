@@ -168,6 +168,11 @@ public:
 
     static MemoryCounters& getInstance();
 
+    MemoryCounters(MemoryCounters const&) = delete;
+    MemoryCounters& operator=(MemoryCounters const&) = delete;
+    MemoryCounters(MemoryCounters&&) = delete;
+    MemoryCounters& operator=(MemoryCounters&&) = delete;
+
     static std::string bytesToString(SizeType32 bytes, int precision = 2);
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
