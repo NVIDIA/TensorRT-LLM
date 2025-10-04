@@ -224,6 +224,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = 1.0
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
+    prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
@@ -277,6 +278,7 @@ class CompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             temperature=self.temperature,
             top_p=self.top_p,
+            prompt_ignore_length=self.prompt_ignore_length,
 
             # completion-sampling-params
             use_beam_search=self.use_beam_search,
@@ -524,6 +526,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "reasoning is shown in the model's response. Options: "
                 "'low', 'medium', 'high'."),
         )
+    prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -615,6 +618,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             seed=self.seed,
             stop=self.stop,
             temperature=self.temperature,
+            prompt_ignore_length=self.prompt_ignore_length,
 
             # chat-completion-sampling-params
             best_of=self.best_of,
