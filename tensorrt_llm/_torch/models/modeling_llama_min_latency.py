@@ -800,18 +800,19 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
         needs_post_allreduce = self.fusion_config.POST_MOE_FUSION \
             or self.fusion_config.POST_MLP_FUSION
         if needs_post_allreduce and self.next_layer_layernorm is not None:
-            if use_fp8_allreduce and self.next_attn is not None:
+            if use_fp8_allreduce and self.next_attn is not None \
+                and hasattr(elf.next_attn.qkv_proj, 'input_scale'):
                 hidden_states, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
-                            self.next_attn.qkv_proj, 'input_scale') else None,
+                        scale=self.next_attn.qkv_proj.input_scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-            elif use_fp4_allreduce and self.next_attn is not None:
+            elif use_fp4_allreduce and self.next_attn is not None \
+                and hasattr(self.next_attn.qkv_proj, 'input_scale'):
                 act_fp4, act_sf, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -819,8 +820,7 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
-                            self.next_attn.qkv_proj, 'input_scale') else None,
+                        scale=self.next_attn.qkv_proj.input_scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:
