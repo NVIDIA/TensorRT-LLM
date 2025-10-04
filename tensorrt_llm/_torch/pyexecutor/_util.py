@@ -197,6 +197,19 @@ class KvCacheCreator:
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += (num_req_tokens + self._tokens_per_block -
                                  1) // self._tokens_per_block
+
+        # Max cuda graph warmup required tokens
+        max_cuda_graph_bs = min(self._model_engine.batch_size,
+                                self._model_engine._max_cuda_graph_batch_size)
+        cuda_graph_warmup_block = (
+            self._model_engine.max_seq_len +
+            1) // self._tokens_per_block + max_cuda_graph_bs - 1
+        num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
+
+        # This is the minimal blocks required to run with max bs
+        # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
+        num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
+
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
             0].sampling_config.beam_width
