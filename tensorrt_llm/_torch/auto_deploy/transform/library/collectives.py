@@ -22,7 +22,7 @@ def _allreduce_residual_rmsnorm_pattern(
     """
     Reference PyTorch composition of:
         y = all_reduce(x)
-        z = y + residual
+        z = residual + y
         normed = RMSNorm(z, weight, eps)
     Returns (normed, z)
     """
@@ -30,6 +30,30 @@ def _allreduce_residual_rmsnorm_pattern(
     input_dtype = x.dtype
     hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
     add = residual + hidden_states
+
+    hidden_states = add.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+
+    normed = weight * hidden_states.to(input_dtype)
+
+    return normed, add
+
+
+def _allreduce_residual_rmsnorm_pattern2(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
+):
+    """
+    Reference PyTorch composition of:
+        y = all_reduce(x)
+        z = y + residual
+        normed = RMSNorm(z, weight, eps)
+    Returns (normed, z)
+    """
+
+    input_dtype = x.dtype
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    add = hidden_states + residual
 
     hidden_states = add.to(torch.float32)
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -70,6 +94,14 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
 
         register_ad_pattern(
             search_fn=_allreduce_residual_rmsnorm_pattern,
+            replace_fn=_allreduce_residual_rmsnorm_repl,
+            patterns=patterns,
+            dummy_args=dummy_args,
+            op_ignore_types={torch.ops.aten.to.dtype: (torch.dtype,)},
+            scalar_workaround={"eps": 0.1253},
+        )
+        register_ad_pattern(
+            search_fn=_allreduce_residual_rmsnorm_pattern2,
             replace_fn=_allreduce_residual_rmsnorm_repl,
             patterns=patterns,
             dummy_args=dummy_args,
