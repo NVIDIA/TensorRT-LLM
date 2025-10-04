@@ -12,7 +12,7 @@ The `trtllm-serve` command supports the `extra-llm-config.yaml` parameter. In th
 
 ```yaml
 cache_transceiver_config:
-  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., UCX), `UCX`, `NIXL`.
+  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., NIXL), `UCX`, `NIXL`.
   backend: <str>
   # KV cache buffer size. Set it ≥ the maximum ISL (Input Sequence Length) for best performance.
   max_tokens_in_buffer: <int>
