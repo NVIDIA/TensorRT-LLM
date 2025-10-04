@@ -358,6 +358,13 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
+        if generation_config is not None:
+            self.max_tokens = self.max_tokens if self.max_tokens is not None else getattr(generation_config, "max_tokens", None)
+            self.min_tokens = self.min_tokens if self.min_tokens is not None else getattr(generation_config, "min_tokens", None)
+            self.temperature = self.temperature if self.temperature is not None else getattr(generation_config, "temperature", None)
+            self.top_k = self.top_k if self.top_k is not None else getattr(generation_config, "top_k", None)
+            self.top_p = self.top_p if self.top_p is not None else getattr(generation_config, "top_p", None)
+
         def _encode(tokenizer, text, add_special_tokens):
             try:
                 return tokenizer.encode(text, add_special_tokens=add_special_tokens)
