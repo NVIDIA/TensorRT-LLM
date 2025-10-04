@@ -172,7 +172,6 @@ class QuantizationFusionMixin(ABC):
         # add new linear node + split node
         with gm.graph.inserting_before(linear_nodes[0]):
             fused_linear_node = gm.graph.call_function(
-                # get_op_overload_packet(linear_nodes[0].target),
                 linear_nodes[0].target,
                 args=(parent_node, get_param_node, None, *custom_tail_args),
                 kwargs=fused_kwargs,
