@@ -117,7 +117,7 @@ transforms:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
     stage: post_load_fusion
-    backend: flashinfer
+    backend: triton
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################

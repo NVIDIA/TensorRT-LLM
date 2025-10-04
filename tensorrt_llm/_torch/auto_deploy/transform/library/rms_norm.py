@@ -27,7 +27,7 @@ _BACKEND_OPS = {
 }
 
 
-def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rms_norm_pattern(data: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """Implements the RMSNorm pattern for pattern matching.
 
     Args:
@@ -39,15 +39,16 @@ def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> t
         Normalized and scaled tensor.
     """
     input_dtype = data.dtype
-    data = data.to(torch.float32)
-    variance = data.pow(2).mean(-1, keepdim=True)
-    data = data * torch.rsqrt(variance + eps)
-    return weight * data.to(input_dtype)
+    residual_out = residual + data
+    data_out = residual_out.to(torch.float32)
+    variance = data_out.pow(2).mean(-1, keepdim=True)
+    data_out = data_out * torch.rsqrt(variance + eps)
+    return weight * data_out.to(input_dtype), residual_out
 
 
 def _rms_norm_replacement(
-    data: torch.Tensor, weight: torch.Tensor, eps: float, backend: str
-) -> torch.Tensor:
+    data: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, backend: str
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backend-specific rms_norm implementation.
 
     Args:
@@ -63,7 +64,7 @@ def _rms_norm_replacement(
     assert backend.lower() in _BACKEND_OPS, (
         f"Invalid {backend=}; must be one of {list(_BACKEND_OPS)}"
     )
-    return _BACKEND_OPS[backend.lower()](data, weight, eps)
+    return _BACKEND_OPS[backend.lower()](data, residual, weight, eps)
 
 
 class FuseRMSNormConfig(TransformConfig):
@@ -118,6 +119,7 @@ class FuseRMSNorm(BaseTransform):
 
         def dummy_args(input_dtype: torch.dtype, weight_dtype: torch.dtype, eps: float = 1e-6):
             return [
+                torch.randn(bs, hidden_size, device="cuda", dtype=input_dtype),
                 torch.randn(bs, hidden_size, device="cuda", dtype=input_dtype),
                 torch.randn(hidden_size, device="cuda", dtype=weight_dtype),
                 eps,

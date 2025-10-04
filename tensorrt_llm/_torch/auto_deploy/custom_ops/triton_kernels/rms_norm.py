@@ -7,8 +7,10 @@ from torch import Tensor
 @triton.jit
 def rms_norm_kernel(
     input,
+    residual,
     weight,
     output,
+    res_out,
     input_row_stride: tl.constexpr,
     eps: tl.constexpr,
     N_COLS: tl.constexpr,
@@ -22,8 +24,12 @@ def rms_norm_kernel(
 
     x_ptr = input + prog_id * input_row_stride
     x = tl.load(x_ptr + offsets, mask=offsets < N_COLS)
+    res_ptr = residual + prog_id * input_row_stride
+    res = tl.load(res_ptr + offsets, mask=offsets < N_COLS)
+    
+    x += res
     xf = x.to(tl.float32)
-
+    
     var = tl.sum(xf * xf, 0) * float(1.0 / N_COLS)
     out = xf / tl.sqrt(var + eps)
     out = (w * out).to(x.dtype)
@@ -31,8 +37,11 @@ def rms_norm_kernel(
     out_ptr = output + prog_id * input_row_stride
     tl.store(out_ptr + offsets, out, mask=offsets < N_COLS)
 
+    res_out_ptr = res_out + prog_id * input_row_stride
+    tl.store(res_out_ptr + offsets, x, mask=offsets < N_COLS)
 
-def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
+
+def rms_norm(hidden_states: Tensor, residual: Tensor, weight: Tensor, eps: float = 1e-5):
     """Rms norm."""
     feat_size = weight.shape[0]
     seq_len = hidden_states.numel() // hidden_states.size(-1)
@@ -40,12 +49,14 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
 
     BLOCK_N = triton.next_power_of_2(feat_size)
     out = torch.empty_like(hidden_states)
-
+    res_out = torch.empty_like(residual)
     grid = (seq_len,)
     rms_norm_kernel[grid](
         hidden_states,
+        residual,
         weight,
         out,
+        res_out,
         input_row_stride=input_stride,
         eps=eps,
         N_COLS=feat_size,
@@ -54,4 +65,4 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
         num_stages=3,
     )
 
-    return out
+    return out, res_out

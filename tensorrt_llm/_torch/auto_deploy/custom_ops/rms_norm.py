@@ -2,7 +2,7 @@
 
 import flashinfer
 import torch
-
+from typing import Tuple
 from .triton_kernels.rms_norm import rms_norm
 
 
@@ -40,7 +40,7 @@ def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 @torch.library.custom_op("auto_deploy::triton_rms_norm", mutates_args=())
-def triton_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def triton_rmsnorm(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """Custom operator for Triton RMSNorm implementation.
 
     Args:
@@ -51,13 +51,18 @@ def triton_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
     Returns:
         Normalized and scaled tensor using Triton implementation.
     """
-    return rms_norm(input, weight, eps)
+    input_flat = input.reshape(-1, input.shape[-1])
+    residual_flat = residual.reshape(-1, residual.shape[-1])
+    rmsnorm_flat, res_out_flat = rms_norm(input_flat, residual_flat, weight, eps)
+    out = rmsnorm_flat.reshape(input.shape)
+    res_out = res_out_flat.reshape(residual.shape)
+    return out, res_out
 
 
 @triton_rmsnorm.register_fake
-def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Fake implementation for the custom operator during tracing."""
-    return torch.empty_like(input)
+    return torch.empty_like(input), torch.empty_like(residual)
 
 
 @torch.library.custom_op("auto_deploy::torch_rmsnorm", mutates_args=())
