@@ -1,18 +1,17 @@
 import gc
-import json
 import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from queue import Queue
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Union
 
 import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
+from .._utils import mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
@@ -141,25 +140,9 @@ class GenerationExecutorWorker(BaseWorker):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
-
-        # Define a Callable to join iteration and request stats
-        def stats_serializer(
-                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-            iteration_stats, req_stats = stats
-            stats_dict = json.loads(iteration_stats.to_json_str())
-
-            if req_stats is not None and len(req_stats) > 0:
-                stats_dict["requestStats"] = []
-                for req_stat in req_stats:
-                    stats_dict["requestStats"].append(
-                        json.loads(req_stat.to_json_str()))
-
-            # Convert back to JSON string
-            return json.dumps(stats_dict)
-
         return self._iteration_result_task(self.stats_queues, self.fetch_stats,
                                            self._iter_stats_result,
-                                           stats_serializer)
+                                           self._stats_serializer)
 
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
@@ -170,14 +153,14 @@ class GenerationExecutorWorker(BaseWorker):
                 events_api = lambda: [None]
             else:
                 events_api = event_manager.get_latest_events
-            return self._iteration_result_task(
-                self.kv_events_queues, events_api, self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
+            return self._iteration_result_task(self.kv_events_queues,
+                                               events_api,
+                                               self._iter_kv_events_result,
+                                               self._kv_cache_events_serializer)
         else:
             return self._iteration_result_task(
                 self.kv_events_queues, self.engine.get_latest_kv_cache_events,
-                self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
+                self._iter_kv_events_result, self._kv_cache_events_serializer)
 
     def start(self):
         # create iteration result queues

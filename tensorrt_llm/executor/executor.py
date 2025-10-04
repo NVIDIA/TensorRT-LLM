@@ -445,9 +445,22 @@ class GenerationExecutor(ABC):
         mpirun_launch = external_mpi_comm_available(model_world_size)
         # The case where the Python main process utilizes mpi4py to spawn MPI workers
         spawn_workers = need_spawn_mpi_workers(model_world_size)
+        orchestrator_is_rpc = llm_args and llm_args.orchestrator_type == "rpc"
+
         if spawn_workers or (mpirun_launch and reuse_mpi_comm):
             if reuse_mpi_comm:
                 assert mpi_session is not None, "reuse_mpi_comm requires an external MPI session"
+
+            if orchestrator_is_rpc:
+                from .rpc_proxy import GenerationExecutorRpcProxy
+                return GenerationExecutorRpcProxy(
+                    worker_kwargs,
+                    model_world_size=model_world_size,
+                    mpi_session=mpi_session,
+                    postproc_worker_config=postproc_worker_config,
+                    is_llm_executor=is_llm_executor,
+                    kv_connector_config=kv_connector_config)
+
             return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
@@ -464,6 +477,16 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
+            if orchestrator_is_rpc:
+                from .rpc_proxy import GenerationExecutorRpcProxy
+                return GenerationExecutorRpcProxy(
+                    worker_kwargs,
+                    model_world_size=model_world_size,
+                    mpi_session=mpi_session,
+                    postproc_worker_config=postproc_worker_config,
+                    is_llm_executor=is_llm_executor,
+                    kv_connector_config=kv_connector_config)
+
             return GenerationExecutorWorker(
                 **worker_kwargs,
                 is_llm_executor=is_llm_executor,
@@ -474,6 +497,16 @@ class GenerationExecutor(ABC):
         # While this requires uses to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
+            if orchestrator_is_rpc:
+                from .rpc_proxy import GenerationExecutorRpcProxy
+                return GenerationExecutorRpcProxy(
+                    worker_kwargs,
+                    model_world_size=model_world_size,
+                    mpi_session=mpi_session,
+                    postproc_worker_config=postproc_worker_config,
+                    is_llm_executor=is_llm_executor,
+                    kv_connector_config=kv_connector_config)
+
             return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
@@ -486,6 +519,7 @@ class GenerationExecutor(ABC):
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
             mpi_session = ProcessPoolExecutorSession(n_workers=1,
                                                      mp_context=ctx)
+            # TODO: add rpc worker here
             return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,

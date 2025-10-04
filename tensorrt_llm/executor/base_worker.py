@@ -235,6 +235,12 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_iteration_stats()
 
+    def fetch_kv_cache_events(self) -> list:
+        if isinstance(self.engine, tllm.Executor):
+            return self.engine.get_latest_kv_cache_events()
+        else:
+            return self.engine.get_latest_kv_cache_events()
+
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None
@@ -559,6 +565,38 @@ class BaseWorker(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def shutdown(self):
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        if self.engine is not None and self.engine.can_enqueue_requests():
+            self.engine.shutdown()
+            self.engine = None
+
+    # Define a Callable to join iteration and request stats
+    @staticmethod
+    def _stats_serializer(
+            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+        iteration_stats, req_stats = stats
+        stats_dict = json.loads(iteration_stats.to_json_str())
+
+        if req_stats is not None and len(req_stats) > 0:
+            stats_dict["requestStats"] = []
+            for req_stat in req_stats:
+                stats_dict["requestStats"].append(
+                    json.loads(req_stat.to_json_str()))
+
+        # Convert back to JSON string
+        return json.dumps(stats_dict)
+
+    # Define a Callable to serialize KV cache events
+    @staticmethod
+    def _kv_cache_events_serializer(events) -> str:
+        from .._utils import KVCacheEventSerializer
+        return json.dumps(KVCacheEventSerializer.serialize(events))
 
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
