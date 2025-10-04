@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -68,6 +68,8 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+
+        self._disable_mpi = mpi_disabled()
 
     def _get_from_request_queue(
             self,
@@ -267,8 +269,14 @@ class ExecutorRequestQueue:
     ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
         # Calculate timeout
-        timeout = None if (total_num_active_requests == 0) and len(
-            self.waiting_queue) == 0 else datetime.timedelta(0)
+        idle = (total_num_active_requests == 0) and len(self.waiting_queue) == 0
+        if idle:
+            # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
+            # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
+            timeout = datetime.timedelta(
+                seconds=1200) if self._disable_mpi else None
+        else:
+            timeout = datetime.timedelta(0)
 
         # Fetch requests from rank 0
         new_requests = []
@@ -569,7 +577,13 @@ class ExecutorRequestQueue:
             payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+            if self._disable_mpi:
+                isend_payload = self.dist.isend_object(payloads,
+                                                       self.dist.next_pp_rank,
+                                                       tag)
+                isend_payload.wait()
+            else:
+                self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
 
         return payloads
 

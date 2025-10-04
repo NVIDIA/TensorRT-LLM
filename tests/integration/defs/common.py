@@ -16,6 +16,7 @@ import copy
 import os
 import platform
 import re
+import socket
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -1135,3 +1136,14 @@ def get_mmlu_accuracy(output):
     print(f"MMLU weighted average accuracy is: {mmlu_accuracy}")
 
     return mmlu_accuracy
+
+
+def wait_for_server(host, port, timeout_seconds=180):
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except (socket.error, ConnectionRefusedError, OSError):
+            time.sleep(2)
+    return False

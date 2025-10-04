@@ -36,6 +36,7 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -2072,6 +2073,13 @@ def pytest_addoption(parser):
                      action="store_true",
                      help="'--perf' will run perf tests")
     parser.addoption(
+        "--run-ray",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Ray orchestrator path for integration tests (disables MPI).",
+    )
+    parser.addoption(
         "--perf-log-formats",
         help=
         "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",
@@ -2171,6 +2179,8 @@ def pytest_collection_modifyitems(session, config, items):
 def pytest_configure(config):
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+    if config.getoption("--run-ray"):
+        os.environ["TLLM_DISABLE_MPI"] = "1"
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):
@@ -2269,6 +2279,10 @@ def check_nvlink():
 
 skip_nvlink_inactive = pytest.mark.skipif(check_nvlink() is False,
                                           reason="nvlink is inactive.")
+
+skip_ray = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="This test is skipped for Ray orchestrator.")
 
 
 @pytest.fixture(scope="function")
@@ -2448,3 +2462,15 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture(autouse=True)
+def ray_cleanup(llm_venv) -> None:
+    yield
+
+    if mpi_disabled():
+        llm_venv.run_cmd([
+            "-m",
+            "ray.scripts.scripts",
+            "stop",
+        ])
