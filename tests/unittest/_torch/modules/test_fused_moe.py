@@ -1612,15 +1612,14 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                                       dtype=torch.int8).cuda()
 
             # The pre-quant scale to be multiplied with the input activation.
-            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
+            # Use random pre-quant scales [0.95, 1.05] instead of fixed 1.0 to ensure the kernel handles
+            # non-uniform pre-quant scaling factors correctly
+            w1_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w2_pre_quant_scale = torch.rand(
+                INTERMEDIATE_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w3_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
 
             # The weight scale to dequantize int4 weights (by multiplication).
             w1_scale = torch.randn(
