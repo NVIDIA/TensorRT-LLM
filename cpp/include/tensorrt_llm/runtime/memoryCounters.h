@@ -85,6 +85,11 @@ public:
     }
 
     template <MemoryType T>
+    struct always_false : std::false_type
+    {
+    };
+
+    template <MemoryType T>
     void allocate(SizeType32 size)
     {
         if (size > static_cast<SizeType32>(std::numeric_limits<DiffType>::max()))
@@ -119,7 +124,7 @@ public:
         }
         else
         {
-            static_assert(!std::is_same_v<T, T>, "Unknown memory type!");
+            static_assert(always_false<T>::value, "Unknown memory type!");
         }
     }
 
@@ -160,13 +165,18 @@ public:
         }
         else
         {
-            static_assert(!std::is_same_v<T, T>, "Unknown memory type!");
+            static_assert(always_false<T>::value, "Unknown memory type!");
         }
     }
 
     void deallocate(MemoryType memoryType, SizeType32 size);
 
     static MemoryCounters& getInstance();
+
+    MemoryCounters(MemoryCounters const&) = delete;
+    MemoryCounters& operator=(MemoryCounters const&) = delete;
+    MemoryCounters(MemoryCounters&&) = delete;
+    MemoryCounters& operator=(MemoryCounters&&) = delete;
 
     static std::string bytesToString(SizeType32 bytes, int precision = 2);
 
