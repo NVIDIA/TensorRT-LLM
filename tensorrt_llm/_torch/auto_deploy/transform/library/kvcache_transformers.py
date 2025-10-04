@@ -60,8 +60,9 @@ def fake_profiler_mha(
     v_fake = graph.placeholder(name="v_fake")
     v_fake.meta["val"] = torch.empty_like(value.transpose(1, 2), device="meta", dtype=value.dtype)
 
+    node_kwargs["layout"] = "bsnd"
     module._node_ref = graph.call_function(
-        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention,
         args=(q_fake, k_fake, v_fake),
         kwargs=node_kwargs,
     )
