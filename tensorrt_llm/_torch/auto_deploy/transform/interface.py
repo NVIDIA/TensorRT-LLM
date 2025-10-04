@@ -5,6 +5,7 @@ This module defines the base classes and interfaces for all transforms.
 
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum
 from functools import total_ordering, wraps
 from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
@@ -19,6 +20,7 @@ from ..transformations._graph import (
     canonicalize_graph,
     lift_to_meta,
     named_graphmodules,
+    placeholders_on_meta,
     run_shape_prop,
 )
 from ..utils.logger import ad_logger
@@ -416,11 +418,13 @@ class BaseTransform(ABC):
         is_clean = info.is_clean
         has_valid_shapes = is_clean and info.has_valid_shapes
 
+        use_meta = isinstance(gm, GraphModule) and placeholders_on_meta(gm)
+
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
             self._log_info("running pre-cleanup with shape_prop")
             canonicalize_graph(gm)
-            with lift_to_meta(gm):
+            with lift_to_meta(gm) if use_meta else nullcontext():
                 run_shape_prop(gm)
             is_clean = True
             has_valid_shapes = True
@@ -444,11 +448,13 @@ class BaseTransform(ABC):
         if not self.config.run_graph_cleanup:
             return info
 
+        use_meta = isinstance(gm, GraphModule) and placeholders_on_meta(gm)
+
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
             self._log_info("running post-cleanup with shape_prop")
             canonicalize_graph(gm)
-            with lift_to_meta(gm):
+            with lift_to_meta(gm) if use_meta else nullcontext():
                 run_shape_prop(gm)
         elif self.config.run_graph_cleanup and not info.is_clean:
             self._log_info("running post-cleanup (no shape_prop)")

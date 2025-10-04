@@ -481,7 +481,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
     algo_name = "FP8"
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_bmm
+        return torch.ops.auto_deploy.torch_quant_fp8_bmm.default
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)

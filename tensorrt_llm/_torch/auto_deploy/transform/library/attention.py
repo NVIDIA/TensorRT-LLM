@@ -303,9 +303,6 @@ class MatchRepeatKV(BaseTransform):
 
         num_kv_patterns = _apply_pattern(gm, "Repeat KV", register_repeat_kv)
 
-        if num_kv_patterns > 0:
-            self.config.run_shape_prop = True
-
         info = TransformInfo(
             skipped=False,
             num_matches=num_kv_patterns,
