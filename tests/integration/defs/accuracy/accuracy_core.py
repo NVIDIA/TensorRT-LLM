@@ -186,7 +186,8 @@ class AccuracyTask:
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False):
+                 streaming: bool = False,
+                 is_integration_test: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -199,7 +200,8 @@ class AccuracyTask:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
             )
-        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
+        is_integration_test = is_integration_test or os.getenv(
+            'INTEGRATION_TEST', '0') == '1'
 
         if is_integration_test:
             logger.info(
