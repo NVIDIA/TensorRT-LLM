@@ -10,6 +10,7 @@ This file tests:
 import pytest
 import random
 import torch
+from unittest.mock import Mock, patch
 from utils.util import getSMVersion
 from tensorrt_llm import deep_gemm
 from tensorrt_llm.deep_gemm import (fp8_paged_mqa_logits,
@@ -17,8 +18,15 @@ from tensorrt_llm.deep_gemm import (fp8_paged_mqa_logits,
                                      get_num_sms)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     compute_cu_seqlen_kv_bounds_nocache,
-    DSACacheManager
+    DSACacheManager,
+    Indexer
 )
+from tensorrt_llm._torch.attention_backend.interface import (
+    RopeParams,
+    PositionalEmbeddingParams
+)
+from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -50,11 +58,17 @@ def create_dsa_cache_manager(
     """Helper to create a DSACacheManager for testing."""
     # Create a minimal sparse attention config
     class SparseAttentionConfig:
-        def __init__(self, index_head_dim):
+        def __init__(self, index_head_dim, index_n_heads, index_topk):
             self.index_head_dim = index_head_dim
+            self.index_n_heads = index_n_heads
+            self.index_topk = index_topk
             self.prompt_budget = 1024
 
-    sparse_attn_config = SparseAttentionConfig(head_dim)
+    sparse_attn_config = SparseAttentionConfig(
+        index_head_dim=head_dim,
+        index_n_heads=32,  # Default number of heads for indexer
+        index_topk=2048
+    )
 
     # Create KV cache config
     # Note: max_attention_window expects list[int] (one per layer)
@@ -83,7 +97,52 @@ def create_dsa_cache_manager(
         sparse_attn_config=sparse_attn_config,
     )
 
-    return cache_manager
+    return cache_manager, sparse_attn_config
+
+
+def create_indexer(sparse_attn_config, layer_idx=0):
+    """Helper to create an Indexer for testing."""
+    # Create RopeParams
+    rope_params = RopeParams(
+        dim=64,  # qk_rope_head_dim
+        theta=10000.0,
+        max_positions=4096
+    )
+
+    # Create PositionalEmbeddingParams with required 'type' argument
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.rope_gpt_neox,
+        rope=rope_params,
+        is_neox=True
+    )
+
+    # Create MLAParams
+    class MLAParams:
+        def __init__(self, head_dim):
+            self.hidden_size = 4096  # Example hidden size
+            self.q_lora_rank = 512   # Example q_lora_rank
+            self.qk_rope_head_dim = 64
+
+    mla_params = MLAParams(sparse_attn_config.index_head_dim)
+
+    # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
+    with patch('tensorrt_llm._torch.attention_backend.sparse.dsa.RotaryEmbedding') as mock_rope:
+        # Create a mock instance with a simple forward method
+        mock_rope_instance = Mock()
+        mock_rope_instance.forward = Mock(side_effect=lambda pos_ids, tensors: tensors)
+        mock_rope.return_value = mock_rope_instance
+
+        indexer = Indexer(
+            quant_config=None,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            skip_create_weights_in_init=True,  # Skip weight creation for test
+            sparse_attention_config=sparse_attn_config,
+            dtype=torch.bfloat16,
+            layer_idx=layer_idx
+        )
+
+    return indexer
 
 def _calc_diff(x: torch.Tensor, y: torch.Tensor):
     """Return a global difference metric for unit tests.
@@ -111,47 +170,6 @@ def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims, use_ue8m0=False):
     sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
     return x_scaled, sf.squeeze()
-
-
-def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
-    """
-    Cast paged KV cache to FP8 format with packed scale layout.
-
-    Args:
-        x: Tensor of shape [num_blocks, block_size, 1, head_dim]
-
-    Returns:
-        Packed FP8 cache with shape [num_blocks, block_size, 1, head_dim + 4]
-        where the last 4 bytes per token store the float32 dequant scale.
-    """
-    # x: (num_blocks, block_size, 1, head_dim)
-    num_blocks, block_size, num_heads, head_dim = x.shape
-    assert num_heads == 1
-
-    # Compute per-token scales: amax along head_dim
-    x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
-    sf = x_amax / 448.0
-
-    # Quantize to FP8
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
-
-    # Pack FP8 data and scales into flat layout then reshape
-    x_fp8 = torch.empty(
-        (num_blocks, block_size * (head_dim + 4)),
-        device=x.device,
-        dtype=torch.uint8,
-    )
-
-    # Pack FP8 values: [num_blocks, block_size * head_dim]
-    x_fp8[:, :block_size * head_dim] = x_scaled.view(
-        num_blocks, block_size * head_dim).view(dtype=torch.uint8)
-
-    # Pack scales: [num_blocks, block_size * 4]
-    x_fp8[:, block_size * head_dim:] = sf.view(
-        num_blocks, block_size).view(dtype=torch.uint8)
-
-    # Reshape to [num_blocks, block_size, 1, head_dim + 4]
-    return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
 
 def _ref_fp8_paged_mqa_logits(
@@ -351,115 +369,208 @@ def test_deepgemm_fp8_mqa_logits_basic():
     assert diff < 1e-3, f"{diff=}" # check for cosine similarity
     check_accuracy(logits, ref_logits, atol=1e-2, rtol=2e-1, percent=0.9) # double check for per-element similarity
 
+def _create_mock_metadata(request_ids, batch_size, num_contexts, num_generations, 
+                          seq_lens, kv_lens, num_cached_tokens):
+    """Helper to create mock metadata for testing."""
+    class MockKVCacheParams:
+        def __init__(self):
+            self.num_cached_tokens_per_seq = num_cached_tokens
+    
+    class MockMetadata:
+        def __init__(self):
+            self.request_ids = request_ids
+            self.num_contexts = num_contexts
+            self.num_generations = num_generations
+            self.seq_lens = seq_lens
+            self.kv_lens = kv_lens
+            self.kv_cache_params = MockKVCacheParams()
+    
+    return MockMetadata()
+
+
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @pytest.mark.skipif(getSMVersion() < 90,
                     reason="fp8_paged_mqa_logits is only supported in SM90 and SM100")
-def test_indexer_paged_kv_cache_block_management():
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2)])
+def test_indexer_paged_kv_cache_block_management(batch_size, next_n):
     """
-    Explicitly test paged KV cache block table management using DSACacheManager.
-
-    This test validates:
-    1. DSACacheManager.get_indexer_k_cache_buffers() provides correct cache
-    2. DSACacheManager.get_indexer_k_block_offsets() provides correct block tables
-    3. Non-contiguous block assignments work correctly
-    4. Different sequences can use different physical blocks
-
-    Uses same parameters as test_deepgemm_fp8_paged_mqa_logits with next_n=1
+    Test FP8 paged KV cache with two-phase workflow and variable context lengths.
+    
+    Validates:
+    - Variable-length sequences in the same batch
+    - Slot mapping computation for non-interleaved FP8 cache layout
+    - Vectorized scatter operations for FP8 data and scales
+    - Block table management for paged attention
+    - Multi-token generation phase (similar to prepare_resources)
+    - Kernel accuracy vs reference implementation
     """
     torch.manual_seed(123)
     random.seed(123)
 
-    # Use same parameters as test_deepgemm_fp8_paged_mqa_logits
-    batch_size, next_n = 4, 1
+    # Test parameters
     heads, head_dim = 32, 128
     block_size = 64
+    avg_context_len = 2048
+    num_gen_tokens = next_n  # Number of tokens to generate per sequence
     max_model_len = 4096
     layer_idx = 0
 
-    # Create DSA cache manager
-    cache_manager = create_dsa_cache_manager(
-        batch_size=batch_size,
-        head_dim=head_dim,
-        tokens_per_block=block_size,
-        max_seq_len=max_model_len,
-        num_layers=1
+    # Generate variable context lengths per sequence
+    context_lens_context = torch.randint(
+        int(0.7 * avg_context_len), 
+        int(1.4 * avg_context_len),
+        (batch_size,),
+        dtype=torch.int32,
+        device="cpu"
     )
 
-    # Add dummy requests to allocate blocks (192 tokens each = 3 blocks)
+    # Final lengths after generation phase
+    final_lens = context_lens_context + num_gen_tokens
+    max_seq_len = final_lens.max().item()
+    
+    print(f"\n=== Test Config ===")
+    print(f"  Batch: {batch_size}, Next_N: {next_n}, Heads: {heads}, Head_dim: {head_dim}")
+    print(f"  Context lengths: {context_lens_context.tolist()}")
+    print(f"  Final lengths: {final_lens.tolist()}")
+    print(f"  Max sequence length: {max_seq_len}")
+
+    # Setup: Create cache manager and indexer
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size, head_dim=head_dim, tokens_per_block=block_size,
+        max_seq_len=max_model_len, num_layers=1
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+    indexer.set_cache_manager(cache_manager)
+    
+    # Allocate blocks for all sequences (max final length)
     request_ids = list(range(batch_size))
-    token_nums = [192] * batch_size
     cache_manager.add_dummy_requests(
         request_ids=request_ids,
-        token_nums=token_nums,
+        token_nums=final_lens.tolist(),
         is_gen=False,
         prepare_resource=True
     )
 
-    # Get indexer k cache buffer using cache manager method
-    kv_cache = cache_manager.get_indexer_k_cache_buffers(layer_idx)
-    # Shape: [num_blocks, block_size, 1, head_dim + scale_size]
+    # Generate test data with variable lengths
+    total_context_tokens = context_lens_context.sum().item()
+    q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, heads), device="cuda", dtype=torch.float32)
+    k_context_bf16 = torch.randn((total_context_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_gen_bf16 = torch.randn((batch_size * num_gen_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
 
-    # Get block tables using cache manager method
-    block_tables = cache_manager.get_indexer_k_block_offsets(request_ids)
-    # Shape: [batch_size, max_blocks_per_seq]
+    # Phase 1: Write context tokens (variable per sequence) as FP8
+    print(f"\n=== Phase 1: Context (variable tokens/seq) ===")
+    metadata_context = _create_mock_metadata(
+        request_ids, batch_size, num_contexts=batch_size, num_generations=0,
+        seq_lens=context_lens_context.clone(),
+        kv_lens=context_lens_context.clone(),
+        num_cached_tokens=[0] * batch_size
+    )
+    indexer.prepare(metadata_context)
+    
+    k_context_fp8, k_context_scale = torch.ops.trtllm.fp8_quantize_1x128(k_context_bf16)
+    k_context_scale = k_context_scale.contiguous().transpose(0, 1)
+    indexer._update_k_cache(k_context_fp8, k_context_scale)
+    print(f"✓ Wrote {total_context_tokens} FP8 context tokens to cache")
 
-    print(f"✓ Cache manager setup:")
-    print(f"  - KV cache shape: {kv_cache.shape}")
-    print(f"  - Block tables shape: {block_tables.shape}")
-    print(f"  - Block assignments per sequence:")
-    for i in range(batch_size):
-        assigned_blocks = block_tables[i, :3].cpu().tolist()
-        print(f"    Seq {i}: blocks {assigned_blocks}")
+    # Phase 2: Write generation tokens (next_n per sequence) as FP8
+    # Similar to prepare_resources: add_token() for each new token
+    print(f"\n=== Phase 2: Generation ({num_gen_tokens} tokens/seq) ===")
+    metadata_gen = _create_mock_metadata(
+        request_ids, batch_size, num_contexts=0, num_generations=batch_size,
+        seq_lens=torch.tensor([num_gen_tokens] * batch_size, dtype=torch.int32, device='cpu'),
+        kv_lens=final_lens.clone(),
+        num_cached_tokens=context_lens_context.tolist()
+    )
+    indexer.prepare(metadata_gen)
+    
+    k_gen_fp8, k_gen_scale = torch.ops.trtllm.fp8_quantize_1x128(k_gen_bf16)
+    k_gen_scale = k_gen_scale.contiguous().transpose(0, 1)
+    indexer._update_k_cache(k_gen_fp8, k_gen_scale)
+    print(f"✓ Wrote {batch_size * num_gen_tokens} FP8 generation tokens to cache")
 
-    # Create BF16 version of cache for test data (strip scale bytes)
-    num_blocks, _, _, head_dim_with_scale = kv_cache.shape
-    kv_cache_bf16 = torch.randn((num_blocks, block_size, 1, head_dim),
-                                device="cuda", dtype=torch.bfloat16)
-
-    # Create context lengths (3 blocks = 192 tokens each)
-    context_lens = torch.tensor([192, 192, 192, 192], dtype=torch.int32, device="cuda")
-
-    # Create queries and weights with random values (like test_deepgemm_fp8_paged_mqa_logits)
-    q = torch.randn((batch_size, next_n, heads, head_dim),
-                    device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn((batch_size * next_n, heads),
-                         device="cuda", dtype=torch.float32)
-
-    # Convert to FP8
+    # Run kernel: FP8 paged MQA with actual cache
+    print(f"\n=== Kernel Execution ===")
+    kv_cache_fp8_pool = cache_manager.get_indexer_k_cache_buffers(layer_idx)
     q_fp8 = q.to(torch.float8_e4m3fn)
-    kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache_bf16)
-
-    # Get schedule metadata
-    schedule_metadata = get_paged_mqa_logits_metadata(
-        context_lens, block_size, get_num_sms())
-
-    # Call kernel with cache manager's block tables
+    
     logits = fp8_paged_mqa_logits(
-        q_fp8, kv_cache_fp8, weights, context_lens,
-        block_tables, schedule_metadata, max_model_len
+        q_fp8, kv_cache_fp8_pool, weights,
+        indexer.decode_context_lens.cuda(),  # Use final lengths
+        indexer.decode_block_table,
+        indexer.scheduler_metadata_buffer,
+        max_model_len
     )
+    print(f"✓ Kernel output shape: {logits.shape}")
 
-    # Compute reference with same block tables
+    # Reference: Reconstruct BF16 cache from original values
+    print(f"\n=== Reference Computation ===")
+    num_blocks = kv_cache_fp8_pool.shape[0]
+    kv_cache_bf16 = torch.zeros((num_blocks, block_size, 1, head_dim), device="cuda", dtype=torch.bfloat16)
+    
+    # Populate cache with variable-length sequences
+    context_offset = 0
+    gen_offset = 0
+    for seq_idx in range(batch_size):
+        seq_context_len = context_lens_context[seq_idx].item()
+        seq_total_len = final_lens[seq_idx].item()
+        
+        # Write context tokens
+        for token_pos in range(seq_context_len):
+            block_idx = token_pos // block_size
+            pos_in_block = token_pos % block_size
+            physical_block_id = indexer.decode_block_table[seq_idx, block_idx].item()
+            if physical_block_id >= 0:
+                kv_cache_bf16[physical_block_id, pos_in_block, 0, :] = \
+                    k_context_bf16[context_offset + token_pos]
+        
+        # Write generation tokens
+        for gen_token_idx in range(num_gen_tokens):
+            token_pos = seq_context_len + gen_token_idx
+            block_idx = token_pos // block_size
+            pos_in_block = token_pos % block_size
+            physical_block_id = indexer.decode_block_table[seq_idx, block_idx].item()
+            if physical_block_id >= 0:
+                kv_cache_bf16[physical_block_id, pos_in_block, 0, :] = \
+                    k_gen_bf16[gen_offset + gen_token_idx]
+        
+        context_offset += seq_context_len
+        gen_offset += num_gen_tokens
+    
     ref_logits = _ref_fp8_paged_mqa_logits(
-        q, kv_cache_bf16, weights, context_lens,
-        block_tables, max_model_len
+        q, kv_cache_bf16, weights,
+        indexer.decode_context_lens.cuda(),
+        indexer.decode_block_table,
+        max_model_len
     )
+    print(f"✓ Reference output shape: {ref_logits.shape}")
 
-    # Check kernel matches reference (both should handle paging identically)
-    # This is the main validation that block table lookups work correctly
-    mask = torch.arange(max_model_len, device="cuda")[None, :] < context_lens[:, None]
-    logits_masked = logits.masked_fill(~mask, 0)
-    ref_logits_masked = ref_logits.masked_fill(~mask, 0)
-
-    diff = _calc_diff(logits_masked, ref_logits_masked)
-    assert diff < 1e-3, f"{diff=} - Kernel and reference should match for paged access"
-
-    print(f"✓ Paged KV cache block management validated:")
-    print(f"  - Using DSACacheManager.get_indexer_k_cache_buffers()")
-    print(f"  - Using DSACacheManager.get_indexer_k_block_offsets()")
-    print(f"  - {batch_size} sequences with cache-managed blocks")
-    print(f"  - Each sequence accesses distinct physical blocks")
-    print(f"  - Kernel accuracy: {diff:.6f}")
+    # Validate: Compare masked outputs (handle variable lengths and next_n)
+    print(f"\n=== Validation ===")
+    context_lens_cuda = indexer.decode_context_lens.cuda()  # [batch_size]
+    
+    # Expand context lens for each query: each sequence has next_n queries
+    # Query at position i (where i = 0..next_n-1) attends to tokens up to (context_len - next_n + i)
+    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)  # [1, max_model_len]
+    
+    # For each query, compute its end position
+    # Shape: [batch_size * next_n]
+    row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n  # Which sequence
+    next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n  # Query offset within sequence
+    query_end_positions = context_lens_cuda[row_indices] - next_n + next_n_offset  # [batch_size * next_n]
+    
+    # Create mask: positions <= query_end_position
+    # Shape: [batch_size * next_n, max_model_len]
+    mask = positions <= query_end_positions.unsqueeze(1)
+    
+    diff = _calc_diff(
+        logits.masked_fill(~mask, 0),
+        ref_logits.masked_fill(~mask, 0)
+    )
+    
+    assert diff < 1e-3, f"Accuracy check failed: {diff=}"
+    print(f"✅ Test passed! Accuracy: {diff:.6f} < 1e-3")
+    print(f"   Total cache tokens: {final_lens.sum().item()}, Avg: {final_lens.float().mean():.1f}")
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -574,6 +685,78 @@ def test_decode_phase_masking():
     assert torch.isinf(short_topk_values[0, 4:]).all(), "Last 6 should be -inf"
     assert (short_topk_indices[0, :4] <= 3).all(), "Valid topk indices should be within range [0, 3]"
 
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@pytest.mark.skipif(getSMVersion() < 90,
+                    reason="FP8 operations require SM90+")
+def test_fp8_scale_roundtrip():
+    """Verify FP8 quantization scales survive write/read cycle for multiple requests."""
+    torch.manual_seed(42)
+    
+    # Setup with 2 requests, each spanning multiple blocks
+    batch_size = 2
+    head_dim, block_size = 128, 64
+    max_seq_len = 512
+    num_tokens_per_req = [150, 100]  # Request 0: 3 blocks, Request 1: 2 blocks
+    
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size, head_dim=head_dim, tokens_per_block=block_size, 
+        max_seq_len=max_seq_len, num_layers=1
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=0)
+    indexer.set_cache_manager(cache_manager)
+    
+    # Allocate blocks for both requests
+    request_ids = [0, 1]
+    cache_manager.add_dummy_requests(request_ids, num_tokens_per_req, is_gen=False, prepare_resource=True)
+    
+    # Prepare and write data for each request
+    total_tokens = sum(num_tokens_per_req)
+    metadata = _create_mock_metadata(
+        request_ids, batch_size, num_contexts=batch_size, num_generations=0,
+        seq_lens=torch.tensor(num_tokens_per_req, dtype=torch.int32),
+        kv_lens=torch.tensor(num_tokens_per_req, dtype=torch.int32),
+        num_cached_tokens=[0] * batch_size
+    )
+    indexer.prepare(metadata)
+    
+    # Generate unique patterns for each request and quantize
+    k_original = torch.randn((total_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k_original)
+    k_scale = k_scale.contiguous().transpose(0, 1)
+    
+    # Write to cache
+    indexer._update_k_cache(k_fp8, k_scale)
+    
+    # Verify scales for both requests
+    cache_flat = cache_manager.indexer_k_cache_pool_per_layer[0]  # [num_blocks, flat_bytes]
+    block_offsets = cache_manager.get_indexer_k_block_offsets(request_ids)
+    
+    scale_offset = block_size * head_dim  # Scales start after FP8 data
+    scale_size = 4  # float32
+    original_scales = k_scale.cpu().numpy()
+    
+    # Verify scales for all requests
+    global_token_idx = 0
+    for req_idx, num_tokens in enumerate(num_tokens_per_req):
+        for local_token_idx in range(num_tokens):
+            # Compute block location
+            block_idx_in_seq = local_token_idx // block_size
+            pos_in_block = local_token_idx % block_size
+            block_id = block_offsets[req_idx, block_idx_in_seq].item()
+            
+            # Extract stored scale
+            scale_bytes = cache_flat[block_id, scale_offset + pos_in_block * scale_size : 
+                                              scale_offset + (pos_in_block + 1) * scale_size]
+            stored_scale = scale_bytes.view(torch.float32).item()
+            
+            # Compare with original
+            orig_scale = original_scales[global_token_idx]
+            assert abs(orig_scale - stored_scale) < 1e-6, \
+                f"Request {req_idx}, token {local_token_idx} (block {block_idx_in_seq}, pos {pos_in_block}): " \
+                f"scale mismatch (orig={orig_scale:.6f}, stored={stored_scale:.6f})"
+            
+            global_token_idx += 1
 
 def test_compute_cu_seqlen_bounds_nocache():
     """Simple test case with 2 sequences."""

@@ -443,7 +443,7 @@ def _per_token_quant_and_transform_kernel(
             output_s_int32,
         )
 
-
+# TODO: Add more comments and tests for this function for future reuse
 def per_token_quant_and_transform(
     input: torch.Tensor,
     quant_group_size: int = 128,

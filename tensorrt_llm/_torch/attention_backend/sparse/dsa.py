@@ -14,7 +14,8 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequestState, get_draft_token_length)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
                                                              KVCacheManager)
 from tensorrt_llm._utils import get_size_in_bytes
@@ -161,14 +162,16 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128
         self._tokens_per_block = None  # Will be retrieved from cache_manager
-        self.slot_mapping = None
+        # Separate slot mappings for non-interleaved layout (flat byte indices)
+        self.slot_mapping_fp8 = None    # [total_tokens] flat byte indices for FP8 data start
+        self.slot_mapping_scale = None  # [total_tokens] flat byte indices for scale start
 
         # TODO: Consolidate these parameters into decoder metadata.
         # Preparation stage buffers
         self.num_sms = deep_gemm.get_num_sms()
         self.scheduler_metadata_buffer = torch.empty((self.num_sms + 1, 2),
                                                 dtype=torch.int32,
-                                                device=self.device)
+                                                device='cuda')
         # Decode phase metadata
         self.decode_context_lens = None  # Context lengths for decode phase
         self.decode_block_table = None   # Block table for decode phase
@@ -241,35 +244,43 @@ class Indexer(nn.Module):
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
-        # Compute the flat slot mapping for all tokens
+        # Compute the flat slot mapping for all tokens (separate FP8 and scale offsets)
         self._compute_slot_mapping(request_ids, start_positions, num_tokens_per_request)
 
     def _compute_slot_mapping(self, request_ids: List[int],
                               start_positions: torch.Tensor,
-                              num_tokens_per_request: torch.Tensor) -> torch.Tensor:
+                              num_tokens_per_request: torch.Tensor) -> None:
         """
-        Compute flat slot mapping for indexer k cache updates (in model preparation stage).
+        Compute flat byte-level slot mappings for indexer k cache updates
+        Computes separate flat indices for FP8 data and scales.
 
         Args:
             request_ids: List of request IDs
             start_positions: Starting position in cache for each request
             num_tokens_per_request: Number of tokens to insert for each request
 
-        Returns:
-            slot_mapping: [total_tokens] tensor where slot_mapping[i] = flat_cache_index
+        Sets:
+            self.slot_mapping_fp8: [total_tokens] - flat byte index for FP8 data start
+            self.slot_mapping_scale: [total_tokens] - flat byte index for scale start
         """
         block_offsets = self.cache_manager.get_indexer_k_block_offsets(request_ids)
         total_tokens = num_tokens_per_request.sum().item()
+        
+        head_dim = self.head_dim
+        scale_size = head_dim // self.quant_block_size * 4  # float32 = 4 bytes
+        block_stride = self.tokens_per_block * (head_dim + scale_size)  # Bytes per block
+        scale_base_offset = self.tokens_per_block * head_dim  # Offset to scale region in block
 
-        # Preallocate slot_mapping
-        self.slot_mapping = torch.empty(total_tokens, dtype=torch.long, device=start_positions.device)
+        # Preallocate slot mappings: [total_tokens] flat byte indices
+        self.slot_mapping_fp8 = torch.full((total_tokens,), -1, dtype=torch.int64, device=start_positions.device)
+        self.slot_mapping_scale = torch.full((total_tokens,), -1, dtype=torch.int64, device=start_positions.device)
 
         token_idx = 0
         for req_idx, req_id in enumerate(request_ids):
             num_tokens = num_tokens_per_request[req_idx].item()
             start_pos = start_positions[req_idx].item()
 
-            # Compute slot for each token in this request
+            # Compute slots for each token in this request
             for local_token_idx in range(num_tokens):
                 global_pos = start_pos + local_token_idx
                 block_idx_in_seq = global_pos // self.tokens_per_block
@@ -279,42 +290,57 @@ class Indexer(nn.Module):
                 if block_idx_in_seq < block_offsets.shape[1]:
                     block_id = block_offsets[req_idx, block_idx_in_seq].item()
                     if block_id >= 0:
-                        # Flatten: slot = block_id * tokens_per_block + pos_in_block
-                        self.slot_mapping[token_idx] = block_id * self.tokens_per_block + pos_in_block
-                    else:
-                        self.slot_mapping[token_idx] = -1  # Invalid slot
-                else:
-                    self.slot_mapping[token_idx] = -1  # Out of bounds
+                        # Flat byte index for FP8 data
+                        fp8_flat_idx = block_id * block_stride + pos_in_block * head_dim
+                        self.slot_mapping_fp8[token_idx] = fp8_flat_idx
+                        
+                        # Flat byte index for scale
+                        scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
+                        self.slot_mapping_scale[token_idx] = scale_flat_idx
 
                 token_idx += 1
+        
+        self.slot_mapping_fp8 = self.slot_mapping_fp8.cuda(non_blocking=True)
+        self.slot_mapping_scale = self.slot_mapping_scale.cuda(non_blocking=True)
 
 
     def _update_k_cache(self, k_fp8: torch.Tensor, k_scale: torch.Tensor) -> None:
         """
-        Insert/append k values and scales into the indexer k cache using pre-computed slot_mapping.
+        Insert/append k values and scales into the indexer k cache using pre-computed slot mappings.
+        Uses flat byte indices with vectorized scatter.
 
-        Note: slot_mapping should be pre-computed in prepare() stage.
+        Note: slot_mapping_fp8 and slot_mapping_scale should be pre-computed in prepare() stage
+              and should only contain valid indices.
 
         Args:
             k_fp8: FP8 quantized k tensor, shape [total_tokens, head_dim]
             k_scale: Scaling factors, shape [total_tokens, head_dim // quant_block_size]
         """
-        if self.cache_manager is None or self.slot_mapping is None:
+        if self.cache_manager is None or self.slot_mapping_fp8 is None:
             return
 
         k_cache = self.cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
-
-        # Concatenate k_fp8 and k_scale: [total_tokens, head_dim + scale_size]
-        # Convert scale to uint8 view for concatenation
-        k_scale_bytes = k_scale.view(torch.uint8).view(k_scale.shape[0], -1)
-        k_fp8_bytes = k_fp8.view(torch.uint8).view(k_fp8.shape[0], -1)
-        k_combined = torch.cat([k_fp8_bytes, k_scale_bytes], dim=-1)
-
-        # Flatten cache for vectorized indexing: [num_blocks * tokens_per_block, 1, head_dim + scale_size]
-        k_cache_flat = k_cache.view(-1, k_cache.shape[-1])  # [num_blocks * tokens_per_block, head_dim + scale_size]
-
-        # Update cache at computed slots
-        k_cache_flat[self.slot_mapping[:len(k_combined)]] = k_combined
+        k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
+        
+        num_tokens = k_fp8.shape[0]
+        head_dim = k_fp8.shape[1]
+        scale_size = k_scale.shape[1] * 4  # Convert to bytes (float32 = 4 bytes)
+        
+        # Convert to bytes: flatten first, then view as uint8, then reshape
+        k_fp8_bytes = k_fp8.contiguous().view(-1).view(torch.uint8).view(num_tokens, head_dim)
+        k_scale_bytes = k_scale.contiguous().view(-1).view(torch.uint8).view(num_tokens, scale_size)
+        
+        # Scatter FP8 data
+        flat_indices_fp8 = self.slot_mapping_fp8[:num_tokens]  # [num_tokens] start indices
+        byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
+        scatter_indices_fp8 = flat_indices_fp8.unsqueeze(1) + byte_offsets  # [num_tokens, head_dim]
+        k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
+        
+        # Scatter scales
+        flat_indices_scale = self.slot_mapping_scale[:num_tokens]  # [num_tokens] start indices
+        byte_offsets = torch.arange(scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
+        scatter_indices_scale = flat_indices_scale.unsqueeze(1) + byte_offsets  # [num_tokens, scale_size]
+        k_cache_flat[scatter_indices_scale] = k_scale_bytes
 
     def sparse_attn_indexer(
         self,
@@ -341,8 +367,7 @@ class Indexer(nn.Module):
         topk_indices_buffer[:hidden_states.shape[0]] = -1
 
         # Quantize k and store into indexer k cache
-        k_fp8, k_scale = fp8_utils.per_token_quant_and_transform(
-                k[:num_tokens], self.quant_block_size, scale_ue8m0=self.scale_fmt == "ue8m0")
+        k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k[:num_tokens])
         self._update_k_cache(k_fp8, k_scale)
 
         if has_prefill:
@@ -609,12 +634,13 @@ class DSACacheManager(KVCacheManager):
                                                    tokens_per_block)
 
         # Indexer K cache pool for DSA attention
-        # Shape: [num_blocks, tokens_per_block, 1, index_head_dim]
+        # Shape: [num_blocks, tokens_per_block * (index_head_dim + scale_size)]
+        # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
         # Store FP8-quantized k values from the indexer
+        scale_size = self.index_head_dim // self.quant_block_size * 4
         self.indexer_k_cache_pool_per_layer = [
             torch.empty(
-                (self.num_blocks, tokens_per_block, 1, self.index_head_dim +
-                 self.index_head_dim // self.quant_block_size * 4),
+                (self.num_blocks, tokens_per_block * (self.index_head_dim + scale_size)),
                 device="cuda",
                 dtype=torch.uint8) for _ in range(self.num_local_layers)
         ]
@@ -654,18 +680,46 @@ class DSACacheManager(KVCacheManager):
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
-        return self.indexer_k_cache_pool_per_layer[layer_idx]
+        block_size = self.low_rank_cache_manager.tokens_per_block
+        per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        return self.indexer_k_cache_pool_per_layer[layer_idx].view(self.num_blocks, block_size, 1, per_token_size)
 
     def get_indexer_k_block_offsets(self, request_ids: List[int]) -> torch.Tensor:
-        """Get block offsets for indexer k cache (uses same block manager as low_rank_cache)."""
+        """Get block offsets for indexer k cache """
         return self.low_rank_cache_manager.get_block_offsets(request_ids)
 
     def prepare_resources(self, scheduled_batch):
+        """
+        Prepare resources for both low rank cache and indexer K cache.
+        """
         super().prepare_resources(scheduled_batch)
-        for req in scheduled_batch.all_requests():
+        context_batch = scheduled_batch.context_requests
+        generation_batch = scheduled_batch.generation_requests
+        
+        # Allocate blocks for context requests
+        for req in context_batch:
             request_id = req.py_request_id
-            self.low_rank_cache_manager.add_tokens(request_id,
-                                                   req.max_beam_num_tokens)
+            if req.is_first_context_chunk:
+                self.low_rank_cache_manager.add_tokens(request_id, req.prompt_len)
+                # TODO: Add support for num_extra_kv_tokens
+                # for _ in range(self.num_extra_kv_tokens):
+                #     self.low_rank_cache_manager.add_tokens(request_id, 1)
+
+                # Add draft tokens
+                draft_token_len = get_draft_token_length(req)
+                if draft_token_len > 0:
+                    self.low_rank_cache_manager.add_tokens(request_id, draft_token_len)
+        
+        # Allocate blocks for generation requests
+        for req in generation_batch:
+            request_id = req.py_request_id
+            self.low_rank_cache_manager.add_tokens(request_id, 1)
+            # Add draft tokens
+            draft_token_len = get_draft_token_length(req)
+            if draft_token_len > 0:
+                self.low_rank_cache_manager.add_tokens(request_id, draft_token_len)
+            
+        # TODO: Support beam search, current assume beam_width=1
 
     def update_resources(self, scheduled_batch):
         for request in scheduled_batch.context_requests:
