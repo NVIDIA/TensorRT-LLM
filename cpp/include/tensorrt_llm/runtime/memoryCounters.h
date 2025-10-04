@@ -87,6 +87,10 @@ public:
     template <MemoryType T>
     void allocate(SizeType32 size)
     {
+        if (size > static_cast<SizeType32>(std::numeric_limits<DiffType>::max()))
+        {
+            TLLM_THROW("Memory size too large for diff type: %zu", size);
+        }
         auto const sizeDiff = static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
         {
@@ -115,7 +119,7 @@ public:
         }
         else
         {
-            TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
+            static_assert(!std::is_same_v<T, T>, "Unknown memory type!");
         }
     }
 
@@ -124,6 +128,10 @@ public:
     template <MemoryType T>
     void deallocate(SizeType32 size)
     {
+        if (size > static_cast<SizeType32>(std::numeric_limits<DiffType>::max()))
+        {
+            TLLM_THROW("Memory size too large for diff type: %zu", size);
+        }
         auto const sizeDiff = -static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
         {
@@ -152,13 +160,18 @@ public:
         }
         else
         {
-            TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
+            static_assert(!std::is_same_v<T, T>, "Unknown memory type!");
         }
     }
 
     void deallocate(MemoryType memoryType, SizeType32 size);
 
     static MemoryCounters& getInstance();
+
+    MemoryCounters(MemoryCounters const&) = delete;
+    MemoryCounters& operator=(MemoryCounters const&) = delete;
+    MemoryCounters(MemoryCounters&&) = delete;
+    MemoryCounters& operator=(MemoryCounters&&) = delete;
 
     static std::string bytesToString(SizeType32 bytes, int precision = 2);
 
