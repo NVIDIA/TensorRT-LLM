@@ -130,6 +130,7 @@ public:
     void createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         int const lda, int const ldb, int const ldc, int8_t fastAcc = 0);
     void setScaleDescriptors(void* scale_a, void* scale_b);
+    void setBiasDescriptor(void* bias);
     void destroyDescriptors();
 
     cublasHandle_t getCublasHandle()
