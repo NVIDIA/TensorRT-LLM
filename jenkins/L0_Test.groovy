@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-slurm_refactor', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -930,8 +930,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export NVIDIA_IMEX_CHANNELS=0
+                    export NVIDIA_IMEX_CHANNELS=0
+                    export NVIDIA_VISIBLE_DEVICES=\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=noheader)-1)))
                     chmod +x $scriptRunNode
-                    srun ${srunArgs.join(" ")} ${scriptRunNode}
+                    srun --kill-on-bad-exit=1 ${srunArgs.join(" ")} ${scriptRunNode}
                 """.replaceAll("(?m)^\\s*", "")
                 pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
                 Utils.copyFileToRemoteHost(
@@ -2679,7 +2681,7 @@ def launchTestJobs(pipeline, testFilter)
     multiNodesSBSAConfigs = [:]
     def numMultiNodeTests = 9
     multiNodesSBSAConfigs += (1..numMultiNodeTests).collectEntries { i ->
-        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-multi-node", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
+        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-trtllm", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
     }
     fullSet += multiNodesSBSAConfigs.keySet()
 
