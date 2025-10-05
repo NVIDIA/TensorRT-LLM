@@ -51,6 +51,7 @@ def _joint_transform(gm: GraphModule) -> None:
         {
             "match_repeat_kv": {
                 "stage": "pattern_matcher",
+                "run_shape_prop": True,
             },
             "match_eager_attention": {
                 "stage": "pattern_matcher",
