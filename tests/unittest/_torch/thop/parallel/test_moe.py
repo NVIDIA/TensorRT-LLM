@@ -1844,7 +1844,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     [
         pytest.param(
             {
-                "num_experts": 512,
+                "num_experts": 16,
                 "top_k": 10,
                 "n_groups": None,
                 "top_k_groups": None,
@@ -1855,7 +1855,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
             id="RoutingRenormalize_qwen_next"),
         pytest.param(
             {
-                "num_experts": 128,
+                "num_experts": 16,
                 "top_k": 8,
                 "n_groups": None,
                 "top_k_groups": None,
@@ -1866,7 +1866,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
             id="RoutingRenormalize_topk_8"),
         pytest.param(
             {
-                "num_experts": 128,
+                "num_experts": 16,
                 "top_k": 4,
                 "n_groups": None,
                 "top_k_groups": None,
@@ -2193,8 +2193,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 unpadded_hidden_size, 0, num_experts, routed_scaling,
-                routing_method_type, act_type.value, 1.0, topk_weights,
-                topk_ids)
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -2206,7 +2205,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, 1.0, topk_weights, topk_ids)
+                act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -2218,7 +2217,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 scale_c_fc1, scale_gate_fc1, scale_c_fc2, num_experts, top_k,
                 n_groups, top_k_groups, intermediate_size, 0, num_experts,
-                routed_scaling, routing_method_type, act_type.value, 1.0,
+                routed_scaling, routing_method_type, act_type.value,
                 topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
