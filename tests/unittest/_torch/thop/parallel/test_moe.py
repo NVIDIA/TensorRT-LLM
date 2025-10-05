@@ -964,7 +964,7 @@ class TestMoeFP8:
                 gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, routing_method_type,
-                topk_weights, topk_ids)
+                topk_weights, topk_ids, imbalance_factor=1.0)
 
         output_dequant_actual = output.to(torch.float)
         #
@@ -1417,6 +1417,7 @@ class TestMoeFp4:
                 num_experts,
                 routed_scaling,
                 routing_method_type,
+                imbalance_factor=1.0,
                 do_finalize=True,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights)
@@ -1661,6 +1662,7 @@ class TestMoeFp4:
                 num_experts,
                 routed_scaling,
                 routing_method_type,
+                imbalance_factor=1.0,
                 do_finalize=True,
                 act_type=ActType.SwiGlu.value,
                 topk_ids=topk_ids,
@@ -1809,7 +1811,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
         top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
         routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
-        routing_method_type, topk_weights, topk_ids)
+        routing_method_type, topk_weights, topk_ids, imbalance_factor=1.0)
 
     output_dequant_actual = output.to(torch.float)
 
