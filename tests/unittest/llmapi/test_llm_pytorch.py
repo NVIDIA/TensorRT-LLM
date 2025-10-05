@@ -565,7 +565,6 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-@pytest.mark.skip(reason="https://nvbugs/5521949")
 def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
@@ -592,12 +591,16 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
             lora_model.save_pretrained(lora_path)
             lora_paths.append(lora_path)
 
-        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
-                                        lora_target_modules=target_modules,
+        trtllm_lora_config = LoraConfig(lora_target_modules=target_modules,
                                         max_lora_rank=8,
                                         max_loras=2,
                                         max_cpu_loras=2)
-        llm = LLM(model_dir, lora_config=trtllm_lora_config)
+        llm = LLM(
+            model_dir,
+            lora_config=trtllm_lora_config,
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
