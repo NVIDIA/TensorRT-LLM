@@ -20,7 +20,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
@@ -230,6 +231,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     def get_vocab_size(self):
         return self.model_config.llm_config.vocab_size
 
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        " Return multimodal special token ids for NanoV2VL. "
+        # TODO: Hardcoded for now, need extract from model config later.
+        return torch.tensor([131073, 131074])
+
     def get_mm_token_ids(self):
         return torch.tensor([self.img_context_token_id], dtype=torch.int32)
 
@@ -297,6 +303,55 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             blocks += 1
         num_image_tokens = self.num_image_token * blocks
         return num_image_tokens
+
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: List[Image.Image],
+        video_pruning_ratio: Optional[float] = None,
+        **kwargs,
+    ):
+        # Use VIDEO_PRUNING_RATIO if not explicitly provided
+        if video_pruning_ratio is None:
+            video_pruning_ratio = VIDEO_PRUNING_RATIO
+
+        num_frames = len(video)
+
+        if video_pruning_ratio > 0:
+            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
+                                                                 **kwargs)
+            num_tokens_per_frame_list = [num_tokens_per_frame] * num_frames
+
+            # Total patches across all frames
+            total_num_tokens_base = sum(num_tokens_per_frame_list)
+
+            # Calculate total desired tokens after pruning
+            desired_num_tokens = int(total_num_tokens_base *
+                                     (1.0 - video_pruning_ratio))
+
+            # Calculate tokens for each frame except the last
+            existing_num_tokens = 0
+            for i in range(num_frames - 1):
+                feature_size = num_tokens_per_frame_list[i]
+                feature_size = int(feature_size * (1.0 - video_pruning_ratio))
+                existing_num_tokens += feature_size
+
+            # Last frame gets the remaining tokens
+            last_frame_tokens = desired_num_tokens - existing_num_tokens
+            num_total_tokens = existing_num_tokens + last_frame_tokens
+
+            # Add start and end tokens for each frame
+            num_total_tokens += num_frames * 2
+        else:
+            # No pruning - sum tokens for all frames
+            num_total_tokens = sum(
+                self.get_num_tokens_per_image(
+                    image=frame, video_pruning_ratio=None, **kwargs)
+                for frame in video)
+            # Add start and end tokens for each frame
+            num_total_tokens += num_frames * 2
+
+        return num_total_tokens
 
     @torch.inference_mode()
     def __call__(
@@ -487,7 +542,9 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_disagg():
-                mm_embedding = self.vision_encoder(multimodal_params)
+                mm_embedding = get_multimodal_embeddings(
+                    encoder_forward_fn=self.vision_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
                 raise NotImplementedError(
                     "Nano-V2-VLM does not support disaggregated inference yet. Please unset "
