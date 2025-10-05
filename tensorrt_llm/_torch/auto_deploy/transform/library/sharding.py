@@ -174,11 +174,11 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
 
-        # if world_size < 2:
-        #     ad_logger.info("Skipping sharding for single device")
-        #     return gm, TransformInfo(
-        #         skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-        #     )
+        if world_size < 2:
+            ad_logger.info("Skipping sharding for single device")
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
         shared_config.sharding_config.rank = local_rank
@@ -218,30 +218,28 @@ class Sharding(BaseTransform):
 
             elif source == ShardingSource.CUSTOM:
                 ad_logger.info("Applying sharding from custom config")
-                if shared_config.sharding_config.custom_sharding_config is None:
+                if sharding_config.custom_sharding_config is None:
                     ad_logger.warning(
                         "No custom sharding config found. Skipping sharding from custom config"
                     )
                     continue
-                sharding_config.predefined_config["tp_plan"] = (
-                    shared_config.sharding_config.custom_sharding_config
-                )
+                sharding_config.predefined_config = sharding_config.custom_sharding_config
                 info += detect_sharding_from_factory_config(gm, sharding_config)
 
             elif source == ShardingSource.HEURISTIC:
                 ad_logger.info(
-                    f"Running autodeploy sharding heuristics: {shared_config.sharding_config.sharding_dims}"
+                    f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}"
                 )
                 # run TP sharding across ranks
-                if ShardingDim.TP in shared_config.sharding_config.sharding_dims:
+                if ShardingDim.TP in sharding_config.sharding_dims:
                     info += detect_column_row_shard(gm, sharding_config)
 
                 # run EP sharding across ranks
-                if ShardingDim.EP in shared_config.sharding_config.sharding_dims:
+                if ShardingDim.EP in sharding_config.sharding_dims:
                     info += detect_ep_shard(gm, sharding_config)
 
                 # run BMM sharding across ranks
-                if ShardingDim.BMM in shared_config.sharding_config.sharding_dims:
+                if ShardingDim.BMM in sharding_config.sharding_dims:
                     info += detect_dp_bmm_shard(gm, sharding_config)
 
         return gm, info
