@@ -39,7 +39,7 @@ transforms:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
-    attn_backend: flashinfer
+    attn_layout: bsnd
   match_rope_pattern:
     stage: pattern_matcher
   match_rope_layout:
@@ -141,7 +141,7 @@ transforms:
     stage: cache_init
   resize_kv_cache:
     stage: cache_init
-    free_mem_ratio: 0.0
+    free_mem_ratio: 0.8
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################

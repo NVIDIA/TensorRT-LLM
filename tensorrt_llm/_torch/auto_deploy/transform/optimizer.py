@@ -32,7 +32,6 @@ class InferenceOptimizer:
         self.shared_config = SharedConfig(
             local_rank=local_rank,
             world_size=world_size,
-            # local_device=local_device
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:

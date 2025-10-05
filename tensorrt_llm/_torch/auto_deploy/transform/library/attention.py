@@ -1,13 +1,12 @@
 """Pattern matching for detecting repeat_kv, eager, grouped attention patterns from Huggingface models."""
 
-from typing import Any, Callable, Dict, List, Tuple, Type
+from typing import Any, Callable, Dict, List, Literal, Tuple, Type
 
 import torch
 import torch.nn.functional as F
 from pydantic import Field
 from torch.fx import GraphModule
 
-from ...custom_ops.attention_interface import AttentionRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -496,7 +495,9 @@ class MatchGroupedAttention(BaseTransform):
 class MatchAttentionLayoutConfig(TransformConfig):
     """Configuration for the match attention layout transform."""
 
-    attn_backend: str = Field(description="Attention backend to use.")
+    attn_layout: Literal["bsnd", "bnsd"] = Field(
+        description="Layout expected by the attention backend."
+    )
 
 
 @TransformRegistry.register("match_attention_layout")
@@ -524,15 +525,17 @@ class MatchAttentionLayout(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Get attention layout from attention_op
-        attention_op = AttentionRegistry.get(self.config.attn_backend)
-        attention_layout = attention_op.get_attention_layout()
-
         # List of SDPA operations to look for
         sdpa_ops = {
             torch.ops.auto_deploy.torch_attention_sdpa,
             torch.ops.auto_deploy.torch_attention_grouped_sdpa,
         }
+
+        source_ops = {
+            "bsnd": torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+            "bnsd": torch.ops.auto_deploy.torch_attention_grouped_sdpa,
+        }
+        source_op = source_ops[self.config.attn_layout]
 
         graph = gm.graph
         num_bsnd_patterns = 0
@@ -548,7 +551,7 @@ class MatchAttentionLayout(BaseTransform):
             q, k, v = sdpa_node.args[:3]
 
             # Check if we need to transpose the inputs
-            if attention_layout == "bsnd":
+            if self.config.attn_layout == "bsnd":
                 # Add transposes before the node (from bnsd to bsnd)
                 with graph.inserting_before(sdpa_node):
                     q_updated = graph.call_function(torch.ops.aten.transpose.int, args=(q, 1, 2))
@@ -559,25 +562,25 @@ class MatchAttentionLayout(BaseTransform):
                 q_updated.meta["val"] = q.meta["val"].transpose(1, 2)
                 k_updated.meta["val"] = k.meta["val"].transpose(1, 2)
                 v_updated.meta["val"] = v.meta["val"].transpose(1, 2)
-            elif attention_layout == "bnsd":
+            elif self.config.attn_layout == "bnsd":
                 # we don't need to do anything...
                 q_updated = q
                 k_updated = k
                 v_updated = v
             else:
-                raise ValueError(f"Unsupported attention layout: {attention_layout}")
+                raise ValueError(f"Unsupported attention layout: {self.config.attn_layout}")
 
             # Create bsnd_grouped_sdpa node with the same args as the original node
             # but using the transposed inputs
             with graph.inserting_before(sdpa_node):
                 source_sdpa_node = graph.call_function(
-                    attention_op.get_source_attention_op(),
+                    source_op,
                     args=(q_updated, k_updated, v_updated) + sdpa_node.args[3:],
                     kwargs=sdpa_node.kwargs,
                 )
 
             # Check if need to update the output node to match the layout
-            if attention_layout == "bsnd":
+            if self.config.attn_layout == "bsnd":
                 # Add transpose for the output (from bsnd back to bnsd)
                 with graph.inserting_after(source_sdpa_node):
                     output_updated = graph.call_function(
@@ -587,10 +590,10 @@ class MatchAttentionLayout(BaseTransform):
                 # Preserve fake tensor in meta["val"] for the transposed inputs
                 source_sdpa_node.meta["val"] = sdpa_node.meta["val"].transpose(1, 2).contiguous()
                 output_updated.meta["val"] = source_sdpa_node.meta["val"].transpose(1, 2)
-            elif attention_layout == "bnsd":
+            elif self.config.attn_layout == "bnsd":
                 output_updated = source_sdpa_node
             else:
-                raise ValueError(f"Unsupported attention layout: {attention_layout}")
+                raise ValueError(f"Unsupported attention layout: {self.config.attn_layout}")
 
             # Replace the old node with the transposed output
             sdpa_node.replace_all_uses_with(output_updated)

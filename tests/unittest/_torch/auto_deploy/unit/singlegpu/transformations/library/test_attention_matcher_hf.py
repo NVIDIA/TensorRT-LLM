@@ -1,7 +1,7 @@
 """Test that the attention matcher works with HF's SDPA backends."""
 
 import copy
-from typing import Any, Callable, Dict
+from typing import Any, Dict
 
 import pytest
 import torch
@@ -12,29 +12,11 @@ from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
-    AttentionDescriptor,
-    AttentionRegistry,
-)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 torch.manual_seed(0)
-
-
-class MockAttentionDescriptor(AttentionDescriptor):
-    """A mock class that mimics the AttentionDescriptor interface for testing."""
-
-    layout: str = "bsnd"
-
-    @classmethod
-    def get_attention_layout(cls) -> str:
-        return cls.layout
-
-    @classmethod
-    def get_source_attention_op(cls) -> Callable:
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
 
 
 class HFWrapper(nn.Module):
@@ -62,7 +44,7 @@ def _joint_transform(gm: GraphModule) -> None:
             },
             "match_attention_layout": {
                 "stage": "pattern_matcher",
-                "attn_backend": "mock",
+                "attn_layout": "bsnd",
             },
         },
     )(None, gm)
@@ -81,7 +63,6 @@ def _joint_transform(gm: GraphModule) -> None:
     ["eager", "sdpa"],
 )
 def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str):
-    AttentionRegistry._attention_registry["mock"] = MockAttentionDescriptor
     if attn_implementation == "sdpa":
         pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
 

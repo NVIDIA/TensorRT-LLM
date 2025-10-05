@@ -122,10 +122,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         frozen=True,
     )
 
-    attn_backend: Optional[Literal["flashinfer", "triton", "torch"]] = Field(
-        default=None, description="An overwrite to default.yaml for convenience config."
-    )
-
     ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
@@ -169,15 +165,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             "torch",
         ]:
             self.attn_page_size = self.max_seq_len
-        return self
-
-    @model_validator(mode="after")
-    def update_attn_backend(self):
-        if not self.attn_backend:
-            return self
-        for k, transform_config in self.transforms.items():
-            if "attn_backend" in transform_config:
-                self.transforms[k]["attn_backend"] = self.attn_backend
         return self
 
     @field_validator("model_factory", mode="after")
