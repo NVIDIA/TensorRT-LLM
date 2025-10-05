@@ -193,9 +193,11 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        if hasattr(
+                self._model_engine.model,
+                "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                    self._model_engine.model.original_arch, None
+                ) and self._model_engine.attn_runtime_features.chunked_prefill:
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
