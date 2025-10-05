@@ -61,8 +61,6 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
-MAX_UINT64 = (1 << 64) - 1
-
 
 class ModelEngine(ABC):
 

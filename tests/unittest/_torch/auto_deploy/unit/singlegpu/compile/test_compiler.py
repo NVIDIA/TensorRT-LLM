@@ -7,7 +7,7 @@ from _model_test_utils import (
 )
 from torch.nn import Module
 
-from tensorrt_llm._torch.auto_deploy.compile import compile_and_capture
+from tensorrt_llm._torch.auto_deploy.compile import CompileBackendRegistry
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
@@ -53,12 +53,13 @@ def test_compile_and_capture(model_type, model_cls, input_shape, output_shape_fn
     graph_module = torch_export_to_gm(mod, args=(sample_input,), dynamic_shapes=dynamic_shapes)
 
     with torch.inference_mode():
-        compiled_model = compile_and_capture(
+        compiler_cls = CompileBackendRegistry.get(backend_cls)
+        compiled_model = compiler_cls(
             graph_module,
-            backend_cls,
             args=(sample_input,),
-            dynamic_shapes=dynamic_shapes,
-        )
+            num_batched_inputs=1,
+            max_batch_size=batch_size,
+        ).compile()
 
         assert isinstance(compiled_model, Module), "Compiled model is not a valid nn.Module."
         output = compiled_model(sample_input)

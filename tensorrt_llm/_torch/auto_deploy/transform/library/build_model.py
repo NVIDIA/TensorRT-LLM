@@ -20,11 +20,6 @@ class BuildModelConfig(TransformConfig):
     """Configuration for the build model transform."""
 
     device: str = Field(default="meta", description="The device to build the model on.")
-    use_strict_forward: bool = Field(
-        default=True,
-        description="If True, the forward pass will be patched to use a strict positional-only list"
-        " of arguments. If False, the default with **kwargs can be used.",
-    )
 
 
 @TransformRegistry.register("build_model")
@@ -50,9 +45,6 @@ class BuildModel(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         # build the model
         model = factory.build_model(self.config.device)
-
-        assert self.config.use_strict_forward, "Only strict forward is supported."
-        factory._set_strict_forward(model)
 
         # as wrapper to satisfy the interface we will register the model as a submodule
         gm.add_module("factory_model", model)
@@ -88,8 +80,6 @@ class BuildAndLoadFactoryModel(BuildModel):
 
         # build and load the model
         model = factory.build_and_load_model(self.config.device)
-
-        assert not self.config.use_strict_forward, "Only regular forward is supported."
 
         # as wrapper to satisfy the interface we will register the model as a submodule
         gm.add_module("factory_model", model)

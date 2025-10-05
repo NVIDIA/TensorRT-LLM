@@ -262,7 +262,7 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        logits: torch.Tensor = self.model(self.cache_seq_interface)[0]
+        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)

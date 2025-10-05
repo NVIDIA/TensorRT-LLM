@@ -344,7 +344,7 @@ class CUDAGraphRunner:
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
-                max_num_draft_tokens=engine.max_draft_len,
+                max_num_draft_tokens=engine.runtime_draft_len,
                 use_mrope=engine.use_mrope,
                 max_beam_width=engine.max_beam_width)[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True

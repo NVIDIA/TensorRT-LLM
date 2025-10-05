@@ -25,9 +25,10 @@ import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd,
                          get_cpp_benchmark, get_trt_llm_lib_dir, parse_output,
-                         quantize_data, similar, test_multi_lora_support,
-                         venv_check_call, venv_check_output,
-                         venv_mpi_check_call)
+                         quantize_data, similar,
+                         test_llm_torch_multi_lora_support,
+                         test_multi_lora_support, venv_check_call,
+                         venv_check_output, venv_mpi_check_call)
 # yapf: disable
 from defs.conftest import (get_device_count, get_device_memory,
                            get_host_total_memory, get_sm_version,
@@ -4036,6 +4037,87 @@ def test_llama_3_x_fp8_with_bf16_lora(llama_example_root, llm_datasets_root,
     defs.ci_profiler.stop("test_multi_lora_support")
     print(
         f"test_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_multi_lora_support')} sec"
+    )
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llama_model_root", [
+    'llama-v3-8b-instruct-hf',
+    'llama-3.1-8b-instruct',
+    'llama-3.2-1b-instruct',
+    'llama-3.2-3b-instruct',
+    'llama-3.3-70b-instruct',
+],
+                         indirect=True)
+def test_llama_3_x_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
+                                        qcache_dir_without_install_package,
+                                        llm_venv, engine_dir, llama_model_root):
+    """Run Llama models with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    if "llama-3.3-70b-instruct" in llama_model_root.lower():
+        tensor_parallel_size = 8
+        if get_device_count() < 8:
+            pytest.skip(
+                "Skipping: llama-3.3-70b-instruct model requires 8 GPUs")
+    else:
+        tensor_parallel_size = 1
+
+    expected_outputs = {
+        'llama-v3-8b-instruct-hf': [
+            " I hope you're having a great day! I just wanted to reach out and say hi, and see if you're doing okay. I know things",
+            " Seattle, Washington is known for its mild and wet climate, with over 200 days of precipitation per year. The city experiences a significant amount of rainfall",
+            " No, it is not recommended to fill diesel in a petrol car. Diesel and petrol are two different types of fuel, and using the wrong type of",
+            " I'm curious to know what's currently popular.\nI can help you with that! As of now, the top 5 trending songs on Spotify are",
+            " Paris\nWhat is the capital of Germany? Berlin\nWhat is the capital of Italy? Rome\nWhat is the capital of Spain? Madrid\nWhat"
+        ],
+        'llama-3.1-8b-instruct': [
+            " I'm doing pretty well, thanks for asking. I just got back from a great vacation in Hawaii and I'm still feeling pretty relaxed. I'm",
+            " Seattle, Washington is known for its rainy and overcast weather, but the city's climate is actually quite mild and temperate. The city experiences a",
+            " | What happens if you put diesel in a petrol car?\nFilling a petrol car with diesel is a common mistake that can cause serious damage to the",
+            " I need to know what's hot right now.\nI can check the top 5 trending songs on Spotify for you. However, please note that the",
+            " Paris\nWhat is the capital of France?\nThe capital of France is Paris. Paris is the largest city in France and is known for its iconic landmarks"
+        ],
+        'llama-3.2-1b-instruct': [
+            " I'm doing great, thanks for asking! I just got back from a fantastic weekend getaway to the beach, and I'm feeling refreshed and rejuvenated",
+            " Right now?\nI'm planning a trip to Seattle and I want to know what the weather is like. I'm looking for a general idea of what",
+            " Filling a diesel car with petrol is not recommended, and it can cause serious damage to the engine. Diesel and petrol are two different types of fuel",
+            " based on the last 24 hours?\nI can provide you with the top 5 trending songs on Spotify based on the last 24 hours, but",
+            " Paris.\nThe capital of France is Paris. Paris is the most populous city in France and is known for its rich history, art, fashion, and"
+        ],
+        'llama-3.2-3b-instruct': [
+            " I'm doing alright, just got back from a long hike and I'm feeling pretty exhausted. Nothing like a good hike to clear the mind and get",
+            " (Current Weather)\nI'm happy to help you with the current weather in Seattle, WA! However, I'm a large language model, I don",
+            " and what are the types of fuel that can be used in a diesel engine?\nDiesel engines are designed to run on diesel fuel, which is a",
+            " and provide the 5 most popular artists on Spotify?\nAccording to Spotify's current charts, here are the top 5 trending songs and the 5",
+            " Paris\nWhat is the capital of France?\nThe capital of France is indeed Paris. Located in the north-central part of the country, Paris is a"
+        ],
+        'llama-3.3-70b-instruct': [
+            " I hope you are having a great day. I am doing well, thanks for asking. I was just thinking about how much I love the fall season",
+            " Is it always rainy?\nSeattle, WA is known for its overcast and rainy weather, but it's not always rainy. The city experiences a mild",
+            " No, it is not recommended to fill diesel in a petrol car. Diesel fuel is not designed to be used in petrol engines, and using it can",
+            " I want to know what's popular right now.\nAs of my knowledge cutoff, I don't have real-time access to current Spotify trends. However,",
+            " Paris\nWhat is the capital of Germany? Berlin\nWhat is the capital of Italy? Rome\nWhat is the capital of Spain? Madrid\nWhat"
+        ],
+    }
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+
+    model_name = os.path.basename(llama_model_root).lower()
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llama_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        tensor_parallel_size=tensor_parallel_size,
+        expected_outputs=expected_outputs[model_name])
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+    print(
+        f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
     )
 
 

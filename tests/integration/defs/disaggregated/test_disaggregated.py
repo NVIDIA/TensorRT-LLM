@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import re
 import subprocess
@@ -21,10 +22,12 @@ from typing import Callable
 
 import pytest
 import yaml
+from defs.common import wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -267,13 +270,146 @@ def get_test_config(test_desc, example_dir, test_root):
     return config_map[test_desc]
 
 
+def get_extra_llm_config(config, suffix, cwd):
+    extra_llm_config = {
+        'orchestrator_type': 'ray',
+    }
+    for key, value in config.items():
+        if key not in ['num_instances', 'urls']:
+            extra_llm_config[key] = value
+
+    temp_fd, extra_config_file = tempfile.mkstemp(suffix='_%s.yaml' % suffix,
+                                                  dir=cwd)
+    with os.fdopen(temp_fd, 'w') as f:
+        yaml.dump(extra_llm_config, f)
+
+    return extra_config_file
+
+
+def generate_worker_commands(model_path, config, server_config,
+                             extra_config_file, server_role):
+    worker_commands = []
+
+    assert model_path, "model path is required."
+
+    for url in server_config['urls']:
+        host, port = url.split(':')
+        cmd = [
+            'trtllm-serve', model_path, '--host', host, '--port', port,
+            '--backend', config['backend'], '--extra_llm_api_options',
+            extra_config_file, '--server_role', server_role
+        ]
+        worker_commands.append(cmd)
+    return worker_commands
+
+
+def run_client_tests(example_dir,
+                     config_file,
+                     test_desc,
+                     num_iters,
+                     env,
+                     server_start_timeout,
+                     prompt_file,
+                     extra_endpoints_test,
+                     server_url,
+                     workers_proc,
+                     server_proc,
+                     use_ray=False):
+    """Run client tests against the disaggregated server."""
+    client_dir = f"{example_dir}/clients"
+    for _ in range(num_iters):
+        client_cmd = [
+            'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
+            '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
+            '--server-start-timeout',
+            str(server_start_timeout)
+        ]
+        if prompt_file == "long_prompts.json":
+            # Use max_tokens 4 for long prompts to reduce test time
+            client_cmd.extend(['--max-tokens', '4'])
+
+        # Prepare poll processes
+        worker_processes = []
+        if use_ray:
+            for proc_cm in workers_proc:
+                worker_processes.append(proc_cm.__enter__())
+        else:
+            worker_processes = [workers_proc]
+
+        poll_procs = worker_processes + [server_proc]
+        check_call(client_cmd, env=env, poll_procs=poll_procs)
+
+        # Streaming client run
+        streaming_client_cmd = client_cmd + [
+            '--streaming', '-o', 'output_streaming.json'
+        ]
+        check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
+
+        # Run the chat completion endpoint test only for TinyLlama
+        if test_desc == "overlap" or test_desc == "trtllm_sampler":
+            chat_client_cmd = client_cmd + [
+                '-e', 'chat', '-o', 'output_chat.json'
+            ]
+            check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
+
+            streaming_chat_client_cmd = chat_client_cmd + [
+                '--streaming', '-o', 'output_streaming_chat.json'
+            ]
+            check_call(streaming_chat_client_cmd,
+                       env=env,
+                       poll_procs=poll_procs)
+
+        # Skip output verification for long prompts test
+        if prompt_file == "long_prompts.json":
+            continue
+
+        if extra_endpoints_test is not None:
+            extra_endpoints_test(server_url)
+
+        # Verify outputs
+        not_expected_strings = ["Berlin Berlin"]
+
+        output_files = ['output.json', 'output_streaming.json']
+        if test_desc == "overlap" or test_desc == "trtllm_sampler":
+            # Disable streaming chat completion for overlap test
+            # due to bug
+            output_files.extend(['output_chat.json'])
+
+        if test_desc.startswith("gen_only"):
+            continue
+
+        for output_file in output_files:
+            with open(output_file, 'r') as f:
+                content = f.read()
+                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                    expected_strings = [
+                        "Berlin", ["Asyncio is a", "Asyncio module in"]
+                    ]
+                else:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio is a Python library"
+                    ]
+                for expected_string in expected_strings:
+                    if isinstance(expected_string, list):
+                        # At least one of the strings in the list should be found in the content
+                        assert any(
+                            string in content for string in expected_string
+                        ), f"None of the strings in {expected_string} found in {output_file}"
+                    else:
+                        assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                for not_expected_string in not_expected_strings:
+                    assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+
+
 def run_disaggregated_test(example_dir,
                            test_desc,
                            num_iters=5,
                            env=None,
                            cwd=None,
                            prompt_file="prompts.json",
-                           extra_endpoints_test: Callable[[str], None] = None):
+                           extra_endpoints_test: Callable[[str], None] = None,
+                           model_path=None):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
@@ -282,11 +418,42 @@ def run_disaggregated_test(example_dir,
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
 
-    workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
-    ]
+    use_ray = mpi_disabled()
+    if not use_ray:
+        workers_cmd = [
+            'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+            str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+            config_file
+        ]
+    else:
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+
+        if config['backend'] != "pytorch":
+            pytest.skip(
+                "Ray orchestrator is only supported with pytorch backend.")
+
+        extra_config_files = []
+        workers_cmds = []
+        subprocess.run(['ray', 'start', '--head', '--disable-usage-stats'],
+                       check=True)
+
+        # Generate ctx and gen server worker commands
+        ctx_extra_config_file = get_extra_llm_config(config['context_servers'],
+                                                     "ctx", cwd)
+        extra_config_files.append(ctx_extra_config_file)
+        workers_cmds.extend(
+            generate_worker_commands(model_path, config,
+                                     config['context_servers'],
+                                     ctx_extra_config_file, 'context'))
+
+        gen_extra_config_file = get_extra_llm_config(
+            config['generation_servers'], "gen", cwd)
+        extra_config_files.append(gen_extra_config_file)
+        workers_cmds.extend(
+            generate_worker_commands(model_path, config,
+                                     config['generation_servers'],
+                                     gen_extra_config_file, 'generation'))
 
     server_start_timeout = 900
     server_cmd = [
@@ -296,101 +463,79 @@ def run_disaggregated_test(example_dir,
     server_url = get_disagg_server_url_from_cfg(config_file)
 
     try:
-        with (  # Start workers
-                open('output_workers.log', 'w') as output_workers,
-                popen(workers_cmd,
-                      stdout=output_workers,
-                      stderr=subprocess.STDOUT,
-                      env=run_env,
-                      cwd=cwd) as workers_proc,
-                # Start server
-                open('output_disagg.log', 'w') as output_disagg,
-                popen(server_cmd,
-                      stdout=output_disagg,
-                      stderr=subprocess.STDOUT,
-                      env=run_env,
-                      cwd=cwd) as server_proc):
-            client_dir = f"{example_dir}/clients"
-            for _ in range(num_iters):
-                client_cmd = [
-                    'python3', f'{client_dir}/disagg_client.py', '-c',
-                    f'{config_file}', '-p', f'{client_dir}/{prompt_file}',
-                    '--ignore-eos', '--server-start-timeout',
-                    str(server_start_timeout)
-                ]
-                if prompt_file == "long_prompts.json":
-                    # Use max_tokens 4 for long prompts to reduce test time
-                    client_cmd.extend(['--max-tokens', '4'])
-                check_call(client_cmd,
-                           env=env,
-                           poll_procs=[workers_proc, server_proc])
+        if not use_ray:
+            with (  # Start workers
+                    open('output_workers.log', 'w') as output_workers,
+                    popen(workers_cmd,
+                          stdout=output_workers,
+                          stderr=subprocess.STDOUT,
+                          env=run_env,
+                          cwd=cwd) as workers_proc,
+                    # Start server
+                    open('output_disagg.log', 'w') as output_disagg,
+                    popen(server_cmd,
+                          stdout=output_disagg,
+                          stderr=subprocess.STDOUT,
+                          env=run_env,
+                          cwd=cwd) as server_proc):
+                run_client_tests(example_dir,
+                                 config_file,
+                                 test_desc,
+                                 num_iters,
+                                 env,
+                                 server_start_timeout,
+                                 prompt_file,
+                                 extra_endpoints_test,
+                                 server_url,
+                                 workers_proc,
+                                 server_proc,
+                                 use_ray=False)
 
-                # Streaming client run
-                streaming_client_cmd = client_cmd + [
-                    '--streaming', '-o', 'output_streaming.json'
-                ]
-                check_call(streaming_client_cmd,
-                           env=env,
-                           poll_procs=[workers_proc, server_proc])
+        else:
+            workers_proc = []
+            with contextlib.ExitStack() as stack:
+                workers_log = stack.enter_context(
+                    open('output_workers.log', 'w'))
 
-                # Run the chat completion endpoint test only for TinyLlama
-                if test_desc == "overlap" or test_desc == "trtllm_sampler":
-                    chat_client_cmd = client_cmd + [
-                        '-e', 'chat', '-o', 'output_chat.json'
-                    ]
-                    check_call(chat_client_cmd,
-                               env=env,
-                               poll_procs=[workers_proc, server_proc])
+                for cmd in workers_cmds:
+                    proc = stack.enter_context(
+                        popen(
+                            cmd,
+                            stdout=workers_log,
+                            stderr=subprocess.STDOUT,
+                            env=run_env,
+                            cwd=cwd,
+                        ))
+                    workers_proc.append(proc)
 
-                    streaming_chat_client_cmd = chat_client_cmd + [
-                        '--streaming', '-o', 'output_streaming_chat.json'
-                    ]
-                    check_call(streaming_chat_client_cmd,
-                               env=env,
-                               poll_procs=[workers_proc, server_proc])
+                output_disagg = stack.enter_context(
+                    open('output_disagg.log', 'w'))
+                server_proc = stack.enter_context(
+                    popen(server_cmd,
+                          stdout=output_disagg,
+                          stderr=subprocess.STDOUT,
+                          env=run_env,
+                          cwd=cwd))
 
-                # Skip output verification for long prompts test
-                if prompt_file == "long_prompts.json":
-                    continue
+                if not wait_for_server("localhost",
+                                       8000,
+                                       timeout_seconds=server_start_timeout):
+                    raise RuntimeError(
+                        f"Disaggregated server failed to start within {server_start_timeout} seconds"
+                    )
 
-                if extra_endpoints_test is not None:
-                    extra_endpoints_test(server_url)
-
-                # Verify outputs
-                not_expected_strings = ["Berlin Berlin"]
-
-                output_files = ['output.json', 'output_streaming.json']
-                if test_desc == "overlap" or test_desc == "trtllm_sampler":
-                    # Disable streaming chat completion for overlap test
-                    # due to bug
-                    output_files.extend(['output_chat.json'])
-
-                if test_desc.startswith("gen_only"):
-                    continue
-
-                for output_file in output_files:
-                    with open(output_file, 'r') as f:
-                        content = f.read()
-                        if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                            expected_strings = [
-                                "Berlin", ["Asyncio is a", "Asyncio module in"]
-                            ]
-                        else:
-                            expected_strings = [
-                                "The capital of Germany is Berlin",
-                                "Asyncio is a Python library"
-                            ]
-                        for expected_string in expected_strings:
-                            if isinstance(expected_string, list):
-                                # At least one of the strings in the list should be found in the content
-                                assert any(
-                                    string in content
-                                    for string in expected_string
-                                ), f"None of the strings in {expected_string} found in {output_file}"
-                            else:
-                                assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
-                        for not_expected_string in not_expected_strings:
-                            assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+                run_client_tests(example_dir,
+                                 config_file,
+                                 test_desc,
+                                 num_iters,
+                                 env,
+                                 server_start_timeout,
+                                 prompt_file,
+                                 extra_endpoints_test,
+                                 server_url,
+                                 workers_proc,
+                                 server_proc,
+                                 use_ray=True)
     except Exception:
         # Print outputs on error
         logger.error("-------- Workers output --------")
@@ -402,10 +547,16 @@ def run_disaggregated_test(example_dir,
             logger.error(f.read())
         raise
     finally:
-        server_proc.terminate()
-        workers_proc.terminate()
-        server_proc.wait()
-        workers_proc.wait()
+        if use_ray:
+            subprocess.run(['ray', 'stop', '--force'], check=False)
+            for extra_file in extra_config_files:
+                if os.path.exists(extra_file):
+                    os.remove(extra_file)
+        elif 'server_proc' in locals() and 'workers_proc' in locals():
+            server_proc.terminate()
+            workers_proc.terminate()
+            server_proc.wait()
+            workers_proc.wait()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -831,7 +982,8 @@ def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_genpp2",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
 
 
 @pytest.mark.skip_less_device(4)
@@ -851,7 +1003,8 @@ def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2_genpp2",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
 
 
 @pytest.mark.skip_less_device(4)
@@ -871,7 +1024,8 @@ def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_gentp2",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
 
 
 @pytest.mark.skip_less_device(8)
@@ -932,7 +1086,8 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
 
 
 @skip_no_hopper
@@ -1021,7 +1176,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1048,7 +1204,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1074,7 +1231,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1262,7 +1420,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         disaggregated_example_root,
         "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp",
         env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+        model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper

@@ -75,6 +75,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: deprecated
+      orchestrator_type:
+        annotation: Optional[Literal['ray']]
+        default: null
+        status: prototype
       build_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
         default: null
@@ -178,6 +182,10 @@ methods:
       enable_lm_head_tp_in_adp:
         annotation: bool
         default: False
+        status: prototype
+      orchestrator_type:
+        annotation: Optional[Literal["rpc"]]
+        default: null
         status: prototype
     return_annotation: None
   generate:

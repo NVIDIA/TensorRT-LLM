@@ -68,8 +68,9 @@ class ExportToGM(BaseTransform):
         # export the model to a graph module
         gm = torch_export_to_gm(
             model,
-            args=cm.args,
-            dynamic_shapes=cm.dynamic_shapes,
+            args=(),
+            kwargs=cm.named_args,
+            dynamic_shapes=cm.named_dynamic_shapes,
             clone=self.config.clone_state_dict,
             strict=self.config.strict,
             patch_list=self.config.patch_list,

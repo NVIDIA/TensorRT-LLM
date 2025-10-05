@@ -21,8 +21,6 @@ from .routing import BaseMoeRoutingMethod
 
 def get_moe_cls(
         model_config: ModelConfig,
-        routing_method: BaseMoeRoutingMethod,
-        dtype: Optional[torch.dtype] = None,
         override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
     moe_backend = model_config.moe_backend
     quant_config = model_config.quant_config
@@ -77,8 +75,7 @@ def create_moe(
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
 ) -> MoE:
-    moe_cls = get_moe_cls(model_config, routing_method, dtype,
-                          override_quant_config)
+    moe_cls = get_moe_cls(model_config, override_quant_config)
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
