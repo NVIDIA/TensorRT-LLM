@@ -524,7 +524,18 @@ private:
 
             if (isReady)
             {
-                asyncSendAndRemoveResponse(it->first, std::move(it->second));
+                if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+                {
+                    // our nixl impl seems only support recv and send in the same thread
+                    //  if we use zmq as control path, we may avoid this issue
+                    sendAndRemoveResponse(it->first, std::move(it->second));
+                }
+                else
+                {
+                    // if we send data in another thread, multiple rank may send data for different requests at the same
+                    // time with gen DP case.
+                    asyncSendAndRemoveResponse(it->first, std::move(it->second));
+                }
                 removeResponse(it);
             }
             else
