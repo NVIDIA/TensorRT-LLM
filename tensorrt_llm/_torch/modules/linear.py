@@ -148,9 +148,15 @@ def load_weights_vanilla_helper(module: Linear,
     copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
-        bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                 module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, bias_transform(bias))
+        if 'bias' in weights[0]:
+            bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+                                     module.tp_rank, module.tp_mode, device)
+            copy_weight(module.bias, bias_transform(bias))
+        else:
+            # Some checkpoints omit bias tensors even when the module was
+            # instantiated with bias enabled. In that case, fallback to zeros
+            # so loading can proceed.
+            module.bias.data.zero_()
 
 
 def load_weights_fused_qkv_helper(
@@ -170,14 +176,17 @@ def load_weights_fused_qkv_helper(
                                  module.tp_rank, module.tp_mode, device)
 
     if module.bias is not None:
-        q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode, device)
-        k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode, device)
-        v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias,
-                    bias_transform(torch.cat((q_bias, k_bias, v_bias))))
+        if all('bias' in w for w in weights):
+            q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+                                       module.tp_rank, module.tp_mode, device)
+            k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+                                       module.tp_rank, module.tp_mode, device)
+            v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
+                                       module.tp_rank, module.tp_mode, device)
+            copy_weight(module.bias,
+                        bias_transform(torch.cat((q_bias, k_bias, v_bias))))
+        else:
+            module.bias.data.zero_()
 
     return tuple(map(weight_transform, (q_weight, k_weight, v_weight)))
 
@@ -195,12 +204,16 @@ def load_weights_fused_gate_up_helper(
     up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
                                   module.tp_rank, module.tp_mode, device)
     if module.bias is not None:
-        gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                      module.tp_rank, module.tp_mode, device)
-        up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                    module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, bias_transform(torch.cat(
-            (gate_bias, up_bias))))
+        if all('bias' in w for w in weights):
+            gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+                                          module.tp_rank, module.tp_mode,
+                                          device)
+            up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+                                        module.tp_rank, module.tp_mode, device)
+            copy_weight(module.bias,
+                        bias_transform(torch.cat((gate_bias, up_bias))))
+        else:
+            module.bias.data.zero_()
     return tuple(map(weight_transform, (gate_weight, up_weight)))
 
 
