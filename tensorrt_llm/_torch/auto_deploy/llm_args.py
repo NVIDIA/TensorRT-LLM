@@ -136,9 +136,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         frozen=True,
     )
 
-    enable_chunked_prefill: bool = Field(
-        default=False, description="Enable chunked prefill.", frozen=True
-    )
+    enable_chunked_prefill: bool = Field(default=False, description="Enable chunked prefill.")
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
     attn_backend: Literal["flashinfer", "triton", "torch"] = Field(
