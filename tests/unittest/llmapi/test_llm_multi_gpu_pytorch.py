@@ -9,6 +9,8 @@ from .lora_test_utils import check_llama_7b_multi_lora_from_request_test_harness
 from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
 from .test_llm import _test_llm_capture_request_error
 # isort: on
+from utils.util import skip_ray
+
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -61,6 +63,7 @@ def test_llama_7b_multi_lora_tp2():
         cuda_graph_config=None)
 
 
+@skip_ray
 @pytest.mark.gpu2
 def test_llm_rpc_tp2():
     with LLM(model=llama_model_path,
@@ -78,6 +81,7 @@ def test_llm_rpc_tp2():
         assert len(res.outputs[0].token_ids) == 10
 
 
+@skip_ray
 @pytest.mark.gpu2
 @pytest.mark.asyncio
 async def test_llm_rpc_streaming_tp2():
