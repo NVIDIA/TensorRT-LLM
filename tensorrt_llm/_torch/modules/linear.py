@@ -148,15 +148,9 @@ def load_weights_vanilla_helper(module: Linear,
     copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
-        if 'bias' in weights[0]:
-            bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                     module.tp_rank, module.tp_mode, device)
-            copy_weight(module.bias, bias_transform(bias))
-        else:
-            # Some checkpoints omit bias tensors even when the module was
-            # instantiated with bias enabled. In that case, fallback to zeros
-            # so loading can proceed.
-            module.bias.data.zero_()
+        bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+                                 module.tp_rank, module.tp_mode, device)
+        copy_weight(module.bias, bias_transform(bias))
 
 
 def load_weights_fused_qkv_helper(

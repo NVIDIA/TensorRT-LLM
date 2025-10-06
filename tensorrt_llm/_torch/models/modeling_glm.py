@@ -224,7 +224,7 @@ class GLM4Attention(QKNormRoPEAttention):
             fuse_qk_norm_rope=fuse_qk_norm_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
+            dense_bias=False,
             config=model_config,
             aux_stream=aux_stream,
         )
