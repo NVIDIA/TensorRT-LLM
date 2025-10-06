@@ -39,6 +39,10 @@ class FalconH1MLP(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
 
+        if config.hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+                             "Only silu is supported for now.")
+
         # Handle list intermediate_size
         self.intermediate_size = (intermediate_size[0] if isinstance(
             intermediate_size, list) else intermediate_size)
@@ -113,9 +117,7 @@ class FalconH1SSMDecoderLayer(nn.Module):
                                  nheads=config.mamba_n_heads,
                                  n_groups=config.mamba_n_groups,
                                  head_dim=config.mamba_d_head,
-                                 chunk_size=getattr(
-                                     config, "mamba_chunk_size",
-                                     getattr(config, "chunk_size", 128)),
+                                 chunk_size=config.mamba_chunk_size,
                                  layer_idx=layer_idx,
                                  rms_norm_eps=config.rms_norm_eps,
                                  dtype=config.torch_dtype,
@@ -397,3 +399,6 @@ class FalconH1ForCausalLM(DecoderModelForCausalLM[FalconH1Model,
         else:
             new_weights = _normalize_keys(new_weights)
         super().load_weights(new_weights, weight_mapper)
+
+
+# TODO: Take lm_head_multiplier into account
