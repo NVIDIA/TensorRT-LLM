@@ -202,7 +202,7 @@ Additionally, we offer a fully executable script—please refer to [Disaggregate
 
 ## Mixed Precision Context and Generation
 
-In disaggregated serving, the context (prefill) workers and generation (decode) workers have different performance characteristics: prefill workers are typically compute-bound while decode workers are memory-bound. By running these workers with different precisions, we offer better functional support and the ability to interpolate between performance/compute trade-offs between different quantization levels.
+In disaggregated serving, the context (prefill) workers and generation (decode) workers have different performance characteristics: prefill workers are more compute-bound while decode workers are more memory-bound. Therefore, it may be beneficial to run prefill workers in higher precision. Running these workers with different precisions also enables the ability to interpolate between performance/compute trade-offs of different quantization levels.
 
 ### Prerequisites
 
