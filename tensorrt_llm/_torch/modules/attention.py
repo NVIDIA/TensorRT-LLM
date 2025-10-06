@@ -117,6 +117,7 @@ class Attention(nn.Module):
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
+        use_custom_cublas_mm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -219,7 +220,7 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -237,7 +238,7 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
