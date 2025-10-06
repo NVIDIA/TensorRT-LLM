@@ -886,11 +886,18 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                         }
 
                     module_weights.append(fw)
-                module.load_weights(weights=module_weights)
+                try:
+                    module.load_weights(weights=module_weights)
+                except KeyError as key_err:
+                    raise KeyError(f"{key_err} in module {name}") from key_err
             else:
                 module_weights = filter_weights(name, weights)
                 if hasattr(module, 'load_weights'):
-                    module.load_weights(weights=[module_weights])
+                    try:
+                        module.load_weights(weights=[module_weights])
+                    except KeyError as key_err:
+                        raise KeyError(
+                            f"{key_err} in module {name}") from key_err
                 else:
                     for n, p in module._parameters.items():
                         if p is not None:
