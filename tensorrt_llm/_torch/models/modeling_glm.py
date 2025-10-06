@@ -443,7 +443,7 @@ class Deepseekv3MoE(nn.Module):
 
         # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.quant_algo and model_config.quant_config.group_size is not None:
+        if model_config.quant_config and model_config.quant_config.group_size is not None:
             block_size = model_config.quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
@@ -465,7 +465,6 @@ class Deepseekv3MoE(nn.Module):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
-        self.layer_idx = layer_idx
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -667,7 +666,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx)
         else:
             block_size = 1
-            if quant_config and quant_config.quant_algo and quant_config.group_size is not None:
+            if quant_config and quant_config.group_size is not None:
                 block_size = quant_config.group_size
             self.mlp_tp_size = self._compute_mlp_tp_size(
                 config.intermediate_size, block_size)
