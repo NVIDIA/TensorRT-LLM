@@ -956,6 +956,8 @@ class TestLlmError:
             llm.generate([ids])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5560921")
+@skip_ray
 def test_llm_rpc():
     # TODO: remove the with-statement when shutdown hang issue is fixed
     with LLM(model=llama_model_path,
@@ -972,6 +974,8 @@ def test_llm_rpc():
         assert len(res.outputs[0].token_ids) == 10
 
 
+@pytest.mark.skip(reason="https://nvbugs/5560921")
+@skip_ray
 @pytest.mark.asyncio
 async def test_llm_rpc_streaming():
     # TODO: remove the with-statement when shutdown hang issue is fixed
