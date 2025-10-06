@@ -210,7 +210,7 @@ class GLM4Attention(QKNormRoPEAttention):
             )
         else:
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
+                type=PositionEmbeddingType.yarn,
                 rope=RopeParams.from_config(config),
             )
 
