@@ -37,6 +37,8 @@ from ..utils.logger import ad_logger
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 DynamicShapeCallback = Callable[[], DynamicShape]
 
+Constant = Union[int, float, str, None]
+
 
 @dataclass
 class CacheConfig:
@@ -310,12 +312,28 @@ class SequenceInfo:
         return tuple(self.named_args.values())
 
     @property
-    def const_args_for_prepare_metadata(self) -> Tuple:
+    def args_for_prepare_metadata(self) -> Tuple[str, ...]:
+        """Return a tuple of node/tensor arguments for the prepare_metadata op.
+
+        The ``prepare_metadata`` interface expects the following arguments:
+
+        1. ``args_for_prepare_metadata`` as nodes, i.e., as input-dependent tensors.
+        2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
+           to the corresponding ``prepare_metadata`` node/op.
+
+        This interface handles the tensor/node arguments part and can be used by compiler passes
+        like ``insert_cached_attention`` to extract the constant arguments and add them to the
+        ``prepare_metadata`` node/op.
+        """
+        return tuple(self.named_standard_args.keys())
+
+    @property
+    def const_args_for_prepare_metadata(self) -> Tuple[Constant, ...]:
         """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op.
 
         The ``prepare_metadata`` interface expects the following arguments:
 
-        1. ``named_standard_args`` as nodes,i.e., as input-dependent tensors.
+        1. ``args_for_prepare_metadata`` as nodes, i.e., as input-dependent tensors.
         2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
            to the corresponding ``prepare_metadata`` node/op.
 
@@ -784,9 +802,6 @@ class SequenceInfo:
             self._extra_dynamic_shapes_callbacks[name] = lambda: {}
         else:
             self._extra_dynamic_shapes_callbacks[name] = dynamic_shape_callback
-
-
-Constant = Union[int, float, str, None]
 
 
 class MHACallable(Protocol):

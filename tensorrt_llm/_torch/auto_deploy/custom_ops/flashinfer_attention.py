@@ -355,7 +355,7 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
         """Get the source attention op that we target for replacement."""
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
@@ -399,6 +399,21 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Sanity check: layout == "bsnd"
+        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        layout = source_attn_node.kwargs.get("layout", None)
+        if (
+            layout is None
+            and len(source_attn_node.args) > 0
+            and isinstance(source_attn_node.args[-1], str)
+        ):
+            layout = source_attn_node.args[-1]
+        if layout != "bsnd":
+            raise RuntimeError(
+                f"Expected torch_attention layout='bsnd' but got {layout!r} "
+                f"for node: {source_attn_node.format_node()}"
+            )
+
         # Double check other arguments
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
