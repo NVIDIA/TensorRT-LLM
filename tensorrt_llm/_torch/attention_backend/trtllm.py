@@ -406,15 +406,15 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         
-        print(f"[DEBUG] TrtllmAttention.forward - q shape: {q.shape}, \
-            sequence_length shape: {self.sequence_length.shape}, \
-            host_past_key_value_lengths shape: {self.host_past_key_value_lengths.shape}, \
-            context_lengths shape: {self.context_lengths.shape}, \
-            host_context_lengths shape: {self.host_context_lengths.shape}, \
-            host_request_types shape: {self.host_request_types.shape}, \
-            kv_cache_block_offsets shape: {self.kv_cache_block_offsets.shape if self.kv_cache_block_offsets is not None else None}, \
-            k shape: {k.shape if k is not None else None}, v shape: {v.shape if v is not None else None}, output shape: {output.shape if output is not None else None}, output_sf shape: {output_sf.shape if output_sf is not None else None}, \
-            out_dtype: {out_dtype if out_dtype is not None else None}, is_fused_qkv: {is_fused_qkv}, update_kv_cache: {update_kv_cache}, attention_mask: {attention_mask}")
+        #print(f"[DEBUG] TrtllmAttention.forward - q shape: {q.shape}, \
+        #    sequence_length shape: {self.sequence_length.shape}, \
+        #    host_past_key_value_lengths shape: {self.host_past_key_value_lengths.shape}, \
+        #    context_lengths shape: {self.context_lengths.shape}, \
+        #    host_context_lengths shape: {self.host_context_lengths.shape}, \
+        #    host_request_types shape: {self.host_request_types.shape}, \
+        #    kv_cache_block_offsets shape: {self.kv_cache_block_offsets.shape if self.kv_cache_block_offsets is not None else None}, \
+        #    k shape: {k.shape if k is not None else None}, v shape: {v.shape if v is not None else None}, output shape: {output.shape if output is not None else None}, output_sf shape: {output_sf.shape if output_sf is not None else None}, \
+        #    out_dtype: {out_dtype if out_dtype is not None else None}, is_fused_qkv: {is_fused_qkv}, update_kv_cache: {update_kv_cache}, attention_mask: {attention_mask}")
 
         torch.ops.trtllm.attention_inplace(
             q,
@@ -696,12 +696,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 )
 
     def prepare(self, splitBatchOverlap: Optional[int] = None) -> None:
-        print(f"[DEBUG] TrtllmAttention.prepare")
+        print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap}")
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
             if splitBatchOverlap is not None:
-                print(f"[DEBUG] TrtllmAttention.prepare - splitBatchOverlap is not None")
+                #print(f"[DEBUG] TrtllmAttention.prepare - splitBatchOverlap is not None")
                 if splitBatchOverlap == 1:
                     print(f"[DEBUG] TrtllmAttention.prepare - splitBatchOverlap is 1")
                     get_global_attrs().attention_metadata_half1 = weakref.ref(self)
@@ -732,21 +732,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             dtype=torch.int,
             device='cpu',
         )
-        print(f"[DEBUG] TrtllmAttention.prepare - num_seqs: {self.num_seqs}")
+        #print(f"[DEBUG] TrtllmAttention.prepare - num_seqs: {self.num_seqs}")
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
         self.prompt_lens_cuda[:self.num_seqs].copy_(
             self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
-        print(f"[DEBUG] TrtllmAttention.prepare - self.kv_cache_params.use_cache: {self.kv_cache_params.use_cache}")
-        print(f"[DEBUG] TrtllmAttention.prepare - self.kv_cache_params.num_cached_tokens_per_seq: {self.kv_cache_params.num_cached_tokens_per_seq}")
+        #print(f"[DEBUG] TrtllmAttention.prepare - self.kv_cache_params.use_cache: {self.kv_cache_params.use_cache}")
+        #print(f"[DEBUG] TrtllmAttention.prepare - self.kv_cache_params.num_cached_tokens_per_seq: {self.kv_cache_params.num_cached_tokens_per_seq}")
         cached_token_lens = torch.tensor(
             self.kv_cache_params.num_cached_tokens_per_seq,
             dtype=torch.int,
             device='cpu',
         ) if self.kv_cache_params.use_cache else None
-        print(f"[DEBUG] TrtllmAttention.prepare - cached_token_lens: {cached_token_lens}")
-        print(f"[DEBUG] TrtllmAttention.prepare - self.seq_lens_kv: {self.seq_lens_kv}")
+        #print(f"[DEBUG] TrtllmAttention.prepare - cached_token_lens: {cached_token_lens}")
+        #print(f"[DEBUG] TrtllmAttention.prepare - self.seq_lens_kv: {self.seq_lens_kv}")
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
@@ -779,8 +779,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
-            print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap} - self.kv_lens[:self.num_seqs]: {self.kv_lens[:self.num_seqs]}")
-            print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap} - self.kv_cache_manager.max_seq_len: {self.kv_cache_manager.max_seq_len}")
+            #print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap} - self.kv_lens[:self.num_seqs]: {self.kv_lens[:self.num_seqs]}")
+            #print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap} - self.kv_cache_manager.max_seq_len: {self.kv_cache_manager.max_seq_len}")
             assert self.kv_lens[:self.num_seqs].max(
             ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
@@ -792,7 +792,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                                   num_seqs]
 
     def prepare_flash_mla(self) -> None:
-        print(f"[DEBUG] TrtllmAttention.prepare_flash_mla - self.request_ids: {self.request_ids}")
+        #print(f"[DEBUG] TrtllmAttention.prepare_flash_mla - self.request_ids: {self.request_ids}")
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
             self.request_ids).pin_memory()
         num_blocks = block_ids_per_seq.shape[1]
@@ -1122,14 +1122,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_sf: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        print(f"[DEBUG] TrtllmAttention.forward - q shape: {q.shape}, dtype: {q.dtype}")
-        print(f"[DEBUG] TrtllmAttention.forward - k shape: {k.shape if k is not None else None}, dtype: {k.dtype if k is not None else None}")
-        print(f"[DEBUG] TrtllmAttention.forward - v shape: {v.shape if v is not None else None}, dtype: {v.dtype if v is not None else None}")
-        print(f"[DEBUG] TrtllmAttention.forward - attention_input_type: {attention_input_type}")
-        print(f"[DEBUG] TrtllmAttention.forward - latent_cache shape: {latent_cache.shape if latent_cache is not None else None}")
-        print(f"[DEBUG] TrtllmAttention.forward - q_pe shape: {q_pe.shape if q_pe is not None else None}")
-        print(f"[DEBUG] TrtllmAttention.forward - output shape: {output.shape if output is not None else None}")
-        print(f"[DEBUG] TrtllmAttention.forward - attn_metadata: {metadata}")
+        #print(f"[DEBUG] TrtllmAttention.forward - q shape: {q.shape}, dtype: {q.dtype}")
+        #print(f"[DEBUG] TrtllmAttention.forward - k shape: {k.shape if k is not None else None}, dtype: {k.dtype if k is not None else None}")
+        #print(f"[DEBUG] TrtllmAttention.forward - v shape: {v.shape if v is not None else None}, dtype: {v.dtype if v is not None else None}")
+        #print(f"[DEBUG] TrtllmAttention.forward - attention_input_type: {attention_input_type}")
+        #print(f"[DEBUG] TrtllmAttention.forward - latent_cache shape: {latent_cache.shape if latent_cache is not None else None}")
+        #print(f"[DEBUG] TrtllmAttention.forward - q_pe shape: {q_pe.shape if q_pe is not None else None}")
+        #print(f"[DEBUG] TrtllmAttention.forward - output shape: {output.shape if output is not None else None}")
+        #print(f"[DEBUG] TrtllmAttention.forward - attn_metadata: {metadata}")
         
         assert isinstance(
             metadata,
@@ -1157,22 +1157,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
             )
-        print(f"[DEBUG] TrtllmAttention.forward wrapper.plan layer_idx: {self.get_local_layer_idx(metadata)}\
-              tokens_per_block: {metadata.tokens_per_block}, max_num_requests: {metadata.max_num_requests},\
-              max_seq_len: {metadata.max_seq_len}, max_num_tokens: {metadata.max_num_tokens}\
-              attention_window_size: {attention_window_size}, sink_token_length: {0}, beam_width: {metadata.beam_width}\
-              sequence_length: {metadata.kv_lens_cuda_runtime.shape if metadata.kv_lens_cuda_runtime is not None else None}, host_past_key_value_lengths: {metadata.kv_lens_runtime.shape if metadata.kv_lens_runtime is not None else None}\
-              context_lengths: {metadata.prompt_lens_cuda_runtime.shape if metadata.prompt_lens_cuda_runtime is not None else None}, host_context_lengths: {metadata.prompt_lens_cpu_runtime.shape if metadata.prompt_lens_cpu_runtime is not None else None}\
-              host_request_types: {metadata.host_request_types_runtime.shape if metadata.host_request_types_runtime is not None else None}, kv_cache_block_offsets: {metadata.kv_cache_block_offsets.shape if metadata.kv_cache_block_offsets is not None else None}\
-              host_kv_cache_block_offsets: {metadata.host_kv_cache_block_offsets.shape if metadata.host_kv_cache_block_offsets is not None else None}, host_kv_cache_pool_pointers: {metadata.host_kv_cache_pool_pointers.shape if metadata.host_kv_cache_pool_pointers is not None else None}\
-              host_kv_cache_pool_mapping: {metadata.host_kv_cache_pool_mapping.shape if metadata.host_kv_cache_pool_mapping is not None else None}, block_ids_per_seq: {metadata.block_ids_per_seq.shape if metadata.block_ids_per_seq is not None else None}\
-              workspace: {metadata.workspace.shape if metadata.workspace is not None else None}, cache_indirection: {metadata.cache_indirection.shape if metadata.cache_indirection is not None else None}, kv_scale_orig_quant: {self.kv_scale_orig_quant}\
-              kv_scale_quant_orig: {self.kv_scale_quant_orig}, out_scale: {out_scale.shape if out_scale is not None else None}, out_scale_sf: {out_scale_sf.shape if out_scale_sf is not None else None}\
-              latent_cache: {latent_cache.shape if latent_cache is not None else None}, q_pe: {q_pe.shape if q_pe is not None else None}, mrope_config: {mrope_config}, mla_context_paged_kv: {mla_context_paged_kv.shape if mla_context_paged_kv is not None else None}\
-              mla_context_kv_cache_block_offsets: {mla_context_kv_cache_block_offsets.shape if mla_context_kv_cache_block_offsets is not None else None}, softmax_stats_tensor: {softmax_stats_tensor.shape if softmax_stats_tensor is not None else None}\
-              is_spec_decoding_enabled: {metadata.is_spec_decoding_enabled}, use_spec_decoding: {metadata.use_spec_decoding}\
-              spec_decoding_position_offsets: {metadata.spec_decoding_position_offsets.shape if metadata.spec_decoding_position_offsets is not None else None}, spec_decoding_packed_mask: {metadata.spec_decoding_packed_mask.shape if metadata.spec_decoding_packed_mask is not None else None}\
-              spec_decoding_generation_lengths: {metadata.spec_decoding_generation_lengths}")
+        #print(f"[DEBUG] TrtllmAttention.forward wrapper.plan layer_idx: {self.get_local_layer_idx(metadata)}\
+        #      tokens_per_block: {metadata.tokens_per_block}, max_num_requests: {metadata.max_num_requests},\
+        #      max_seq_len: {metadata.max_seq_len}, max_num_tokens: {metadata.max_num_tokens}\
+        #      attention_window_size: {attention_window_size}, sink_token_length: {0}, beam_width: {metadata.beam_width}\
+        #      sequence_length: {metadata.kv_lens_cuda_runtime.shape if metadata.kv_lens_cuda_runtime is not None else None}, host_past_key_value_lengths: {metadata.kv_lens_runtime.shape if metadata.kv_lens_runtime is not None else None}\
+        #      context_lengths: {metadata.prompt_lens_cuda_runtime.shape if metadata.prompt_lens_cuda_runtime is not None else None}, host_context_lengths: {metadata.prompt_lens_cpu_runtime.shape if metadata.prompt_lens_cpu_runtime is not None else None}\
+        #      host_request_types: {metadata.host_request_types_runtime.shape if metadata.host_request_types_runtime is not None else None}, kv_cache_block_offsets: {metadata.kv_cache_block_offsets.shape if metadata.kv_cache_block_offsets is not None else None}\
+        #      host_kv_cache_block_offsets: {metadata.host_kv_cache_block_offsets.shape if metadata.host_kv_cache_block_offsets is not None else None}, host_kv_cache_pool_pointers: {metadata.host_kv_cache_pool_pointers.shape if metadata.host_kv_cache_pool_pointers is not None else None}\
+        #      host_kv_cache_pool_mapping: {metadata.host_kv_cache_pool_mapping.shape if metadata.host_kv_cache_pool_mapping is not None else None}, block_ids_per_seq: {metadata.block_ids_per_seq.shape if metadata.block_ids_per_seq is not None else None}\
+        #      workspace: {metadata.workspace.shape if metadata.workspace is not None else None}, cache_indirection: {metadata.cache_indirection.shape if metadata.cache_indirection is not None else None}, kv_scale_orig_quant: {self.kv_scale_orig_quant}\
+        #      kv_scale_quant_orig: {self.kv_scale_quant_orig}, out_scale: {out_scale.shape if out_scale is not None else None}, out_scale_sf: {out_scale_sf.shape if out_scale_sf is not None else None}\
+        #      latent_cache: {latent_cache.shape if latent_cache is not None else None}, q_pe: {q_pe.shape if q_pe is not None else None}, mrope_config: {mrope_config}, mla_context_paged_kv: {mla_context_paged_kv.shape if mla_context_paged_kv is not None else None}\
+        #      mla_context_kv_cache_block_offsets: {mla_context_kv_cache_block_offsets.shape if mla_context_kv_cache_block_offsets is not None else None}, softmax_stats_tensor: {softmax_stats_tensor.shape if softmax_stats_tensor is not None else None}\
+        #      is_spec_decoding_enabled: {metadata.is_spec_decoding_enabled}, use_spec_decoding: {metadata.use_spec_decoding}\
+        #      spec_decoding_position_offsets: {metadata.spec_decoding_position_offsets.shape if metadata.spec_decoding_position_offsets is not None else None}, spec_decoding_packed_mask: {metadata.spec_decoding_packed_mask.shape if metadata.spec_decoding_packed_mask is not None else None}\
+        #      spec_decoding_generation_lengths: {metadata.spec_decoding_generation_lengths}")
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1227,7 +1227,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
-        print(f"[DEBUG] TrtllmAttention.forward - About to call CUDA kernel with out_dtype: {out_dtype}")
+        #print(f"[DEBUG] TrtllmAttention.forward - About to call CUDA kernel with out_dtype: {out_dtype}")
         output, output_sf = self.wrapper.run(
             q,
             k,
@@ -1242,10 +1242,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if out_dtype == torch.uint8:
             assert output_sf is not None
             result = Fp4QuantizedTensor(output, output_sf)
-            print(f"[DEBUG] TrtllmAttention.forward - Returning Fp4QuantizedTensor with shape: {result.shape}")
+            #print(f"[DEBUG] TrtllmAttention.forward - Returning Fp4QuantizedTensor with shape: {result.shape}")
             return result
         
-        print(f"[DEBUG] TrtllmAttention.forward - Final output shape: {output.shape}, dtype: {output.dtype}")
+        #print(f"[DEBUG] TrtllmAttention.forward - Final output shape: {output.shape}, dtype: {output.dtype}")
         return output
 
     @classmethod

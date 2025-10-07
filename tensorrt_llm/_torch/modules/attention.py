@@ -326,9 +326,11 @@ def extract_extra_attrs(layer_idx: str):
     assert metadata_ref is not None, "Attention metadata is not set"
     if metadata_ref_half1 is not None and metadata_ref_half2 is not None:
         if ping % 2 == 0:
+            print(f"[DEBUG] extract_extra_attrs - {ping} - metadata_ref_half1 {metadata_ref_half1}")
             metadata = metadata_ref_half1()
 
         else:
+            print(f"[DEBUG] extract_extra_attrs - {ping} - metadata_ref_half2 {metadata_ref_half2}")
             metadata = metadata_ref_half2()
         ping += 1
     else:
@@ -336,15 +338,15 @@ def extract_extra_attrs(layer_idx: str):
     assert isinstance(
         metadata,
         TrtllmAttentionMetadata,
-    )
+    ), f"Metadata is not a subclass of TrtllmAttentionMetadata for layer {layer_idx} {metadata}"
 
     mla_layers = extra_attrs.get("mla_layers", None)
     assert mla_layers is not None, "MLA layers is not registered"
     mla_layer_ref = mla_layers.get(layer_idx, None)
     assert mla_layer_ref is not None, f"Cannot find MLA layer for layer {layer_idx}"
     mla_layer = mla_layer_ref()
-    print(f"[DEBUG] extract_extra_attrs - mla_layer: {mla_layer}")
-    print(f"[DEBUG] extract_extra_attrs - mla_layer type: {type(mla_layer)}")
+    # print(f"[DEBUG] extract_extra_attrs - mla_layer: {mla_layer}")
+    # print(f"[DEBUG] extract_extra_attrs - mla_layer type: {type(mla_layer)}")
     assert isinstance(
         mla_layer,
         MLA), "MLA layer must be a subclass of MLA or an instance of MLA"
@@ -361,7 +363,7 @@ def mla_custom_op_inplace(
     output: torch.Tensor,
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx)
-    print(f"[DEBUG] MLA.forward_impl.mla_custom_op_inplace - metadata: {metadata}")
+    # print(f"[DEBUG] MLA.forward_impl.mla_custom_op_inplace - metadata: {metadata}")
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
 
 
@@ -743,8 +745,8 @@ class MLA(nn.Module):
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
                      output: Optional[torch.Tensor] = None) -> torch.Tensor:
-        print(f"[DEBUG] MLA.forward_impl - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-        print(f"[DEBUG] MLA.forward_impl - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        # print(f"[DEBUG] MLA.forward_impl - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] MLA.forward_impl - position_ids shape: {position_ids.shape if position_ids is not None else None}")
         
         """
         Forward pass for the MLA module.
@@ -763,7 +765,7 @@ class MLA(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
-            print(f"[DEBUG] MLA.forward_impl - is_lite mode - q: {q.shape}, compressed_kv: {compressed_kv.shape}, k_pe: {k_pe.shape}")
+            # print(f"[DEBUG] MLA.forward_impl - is_lite mode - q: {q.shape}, compressed_kv: {compressed_kv.shape}, k_pe: {k_pe.shape}")
         else:
             q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
@@ -776,7 +778,7 @@ class MLA(nn.Module):
                 self.ln_events[1],
                 self.aux_stream,
             )
-            print(f"[DEBUG] MLA.forward_impl - full mode - q: {q.shape}, compressed_kv: {compressed_kv.shape}, k_pe: {k_pe.shape}")
+            # print(f"[DEBUG] MLA.forward_impl - full mode - q: {q.shape}, compressed_kv: {compressed_kv.shape}, k_pe: {k_pe.shape}")
 
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
@@ -785,7 +787,7 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        print(f"[DEBUG] MLA.forward_impl - After projections - q: {q.shape}, latent_cache: {latent_cache.shape}")
+        # print(f"[DEBUG] MLA.forward_impl - After projections - q: {q.shape}, latent_cache: {latent_cache.shape}")
 
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -801,7 +803,7 @@ class MLA(nn.Module):
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            print(f"[DEBUG] MLA.forward_impl - Context batch - q_ctx: {q_ctx.shape}, compressed_kv_ctx: {compressed_kv_ctx.shape}")
+            # print(f"[DEBUG] MLA.forward_impl - Context batch - q_ctx: {q_ctx.shape}, compressed_kv_ctx: {compressed_kv_ctx.shape}")
             
             if self.apply_rotary_emb:
                 assert position_ids is not None
@@ -814,7 +816,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 latent_cache_ctx,
                 output=output if num_generations == 0 else None)
-            print(f"[DEBUG] MLA.forward_impl - Context output: {attn_output_context.shape}")
+            # print(f"[DEBUG] MLA.forward_impl - Context output: {attn_output_context.shape}")
             if num_generations == 0:
                 return attn_output_context
         else:
@@ -825,7 +827,7 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            print(f"[DEBUG] MLA.forward_impl - Generation batch - q_gen: {q_gen.shape}, compressed_kv_gen: {compressed_kv_gen.shape}")
+            # print(f"[DEBUG] MLA.forward_impl - Generation batch - q_gen: {q_gen.shape}, compressed_kv_gen: {compressed_kv_gen.shape}")
             
             if self.apply_rotary_emb:
                 assert position_ids is not None
@@ -838,7 +840,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 latent_cache_gen,
                 output=output if num_contexts == 0 else None)
-            print(f"[DEBUG] MLA.forward_impl - Generation output: {attn_output_gen.shape}")
+            # print(f"[DEBUG] MLA.forward_impl - Generation output: {attn_output_gen.shape}")
             if num_contexts == 0:
                 return attn_output_gen
         else:
@@ -864,7 +866,7 @@ class MLA(nn.Module):
         output[attn_output_context.shape[0]:, :] = attn_output_gen
         attn_output_context = None
         attn_output_gen = None
-        print(f"[DEBUG] MLA.forward_impl - Final combined output: {output.shape}")
+        # print(f"[DEBUG] MLA.forward_impl - Final combined output: {output.shape}")
         return output
 
     def _maybe_concat_qkv(self, q, k, v):
@@ -1237,7 +1239,7 @@ class MLA(nn.Module):
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
-        print(f"[DEBUG] MLA.forward_genertion {attn_metadata.is_cross} {attn_metadata}")
+        # print(f"[DEBUG] MLA.forward_genertion {attn_metadata.is_cross} {attn_metadata}")
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,
@@ -1278,7 +1280,7 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-        print(f"[DEBUG] MLA.forward_generation - output shape: {output.shape}, dtype: {output.dtype}")
+        # print(f"[DEBUG] MLA.forward_generation - output shape: {output.shape}, dtype: {output.dtype}")
         return output
 
     def forward(
@@ -1288,27 +1290,27 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
-        print(f"[DEBUG] MLA.forward - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-        print(f"[DEBUG] MLA.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
-        print(f"[DEBUG] MLA.forward - attn_metadata: {attn_metadata}")
+        # print(f"[DEBUG] MLA.forward - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] MLA.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        # print(f"[DEBUG] MLA.forward - attn_metadata: {attn_metadata}")
         
         attn_output = self.create_output(hidden_states)
-        print(f"[DEBUG] MLA.forward - Created output tensor shape: {attn_output.shape}, dtype: {attn_output.dtype}")
+        # print(f"[DEBUG] MLA.forward - Created output tensor shape: {attn_output.shape}, dtype: {attn_output.dtype}")
         
         if self.register_to_config:
-            print(f"[DEBUG] MLA.forward - Using custom op for layer {self.layer_idx_str}")
+            # print(f"[DEBUG] MLA.forward - Using custom op for layer {self.layer_idx_str}")
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
                                                    attn_output)
         else:
-            print(f"[DEBUG] MLA.forward - Using forward_impl")
+            # print(f"[DEBUG] MLA.forward - Using forward_impl")
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
                               output=attn_output)
         
-        print(f"[DEBUG] MLA.forward - Before o_proj, attn_output shape: {attn_output.shape}")
+        # print(f"[DEBUG] MLA.forward - Before o_proj, attn_output shape: {attn_output.shape}")
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
-        print(f"[DEBUG] MLA.forward - After o_proj, attn_output shape: {attn_output.shape}, dtype: {attn_output.dtype}")
+        # print(f"[DEBUG] MLA.forward - After o_proj, attn_output shape: {attn_output.shape}, dtype: {attn_output.dtype}")
         return attn_output

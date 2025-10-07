@@ -314,6 +314,12 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_backend = None
 
+        self.enable_split_batch_overlap = os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP") == "1"
+        self.enable_split_batch_overlap_local_bs = int(os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS",0))
+        self.enable_split_batch_overlap_split_bs = int(os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS",0)) # will be typically half of the above
+        if self.enable_split_batch_overlap:
+            assert self.enable_split_batch_overlap_local_bs > 0 and self.enable_split_batch_overlap_split_bs > 0, "ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS and ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS must be set"
+
         try:
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
@@ -1435,50 +1441,47 @@ class PyTorchModelEngine(ModelEngine):
             num_extra_kv_tokens=0 if self.spec_config is None else
             self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
-
-        print(f"[DEBUG] TrtllmAttention.prepare (full)) - attn_metadata.kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}")
+        print(f"[DEBUG] TrtllmAttention.prepare - attn_metadata")
         attn_metadata.prepare()
-
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata)
         
         attn_metadata_half1 = None
         attn_metadata_half2 = None
-        if attn_metadata.num_contexts == 0 and len(attn_metadata.request_ids) == 64 and os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP") == "1":
-            print(f"[DEBUG] TrtllmAttention.prepare - {attn_metadata}")
+        if attn_metadata.num_contexts == 0 and len(attn_metadata.request_ids) == self.enable_split_batch_overlap_local_bs and self.enable_split_batch_overlap:
             attn_metadata_half1 = copy.copy(attn_metadata)
-            attn_metadata_half1.max_num_requests = 32
-            attn_metadata_half1.max_num_sequences = 32
+            attn_metadata_half1.max_num_requests = self.enable_split_batch_overlap_split_bs #32
+            attn_metadata_half1.max_num_sequences = self.enable_split_batch_overlap_split_bs #32
             attn_metadata_half1.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
             #attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
-            attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
-            attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:32,:,:]
-            attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:32,:,:]
-            attn_metadata_half1.seq_lens = attn_metadata.seq_lens[:32]
+            attn_metadata_half1.kv_cache_manager.tokens_per_block = self.enable_split_batch_overlap_split_bs #32
+            attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,self.enable_split_batch_overlap_split_bs:,:,:]
+            attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:self.enable_split_batch_overlap_split_bs,:,:]
+            attn_metadata_half1.seq_lens = attn_metadata.seq_lens[:self.enable_split_batch_overlap_split_bs]
             # This is done as is_cross check is seq_lens_kv and seq_lens are the same tensor
             attn_metadata_half1.seq_lens_kv = attn_metadata_half1.seq_lens
-            attn_metadata_half1.prompt_lens = attn_metadata.prompt_lens[:32]
-            attn_metadata_half1.request_ids = attn_metadata.request_ids[:32]
+            attn_metadata_half1.prompt_lens = attn_metadata.prompt_lens[:self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half1.request_ids = attn_metadata.request_ids[:self.enable_split_batch_overlap_split_bs]
             attn_metadata_half1.kv_cache_params = copy.copy(attn_metadata.kv_cache_params)
-            attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq = copy.copy(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:32])
+            attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq = copy.copy(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:self.enable_split_batch_overlap_split_bs])
             attn_metadata_half1.on_update()
             print(f"[DEBUG] TrtllmAttention.prepare (half1) - attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq: {attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq}")
             attn_metadata_half1.prepare(splitBatchOverlap=1)
 
             attn_metadata_half2 = copy.copy(attn_metadata)
-            attn_metadata_half2.max_num_requests = 32
-            attn_metadata_half2.max_num_sequences = 32
+            attn_metadata_half2.max_num_requests = self.enable_split_batch_overlap_split_bs
+            attn_metadata_half2.max_num_sequences = self.enable_split_batch_overlap_split_bs
             attn_metadata_half2.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
             #attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
-            attn_metadata_half2.kv_cache_manager.tokens_per_block = 32
-            attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,32:,:,:]
-            attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,32:,:,:]
-            attn_metadata_half2.seq_lens = attn_metadata.seq_lens[32:]
+            attn_metadata_half2.kv_cache_manager.tokens_per_block = self.enable_split_batch_overlap_split_bs #32
+            attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,self.enable_split_batch_overlap_split_bs:,:,:]
+            attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,self.enable_split_batch_overlap_split_bs:,:,:]
+            attn_metadata_half2.seq_lens = attn_metadata.seq_lens[self.enable_split_batch_overlap_split_bs:]
             attn_metadata_half2.seq_lens_kv = attn_metadata_half2.seq_lens
-            attn_metadata_half2.prompt_lens = attn_metadata.prompt_lens[32:]
-            attn_metadata_half2.request_ids = attn_metadata.request_ids[32:]
+            attn_metadata_half2.prompt_lens = attn_metadata.prompt_lens[self.enable_split_batch_overlap_split_bs:]
+            attn_metadata_half2.request_ids = attn_metadata.request_ids[self.enable_split_batch_overlap_split_bs:]
             attn_metadata_half2.kv_cache_params = copy.copy(attn_metadata.kv_cache_params)
-            attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq = copy.copy(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[32:])
+            attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq = copy.copy(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[self.enable_split_batch_overlap_split_bs:])
             attn_metadata_half2.on_update() 
             print(f"[DEBUG] TrtllmAttention.prepare (half2) - attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq: {attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq}")
             attn_metadata_half2.prepare(splitBatchOverlap=2)
@@ -2140,11 +2143,13 @@ class PyTorchModelEngine(ModelEngine):
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
-        print(f"[DEBUG] model_forward - kwargs: {kwargs['attn_metadata']}")
+        print(f"[DEBUG] model_forward setting attention_metadata in attrs")
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
         if 'attn_metadata_half1' in kwargs and kwargs['attn_metadata_half1'] is not None:
+            print(f"[DEBUG] model_forward setting attention_metadata_half1 in attrs")
             attrs["attention_metadata_half1"] = weakref.ref(kwargs['attn_metadata_half1'])
         if 'attn_metadata_half2' in kwargs and kwargs['attn_metadata_half2'] is not None:
+            print(f"[DEBUG] model_forward setting attention_metadata_half2 in attrs")
             attrs["attention_metadata_half2"] = weakref.ref(kwargs['attn_metadata_half2'])
         attrs.update(self.model.model_config.extra_attrs)
 
@@ -2158,50 +2163,41 @@ class PyTorchModelEngine(ModelEngine):
                       inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
-        print(f"[DEBUG] _forward_step - Input keys: {list(inputs.keys())}")
-        for key, value in inputs.items():
-            if hasattr(value, 'shape'):
-                print(f"[DEBUG] _forward_step - {key} shape: {value.shape}, dtype: {value.dtype}")
-            elif isinstance(value, (list, tuple)):
-                print(f"[DEBUG] _forward_step - {key}: {type(value)} with {len(value)} elements")
-            else:
-                print(f"[DEBUG] _forward_step - {key}: {type(value)}")
+        #print(f"[DEBUG] _forward_step - Input keys: {list(inputs.keys())}")
         
-        if gather_ids is not None:
-            print(f"[DEBUG] _forward_step - gather_ids shape: {gather_ids.shape}, dtype: {gather_ids.dtype}")
-        
+       
         inputs = self._preprocess_inputs(inputs)
-        print(f"[DEBUG] _forward_step - After _preprocess_inputs, keys: {list(inputs.keys())}")
+        #print(f"[DEBUG] _forward_step - After _preprocess_inputs, keys: {list(inputs.keys())}")
         
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
-            print(f"[DEBUG] _forward_step - Updated gather_ids from spec_metadata: {gather_ids.shape if gather_ids is not None else None}")
+            #print(f"[DEBUG] _forward_step - Updated gather_ids from spec_metadata: {gather_ids.shape if gather_ids is not None else None}")
         
         if self.without_logits:
-            print(f"[DEBUG] _forward_step - Calling model_forward without logits")
+            #print(f"[DEBUG] _forward_step - Calling model_forward without logits")
             outputs = self.model_forward(**inputs)
-            print(f"[DEBUG] _forward_step - Output keys: {list(outputs.keys())}")
-            for key, value in outputs.items():
-                if hasattr(value, 'shape'):
-                    print(f"[DEBUG] _forward_step - output.{key} shape: {value.shape}, dtype: {value.dtype}")
+            #print(f"[DEBUG] _forward_step - Output keys: {list(outputs.keys())}")
+            #for key, value in outputs.items():
+                #if hasattr(value, 'shape'):
+                    #print(f"[DEBUG] _forward_step - output.{key} shape: {value.shape}, dtype: {value.dtype}")
             return outputs
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        print(f"[DEBUG] _forward_step - Calling model_forward with return_context_logits={gather_ids is not None or gather_context_logits}")
+        #print(f"[DEBUG] _forward_step - Calling model_forward with return_context_logits={gather_ids is not None or gather_context_logits}")
         logits = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
-        print(f"[DEBUG] _forward_step - Raw logits shape: {logits.shape}, dtype: {logits.dtype}")
+        #print(f"[DEBUG] _forward_step - Raw logits shape: {logits.shape}, dtype: {logits.dtype}")
         
         if gather_ids is not None:
             gathered_logits = logits[gather_ids]
-            print(f"[DEBUG] _forward_step - Gathered logits shape: {gathered_logits.shape}, dtype: {gathered_logits.dtype}")
+            #print(f"[DEBUG] _forward_step - Gathered logits shape: {gathered_logits.shape}, dtype: {gathered_logits.dtype}")
             return {'logits': gathered_logits}
         else:
-            print(f"[DEBUG] _forward_step - Returning original logits")
+            #print(f"[DEBUG] _forward_step - Returning original logits")
             return {'logits': logits}
 
     def _init_userbuffers(self, hidden_size):

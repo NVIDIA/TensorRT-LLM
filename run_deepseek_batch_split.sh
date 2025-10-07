@@ -13,6 +13,7 @@ multi_round=1
 disable_overlap_scheduler="false"
 
 # Default batch split configuration
+ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP=${ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP:-0}
 USE_BATCH_SPLIT_MODEL="true"
 BATCH_SPLIT_RATIO=0.5
 USE_SEPARATE_STREAMS="true"
@@ -259,15 +260,21 @@ run_dep_benchmark() {
 
     nsys_prefix=""
     # check NSYS_MODE is not empty
+    # removed -t python-gil due to DLB issue
     if [ "${nsys_on}" == "true" ]; then
-        nsys_file=${sub_dir}/nsys_worker_proc_${SLURM_PROCID}
-        nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
+        nsys_file=${sub_dir}/nsys_worker_proc_stream_ovlp${ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP}
+        nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=all"
         export TLLM_PROFILE_START_STOP=700-750
         export TLLM_PROFILE_RECORD_GC=1
         export TLLM_NVTX_DEBUG=1
     fi
-
-    trtllm-bench -m ${model_card} --model_path ${model_path} throughput \
+    if [ "${ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP}" == "1" ]; then
+        export ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS=${max_batch_size}
+        export ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS=$((${max_batch_size}/2))
+        echo "ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS: ${ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS}"
+        echo "ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS: ${ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS}"
+    fi
+    ${nsys_prefix} trtllm-bench -m ${model_card} --model_path ${model_path} throughput \
         --tp ${tp} \
         --ep ${ep} \
         --warmup 0 \
