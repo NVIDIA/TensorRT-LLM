@@ -4,6 +4,10 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
+
+from .utils import get_shared_pool
+
 
 @dataclass
 class BufferBlock:
@@ -80,9 +84,23 @@ class Buffers:
 
         # No suitable buffer was found, so allocate a new one.
         # The new buffer is created with uint8 to represent raw bytes.
-        new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                        device='cuda',
-                                        dtype=torch.uint8)
+        new_buffer_tensor = None
+        try:
+            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
+                new_buffer_tensor = torch.zeros((required_memory_size, ),
+                                                device='cuda',
+                                                dtype=torch.uint8)
+        except Exception as ex:
+            # Need to check if this is an OOM exception
+            logger.debug(
+                f"Exception happened to create tensor from given memory pool: {str(ex)}"
+            )
+            # if exception happens during allocating memory from shared pool, retry
+            # to allocate from default pool
+            new_buffer_tensor = torch.zeros((required_memory_size, ),
+                                            device='cuda',
+                                            dtype=torch.uint8)
+
         new_block = BufferBlock(buffer=new_buffer_tensor,
                                 is_reserved=reserve_buffer)
 

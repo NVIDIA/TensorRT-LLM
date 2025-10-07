@@ -48,7 +48,8 @@ from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
-                     set_torch_compiling, with_model_extra_attrs)
+                     set_shared_mem_pool, set_torch_compiling,
+                     with_model_extra_attrs)
 from .config import PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
@@ -2209,35 +2210,35 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
-
-            if not maybe_graph:
-                # Fallback to eager execution if graph was not used
-                with MoeLoadBalancerIterContext(moe_load_balancer):
-                    outputs = self._forward_step(inputs, gather_ids,
-                                                 gather_context_logits)
-            else:
-                if self.cuda_graph_runner.needs_capture(key):
-
-                    def capture_forward_fn(inputs: Dict[str, Any]):
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
-                            return self._forward_step(
-                                inputs,
-                                gather_ids=gather_ids,
-                                gather_context_logits=gather_context_logits)
-
-                    def capture_postprocess_fn(inputs: Dict[str, Any]):
-                        self._postprocess_inputs(inputs)
-
-                    self.cuda_graph_runner.capture(key, capture_forward_fn,
-                                                   inputs,
-                                                   capture_postprocess_fn)
-
-                    # here we don't need to use context since cuda graph capture didn't run kernel.
-                    # maybe we need a cleaner way to do this.
-                    outputs = self.cuda_graph_runner.replay(key, inputs)
-                else:
+            with set_shared_mem_pool(self.cuda_graph_runner.get_graph_pool()):
+                if not maybe_graph:
+                    # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = self._forward_step(inputs, gather_ids,
+                                                     gather_context_logits)
+                else:
+                    if self.cuda_graph_runner.needs_capture(key):
+
+                        def capture_forward_fn(inputs: Dict[str, Any]):
+                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                                return self._forward_step(
+                                    inputs,
+                                    gather_ids=gather_ids,
+                                    gather_context_logits=gather_context_logits)
+
+                        def capture_postprocess_fn(inputs: Dict[str, Any]):
+                            self._postprocess_inputs(inputs)
+
+                        self.cuda_graph_runner.capture(key, capture_forward_fn,
+                                                       inputs,
+                                                       capture_postprocess_fn)
+
+                        # here we don't need to use context since cuda graph capture didn't run kernel.
+                        # maybe we need a cleaner way to do this.
                         outputs = self.cuda_graph_runner.replay(key, inputs)
+                    else:
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            outputs = self.cuda_graph_runner.replay(key, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
