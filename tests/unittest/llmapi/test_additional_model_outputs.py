@@ -57,6 +57,7 @@ class DummyModel(torch.nn.Module):
     def forward(self,
                 *args,
                 input_ids: torch.Tensor,
+                position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata,
                 return_context_logits: bool = False,
                 **kwargs) -> torch.Tensor:
@@ -79,13 +80,15 @@ class DummyModel(torch.nn.Module):
             # For context logits, return logits for all positions
             logits = logits[last_tokens]
 
-        # Context output: fixed values for testing, one output per input token
-        context_output = torch.ones(
-            (num_batch_tokens, hidden_size), device='cuda') * 0.2
+        # Context output: values depend on position for testing, one output per input token
+        context_output = (
+            position_ids.reshape(-1, 1).expand(num_batch_tokens, hidden_size) *
+            0.2)
 
-        # Generation output: fixed values for testing, one output per sequence
-        generation_output = torch.ones(
-            (num_batch_tokens, hidden_size), device='cuda') * 0.3
+        # Generation output: values depend on position for testing, one output per sequence
+        generation_output = (
+            position_ids.reshape(-1, 1).expand(num_batch_tokens, hidden_size) *
+            0.3)
         generation_output = generation_output[last_tokens]
 
         return {
@@ -232,11 +235,14 @@ def test_additional_model_outputs_integration():
             # Verify tensor shapes are reasonable
             context_output = sequence.additional_context_outputs[
                 "context_output"]
+            context_generation_output = sequence.additional_generation_outputs[
+                "context_output"]
             generation_output = sequence.additional_generation_outputs[
                 "generation_output"]
 
             # Verify that the outputs are tensors
             assert isinstance(context_output, torch.Tensor)
+            assert isinstance(context_generation_output, torch.Tensor)
             assert isinstance(generation_output, torch.Tensor)
 
             # Verify context output shape
@@ -244,11 +250,42 @@ def test_additional_model_outputs_integration():
             assert context_output.shape[0] == prompt_lens[i]
             assert context_output.shape[1] == config.hidden_size
 
+            expected_context_output = torch.arange(
+                prompt_lens[i], dtype=torch.float32).unsqueeze(1).expand(
+                    prompt_lens[i], config.hidden_size) * 0.2
+
+            assert torch.equal(context_output, expected_context_output)
+
+            # Verify context generation output shape
+            assert context_generation_output.dim() == 3
+            assert context_generation_output.shape[0] == num_generated_tokens
+            assert context_generation_output.shape[1] == max_beam_width
+            assert context_generation_output.shape[2] == config.hidden_size
+
+            gen_start_idx = prompt_lens[i] - 1
+            gen_end_idx = gen_start_idx + num_generated_tokens
+
+            expected_context_generation_output = torch.arange(
+                gen_start_idx, gen_end_idx,
+                dtype=torch.float32).unsqueeze(1).expand(
+                    num_generated_tokens, config.hidden_size) * 0.2
+
+            assert torch.equal(context_generation_output,
+                               expected_context_generation_output.unsqueeze(1))
+
             # Verify generation output shape
             assert generation_output.dim() == 3
             assert generation_output.shape[0] == num_generated_tokens
             assert generation_output.shape[1] == max_beam_width
             assert generation_output.shape[2] == config.hidden_size
+
+            expected_generation_output = torch.arange(
+                gen_start_idx, gen_end_idx,
+                dtype=torch.float32).unsqueeze(1).expand(
+                    num_generated_tokens, config.hidden_size) * 0.3
+
+            assert torch.equal(generation_output,
+                               expected_generation_output.unsqueeze(1))
 
 
 if __name__ == "__main__":
