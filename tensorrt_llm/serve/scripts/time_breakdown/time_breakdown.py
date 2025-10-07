@@ -269,7 +269,7 @@ class RequestTimeBreakdown:
 
     def create_timing_diagram(self,
                               timing_data: List[Dict],
-                              output_file: str = None):
+                              output_file: Optional[str] = None):
         """Create an interactive HTML stacked bar chart showing time breakdown."""
         if not timing_data:
             print("No timing data to visualize.")
