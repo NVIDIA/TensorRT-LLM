@@ -1,0 +1,8 @@
+moe_backend: TRTLLM
+use_cuda_graph: true
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
+  use_relaxed_acceptance_for_thinking: true
+  relaxed_topk: 10
+  relaxed_delta: 0.6
