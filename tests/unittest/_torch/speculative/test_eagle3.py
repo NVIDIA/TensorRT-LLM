@@ -28,9 +28,18 @@ def enforce_single_worker(monkeypatch):
         [True, "TRTLLM", True, False, False, False, True, False, False, False],
         [True, "TRTLLM", True, False, False, False, False, False, False, False],
         [False, "TRTLLM", True, False, False, False, True, False, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True, False, False, False],
-        [False, "FLASHINFER", True, False, False, False, True, False, False, False],
+        [
+            False, "TRTLLM", True, False, False, False, False, False, False,
+            False
+        ],
+        [
+            True, "FLASHINFER", True, False, False, False, True, False, False,
+            False
+        ],
+        [
+            False, "FLASHINFER", True, False, False, False, True, False, False,
+            False
+        ],
         [False, "TRTLLM", False, True, True, False, True, False, False, False],
         [True, "TRTLLM", False, True, True, False, True, False, False, False],
         [True, "TRTLLM", True, False, True, True, True, False, False, False],
@@ -38,10 +47,37 @@ def enforce_single_worker(monkeypatch):
         # TODO: nvbugs/5461761
         # [True, "TRTLLM", True, False, False, True, True, False, False, False],
         [True, "TRTLLM", False, False, False, False, True, False, False, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False, False],
+        [
+            False, "TRTLLM", False, False, False, False, True, False, False,
+            False
+        ],
         [True, "TRTLLM", False, False, False, False, False, True, False, False],
         [True, "TRTLLM", False, False, False, False, False, True, True, False],
-        [True, "TRTLLM", False, True, True, True, True, True, True, True],
+        [
+            False, "TRTLLM", False, False, False, False, False, True, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, False, True, True, False, False],
+        [False, "TRTLLM", False, False, False, False, True, True, False, False],
+        [
+            True, "TRTLLM", False, False, False, False, False, False, False,
+            False
+        ],
+        [
+            False, "TRTLLM", False, False, False, False, False, False, False,
+            False
+        ],
+        [True, "TRTLLM", False, False, False, True, True, False, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False, False],
+        [
+            True, "FLASHINFER", False, False, False, False, True, False, False,
+            False
+        ],
+        [
+            False, "FLASHINFER", False, False, False, False, True, False, False,
+            False
+        ],
+        [True, "TRTLLM", False, True, True, True, True, True, True, True, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
