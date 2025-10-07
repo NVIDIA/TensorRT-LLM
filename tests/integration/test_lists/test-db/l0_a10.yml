@@ -19,6 +19,7 @@ l0_a10:
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
+  - unittest/others/test_time_breakdown.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]

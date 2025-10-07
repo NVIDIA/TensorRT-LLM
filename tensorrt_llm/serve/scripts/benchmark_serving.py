@@ -44,7 +44,8 @@ from tensorrt_llm.serve.scripts.benchmark_dataset import (
     HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
     SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
-    convert_to_pytorch_benchmark_format, write_to_json, RequestTimingBreakdown)
+    convert_to_pytorch_benchmark_format, write_to_json)
+from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -906,7 +907,7 @@ def main(args: argparse.Namespace):
         save_to_pytorch_benchmark_format(args, result_json, file_name)
 
     # Save per-request breakdown if requested
-    if args.save_request_timing_breakdown:
+    if args.save_request_time_breakdown:
         print("Fetching request performance metrics...")
         perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
 
@@ -929,25 +930,24 @@ def main(args: argparse.Namespace):
 
             # Create timing diagram from the saved JSON file
             try:
-                analyzer = RequestTimingBreakdown()
+                analyzer = RequestTimeBreakdown()
 
-                print(
-                    "Creating timing diagram from request timing breakdown...")
+                print("Creating time diagram from request time breakdown...")
                 timing_data = analyzer.parse_json_file(perf_filename)
 
                 if timing_data:
                     # Generate HTML filename for the timing diagram
-                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-timing_diagram.html"
+                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
                     analyzer.create_timing_diagram(timing_data,
                                                    diagram_filename)
 
-                    print(f"Timing diagram saved to: {diagram_filename}")
+                    print(f"Time diagram saved to: {diagram_filename}")
                 else:
                     print(
-                        "No timing data found in request timing breakdown - skipping diagram creation."
+                        "No time data found in request time breakdown - skipping diagram creation."
                     )
             except Exception as e:
-                print(f"Failed to create timing diagram: {e}")
+                print(f"Failed to create time diagram: {e}")
                 print("Performance metrics were still saved successfully.")
         else:
             print("Failed to fetch per-request performance metrics.")
@@ -1336,10 +1336,10 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--save-request-timing-breakdown",
+        "--save-request-time-breakdown",
         action="store_true",
         help=
-        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive timing diagram.",
+        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
     )
 
     args = parser.parse_args()
