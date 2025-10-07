@@ -202,7 +202,7 @@ Additionally, we offer a fully executable script—please refer to [Disaggregate
 
 ## Mixed Precision Context and Generation
 
-In disaggregated serving, the context (prefill) workers and generation (decode) workers have different performance characteristics: prefill workers are more compute-bound while decode workers are more memory-bound. Therefore, it may be beneficial to run prefill workers in higher precision. Running these workers with different precisions also enables the ability to interpolate between performance/compute trade-offs of different quantization levels.
+In disaggregated serving, the context workers and generation workers have different performance characteristics: context workers are compute-bound while generation workers are memory-bound. Therefore, it may be beneficial to run context workers in higher precision. Running these workers with different precisions also enables the ability to interpolate between performance/compute trade-offs of different quantization levels.
 
 ### Prerequisites
 
@@ -211,7 +211,7 @@ To enable mixed precision serving, you'll need:
 2. The original unquantized checkpoint
 3. Both checkpoints must use the same KV cache dtype to ensure compatibility during transfer
 
-### Example (BF 16 Prefill, FP 8 Decode)
+### Example (BF 16 Gen, FP 8 Ctx)
 
 A quantized checkpoint can be created `--kv_cache_qformat none`.
 
