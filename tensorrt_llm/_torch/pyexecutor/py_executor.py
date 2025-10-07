@@ -1928,6 +1928,27 @@ class PyExecutor:
 
         return self.kv_cache_transceiver.cancel_request(request)
 
+    def _is_request_in_transmission(self, request) -> bool:
+        """Check if a request is currently in transmission state."""
+        return (request.state
+                == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                or request.state
+                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+
+    def _try_cancel_request(self, request) -> bool:
+        """Check if a request can be canceled and attempt cancellation if needed.
+
+        Returns:
+            bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
+        """
+        if self.kv_cache_transceiver is None:
+            return True
+
+        if not self._is_request_in_transmission(request):
+            return True
+
+        return self.kv_cache_transceiver.cancel_request(request)
+
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if self.executor_request_queue.get_canceled_req_ids_size() == 0:
