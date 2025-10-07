@@ -771,13 +771,11 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs with relaxed tolerance for FP8
