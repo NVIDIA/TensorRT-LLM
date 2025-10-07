@@ -25,6 +25,11 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import Session, TensorInfo
 
+try:
+    import ray
+except ImportError:
+    import tensorrt_llm.ray_stub as ray
+
 
 def ASSERT_DRV(err):
     if isinstance(err, cuda.CUresult):
@@ -451,3 +456,32 @@ def check_accuracy(a, b, atol, rtol, percent):
 skip_ray = pytest.mark.skipif(
     os.environ.get("TLLM_DISABLE_MPI") == "1",
     reason="This test is skipped for Ray orchestrator.")
+
+
+@contextmanager
+def try_expose_error_in_ray(error_type: type[Exception]):
+
+    if os.environ.get("TLLM_DISABLE_MPI") != "1":
+        yield
+        return
+
+    try:
+        yield
+    except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError) as e:
+        if hasattr(e, 'cause') and e.cause is not None:
+            raise e.cause
+
+        if hasattr(e, 'error_msg'):
+            import re
+            error_str = str(e.error_msg)
+
+            error_type_name = error_type.__name__
+            pattern = rf'{error_type_name}:\s*(.+?)(?:\n|$)'
+            matches = re.findall(pattern, error_str, re.DOTALL)
+
+            if matches:
+                error_message = matches[-1].strip()
+                raise error_type(error_message)
+
+        # If not found, raise the original Ray error
+        raise e

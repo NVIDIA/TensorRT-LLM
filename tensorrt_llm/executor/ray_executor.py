@@ -224,11 +224,14 @@ class RayExecutor(GenerationExecutor):
         self.workers = None
         if hasattr(self,
                    "placement_group") and self.placement_group is not None:
-            ray.util.remove_placement_group(self.placement_group)
+            # Only remove placement group if Ray is still initialized
+            # to avoid triggering auto_init_ray() during program exit
+            if ray.is_initialized():
+                ray.util.remove_placement_group(self.placement_group)
             self.placement_group = None
         self.bundle_indices = None
 
-        if self.has_start_local_cluser:
+        if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
 
