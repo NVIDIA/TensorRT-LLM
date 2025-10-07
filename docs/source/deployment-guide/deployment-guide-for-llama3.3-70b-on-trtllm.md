@@ -1,4 +1,4 @@
-# Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell & Hopper Hardware
+# Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
@@ -39,7 +39,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6 \
+nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
 /bin/bash
 ```
 
@@ -52,21 +52,12 @@ Note:
 
 If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
 
-### Creating the TensorRT LLM Server config
+### Recommended Performance Settings
 
-We create a YAML configuration file /tmp/config.yml for the TensorRT LLM Server and populate it with the following recommended performance settings.
+We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. You can use these out-of-the-box, or adjust them to your specific use case.
 
 ```shell
-EXTRA_LLM_API_FILE=/tmp/config.yml
-
-cat << EOF > ${EXTRA_LLM_API_FILE}
-enable_attention_dp: false
-cuda_graph_config:
-  enable_padding: true
-  max_batch_size: 1024
-kv_cache_config:
-  dtype: fp8
-EOF
+EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/llama-3.3-70b.yaml
 ```
 
 ### Launch the TensorRT LLM Server

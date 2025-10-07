@@ -1,0 +1,8 @@
+enable_attention_dp: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 720
+moe_config:
+  backend: TRTLLM
+stream_interval: 20
+num_postprocess_workers: 4

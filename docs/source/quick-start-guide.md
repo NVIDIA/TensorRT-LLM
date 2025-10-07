@@ -5,7 +5,9 @@
 This is the starting point to try out TensorRT LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT LLM.
 
 
-## Launch Docker on a node with NVIDIA GPUs deployed
+## Launch Docker Container
+
+The [TensorRT LLM container](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) maintained by NVIDIA contains all of the required dependencies pre-installed. You can start the container on a machine with NVIDIA GPUs via:
 
 ```bash
 docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:x.y.z
@@ -13,7 +15,7 @@ docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=671
 
 
 (deploy-with-trtllm-serve)=
-## Deploy online serving with trtllm-serve
+## Deploy Online Serving with trtllm-serve
 
 You can use the `trtllm-serve` command to start an OpenAI compatible server to interact with a model.
 To start the server, you can run a command like the following example inside a Docker container:
@@ -23,7 +25,7 @@ trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
 ```{note}
-If you are running trtllm-server inside a Docker container, you have two options for sending API requests:
+If you are running `trtllm-serve` inside a Docker container, you have two options for sending API requests:
 1. Expose a port (e.g., 8000) to allow external access to the server from outside the container.
 2. Open a new terminal and use the following command to directly attach to the running container:
 ```bash
@@ -77,7 +79,7 @@ _Example Output_
 
 For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve/trtllm-serve.rst) section.
 
-## Run Offline inference with LLM API
+## Run Offline Inference with LLM API
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single `LLM` instance.
 
 Here is a simple example to show how to use the LLM API with TinyLlama.
@@ -89,6 +91,25 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 
 You can also directly load pre-quantized models [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
 To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
+
+## Quick Start for Popular Models
+
+Below is a table containing one-line `trtllm-serve` commands that can be used to easily deploy popular models including DeepSeek-R1, gpt-oss, Llama 4, Qwen3, and more. The CLI options and LLM API configuration settings have been tuned for the listed inference scenarios, though you may be able to improve performance further with additional tuning for your use case.
+
+We maintain the LLM API configuration files with recommended settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. The `trtllm-serve` commands below are designed to be run within the TensorRT LLM Docker container since the config files will be available at `/app/tensorrt_llm/examples/configs`. 
+
+This table is designed to be simple; for detailed model-specific deployment guides, check out the [Model Recipes](deployment-guide/index.rst).
+
+| Model Name | GPU | Inference Scenario | Command |
+|------|------|------|------|
+| [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) | H100, H200 | Max Throughput | `trtllm-serve deepseek-ai/DeepSeek-R1-0528 --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 1024 --max_num_tokens 3200 --kv_cache_free_gpu_memory_fraction 0.8 --tp_size 8 --ep_size 8 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/deepseek-r1-throughput.yaml` |
+| [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) | B200, GB200 | Max Throughput | `trtllm-serve deepseek-ai/DeepSeek-R1-0528 --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 1024 --max_num_tokens 3200 --kv_cache_free_gpu_memory_fraction 0.8 --tp_size 8 --ep_size 8 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/deepseek-r1-deepgemm.yaml` |
+| [DeepSeek-R1 (NVFP4)](https://huggingface.co/nvidia/DeepSeek-R1-FP4) | B200, GB200 | Max Throughput | `trtllm-serve nvidia/DeepSeek-R1-FP4 --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 1024 --max_num_tokens 3200 --kv_cache_free_gpu_memory_fraction 0.8 --tp_size 8 --ep_size 8 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/deepseek-r1-throughput.yaml` |
+| [DeepSeek-R1 (NVFP4)](https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2) | B200, GB200 | Min Latency | `trtllm-serve nvidia/DeepSeek-R1-FP4-v2 --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 4 --tp_size 8 --ep_size 2 --max_num_tokens 32768 --trust_remote_code --kv_cache_free_gpu_memory_fraction 0.75 --extra_llm_api_options /app/tensorrt_llm/examples/configs/deepseek-r1-latency.yaml` |
+| [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | Any | Max Throughput | `trtllm-serve openai/gpt-oss-120b --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 720 --max_num_tokens 16384 --kv_cache_free_gpu_memory_fraction 0.9 --tp_size 8 --ep_size 8 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/gpt-oss-120b-throughput.yaml}` |
+| [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | Any | Min Latency | `trtllm-serve openai/gpt-oss-120b --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 720 --max_num_tokens 16384 --kv_cache_free_gpu_memory_fraction 0.9 --tp_size 8 --ep_size 8 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/gpt-oss-120b-latency.yaml}` |
+| [Llama-3.3-70B (FP8)](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8) | Any | Max Throughput | `trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 1024 --max_num_tokens 2048 --kv_cache_free_gpu_memory_fraction 0.9 --tp_size 1 --ep_size 1 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/llama-3.3-70b.yaml` |
+| [Llama 4 Scout (FP8)](https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8) | Any | Max Throughput | `trtllm-serve nvidia/Llama-4-Scout-17B-16E-Instruct-FP8 --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 1024 --max_num_tokens 2048 --kv_cache_free_gpu_memory_fraction 0.9 --tp_size 1 --ep_size 1 --trust_remote_code --extra_llm_api_options /app/tensorrt_llm/examples/configs/llama-4-scout.yaml` |
 
 ## Next Steps
 

@@ -6,8 +6,8 @@ Model Recipes
    :caption: Model Recipes
    :name: Model Recipes
 
-   quick-start-recipe-for-deepseek-r1-on-trtllm.md
-   quick-start-recipe-for-llama3.3-70b-on-trtllm.md
-   quick-start-recipe-for-llama4-scout-on-trtllm.md
-   quick-start-recipe-for-gpt-oss-on-trtllm.md
-   quick-start-recipe-for-qwen3-next-on-trtllm.md
+   deployment-guide-for-deepseek-r1-on-trtllm.md
+   deployment-guide-for-llama3.3-70b-on-trtllm.md
+   deployment-guide-for-llama4-scout-on-trtllm.md
+   deployment-guide-for-gpt-oss-on-trtllm.md
+   deployment-guide-for-qwen3-next-on-trtllm.md
