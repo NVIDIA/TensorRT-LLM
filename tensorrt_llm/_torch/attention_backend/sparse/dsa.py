@@ -265,7 +265,7 @@ class Indexer(nn.Module):
         """
         block_offsets = self.cache_manager.get_indexer_k_block_offsets(request_ids)
         total_tokens = num_tokens_per_request.sum().item()
-        
+
         head_dim = self.head_dim
         scale_size = head_dim // self.quant_block_size * 4  # float32 = 4 bytes
         block_stride = self.tokens_per_block * (head_dim + scale_size)  # Bytes per block
@@ -293,13 +293,13 @@ class Indexer(nn.Module):
                         # Flat byte index for FP8 data
                         fp8_flat_idx = block_id * block_stride + pos_in_block * head_dim
                         self.slot_mapping_fp8[token_idx] = fp8_flat_idx
-                        
+
                         # Flat byte index for scale
                         scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
                         self.slot_mapping_scale[token_idx] = scale_flat_idx
 
                 token_idx += 1
-        
+
         self.slot_mapping_fp8 = self.slot_mapping_fp8.cuda(non_blocking=True)
         self.slot_mapping_scale = self.slot_mapping_scale.cuda(non_blocking=True)
 
@@ -321,21 +321,21 @@ class Indexer(nn.Module):
 
         k_cache = self.cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
         k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
-        
+
         num_tokens = k_fp8.shape[0]
         head_dim = k_fp8.shape[1]
         scale_size = k_scale.shape[1] * 4  # Convert to bytes (float32 = 4 bytes)
-        
+
         # Convert to bytes: flatten first, then view as uint8, then reshape
         k_fp8_bytes = k_fp8.contiguous().view(-1).view(torch.uint8).view(num_tokens, head_dim)
         k_scale_bytes = k_scale.contiguous().view(-1).view(torch.uint8).view(num_tokens, scale_size)
-        
+
         # Scatter FP8 data
         flat_indices_fp8 = self.slot_mapping_fp8[:num_tokens]  # [num_tokens] start indices
         byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
         scatter_indices_fp8 = flat_indices_fp8.unsqueeze(1) + byte_offsets  # [num_tokens, head_dim]
         k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
-        
+
         # Scatter scales
         flat_indices_scale = self.slot_mapping_scale[:num_tokens]  # [num_tokens] start indices
         byte_offsets = torch.arange(scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
@@ -695,7 +695,7 @@ class DSACacheManager(KVCacheManager):
         super().prepare_resources(scheduled_batch)
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
-        
+
         # Allocate blocks for context requests
         for req in context_batch:
             request_id = req.py_request_id
@@ -709,7 +709,7 @@ class DSACacheManager(KVCacheManager):
                 draft_token_len = get_draft_token_length(req)
                 if draft_token_len > 0:
                     self.low_rank_cache_manager.add_tokens(request_id, draft_token_len)
-        
+
         # Allocate blocks for generation requests
         for req in generation_batch:
             request_id = req.py_request_id
@@ -718,7 +718,7 @@ class DSACacheManager(KVCacheManager):
             draft_token_len = get_draft_token_length(req)
             if draft_token_len > 0:
                 self.low_rank_cache_manager.add_tokens(request_id, draft_token_len)
-            
+
         # TODO: Support beam search, current assume beam_width=1
 
     def update_resources(self, scheduled_batch):
