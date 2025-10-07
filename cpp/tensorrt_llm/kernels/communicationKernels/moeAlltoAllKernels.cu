@@ -380,10 +380,12 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
                  int send_count = ptrs.send_counters[target_rank];
                  ptrs.recv_counters[target_rank][rank_id] = send_count;
                  
+#if !DISABLE_SYNC_FOR_PROFILING
                  uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                  uint32_t flag_value = *ptrs.flag_val;
                  // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
                  asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
+#endif
  
                  #if ENABLE_DEBUG_PRINT
                  printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
