@@ -347,8 +347,10 @@ def generate_llmapi():
 
 def update_version():
     """Replace the placeholder container version in all docs source files."""
-    version_path = (Path(__file__).parent.parent.parent / "tensorrt_llm" / "version.py").resolve()
-    spec = importlib.util.spec_from_file_location("version_module", version_path)
+    version_path = (Path(__file__).parent.parent.parent / "tensorrt_llm" /
+                    "version.py").resolve()
+    spec = importlib.util.spec_from_file_location("version_module",
+                                                  version_path)
     version_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(version_module)
     version = version_module.__version__
