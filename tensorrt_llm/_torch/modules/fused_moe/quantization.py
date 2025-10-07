@@ -2039,23 +2039,6 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
         return super().load_expert_w2_weight_scale_nvfp4(
             module, w2_weight_scale, dst_w2_weight_scale, 32)
 
-    def load_all_fp4_weight_scales_and_alphas(
-            self, module: torch.nn.Module, weights: Dict,
-            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor, dst_fc31_alpha: torch.Tensor,
-            dst_fc2_alpha: torch.Tensor):
-        super().load_all_fp4_weight_scales_and_alphas(
-            module, weights, load_expert_ids, dst_w3_w1_weight_scale,
-            dst_w2_weight_scale, dst_fc31_alpha, dst_fc2_alpha)
-        # The kernel we use will convert nvfp4 to e4m3 before matmul,
-        # so the range of the scale factor can only be [0,448/6].
-        dst_w3_w1_weight_scale.copy_((dst_w3_w1_weight_scale.to(torch.float32) /
-                                      6.0).to(torch.float8_e4m3fn))
-        dst_w2_weight_scale.copy_((dst_w2_weight_scale.to(torch.float32) /
-                                   6.0).to(torch.float8_e4m3fn))
-        dst_fc31_alpha.copy_(dst_fc31_alpha * 6.0)
-        dst_fc2_alpha.copy_(dst_fc2_alpha * 6.0)
-
 
 def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
                           shard_dim_size):
