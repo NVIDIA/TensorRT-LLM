@@ -222,6 +222,8 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -689,7 +691,7 @@ class WideEPMoE(MoE):
             input_sf=x_sf,
             swizzled_input_sf=False,
             min_latency_mode=False,
-            use_fused_finalize=True,
+            use_fused_finalize=self.use_fused_finalize,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
         )
