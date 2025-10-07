@@ -349,10 +349,20 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     # TODO: detect whether SSM layer is present in the model and raise an error or disable block
     # reuse with a warning --> see https://github.com/NVIDIA/TensorRT-LLM/issues/7142. For now, we
     # just emit a general warning.
-    if enable_block_reuse:
-        ad_logger.warning(
+    if enable_block_reuse and not engine.cache_seq_interface.is_paged:
+        raise RuntimeError(
             f"{enable_block_reuse=} is enabled. Note that this is not supported for SSM layers and"
-            " may lead to incorrect results if the model contains SSM layers."
+            " other non-paged attention operators and may lead to incorrect results if the model "
+            "contains such non-paged SSM/attention layers. Please set the "
+            "kv_cache_config.enable_block_reuse field in "
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs to False."
+        )
+
+    # Another sanity check on paging
+    if engine.cache_seq_interface.info.is_paged and not engine.cache_seq_interface.is_paged:
+        ad_logger.warning(
+            "The model does not support full paging. Some caching will be performed in a non-paged "
+            "fashion."
         )
 
     # resource managers

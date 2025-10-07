@@ -187,16 +187,3 @@ def test_parallel_config_validation(parallel_field, invalid_value):
         ValueError, match="AutoDeploy only supports parallelization via the `world_size` argument."
     ):
         LlmArgs(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "attn_backend,expected_attn_page_size",
-    [
-        ("flashinfer", 64),  # Default attn_page_size
-        ("triton", 1024),  # Should equal max_seq_len
-    ],
-)
-def test_attention_backend_page_size_logic(attn_backend, expected_attn_page_size):
-    """Test attn_page_size logic for different attention backends."""
-    args = LlmArgs(model="test-model", attn_backend=attn_backend, max_seq_len=1024)
-    assert args.attn_page_size == expected_attn_page_size

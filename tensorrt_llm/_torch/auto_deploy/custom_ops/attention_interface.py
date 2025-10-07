@@ -825,16 +825,45 @@ class PrepareMetadataCallable(Protocol):
     ) -> List[torch.Tensor]: ...
 
 
-class GetCacheCallable(Protocol):
-    def __call__(self, sequence_info: SequenceInfo) -> torch.Tensor: ...
+class BufferHandler(ABC):
+    """An abstract interface to handle buffer-related operations.
+
+    The BufferHandler interface standardizes operations that the cached sequence interface performs
+    on the buffers providing an abstract handle.
+    """
+
+    @abstractmethod
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        """Initialize the buffer for the given sequence info."""
 
 
-class GetBufferCallable(GetCacheCallable):
-    pass
+class CacheHandler(BufferHandler):
+    """An abstract interface to handle cache-related operations.
+
+    The CacheHandler interface standardizes operations that the cached sequence interface performs
+    on the caches providing an abstract handle.
+    """
+
+    @property
+    @abstractmethod
+    def is_paged(self) -> bool:
+        """Whether the cache handler supports paging.
+
+        Note that paged caches also require the resize operation to be implemented.
+        """
+
+    def resize(self, cache_pool: torch.Tensor, num_pages: int) -> None:
+        """Resize the cache for the given cache pool."""
+        assert self.is_paged, "Resize operation is only supported for paged caches."
+        self._resize(cache_pool, num_pages)
+
+    def _resize(self, cache_pool: torch.Tensor, num_pages: int) -> None:
+        """Resize the cache for the given cache pool."""
+        raise NotImplementedError("Resize operation is not implemented for this cache handler.")
 
 
-CacheInitializerDict = Dict[str, GetCacheCallable]
-BufferInitializerDict = Dict[str, GetBufferCallable]
+CacheHandlerDict = Dict[str, CacheHandler]
+BufferHandlerDict = Dict[str, BufferHandler]
 AttentionLayout = Literal["bsnd", "bnsd"]
 
 
@@ -923,17 +952,17 @@ class AttentionDescriptor(ABC):
 
     @classmethod
     @abstractmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
-        """Provide a dictionary of function pointers that can be used to initialize the caches.
+    ) -> CacheHandlerDict:
+        """Provide a dictionary of cache handlers that can be used to initialize the caches.
 
         The key corresponds to the argument name used in the attention op signature. The function
         key doesn't need to be unique across multiple attention nodes in the graph. The key used to
         describe the cache in the graph will be patched with the attention node index to ensure
         uniqueness.
 
-        ``get_cache_initializers`` will be called *once* during cache initialization and before
+        ``get_cache_handlers.init`` will be called *once* during cache initialization and before
         the initial forward pass for each attention op detected in the graph. The caches will be
         managed by the global CacheManager and passed back to the attention op during the forward
         pass.
@@ -943,8 +972,8 @@ class AttentionDescriptor(ABC):
         """
 
     @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        """Provide a dictionary of function pointers that can be used to initialize buffers.
+    def get_global_buffer_handlers(cls, source_attn_node: Node) -> BufferHandlerDict:
+        """Provide a dictionary of buffer handlers that can be used to initialize buffers.
 
         The key corresponds to the buffer name used in the graph module and will **not**
         be patched unlike a cache key. Hence, it is a **global** key that is shared across all
@@ -956,9 +985,10 @@ class AttentionDescriptor(ABC):
         pass for each attention op detected in the graph. The buffer will be managed by the global
         CacheManager and passed back to the attention op during the forward pass.
 
-        If the buffer initializer requires information about the attention op, it can retrieve
+        If the buffer handler requires information about the attention op, it can retrieve
         the necessary information from the source attention node.
         """
+        return {}
 
     @classmethod
     @abstractmethod

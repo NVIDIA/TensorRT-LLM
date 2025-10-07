@@ -17,9 +17,9 @@ from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
     CacheConfig,
-    CacheInitializerDict,
+    CacheHandler,
+    CacheHandlerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
@@ -286,12 +286,35 @@ def _torch_cached_ssm_transform_fake(
     )
 
 
+class SSMCacheHandler(CacheHandler):
+    """A cache handler for SSM cache."""
+
+    @property
+    def is_paged(self) -> bool:
+        return False
+
+    def __init__(self, num_heads: int, head_dim: int, ssm_state_size: int, dtype: torch.dtype):
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.ssm_state_size = ssm_state_size
+        self.dtype = dtype
+
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_batch_size,
+            self.num_heads,
+            self.head_dim,
+            self.ssm_state_size,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+
 @AttentionRegistry.register("torch_ssm")
 class TorchBackendSSM(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
-        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm now
-        return True
+        return False
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
@@ -317,15 +340,16 @@ class TorchBackendSSM(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 3
 
     @classmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+    ) -> CacheHandlerDict:
         # Shapes from fake tensors
         hs_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         B_fake: torch.Tensor = source_attn_node.args[2].meta["val"]
 
         num_heads = hs_fake.shape[-2]
         head_dim = hs_fake.shape[-1]
+        dtype = cache_config.dtype or hs_fake.dtype
 
         # Infer state size by assuming B has shape [b, s, n_groups * ssm_state_size]
         # During runtime we pass [b, s, n_groups, ssm_state_size]; both give the same last dim product.
@@ -335,21 +359,9 @@ class TorchBackendSSM(AttentionDescriptor):
             # Fallback: assume last dim is n_groups * state_size and choose a minimal positive size
             ssm_state_size = max(1, B_fake.shape[-1])
 
-        def _get_ssm_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_batch_size,
-                num_heads,
-                head_dim,
-                ssm_state_size,
-                device=si.device,
-                dtype=cache_config.dtype or hs_fake.dtype,
-            )
+        handler = SSMCacheHandler(num_heads, head_dim, ssm_state_size, dtype)
 
-        return {"ssm_state_cache": _get_ssm_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+        return {"ssm_state_cache": handler}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

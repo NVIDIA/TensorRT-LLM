@@ -52,8 +52,8 @@ def test_update_kv_cache(k_d_head, v_d_head, seq_lens, dtype):
     MAX_SEQ_LEN = 64
     MAX_BATCH_SIZE = 16
     SEQ_LENS = seq_lens
-    CACHE_LOCS = list(range(0, len(SEQ_LENS)))
-    random.shuffle(CACHE_LOCS)
+    SLOT_IDXS = list(range(0, len(SEQ_LENS)))
+    random.shuffle(SLOT_IDXS)
     INPUT_POS = [
         random.randint(0, 16) for _ in range(len(SEQ_LENS))
     ]  # The starting position for in the cache for each of the sequences.
@@ -89,7 +89,7 @@ def test_update_kv_cache(k_d_head, v_d_head, seq_lens, dtype):
         k_cache,
         v_cache,
         torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32),
-        torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32),
+        torch.tensor(SLOT_IDXS, device=DEVICE, dtype=torch.int32),
         MAX_SEQ_LEN,
         N_KV_HEADS,
         K_D_HEAD,
@@ -99,13 +99,13 @@ def test_update_kv_cache(k_d_head, v_d_head, seq_lens, dtype):
     )
 
     # Check if the cache was correctly updated:
-    for i, cache_loc in enumerate(CACHE_LOCS):
+    for i, slot_i in enumerate(SLOT_IDXS):
         assert torch.equal(
-            k_cache[cache_loc, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].squeeze(),
+            k_cache[slot_i, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].squeeze(),
             k[i].squeeze(),
         )
         assert torch.equal(
-            v_cache[cache_loc, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].squeeze(),
+            v_cache[slot_i, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].squeeze(),
             v[i].squeeze(),
         )
 
@@ -118,8 +118,8 @@ def test_attention_kv_flash_decoding(d_head):
     N_HEADS = 1
     D_HEAD = d_head
     MAX_SEQ_LEN = 64
-    CACHE_LOCS = list(range(0, BATCH_SIZE))
-    random.shuffle(CACHE_LOCS)
+    SLOT_IDXS = list(range(0, BATCH_SIZE))
+    random.shuffle(SLOT_IDXS)
     INPUT_POS = [0] * BATCH_SIZE
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, 1, N_HEADS, D_HEAD, dtype=DTYPE, device=DEVICE)
@@ -137,7 +137,7 @@ def test_attention_kv_flash_decoding(d_head):
         k_cache,
         v_cache,
         torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32),
-        torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32),
+        torch.tensor(SLOT_IDXS, device=DEVICE, dtype=torch.int32),
         MAX_SEQ_LEN,
         N_HEADS,
         D_HEAD,
@@ -165,7 +165,7 @@ def test_attention_kv_flash_decoding(d_head):
             q,
             k_cache,
             v_cache,
-            torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32),
+            torch.tensor(SLOT_IDXS, device=DEVICE, dtype=torch.int32),
             torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32),
             output_tensor,
             output_logsumexp,
@@ -185,8 +185,8 @@ def test_attention_kv_flash_decoding(d_head):
         ref.append(
             torch.nn.functional.scaled_dot_product_attention(
                 q[i, :, :, :].unsqueeze(0).transpose(1, 2),  # [BSND]->[BNSD]
-                k_cache[CACHE_LOCS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0).transpose(1, 2),
-                v_cache[CACHE_LOCS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0).transpose(1, 2),
+                k_cache[SLOT_IDXS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0).transpose(1, 2),
+                v_cache[SLOT_IDXS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0).transpose(1, 2),
             )
         )
     ref = torch.cat(ref, dim=0)
@@ -212,7 +212,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
     Q_D_HEAD = q_d_head
     V_D_HEAD = v_d_head
     MAX_SEQ_LEN = 64
-    CACHE_LOCS = list(range(0, BATCH_SIZE))
+    SLOT_IDXS = list(range(0, BATCH_SIZE))
     INPUT_POS = [0] * BATCH_SIZE
     # Q,K,V are computed using GEMM.
     q = torch.randn(BATCH_SIZE, 1, N_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
@@ -221,7 +221,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
     k_cache = torch.randn(BATCH_SIZE, MAX_SEQ_LEN, N_KV_HEADS, Q_D_HEAD, dtype=DTYPE, device=DEVICE)
     v_cache = torch.randn(BATCH_SIZE, MAX_SEQ_LEN, N_KV_HEADS, V_D_HEAD, dtype=DTYPE, device=DEVICE)
 
-    cache_loc = torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32)
+    slot_idx = torch.tensor(SLOT_IDXS, device=DEVICE, dtype=torch.int32)
     input_pos = torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32)
 
     grid = (BATCH_SIZE, N_KV_HEADS, 1)  #
@@ -233,7 +233,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idx,
         MAX_SEQ_LEN,
         N_KV_HEADS,
         Q_D_HEAD,
@@ -263,7 +263,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
             q,
             k_cache,
             v_cache,
-            cache_loc,
+            slot_idx,
             input_pos,
             output_tensor,
             output_logsumexp,
@@ -285,8 +285,8 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
 
     ref = []
     for i in range(BATCH_SIZE):
-        kk = k_cache[CACHE_LOCS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0)
-        vv = v_cache[CACHE_LOCS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0)
+        kk = k_cache[SLOT_IDXS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0)
+        vv = v_cache[SLOT_IDXS[i], 0 : INPUT_POS[i] + 1, :, :].unsqueeze(0)
 
         if N_HEADS != N_KV_HEADS:
             kk = repeat_kv(q[i, :, :, :].unsqueeze(0), kk)
@@ -453,8 +453,8 @@ def test_context_attention_kv_flattened(
     V_D_HEAD = v_d_head
     MAX_SEQ_LEN = 64
     SEQ_LENS = [36, 44, 12, 1, 1]
-    CACHE_LOCS = list(range(0, len(SEQ_LENS)))
-    random.shuffle(CACHE_LOCS)
+    SLOT_IDXS = list(range(0, len(SEQ_LENS)))
+    random.shuffle(SLOT_IDXS)
     INPUT_POS = [2, 4, 8, 0, 1]  # The starting position for in the cache for each of the sequences.
     q = []
     k = []
@@ -476,10 +476,10 @@ def test_context_attention_kv_flattened(
     def compute_reference(q, k_cache, v_cache):
         ref = []
         for i in range(len(SEQ_LENS)):
-            kk = k_cache[CACHE_LOCS[i], : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].view(
+            kk = k_cache[SLOT_IDXS[i], : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].view(
                 1, INPUT_POS[i] + SEQ_LENS[i], N_KV_HEADS, K_D_HEAD
             )
-            vv = v_cache[CACHE_LOCS[i], : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].view(
+            vv = v_cache[SLOT_IDXS[i], : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].view(
                 1, INPUT_POS[i] + SEQ_LENS[i], N_KV_HEADS, V_D_HEAD
             )
 
@@ -528,7 +528,7 @@ def test_context_attention_kv_flattened(
     seq_start_indices = torch.zeros(len(SEQ_LENS), device=DEVICE, dtype=torch.int32)
     seq_start_indices[1:] = torch.cumsum(seq_len[:-1], 0)
     input_pos = torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32)
-    cache_loc = torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32)
+    slot_idxs = torch.tensor(SLOT_IDXS, device=DEVICE, dtype=torch.int32)
     SEQ_BLOCK = 32
     output_tensor = torch.empty((1, sum(SEQ_LENS), N_HEADS, V_D_HEAD), dtype=DTYPE, device=DEVICE)
     grid = (len(SEQ_LENS), N_KV_HEADS, (max(SEQ_LENS) + SEQ_BLOCK - 1) // SEQ_BLOCK)
@@ -540,7 +540,7 @@ def test_context_attention_kv_flattened(
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idxs,
         MAX_SEQ_LEN,
         N_KV_HEADS,
         K_D_HEAD,
@@ -550,7 +550,7 @@ def test_context_attention_kv_flattened(
     )
 
     # Check if the cache was correctly updated:
-    for i, cl in enumerate(CACHE_LOCS):
+    for i, cl in enumerate(SLOT_IDXS):
         assert torch.equal(
             k_cache[cl, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i], :N_KV_HEADS, :].squeeze(),
             k[i].squeeze(),
@@ -568,7 +568,7 @@ def test_context_attention_kv_flattened(
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idxs,
         output_tensor,
         1.0 / math.sqrt(Q_D_HEAD),
         N_HEADS,
@@ -604,8 +604,8 @@ def test_update_kv_cache_rope_fusion(seq_lens, n_heads, n_kv_heads, dtype):
     MAX_BATCH_SIZE = 16
     SEQ_LENS = seq_lens
     BATCH_SIZE = len(SEQ_LENS)
-    CACHE_LOCS = list(range(0, BATCH_SIZE))
-    random.shuffle(CACHE_LOCS)
+    SLOT_IDXS = list(range(0, BATCH_SIZE))
+    random.shuffle(SLOT_IDXS)
     INPUT_POS = [
         random.randint(0, 16) for _ in range(BATCH_SIZE)
     ]  # The starting position for in the cache for each of the sequences.
@@ -651,7 +651,7 @@ def test_update_kv_cache_rope_fusion(seq_lens, n_heads, n_kv_heads, dtype):
         k_cache,
         v_cache,
         torch.tensor(INPUT_POS, device=DEVICE, dtype=torch.int32),
-        torch.tensor(CACHE_LOCS, device=DEVICE, dtype=torch.int32),
+        torch.tensor(SLOT_IDXS, device=DEVICE, dtype=torch.int32),
         freqs,
         MAX_SEQ_LEN,
         N_HEADS,
@@ -697,14 +697,14 @@ def test_update_kv_cache_rope_fusion(seq_lens, n_heads, n_kv_heads, dtype):
         start = end
 
     # Check if the cache was correctly updated:
-    for i, cl in enumerate(CACHE_LOCS):
+    for i, slot_i in enumerate(SLOT_IDXS):
         assert torch.allclose(
-            k_cache[cl, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i]].squeeze(),
+            k_cache[slot_i, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i]].squeeze(),
             k_ref[i].squeeze(),
             atol=1e-2,
             rtol=1e-2,
         )
         assert torch.equal(
-            v_cache[cl, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i]].squeeze(),
+            v_cache[slot_i, INPUT_POS[i] : INPUT_POS[i] + SEQ_LENS[i]].squeeze(),
             v[i].squeeze(),
         )

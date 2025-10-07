@@ -209,21 +209,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     attn_page_size: int = Field(
         default=64,
         ge=1,
-        description="Page size for attention (tokens_per_block). For triton and torch "
-        "backends, this should equal max_seq_len. Temporary field until tokens_per_block gets "
-        "properly passed through.",
+        description="Page size (tokens_per_block) for cached attention backends that support "
+        "paging. Temporary field until tokens_per_block gets properly passed through.",
     )
 
     ### VALIDATION #################################################################################
-    @model_validator(mode="after")
-    # TODO: discuss what to do with this once we fully transition to the new inference optimizer
-    def update_attn_page_size(self):
-        # NOTE force attn_page_size to equal max_seq_len for triton backend
-        # TODO: maybe don't do this and rely on slot_idx instead??
-        if self.attn_backend == "triton" or self.attn_backend == "torch":
-            self.attn_page_size = self.max_seq_len
-        return self
-
     @field_validator("model_factory", mode="after")
     @classmethod
     def model_factory_exists(cls, value: str) -> str:

@@ -10,13 +10,15 @@ from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
+    BufferHandler,
+    BufferHandlerDict,
     CacheConfig,
-    CacheInitializerDict,
+    CacheHandlerDict,
     MHACallable,
     PrepareMetadataCallable,
     SequenceInfo,
 )
+from .torch_backend_attention import UnpagedKVCacheHandler
 from .triton_attention import _flattened_context_mha, _generate_mha
 
 Constant = Union[int, float, str, None]
@@ -34,7 +36,7 @@ def fused_flattened_mla_with_cache(
     # METADATA
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
@@ -121,7 +123,7 @@ def fused_flattened_mla_with_cache(
             value_states.contiguous(),
             k_cache,
             v_cache,
-            cache_loc,
+            slot_idx,
             input_pos,
             y,
         )
@@ -133,7 +135,7 @@ def fused_flattened_mla_with_cache(
             key_states.contiguous(),
             value_states.contiguous(),
             input_pos,
-            cache_loc,
+            slot_idx,
             k_cache,
             v_cache,
             seq_len,
@@ -157,7 +159,7 @@ def fused_flattened_mla_with_cache_fake(
     # METADATA
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
@@ -190,21 +192,45 @@ def prepare_fused_mla_metadata(
     return (
         seq_len[:num_seq].clone(),
         input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
+        slot_idx[:num_seq].clone(),
         seq_start,
     )
 
 
 @prepare_fused_mla_metadata.register_fake
 def prepare_fused_mla_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     return (
         torch.empty_like(seq_len),
         torch.empty_like(input_pos),
-        torch.empty_like(cache_loc),
+        torch.empty_like(slot_idx),
         torch.empty_like(seq_len),
     )
+
+
+class CosSinHandler(BufferHandler):
+    """A buffer handler for cos and sin."""
+
+    def __init__(self, rope_head_dim: int, rope_theta: float):
+        self.rope_head_dim = rope_head_dim
+        self.rope_theta = rope_theta
+
+    @staticmethod
+    def _precompute_inv_freq(seq_len: int, head_dim: int, rope_theta: float = 1e4) -> torch.Tensor:
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        t = torch.arange(seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
+
+        freqs = torch.outer(t, inv_freq.to(t.device))
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos_sin_stacked = torch.stack([emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)])
+        return cos_sin_stacked
+
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return self._precompute_inv_freq(
+            sequence_info.max_seq_len, self.rope_head_dim, self.rope_theta
+        ).to(sequence_info.device)
 
 
 @AttentionRegistry.register("MultiHeadLatentAttention")
@@ -237,9 +263,9 @@ class MultiHeadLatentAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.triton_attention_prepare_fused_mla_metadata, 4
 
     @classmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+    ) -> CacheHandlerDict:
         q_nope_fake = source_attn_node.args[0].meta["val"]
         q_pe_fake = source_attn_node.args[1].meta["val"]
         kv_fake = source_attn_node.args[2].meta["val"]
@@ -247,57 +273,22 @@ class MultiHeadLatentAttention(AttentionDescriptor):
         num_kv_heads = kv_fake.shape[1]
         head_dim = q_nope_fake.shape[-1]
         rope_dim = q_pe_fake.shape[-1]
+        dtype = cache_config.dtype or kv_fake.dtype
 
-        def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for MultiHeadLatentAttention"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                head_dim + rope_dim,
-                device=si.device,
-                dtype=cache_config.dtype or kv_fake.dtype,
-            )
-
-        def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for MultiHeadLatentAttention"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or kv_fake.dtype,
-            )
-
-        return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
+        return {
+            "k_cache": UnpagedKVCacheHandler(num_kv_heads, head_dim + rope_dim, dtype),
+            "v_cache": UnpagedKVCacheHandler(num_kv_heads, head_dim, dtype),
+        }
 
     @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
+    def get_global_buffer_handlers(cls, source_attn_node: Node) -> BufferHandlerDict:
         q_pe_fake = source_attn_node.args[1].meta["val"]
         rope_head_dim = q_pe_fake.shape[-1]
         rope_theta: float = 10000.0  # TODO: remove once MLA is unfused
+        handler = CosSinHandler(rope_head_dim, rope_theta)
 
-        def _get_cos_sin_stacked(si: SequenceInfo):
-            if rope_theta is None:
-                return torch.empty(0, device=si.device)
-            return cls._precompute_inv_freq(si.max_seq_len, rope_head_dim, rope_theta).to(si.device)
-
-        return {
-            f"cos_sin_stacked_{rope_head_dim}_{rope_theta}".replace(".", "_"): _get_cos_sin_stacked
-        }
+        return {f"cos_sin_stacked_{rope_head_dim}_{rope_theta}".replace(".", "_"): handler}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         return [None]
-
-    @staticmethod
-    def _precompute_inv_freq(seq_len: int, head_dim: int, rope_theta: float = 1e4) -> torch.Tensor:
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t = torch.arange(seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
-
-        freqs = torch.outer(t, inv_freq.to(t.device))
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos_sin_stacked = torch.stack([emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)])
-        return cos_sin_stacked

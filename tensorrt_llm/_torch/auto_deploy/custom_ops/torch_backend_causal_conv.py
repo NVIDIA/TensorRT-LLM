@@ -21,9 +21,9 @@ from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
     CacheConfig,
-    CacheInitializerDict,
+    CacheHandler,
+    CacheHandlerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
@@ -290,12 +290,33 @@ def _torch_cached_causal_conv1d_fake(
     )
 
 
+class CausalConvCacheHandler(CacheHandler):
+    """A cache handler for causal conv cache."""
+
+    @property
+    def is_paged(self) -> bool:
+        return False
+
+    def __init__(self, in_channels: int, kernel_size: int, dtype: torch.dtype):
+        self.in_channels = in_channels
+        self.kernel_size = kernel_size
+        self.dtype = dtype
+
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_batch_size,
+            self.in_channels,
+            self.kernel_size,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+
 @AttentionRegistry.register("torch_causal_conv")
 class TorchBackendCausalConv(AttentionDescriptor):
     @classmethod
     def is_paged(cls) -> bool:
-        # TODO: we should refine our notion of "is_paged" --> seems counterintuitive for ssm nows
-        return True
+        return False
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
@@ -322,29 +343,17 @@ class TorchBackendCausalConv(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_causal_conv_prepare_metadata, 3
 
     @classmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+    ) -> CacheHandlerDict:
         inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
         w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
 
         in_channels = inp_fake.shape[-1]
         kernel_size = w_fake.shape[-1]
+        dtype = cache_config.dtype or inp_fake.dtype
 
-        def _get_conv_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_batch_size,
-                in_channels,
-                kernel_size,
-                device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
-            )
-
-        return {"conv_state_cache": _get_conv_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+        return {"conv_state_cache": CausalConvCacheHandler(in_channels, kernel_size, dtype)}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

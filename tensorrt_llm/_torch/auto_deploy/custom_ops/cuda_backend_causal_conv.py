@@ -9,28 +9,16 @@ The flattened cached op integrates with the auto_deploy attention interface
 and updates a slot-indexed convolution state cache internally.
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
-from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
-    AttentionDescriptor,
-    AttentionLayout,
-    AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
-    Constant,
-    MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
-)
+from .attention_interface import AttentionRegistry, CacheConfig, CacheHandlerDict, MHACallable
+from .torch_backend_causal_conv import TorchBackendCausalConv
 
 
 def _build_conv_state_from_sequence(input_bt_c: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -52,44 +40,6 @@ def _build_conv_state_from_sequence(input_bt_c: torch.Tensor, kernel_size: int) 
 # ---------------------------------------------------------------
 # Metadata + flattened cached op that integrates with the AD i/f
 # ---------------------------------------------------------------
-@torch.library.custom_op("auto_deploy::cuda_causal_conv_prepare_metadata", mutates_args=())
-def cuda_causal_conv_prepare_metadata(
-    input_ids: torch.Tensor,
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    slot_idx: torch.Tensor,
-    page_size: int,
-) -> List[torch.Tensor]:
-    """Prepare metadata for cached causal conv (CUDA backend).
-
-    Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
-    """
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-
-    seq_start = torch.zeros_like(seq_len_sanitized)
-    if num_seq > 1:
-        seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
-
-    slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized)
-
-
-@cuda_causal_conv_prepare_metadata.register_fake
-def cuda_causal_conv_prepare_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
-):
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
-    num_seq = len(seq_len_sanitized)
-    return (
-        torch.empty_like(seq_len_sanitized),
-        torch.empty_like(seq_len_sanitized),
-        torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
-    )
 
 
 @torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={})
@@ -231,63 +181,16 @@ def _cuda_cached_causal_conv1d_fake(
 
 
 @AttentionRegistry.register("cuda_causal_conv")
-class CudaBackendCausalConv(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        return True
-
-    @classmethod
-    def get_attention_layout(cls) -> AttentionLayout:
-        # Hidden states follow [b, s, c]
-        return "bsnd"
-
-    @classmethod
-    def get_num_qkv_args(cls) -> int:
-        # torch_causal_conv1d signature has 3 relevant tensor arguments
-        # TODO: bias can be optional!! How to handle None bias here?
-        return 3
-
-    @classmethod
-    def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_causal_conv1d
-
+class CudaBackendCausalConv(TorchBackendCausalConv):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.cuda_cached_causal_conv1d
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata, 3
-
-    @classmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
-        inp_fake: torch.Tensor = source_attn_node.args[0].meta["val"]
-        w_fake: torch.Tensor = source_attn_node.args[1].meta["val"]
-
-        in_channels = inp_fake.shape[-1]
-        kernel_size = w_fake.shape[-1]
-
-        def _get_conv_cache(si: SequenceInfo):
-            return torch.empty(
-                si.max_batch_size,
-                in_channels,
-                max(1, kernel_size - 1),
-                device=si.device,
-                dtype=cache_config.dtype or inp_fake.dtype,
-            )
-
-        return {"conv_state_cache": _get_conv_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
-
-    @classmethod
-    def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        stride, padding, dilation, groups, padding_mode = extract_op_args(
-            source_attn_node, "stride", "padding", "dilation", "groups", "padding_mode"
-        )
-        return [stride, padding, dilation, groups, padding_mode]
+    ) -> CacheHandlerDict:
+        handlers = super().get_cache_handlers(source_attn_node, cache_config)
+        for handler in handlers.values():
+            handler.kernel_size = max(1, handler.kernel_size - 1)
+        return handlers

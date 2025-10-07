@@ -236,7 +236,7 @@ def update_kv_cache(
     v_cache: torch.Tensor,
     seq_len: torch.Tensor,  # metadata
     input_pos: torch.Tensor,  # metadata
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -245,12 +245,12 @@ def update_kv_cache(
     """
 
     for idx in range(seq_len.shape[0]):
-        k_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = key_states[
+        k_cache[slot_idx[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = key_states[
             seq_start[idx] : seq_start[idx] + seq_len[idx], ...
         ]
-        v_cache[cache_loc[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = (
-            value_states[seq_start[idx] : seq_start[idx] + seq_len[idx], ...]
-        )
+        v_cache[slot_idx[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = value_states[
+            seq_start[idx] : seq_start[idx] + seq_len[idx], ...
+        ]
 
 
 @torch.library.custom_op("auto_deploy::torch_attention_fused_mla_ref", mutates_args=())
@@ -261,7 +261,7 @@ def fused_mla_ref(
     k_pe: torch.Tensor,
     seq_len: torch.Tensor,  # metadata
     input_pos: torch.Tensor,  # metadata
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     k_cache: torch.Tensor,  # caches
     v_cache: torch.Tensor,  # caches
@@ -327,15 +327,15 @@ def fused_mla_ref(
 
     # Update KV cache
     update_kv_cache(
-        key_states, value_states, k_cache, v_cache, seq_len, input_pos, cache_loc, seq_start
+        key_states, value_states, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start
     )
 
     # Compute attention
     attn_outputs = []
     for idx in range(seq_len.shape[0]):
         # Get inputs from KV cache
-        k = k_cache[cache_loc[idx], : input_pos[idx] + seq_len[idx], :, :]  # [kv_seq_len, n, d]
-        v = v_cache[cache_loc[idx], : input_pos[idx] + seq_len[idx], :, :]  # [kv_seq_len, n, d]
+        k = k_cache[slot_idx[idx], : input_pos[idx] + seq_len[idx], :, :]  # [kv_seq_len, n, d]
+        v = v_cache[slot_idx[idx], : input_pos[idx] + seq_len[idx], :, :]  # [kv_seq_len, n, d]
         # Generate attention mask
         if q_len == 1:
             # Generate phase - single token attention mask
@@ -394,7 +394,7 @@ def fused_mla_ref_fake(
     k_pe: torch.Tensor,
     seq_len: torch.Tensor,  # metadata
     input_pos: torch.Tensor,  # metadata
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     k_cache: torch.Tensor,  # caches
     v_cache: torch.Tensor,  # caches

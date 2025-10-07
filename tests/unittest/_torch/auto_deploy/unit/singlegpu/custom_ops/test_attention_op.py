@@ -99,7 +99,7 @@ def test_flat_gqa_op(
     cache_max_seq_len = 2 * (max_seq_len + 1)
     cache_max_batch_size = 2 * batch_size
     cache_size = (cache_max_batch_size, cache_max_seq_len, n_kv_heads, D_HEAD)
-    cache_loc = torch.randperm(cache_max_batch_size, **int_kwargs)[:batch_size]
+    slot_idx = torch.randperm(cache_max_batch_size, **int_kwargs)[:batch_size]
 
     k_cache = torch.randn(cache_size, **dtype_kwargs)
     v_cache = torch.randn(cache_size, **dtype_kwargs)
@@ -134,7 +134,7 @@ def test_flat_gqa_op(
         # METADATA
         seq_len,
         input_positions,
-        cache_loc,
+        slot_idx,
         seq_start,
         # CACHES
         k_cache,
@@ -147,7 +147,7 @@ def test_flat_gqa_op(
 
     # Use torch backend as clean reference
     ref_flat = TorchAttentionReference.flattened_mha_with_cache(
-        q, k, v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
+        q, k, v, seq_len, input_positions, slot_idx, seq_start, k_cache, v_cache
     )
 
     assert torch.allclose(
@@ -179,7 +179,7 @@ def test_flat_gqa_op_with_rope(
     cache_max_seq_len = 2 * (max_seq_len + 1)
     cache_max_batch_size = 2 * batch_size
     cache_size = (cache_max_batch_size, cache_max_seq_len, n_kv_heads, D_HEAD)
-    cache_loc = torch.randperm(cache_max_batch_size, **int_kwargs)[:batch_size]
+    slot_idx = torch.randperm(cache_max_batch_size, **int_kwargs)[:batch_size]
 
     k_cache = torch.randn(cache_size, **dtype_kwargs)
     v_cache = torch.randn(cache_size, **dtype_kwargs)
@@ -220,7 +220,7 @@ def test_flat_gqa_op_with_rope(
             k,
             v,
             input_positions,
-            cache_loc,
+            slot_idx,
             seq_len,
             seq_start,
             k_cache,
@@ -234,7 +234,7 @@ def test_flat_gqa_op_with_rope(
             k,
             v,
             input_positions,
-            cache_loc,
+            slot_idx,
             seq_len,
             seq_start,
             k_cache,
@@ -244,8 +244,8 @@ def test_flat_gqa_op_with_rope(
 
     # prep batched tensors for comparison
     q_b = torch.zeros(batch_size, n_heads, max_seq_len, D_HEAD, **dtype_kwargs)
-    k_cache_b = k_cache[cache_loc].transpose(1, 2)
-    v_cache_b = v_cache[cache_loc].transpose(1, 2)
+    k_cache_b = k_cache[slot_idx].transpose(1, 2)
+    v_cache_b = v_cache[slot_idx].transpose(1, 2)
 
     def _store(t_batched, t_flat):
         # batched layout: [n,s,d]; flat layout: [s,n*d]
