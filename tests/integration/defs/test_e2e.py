@@ -1953,18 +1953,17 @@ def test_ptp_quickstart_advanced_mtp_eagle(llm_root, llm_venv, model_name,
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        llm_venv.run_cmd(
-            [
-                str(example_root / "quickstart_advanced.py"),
-                "--use_cuda_graph",
-                "--spec_decode_max_draft_len",
-                "1",  # test 1 MTP module
-                "--spec_decode_algo",
-                "MTP",
-                "--model_dir",
-                f"{llm_models_root()}/{model_path}",
-            ],
-            stdout=running_log)
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--use_cuda_graph",
+            "--spec_decode_max_draft_len",
+            "3",
+            "--spec_decode_algo",
+            "MTP",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ],
+                         stdout=running_log)
         # 74.60 is the memory usage for DeepSeek-V3-Lite-BF16 with MTP Eagle 2 two model style as one extra kv cache is needed for draft model.
         _check_mem_usage(running_log, [74.60, 0, 0, 0])
 
