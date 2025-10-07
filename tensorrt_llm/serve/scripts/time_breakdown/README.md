@@ -14,7 +14,7 @@ The tool generates:
 
 ### Example Visualization
 
-![Request Time Breakdown Example](../../../../docs/source/media/request_time_breakdown_example.png)
+![Request Time Breakdown Example](images/request_time_breakdown_example.png)
 
 *Example of the interactive time diagram showing request time breakdown across different processing stages.*
 
@@ -153,20 +153,27 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --random-ids \
         --max-concurrency 64 \
         --save-result \
+        --result-dir <RESULT_DIR> \
         --percentile-metrics "ttft,tpot,itl,e2e" \
-        --save-request-timing-breakdown 
+        --save-request-time-breakdown 
 ```
-
+You will be able find the interactive time diagram in `<RESULT_DIR>`.
 ### As a CLI Tool
-
+Step 1:
+Query the perf_metrics.json using the `/perf_metrics` endpoint of the trtllm server (in case of disaggreated serving, you only need to query the disagg server). Make sure the servers have `perf_metrics_max_requests` and `return_perf_metric` configured.
+```
+curl -o perf_metrics.json <HOST>:<PORT>/perf_metrics
+```
+Step 2:
+Process the `perf_metrics.json` with `time_breakdown.py`
 ```bash
-# Basic usage - analyze and create timing diagram
+# Basic usage - analyze and create time diagram
 python time_breakdown.py perf_metrics.json
 
 # Specify custom output file
-python time_breakdown.py perf_metrics.json -o my_timing_diagram.html
+python time_breakdown.py perf_metrics.json -o my_time_diagram.html
 
-# Show statistics only (no diagram)
+# Show statistics only (no diagram) 
 python time_breakdown.py perf_metrics.json --stats-only
 
 # Create diagram and show statistics
