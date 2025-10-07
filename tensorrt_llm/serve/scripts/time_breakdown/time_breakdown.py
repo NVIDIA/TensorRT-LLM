@@ -19,6 +19,7 @@ Usage as library:
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -42,12 +43,12 @@ class TimingMetric:
 
     def calculate_duration(self, timing_data: Dict[str, float]) -> float:
         """Calculate the duration for this metric from timing data."""
-        start_time = timing_data.get(self.start_field, 0)
-        end_time = timing_data.get(self.end_field, 0)
+        start_time = timing_data.get(self.start_field, float('nan'))
+        end_time = timing_data.get(self.end_field, float('nan'))
 
-        # If either timestamp is 0 (not available), return 0 duration
-        if start_time == 0 or end_time == 0:
-            return 0.0
+        # If either timestamp is NaN (not available), return NaN duration
+        if math.isnan(start_time) or math.isnan(end_time):
+            return float('nan')
 
         return max(0, end_time - start_time)
 

@@ -75,7 +75,7 @@ The tool aims to track detailed timing segments throughout the request lifecycle
    - **Includes**: Response forwarding, aggregation
 ## Input Format
 
-The tool expects a JSON file containing an array of request performance metrics.
+The tool expects a JSON file containing an array of request performance metrics (unit: seconds).
 
 ### Aggregated Format
 

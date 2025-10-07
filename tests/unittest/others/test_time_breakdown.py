@@ -480,20 +480,15 @@ class TestIntegration(unittest.TestCase):
             }
         } for i in range(5)]
 
-        # Create temporary JSON file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
-                                         delete=False) as f:
-            json.dump(test_data, f)
-            json_file = f.name
+        # Create temporary files and run the complete workflow
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as json_f, \
+             tempfile.NamedTemporaryFile(suffix='.html', delete=True) as html_f:
+            # Write test data to JSON file
+            json.dump(test_data, json_f)
+            json_f.flush()  # Ensure data is written before reading
 
-        # Create temporary output file
-        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
-            html_file = f.name
-
-        try:
-            # Run the complete workflow
             analyzer = RequestTimeBreakdown()
-            timing_data = analyzer.parse_json_file(json_file)
+            timing_data = analyzer.parse_json_file(json_f.name)
 
             # Verify parsing
             self.assertEqual(len(timing_data), 5)
@@ -502,16 +497,7 @@ class TestIntegration(unittest.TestCase):
             with patch(
                     'tensorrt_llm.serve.scripts.time_breakdown.time_breakdown.pyo.plot'
             ):
-                analyzer.create_timing_diagram(timing_data, html_file)
-
-            # Should complete without errors
-
-        finally:
-            # Cleanup
-            if os.path.exists(json_file):
-                os.unlink(json_file)
-            if os.path.exists(html_file):
-                os.unlink(html_file)
+                analyzer.create_timing_diagram(timing_data, html_f.name)
 
 
 if __name__ == '__main__':

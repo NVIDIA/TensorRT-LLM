@@ -924,7 +924,10 @@ def main(args: argparse.Namespace):
 
             # Save perf metrics to JSON file
             with open(perf_filename, "w", encoding='utf-8') as outfile:
-                json.dump(perf_metrics, outfile, indent=2)
+                try:
+                    json.dump(perf_metrics, outfile, indent=2)
+                except Exception as e:
+                    print(f"Failed to save perf metrics: {e}")
 
             print(f"Request performance metrics saved to: {perf_filename}")
 
