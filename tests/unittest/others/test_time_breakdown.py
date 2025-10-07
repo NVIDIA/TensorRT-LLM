@@ -65,7 +65,7 @@ class TestTimingMetric(unittest.TestCase):
                               start_field='start_time',
                               end_field='end_time')
 
-        timing_data = {'start_time': 0, 'end_time': 3.5}
+        timing_data = {'end_time': 3.5}
 
         duration = metric.calculate_duration(timing_data)
         self.assertEqual(duration, 0.0)

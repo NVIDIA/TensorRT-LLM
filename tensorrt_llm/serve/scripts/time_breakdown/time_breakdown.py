@@ -48,9 +48,14 @@ class TimingMetric:
 
         # If either timestamp is NaN (not available), return NaN duration
         if math.isnan(start_time) or math.isnan(end_time):
-            return float('nan')
+            print(f"Warning: {self.name} has NaN start or end time")
+            return 0
 
-        return max(0, end_time - start_time)
+        if start_time > end_time:
+            print(f"Warning: {self.name} has start time after end time")
+            return 0
+
+        return end_time - start_time
 
 
 class TimingMetricsConfig:
