@@ -8,7 +8,6 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
-from tensorrt_llm.sampling_params import AdditionalModelOutput
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -225,19 +224,18 @@ class LogProbStorage:
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
-    def __init__(
-            self,
-            prompt_len: int,
-            max_new_tokens: int,
-            use_device_memory=True,
-            streaming=False,
-            return_log_probs: bool = False,
-            return_context_logits: bool = False,
-            return_generation_logits: bool = False,
-            exclude_last_generation_logits: bool = False,
-            use_chunked_generation_logits: bool = True,
-            chunk_size: int = 8,
-            additional_outputs: Optional[List[AdditionalModelOutput]] = None):
+    def __init__(self,
+                 prompt_len: int,
+                 max_new_tokens: int,
+                 use_device_memory=True,
+                 streaming=False,
+                 return_log_probs: bool = False,
+                 return_context_logits: bool = False,
+                 return_generation_logits: bool = False,
+                 exclude_last_generation_logits: bool = False,
+                 use_chunked_generation_logits: bool = True,
+                 chunk_size: int = 8,
+                 additional_outputs: Optional[List[str]] = None):
         if streaming and use_chunked_generation_logits:
             assert chunk_size == 1, "chunk_size must be 1 in streaming mode"
         self._streaming = streaming
@@ -257,12 +255,12 @@ class PyResult:
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
         self._additional_context_outputs = {
-            output.name: []
-            for output in additional_outputs if output.gather_context
+            name: []
+            for name in additional_outputs
         } if additional_outputs else None
         self._additional_generation_outputs = {
-            output.name: []
-            for output in additional_outputs
+            name: []
+            for name in additional_outputs
         } if additional_outputs else None
 
     def append_context_logits(self, context_logits: torch.Tensor):
@@ -345,6 +343,8 @@ class PyResult:
             return None
         outputs = {}
         for name, output_list in self._additional_context_outputs.items():
+            if len(output_list) == 0:
+                continue
             outputs[name] = torch.cat(
                 output_list, dim=0) if len(output_list) > 1 else output_list[0]
         return outputs
@@ -355,6 +355,8 @@ class PyResult:
             return None
         outputs = {}
         for name, output_list in self._additional_generation_outputs.items():
+            if len(output_list) == 0:
+                continue
             outputs[name] = torch.cat(
                 output_list, dim=0) if len(output_list) > 1 else output_list[0]
         return outputs
@@ -430,7 +432,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
-            additional_outputs: Optional[List[AdditionalModelOutput]] = None,
+            additional_outputs: Optional[List[str]] = None,
             return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
@@ -720,9 +722,8 @@ def executor_request_to_llm_request(
         return_generation_logits,
         exclude_last_generation_logits=exclude_last_generation_logits,
         additional_outputs=[
-            AdditionalModelOutput(name=output.name,
-                                  gather_context=output.gather_context) for
-            output in executor_request.output_config.additional_model_outputs
+            output.name for output in
+            executor_request.output_config.additional_model_outputs
         ] if executor_request.output_config.additional_model_outputs is not None
         else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),

@@ -19,7 +19,6 @@ from tensorrt_llm._torch.models.modeling_utils import (
     ModelConfig, register_auto_model, register_checkpoint_weight_loader,
     register_config_loader)
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.sampling_params import AdditionalModelOutput
 
 
 class DummyConfig(PretrainedConfig):
@@ -140,10 +139,7 @@ class DummyConfigLoader(BaseConfigLoader):
 def test_additional_model_outputs_sampling_params():
     """Test that additional_model_outputs can be configured in SamplingParams."""
     # Create sampling params with additional outputs
-    additional_outputs = [
-        AdditionalModelOutput(name="context_output", gather_context=True),
-        AdditionalModelOutput(name="generation_output", gather_context=False),
-    ]
+    additional_outputs = ["context_output", "generation_output"]
 
     sampling_params = SamplingParams(
         max_tokens=5,
@@ -153,11 +149,8 @@ def test_additional_model_outputs_sampling_params():
     # Verify the sampling params are configured correctly
     assert sampling_params.additional_model_outputs is not None
     assert len(sampling_params.additional_model_outputs) == 2
-    assert sampling_params.additional_model_outputs[0].name == "context_output"
-    assert sampling_params.additional_model_outputs[0].gather_context
-    assert sampling_params.additional_model_outputs[
-        1].name == "generation_output"
-    assert not sampling_params.additional_model_outputs[1].gather_context
+    assert sampling_params.additional_model_outputs[0] == "context_output"
+    assert sampling_params.additional_model_outputs[1] == "generation_output"
 
 
 @pytest.mark.part0
@@ -180,10 +173,7 @@ def test_additional_model_outputs_integration():
     This test uses a dummy model to test the additional_model_outputs feature.
     """
     # Create sampling params with additional outputs
-    additional_outputs = [
-        AdditionalModelOutput(name="context_output", gather_context=True),
-        AdditionalModelOutput(name="generation_output", gather_context=False),
-    ]
+    additional_outputs = ["context_output", "generation_output"]
 
     num_generated_tokens = 5
 

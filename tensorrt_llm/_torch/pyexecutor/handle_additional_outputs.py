@@ -18,6 +18,7 @@ class HandleAdditionalOutputs:
         generation_requests: List[LlmRequest],
         outputs: Dict[str, torch.Tensor],
         beam_width: int,
+        num_context_tokens: int,
     ):
         """Handles context and generation logits for a batch of requests.
 
@@ -26,10 +27,23 @@ class HandleAdditionalOutputs:
             generation_requests: List of generation requests to process
             outputs: Additional outputs tensors
             beam_width: Beam width for the generation requests
+            num_context_tokens: Number of context tokens in the batch
         """
         if not any(r.py_additional_outputs
                    for r in chain(context_requests, generation_requests)):
             return
+
+        output_length_with_context = num_context_tokens + beam_width * len(
+            generation_requests)
+        output_length_without_context = len(
+            context_requests) + beam_width * len(generation_requests)
+
+        gather_context = {}
+        for name, tensor in outputs.items():
+            if tensor.shape[0] == output_length_with_context:
+                gather_context[name] = True
+            else:
+                gather_context[name] = False
 
         output_index_with_context = 0
         output_index_without_context = 0
@@ -43,12 +57,12 @@ class HandleAdditionalOutputs:
 
             additional_outputs = llm_req.py_additional_outputs
             req_context_output = False
-            for output in additional_outputs:
-                if output.gather_context:
-                    output_device_view = outputs[
-                        output.name][outputs_begin:outputs_end]
+            for name in additional_outputs:
+                if gather_context[name]:
+                    output_device_view = outputs[name][
+                        outputs_begin:outputs_end]
                     llm_req.py_result.append_additional_context_outputs(
-                        output.name, output_device_view)
+                        name, output_device_view)
                     req_context_output = True
 
             if req_context_output and llm_req.prepopulated_prompt_len > 0:
@@ -60,32 +74,34 @@ class HandleAdditionalOutputs:
             output_index_without_context += 1
 
             if llm_req.is_last_context_chunk:
-                for output in additional_outputs:
+                for name in additional_outputs:
                     outputs_begin = (output_index_with_context
-                                     if output.gather_context else
+                                     if gather_context[name] else
                                      output_index_without_context) - 1
                     outputs_end = outputs_begin + 1
 
-                    output_device_view = outputs[
-                        output.name][outputs_begin:outputs_end]
+                    output_device_view = outputs[name][
+                        outputs_begin:outputs_end]
                     llm_req.py_result.append_additional_generation_outputs(
-                        output.name,
-                        torch.tile(output_device_view, (1, beam_width, 1)))
+                        name, torch.tile(output_device_view,
+                                         (1, beam_width, 1)))
 
         for llm_req in generation_requests:
             additional_outputs = llm_req.py_additional_outputs
 
-            for output in additional_outputs:
+            for name in additional_outputs:
                 outputs_begin = (output_index_with_context
-                                 if output.gather_context else
+                                 if gather_context[name] else
                                  output_index_without_context)
                 outputs_end = outputs_begin + beam_width
 
-                output_device_view = outputs[
-                    output.name][outputs_begin:outputs_end].reshape(
-                        1, beam_width, -1)
+                output_device_view = outputs[name][
+                    outputs_begin:outputs_end].reshape(1, beam_width, -1)
                 llm_req.py_result.append_additional_generation_outputs(
-                    output.name, output_device_view)
+                    name, output_device_view)
 
             output_index_with_context += beam_width
             output_index_without_context += beam_width
+
+        assert output_index_with_context == output_length_with_context, f"output_index_with_context: {output_index_with_context}, output_length_with_context: {output_length_with_context}"
+        assert output_index_without_context == output_length_without_context, f"output_index_without_context: {output_index_without_context}, output_length_without_context: {output_length_without_context}"

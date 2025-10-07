@@ -1816,9 +1816,12 @@ class PyExecutor:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
+                num_context_tokens = 0
                 for request in scheduled_batch.context_requests:
-                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                    context_chunk_size = request.context_chunk_size
+                    prefix_sum += context_chunk_size if request.py_return_context_logits else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
+                    num_context_tokens += context_chunk_size
 
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
@@ -1831,7 +1834,8 @@ class PyExecutor:
 
                 HandleAdditionalOutputs()(scheduled_batch.context_requests,
                                           scheduled_batch.generation_requests,
-                                          batch_outputs, beam_width)
+                                          batch_outputs, beam_width,
+                                          num_context_tokens)
 
                 return self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
