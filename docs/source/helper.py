@@ -346,24 +346,23 @@ def generate_llmapi():
 
 
 def update_version():
-    version_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     "../../tensorrt_llm/version.py"))
-    spec = importlib.util.spec_from_file_location("version_module",
-                                                  version_path)
+    """Replace the placeholder container version in all docs source files."""
+    version_path = (Path(__file__).parent.parent.parent / "tensorrt_llm" / "version.py").resolve()
+    spec = importlib.util.spec_from_file_location("version_module", version_path)
     version_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(version_module)
     version = version_module.__version__
-    file_list = [
-        "docs/source/quick-start-guide.md",
-        "docs/source/commands/trtllm-serve/run-benchmark-with-trtllm-serve.md"
-    ]
-    for file in file_list:
-        file_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../" + file))
+
+    docs_source_dir = Path(__file__).parent.resolve()
+    md_files = list(docs_source_dir.rglob("*.md"))
+
+    for file_path in md_files:
         with open(file_path, "r") as f:
             content = f.read()
-        content = content.replace("x.y.z", version)
+        content = content.replace(
+            "nvcr.io/nvidia/tensorrt-llm/release:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/release:{version}",
+        )
         with open(file_path, "w") as f:
             f.write(content)
 
