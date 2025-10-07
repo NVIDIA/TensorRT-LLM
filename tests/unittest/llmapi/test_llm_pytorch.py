@@ -29,7 +29,8 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
 from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
                         skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
-                        skip_gpu_memory_less_than_138gb, skip_ray)
+                        skip_gpu_memory_less_than_138gb, skip_ray,
+                        try_expose_error_in_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -414,7 +415,6 @@ def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_ca
         repeats_per_call=1)
 
 
-@skip_ray
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
@@ -431,24 +431,27 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
 
     # Test that too small PeftCacheConfig.host_cache_size causes failure
     with pytest.raises(RuntimeError):
-        check_llama_7b_multi_lora_from_request_test_harness(
-            LLM,
-            lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(
-                host_cache_size=1),  # size in bytes
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+        with try_expose_error_in_ray(RuntimeError):
+            check_llama_7b_multi_lora_from_request_test_harness(
+                LLM,
+                lora_config=lora_config_no_cache_size_values,
+                peft_cache_config=PeftCacheConfig(
+                    host_cache_size=1),  # size in bytes
+                # Disable CUDA graph
+                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+                cuda_graph_config=None)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
-        check_llama_7b_multi_lora_from_request_test_harness(
-            LLM,
-            lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
-            # Disable CUDA graph
-            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            cuda_graph_config=None)
+        with try_expose_error_in_ray(RuntimeError):
+            check_llama_7b_multi_lora_from_request_test_harness(
+                LLM,
+                lora_config=lora_config_no_cache_size_values,
+                peft_cache_config=PeftCacheConfig(
+                    device_cache_percent=0.0000001),
+                # Disable CUDA graph
+                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+                cuda_graph_config=None)
 
 
 @skip_gpu_memory_less_than_40gb
