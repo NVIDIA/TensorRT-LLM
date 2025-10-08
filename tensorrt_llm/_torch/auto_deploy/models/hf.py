@@ -2,6 +2,7 @@
 
 import os
 import re
+import types
 from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -14,6 +15,8 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
 from PIL import Image
 from torch._prims_common import DeviceLikeType
+from torch.export import Dim
+from torch.fx import GraphModule
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -30,10 +33,17 @@ from transformers.utils import (
     WEIGHTS_NAME,
 )
 
-from ..custom_ops.attention_interface import CacheConfig, Dim, DynamicShapeCallback
+from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
-from .factory import ModelFactory, ModelFactoryRegistry, ShardingConfigSource
+from .factory import (
+    DynamicShape,
+    FullModelExportInfo,
+    ModelFactory,
+    ModelFactoryRegistry,
+    ShardingConfigSource,
+    SubModuleExportInfo,
+)
 from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
 
 
@@ -440,6 +450,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                 if new_key != key:
                     state_dict[new_key] = state_dict.pop(key)
 
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
+
 
 class _StateDictParamNameConverter:
     """Helper class for applying param name conversions to a state dict.
@@ -478,6 +491,50 @@ class _StateDictParamNameConverter:
 
                 if new_key != key:
                     state_dict[new_key] = state_dict.pop(key)
+
+
+class TextModelExportInfo(SubModuleExportInfo):
+    """An export configuration for the text model portion of a VLM."""
+
+    def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Post-process the subgraph module and make sure the embedding remains available."""
+        sub_gm.embed_tokens = sub_mod.get_input_embeddings()
+        sub_gm.get_input_embeddings = types.MethodType(
+            sub_mod.get_input_embeddings.__func__, sub_gm
+        )
+
+        # add a dummy node to the graph for making the embedding module "sticky/impure"
+        # TODO (lucaslie): is there a better way to make it "sticky"?
+        n_embed_tokens = sub_gm.graph.get_attr("embed_tokens.weight")
+        sub_gm.graph.call_function(
+            torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
+        )
+
+    def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
+        batch_size_dyn = Dim.DYNAMIC
+        seq_len_dyn = Dim.DYNAMIC
+        return {
+            "input_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+            "inputs_embeds": {0: batch_size_dyn, 1: seq_len_dyn},
+            "position_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+        }
+
+    @classmethod
+    def from_autoinferred(cls, model: nn.Module) -> "TextModelExportInfo":
+        """Create an export configuration from the model by auto-inferring the text submodule.
+
+        model:
+            The full model (AutoModelForImageTextToText)
+
+        Returns:
+            An export configuration for the text submodule with the right submodule key.
+
+        The text submodule is being auto-discovered by looking at the first submodule that contains
+        the ``text_config`` instead of the full config object.
+        """
+        # TODO" implement the logic to auto-infer the text submodule
+        submodule_key = "model.language_model"
+        return cls(submodule_key)
 
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
@@ -521,6 +578,11 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         """Return a dictionary of example inputs for the model."""
 
+        # NOTE: for now we only export text_model - hence using the default example_inputs is
+        # sufficient. Leaving the logic below for future reference. Moreover, note that I noticed
+        # that same models
+        return super().get_example_inputs()
+
         def _prep_seq(text, img1, img2):
             return [
                 {
@@ -549,7 +611,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             ),
         ]
 
-        processor = AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        processor = self.init_processor()
         inputs = processor.apply_chat_template(
             batch_messages,
             add_generation_prompt=True,
@@ -570,30 +632,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         #    values still need to be returned by `get_example_inputs`.
         return {**inputs}
 
-    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
-        """Return a dictionary of extra inputs for the model.
-
-        Returns:
-            A dictionary of extra inputs for the model where the key corresponds to the argument
-            name and the value corresponds to a tuple of (example_input, dynamic_shape_callback).
-            The dynamic shape callback is a function that returns the dynamic shape of the extra
-            input. Simply set to `None` if the extra input is not dynamic.
-        """
-
-        def _get_dynamic_shape():
-            return {
-                # TODO (lucaslie): how to set default values for dynamic shapes?
-                0: Dim("img_batch_size", max=10),
-                2: Dim("img_height", min=32, max=2048),
-                3: Dim("img_width", min=32, max=2048),
-            }
-
-        none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
-
     @property
     def _example_image_dims(self) -> Tuple[int, int]:
         # Some specializations (children) of this class may override this if their models have
         # assumptions on the image dimensions. For example, they may have a lower bound due to
         # the patch size they use.
-        return (16, 16)
+        return (64, 64)
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [TextModelExportInfo.from_autoinferred(model)]

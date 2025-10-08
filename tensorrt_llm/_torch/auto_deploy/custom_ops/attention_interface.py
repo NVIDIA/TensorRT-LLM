@@ -559,8 +559,8 @@ class SequenceInfo:
 
     def set_example_sequence(
         self,
-        input_ids: Sequence[Sequence[int]] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[Sequence[Sequence[int]]] = None,
+        position_ids: Optional[Sequence[Sequence[int]]] = None,
         **extra_args,
     ) -> None:
         """Set an example sequence useful for testing and export purposes without cache history."""

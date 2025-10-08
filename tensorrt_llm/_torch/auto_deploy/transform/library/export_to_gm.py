@@ -132,20 +132,20 @@ class ExportToGM(BaseTransform):
         # set the example sequence
         cm.info.set_example_sequence(**factory.get_example_inputs())
 
-        submodule_export_configs = factory.get_submodule_export_config()
+        export_infos = factory.get_export_infos(mod)
 
         # check if any submodules to be exported are children of other submodules that need to be
         # exported. We don't allow for this since this may imply that the submodules are not
         # independent, which would conflict with graph capture logic, i.e., you cannot graph-capture
         # "model" and "model.text_model" for example. However, you can export "model.text_model" and
         # "model.vision_model" separately.
-        sub_keys = list(submodule_export_configs.keys())
+        sub_keys = [info.submodule_name for info in export_infos]
         assert all(not k1.startswith(k2) for k1 in sub_keys for k2 in sub_keys if k1 != k2), (
             f"Cannot export submodules of already exported submodules, {sub_keys=}"
         )
 
-        for key, (_get_dyn_shape, _post_process) in submodule_export_configs.items():
-            sub_mod = mod.get_submodule(key)
+        for e_info in export_infos:
+            sub_mod = mod.get_submodule(e_info.submodule_name)
 
             # start by capturing the kwargs that are passed to the submodule for export
             with capture_forward_kwargs(sub_mod) as captured_kwargs:
@@ -158,9 +158,8 @@ class ExportToGM(BaseTransform):
                 )
 
             # construct dynamic shapes based on the captured kwargs and the dynamic shape lookup
-            dyn_shape_lookup = _get_dyn_shape()
             dynamic_shapes = {
-                k: dyn_shape_lookup.get(k, {} if isinstance(v, torch.Tensor) else None)
+                k: e_info.dynamic_shape_lookup.get(k, {} if isinstance(v, torch.Tensor) else None)
                 for k, v in captured_kwargs.items()
             }
 
@@ -182,13 +181,13 @@ class ExportToGM(BaseTransform):
                 )
 
             # post process the sub graph module
-            _post_process(sub_mod, key, sub_gm)
+            e_info.post_process(sub_mod, sub_gm)
 
             # set the sub graph module
-            if key == "":
+            if e_info.submodule_name == "":
                 mod = sub_gm
             else:
-                mod.set_submodule(key, sub_gm)
+                mod.set_submodule(e_info.submodule_name, sub_gm)
 
         # this is a clean graph by definition since it was just exported
         info = TransformInfo(

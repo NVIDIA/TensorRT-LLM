@@ -46,6 +46,9 @@ class BuildModel(BaseTransform):
         # build the model
         model = factory.build_model(self.config.device)
 
+        # # set strict args to False
+        cm.info.use_strict_args = False
+
         # by convention, we say the model is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 

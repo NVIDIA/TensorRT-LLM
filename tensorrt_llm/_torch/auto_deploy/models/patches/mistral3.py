@@ -1,4 +1,8 @@
-"""A patch for the Mistral3Model to make it compatible with torch.export."""
+"""A patch for the Mistral3Model to make it compatible with torch.export.
+
+NOTE: most patches are not used at the moment since only text submodule is exported. Keeping it here
+for future reference in case we decide to also export the image model.
+"""
 
 from typing import List, Optional, Union
 
@@ -8,7 +12,7 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ModelOutputWithPast,
 )
 
-from ...export.interface import BaseExportPatch, ExportPatchRegistry
+from ...export.interface import BaseExportPatch
 
 
 def _get_image_features_flat(
@@ -160,7 +164,8 @@ def _mistral_forward(
     )
 
 
-@ExportPatchRegistry.register("hf_mistral3")
+# NOTE: do not register since it is not used at the moment
+# @ExportPatchRegistry.register("hf_mistral3")
 class Mistral3ModelPatch(BaseExportPatch):
     """Patch for `Mistral3Model`."""
 

@@ -439,7 +439,7 @@ _SMALL_MODEL_CONFIGS = {
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
         "llm_models_subdir": "Mistral-Small-3.1-24B-Instruct-2503",
-        "model_factory": "Mistral3VLM",
+        "model_factory": "AutoModelForImageTextToText",
         "compile_backend": "torch-simple",
         "model_kwargs": {
             "text_config": {"num_hidden_layers": 2},
