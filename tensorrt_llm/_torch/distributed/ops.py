@@ -736,14 +736,16 @@ class FlashInferVLLMAllReduce(nn.Module):
 
         try:
             if registered:
+                print(f"Rank {self.mapping.tp_rank}: Registered all reduce")
                 flashinfer_comm.vllm_all_reduce(self.workspace.fa, input_tensor,
                                                 output_tensor, 0, 0, 36)
             else:
+                print(f"Rank {self.mapping.tp_rank}: Unregistered all reduce", self.workspace.buffer_ptrs_ipc.peer_ptrs[self.mapping.tp_rank])
                 flashinfer_comm.vllm_all_reduce(
                     self.workspace.fa,
                     input_tensor,
                     output_tensor,
-                    self.workspace.buffer_ptrs_ipc.peer_ptrs[self.mapping.rank],
+                    self.workspace.buffer_ptrs_ipc.peer_ptrs[self.mapping.tp_rank],
                     self.reg_buffer_size,
                     36,  # CTA upper bounds: 36 as mentioned in the API
                 )
