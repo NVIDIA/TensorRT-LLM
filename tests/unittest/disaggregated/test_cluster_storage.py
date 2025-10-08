@@ -16,10 +16,6 @@ from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
                                                 create_cluster_storage,
                                                 create_cluster_storage_client)
 
-pytest_async_module = pytest.mark.asyncio(loop_scope="module")
-pytest_async_fixture = pytest_asyncio.fixture
-pytest_ignore_tleak = pytest.mark.threadleak(enabled=False)
-
 _counter = 0
 
 
@@ -48,7 +44,7 @@ class Server(uvicorn.Server):
 timeout = pytest.mark.timeout
 
 
-@pytest_async_fixture(scope="function")
+@pytest_asyncio.fixture(scope="function")
 async def storage_client(storage_server):
     _, cluster_uri = storage_server
     return create_cluster_storage_client(cluster_uri, "test")
@@ -66,15 +62,18 @@ class TestClusterStorage:
     __test__ = False
 
     @timeout(5)
-    @pytest_async_module
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_set(self, storage_server, storage_client):
         assert await storage_client.set("test_key",
                                         "test_value",
                                         overwrite_if_exists=True)
         assert await storage_client.get("test_key") == "test_value"
+        assert not await storage_client.set(
+            "test_key", "test_value", overwrite_if_exists=False)
+        assert await storage_client.get("test_key") == "test_value"
 
     @timeout(5)
-    @pytest_async_module
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_get(self, storage_server, storage_client):
         assert await storage_client.set("test_key",
                                         "test_value",
@@ -82,7 +81,7 @@ class TestClusterStorage:
         assert await storage_client.get("test_key") == "test_value"
 
     @timeout(5)
-    @pytest_async_module
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_expire(self, storage_server, storage_client):
         assert await storage_client.set("test_key",
                                         "test_value",
@@ -95,8 +94,8 @@ class TestClusterStorage:
         assert await storage_client.get("test_key") is None
 
     @timeout(5)
-    @pytest_async_module
-    async def test_get_keys(self, storage_server, storage_client):
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_get_prefix(self, storage_server, storage_client):
         keys = [gen_key("test_key_unique") for _ in range(3)]
         values = [f"test_value{i}" for i in range(3)]
         for key, value in zip(keys, values):
@@ -113,8 +112,8 @@ class TestClusterStorage:
         answer_keys = await storage_client.get_prefix(keys[1], keys_only=True)
         assert answer_keys == {keys[1]: ""}
 
-    @pytest_ignore_tleak
-    @pytest_async_module
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.asyncio(loop_scope="module")
     @timeout(5)
     async def test_watch(self, storage_server_client, storage_client):
         item1 = StorageItem(key=gen_key("test_key"), value="test_value1")
@@ -127,8 +126,17 @@ class TestClusterStorage:
         ]
         assert await storage_server_client.get(item1.key) == item1.value
 
-    @pytest_ignore_tleak
-    @pytest_async_module
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.asyncio(loop_scope="module")
+    @timeout(10)
+    async def test_unwatch(self, storage_server_client, storage_client):
+        assert await storage_server_client.watch("test_key")
+        await storage_server_client.unwatch("test_key")
+        with pytest.raises(ValueError):
+            await storage_server_client.unwatch("test_key")
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.asyncio(loop_scope="module")
     @timeout(10)
     async def test_watch_multiple(self, storage_server_client):
         item1 = StorageItem(key=gen_key("test_key"), value="test_value1")
@@ -144,8 +152,8 @@ class TestClusterStorage:
         assert set([event.event_type
                     for event in watch_events]) == {WatchEventType.SET}
 
-    @pytest_ignore_tleak
-    @pytest_async_module
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.asyncio(loop_scope="module")
     @timeout(10)
     async def test_watch_set_and_delete(self, storage_server_client):
         item1 = StorageItem(key=gen_key("test_key"), value="test_value1")

@@ -45,17 +45,17 @@ class ConditionalDisaggConfig():
 
 @dataclass
 class MinimalInstances:
-    context_servers: int = 1
-    generation_servers: int = 1
+    context_servers: int = 1  # the minimal number of context servers
+    generation_servers: int = 1  # the minimal number of generation servers
 
 
 @dataclass
 class DisaggClusterConfig:
-    cluster_uri: str
-    cluster_name: str = ""
+    cluster_uri: str  # the uri of the cluster storage
+    cluster_name: str = ""  # the name of the cluster, used like a namespace
     minimal_instances: Optional[MinimalInstances] = None
-    heartbeat_interval: int = 5
-    inactive_timeout: int = 10
+    heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
+    inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
 
 
 @dataclass

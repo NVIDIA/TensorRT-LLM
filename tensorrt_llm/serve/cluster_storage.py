@@ -67,6 +67,7 @@ class ClusterStorage(abc.ABC):
     async def stop(self):
         ...
 
+    # set the key with the value, if the key already exists and overwrite_if_exists is False, return False
     async def set(self,
                   key: str,
                   value: str,
@@ -78,18 +79,24 @@ class ClusterStorage(abc.ABC):
     async def expire(self, key: str, ttl: int) -> bool:
         ...
 
+    # get the value of the key, return None if the key does not exist or is expired
     async def get(self, key: str) -> str:
         ...
 
+    # delete the key, return True if the key is deleted, False otherwise
     async def delete(self, key: str) -> bool:
         ...
 
+    # watch the key prefix, return the watch event queue
     async def watch(self, key_prefix: str) -> WatchEventQueue:
         ...
 
+    # unwatch the key prefix, if the key prefix is not in the watch list, raise an error
     async def unwatch(self, key_prefix: str) -> None:
         ...
 
+    # get the value of the key prefix, return the dict of key and value
+    # if keys_only is True, the value will be empty string
     async def get_prefix(self,
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
@@ -133,6 +140,7 @@ class HttpClusterStorageServer(ClusterStorage):
         self._watch_handles = {}
         self._watch_lock = asyncio.Lock()
         self._check_expired_task = None
+        self._check_expired_interval = 1  # in seconds
         if server:
             self.add_routes(server)
 
@@ -228,14 +236,14 @@ class HttpClusterStorageServer(ClusterStorage):
                     key_prefixes=[key_prefix], events=asyncio.Queue())
             return self._watch_handles[key_prefix]
 
-    async def unwatch(self, key_prefixes: List[str]) -> None:
+    async def unwatch(self, key_prefix: str) -> None:
         async with self._watch_lock:
-            for key_prefix in key_prefixes:
-                if key_prefix in self._watch_handles:
-                    self._watch_handles.pop(key_prefix)
-                else:
-                    raise ValueError(
-                        f"Key prefix {key_prefix} not in watch list")
+            if key_prefix in self._watch_handles:
+                self._watch_handles.pop(key_prefix)
+            else:
+                raise ValueError(
+                    f"Key prefix {key_prefix} not in watch list, {self._watch_handles.keys()}"
+                )
 
     async def _notify_watch_event(self, key, storage_item: StorageItem,
                                   event_type: WatchEventType):
@@ -255,21 +263,22 @@ class HttpClusterStorageServer(ClusterStorage):
 
     async def _check_expired(self):
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(self._check_expired_interval)
             try:
                 before_len = len(self._storage)
+                current_time = key_time()
                 async with self._lock:
-                    key_to_delete = [
-                        key for key in self._storage.keys()
-                        if self._storage[key].expire_time > 0
-                        and self._storage[key].expire_time < key_time()
-                    ]
-                    for key in key_to_delete:
-                        await self._notify_watch_event(key, self._storage[key],
-                                                       WatchEventType.DELETE)
-                        self._storage.pop(key)
+                    kv_to_delete = {
+                        k: v
+                        for k, v in self._storage.items()
+                        if v.expire_time > 0 and v.expire_time < current_time
+                    }
+                    for k in kv_to_delete.keys():
+                        self._storage.pop(k)
+                for k, v in kv_to_delete.items():
+                    await self._notify_watch_event(k, v, WatchEventType.DELETE)
                 logger.debug(
-                    f"Checked expired, {before_len} -> {len(self._storage)}, keys to delete: {key_to_delete}"
+                    f"Checked expired, {before_len} -> {len(self._storage)}, keys to delete: {kv_to_delete.keys()}"
                 )
             except Exception as e:
                 logger.error(f"Error checking expired: {e}")

@@ -4,15 +4,16 @@ import tempfile
 import time
 
 import pytest
+import pytest_asyncio
+from test_cluster_storage import http_server_storage
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
-from tensorrt_llm.serve.auto_scaling import ClusterManager, ClusterWorker
 from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage,
                                                 create_cluster_storage_client)
-
-from .test_cluster_storage import http_server_storage, pytest_async_fixture
+from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
+                                                    DisaggClusterWorker)
 
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
@@ -36,8 +37,8 @@ def config(request):
                                cluster_name="test",
                                minimal_instances=MinimalInstances(
                                    context_servers=1, generation_servers=1),
-                               inactive_timeout=INACTIVE_TIMEOUT,
-                               heartbeat_interval=HEARTBEAT_INTERVAL)
+                               inactive_timeout_sec=INACTIVE_TIMEOUT,
+                               heartbeat_interval_sec=HEARTBEAT_INTERVAL)
 
 
 @pytest.fixture(scope="module")
@@ -60,16 +61,16 @@ def storage_server(config):
         raise ValueError(f"Invalid cluster storage URI: {config.cluster_uri}")
 
 
-@pytest_async_fixture(scope="module")
+@pytest_asyncio.fixture(scope="function")
 async def storage_client(storage_server):
     _, cluster_uri = storage_server
     return create_cluster_storage_client(cluster_uri, "test")
 
 
-@pytest_async_fixture(scope="module")
+@pytest_asyncio.fixture(scope="function")
 async def cluster_manager(config, storage_server):
     storage, cluster_uri = storage_server
-    manager = ClusterManager(config, storage)
+    manager = DisaggClusterManager(config, storage)
     await manager.start()
     yield manager
     await manager.stop()
@@ -84,14 +85,14 @@ async def test_init_workers_first(config, storage_server):
         # get the pre-registered workers
         server, storage_uri = storage_server
         storage_client = create_cluster_storage_client(storage_uri, "test")
-        ctx_worker = ClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
-                                   config, storage_client)
-        gen_worker = ClusterWorker(ServerRole.GENERATION, "127.0.0.1", 8002,
-                                   config, storage_client)
+        ctx_worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
+                                         config, storage_client)
+        gen_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1",
+                                         8002, config, storage_client)
         await ctx_worker.register_worker()
         await gen_worker.register_worker()
 
-        cluster_manager = ClusterManager(config, server)
+        cluster_manager = DisaggClusterManager(config, server)
         await cluster_manager.start()
         existing_workers = await cluster_manager.watch_workers(
             get_existing_first=True)
@@ -106,40 +107,75 @@ async def test_init_workers_first(config, storage_server):
         await gen_worker.deregister_worker()
 
 
+async def register_worker_and_watch(cluster_manager, storage_client, config):
+    assert cluster_manager.current_ctx_worker_num == 0
+    assert cluster_manager.current_gen_worker_num == 0
+    await cluster_manager.watch_workers()
+    try:
+        await asyncio.wait_for(cluster_manager.get_worker_events(), timeout=1)
+    except asyncio.TimeoutError:
+        pass
+    assert await cluster_manager.is_ready() == False
+
+    ctx_worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
+                                     config, storage_client)
+    await cluster_manager.watch_workers()
+    await ctx_worker.register_worker()
+    worker_events = await cluster_manager.get_worker_events()
+    assert worker_events == [(ctx_worker.worker_info, WatchEventType.SET)]
+    assert cluster_manager.current_ctx_worker_num == 1
+    assert cluster_manager.current_gen_worker_num == 0
+    assert await cluster_manager.is_ready() == False
+
+    gen_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1", 8002,
+                                     config, storage_client)
+    await gen_worker.register_worker()
+    worker_events = await cluster_manager.get_worker_events()
+    assert worker_events == [(gen_worker.worker_info, WatchEventType.SET)]
+    assert cluster_manager.current_ctx_worker_num == 1
+    assert cluster_manager.current_gen_worker_num == 1
+    assert await cluster_manager.is_ready() == True
+    return ctx_worker, gen_worker
+
+
 @pytest.mark.parametrize("config", storage_types, indirect=True)
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.timeout(20)
 @pytest.mark.asyncio(scope="module")
-async def test_cluster_manager(cluster_manager, storage_client, config):
+async def test_watch_workers(cluster_manager, storage_client, config):
     try:
-        cluster_manager.current_ctx_worker_num == 0
-        cluster_manager.current_gen_worker_num == 0
-        await cluster_manager.watch_workers()
-        try:
-            await asyncio.wait_for(cluster_manager.get_worker_events(),
-                                   timeout=1)
-        except asyncio.TimeoutError:
-            pass
-        assert await cluster_manager.is_ready() == False
+        ctx_worker, gen_worker = await register_worker_and_watch(
+            cluster_manager, storage_client, config)
+    finally:
+        await ctx_worker.deregister_worker()
+        await gen_worker.deregister_worker()
 
-        ctx_worker = ClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
-                                   config, storage_client)
-        await cluster_manager.watch_workers()
-        await ctx_worker.register_worker()
-        worker_events = await cluster_manager.get_worker_events()
-        assert worker_events == [(ctx_worker.worker_info, WatchEventType.SET)]
-        assert cluster_manager.current_ctx_worker_num == 1
-        assert cluster_manager.current_gen_worker_num == 0
-        assert await cluster_manager.is_ready() == False
 
-        gen_worker = ClusterWorker(ServerRole.GENERATION, "127.0.0.1", 8002,
-                                   config, storage_client)
-        await gen_worker.register_worker()
-        worker_events = await cluster_manager.get_worker_events()
-        assert worker_events == [(gen_worker.worker_info, WatchEventType.SET)]
-        assert cluster_manager.current_ctx_worker_num == 1
-        assert cluster_manager.current_gen_worker_num == 1
-        assert await cluster_manager.is_ready() == True
+@pytest.mark.parametrize("config", storage_types, indirect=True)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(20)
+@pytest.mark.asyncio(scope="module")
+async def test_unwatch_workers(cluster_manager, storage_client, config):
+    try:
+        ctx_worker, gen_worker = await register_worker_and_watch(
+            cluster_manager, storage_client, config)
+        await cluster_manager.unwatch_workers()
+        with pytest.raises(ValueError):
+            await cluster_manager.get_worker_events()
+    finally:
+        await ctx_worker.deregister_worker()
+        await gen_worker.deregister_worker()
+
+
+@pytest.mark.parametrize("config", storage_types, indirect=True)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(20)
+@pytest.mark.asyncio(scope="module")
+async def test_watch_register_then_deregister(cluster_manager, storage_client,
+                                              config):
+    try:
+        ctx_worker, gen_worker = await register_worker_and_watch(
+            cluster_manager, storage_client, config)
 
         await ctx_worker.deregister_worker()
         worker_events = await cluster_manager.get_worker_events()
@@ -165,7 +201,8 @@ async def test_cluster_manager(cluster_manager, storage_client, config):
 @pytest.mark.parametrize("config", storage_types, indirect=True)
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.asyncio(scope="module")
-async def test_cluster_worker(cluster_manager, storage_client, config):
+async def test_cluster_worker_heartbeat(cluster_manager, storage_client,
+                                        config):
 
     async def wait_for_worker_events(expected_new_event_num,
                                      expected_dead_event_num):
@@ -196,10 +233,10 @@ async def test_cluster_worker(cluster_manager, storage_client, config):
     try:
         await cluster_manager.start()
         await cluster_manager.watch_workers()
-        ctx_worker = ClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
-                                   config, storage_client)
-        gen_worker = ClusterWorker(ServerRole.GENERATION, "127.0.0.1", 8002,
-                                   config, storage_client)
+        ctx_worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001,
+                                         config, storage_client)
+        gen_worker = DisaggClusterWorker(ServerRole.GENERATION, "127.0.0.1",
+                                         8002, config, storage_client)
 
         keep_heartbeat = True
         assert await ctx_worker.register_worker(validator=lambda: keep_heartbeat
@@ -212,7 +249,7 @@ async def test_cluster_worker(cluster_manager, storage_client, config):
         assert len(dead_workers_ids) == 0
         assert await cluster_manager.is_ready() == True
 
-        await asyncio.sleep(config.inactive_timeout + 1)
+        await asyncio.sleep(config.inactive_timeout_sec + 1)
         assert await cluster_manager.is_ready() == True
 
         # stop heartbeat, then we should see two workers deleted

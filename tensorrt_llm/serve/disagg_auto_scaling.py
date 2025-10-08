@@ -4,7 +4,7 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.logger import logger
@@ -29,7 +29,11 @@ def get_worker_key(name: str, role: ServerRole, worker_id: str = "") -> str:
     return f"{get_worker_key_prefix(name)}/{worker_id}"
 
 
-class ClusterManager:
+class DisaggClusterManager:
+    """
+    The cluster manager is responsible for managing the workers in the cluster.
+    It will watch the workers and notify the router when the workers are changed.
+    """
 
     def __init__(self, config: DisaggClusterConfig, storage: ClusterStorage):
         self._config = config
@@ -37,17 +41,22 @@ class ClusterManager:
         self._lock = asyncio.Lock()
         self._minimal_ctx_worker_num = config.minimal_instances.context_servers
         self._minimal_gen_worker_num = config.minimal_instances.generation_servers
-        self._current_ctx_workers = {}
-        self._current_gen_workers = {}
+        self._current_ctx_workers = {}  # worker_id -> WorkerInfo
+        self._current_gen_workers = {}  # worker_id -> WorkerInfo
         self._watch_handle = None
 
-    async def start(self):
+    def __del__(self):
+        if asyncio.get_event_loop():
+            asyncio.run_coroutine_threadsafe(self.unwatch_workers(),
+                                             asyncio.get_event_loop())
+
+    async def start(self) -> None:
         await self._cluster_storage.start()
 
-    async def stop(self):
+    async def stop(self) -> None:
         await self._cluster_storage.stop()
 
-    async def cluster_info(self) -> dict:
+    async def cluster_info(self) -> Dict[str, Any]:
         async with self._lock:
             return {
                 "current_workers": {
@@ -67,15 +76,15 @@ class ClusterManager:
             }
 
     @property
-    def current_ctx_worker_num(self):
+    def current_ctx_worker_num(self) -> int:
         return len(self._current_ctx_workers)
 
     @property
-    def current_gen_worker_num(self):
+    def current_gen_worker_num(self) -> int:
         return len(self._current_gen_workers)
 
     @property
-    def worker_key_prefix(self):
+    def worker_key_prefix(self) -> str:
         return get_worker_key_prefix(self._config.cluster_name)
 
     async def watch_workers(self, get_existing_first: bool = True):
@@ -94,12 +103,14 @@ class ClusterManager:
             self.worker_key_prefix)
         return workers
 
-    async def unwatch_workers(self):
-        await self._cluster_storage.unwatch([self.worker_key_prefix])
+    async def unwatch_workers(self) -> None:
+        await self._cluster_storage.unwatch(self.worker_key_prefix)
         self._watch_handle = None
 
     async def get_worker_events(
             self) -> List[Tuple[WorkerInfo, WatchEventType]]:
+        if self._watch_handle is None:
+            raise ValueError("Watch handle is not initialized")
         events = await self._watch_handle.drain()
         worker_events = []
         for event in events:
@@ -175,7 +186,12 @@ class ClusterManager:
         return router_ctx_worker_num >= self._minimal_ctx_worker_num and router_gen_worker_num >= self._minimal_gen_worker_num
 
 
-class ClusterWorker:
+class DisaggClusterWorker:
+    """
+    The cluster worker is responsible for registering and deregistering the worker to the cluster storage.
+    It will send heartbeat to the cluster storage every heartbeat_interval_sec seconds.
+    If the worker heartbeat fails, it will re-register itself.
+    """
 
     def __init__(self, role: ServerRole, host: str, port: int,
                  config: DisaggClusterConfig, storage: ClusterStorage):
@@ -210,7 +226,7 @@ class ClusterWorker:
         return get_worker_key(self._config.cluster_name, self._role,
                               self._worker_id)
 
-    async def register_worker(self, validator=None, retry_interval=5):
+    async def register_worker(self, validator=None, retry_interval=5) -> bool:
         self._stop = False
         await self._cluster_storage.start()
         if validator and not validator():
@@ -225,7 +241,7 @@ class ClusterWorker:
         success = await self._cluster_storage.set(
             self.worker_key,
             json.dumps(asdict(worker_info)),
-            ttl=self._config.inactive_timeout)
+            ttl=self._config.inactive_timeout_sec)
         if not success:
             if retry_interval > 0:
                 logger.warning(
@@ -237,17 +253,17 @@ class ClusterWorker:
             logger.info(
                 f"Worker {self.worker_info.worker_id} registration successful")
         self._last_heartbeat = key_time()
-        if self._config.heartbeat_interval > 0 and self._config.heartbeat_interval < self._config.inactive_timeout:
+        if self._config.heartbeat_interval_sec > 0 and self._config.heartbeat_interval_sec < self._config.inactive_timeout_sec:
             if not self._heartbeat_task:
                 self._heartbeat_task = asyncio.create_task(
                     self._heartbeat(validator))
         else:
             logger.warning(
-                f"Heartbeat interval {self._config.heartbeat_interval} is not positive or less than inactive timeout {self._config.inactive_timeout}, heartbeat is disabled"
+                f"Heartbeat interval {self._config.heartbeat_interval_sec} is not positive or less than inactive timeout {self._config.inactive_timeout_sec}, heartbeat is disabled"
             )
         return True
 
-    async def deregister_worker(self):
+    async def deregister_worker(self) -> bool:
         self._stop = True
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -262,7 +278,7 @@ class ClusterWorker:
     async def _heartbeat(self, validator=None):
         logger.info(f"Worker {self.worker_info.worker_id} heartbeat started")
         while not self._stop:
-            remaining_time = self._config.heartbeat_interval - (
+            remaining_time = self._config.heartbeat_interval_sec - (
                 key_time() - self._last_heartbeat)
             if remaining_time > 0:
                 await asyncio.sleep(remaining_time)
@@ -273,7 +289,7 @@ class ClusterWorker:
                 )
                 continue
             expire_res = await self._cluster_storage.expire(
-                self.worker_key, self._config.inactive_timeout)
+                self.worker_key, self._config.inactive_timeout_sec)
             if not expire_res:
                 logger.warning(
                     f"Worker {self.worker_info.worker_id} heartbeat failed, re-registering {key_time()}"
