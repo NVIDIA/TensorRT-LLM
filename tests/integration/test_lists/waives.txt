@@ -329,7 +329,6 @@ test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistr
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput] SKIP (https://nvbugs/5481198)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale_chunked_prefill[latency] SKIP (https://nvbugs/5481198)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale_chunked_prefill[throughput] SKIP (https://nvbugs/5481198)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_trtllmgen] SKIP (https://nvbugs/5516845)
 accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_allreduce_plugin] SKIP (https://nvbugs/5532023)
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2 SKIP (https://nvbugs/5532023)
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_cp2 SKIP (https://nvbugs/5532023)
