@@ -2,8 +2,8 @@ backend: pytorch
 max_batch_size: 1024
 max_num_tokens: 2048
 kv_cache_free_gpu_memory_fraction: 0.9
-tp_size: 1
-ep_size: 1
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
 trust_remote_code: true
 enable_attention_dp: false
 cuda_graph_config:
