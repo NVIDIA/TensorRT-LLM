@@ -1875,8 +1875,8 @@ class Linear(nn.Module):
             "_USE_FLASHINFER_TRTLLM_ALLREDUCE", "0") == "1"
         self.flashinfer_vllm = self.use_flashinfer_allreduce and os.getenv(
             "_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1"
-        self.flashinfer_token_threshold = int(os.getenv(
-            "_FLASHINFER_TOKEN_THRESHOLD", "256"))
+        self.flashinfer_token_threshold = int(
+            os.getenv("_FLASHINFER_TOKEN_THRESHOLD", "256"))
         # print(f"flashinfer_trtllm: {self.flashinfer_trtllm}")
         # print(f"flashinfer_vllm: {self.flashinfer_vllm}")
 
@@ -2032,7 +2032,8 @@ class Linear(nn.Module):
                         output,
                         all_reduce_params=None,
                     )
-                elif self.flashinfer_vllm and output.size(0) <= self.flashinfer_token_threshold:
+                elif self.flashinfer_vllm and output.size(
+                        0) <= self.flashinfer_token_threshold:
                     output = self.flash_infer_all_reduce(
                         output,
                         all_reduce_params=None,

@@ -1,9 +1,9 @@
 import math
+import os
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from functools import wraps
 from typing import Optional
-import os
 
 import numpy as np
 import torch
@@ -481,7 +481,7 @@ class TorchDist(Distributed):
 
         init_pg(torch.distributed.group.WORLD, self.local_comm,
                 torch_pybind11_abi())
-        
+
         if os.getenv("_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1":
             self._flashinfer_vllm_comm = FlashInferVLLMComm(
                 mapping, self.cpu_tp_group)
