@@ -270,74 +270,63 @@ def get_test_config(test_desc, example_dir, test_root):
     return config_map[test_desc]
 
 
-def get_extra_llm_config(config, suffix, cwd):
-    extra_llm_config = {
-        'orchestrator_type': 'ray',
-    }
-    for key, value in config.items():
-        if key not in ['num_instances', 'urls']:
-            extra_llm_config[key] = value
+def run_disaggregated_test(example_dir,
+                           test_desc,
+                           num_iters=5,
+                           env=None,
+                           cwd=None,
+                           prompt_file="prompts.json",
+                           extra_endpoints_test: Callable[[str], None] = None):
+    """Run disaggregated test with given configuration."""
+    cleanup_output_files()
+    run_env = env.copy()
+    run_env["UCX_TLS"] = "^ib"
 
-    temp_fd, extra_config_file = tempfile.mkstemp(suffix='_%s.yaml' % suffix,
-                                                  dir=cwd)
-    with os.fdopen(temp_fd, 'w') as f:
-        yaml.dump(extra_llm_config, f)
+    num_ranks, config_file = get_test_config(test_desc, example_dir,
+                                             os.path.dirname(__file__))
 
-    return extra_config_file
+    workers_cmd = [
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        config_file
+    ]
 
+    server_start_timeout = 900
+    server_cmd = [
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
+        str(server_start_timeout), '-c', config_file
+    ]
+    server_url = get_disagg_server_url_from_cfg(config_file)
 
-def generate_worker_commands(model_path, config, server_config,
-                             extra_config_file, server_role):
-    worker_commands = []
-
-    assert model_path, "model path is required."
-
-    for url in server_config['urls']:
-        host, port = url.split(':')
-        cmd = [
-            'trtllm-serve', model_path, '--host', host, '--port', port,
-            '--backend', config['backend'], '--extra_llm_api_options',
-            extra_config_file, '--server_role', server_role
-        ]
-        worker_commands.append(cmd)
-    return worker_commands
-
-
-def run_client_tests(example_dir,
-                     config_file,
-                     test_desc,
-                     num_iters,
-                     env,
-                     server_start_timeout,
-                     prompt_file,
-                     extra_endpoints_test,
-                     server_url,
-                     workers_proc,
-                     server_proc,
-                     use_ray=False):
-    """Run client tests against the disaggregated server."""
-    client_dir = f"{example_dir}/clients"
-    for _ in range(num_iters):
-        client_cmd = [
-            'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
-            '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
-            '--server-start-timeout',
-            str(server_start_timeout)
-        ]
-        if prompt_file == "long_prompts.json":
-            # Use max_tokens 4 for long prompts to reduce test time
-            client_cmd.extend(['--max-tokens', '4'])
-
-        # Prepare poll processes
-        worker_processes = []
-        if use_ray:
-            for proc_cm in workers_proc:
-                worker_processes.append(proc_cm.__enter__())
-        else:
-            worker_processes = [workers_proc]
-
-        poll_procs = worker_processes + [server_proc]
-        check_call(client_cmd, env=env, poll_procs=poll_procs)
+    try:
+        with (  # Start workers
+                open('output_workers.log', 'w') as output_workers,
+                popen(workers_cmd,
+                      stdout=output_workers,
+                      stderr=subprocess.STDOUT,
+                      env=run_env,
+                      cwd=cwd) as workers_proc,
+                # Start server
+                open('output_disagg.log', 'w') as output_disagg,
+                popen(server_cmd,
+                      stdout=output_disagg,
+                      stderr=subprocess.STDOUT,
+                      env=run_env,
+                      cwd=cwd) as server_proc):
+            client_dir = f"{example_dir}/clients"
+            for _ in range(num_iters):
+                client_cmd = [
+                    'python3', f'{client_dir}/disagg_client.py', '-c',
+                    f'{config_file}', '-p', f'{client_dir}/{prompt_file}',
+                    '--ignore-eos', '--server-start-timeout',
+                    str(server_start_timeout)
+                ]
+                if prompt_file == "long_prompts.json":
+                    # Use max_tokens 4 for long prompts to reduce test time
+                    client_cmd.extend(['--max-tokens', '4'])
+                check_call(client_cmd,
+                           env=env,
+                           poll_procs=[workers_proc, server_proc])
 
         # Streaming client run
         streaming_client_cmd = client_cmd + [

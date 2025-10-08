@@ -529,16 +529,6 @@ class TorchDist(Distributed):
     def broadcast(self, obj, root=0):
         assert not (self.mapping.has_cp_ulysses() and self.mapping.has_tp()
                     ), 'Unsupported mix of Ulysses CP and TP.'
-
-        if mpi_disabled():
-            if isinstance(obj, torch.Tensor):
-                dist.broadcast(obj, src=root)
-                return obj
-            else:
-                obj_list = [obj]
-                dist.broadcast_object_list(obj_list, src=root)
-                return obj_list[0]
-
         if self.mapping.has_cp_ulysses():
             self.broadcast_cp(obj, root)
         elif self.mapping.has_tp():

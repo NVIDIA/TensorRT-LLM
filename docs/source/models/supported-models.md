@@ -23,7 +23,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen2ForRewardModel`                | Qwen2-based                        | `Qwen/Qwen2.5-Math-RM-72B`                   |
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
-
+| `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 
 
 ## Model-Feature Support Matrix(Key Models)
@@ -34,6 +34,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | ------------------------------ | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ------------------------- | ------------------------- | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
 | DeepseekV3ForCausalLM          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No                        | No                        | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | Qwen3MoeForCausalLM            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
+| Qwen3NextForCausalLM           | No                | Yes        | No                         | No                    | No              | No  | No                        | No                        | No            | No               | No             | No                       | No                    | No              |
 | Llama4ForConditionalGeneration | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | GPT-OSS                        | Yes               | Yes        | Yes                        | Yes                   | No              | No  | Yes                       | No                        | Yes           | Yes              | No             | N/A                      | Yes                   | Yes             |
 

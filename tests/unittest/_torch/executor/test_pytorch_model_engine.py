@@ -16,8 +16,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManagerType
                                                              )
 # isort: on
-from utils.util import skip_ray
-
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -324,7 +322,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
 
-    @skip_ray
     def test_prepare_tp_inputs_with_helix_parallelism(self) -> None:
         """Test _prepare_tp_inputs function with helix parallelism."""
 
