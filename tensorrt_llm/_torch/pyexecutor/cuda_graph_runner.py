@@ -244,12 +244,21 @@ class CUDAGraphRunner:
                 capture_inputs['attn_metadata'].use_spec_decoding = True
             return forward_fn(capture_inputs)
 
+        def _maybe_add_flashinfer_allreduce_context():
+            if engine._enable_flashinfer_allreduce:
+                from ..flashinfer_utils import \
+                    current_flashinfer_allreduce_workspace
+                return current_flashinfer_allreduce_workspace().capture()
+            else:
+                return contextlib.nullcontext()
+
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
         graph = torch.cuda.CUDAGraph()
-        with with_multi_stream(True), piecewise_cuda_graph(False):
+        with with_multi_stream(True), piecewise_cuda_graph(
+                False), _maybe_add_flashinfer_allreduce_context():
             for _ in range(self.WARMUP_STEPS):
                 _setup_spec_decoding_and_forward(key, forward_fn,
                                                  capture_inputs)

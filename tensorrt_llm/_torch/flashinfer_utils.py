@@ -1,3 +1,4 @@
+import contextlib
 import os
 import platform
 import traceback
@@ -5,6 +6,7 @@ import traceback
 import torch
 
 from tensorrt_llm._ipc_utils import IpcMemory
+from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_comm
 from tensorrt_llm.mapping import Mapping
 
 from ..logger import logger
@@ -44,30 +46,80 @@ class FlashInferAllReduceWorkspace:
         self.mapping = mapping
 
         max_size = 8192 * 8192 * 2  # 2 bytes for bfloat16
-        print(
+        logger.info(
             f"Opening IPC memory for meta with size {flashinfer_comm.vllm_meta_size() + max_size}"
         )
-        self.meta_ptrs_ipc = IpcMemory(
-            mapping,
-            flashinfer_comm.vllm_meta_size() + max_size)
+        try:
+            self.meta_ptrs_ipc = IpcMemory(
+                mapping,
+                flashinfer_comm.vllm_meta_size() + max_size)
 
-        # Create rank data buffer (8MB as in test)
-        self.rank_data = torch.empty(8 * 1024 * 1024,
-                                     dtype=torch.uint8,
-                                     device=f"cuda:{mapping.local_rank}")
+            # Create rank data buffer (8MB as in test)
+            self.rank_data = torch.empty(8 * 1024 * 1024,
+                                         dtype=torch.uint8,
+                                         device=f"cuda:{mapping.local_rank}")
 
-        # Create buffer pointers for IPC communication
-        self.buffer_ptrs_ipc = IpcMemory(mapping, max_size)
+            # Create buffer pointers for IPC communication
+            self.buffer_ptrs_ipc = IpcMemory(mapping, max_size)
 
-        # Initialize custom allreduce
-        self.fa = flashinfer_comm.vllm_init_custom_ar(
-            ipc_tensors=self.meta_ptrs_ipc.peer_ptrs,
-            rank_data=self.rank_data,
-            rank=mapping.rank,
-            full_nvlink=True)
+            # Initialize custom allreduce
+            self.fa = flashinfer_comm.vllm_init_custom_ar(
+                ipc_tensors=self.meta_ptrs_ipc.peer_ptrs,
+                rank_data=self.rank_data,
+                rank=mapping.rank,
+                full_nvlink=True)
 
-        flashinfer_comm.vllm_register_buffer(self.fa,
-                                             self.buffer_ptrs_ipc.peer_ptrs)
+            flashinfer_comm.vllm_register_buffer(self.fa,
+                                                 self.buffer_ptrs_ipc.peer_ptrs)
+        except Exception:
+            traceback.print_exc()
+            logger.error(f"Error initializing FlashInferAllReduceWorkspace")
+            raise
+
+        self._is_capturing = False
+        self._graph_registered = False
+        logger.info(
+            f"FlashInferAllReduceWorkspace initialized for rank {mapping.rank}")
+
+    @contextlib.contextmanager
+    def capture(self):
+        try:
+            self._is_capturing = True
+            logger.info(
+                f"Rank {self.mapping.rank}: Starting CUDA graph capture")
+            yield
+        finally:
+            self._is_capturing = False
+            # Register graph buffers after capture if not already done
+            if not self._graph_registered:
+                self.register_graph_buffers()
+            logger.info(
+                f"Rank {self.mapping.rank}: Finished CUDA graph capture")
+
+    def register_graph_buffers(self):
+        # add error handling
+        handle, offsets = flashinfer_comm.get_graph_buffer_ipc_meta(self.fa)
+        logger.info(
+            f"Rank {self.mapping.rank}: Registering {len(handle)} graph buffer(s)"
+        )
+
+        # broadcast
+        if mpi_disabled():
+            allgather = torch_comm().tp_allgather
+        else:
+            comm = mpi_comm().Split(
+                self.mapping.pp_rank * self.mapping.cp_size +
+                self.mapping.cp_rank, self.mapping.tp_rank)
+            allgather = comm.allgather
+
+        handles = allgather(handle)
+        offsets = allgather(offsets)
+
+        flashinfer_comm.vllm_register_graph_buffers(self.fa, handles, offsets)
+        self._graph_registered = True
+        logger.info(
+            f"Rank {self.mapping.rank}: Registered {len(handle)} graph buffer(s)"
+        )
 
 
 flashinfer_allreduce_workspace = None
