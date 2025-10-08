@@ -303,7 +303,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml")
+            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated")
             if (isRerunFailed) {
                 echo "The tests still failed after rerun attempt."
                 rerunFailed = true
@@ -1621,24 +1621,28 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml") {
+def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         error "There is not ${resultFileName} file, skip the rerun step"
     }
+
+    // Create rerun directory structure to avoid conflicts
+    def rerunDir = "${WORKSPACE}/${stageName}/rerun/${testType}"
+    sh "mkdir -p ${rerunDir}"
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
-        --output-dir=${WORKSPACE}/${stageName}/ \
+        --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
         --fail-signatures='${failSignaturesList}'
     """
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
     // fail the stage immediately without attempting any reruns
-    def rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
+    def rerunTestList = "${rerunDir}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
         error "There are some failed tests that cannot be rerun, skip the rerun step."
@@ -1647,32 +1651,32 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
     for (times in [1, 2]) {
-        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (fileExists(currentRerunTestList)) {
             count = sh(
                 script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
-            echo "Found ${count} tests to rerun ${times} time(s)"
+            echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
             validLineCount += count
         }
     }
     if (validLineCount > 5) {
-        error "There are more than 5 failed tests, skip the rerun step."
+        error "There are more than 5 failed ${testType} tests, skip the rerun step."
     } else if (validLineCount == 0) {
-        error "No failed tests need to be rerun, skip the rerun step."
+        error "No failed ${testType} tests need to be rerun, skip the rerun step."
     }
 
     // Rerun tests
     def isRerunFailed = false
     for (times in [1, 2]) {
-        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (!fileExists(currentRerunTestList)) {
-            echo "No failed tests need to be rerun ${times} time(s)"
+            echo "No failed ${testType} tests need to be rerun ${times} time(s)"
             continue
         }
         sh "cat ${currentRerunTestList}"
-        def xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
+        def xmlFile = "${rerunDir}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
         def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
         def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
@@ -1681,7 +1685,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         }
         newTestCmdLine += [
             "--test-list=${currentRerunTestList}",
-            "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
+            "--csv=${rerunDir}/rerun_report_${times}.csv",
             "--junit-xml ${xmlFile}",
             "--reruns ${times - 1}"
         ]
@@ -1694,45 +1698,118 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             throw e
         } catch (Exception e) {
             if (!fileExists(xmlFile)) {
-                echo "The tests crashed when rerun attempt."
+                echo "The ${testType} tests crashed when rerun attempt."
                 throw e
             }
-            echo "The tests still failed after rerun attempt."
+            echo "The ${testType} tests still failed after rerun attempt."
             isRerunFailed = true
         }
     }
 
-    // Specify the stage name correctly
-    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+    // Specify the stage name correctly for rerun results
+    sh "cd ${rerunDir} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
-    // Generate rerun report
-    def inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
-                      "${WORKSPACE}/${stageName}/rerun_results_1.xml",
-                      "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
+    echo "isRerunFailed for ${testType}: ${isRerunFailed}"
+    return isRerunFailed
+}
+
+def generateRerunReport(stageName, llmSrc) {
+    echo "Generating comprehensive rerun report for stage: ${stageName}"
+
+    def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
+    def regularRerunDir = "${rerunBaseDir}/regular"
+    def isolatedRerunDir = "${rerunBaseDir}/isolated"
+
+    // Check if any rerun directories exist
+    def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+    def hasIsolatedReruns = sh(script: "[ -d '${isolatedRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+    if (!hasRegularReruns && !hasIsolatedReruns) {
+        echo "No rerun results found, skipping rerun report generation"
+        return
+    }
+
+    // Collect all original and rerun result files
+    def allInputFiles = []
+
+    // Add original results
+    if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
+        allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
+    }
+
+    // Add isolated test results
+    def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
+    if (isolatedResults) {
+        isolatedResults.split('\n').each { file ->
+            if (file.trim()) {
+                allInputFiles.add(file.trim())
+            }
+        }
+    }
+
+    // Add regular rerun results
+    if (hasRegularReruns) {
+        for (times in [1, 2]) {
+            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            if (fileExists(rerunFile)) {
+                allInputFiles.add(rerunFile)
+            }
+        }
+    }
+
+    // Add isolated rerun results
+    if (hasIsolatedReruns) {
+        for (times in [1, 2]) {
+            def rerunFile = "${isolatedRerunDir}/rerun_results_${times}.xml"
+            if (fileExists(rerunFile)) {
+                allInputFiles.add(rerunFile)
+            }
+        }
+    }
+
+    if (allInputFiles.isEmpty()) {
+        echo "No valid input files found for rerun report generation"
+        return
+    }
+
+    echo "Generating rerun report with input files: ${allInputFiles.join(',')}"
+
+    // Generate comprehensive rerun report
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
-        --input-files=${inputFiles.join(",")}
+        --input-files=${allInputFiles.join(",")}
     """
 
-    // Update original results xml file with rerun results xml files for junit
+    // Update original results xml file with all rerun results for junit
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         merge_junit_xmls \
         --output-file=${WORKSPACE}/${stageName}/results.xml \
-        --input-files=${inputFiles.join(",")} \
+        --input-files=${allInputFiles.join(",")} \
         --deduplicate
     """
 
-    trtllm_utils.uploadArtifacts(
-        "${WORKSPACE}/${stageName}/rerun_results.html",
-        "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
-    )
+    // Upload rerun report
+    if (fileExists("${WORKSPACE}/${stageName}/rerun_results.html")) {
+        trtllm_utils.uploadArtifacts(
+            "${WORKSPACE}/${stageName}/rerun_results.html",
+            "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+        )
+        echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    }
 
-    echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
-    echo "isRerunFailed: ${isRerunFailed}"
-    return isRerunFailed
+    // Copy rerun artifacts to a consolidated location for easier access
+    sh "mkdir -p ${WORKSPACE}/${stageName}/rerun_artifacts"
+    if (hasRegularReruns) {
+        sh "cp -r ${regularRerunDir}/* ${WORKSPACE}/${stageName}/rerun_artifacts/ 2>/dev/null || true"
+    }
+    if (hasIsolatedReruns) {
+        sh "cp -r ${isolatedRerunDir}/* ${WORKSPACE}/${stageName}/rerun_artifacts/ 2>/dev/null || true"
+    }
+
+    echo "Rerun report generation completed for stage: ${stageName}"
 }
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
@@ -2014,7 +2091,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine, "results.xml", "regular")
                     if (isRerunFailed) {
                         echo "The tests still failed after rerun attempt."
                         rerunFailed = true
@@ -2037,6 +2114,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (noRegularTests && noIsolateTests) {
             error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
         }
+
+        // Generate comprehensive rerun report if any reruns occurred
+        stage ("[${stageName}] Generate Rerun Report") {
+            generateRerunReport(stageName, llmSrc)
+        }
+
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
         }
