@@ -101,7 +101,7 @@ class RayExecutor(GenerationExecutor):
 
             self.create_workers(RayGPUWorker, worker_kwargs)
         except Exception as e:
-            # Clean up the Ray resources early
+            # Clean up the Ray resources early during exception
             self.shutdown()
             logger.error(f"Failed to initialize RayExecutor: {e}")
             raise e
