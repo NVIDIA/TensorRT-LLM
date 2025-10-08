@@ -173,6 +173,15 @@ class KvCacheCreator:
                                          beam_width=max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1)
+            if self._model_engine.use_mrope:
+                request.py_multimodal_data = {
+                    "mrope_config": {
+                        "mrope_position_ids":
+                        torch.zeros(3, 1, input_seq_len, dtype=torch.int32),
+                        "mrope_position_deltas":
+                        torch.zeros(1, 1, dtype=torch.int32)
+                    }
+                }
             requests.append(request)
             remaining_tokens -= input_seq_len
         if self._mapping.enable_attention_dp:

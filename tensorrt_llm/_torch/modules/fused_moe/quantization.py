@@ -96,7 +96,7 @@ def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
                                     torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
-    key = (dst_w3_w1_weight.shape, "w31")
+    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1))
     if key not in cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
@@ -122,7 +122,7 @@ def trtllmgen_maybe_get_cached_w2_permute_indices(
                                     torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
-    key = (dst_w2_weight.shape, "w2")
+    key = (dst_w2_weight.shape, "w2", int(num_elts_per_sf or -1))
     if key not in cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = (get_shuffle_matrix_a_row_indices(
@@ -1478,11 +1478,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     Base class for NVFP4 fused MoE methods for all backends.
     """
 
-    def create_weights(self, module: torch.nn.Module, weight_dtype,
-                       weight_vec_size, block_scales_dtype,
-                       block_scales_vec_size):
+    def create_weights(self,
+                       module: torch.nn.Module,
+                       weight_dtype,
+                       weight_vec_size,
+                       block_scales_dtype,
+                       block_scales_vec_size,
+                       scaling_vector_size=16):
 
-        module.scaling_vector_size = 16
+        module.scaling_vector_size = scaling_vector_size
         # Divide by 16 because we use int64 to pack 16 fp4 values
         w3_w1_weight_shape = (module.expert_size_per_partition,
                               module.intermediate_size_per_partition * 2,
@@ -1893,9 +1897,12 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                             non_blocking=True)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
-            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            self,
+            module: torch.nn.Module,
+            w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
-            dst_w3_w1_weight_scale: torch.Tensor):
+            dst_w3_w1_weight_scale: torch.Tensor,
+            num_elts_per_sf: int = 16):
         device = dst_w3_w1_weight_scale.device
         assert device.type == "cuda"
         w1_weight_scale = load_weight_shard(w1_weight_scale,
@@ -1933,7 +1940,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             dst_w3_w1_weight_scale.view(float4_sf_dtype),
             self._cache_permute_indices,
             epilogue_tile_m,
-            num_elts_per_sf=16)
+            num_elts_per_sf=num_elts_per_sf)
 
         # Shuffle the weight according to permute indices
         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
@@ -1949,9 +1956,11 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             processed_w3_w1_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
 
-    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
+    def load_expert_w2_weight_scale_nvfp4(self,
+                                          module: torch.nn.Module,
                                           w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+                                          dst_w2_weight_scale: torch.Tensor,
+                                          num_elts_per_sf: int = 16):
         device = dst_w2_weight_scale.device
         assert device.type == "cuda"
         w2_weight_scale = load_weight_shard(w2_weight_scale,
@@ -1976,7 +1985,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
             dst_w2_weight_scale.view(float4_sf_dtype),
             self._cache_permute_indices,
             epilogue_tile_m,
-            num_elts_per_sf=16)
+            num_elts_per_sf=num_elts_per_sf)
 
         # Shuffle the weight according to permute indices
         w_shuffled = torch.ops.trtllm.shuffle_matrix(
@@ -1996,6 +2005,56 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
                                        module.fc31_alpha.data,
                                        non_blocking=True)
+
+
+class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
+
+    def create_weights(self, module: torch.nn.Module):
+        weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
+        block_scales_vec_size = 1
+
+        NVFP4FusedMoEMethod.create_weights(self, module, self.weight_dtype,
+                                           weight_vec_size,
+                                           self.block_scales_dtype,
+                                           block_scales_vec_size, 32)
+
+        fc31_scale_c = nn.Parameter(torch.ones(module.expert_size_per_partition,
+                                               dtype=torch.float32),
+                                    requires_grad=False)
+        module.register_parameter("fc31_scale_c", fc31_scale_c)
+
+        self.setup_quant_scales(module)
+
+    def load_expert_w3_w1_weight_scale_nvfp4(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        return super().load_expert_w3_w1_weight_scale_nvfp4(
+            module, w1_weight_scale, w3_weight_scale, dst_w3_w1_weight_scale,
+            32)
+
+    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor):
+        return super().load_expert_w2_weight_scale_nvfp4(
+            module, w2_weight_scale, dst_w2_weight_scale, 32)
+
+    def load_all_fp4_weight_scales_and_alphas(
+            self, module: torch.nn.Module, weights: Dict,
+            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor, dst_fc31_alpha: torch.Tensor,
+            dst_fc2_alpha: torch.Tensor):
+        super().load_all_fp4_weight_scales_and_alphas(
+            module, weights, load_expert_ids, dst_w3_w1_weight_scale,
+            dst_w2_weight_scale, dst_fc31_alpha, dst_fc2_alpha)
+        # The kernel we use will convert nvfp4 to e4m3 before matmul,
+        # so the range of the scale factor can only be [0,448/6].
+        dst_w3_w1_weight_scale.copy_((dst_w3_w1_weight_scale.to(torch.float32) /
+                                      6.0).to(torch.float8_e4m3fn))
+        dst_w2_weight_scale.copy_((dst_w2_weight_scale.to(torch.float32) /
+                                   6.0).to(torch.float8_e4m3fn))
+        dst_fc31_alpha.copy_(dst_fc31_alpha * 6.0)
+        dst_fc2_alpha.copy_(dst_fc2_alpha * 6.0)
 
 
 def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
