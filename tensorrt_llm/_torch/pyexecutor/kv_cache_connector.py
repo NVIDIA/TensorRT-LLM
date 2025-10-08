@@ -392,6 +392,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def get_num_new_matched_tokens(self, request: LlmRequest,
                                    num_computed_tokens: int) -> int:
+        if request.is_generation_only_request:
+            raise RuntimeError(
+                "Connector API is not supported for generation-only requests!")
+
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(
                 request, num_computed_tokens))

@@ -229,6 +229,9 @@ class PyExecutor:
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         self.ctx_in_transmission_requests = []
+        self.ctx_in_transmission_counter = (1 if kv_cache_transceiver else
+                                            0) + (1 if kv_connector_manager else
+                                                  0)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -312,8 +315,8 @@ class PyExecutor:
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with KvCacheTransceiver."
+                logger.warning(
+                    "Both KV Cache Connector and KV Cache Transceiver are enabled. Are you sure you want to do this?"
                 )
 
             if self.dist.pp_size > 1:
@@ -958,7 +961,8 @@ class PyExecutor:
                                     block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                         req, True)
                                     self.ctx_in_transmission_requests.append(
-                                        (req, block_id))
+                                        (req, block_id,
+                                         self.ctx_in_transmission_counter))
 
                         if self.kv_cache_transceiver:
                             self._send_disagg_ctx_cache(
@@ -978,7 +982,7 @@ class PyExecutor:
                     self.micro_batches[prev_microbatch_id] = None
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+                    self.terminate_disagg_ctx_finished_requests()
 
                 if self._disagg_pp_termination_handler is not None:
                     requests_to_terminate = self._disagg_pp_termination_handler.sync(
@@ -1075,7 +1079,17 @@ class PyExecutor:
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
-                self.resource_manager.free_resources(req)
+                for request, block_id, counter in self.ctx_in_transmission_requests[:]:
+                    if request == req:
+                        self.ctx_in_transmission_requests.remove(
+                            (request, block_id, counter))
+
+                        if counter == 1:
+                            self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                        else:
+                            self.ctx_in_transmission_requests.append(
+                                (request, block_id, counter - 1))
+                        break
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -1163,7 +1177,8 @@ class PyExecutor:
                                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
                                     req, True)
                                 self.ctx_in_transmission_requests.append(
-                                    (req, block_id))
+                                    (req, block_id,
+                                     self.ctx_in_transmission_counter))
 
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1179,7 +1194,7 @@ class PyExecutor:
                         self._add_kv_cache_events()
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+                    self.terminate_disagg_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
 
@@ -1364,7 +1379,7 @@ class PyExecutor:
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
+                    self.terminate_disagg_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
 
@@ -1899,11 +1914,16 @@ class PyExecutor:
                 # we still need to free resources corresponding to other resource managers.
                 self.resource_manager.free_resources(request)
             else:
-                if not self.kv_connector_manager.request_finished(
-                        request, cache_block_ids):
-                    self.resource_manager.free_resources(request)
-        else:
-            self.resource_manager.free_resources(request)
+                if self.kv_connector_manager.request_finished(
+                        request,
+                        cache_block_ids) and not self.kv_cache_transceiver:
+                    block_id = self.kv_cache_manager.store_blocks_for_reuse(
+                        request, True)
+                    self.ctx_in_transmission_requests.append(
+                        (request, block_id, self.ctx_in_transmission_counter))
+
+        self.resource_manager.free_resources(request)
+
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 
@@ -2050,7 +2070,7 @@ class PyExecutor:
                 else:
                     if request.is_disagg_context_transmission_state:
                         self.ctx_in_transmission_requests.append(
-                            (request, None))
+                            (request, None, self.ctx_in_transmission_counter))
                     else:
                         requests_to_terminate.append(request)
             else:
@@ -2064,15 +2084,20 @@ class PyExecutor:
             self._terminate_request(request)
         return requests_to_terminate
 
-    @nvtx_range("_terminate_ctx_finished_requests")
-    def _terminate_ctx_finished_requests(self):
-        for request, block_id in self.ctx_in_transmission_requests[:]:
+    @nvtx_range("terminate_disagg_ctx_finished_requests")
+    def terminate_disagg_ctx_finished_requests(self):
+        for request, block_id, counter in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
-                else:
+                elif counter == 1:
                     self.kv_cache_manager.unpin_blocks_by_id(block_id)
-                self.ctx_in_transmission_requests.remove((request, block_id))
+                else:
+                    self.ctx_in_transmission_requests.append(
+                        (request, block_id, counter - 1))
+
+                self.ctx_in_transmission_requests.remove(
+                    (request, block_id, counter))
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
