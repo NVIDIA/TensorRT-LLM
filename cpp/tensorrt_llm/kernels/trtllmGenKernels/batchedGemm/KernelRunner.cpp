@@ -152,6 +152,16 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
                 }
             }
 
+            // FIXME: Disables a few static scheduler kernels (schedS) that appears to have issues;
+            // found after commit e257cb3533; still under investigation. Offending kernels:
+            // bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m128x64x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a
+            // bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s3_et128x64_m128x64x32_cga1x1x1_16dp256b_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f
+            if (options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt == true
+                && options.mTileN == 64)
+            {
+                continue;
+            }
+
             if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM)
             {
                 mPassingConfigIndices.push_back(i);
