@@ -12,7 +12,7 @@ from ray.util.placement_group import (PlacementGroup,
                                       get_current_placement_group,
                                       placement_group)
 
-from tensorrt_llm._utils import get_free_port
+from tensorrt_llm._utils import get_free_port, unwrap_ray_errors
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_range_debug
@@ -143,22 +143,29 @@ class RayExecutor(GenerationExecutor):
             for rank in range(self.world_size)
         ]
 
-        ray.get([worker.__ray_ready__.remote() for worker in self.workers])
+        try:
+            ray.get([worker.__ray_ready__.remote() for worker in self.workers])
+        except ray.exceptions.ActorDiedError as e:
+            if "The actor died because of an error raised in its creation task" in str(
+                    e):
+                raise RuntimeError(
+                    "RayGPUWorker died during initialization") from e
+            raise
 
     def call_all_ray_workers(self, func: str, leader_only: bool,
                              async_call: bool, *args, **kwargs):
         workers = (self.workers[0], ) if leader_only else self.workers
-
-        if async_call:
-            return [
-                getattr(worker, func).remote(*args, **kwargs)
-                for worker in workers
-            ]
-        else:
-            return ray.get([
-                getattr(worker, func).remote(*args, **kwargs)
-                for worker in workers
-            ])
+        with unwrap_ray_errors():
+            if async_call:
+                return [
+                    getattr(worker, func).remote(*args, **kwargs)
+                    for worker in workers
+                ]
+            else:
+                return ray.get([
+                    getattr(worker, func).remote(*args, **kwargs)
+                    for worker in workers
+                ])
 
     def collective_rpc(self,
                        method: str,
@@ -171,17 +178,17 @@ class RayExecutor(GenerationExecutor):
         kwargs = kwargs or {}
 
         refs = []
-        for w in workers:
-            try:
-                refs.append(getattr(w, method).remote(*args, **kwargs))
-            except AttributeError:
-                # Here worker is the RayWorkerWrapper.
-                # For extended worker methods, we need to use call_worker_method since
-                # Ray actor doesn't work with __getattr__ delegation.
-                refs.append(w.call_worker_method.remote(method, *args,
-                                                        **kwargs))
-
-        return refs if non_block else ray.get(refs)
+        with unwrap_ray_errors():
+            for w in workers:
+                try:
+                    refs.append(getattr(w, method).remote(*args, **kwargs))
+                except AttributeError:
+                    # Here worker is the RayWorkerWrapper.
+                    # For extended worker methods, we need to use call_worker_method since
+                    # Ray actor doesn't work with __getattr__ delegation.
+                    refs.append(
+                        w.call_worker_method.remote(method, *args, **kwargs))
+            return refs if non_block else ray.get(refs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
