@@ -430,28 +430,25 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
         lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
 
     # Test that too small PeftCacheConfig.host_cache_size causes failure
-    with pytest.raises(RuntimeError):
-        with try_expose_error_in_ray(RuntimeError):
-            check_llama_7b_multi_lora_from_request_test_harness(
-                LLM,
-                lora_config=lora_config_no_cache_size_values,
-                peft_cache_config=PeftCacheConfig(
-                    host_cache_size=1),  # size in bytes
-                # Disable CUDA graph
-                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-                cuda_graph_config=None)
+    with pytest.raises(RuntimeError), try_expose_error_in_ray(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1),  # size in bytes
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
-    with pytest.raises(RuntimeError):
-        with try_expose_error_in_ray(RuntimeError):
-            check_llama_7b_multi_lora_from_request_test_harness(
-                LLM,
-                lora_config=lora_config_no_cache_size_values,
-                peft_cache_config=PeftCacheConfig(
-                    device_cache_percent=0.0000001),
-                # Disable CUDA graph
-                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-                cuda_graph_config=None)
+    with pytest.raises(RuntimeError), try_expose_error_in_ray(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
 
 
 @skip_gpu_memory_less_than_40gb
