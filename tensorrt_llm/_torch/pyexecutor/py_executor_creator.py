@@ -29,6 +29,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist, TorchDist
+from ..flashinfer_utils import init_flashinfer_allreduce_workspace
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
@@ -295,6 +296,10 @@ def create_py_executor(
         dist = TorchDist(mapping=mapping)
     else:
         dist = MPIDist(mapping=mapping)
+
+    # TODO: convert to arg
+    if os.getenv("_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1":
+        init_flashinfer_allreduce_workspace(mapping)
 
     cache_transceiver_config = None
     if llm_args.cache_transceiver_config is not None:

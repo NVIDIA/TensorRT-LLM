@@ -32,7 +32,7 @@ from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import MPIDist
-from ..distributed.communicator import init_pp_comm, init_torch_dist_tp_comm
+from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -153,8 +153,7 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        if mapping.has_tp():
-            init_torch_dist_tp_comm(mapping)
+
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
