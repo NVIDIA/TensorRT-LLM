@@ -605,7 +605,8 @@ def executor_request_to_llm_request(
         executor_request: ExecutorRequest,
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
-        input_token_ids: Optional[List] = None) -> LlmRequest:
+        input_token_ids: Optional[List] = None,
+        position_ids: Optional[List] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
@@ -644,6 +645,7 @@ def executor_request_to_llm_request(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
+        position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None

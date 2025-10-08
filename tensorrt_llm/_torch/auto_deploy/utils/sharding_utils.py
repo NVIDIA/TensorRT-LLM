@@ -186,8 +186,8 @@ def _insert_sharded_matmul(
 
     # figure out the right dist op
     dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
+        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -581,7 +581,7 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Add all_gather node after BMM to collect results
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather,
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
@@ -669,7 +669,7 @@ def _insert_sharded_moe(
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
         dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,)
+            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)

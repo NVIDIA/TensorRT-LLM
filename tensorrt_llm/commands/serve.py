@@ -165,15 +165,6 @@ def launch_server(host: str,
     elif backend == '_autodeploy':
         # AutoDeploy does not support build_config
         llm_args.pop("build_config", None)
-        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
-        # AutoDeploy does not support cache reuse yet.
-        kv_cache_config = llm_args["kv_cache_config"]
-        # If the LLM API options YAML contained a portion for `kv_cache_config`, then this will be
-        # a dict. Otherwise, it will be an instance of the `KvCacheConfig` class, hence the below.
-        if isinstance(kv_cache_config, dict):
-            llm_args["kv_cache_config"]["enable_block_reuse"] = False
-        else:
-            llm_args["kv_cache_config"].enable_block_reuse = False
         llm = AutoDeployLLM(**llm_args)
     elif backend == 'tensorrt' or backend == 'trt':
         llm_args.pop("backend")

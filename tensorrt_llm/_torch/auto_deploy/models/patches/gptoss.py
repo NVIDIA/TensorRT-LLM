@@ -59,7 +59,7 @@ def gpt_oss_attention(
         sinks = self.sinks
 
     # Use custom op to capture attention. This layout is bsnd (batch, seq, num_heads, head_dim)
-    attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(
+    attn_output = torch.ops.auto_deploy.torch_attention(
         query_states,
         key_states,
         value_states,
@@ -69,6 +69,7 @@ def gpt_oss_attention(
         scale=self.scaling,
         sinks=sinks,
         sliding_window=sliding_window,
+        layout="bsnd",
     )
 
     # Reshape back to original input shape

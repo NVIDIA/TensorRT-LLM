@@ -36,6 +36,9 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
+# Use TinyGEMM when the number of tokens is not larger than this threshold
+MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+
 
 class AttentionBlock(Attention):
 
@@ -43,6 +46,7 @@ class AttentionBlock(Attention):
         self,
         config: ModelConfig[GptOssConfig],
         layer_idx: int = 0,
+        use_custom_cublas_mm: bool = False,
     ):
         pretrained_config = config.pretrained_config
 
@@ -75,6 +79,7 @@ class AttentionBlock(Attention):
             config=config,
             q_scaling=1.0,
             attention_chunk_size=None,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         # Only apply sliding window to every other layer
@@ -127,6 +132,7 @@ class MLPBlock(torch.nn.Module):
         config: ModelConfig[GptOssConfig],
         layer_idx: int,
         reduce_results: bool = True,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
 
@@ -146,8 +152,7 @@ class MLPBlock(torch.nn.Module):
             out_features=pretrained_config.num_local_experts,
             bias=True,
             dtype=pretrained_config.torch_dtype,
-            use_custom_cublas_mm=
-            False,  # TODO: check perf & cublass mm can not support bias.
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(
@@ -219,6 +224,15 @@ class MLPBlock(torch.nn.Module):
             device=device,
             dtype=pretrained_config.torch_dtype)
 
+    def compute_gate_output(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
+            weight = self.gate.weight
+            bias = self.gate.bias
+            g = torch.ops.trtllm.tinygemm2(x, weight, bias)
+        else:
+            g = self.gate(x)
+        return g
+
     def forward_normal(
         self,
         x: torch.Tensor,
@@ -231,7 +245,7 @@ class MLPBlock(torch.nn.Module):
         # t = self.norm(x) was done in the parent block
         t = x
 
-        g = self.gate(t)
+        g = self.compute_gate_output(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -266,7 +280,7 @@ class MLPBlock(torch.nn.Module):
             if (isinstance(self.experts, (TritonFusedMoE))):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
 
-        g = self.gate(t)
+        g = self.compute_gate_output(t)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -304,6 +318,7 @@ class TransformerBlock(DecoderLayer):
         self,
         config: ModelConfig[GptOssConfig],
         layer_idx: int,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -318,14 +333,17 @@ class TransformerBlock(DecoderLayer):
             eps=pretrained_config.rms_norm_eps,
             dtype=pretrained_config.torch_dtype)
 
-        self.attn = AttentionBlock(config, layer_idx)
+        self.attn = AttentionBlock(config, layer_idx, use_custom_cublas_mm)
 
         self.post_attention_layernorm = RMSNorm(
             hidden_size=pretrained_config.hidden_size,
             eps=pretrained_config.rms_norm_eps,
             dtype=pretrained_config.torch_dtype)
 
-        self.mlp = MLPBlock(config, layer_idx, reduce_results=not self.is_tp)
+        self.mlp = MLPBlock(config,
+                            layer_idx,
+                            reduce_results=not self.is_tp,
+                            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.mapping = config.mapping
 
@@ -459,6 +477,11 @@ class Transformer(DecoderModel):
         # which may be incompatible with torch.compile due to version mismatch.
         enable_torch_compile_for_embedding = model_config.moe_backend != "TRITON"
 
+        # Use custom cublas since we need LUT to tune the perf.
+        prop = torch.cuda.get_device_properties(0)
+        sm_version = prop.major * 10 + prop.minor
+        self.use_custom_cublas_mm = sm_version == 121
+
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
@@ -479,6 +502,7 @@ class Transformer(DecoderModel):
                 gather_output=True,
                 enable_torch_compile_for_embedding=
                 enable_torch_compile_for_embedding,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             )
         # For modeling_speculative, different name expected
         self.embed_tokens = self.embedding
@@ -486,6 +510,7 @@ class Transformer(DecoderModel):
             TransformerBlock(
                 model_config,
                 layer_idx,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
         self.norm = RMSNorm(

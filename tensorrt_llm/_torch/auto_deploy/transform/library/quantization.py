@@ -393,12 +393,95 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
             state_dict[scale_name] = scale
 
 
+@TransformRegistry.register("quantize_int4_linear_from_config")
+class INT4LinearQuantizationFromConfig(Quantization):
+    """Config-based INT4 (AWQ) for the unified ModelOpt checkpoints."""
+
+    algo_name = "W4A16_AWQ"
+
+    @staticmethod
+    def target_op():
+        return torch.ops.auto_deploy.torch_fake_quant_int4_linear.default
+
+    @staticmethod
+    def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
+        N, K = original_weight.shape
+        return torch.empty((N // 2, K), dtype=torch.uint8, device=original_weight.device)
+
+    @staticmethod
+    def scale_names() -> List[str]:
+        return ["pre_quant_scale", "weight_scale"]
+
+    @staticmethod
+    def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        N, K = original_weight_shape
+        BLOCK = 128
+        assert K % BLOCK == 0, "K must be divisible by 128 for INT4 block quant."
+        return {
+            "pre_quant_scale": torch.ones(K, dtype=torch.float32),
+            "weight_scale": torch.empty((N, K // BLOCK), dtype=torch.float32),
+        }
+
+    @staticmethod
+    def build_custom_args_for_linear(scales: Dict[str, Node]) -> Tuple[object, ...]:
+        return ([scales["pre_quant_scale"]], [scales["weight_scale"]], [], [])
+
+    @staticmethod
+    def load_hook(state_dict, prefix, *args, weight_name: str):
+        """
+        Unified ckpt passthrough:
+          - weight: keep packed uint8 (N//2, K)
+          - pre_quant_scale buffer: (K,) or ones(K) if missing
+          - weight_scale buffer: (N, K//128) float32 (no reshape, no *7 here)
+        """
+        if weight_name not in state_dict:
+            return
+        BLOCK = 128
+
+        mod_prefix, _, _ = weight_name.rpartition(".")
+        pre_qs_ckpt = f"{mod_prefix}.pre_quant_scale"  # may be absent
+        wscale_ckpt = f"{mod_prefix}.weight_scale"  # required
+
+        pre_qs_buf = f"{mod_prefix}.pre_quant_scale"
+        wscale_buf = f"{mod_prefix}.weight_scale"
+
+        w_packed = state_dict[weight_name]
+        if w_packed.dtype != torch.uint8:
+            return
+
+        assert wscale_ckpt in state_dict, f"Missing {wscale_ckpt}"
+        wscale_mat = state_dict[wscale_ckpt]  # (N, K//128) float32
+
+        N_half, K = w_packed.shape
+        N = N_half * 2
+        assert K % BLOCK == 0
+        assert wscale_mat.shape == (N, K // BLOCK), (
+            f"weight_scale shape {wscale_mat.shape} != {(N, K // BLOCK)}"
+        )
+
+        # pre_quant_scale: use if present else ones(K)
+        if pre_qs_ckpt in state_dict:
+            pre_qs_val = state_dict[pre_qs_ckpt].to(torch.float32)
+            if pre_qs_val.dim() == 0:
+                pre_qs_val = pre_qs_val.expand(K).clone()
+            else:
+                assert pre_qs_val.numel() == K, (
+                    f"{pre_qs_ckpt} has {pre_qs_val.numel()} elems, expected {K}"
+                )
+        else:
+            pre_qs_val = torch.ones(K, dtype=torch.float32)
+
+        state_dict[weight_name] = w_packed  # (N//2, K) uint8
+        state_dict[pre_qs_buf] = pre_qs_val  # (K,) float32
+        state_dict[wscale_buf] = wscale_mat.to(torch.float32)  # (N, K//128)
+
+
 @TransformRegistry.register("quantize_fp8_bmm_from_config")
 class FP8BMMQuantizationFromConfig(Quantization):
     algo_name = "FP8"
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_bmm
+        return torch.ops.auto_deploy.torch_quant_fp8_bmm.default
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)

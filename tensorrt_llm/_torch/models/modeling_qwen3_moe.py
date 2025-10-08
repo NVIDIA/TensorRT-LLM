@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import torch
 from torch import nn
@@ -15,10 +15,12 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, create_moe)
+                                 RoutingMethodType, TRTLLMGenFusedMoE,
+                                 create_moe, get_moe_cls)
+from ..modules.fused_moe.interface import MoE
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -38,17 +40,17 @@ class Qwen3Gate(nn.Module):
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
         routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
-        moe_backend: str = "CUTLASS",
+        moe_backend_cls: Type[MoE] = CutlassFusedMoE,
     ):
         super().__init__()
         self.top_k = top_k
+        self.moe_backend_cls = moe_backend_cls
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
         self.routing_method_type = routing_method_type
-        self.moe_backend = moe_backend
         # FIXME: out_dtype=float32 does not work
-        # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
+        # self.out_dtype = torch.float32 if moe_backend_cls == TRTLLMGenFusedMoE else dtype
         self.out_dtype = dtype
 
         assert not apply_routing, "Qwen3Gate routing is called inside MoE"
@@ -65,16 +67,13 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
+        output_dtype = torch.bfloat16 if self.moe_backend_cls == TRTLLMGenFusedMoE else torch.float32
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
-            return RenormalizeNaiveMoeRoutingMethod(
-                top_k=self.top_k,
-                output_dtype=torch.bfloat16
-                if self.moe_backend.upper() == "TRTLLM" else torch.float32)
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k,
+                                                    output_dtype=output_dtype)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
-            return RenormalizeMoeRoutingMethod(
-                top_k=self.top_k,
-                output_dtype=torch.bfloat16
-                if self.moe_backend.upper() == "TRTLLM" else torch.float32)
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k,
+                                               output_dtype=output_dtype)
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
@@ -107,7 +106,7 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend=model_config.moe_backend,
+            moe_backend_cls=get_moe_cls(model_config),
         )
 
         self.experts = create_moe(

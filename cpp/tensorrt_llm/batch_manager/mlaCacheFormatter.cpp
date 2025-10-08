@@ -244,7 +244,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         NVTX3_SCOPED_RANGE(sendBufferFun);
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto startTime = std::chrono::steady_clock::now();
+        auto startTime = llmRequest.getSteadyClockNow();
         auto cacheIdx = processIdx % (pPDomainSize * cPDomainSize);
         if (cacheIdx < bufferCoverTargetNum)
         {
@@ -277,7 +277,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 remainSendSize -= sendSize;
             }
         }
-        auto endTime = std::chrono::steady_clock::now();
+        auto endTime = llmRequest.getSteadyClockNow();
         double delay = 0.0;
         if (recordDelay)
         {
@@ -451,7 +451,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         {
             NVTX3_SCOPED_RANGE(recvBufferFun);
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto startTime = std::chrono::steady_clock::now();
+            auto startTime = llmRequest.getSteadyClockNow();
             size_t size = 0;
             if (processIdx >= remainNoCoverTargetNum)
             {
@@ -484,7 +484,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                     remainRecvSize -= recvSize;
                 }
             }
-            auto endTime = std::chrono::steady_clock::now();
+            auto endTime = llmRequest.getSteadyClockNow();
             double delay = 0.0;
             if (recordDelay)
             {
