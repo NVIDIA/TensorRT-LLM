@@ -640,7 +640,6 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5550283")
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -742,6 +741,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
+        alltoall_model.post_load_weights()
 
         # Use DeepGemmFusedMoE as reference
         ref_model = DeepGemmFusedMoE(
@@ -757,6 +757,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         )
         ref_model.to("cuda")
         ref_model.load_weights([weights])
+        ref_model.post_load_weights()
 
         # Evaluate the outputs on variant sequence lengths
         m = MAX_NUM_TOKENS
@@ -773,13 +774,11 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs with relaxed tolerance for FP8
