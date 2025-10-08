@@ -62,61 +62,45 @@ EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/llama-3.3-70b.yaml
 
 ### Launch the TensorRT LLM Server
 
-Below is an example command to launch the TensorRT LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
+Below is an example command to launch the TensorRT LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
 
 ```shell
-trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --max_batch_size 1024 \
-    --max_num_tokens 2048 \
-    --max_seq_len 2048 \
-    --kv_cache_free_gpu_memory_fraction 0.9 \
-    --tp_size 1 \
-    --ep_size 1 \
-    --trust_remote_code \
-    --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 --host 0.0.0.0 --port 8000 --extra_llm_api_options ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
 
-### Configs and Parameters
+### LLM API Options (YAML Configuration)
 
-These options are used directly on the command line when you start the `trtllm-serve` process.
-#### `--tp_size`
+These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
 
 &emsp;**Description:** Sets the **tensor-parallel size**. This should typically match the number of GPUs you intend to use for a single model instance.
 
-#### `--ep_size`
+#### `ep_size`
 
 &emsp;**Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tp_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
-#### `--kv_cache_free_gpu_memory_fraction`
+#### `kv_cache_free_gpu_memory_fraction`
 
 &emsp;**Description:** A value between 0.0 and 1.0 that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 
 &emsp;**Recommendation:** If you experience OOM errors, try reducing this value to **0.8** or lower.
 
-#### `--max_batch_size`
+#### `max_batch_size`
 
 &emsp;**Description:** The maximum number of user requests that can be grouped into a single batch for processing.
 
-#### `--max_num_tokens`
+#### `max_num_tokens`
 
 &emsp;**Description:** The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.
 
-#### `--max_seq_len`
+#### `max_seq_len`
 
 &emsp;**Description:** The maximum possible sequence length for a single request, including both input and generated output tokens.
 
-#### `--trust_remote_code`
+#### `trust_remote_code`
 
 &emsp;**Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
-
-
-#### Extra LLM API Options (YAML Configuration)
-
-These options provide finer control over performance and are set within a YAML file passed to the trtllm-serve command via the \--extra\_llm\_api\_options argument.
 
 #### `kv_cache_config`
 
