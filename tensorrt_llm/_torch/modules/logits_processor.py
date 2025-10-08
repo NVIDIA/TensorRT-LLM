@@ -7,8 +7,9 @@ from .linear import Linear
 
 class LogitsProcessor(nn.Module):
 
-    def __init__(self):
+    def __init__(self, scale: float = 1.0):
         super().__init__()
+        self.scale = scale
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -29,4 +30,6 @@ class LogitsProcessor(nn.Module):
 
         logits = lm_head(hidden_states)
         logits = logits.float()
+        if self.scale != 1.0:
+            logits = logits * self.scale
         return logits

@@ -402,7 +402,8 @@ class DecoderModelForCausalLM(nn.Module,
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True
 
-        self.logits_processor = LogitsProcessor()
+        self.logits_processor = LogitsProcessor(
+            scale=getattr(config.pretrained_config, 'lm_head_multiplier', 1.0))
 
         self.prologue = []
         self.epilogue = [self.lm_head]
