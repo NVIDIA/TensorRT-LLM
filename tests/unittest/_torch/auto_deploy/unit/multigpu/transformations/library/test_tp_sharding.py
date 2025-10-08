@@ -408,10 +408,10 @@ def _run_pattern_detection_job(
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        # (MLP, "torch_dist_all_reduce"),
-        # (FP8MLP, "torch_dist_all_reduce"),
+        (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
-        # (GQA_Block, "torch_dist_all_reduce"),
+        (GQA_Block, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding(
