@@ -119,6 +119,8 @@ class FalconH1SSMDecoderLayer(nn.Module):
                                  head_dim=config.mamba_d_head,
                                  chunk_size=config.mamba_chunk_size,
                                  layer_idx=layer_idx,
+                                 bias=config.mamba_proj_bias,
+                                 conv_bias=config.mamba_conv_bias,
                                  rms_norm_eps=config.rms_norm_eps,
                                  dtype=config.torch_dtype,
                                  config=model_config)
