@@ -52,6 +52,7 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
@@ -59,7 +60,7 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.qk_norm_attention import QKNormRoPEAttention
+from ..modules.qk_norm_attention import compute_yarn_parameters
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
@@ -185,7 +186,52 @@ class DeepseekV3Linear(Linear):
         return output
 
 
-class GLM4Attention(QKNormRoPEAttention):
+# class GLM4Attention(QKNormRoPEAttention):
+
+#     def __init__(
+#         self,
+#         model_config: ModelConfig[PretrainedConfig],
+#         layer_idx: Optional[int] = None,
+#         fuse_qk_norm_rope: bool = True,
+#         aux_stream: Optional[torch.cuda.Stream] = None,
+#     ):
+#         config = model_config.pretrained_config
+
+#         if getattr(config, "rope_scaling", None) is not None:
+#             if "type" in config.rope_scaling:
+#                 pos_type = config.rope_scaling["type"]
+#             elif "rope_type" in config.rope_scaling:
+#                 pos_type = config.rope_scaling["rope_type"]
+#             else:
+#                 raise ValueError(
+#                     "rope_scaling must have type or rope_type field")
+#             pos_embd_params = PositionalEmbeddingParams(
+#                 type=PositionEmbeddingType.from_string(pos_type),
+#                 rope=RopeParams.from_config(config),
+#             )
+#         else:
+#             pos_embd_params = PositionalEmbeddingParams(
+#                 type=PositionEmbeddingType.yarn,
+#                 rope=RopeParams.from_config(config),
+#             )
+
+#         super().__init__(
+#             hidden_size=config.hidden_size,
+#             num_attention_heads=config.num_attention_heads,
+#             num_key_value_heads=config.num_key_value_heads,
+#             max_position_embeddings=config.max_position_embeddings,
+#             bias=config.attention_bias,
+#             pos_embd_params=pos_embd_params,
+#             fuse_qk_norm_rope=fuse_qk_norm_rope,
+#             layer_idx=layer_idx,
+#             dtype=config.torch_dtype,
+#             dense_bias=False,
+#             config=model_config,
+#             aux_stream=aux_stream,
+#         )
+
+
+class GLM4Attention(Attention):
 
     def __init__(
         self,
@@ -195,24 +241,15 @@ class GLM4Attention(QKNormRoPEAttention):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
+        self.pretrained_config = config
 
-        if getattr(config, "rope_scaling", None) is not None:
-            if "type" in config.rope_scaling:
-                pos_type = config.rope_scaling["type"]
-            elif "rope_type" in config.rope_scaling:
-                pos_type = config.rope_scaling["rope_type"]
-            else:
-                raise ValueError(
-                    "rope_scaling must have type or rope_type field")
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(pos_type),
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=RopeParams.from_config(config),
-            )
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams.from_config(config),
+            is_neox=True,
+        )
+
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -221,13 +258,73 @@ class GLM4Attention(QKNormRoPEAttention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            fuse_qk_norm_rope=fuse_qk_norm_rope,
+            rope_fusion=not self.
+            fuse_qk_norm_rope,  # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
-            aux_stream=aux_stream,
         )
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(hidden_size=self.head_dim,
+                                  eps=config.rms_norm_eps,
+                                  dtype=config.torch_dtype,
+                                  has_weights=True)
+            self.k_norm = RMSNorm(hidden_size=self.head_dim,
+                                  eps=config.rms_norm_eps,
+                                  dtype=config.torch_dtype,
+                                  has_weights=True)
+        # Create own stream if none provided (like Qwen3)
+        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
+        )
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def apply_qk_norm(self, q, k):
+
+        def q_l2norm():
+            return self.q_norm(q.reshape(-1, self.head_dim)).reshape(
+                -1, self.q_size)
+
+        def k_l2norm():
+            return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.kv_size)
+
+        q, k = maybe_execute_in_parallel(
+            q_l2norm,
+            k_l2norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        return q, k
+
+    def apply_qk_norm_rope(self, qkv, position_ids):
+        factor, low, high, attention_factor = compute_yarn_parameters(
+            self.pretrained_config)
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv, self.num_heads, self.num_key_value_heads,
+            self.num_key_value_heads, self.head_dim,
+            self.q_norm.variance_epsilon, self.q_norm.weight,
+            self.k_norm.weight,
+            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
+            position_ids.view(-1), factor, low, high, attention_factor)
+        return qkv, None, None
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        if not self.use_qk_norm:
+            return super().apply_rope(q, k, v, position_ids)
+        # Qwen3 applies QK norm before RoPE.
+        if not self.fuse_qk_norm_rope:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.apply_qk_norm(q, k)
+            return super().apply_rope(q, k, v, position_ids)
+
+        assert k is None and v is None, "The input should be a concatenated qkv tensor to apply_qk_norm_rope"
+        qkv = q
+        return self.apply_qk_norm_rope(qkv, position_ids)
 
 
 class Deepseekv3RoutingImpl():
@@ -443,7 +540,7 @@ class Deepseekv3MoE(nn.Module):
 
         # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
+        if model_config.quant_config and model_config.quant_config.quant_algo and model_config.quant_config.group_size is not None:
             block_size = model_config.quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
@@ -666,7 +763,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx)
         else:
             block_size = 1
-            if quant_config and quant_config.group_size is not None:
+            if quant_config and quant_config.quant_algo and quant_config.group_size is not None:
                 block_size = quant_config.group_size
             self.mlp_tp_size = self._compute_mlp_tp_size(
                 config.intermediate_size, block_size)
@@ -1207,8 +1304,123 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                return_context_logits=return_context_logits,
                                **kwargs)
 
+    def _check_weight_coverage(self, weights: Dict):
+        """Check coverage of checkpoint weights vs model parameters."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Quantization-related parameters that are OK to not be in checkpoint
+        quant_params_ok_to_skip = [
+            'alpha', 'input_scale', 'inv_input_scale', 'weight_scale',
+            'weight_scale_2', 'kv_scales', 'inv_kv_scales', 'pre_quant_scale',
+            'scale', 'inv_scale', 'qweight', 'qzeros', 'scales'
+        ]
+
+        # Collect all model parameter names
+        model_params = set()
+        for name, param in self.named_parameters():
+            if param is not None:
+                model_params.add(name)
+
+        # Get checkpoint keys
+        checkpoint_keys = set(weights.keys())
+
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Weight Coverage Summary:")
+        logger.info(f"  Model parameters: {len(model_params)}")
+        logger.info(f"  Checkpoint keys: {len(checkpoint_keys)}")
+
+        # Find mismatches with intelligent handling of fused weights
+        missing_in_checkpoint = []
+        for param_name in model_params:
+            # Skip special parameters
+            skip_patterns = [
+                'next_layer_layernorm', 'v_b_proj', 'k_b_proj_trans'
+            ]
+            skip_patterns.extend(quant_params_ok_to_skip)
+            if any(skip in param_name for skip in skip_patterns):
+                continue
+
+            # Check if this is a fused weight that should exist as separate parts in checkpoint
+            found = False
+
+            # Handle qkv_proj fusion: model has qkv_proj, checkpoint has q_proj, k_proj, v_proj
+            if '.qkv_proj.' in param_name:
+                # Replace qkv_proj with q_proj/k_proj/v_proj and check if any exist
+                q_name = param_name.replace('.qkv_proj.', '.q_proj.')
+                k_name = param_name.replace('.qkv_proj.', '.k_proj.')
+                v_name = param_name.replace('.qkv_proj.', '.v_proj.')
+                if q_name in checkpoint_keys or k_name in checkpoint_keys or v_name in checkpoint_keys:
+                    found = True
+
+            # Handle gate_up_proj fusion: model has gate_up_proj, checkpoint has gate_proj, up_proj
+            elif '.gate_up_proj.' in param_name:
+                gate_name = param_name.replace('.gate_up_proj.', '.gate_proj.')
+                up_name = param_name.replace('.gate_up_proj.', '.up_proj.')
+                if gate_name in checkpoint_keys or up_name in checkpoint_keys:
+                    found = True
+
+            # Handle MoE expert fused weights: these are loaded differently via MoE's load_weights
+            elif '.experts.w3_w1_weight' in param_name or '.experts.w2_weight' in param_name:
+                # These are fused from individual expert weights by the MoE module
+                # Check if individual expert weights exist in checkpoint
+                layer_match = param_name.split(
+                    '.mlp.experts.'
+                )[0] if '.mlp.experts.' in param_name else None
+                if layer_match:
+                    # Check for any expert weights in this layer
+                    expert_pattern = f"{layer_match}.mlp.experts."
+                    if any(expert_pattern in str(k) for k in checkpoint_keys):
+                        found = True
+
+            # Handle expert weights: model has w1/w2/w3, checkpoint might have gate_proj/down_proj/up_proj
+            elif '.w1.' in param_name or '.w2.' in param_name or '.w3.' in param_name:
+                # These are expert weights that get renamed by the regex
+                gate_name = param_name.replace('.w1.', '.gate_proj.')
+                down_name = param_name.replace('.w2.', '.down_proj.')
+                up_name = param_name.replace('.w3.', '.up_proj.')
+                if gate_name in checkpoint_keys or down_name in checkpoint_keys or up_name in checkpoint_keys:
+                    found = True
+
+            # Direct match
+            elif param_name in checkpoint_keys:
+                found = True
+
+            if not found:
+                missing_in_checkpoint.append(param_name)
+
+        # Separate into expected missing (quant params) and unexpected missing
+        expected_missing = [
+            p for p in missing_in_checkpoint
+            if any(q in p for q in quant_params_ok_to_skip)
+        ]
+        unexpected_missing = [
+            p for p in missing_in_checkpoint if p not in expected_missing
+        ]
+
+        logger.info(
+            f"  Expected missing (quantization params): {len(expected_missing)}"
+        )
+        logger.info(
+            f"  Potentially problematic missing: {len(unexpected_missing)}")
+        logger.info(f"{'='*80}")
+
+        if unexpected_missing:
+            logger.warning(
+                f"\n⚠️  {len(unexpected_missing)} model parameters may not be in checkpoint:"
+            )
+            for name in sorted(unexpected_missing)[:20]:
+                logger.warning(f"  - {name}")
+
     def load_weights(self, weights: Dict):
         # model.layers.91.mlp.experts.75.up_proj.weight_scale_2
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Check weight coverage before loading
+        logger.info("Checking weight coverage before loading...")
+        self._check_weight_coverage(weights)
+
         _load_weights_impl(
             self,
             weights,
@@ -1220,6 +1432,84 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 r'(?!.*shared_experts)(?=.*experts?)(.*?)gate_proj(.*)':
                 r'\1w1\2',
             })
+
+    def _validate_loaded_weights(self):
+        """Validate that all critical weights are loaded and initialized."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        issues = []
+        suspicious_params = []
+
+        # Quantization-related parameters that are OK to be zero or computed later
+        quant_params_ok_to_skip = [
+            'alpha',
+            'input_scale',
+            'inv_input_scale',
+            'weight_scale',
+            'weight_scale_2',
+            'kv_scales',
+            'inv_kv_scales',
+            'pre_quant_scale',
+            'scale',
+            'inv_scale',
+            'qweight',
+            'qzeros',
+            'scales'  # AWQ/GPTQ quantization params
+        ]
+
+        for name, param in self.named_parameters():
+            # Skip parameters that are intentionally not loaded or managed differently
+            skip_patterns = [
+                'next_layer_layernorm',
+                'draft_model',
+                'v_b_proj',
+                'k_b_proj_trans',
+            ]
+            # Add quantization parameters to skip list
+            skip_patterns.extend(quant_params_ok_to_skip)
+
+            if any(skip in name for skip in skip_patterns):
+                continue
+
+            # Check for uninitialized or problematic values
+            if param.numel() == 0:
+                continue  # Skip empty parameters
+
+            # Only check core weights (weight, bias) for being all zeros
+            is_core_weight = name.endswith('.weight') or name.endswith('.bias')
+
+            if is_core_weight and torch.all(param == 0):
+                issues.append(f"{name}: all zeros (uninitialized)")
+            elif torch.any(torch.isnan(param)):
+                issues.append(f"{name}: contains NaN")
+            elif torch.any(torch.isinf(param)):
+                issues.append(f"{name}: contains Inf")
+            # Check for suspiciously large values (potential torch.empty() garbage)
+            elif is_core_weight and param.abs().max() > 1e8:
+                suspicious_params.append(
+                    f"{name}: very large values (max={param.abs().max():.2e})")
+
+        if issues:
+            logger.error(
+                f"❌ Found {len(issues)} uninitialized or invalid parameters:")
+            for issue in issues[:20]:  # Show first 20
+                logger.error(f"  {issue}")
+            raise RuntimeError(
+                f"Weight loading validation failed: {len(issues)} parameters not properly initialized"
+            )
+
+        if suspicious_params:
+            logger.warning(
+                f"⚠️  Found {len(suspicious_params)} parameters with suspicious values:"
+            )
+            for param_info in suspicious_params[:10]:  # Show first 10
+                logger.warning(f"  {param_info}")
+
+        if not issues and not suspicious_params:
+            logger.info(
+                "✅ Weight validation passed: all parameters appear properly initialized"
+            )
 
     def post_load_weights(self):
         all_named_modules = dict(self.model.named_modules())
@@ -1249,3 +1539,6 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+        # Validate all weights are properly loaded
+        self._validate_loaded_weights()
