@@ -4,8 +4,8 @@ import traceback
 
 import torch
 
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm._ipc_utils import IpcMemory
+from tensorrt_llm.mapping import Mapping
 
 from ..logger import logger
 
@@ -24,7 +24,6 @@ if platform.system() != "Windows":
     try:
         import flashinfer
         import flashinfer.comm as flashinfer_comm
-        from flashinfer.comm.cuda_ipc import cudart
         logger.info(f"flashinfer is available: {flashinfer.__version__}")
         IS_FLASHINFER_AVAILABLE = True
     except ImportError:
@@ -45,8 +44,12 @@ class FlashInferAllReduceWorkspace:
         self.mapping = mapping
 
         max_size = 8192 * 8192 * 2  # 2 bytes for bfloat16
-        print(f"Opening IPC memory for meta with size {flashinfer_comm.vllm_meta_size() + max_size}")
-        self.meta_ptrs_ipc = IpcMemory(mapping, flashinfer_comm.vllm_meta_size() + max_size)
+        print(
+            f"Opening IPC memory for meta with size {flashinfer_comm.vllm_meta_size() + max_size}"
+        )
+        self.meta_ptrs_ipc = IpcMemory(
+            mapping,
+            flashinfer_comm.vllm_meta_size() + max_size)
 
         # Create rank data buffer (8MB as in test)
         self.rank_data = torch.empty(8 * 1024 * 1024,
@@ -63,7 +66,8 @@ class FlashInferAllReduceWorkspace:
             rank=mapping.rank,
             full_nvlink=True)
 
-        flashinfer_comm.vllm_register_buffer(self.fa, self.buffer_ptrs_ipc.peer_ptrs)
+        flashinfer_comm.vllm_register_buffer(self.fa,
+                                             self.buffer_ptrs_ipc.peer_ptrs)
 
 
 flashinfer_allreduce_workspace = None
