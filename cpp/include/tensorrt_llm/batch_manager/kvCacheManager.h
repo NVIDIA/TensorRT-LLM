@@ -204,6 +204,16 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
+using LookupResult = std::vector<std::tuple<bool,SizeType32,LookupNodePtr>>;
+
+// Vector of LookupResult, one for each BlockKey used during search.
+// If no match was found, vector will be empty.
+// If an exact match was found, vector will have one item.
+// If partial matching is enabled and no exact match was found,
+// vector will list all nodes with at least one matching token.
+// Partially matching nodes are sorted in descending order of number of matching tokens.
+using LookupResults = std::vector<LookupResult>;
+
 // Implement an object that represents a given prompt prefix in search structure.
 // The node contains pointers to all reusable state for the prompt prefix.
 class KVCachePromptLookupNode
@@ -231,7 +241,7 @@ public:
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
     //! matched.
-    [[nodiscard]] std::tuple<bool, SizeType32, LookupNodePtr> findMatchingNode(
+    [[nodiscard]] LookupResult findMatchingNodes(
         BlockKey const& blockKey, bool enablePartialReuse) const;
 
     void setBlock(SizeType32 windowSize, BlockPtr block);
@@ -273,10 +283,11 @@ public:
     //! \brief Find matching nodes for a given prompt prefix
     //! \param allowPartiallyFilledBlock Allow last block in prompt to have less than tokensPerBlock tokens.
     //! \param enablePartialReuse Allow matching tokens to be copied from block that does not match entire prompt.
-    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool createNodes);
+    [[nodiscard]] LookupResults lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool createNodes);
 
     // Debugging functions
-    std::string printNodes(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& nodeInfos);
+    std::string printNode(LookupResult const& match);
+    std::string printNodes(LookupResults const& matches);
     std::string printPrompt(LlmRequest const& llmRequest);
 
 private:
@@ -626,7 +637,7 @@ public:
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     void addSequence(
-        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes);
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, LookupResults const& matchedPromptNodes);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock);
@@ -795,7 +806,7 @@ public:
     //! \brief Store blocks in cached blocks.
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
-    void storeBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds);
+    void storeBlocks(LookupResults const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -833,7 +844,7 @@ private:
     //! \param blockKeys Key of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes, SizeType32 numContextBlocks,
+    SizeType32 loadOrAllocateBlocks(LookupResults const& matchedPromptNodes, SizeType32 numContextBlocks,
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
@@ -988,7 +999,7 @@ public:
     //! \details Does nothing if block is already in secondary memory.
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize);
 
-    void storeBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds,
+    void storeBlocks(LookupResults const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize)
     {
         mWindowBlockManagers.at(windowSize).storeBlocks(lookupNodes, blockIds);

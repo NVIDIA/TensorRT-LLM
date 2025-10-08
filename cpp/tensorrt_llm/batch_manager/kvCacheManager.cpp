@@ -486,11 +486,11 @@ std::string KVCachePromptLookup::printPrompt(LlmRequest const& llmRequest)
     return out.str();
 }
 
-std::string KVCachePromptLookup::printNodes(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& nodeInfos)
+std::string KVCachePromptLookup::printNode(LookupResult const& match)
 {
     std::stringstream out;
     bool firstIteration = true;
-    for (auto const& nodeInfo : nodeInfos)
+    for (auto const& nodeInfo : match)
     {
 	auto const [partialMatch,nuMatched,matchedNode] = nodeInfo;
 	if (firstIteration)
@@ -499,7 +499,7 @@ std::string KVCachePromptLookup::printNodes(std::vector<std::tuple<bool,SizeType
 	}
 	else
 	{
-            out << ", ";
+            out << "|";
 	}
 	if (matchedNode != nullptr)
 	{
@@ -509,6 +509,25 @@ std::string KVCachePromptLookup::printNodes(std::vector<std::tuple<bool,SizeType
 	{
             out << "nil";
 	}
+    }
+    return out.str();
+}
+
+std::string KVCachePromptLookup::printNodes(LookupResults const& matches)
+{
+    std::stringstream out;
+    bool firstIteration = true;
+    for (auto const& match : matches)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+	}
+	else
+	{
+            out << ", ";
+	}
+        out << "[" << printNode(match) << "]";
     }
     return out.str();
 }
@@ -529,27 +548,39 @@ std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmReq
     return blockKeys;
 }
 
-std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool create)
+LookupResults KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool create)
 {
+    TLLM_CHECK_WITH_INFO(!(enablePartialReuse && create), "enablePartialReuse and create are mutually exclusive flags");
     auto blockKeys = getBlockKeys(llmRequest, inputLength, allowPartiallyFilledBlock);
 
-    std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> results;
+    LookupResults results;
     auto searchRoot = mRoot;
     for (auto const& blockKey : blockKeys)
     {
-        auto [partialMatch, numMatched, matchingNode] = searchRoot != nullptr
-            ? searchRoot->findMatchingNode(blockKey, enablePartialReuse)
-            : std::make_tuple(false, 0, nullptr);
-        if (create && matchingNode == nullptr)
+        auto matches = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, enablePartialReuse) : LookupResult();
+        if (create && matches.empty())
         {
             // No match, create blank prompt node
             bool isFull = static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock;
-            matchingNode = std::make_shared<KVCachePromptLookupNode>(blockKey,isFull);
-            matchingNode->setPrevNode(searchRoot);
-            searchRoot->addNextNode(blockKey, matchingNode);
+            auto newNode = std::make_shared<KVCachePromptLookupNode>(blockKey,isFull);
+            newNode->setPrevNode(searchRoot);
+            searchRoot->addNextNode(blockKey, newNode);
+            matches.emplace_back(std::make_tuple(isFull, static_cast<SizeType32>(blockKey.uniqueTokens.size()), newNode));
+            searchRoot = newNode;
         }
-        results.emplace_back(std::make_tuple(partialMatch,numMatched,matchingNode));
-        searchRoot = matchingNode;
+        else if (matches.empty())
+        {
+            // No match
+            // Stop search here
+            searchRoot = nullptr;
+        }
+        else
+        {
+            // Stop search if first node is a partial match
+            auto const& [partialMatch, _, matchingNode] = matches[0];
+            searchRoot = partialMatch ? nullptr : matchingNode;
+        }
+        results.emplace_back(std::move(matches));
     }
     return results;
 }
@@ -570,9 +601,8 @@ std::unordered_map<SizeType32,BlockKey> KVCachePromptLookup::findNewContextBlock
     BlockKey prevBlockKey;
     for (auto const& blockKey : blockKeys)
     {
-        auto [partialMatch, numMatched, matchingNode] = searchRoot != nullptr
-            ? searchRoot->findMatchingNode(blockKey, false)
-            : std::make_tuple(false, 0, nullptr);
+        auto matches = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, false) : LookupResult();
+        [[maybe_unused]] auto const& [dummy1, dummy2, matchingNode] = matches.empty() ? std::make_tuple(false, 0, nullptr) : matches[0];
         for (auto const windowSize : windowSizes)
         {
             if (stillLooking.count(windowSize) && (matchingNode == nullptr || matchingNode->getBlock(windowSize) == nullptr))
@@ -643,6 +673,41 @@ void KVCachePromptLookupNode::removeNextNode(BlockKey const& blockKey)
     mNextNodes.erase(blockKey);
 }
 
+LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse) const
+{
+    LookupResult result;
+    if (blockKey.uniqueTokens.size() == 0 || mNextNodes.size() == 0)
+    {
+        // invalid search key or no searchable nodes
+        return result;
+    }
+    auto itr = mNextNodes.find(blockKey);
+    if (itr != mNextNodes.end())
+    {
+        // found exact match
+        auto node = itr->second;
+        result.emplace_back(std::make_tuple(!node->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), node));
+        return result;
+    }
+    if (enablePartialReuse)
+    {
+        // find all nodes with at least one matching token
+        for (auto const& [key, node] : mNextNodes)
+        {
+            SizeType32 numMatched = key.partialMatch(blockKey);
+            if (numMatched > 0)
+            {
+                result.emplace_back(std::make_tuple(true, numMatched, node));
+            }
+        }
+        // sort partial matches in ascending order
+        std::sort(result.begin(), result.end(), [](std::tuple<bool,SizeType32,LookupNodePtr> const& a, std::tuple<bool,SizeType32,LookupNodePtr> const& b){[[maybe_unused]] auto [dummy1, numMatchedA, dummy2] = a; [[maybe_unused]] auto [dummy3, numMatchedB, dumm4] = b; return numMatchedA > numMatchedB;});
+        return result;
+    }
+    return result;
+}
+
+/*
 std::tuple<bool, SizeType32, LookupNodePtr> KVCachePromptLookupNode::findMatchingNode(BlockKey const& blockKey, bool enablePartialReuse) const
 {
     if (blockKey.uniqueTokens.size() == 0 || mNextNodes.size() == 0)
@@ -675,6 +740,7 @@ std::tuple<bool, SizeType32, LookupNodePtr> KVCachePromptLookupNode::findMatchin
     auto node = itr->second;
     return {!node->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), node};
 }
+*/
 
 void KVCachePromptLookupNode::setBlock(SizeType32 windowSize, BlockPtr block)
 {
@@ -1243,7 +1309,7 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes, SizeType32 numContextBlocks,
+SizeType32 WindowBlockManager::loadOrAllocateBlocks(LookupResults const& matchedPromptNodes, SizeType32 numContextBlocks,
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
 {
     SizeType32 numMatchedTokens{0};
@@ -1256,8 +1322,37 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<std::tuple<bool,
     auto nodeItr = matchedPromptNodes.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
-        auto [partialMatch, numMatched, matchingNode] = nodeItr != matchedPromptNodes.end() ? *(nodeItr++) : std::make_tuple(false,0,nullptr);
-        auto matchingBlock = matchingNode != nullptr ? matchingNode->getBlock(mWindowSize) : nullptr;
+        // Assume no matching node
+        bool partialMatch = false;
+        SizeType32 numMatched = 0;
+        LookupNodePtr matchingNode = nullptr;
+        BlockPtr matchingBlock = nullptr;
+        if (nodeItr != matchedPromptNodes.end())
+        {
+            auto matchedPromptNode = *(nodeItr++);
+            if (matchedPromptNode.size() == 1)
+            {
+                // Exactly one match returned
+                std::tie(partialMatch, numMatched, matchingNode) = matchedPromptNode[0];
+                matchingBlock = matchingNode->getBlock(mWindowSize);
+            }
+            else if (matchedPromptNode.size() > 1)
+            {
+                // More than one match returned
+                // Find longest match with attached block
+                for (auto partiallyMatched : matchedPromptNode)
+                {
+                    [[maybe_unused]] auto [dummy1, thisNodeNumMatched, thisNode] = partiallyMatched;
+                    auto partiallyMatchedBlock = thisNode->getBlock(mWindowSize);
+                    if (partiallyMatchedBlock != nullptr)
+                    {
+                        partialMatch = true;
+                        numMatched = thisNodeNumMatched;
+                        matchingBlock = partiallyMatchedBlock;
+                    }
+                }
+            }
+        }
         if (matchingBlock != nullptr)
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
@@ -1387,7 +1482,7 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
 // There are two versions of WindowBlockManager::addSequence function.
 // This is called when block reuse is enabled.
 void WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes)
+    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, LookupResults const& matchedPromptNodes)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1523,7 +1618,7 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
 }
 
 void WindowBlockManager::storeBlocks(
-    std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& lookupNodes,
+    LookupResults const& lookupNodes,
     std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     TLLM_LOG_DEBUG(
@@ -1538,7 +1633,9 @@ void WindowBlockManager::storeBlocks(
         auto const bid = blockIds[blockCnt];
         TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
         auto& block = mAllBlocksById[bid];
-        auto const [partialMatch, numMatched, matchedNode] = lookupNodes[blockCnt];
+        auto& lookupNode = lookupNodes[blockCnt];
+        TLLM_CHECK_WITH_INFO(lookupNode.size() == 1, "Number of matching nodes must be 1");
+        auto const [partialMatch, numMatched, matchedNode] = lookupNode[0];
         auto matchedBlock = matchedNode->getBlock(mWindowSize);
         if (matchedBlock == nullptr)
         {
