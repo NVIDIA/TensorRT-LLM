@@ -94,7 +94,7 @@ To learn more about the LLM API, check out the [](llm-api/index) and [](examples
 
 ## Quick Start for Popular Models
 
-Below is a table containing one-line `trtllm-serve` commands that can be used to easily deploy popular models including DeepSeek-R1, gpt-oss, Llama 4, Qwen3, and more.
+The table below contains one-line `trtllm-serve` commands that can be used to easily deploy popular models including DeepSeek-R1, gpt-oss, Llama 4, Qwen3, and more.
 
 We maintain LLM API configuration files for these models containing recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. The `trtllm-serve` commands below can be run as-is within the TensorRT LLM Docker container since the config files will be available at `/app/tensorrt_llm/examples/configs`. 
 
