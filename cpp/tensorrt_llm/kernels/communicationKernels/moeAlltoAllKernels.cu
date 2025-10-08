@@ -409,7 +409,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
                     all_flags_set = all_flags_set && (flag_value == expected_value);
                 }
             } while (!all_flags_set);
-            asm volatile("fence.acquire.sys;");
+            // asm volatile("fence.acquire.sys;");
  #endif
         }
      }
@@ -700,7 +700,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
      // - Thread 0 of each block waits for all peers' readiness (equality), then __syncthreads.
      if (blockIdx.x == 0 && threadIdx.x == 0)
      {
-        asm volatile("fence.release.sys;");
+        // asm volatile("fence.release.sys;");
          uint32_t cur_val = *ptrs.flag_val;
          for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
          {
