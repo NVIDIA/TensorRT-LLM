@@ -574,6 +574,9 @@ def fp8_block_scale_moe_runner(
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
+    # FIXME: temporarily disable tuning multiple runners due to kernel failure in test:
+    # python3 -m pytest tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp_trtllm]
+    """
     kernel_runners: List[TunableRunner] = []
     for tile_tokens_dim_ in list(generate_power_of_2_between(start=8, end=64)):
         kernel_runners += [
@@ -582,6 +585,17 @@ def fp8_block_scale_moe_runner(
                                    local_num_experts, routed_scaling_factor,
                                    routing_method_type, tile_tokens_dim_)
         ]
+    """
+    tile_tokens_dim = calculate_tile_tokens_dim(hidden_states.shape[0],
+                                                num_experts,
+                                                top_k,
+                                                max_tile_tokens_dim=64)
+    kernel_runners = [
+        FP8BlockScaleMoERunner(num_experts, top_k, n_group, topk_group,
+                               intermediate_size, local_expert_offset,
+                               local_num_experts, routed_scaling_factor,
+                               routing_method_type, tile_tokens_dim)
+    ]
 
     # Use dummy routing logits for autotuner
     if routing_logits is None:
