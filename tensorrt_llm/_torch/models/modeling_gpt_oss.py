@@ -227,7 +227,7 @@ class MLPBlock(torch.nn.Module):
 
     def compute_gate_output(self, x: torch.Tensor) -> torch.Tensor:
         if get_sm_version() in [
-                90, 100
+                90, 100, 103
         ] and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
             weight = self.gate.weight
             bias = self.gate.bias
