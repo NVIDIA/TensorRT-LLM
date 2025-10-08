@@ -49,7 +49,7 @@ from tensorrt_llm.logger import logger
 try:
     import ray
 except ImportError:
-    import tensorrt_llm.ray_stub as ray
+    ray = None
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -1216,6 +1216,11 @@ def torch_pybind11_abi() -> str:
 
 @contextmanager
 def unwrap_ray_errors():
+    if ray is None:
+        raise RuntimeError(
+            "Ray requested (TLLM_DISABLE_MPI=1), but not installed. Please install Ray."
+        )
+
     try:
         yield
     except ray.exceptions.RayTaskError as e:
