@@ -9,14 +9,8 @@ from utils.llm_data import llm_models_root
 from utils.util import duplicate_list_to_length, flatten_list, similar
 
 from tensorrt_llm import SamplingParams
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
-
-try:
-    import ray
-except ImportError:
-    import tensorrt_llm.ray_stub as ray
 
 
 def check_llama_7b_multi_unique_lora_adapters_from_request(
@@ -112,9 +106,8 @@ def check_llama_7b_multi_lora_from_request_test_harness(
     lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
     sampling_params = SamplingParams(max_tokens=20)
 
-    llm = None
+    llm = llm_class(hf_model_dir, **llm_kwargs)
     try:
-        llm = llm_class(hf_model_dir, **llm_kwargs)
         outputs = llm.generate(prompts,
                                sampling_params,
                                lora_request=[
@@ -122,12 +115,8 @@ def check_llama_7b_multi_lora_from_request_test_harness(
                                    lora_req2
                                ])
     finally:
-        if llm is not None:
-            llm.shutdown()
-        else:
-            # Clean up Ray resources early to prevent pytest-threadleak detection failure
-            if mpi_disabled():
-                ray.shutdown()
+        llm.shutdown()
+
     for output, ref, key_word in zip(outputs, references, key_words):
         assert similar(output.outputs[0].text,
                        ref) or key_word in output.outputs[0].text

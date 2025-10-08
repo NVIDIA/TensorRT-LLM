@@ -57,48 +57,54 @@ class RayExecutor(GenerationExecutor):
             "runtime_env": runtime_env
         }
 
-        if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
-            try:
-                ray.init(address="auto", **ray_init_args)
-                logger.info(f"Attached to an existing Ray cluster.")
-            except ConnectionError:
-                logger.info(f"Ray cluster not found, starting a new one.")
+        try:
+            if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
+                try:
+                    ray.init(address="auto", **ray_init_args)
+                    logger.info(f"Attached to an existing Ray cluster.")
+                except ConnectionError:
+                    logger.info(f"Ray cluster not found, starting a new one.")
 
-            if not ray.is_initialized():
-                ray.init(**ray_init_args)
+                if not ray.is_initialized():
+                    ray.init(**ray_init_args)
+                    self.has_start_local_cluser = True
+            else:
+                ray.init(address="local", **ray_init_args)
                 self.has_start_local_cluser = True
-        else:
-            ray.init(address="local", **ray_init_args)
-            self.has_start_local_cluser = True
 
-        self.world_size = model_world_size
-        self.tp_size = tp_size
-        self.master_address = ray.util.get_node_ip_address()
-        self.master_port = get_free_port()
+            self.world_size = model_world_size
+            self.tp_size = tp_size
+            self.master_address = ray.util.get_node_ip_address()
+            self.master_port = get_free_port()
 
-        self.response_queue = RayAsyncQueue.options(runtime_env={
-            "env_vars": {
-                "TLLM_DISABLE_MPI": "1"
-            }
-        }).remote()
-        self.response_sync_queue = RaySyncQueue.options(runtime_env={
-            "env_vars": {
-                "TLLM_DISABLE_MPI": "1"
-            }
-        }).remote()
-        self.async_response_queue_weakref = self.create_actor_weak_ref(
-            self.response_queue)
-        self.sync_response_queue_weakref = self.create_actor_weak_ref(
-            self.response_sync_queue)
-        self.response_queue.warmup.remote()
-        self.response_sync_queue.warmup.remote()
+            self.response_queue = RayAsyncQueue.options(runtime_env={
+                "env_vars": {
+                    "TLLM_DISABLE_MPI": "1"
+                }
+            }).remote()
+            self.response_sync_queue = RaySyncQueue.options(runtime_env={
+                "env_vars": {
+                    "TLLM_DISABLE_MPI": "1"
+                }
+            }).remote()
+            self.async_response_queue_weakref = self.create_actor_weak_ref(
+                self.response_queue)
+            self.sync_response_queue_weakref = self.create_actor_weak_ref(
+                self.response_sync_queue)
+            self.response_queue.warmup.remote()
+            self.response_sync_queue.warmup.remote()
 
-        worker_kwargs = dict(**worker_kwargs,
-                             postproc_worker_config=postproc_worker_config,
-                             is_llm_executor=is_llm_executor,
-                             kv_connector_config=kv_connector_config)
+            worker_kwargs = dict(**worker_kwargs,
+                                 postproc_worker_config=postproc_worker_config,
+                                 is_llm_executor=is_llm_executor,
+                                 kv_connector_config=kv_connector_config)
 
-        self.create_workers(RayGPUWorker, worker_kwargs)
+            self.create_workers(RayGPUWorker, worker_kwargs)
+        except Exception as e:
+            # Clean up the Ray resources early
+            self.shutdown()
+            logger.error(f"Failed to initialize RayExecutor: {e}")
+            raise e
 
     @staticmethod
     def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
