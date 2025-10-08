@@ -707,6 +707,17 @@ class KVCacheManager(BaseResourceManager):
             self.head_dim,
         )
 
+    def check_nan_in_buffers(self, fill_with_zero: bool = False) -> bool:
+        found_nan = False
+        for layer_idx, layer_offset in self.layer_offsets.items():
+            buffer = self.impl.get_primary_pool_data(layer_offset)
+            if torch.isnan(buffer).any():
+                found_nan = True
+            if fill_with_zero:
+                buffer.zero_()
+        torch.cuda.synchronize()
+        return found_nan
+
     def get_unique_primary_pool(self) -> torch.Tensor:
         return self.impl.get_unique_primary_pool()
 
