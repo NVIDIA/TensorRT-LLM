@@ -740,6 +740,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
+        alltoall_model.post_load_weights()
 
         # Use DeepGemmFusedMoE as reference
         ref_model = DeepGemmFusedMoE(
@@ -755,6 +756,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         )
         ref_model.to("cuda")
         ref_model.load_weights([weights])
+        ref_model.post_load_weights()
 
         # Evaluate the outputs on variant sequence lengths
         m = MAX_NUM_TOKENS
