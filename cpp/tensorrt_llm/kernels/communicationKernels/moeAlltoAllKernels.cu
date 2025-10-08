@@ -358,18 +358,13 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
             payload_idx, ptrs, topk_target_ranks, topk_send_indices);
      }
  
-     // (A) __syncwarp guarantees: If lane0's sent data are visible, then all lanes' sent data are visible
      ThreadingPolicy::sync();
  
      // Finished sending this token. Check if we're the last token to complete.
      if (thread_idx == 0)
      {
          int cnt;
-         // (B) .release guarantees: If increment of local_token_counter is visible, then lane0's sent data are visible
-         asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                      : "=r"(cnt) 
-                      : "l"(ptrs.local_token_counter), "r"(1));
-        // cnt = atomicAdd(ptrs.local_token_counter, 1);
+        cnt = atomicAdd(ptrs.local_token_counter, 1);
          
          if (cnt + 1 == local_num_tokens)  // The last token dispatched
          {
@@ -388,7 +383,6 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
             {
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                 uint32_t flag_value = *ptrs.flag_val;
-                // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
 
                 #if ENABLE_DEBUG_PRINT
