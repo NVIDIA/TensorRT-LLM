@@ -15,8 +15,11 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <sstream>
+#include <string>
+#include <tuple>
 
 namespace tensorrt_llm
 {
@@ -54,7 +57,11 @@ struct Pair
 
 struct PairReduceOp
 {
-    inline __device__ Pair operator()(Pair const& a, Pair const& b) const
+#if defined(__CUDACC__)
+    inline __device__
+#endif
+        Pair
+        operator()(Pair const& a, Pair const& b) const
     {
         Pair result;
         result.max_val = a.max_val > b.max_val ? a.max_val : b.max_val;

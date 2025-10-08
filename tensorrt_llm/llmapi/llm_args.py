@@ -177,12 +177,16 @@ class SparseAttentionBaseConfig(BaseModel):
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
-            "Rocket": RocketSparseAttentionConfig,
+            "rocket": RocketSparseAttentionConfig,
         }
 
-        config_class = config_classes.get("algorithm")
+        algorithm = data.get("algorithm", None)
+        if algorithm is None:
+            raise ValueError(f"Sparse attention algorithm is required")
+
+        config_class = config_classes.get(algorithm.lower())
         if config_class is None:
-            raise ValueError(f"Invalid algorithm")
+            raise ValueError(f"Invalid algorithm: {algorithm}")
 
         return config_class(**data)
 
@@ -1537,7 +1541,7 @@ class BaseLlmArgs(StrictBaseModel):
         description="Cache transceiver config.",
         status="prototype")
 
-    # sparse attention config
+    # Sparse attention config
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
         default=None, description="Sparse attention config.")
 
@@ -2382,9 +2386,6 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
-
-    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
-        default=None, description="Sparse attention config.")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",

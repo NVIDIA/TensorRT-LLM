@@ -1,3 +1,17 @@
+### :title Sparse Attention
+### :order 5
+### :section Customization
+"""
+This example demonstrates how to use sparse attention with TensorRT-LLM.
+
+Supported sparse attention algorithms:
+- RocketKV
+
+Usage:
+```bash
+python llm_sparse_attention.py --algo RocketKV --attention_backend TRTLLM --window_size 32 --kernel_size 63 --prompt_budget 2048
+```
+"""
 import argparse
 import json
 

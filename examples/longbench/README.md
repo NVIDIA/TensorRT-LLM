@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 After cloning, your directory structure should look like:
 
-```
+```text
 sparse_attention/
 ├── eval_longbench_v1.py          # LongBench v1 evaluation script
 ├── eval_longbench_v2.py          # LongBench v2 evaluation script
@@ -145,7 +145,7 @@ python eval_longbench_v2.py \
 
 ### LongBench v1 Output
 
-```
+```text
 results/v1_experiment/
 ├── config.json                          # Experiment configuration
 ├── overall_summary.json                 # Overall experiment summary
@@ -161,7 +161,7 @@ results/v1_experiment/
 
 ### LongBench v2 Output
 
-```
+```text
 results/v2_experiment/
 ├── config.json                          # Experiment configuration
 ├── summary.json                         # Evaluation summary with metrics

@@ -95,22 +95,18 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_scaling = q_scaling
 
-    def _single_request_sparse_attn_predict(self, q: torch.Tensor,
-                                            k: Optional[torch.Tensor],
-                                            v: Optional[torch.Tensor],
-                                            kv_cache_tensor: torch.Tensor,
-                                            metadata: AttentionMetadata,
-                                            past_seen_token: int,
-                                            sample_idx: int,
-                                            **kwargs) -> Optional[torch.Tensor]:
+    def _single_request_sparse_attn_predict(
+            self, q: torch.Tensor, k: Optional[torch.Tensor],
+            v: Optional[torch.Tensor], kv_cache_tensor: torch.Tensor,
+            metadata: AttentionMetadata, past_seen_token: int, sample_idx: int,
+            **kwargs) -> tuple[Optional[torch.Tensor], int]:
         raise NotImplementedError
 
-    def _single_request_sparse_kv_predict(self, q: Optional[torch.Tensor],
-                                          k: Optional[torch.Tensor],
-                                          v: Optional[torch.Tensor],
-                                          metadata: AttentionMetadata,
-                                          past_seen_token: int, sample_idx: int,
-                                          **kwargs) -> Optional[torch.Tensor]:
+    def _single_request_sparse_kv_predict(
+            self, q: Optional[torch.Tensor], k: Optional[torch.Tensor],
+            v: Optional[torch.Tensor], metadata: AttentionMetadata,
+            past_seen_token: int, sample_idx: int,
+            **kwargs) -> tuple[Optional[torch.Tensor], int]:
         raise NotImplementedError
 
     def _single_request_update_kv_cache(self,
@@ -430,7 +426,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, attention_mask, kv_cache_tensor,
-                past_seen_token, cache_idx, sample_idx, metadata, **kwargs)
+                past_seen_token, cache_idx, sample_idx, metadata,
+                attention_window_size, **kwargs)
 
             attn_outputs.append(attn_output)
 
