@@ -280,7 +280,11 @@ class KVCacheManager(BaseResourceManager):
             # Standard case: use original Python implementation
             self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
                 kv_cache_config=kv_cache_config,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
                 mapping=mapping,
+                dtype=dtype,
+                kv_factor=self.kv_factor,
             )
             blocks_per_window = {
                 self.max_attention_window_vec[0]:
@@ -597,9 +601,13 @@ class KVCacheManager(BaseResourceManager):
                 scaling_factor_dtype=DataType.FP8)
         return cache_size_bytes_per_token
 
-    def calculate_max_num_blocks(self, kv_cache_config: KvCacheConfig,
-                                 mapping: Mapping):
-        tokens_per_block = self.tokens_per_block
+    def calculate_max_num_blocks(self,
+                                 kv_cache_config: KvCacheConfig,
+                                 head_dim: int,
+                                 tokens_per_block: int,
+                                 mapping: Mapping,
+                                 dtype: DataType,
+                                 kv_factor: int = 2):
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)
