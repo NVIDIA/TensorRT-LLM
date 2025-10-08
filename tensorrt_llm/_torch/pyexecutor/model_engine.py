@@ -34,6 +34,7 @@ from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
+from ..flashinfer_utils import init_flashinfer_allreduce_workspace
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -172,6 +173,11 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
+
+        self._enable_flashinfer_allreduce = False
+        if os.getenv("_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1":
+            init_flashinfer_allreduce_workspace(mapping)
+            self._enable_flashinfer_allreduce = True
 
         if model is None:
             loader = ModelLoader(
