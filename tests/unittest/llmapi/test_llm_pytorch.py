@@ -29,8 +29,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
 from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
                         skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
-                        skip_gpu_memory_less_than_138gb, skip_ray,
-                        try_expose_error_in_ray)
+                        skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -430,7 +429,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
         lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
 
     # Test that too small PeftCacheConfig.host_cache_size causes failure
-    with pytest.raises(RuntimeError), try_expose_error_in_ray(RuntimeError):
+    with pytest.raises(RuntimeError):
         check_llama_7b_multi_lora_from_request_test_harness(
             LLM,
             lora_config=lora_config_no_cache_size_values,
@@ -441,7 +440,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             cuda_graph_config=None)
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
-    with pytest.raises(RuntimeError), try_expose_error_in_ray(RuntimeError):
+    with pytest.raises(RuntimeError):
         check_llama_7b_multi_lora_from_request_test_harness(
             LLM,
             lora_config=lora_config_no_cache_size_values,

@@ -46,6 +46,11 @@ from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
+try:
+    import ray
+except ImportError:
+    import tensorrt_llm.ray_stub as ray
+
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
@@ -1207,3 +1212,11 @@ def torch_pybind11_abi() -> str:
     if TORCH_PYBIND11_ABI is None:
         TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
     return TORCH_PYBIND11_ABI
+
+
+@contextmanager
+def unwrap_ray_errors():
+    try:
+        yield
+    except ray.exceptions.RayTaskError as e:
+        raise e.as_instanceof_cause() from e
