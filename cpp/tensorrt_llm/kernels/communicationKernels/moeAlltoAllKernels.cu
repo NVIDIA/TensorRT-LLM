@@ -369,6 +369,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
          asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
                       : "=r"(cnt) 
                       : "l"(ptrs.local_token_counter), "r"(1));
+        // cnt = atomicAdd(ptrs.local_token_counter, 1);
          
          if (cnt + 1 == local_num_tokens)  // The last token dispatched
          {
@@ -379,40 +380,44 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
                  // TODO: Are acquire and release necessary here?
                  int send_count = ptrs.send_counters[target_rank];
                  ptrs.recv_counters[target_rank][rank_id] = send_count;
+             }
                  
 #if !DISABLE_SYNC_FOR_PROFILING
-                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-                 uint32_t flag_value = *ptrs.flag_val;
-                 // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
-                 asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
-#endif
- 
-                 #if ENABLE_DEBUG_PRINT
-                 printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
-                 #endif
-             }
- 
- #if !DISABLE_SYNC_FOR_PROFILING
-             // Busy wait until all source ranks targeting this rank have completed sending
-             uint32_t expected_value = *ptrs.flag_val;
-             bool all_flags_set;
-             do {
-                 all_flags_set = true;
-                 for (int source_rank = 0; source_rank < ep_size; source_rank++)
-                 {
-                     uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
-                     uint32_t flag_value;
-                     // Acquire load to ensure visibility of peer's release-store
-                     asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-                     // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
-                     #if ENABLE_DEBUG_PRINT
-                     printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
-                     #endif
-                     all_flags_set = all_flags_set && (flag_value == expected_value);
-                 }
-             } while (!all_flags_set);
+            asm volatile("fence.release.sys;");
+            for (int target_rank = 0; target_rank < ep_size; target_rank++)
+            {
+                uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
+                uint32_t flag_value = *ptrs.flag_val;
+                // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
+
+                #if ENABLE_DEBUG_PRINT
+                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
+                #endif
+            }             
+
+
+            // Busy wait until all source ranks targeting this rank have completed sending
+            uint32_t expected_value = *ptrs.flag_val;
+            bool all_flags_set;
+            do {
+                all_flags_set = true;
+                for (int source_rank = 0; source_rank < ep_size; source_rank++)
+                {
+                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
+                    uint32_t flag_value;
+                    // Acquire load to ensure visibility of peer's release-store
+                    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+                    // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
+                    #if ENABLE_DEBUG_PRINT
+                    printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
+                    #endif
+                    all_flags_set = all_flags_set && (flag_value == expected_value);
+                }
+            } while (!all_flags_set);
+            asm volatile("fence.acquire.sys;");
  #endif
-         }
+        }
      }
  }
  
@@ -701,11 +706,12 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
      // - Thread 0 of each block waits for all peers' readiness (equality), then __syncthreads.
      if (blockIdx.x == 0 && threadIdx.x == 0)
      {
+        asm volatile("fence.release.sys;");
          uint32_t cur_val = *ptrs.flag_val;
          for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
          {
              uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
-             asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
+             asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
              #if ENABLE_DEBUG_PRINT
              printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, cur_val, peer_rank);
              #endif
@@ -723,13 +729,14 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
                  uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
                  uint32_t flag_value;
                  // Acquire load to ensure visibility of peer's release-store
-                 asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+                 asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
                  #if ENABLE_DEBUG_PRINT
                  printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][peer_rank]: %d address: %p\n", rank_id, peer_rank, flag_value, *flag_ptr, flag_ptr);
                  #endif
                  all_flags_set = all_flags_set && (flag_value == expected_value);
              }
          } while (!all_flags_set);
+        asm volatile("fence.acquire.sys;");
      }
      __syncthreads();
  #endif
