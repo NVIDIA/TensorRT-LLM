@@ -123,8 +123,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     def yield_first_chat(num_tokens: int,
                          idx: int,
+                         rsp: GenerationResultBase,
                          role: str = None,
-                         content: str = None):
+                         content: str = None) -> ChatCompletionStreamResponse:
         choice_data = ChatCompletionResponseStreamChoice(index=idx,
                                                          delta=DeltaMessage(
                                                              role=role,
@@ -135,11 +136,12 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=num_tokens,
                                     total_tokens=num_tokens,
-                                    completion_tokens=0)
-        data = chunk.model_dump_json(exclude_none=True)
-        return data
+                                    completion_tokens=0,
+                                    prompt_tokens_details=PromptTokensDetails(cached_tokens=min(num_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32))
+                                    )
+        return chunk
 
-    res: List[str] = []
+    res: List[ChatCompletionStreamResponse] = []
     finish_reason_sent = [False] * args.num_choices
     prompt_tokens = args.num_prompt_tokens
     if stream_option := args.stream_options:
@@ -151,11 +153,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     if args.first_iteration:
         for i in range(args.num_choices):
             res.append(
-                f"data: {yield_first_chat(prompt_tokens, i, role=args.role)} \n\n"
+                yield_first_chat(prompt_tokens, i, rsp, role=args.role)
             )
             if args.echo and args.last_message_content:
                 res.append(
-                    f"data: {yield_first_chat(prompt_tokens, i, content=args.last_message_content)} \n\n"
+                    yield_first_chat(prompt_tokens, i, rsp, content=args.last_message_content)
                 )
         args.first_iteration = False
 
@@ -204,9 +206,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens)
-        data = chunk.model_dump_json(exclude_none=True)
-        res.append(f"data: {data}\n\n")
+                                    total_tokens=output.length + prompt_tokens,
+                                    prompt_tokens_details=PromptTokensDetails(cached_tokens=min(prompt_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32))
+                                    )
+        res.append(chunk)
 
     if include_usage and rsp._done:
         completion_tokens = sum(output.length for output in rsp.outputs)
@@ -214,13 +217,13 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=min(prompt_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32))
         )
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
                                                          model=args.model,
                                                          usage=final_usage)
-        final_usage_data = final_usage_chunk.model_dump_json()
-        res.append(f"data: {final_usage_data}\n\n")
+        res.append(final_usage_chunk)
     return res
 
 
@@ -279,6 +282,7 @@ def chat_response_post_processor(
         prompt_tokens=num_prompt_tokens,
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=min(num_prompt_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32))
     )
     response = ChatCompletionResponse(
         model=args.model,
@@ -339,9 +343,10 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens)
-        data = chunk.model_dump_json(exclude_unset=False)
-        res.append(f"data: {data}\n\n")
+                                    total_tokens=output.length + prompt_tokens,
+                                    prompt_tokens_details=PromptTokensDetails(cached_tokens=min(prompt_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32))
+                                    )
+        res.append(chunk)
 
     if include_usage and rsp._done:
         completion_tokens = sum(output.length for output in rsp.outputs)
@@ -349,13 +354,13 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=min(prompt_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32))
         )
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
+        final_usage_chunk = CompletionStreamResponse(choices=[],
                                                          model=args.model,
                                                          usage=final_usage)
-        final_usage_data = final_usage_chunk.model_dump_json()
-        res.append(f"data: {final_usage_data}\n\n")
+        res.append(final_usage_chunk)
     args.first_iteration = False
     return res
 
@@ -392,10 +397,9 @@ def completion_response_post_processor(
 
     usage = UsageInfo(prompt_tokens=prompt_tokens,
                       completion_tokens=completion_tokens,
-                      total_tokens=completion_tokens + prompt_tokens)
-    response = CompletionResponse(choices=choices,
-                                  model=args.model,
-                                  usage=usage)
+                      total_tokens=completion_tokens + prompt_tokens,
+                      prompt_tokens_details=PromptTokensDetails(cached_tokens=min(prompt_tokens, (getattr(rsp, 'num_reused_blocks', 0) or 0) * 32)))
+    response = CompletionResponse(choices=choices, model=args.model, usage=usage)
     return response
 
 
