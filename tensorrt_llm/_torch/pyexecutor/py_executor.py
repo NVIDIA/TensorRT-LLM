@@ -2067,9 +2067,15 @@ class PyExecutor:
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
-                # Previously, we were doing _handle_errors, which sends an error response.
-                # We should consider how we should be doing this now?
-                self.kv_cache_transceiver.cancel_request(request)
+                # We need to check if can can successfully cancel the request before
+                # terminating it and freeing KV cache associated with it
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                # This will terminate the request and send an error response
+                if is_cancelled:
+                    self._handle_errors(
+                        error_msg=f"Request {request.py_request_id} timed out",
+                        requests=[request])
+                continue
 
             if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
@@ -2122,8 +2128,10 @@ class PyExecutor:
         for request, block_id in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
                 if request.py_kv_transfer_timed_out:
-                    request.py_kv_transfer_start_time = None
-                    self.kv_cache_transceiver.cancel_request(request)
+                    is_cancelled = self.kv_cache_transceiver.cancel_request(
+                        request)
+                    if is_cancelled:
+                        request.py_kv_transfer_start_time = None
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
                 else:
