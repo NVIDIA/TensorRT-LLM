@@ -29,8 +29,13 @@ class HandleAdditionalOutputs:
             beam_width: Beam width for the generation requests
             num_context_tokens: Number of context tokens in the batch
         """
-        if not any(r.py_additional_outputs
-                   for r in chain(context_requests, generation_requests)):
+
+        additional_outputs = set()
+        for r in chain(context_requests, generation_requests):
+            if r.py_additional_outputs is not None:
+                additional_outputs.update(r.py_additional_outputs)
+
+        if not additional_outputs:
             return
 
         output_length_with_context = num_context_tokens + beam_width * len(
@@ -39,8 +44,8 @@ class HandleAdditionalOutputs:
             context_requests) + beam_width * len(generation_requests)
 
         gather_context = {}
-        for name, tensor in outputs.items():
-            if tensor.shape[0] == output_length_with_context:
+        for name in additional_outputs:
+            if outputs[name].shape[0] == output_length_with_context:
                 gather_context[name] = True
             else:
                 gather_context[name] = False
