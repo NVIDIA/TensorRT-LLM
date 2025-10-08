@@ -7,7 +7,8 @@ import torch.nn.functional as F
 from tensorrt_llm._utils import is_sm_100f
 
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import (AuxStreamType, Fp4QuantizedTensor, ceil_div, pad_up,
+                      swizzle_sf, unswizzle_sf)
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
@@ -88,6 +89,46 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     return ref
 
 
+def cute_dsl_nvfp4_group_gemm_ref(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    offset_array: torch.Tensor,
+    output_dtype: torch.dtype,
+    scaling_vector_size: int = 16,
+):
+    m, k = a.size(0), a.size(1) * 2
+    l, n = b.size(0), b.size(1)
+
+    b = b.view(torch.uint8)
+    assert b.size(2) * 2 == k
+    b_sf = b_sf.view(torch.uint8)
+    m_padded = pad_up(m, 128)
+    k_padded = pad_up(ceil_div(k, scaling_vector_size),
+                      16) * scaling_vector_size
+    a_sf_unswizzled = unswizzle_sf(a_sf,
+                                   m_padded,
+                                   k_padded,
+                                   scaling_vector_size=scaling_vector_size)
+    assert a_sf_unswizzled.size(0) == m_padded
+
+    ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
+    offsets = offset_array.cpu().tolist()
+    for i, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        if end <= start:
+            continue
+        a_sf_sliced = swizzle_sf(a_sf_unswizzled[start:end],
+                                 end - start,
+                                 k,
+                                 scaling_vector_size=scaling_vector_size)
+        ref[start:end] = torch.ops.trtllm.nvfp4_gemm(a[start:end], b[i],
+                                                     a_sf_sliced, b_sf[i],
+                                                     alpha[i], output_dtype)
+    return ref
+
+
 class CuteDslFusedMoE(CutlassFusedMoE):
     """
     Python Flow of Fused Mixture of Experts (MoE) Layer.
@@ -151,7 +192,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
@@ -172,6 +212,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
+        # run_post_quant_allgather = self.use_dp and self.parallel_size > 1
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         weight_dtype = self.w3_w1_weight.dtype
@@ -179,10 +220,47 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if self.has_any_quant:
             if self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
+            elif self.has_nvfp4:
+                pass
+                # if run_post_quant_allgather:
+                #     if isinstance(x, Fp4QuantizedTensor):
+                #         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                #         x_row = x.shape[0]
+                #         # note: we use uint8 to store 2 fp4 values
+                #         x_col = x.shape[1] * 2
+                #         x, x_sf = x.fp4_tensor, x.scaling_factor
+                #     else:
+                #         x_row = x.shape[0]
+                #         x_col = x.shape[1]
+                #         x, x_sf = torch.ops.trtllm.fp4_quantize(
+                #             x, self.fc31_input_scale, self.scaling_vector_size,
+                #             False, False)
+                # else:
+                #     if not isinstance(x, Fp4QuantizedTensor):
+                #         x, x_sf = torch.ops.trtllm.fp4_quantize(
+                #             x, self.fc31_input_scale, self.scaling_vector_size,
+                #             False, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
+
+        # if run_post_quant_allgather:
+        #     # Original allgather logic
+        #     if x_sf is not None:
+        #         x_sf = x_sf.view(x_row, ceil_div(x_col,
+        #                                          self.scaling_vector_size))
+        #         assert len(
+        #             x_sf.shape
+        #         ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
+        #         is_sf_swizzled = False
+
+        #     x, x_sf, token_selected_experts, token_final_scales = allgather(
+        #         [x, x_sf, token_selected_experts, token_final_scales],
+        #         self.mapping,
+        #         dim=0,
+        #         sizes=None if use_dp_padding else all_rank_num_tokens)
+        #     x_row = x.shape[0]
 
         (
             permuted_row_to_unpermuted_row_tensor,
@@ -197,7 +275,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_final_scales,
             None,  # w3_w1_weight.view(weight_dtype),
             None,  # w2_weight.view(weight_dtype),
-            None,  # quant_scales,
+            quant_scales=self.quant_scales,
             input_sf=x_sf,
             num_experts_on_rank=self.expert_size_per_partition,
             tp_size=self.tp_size,
@@ -209,24 +287,54 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             min_latency_mode=False,
             use_fp8_block_scaling=use_deepseek_fp8_block_scale,
         )
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-            permuted_data_tensor)
-        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset_tensor,
-        )
-        h2 = swiglu_fused_moe(h1)
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
-        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset_tensor,
-        )
+
+        if self.has_deepseek_fp8_block_scales:
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                permuted_data_tensor)
+            h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=act_input_fp8,
+                b=self.w3_w1_weight.view(weight_dtype),
+                a_sf=act_input_sf,
+                b_sf=self.quant_scales.fc_weight_scales,
+                offset_array=expert_first_token_offset_tensor,
+            )
+            h2 = swiglu_fused_moe(h1)
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                h2)
+            h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=act_input_fp8,
+                b=self.w2_weight.view(weight_dtype),
+                a_sf=act_input_sf,
+                b_sf=self.quant_scales.proj_weight_scales,
+                offset_array=expert_first_token_offset_tensor,
+            )
+        elif self.has_nvfp4:
+            act_input_fp4, act_input_sf = torch.ops.trtllm.fp4_quantize(
+                permuted_data_tensor, self.fc31_input_scale,
+                self.scaling_vector_size, False, True)
+            h1 = cute_dsl_nvfp4_group_gemm_ref(
+                a=act_input_fp4,
+                b=self.w3_w1_weight.view(weight_dtype),
+                a_sf=act_input_sf,
+                b_sf=self.quant_scales.fc1_weight_block,
+                alpha=self.quant_scales.fc1_global,
+                offset_array=expert_first_token_offset_tensor,
+                output_dtype=output_dtype,
+            )
+            h2 = swiglu_fused_moe(h1)
+            act_input_fp4, act_input_sf = torch.ops.trtllm.fp4_quantize(
+                h2, self.fc2_input_scale, self.scaling_vector_size, False, True)
+            h3 = cute_dsl_nvfp4_group_gemm_ref(
+                a=act_input_fp4,
+                b=self.w2_weight.view(weight_dtype),
+                a_sf=act_input_sf,
+                b_sf=self.quant_scales.fc2_weight_block,
+                alpha=self.quant_scales.fc2_global,
+                offset_array=expert_first_token_offset_tensor,
+                output_dtype=output_dtype,
+            )
+
+        # breakpoint()
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             h3,
             None,  # biases
