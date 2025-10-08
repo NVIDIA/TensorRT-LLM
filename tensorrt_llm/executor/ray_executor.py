@@ -152,21 +152,22 @@ class RayExecutor(GenerationExecutor):
                     "RayGPUWorker died during initialization") from e
             raise
 
+    @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,
                              async_call: bool, *args, **kwargs):
         workers = (self.workers[0], ) if leader_only else self.workers
-        with unwrap_ray_errors():
-            if async_call:
-                return [
-                    getattr(worker, func).remote(*args, **kwargs)
-                    for worker in workers
-                ]
-            else:
-                return ray.get([
-                    getattr(worker, func).remote(*args, **kwargs)
-                    for worker in workers
-                ])
+        if async_call:
+            return [
+                getattr(worker, func).remote(*args, **kwargs)
+                for worker in workers
+            ]
+        else:
+            return ray.get([
+                getattr(worker, func).remote(*args, **kwargs)
+                for worker in workers
+            ])
 
+    @unwrap_ray_errors()
     def collective_rpc(self,
                        method: str,
                        args: tuple = (),
@@ -178,17 +179,16 @@ class RayExecutor(GenerationExecutor):
         kwargs = kwargs or {}
 
         refs = []
-        with unwrap_ray_errors():
-            for w in workers:
-                try:
-                    refs.append(getattr(w, method).remote(*args, **kwargs))
-                except AttributeError:
-                    # Here worker is the RayWorkerWrapper.
-                    # For extended worker methods, we need to use call_worker_method since
-                    # Ray actor doesn't work with __getattr__ delegation.
-                    refs.append(
-                        w.call_worker_method.remote(method, *args, **kwargs))
-            return refs if non_block else ray.get(refs)
+        for w in workers:
+            try:
+                refs.append(getattr(w, method).remote(*args, **kwargs))
+            except AttributeError:
+                # Here worker is the RayWorkerWrapper.
+                # For extended worker methods, we need to use call_worker_method since
+                # Ray actor doesn't work with __getattr__ delegation.
+                refs.append(w.call_worker_method.remote(method, *args,
+                                                        **kwargs))
+        return refs if non_block else ray.get(refs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
