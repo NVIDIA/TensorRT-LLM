@@ -145,6 +145,12 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="The fraction of available memory to allocate for cache.",
     )
 
+    simple_shard_only: bool = Field(
+        default=False,
+        description="If True, force simple sharding (all_gather) in tensor parallelism. "
+        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
+    )
+
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
         Field(
             default="torch-compile",
