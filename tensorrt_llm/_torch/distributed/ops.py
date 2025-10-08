@@ -755,7 +755,7 @@ class FlashInferVLLMAllReduce(nn.Module):
                 self.workspace.fa,
                 input_tensor,
                 output_tensor,
-                self.workspace.buffer_ptrs[self.mapping.rank],
+                self.workspace.buffer_ptrs_ipc.peer_ptrs[self.mapping.rank],
                 self.reg_buffer_size,
                 36,  # CTA upper bounds: 36 as mentioned in the API
             )
