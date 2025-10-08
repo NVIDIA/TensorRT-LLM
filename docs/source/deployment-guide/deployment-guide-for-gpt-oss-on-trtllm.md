@@ -58,7 +58,7 @@ If you want to use latest main branch, you can choose to build from source to in
 
 ### Recommended Performance Settings
 
-We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. You can use these out-of-the-box, or adjust them to your specific use case.
+We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
 
 For low-latency with `TRTLLM` MOE backend:
 
