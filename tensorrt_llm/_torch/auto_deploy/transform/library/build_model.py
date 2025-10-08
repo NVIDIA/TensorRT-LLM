@@ -78,10 +78,6 @@ class BuildAndLoadFactoryModel(BuildModel):
         # build and load the model
         model = factory.build_and_load_model(self.config.device)
 
-        # this ensures that extra_args are passed in as they are received instead of enforcing the
-        # registered extra_args
-        cm.info.use_strict_args = False
-
         # we set the standard example sequence WITHOUT extra_args to set them to None so that
         # only the text portion of the model gets called.
         cm.info.set_example_sequence()

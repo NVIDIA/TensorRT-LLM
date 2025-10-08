@@ -8,15 +8,12 @@ transforms:
     stage: factory
     run_per_gm: false
     device: meta
-    # nothing to clean up
-    run_graph_cleanup: false
     requires_clean_graph: false
   export_to_gm:
     stage: export
     clone_state_dict: false
     strict: false
     run_per_gm: false
-    run_graph_cleanup: true
     requires_clean_graph: false
   cleanup_noop_slice:
     stage: post_export

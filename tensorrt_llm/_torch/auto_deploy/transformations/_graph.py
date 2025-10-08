@@ -311,7 +311,7 @@ def add_graph_input(
 
 def placeholders_on_meta(mod: nn.Module) -> bool:
     """
-    Return True if every placeholder node in the graph is on the meta device.
+    Return True if any placeholder node in the graph is on the meta device.
     """
 
     def _is_meta_tensor(t) -> bool:
@@ -335,7 +335,7 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
             if isinstance(val, (list, tuple)):
                 t = next((x for x in val if hasattr(x, "device") or hasattr(x, "is_meta")), None)
 
-            if not _is_meta_tensor(t):
-                return False
+            if _is_meta_tensor(t):
+                return True
 
-    return True
+    return False
