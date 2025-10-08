@@ -525,15 +525,23 @@ class ModelConfig(Generic[TConfig]):
 
         # For kv cache size calculation: set size_per_head
         head_dim_names = ["head_size", "head_dim"]
+        head_size = None
         for head_dim_name in head_dim_names:
-            if head_dim_name in self.pretrained_config:
-                head_size = getattr(self.pretrained_config, head_dim_name)
-                break
-        else:
-            logger.warning(
-                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
+            if hasattr(self.pretrained_config, head_dim_name):
+                value = getattr(self.pretrained_config, head_dim_name)
+                if value is not None:
+                    head_size = value
+                    break
+
+        if head_size is None:
+            assert hidden_size % num_heads == 0, (
+                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
             )
-            head_size = hidden_size // num_heads
+            calculated_head_size = hidden_size // num_heads
+            logger.warning(
+                f"head_size/head_dim is not set or None, using default value {calculated_head_size}"
+            )
+            head_size = calculated_head_size
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size

@@ -24,38 +24,40 @@ def enforce_single_worker(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp",
     [
-        [True, "TRTLLM", True, False, False, False, True, False],
-        [True, "TRTLLM", True, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False],
-        [False, "TRTLLM", True, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True, False],
-        [False, "FLASHINFER", True, False, False, False, True, False],
-        [False, "TRTLLM", False, True, True, False, True, False],
-        [True, "TRTLLM", False, True, True, False, True, False],
-        [True, "TRTLLM", True, False, True, True, True, False],
-        [True, "TRTLLM", True, False, True, False, True, False],
+        [True, "TRTLLM", True, False, False, False, True, False, False],
+        [True, "TRTLLM", True, False, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True, False, False],
+        [False, "TRTLLM", True, False, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, True, False, False],
+        [False, "FLASHINFER", True, False, False, False, True, False, False],
+        [False, "TRTLLM", False, True, True, False, True, False, False],
+        [True, "TRTLLM", False, True, True, False, True, False, False],
+        [True, "TRTLLM", True, False, True, True, True, False, False],
+        [True, "TRTLLM", True, False, True, False, True, False, False],
         # TODO: nvbugs/5461761
         # [True, "TRTLLM", True, False, False, True, True, False],
-        [True, "TRTLLM", False, False, False, False, True, False],
-        [False, "TRTLLM", False, False, False, False, True, False],
-        [True, "TRTLLM", False, False, False, False, False, True],
-        [False, "TRTLLM", False, False, False, False, False, True],
-        [True, "TRTLLM", False, False, False, False, True, True],
-        [False, "TRTLLM", False, False, False, False, True, True],
-        [True, "TRTLLM", False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, True, True, False],
-        [True, "TRTLLM", False, False, False, True, False, False],
-        [True, "FLASHINFER", False, False, False, False, True, False],
-        [False, "FLASHINFER", False, False, False, False, True, False],
+        [True, "TRTLLM", False, False, False, False, True, False, False],
+        [False, "TRTLLM", False, False, False, False, True, False, False],
+        [True, "TRTLLM", False, False, False, False, False, True, False],
+        [True, "TRTLLM", False, False, False, False, False, True, True],
+        [False, "TRTLLM", False, False, False, False, False, True, False],
+        [True, "TRTLLM", False, False, False, False, True, True, False],
+        [False, "TRTLLM", False, False, False, False, True, True, False],
+        [True, "TRTLLM", False, False, False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, True, True, False, False],
+        [True, "TRTLLM", False, False, False, True, False, False, False],
+        [True, "FLASHINFER", False, False, False, False, True, False, False],
+        [False, "FLASHINFER", False, False, False, False, True, False, False],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool, multi_batch: bool, request):
+                      use_chain_drafter: bool, multi_batch: bool,
+                      attention_dp: bool, request):
     # Use enforce_single_worker fixture only when use_chain_drafter is False.
     # Otherwise, we can't modify the returned value of _get_allow_chain_drafter in multiprocessing.
     if not use_chain_drafter:
@@ -98,6 +100,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             cuda_graph_config=cuda_graph_config,
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
+            enable_attention_dp=attention_dp,
             # This max_seq_len is larger than the one specified
             # in the llama 3 8B eagle's config. We want to make sure
             # that the draft model won't go above its max in warmup
