@@ -589,7 +589,7 @@ class RocketVanillaAttention(VanillaAttention):
     def _single_request_sparse_kv_predict(
             self, q: Optional[Tensor], k: Optional[Tensor], v: Optional[Tensor],
             metadata: RocketVanillaAttentionMetadata, past_seen_token: int,
-            sample_idx: int, **kwargs) -> Optional[Tensor]:
+            sample_idx: int, **kwargs) -> tuple[Optional[torch.Tensor], int]:
         """
         Predict KV indices for writing new key/value pairs.
         For RocketKV:
@@ -633,7 +633,7 @@ class RocketVanillaAttention(VanillaAttention):
             self, q: Tensor, k: Optional[Tensor], v: Optional[Tensor],
             kv_cache_tensor: Tensor, metadata: RocketVanillaAttentionMetadata,
             past_seen_token: int, sample_idx: int,
-            **kwargs) -> Optional[Tensor]:
+            **kwargs) -> tuple[Optional[torch.Tensor], int]:
         """
         Predict KV cache indices for sparse attention computation.
         For RocketKV:

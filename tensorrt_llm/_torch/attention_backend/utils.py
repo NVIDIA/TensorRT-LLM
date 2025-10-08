@@ -10,8 +10,10 @@ from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
 
 
-def get_attention_backend(backend_name: str,
-                          sparse_attn_config=None) -> Type[AttentionBackend]:
+def get_attention_backend(
+    backend_name: str,
+    sparse_attn_config: Optional["SparseAttentionConfig"] = None
+) -> Type[AttentionBackend]:
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)

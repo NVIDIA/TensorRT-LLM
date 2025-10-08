@@ -72,10 +72,7 @@ def test_model(backend, model_name, attention_backend):
             count = count + 1
     acc = count / len(outputs)
 
-    if attention_backend == "VANILLA":
-        assert acc >= 0.9, 'accuracy test of rocketkv sparse attention failed'
-    else:
-        assert acc >= 0.8, 'accuracy test of rocketkv sparse attention failed'
+    assert acc >= 0.9, 'accuracy test of rocketkv sparse attention failed'
 
 
 if __name__ == '__main__':
