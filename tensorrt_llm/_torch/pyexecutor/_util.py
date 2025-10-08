@@ -81,11 +81,14 @@ class KvCacheCreator:
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
                                   mapping: Mapping) -> int:
-        mem_per_token = 2
+        mem_bits_per_token = 16
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
+        if quant_config is not None:
+            if quant_config.quant_mode.has_fp8_kv_cache(
+            ) or quant_config.quant_mode.has_int8_kv_cache():
+                mem_bits_per_token = 8
+            elif quant_config.quant_mode.has_fp4_kv_cache():
+                mem_bits_per_token = 4
 
         config = model_config.pretrained_config
 
@@ -112,10 +115,11 @@ class KvCacheCreator:
         # provide at least 1 layer to prevent division by zero cache size
         num_attention_layers = max(
             len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
-        mem_per_token *= num_attention_layers * head_dim
+        mem_bits_per_token *= num_attention_layers * head_dim
+        assert mem_bits_per_token % 8 == 0, f"mem_bits_per_token {mem_bits_per_token} must be divisible by 8"
         # K and V
-        mem_per_token *= kv_factor
-        return mem_per_token
+        mem_bits_per_token *= kv_factor
+        return mem_bits_per_token // 8
 
     def _get_free_gpu_memory_fraction(self) -> float:
         fraction = self._kv_cache_config.free_gpu_memory_fraction
