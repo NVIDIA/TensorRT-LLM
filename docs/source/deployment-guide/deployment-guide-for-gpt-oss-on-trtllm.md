@@ -86,13 +86,13 @@ After the server is set up, the client can now send prompt requests to the serve
 
 These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
 
-#### `tp_size`
+#### `tensor_parallel_size`
 
 * **Description:** Sets the **tensor-parallel size**. This should typically match the number of GPUs you intend to use for a single model instance.
 
-#### `ep_size`
+#### `moe_expert_parallel_size`
 
-* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tp_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
+* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tensor_parallel_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
 #### `kv_cache_free_gpu_memory_fraction`
 

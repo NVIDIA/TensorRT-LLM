@@ -1,7 +1,7 @@
 backend: pytorch
 max_batch_size: 4
-tp_size: 8
-ep_size: 2
+tensor_parallel_size: 8
+moe_expert_parallel_size: 2
 max_num_tokens: 32768
 trust_remote_code: true
 kv_cache_free_gpu_memory_fraction: 0.75
