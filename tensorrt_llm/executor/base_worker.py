@@ -205,10 +205,8 @@ class BaseWorker(GenerationExecutor):
                 # point in the TRT flow is currently not supported (it's at the CPP
                 # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
                 # optimization is not available in TRT-python flow.
-                mapping = engine_config.pretrained_config.mapping if self.llm_args is None else self.llm_args.parallel_config.to_mapping(
-                )
                 self._lora_manager = LoraManager(
-                    mapping=mapping,
+                    mapping=engine_config.pretrained_config.mapping,
                     model_config=self._runtime_model_config,
                     cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
