@@ -397,6 +397,9 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
         build_run(
             f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
+        build_run(
+            f"\"{venv_python}\" -m pybind11_stubgen -o . flash_mla_cpp_tllm --exit-code",
+            env=env_stub_gen)
         if deep_ep:
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
@@ -606,12 +609,14 @@ def main(*,
         build_pyt = "OFF"
         build_deep_ep = "OFF"
         build_deep_gemm = "OFF"
+        build_flash_mla = "OFF"
     else:
         targets.extend(
-            ["th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils"])
+            ["th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils", "flash_mla"])
         build_pyt = "ON"
         build_deep_ep = "ON"
         build_deep_gemm = "ON"
+        build_flash_mla = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -647,7 +652,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -895,6 +900,13 @@ def main(*,
         install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
                      "deep_gemm",
                      deep_gemm_dir,
+                     dirs_exist_ok=True)
+
+        install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
+                     pkg_dir)
+        install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
+                     "flash_mla",
+                     pkg_dir / "flash_mla",
                      dirs_exist_ok=True)
 
         if not skip_stubs:

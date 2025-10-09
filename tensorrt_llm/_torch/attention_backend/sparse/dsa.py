@@ -265,7 +265,6 @@ class Indexer(nn.Module):
         """
         block_offsets = self.cache_manager.get_indexer_k_block_offsets(request_ids)
         total_tokens = num_tokens_per_request.sum().item()
-
         head_dim = self.head_dim
         scale_size = head_dim // self.quant_block_size * 4  # float32 = 4 bytes
         block_stride = self.tokens_per_block * (head_dim + scale_size)  # Bytes per block
@@ -637,6 +636,7 @@ class DSACacheManager(KVCacheManager):
         # Shape: [num_blocks, tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
         # Store FP8-quantized k values from the indexer
+        assert tokens_per_block == 64, "Current DeepGEMM kernels (e.g., fp8_paged_mqa_logits) only support block size of 64"
         scale_size = self.index_head_dim // self.quant_block_size * 4
         self.indexer_k_cache_pool_per_layer = [
             torch.empty(

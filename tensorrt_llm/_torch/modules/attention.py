@@ -26,6 +26,12 @@ from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
+# Import FlashMLA sparse attention kernel
+try:
+    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
+except ImportError:
+    flash_mla_sparse_fwd = None
+
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
@@ -1160,7 +1166,7 @@ class MLA(nn.Module):
         return self.forward_sparse_mla_kvcache_bf16(q, compressed_kv, k_pe, attn_metadata,
                                        output, latent_cache, hidden_states, qr,
                                        position_ids, is_generation = False)
-    
+
     def forward_generation_dsa(
         self,
         q: torch.Tensor,
@@ -1585,11 +1591,11 @@ class MLA(nn.Module):
             gen_kv_lens = attn_metadata.kv_lens_runtime[attn_metadata.num_contexts:attn_metadata.num_seqs]
             total_gen_kv_tokens = gen_kv_lens.sum().item()
             max_gen_kv_len = gen_kv_lens.max().item()
-            
+
             # Build cumulative indptr
             gen_kv_indptr = torch.zeros(num_generations + 1, dtype=torch.int64, device='cuda')
             torch.cumsum(gen_kv_lens, dim=0, dtype=torch.int64, out=gen_kv_indptr[1:])
-            
+
             # Load from paged cache
             full_compressed_kv, full_k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
                 q.dtype,
@@ -1621,12 +1627,12 @@ class MLA(nn.Module):
 
         num_tokens = q.shape[0]
         # find topk_indicies
-        top_k_indices = self.mqa.indexer.sparse_attn_indexer(qr,...)
+        top_k_indices = self.mqa.indexer(q, k_pe, attn_metadata, hidden_states, qr, position_ids)
         topk_indices_reshaped = topk_indices.view(num_tokens, 1, -1)
 
         q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            
+
         q_nope_out = torch.empty(
             [
                 num_tokens, self.num_heads,
@@ -1669,7 +1675,7 @@ class MLA(nn.Module):
 
          # Step 2: Reshape inputs for sparse kernel
         kv_c_and_k_pe_cache = full_latent_cache.view(-1, 1, full_latent_cache.shape[-1])
-        
+
         # Step 3: Handle head padding (kernel requirement)
         sm_version = get_sm_version()
         # TODO: avoid sm version check in the runtime
@@ -1680,23 +1686,27 @@ class MLA(nn.Module):
                 f"Cannot pad num_heads={self.num_heads} to {padding}. "
                 f"Padding must be a multiple of num_heads."
             )
-            
+
             logger.warning_once(
                 f"Padding num_heads from {self.num_heads} to {padding} "
                 f"due to FlashMLA sparse attention kernel requirement"
             )
-            
+
             # Create padded tensor with zeros for extra heads
             q_padded = q_concat.new_empty((num_tokens, padding, q_concat.shape[2]))
             q_padded[:, :self.num_heads, :] = q_concat
             q_concat = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        attn_out_latent = flash_mla_sparse_prefill(q_concat, kv_c_and_k_pe_cache, topk_indices,
-                                          self.softmax_scale)[0] # output: [seq, num_heads, kv_lora_rank]
+        if flash_mla_sparse_fwd is not None:
+            attn_out_latent, _ = flash_mla_sparse_fwd(q_concat, kv_c_and_k_pe_cache, topk_indices,
+                                                       self.softmax_scale)
+        else:
+            raise RuntimeError("flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built.")
+        # output: [seq, num_heads, kv_lora_rank]
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent[:, :self.num_heads, :] # account for padding
-        # TODO: seems we need .contiguous() here when padding enabled before pass to bmm? 
+        # TODO: seems we need .contiguous() here when padding enabled before pass to bmm?
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads, self.kv_lora_rank])
 
