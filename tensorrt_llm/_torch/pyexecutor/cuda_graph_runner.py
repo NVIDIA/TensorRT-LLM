@@ -1,9 +1,12 @@
 import bisect
 import contextlib
+import sys
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ..expert_statistic import ExpertStatistic
 from ..modules.multi_stream_utils import with_multi_stream
@@ -28,7 +31,12 @@ class CUDAGraphRunner:
     """
     WARMUP_STEPS = 2
 
+    def print_current_calling_function(self):
+        logger.info(
+            f"KM Current cuda_graph_runner_function: {sys._getframe(1)}")
+
     def __init__(self, engine: "PyTorchModelEngine"):
+        self.print_current_calling_function()
         self.engine_ref = weakref.ref(engine)
 
         # High-level configuration
@@ -56,6 +64,7 @@ class CUDAGraphRunner:
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
+        self.print_current_calling_function()
         engine = self._get_engine()
 
         token_per_request = self.max_possible_draft_len + 1
@@ -78,29 +87,36 @@ class CUDAGraphRunner:
 
     @property
     def enable_spec_decode(self):
+        self.print_current_calling_function()
         return self._get_engine().is_spec_decode
 
     @property
     def draft_len(self):
+        self.print_current_calling_function()
         return self.spec_config.max_draft_len if self.enable_spec_decode else 0
 
     @property
     def spec_metadata(self):
+        self.print_current_calling_function()
         return self._get_engine().spec_metadata
 
     @property
     def draft_tokens_cuda(self):
+        self.print_current_calling_function()
         return self._get_engine().draft_tokens_cuda
 
     @property
     def attn_metadata(self):
+        self.print_current_calling_function()
         return self._get_engine().attn_metadata
 
     def __del__(self):
+        self.print_current_calling_function()
         self.clear()
 
     def _get_engine(self) -> "PyTorchModelEngine":
         """Safely dereferences the weak reference to the engine."""
+        self.print_current_calling_function()
         engine = self.engine_ref()
         if engine is None:
             raise RuntimeError(
@@ -116,6 +132,7 @@ class CUDAGraphRunner:
         - The attn_metadata for the graph, if applicable.
         - The spec_metadata for the graph, if applicable.
         """
+        self.print_current_calling_function()
         engine = self._get_engine()
 
         # disable when doing statistic
@@ -162,11 +179,13 @@ class CUDAGraphRunner:
         return True, attn_metadata, spec_metadata
 
     def needs_capture(self, batch_size: int):
+        self.print_current_calling_function()
         return (batch_size, self.draft_len) not in self.graph_outputs
 
     def capture(self, batch_size: int, forward_fn: Callable,
                 initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
+        self.print_current_calling_function()
         key = (batch_size, self.draft_len)
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -204,6 +223,9 @@ class CUDAGraphRunner:
             for _ in range(self.WARMUP_STEPS):
                 forward_fn(capture_inputs)
             with torch.cuda.graph(graph, pool=self.memory_pool):
+                logger.info(
+                    f"KM Forward function name called for graph capture: {forward_fn.__name__}"
+                )
                 output = forward_fn(capture_inputs)
 
         self.graphs[key] = graph
@@ -213,6 +235,7 @@ class CUDAGraphRunner:
     def replay(self, batch_size: int,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
+        self.print_current_calling_function()
         key = (batch_size, self.draft_len)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -242,6 +265,7 @@ class CUDAGraphRunner:
 
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager) -> int:
+        self.print_current_calling_function()
         engine = self._get_engine()
         kv_cache_manager = resource_manager.get_resource_manager(
             engine.kv_cache_manager_key)
@@ -298,6 +322,7 @@ class CUDAGraphRunner:
 
     def _round_up_batch_size(self, batch_size: int) -> int:
         """Finds the smallest supported graph batch size >= the given size."""
+        self.print_current_calling_function()
         if not self.supported_batch_sizes:
             return 0
         idx = bisect.bisect_left(self.supported_batch_sizes, batch_size)
@@ -309,7 +334,7 @@ class CUDAGraphRunner:
     def pad_batch(self, scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager):
         """Context manager to pad a batch to a graph-compatible size."""
-
+        self.print_current_calling_function()
         padding_size = self._get_padded_batch(scheduled_requests,
                                               resource_manager)
         try:
@@ -321,6 +346,7 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        self.print_current_calling_function()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()

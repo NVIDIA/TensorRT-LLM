@@ -445,10 +445,6 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if pytorch_backend_config.use_cuda_graph:
-            raise NotImplementedError(
-                "CUDA graphs are not supported with KV connector hooks.")
-
         if executor_config.scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."

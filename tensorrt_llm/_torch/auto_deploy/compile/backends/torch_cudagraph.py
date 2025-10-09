@@ -53,6 +53,7 @@ class CapturedGraph(nn.Module):
 
     def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
+        ad_logger.info("KM capturing one cuda graph")
         # warm-up
         with CudaGraphWarmUpPhase():
             for _ in range(3):
@@ -75,6 +76,7 @@ class CapturedGraph(nn.Module):
 
     def capture_graph(self, *args, **kwargs):
         """Capture and pre-fetch the graph for variable batch size."""
+        ad_logger.info("KM capturing potentially multiple cuda graphs.")
         # flatten args, kwargs
         all_args_flat = _flatten_args(self._in_spec, *args, **kwargs)
 
