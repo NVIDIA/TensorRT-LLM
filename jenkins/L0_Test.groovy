@@ -417,7 +417,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
-                    //cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+                    cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
                 } catch (Exception e) {
                     error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
                 }
@@ -737,7 +737,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
-                    //cleanUpSlurmResources(pipeline, cluster, jobUID)
+                    cleanUpSlurmResources(pipeline, cluster, jobUID)
                 } catch (Exception e) {
                     error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
                 }
