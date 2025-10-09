@@ -1180,7 +1180,8 @@ class PeftCacheManager(BaseResourceManager):
         self._lora_manager = LoraManager(
             mapping=mapping,
             model_config=ModelConfigPython.from_model_config_cpp(
-                model_config, mapping))
+                model_config, mapping),
+            cpp_peft_cache_manager=self.impl)
 
     def get_lora_manager(self) -> LoraManager:
         return self._lora_manager
