@@ -287,6 +287,13 @@ public:
     //! \param enablePartialReuse Allow matching tokens to be copied from block that does not match entire prompt.
     [[nodiscard]] LookupResults lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool createNodes);
 
+    //! \brief Find matching blocks for a given prompt prefix for all window sizes.
+    //! return map of matching blocks vs window size. Matching blocks is a vector of varying size.
+    std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>> lookupBlocks(
+            std::unordered_map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
+            LlmRequest const& llmRequest, SizeType32 inputLength, 
+            bool allowPartiallyFilledBlock, bool enablePartialReuse);
+
     // Debugging functions
     std::string printNode(LookupResult const& match);
     std::string printNodes(LookupResults const& matches);

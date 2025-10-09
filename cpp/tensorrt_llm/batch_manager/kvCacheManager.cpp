@@ -548,6 +548,118 @@ std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmReq
     return blockKeys;
 }
 
+// TODO:
+// Rewrite so this function returns a vector of matching blocks for each window size.
+// This is the only way to get correct results since the next node depends on which of the current nodes have available blocks, which is a local decision for each window size.
+
+std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>> KVCachePromptLookup::lookupBlocks(
+        std::unordered_map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
+        LlmRequest const& llmRequest, SizeType32 inputLength, 
+        bool allowPartiallyFilledBlock, bool enablePartialReuse)
+{
+    // Return value
+    std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>> results;
+    // Keep track of all window sizes that are still looking for matching blocks
+    std::unordered_set<SizeType32> stillLooking;
+    for ([[maybe_unused]] auto const& [windowSize,dummy1] : windowBlockManagers)
+    {
+        stillLooking.insert(windowSize);
+        results.emplace(std::make_pair(windowSize,std::vector<std::tuple<bool,SizeType32,BlockPtr>>()));
+    }
+
+    // Search tree
+    auto blockKeys = getBlockKeys(llmRequest, inputLength, allowPartiallyFilledBlock);
+    auto searchRoot = mRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        if (searchRoot == nullptr)
+        {
+            // Neither exact nor partial matches can be found
+            // Cancel all window sizes still looking for matches
+            stillLooking.clear();
+        }
+        else
+        {
+            // Consider exact match
+            std::unordered_set<SizeType32> needPartials;
+            auto exactMatch = searchRoot->findMatchingNodes(blockKey, false);
+            TLLM_CHECK_WITH_INFO(exactMatch.size() == 0 || exactMatch.size() == 1, "exactMatch must contain either one node or no node");
+            if (exactMatch.size() == 1)
+            {
+                // found exact matching node
+                [[maybe_unused]] auto const& [dummy1, dummy2, exactMatchingNode] = exactMatch[0];
+                for (auto windowSize : stillLooking)
+                {
+                    auto block = exactMatchingNode->getBlock(windowSize);
+                    if (block != nullptr)
+                    {
+                        // found exact matching block 
+                        auto& winres = results[windowSize];
+                        // TODO: verify these outputs
+                        winres.emplace_back(std::make_tuple(!block->isFull(),0,block));
+                    }
+                    else
+                    {
+                        // did not find exact match
+                        if (enablePartialReuse)
+                        {
+                            // look for partial match
+                            needPartials.insert(windowSize);
+                        }
+                        else
+                        {
+                            // partial match disabled, cancel
+                            stillLooking.erase(windowSize);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // did not find exact matching node
+                if (enablePartialReuse)
+                {
+                    for (auto windowSize : stillLooking)
+                    {
+                        needPartials.insert(windowSize);
+                    }
+                }
+                else
+                {
+                    stillLooking.clear();
+                }
+            }
+
+            // Consider partial match
+            if (!needPartials.empty())
+            {
+                // Note: Returns partial matches sorted in descending order on num matched tokens.
+                auto partialMatches = searchRoot->findMatchingNodes(blockKey, true);
+                for (auto windowSize : needPartials)
+                {
+                    for (auto [partialMatch,numMatched,node] : partialMatches)
+                    {
+                        auto block = node->getBlock(windowSize);
+                        if (block != nullptr)
+                        {
+                            // found partial match
+                            auto& winres = results[windowSize];
+                            winres.emplace_back(std::make_tuple(true,numMatched,block));
+                            break;
+                        }
+                    }
+                    stillLooking.erase(windowSize);
+                }
+            }
+        }
+
+        if (stillLooking.empty()) break;
+    }
+
+    return results;
+}
+
+// TODO: I don't think this needs partial reuse anymore. Also, create == true may be only useful option
 LookupResults KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool create)
 {
     TLLM_CHECK_WITH_INFO(!(enablePartialReuse && create), "enablePartialReuse and create are mutually exclusive flags");
@@ -577,6 +689,7 @@ LookupResults KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType
         else
         {
             // Stop search if first node is a partial match
+            // TODO: This may not be correct, findMatchingNodes can return both a full match and several partial matches at once.
             auto const& [partialMatch, _, matchingNode] = matches[0];
             searchRoot = partialMatch ? nullptr : matchingNode;
         }
