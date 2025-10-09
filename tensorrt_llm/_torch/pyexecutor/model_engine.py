@@ -281,7 +281,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
     ):
-        self._km_event = torch.cuda.Event(enable_timing=True)
+        self._forward_pass_event = None
         self.ub_buffers = None
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
@@ -469,6 +469,10 @@ class PyTorchModelEngine(ModelEngine):
                 dtype=torch.int32)
         else:
             self.cache_indirection_attention = None
+
+    def register_forward_pass_event(self, event: torch.cuda.Event):
+        logger.info(f"Registering forward_pass_event: {event}")
+        self._forward_pass_event = event
 
     @property
     def runtime_draft_len(self):
@@ -2324,7 +2328,14 @@ class PyTorchModelEngine(ModelEngine):
             # be triggered. This is the whole point of cuda events and cuda streams.
             # One stream can await on work to be done on a different stream without
             # blocking work on the first stream.
-            self._km_event.record()
+            if self._forward_pass_event:
+                self._forward_pass_event.record()
+                logger.info(
+                    f"KM forward_pass_event recorded: {self._forward_pass_event}"
+                )
+            else:
+                # TODO: take this out for check in
+                logger.info("KM forward_pass_event NOT recorded")
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 

@@ -96,6 +96,18 @@ class KvCacheConnectorWorker(ABC):
         self._metadata = None
 
     @abstractmethod
+    def register_forward_pass_event(self) -> torch.cuda.Event:
+        """
+        Register a cuda event for the end of the forward pass.
+        This event will be recorded into the forward pass stream
+        at the end of the forward pass computation, _but before_
+        the start of the post processing.
+
+        This method is typically used by the connector to obtain a
+        signal of when it's appropriate to start offloading cache blocks.
+        """
+
+    @abstractmethod
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         """
         Register the KV cache tensors to the worker.

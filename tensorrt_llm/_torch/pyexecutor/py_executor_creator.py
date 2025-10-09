@@ -474,6 +474,17 @@ def create_py_executor(
 
                 connector_worker = connector_worker_task.result()
 
+            forward_pass_event = connector_worker.register_forward_pass_event()
+            if forward_pass_event:
+                logger.info(
+                    "KM Worker class has a register_forward_pass_event() method. Calling..."
+                )
+                model_engine.register_forward_pass_event(forward_pass_event)
+            else:
+                logger.info(
+                    "KM Worker class does NOT have a register_forward_pass_event() method. Skipping..."
+                )
+
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)
 
