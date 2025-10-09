@@ -697,7 +697,8 @@ class PyTorchModelEngine(ModelEngine):
         # Create CUDA graphs for different draft lengths
         draft_lengths = []
         if self.is_draft_model:
-            if self.model_is_wrapped:
+            if self.model_is_wrapped and self.is_spec_decode and spec_resource_manager is not None and isinstance(
+                    spec_resource_manager, Eagle3ResourceManager):
                 # The CDL path uses draft_len > 0 for the number of iterations in the drafting loop.
                 draft_lengths.append(self.original_max_draft_len)
             else:
