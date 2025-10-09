@@ -13,6 +13,7 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: others
+      orchestrator: mpi
   tests:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
@@ -31,10 +32,16 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True]
   # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[2]
 - condition:
     ranges:
       system_gpu_count:
@@ -48,6 +55,7 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: others
+      orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
@@ -93,6 +101,7 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: deepseek
+      orchestrator: mpi
   tests:
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp1-bf16-trtllm-deepseekv3_lite]
   - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp4-bf16-trtllm-deepseekv3_lite]
@@ -150,6 +159,7 @@ l0_dgx_h100:
       stage: pre_merge
       backend: pytorch
       auto_trigger: gpt_oss
+      orchestrator: mpi
   tests:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-triton-auto]
@@ -171,6 +181,7 @@ l0_dgx_h100:
       stage: pre_merge
       backend: cpp
       auto_trigger: others
+      orchestrator: mpi
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_multi_gpu.py::test_mpi_utils[90]
@@ -212,3 +223,24 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-nixl_kvcache-90] TIMEOUT (90)
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-nixl_kvcache-90]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+    wildcards:
+      gpu:
+        - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: ray
+  tests:
+    - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu2"
+    - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
+    - accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
+    - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
+    - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
+    - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
+    - examples/test_ray.py::test_ray_disaggregated_serving[tp1]

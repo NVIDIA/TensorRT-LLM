@@ -11,18 +11,33 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
+from torch.types import Number
 
 from ...._utils import nvtx_range
 from ..utils.logger import ad_logger
 
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 DynamicShapeCallback = Callable[[], DynamicShape]
+
+Constant = Union[int, float, str, None]
 
 
 @dataclass
@@ -72,6 +87,8 @@ class SequenceInfo:
     - pages_per_seq: [ps_0, ps_1, ..., ps_{b-1}] where ps_i is the number of pages allocated for
       sequence i. Note that, for example, cache_loc[p_0:p_1] will correspond to the pages associated
       with sequence 1 in the batch.
+    - slot_idx: [s_0, s_1, ..., s_{b-1}]
+      Corresponds to the slot index of each sequence in the batch.
 
     ################################################################################################
 
@@ -134,15 +151,25 @@ class SequenceInfo:
         self._num_pages = max(
             self.max_batch_size,
             (self.max_num_tokens) // self.page_size  # floored number of pages
-            + (self.max_num_tokens % self.page_size > 0) * self.max_batch_size,  # +1 per sequence
+            + (self.max_num_tokens / self.max_batch_size % self.page_size > 0)  # check for overflow
+            * self.max_batch_size,  # +1 page per sequence if overflow is required
         )
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
 
+        # cache_loc requires some special treatment due to block reuse. Note that the constraint for
+        # cache_loc with block_reuse is as follows:
+        # 0 <= cache_loc < num_pages
+        # len(cache_loc) <= max_num_cache_loc_assignments
+        max_num_cache_loc_assignments = (
+            max_seq_len_adjusted // self.page_size + 1
+        ) * self.max_batch_size
+
         # log parameters
         ad_logger.info(
             f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.page_size=}, "
-            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}"
+            f"{self.max_num_tokens=} (inferred), {max_num_tokens=} (provided), {self.num_pages=}, "
+            f"{max_num_cache_loc_assignments=}"
         )
 
         # indicator if extra args are activated that are needed for cached attention backends
@@ -162,8 +189,9 @@ class SequenceInfo:
             # TENSOR FIELDS FOR CACHED ATTENTION
             "seq_len": torch.empty(self.max_batch_size, dtype=torch.int),
             "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
-            "cache_loc": torch.empty(self.num_pages, dtype=torch.int),
+            "cache_loc": torch.empty(max_num_cache_loc_assignments, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
+            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
         }
@@ -172,7 +200,8 @@ class SequenceInfo:
         }
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
-        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq")
+        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        self._cached_constants = ("page_size",)
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
@@ -283,12 +312,28 @@ class SequenceInfo:
         return tuple(self.named_args.values())
 
     @property
-    def const_args_for_prepare_metadata(self) -> Tuple:
+    def args_for_prepare_metadata(self) -> Tuple[str, ...]:
+        """Return a tuple of node/tensor arguments for the prepare_metadata op.
+
+        The ``prepare_metadata`` interface expects the following arguments:
+
+        1. ``args_for_prepare_metadata`` as nodes, i.e., as input-dependent tensors.
+        2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
+           to the corresponding ``prepare_metadata`` node/op.
+
+        This interface handles the tensor/node arguments part and can be used by compiler passes
+        like ``insert_cached_attention`` to extract the constant arguments and add them to the
+        ``prepare_metadata`` node/op.
+        """
+        return tuple(self.named_standard_args.keys())
+
+    @property
+    def const_args_for_prepare_metadata(self) -> Tuple[Constant, ...]:
         """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op.
 
         The ``prepare_metadata`` interface expects the following arguments:
 
-        1. ``named_standard_args`` as nodes,i.e., as input-dependent tensors.
+        1. ``args_for_prepare_metadata`` as nodes, i.e., as input-dependent tensors.
         2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
            to the corresponding ``prepare_metadata`` node/op.
 
@@ -296,10 +341,10 @@ class SequenceInfo:
         ``insert_cached_attention`` to extract the constant arguments and add them to the
         ``prepare_metadata`` node/op.
         """
-        return (self.page_size,)
+        return tuple(getattr(self, k) for k in self._cached_constants)
 
     @property
-    def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
+    def named_dynamic_shapes(self) -> Dict[str, DynamicShape]:
         """Return dynamic shapes of sequence info tensors.
 
         NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
@@ -311,6 +356,7 @@ class SequenceInfo:
             if self.max_batch_size > 1:
                 bs_seq_len_shape[0] = Dim("batch_size", max=self.max_batch_size)
             bs_seq_len_shape[1] = Dim("seq_len", max=self.max_seq_len)
+            # bs_seq_len_shape[1] = Dim.AUTO
             self._dynamic_shapes = {k: bs_seq_len_shape for k in self._uncached_arg_names}
             # cached args are static
             self._dynamic_shapes.update({k: {} for k in self._cached_arg_names})
@@ -363,7 +409,8 @@ class SequenceInfo:
     def num_pages(self, value):
         self._num_pages = value
         # update the cache_loc tensor
-        self._args_device["cache_loc"].resize_(value)
+        if self._args_device["cache_loc"].numel() < value:
+            self._args_device["cache_loc"].resize_(value)
 
     @property
     def is_paged(self) -> bool:
@@ -522,11 +569,15 @@ class SequenceInfo:
         cache_loc = list(range(sum(pages_per_seq)))
         page_assignments = self._get_page_assignments(cache_loc, pages_per_seq)
 
+        # vanilla slot indices
+        slot_idx = list(range(len(input_ids)))
+
         self.nest_sequences(
             input_ids,
             position_ids,  # will be auto-inferred if None
             input_pos=0,  # no cache history
             page_assignments=page_assignments,  # vanilla page assignments
+            slot_idx=slot_idx,  # vanilla slot indices
             **extra_args,
         )
 
@@ -560,15 +611,15 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[int | float],
-        reset: bool = False,
+        tnsr_like: List[Number],
+        reset_val: Optional[Number] = None,
     ) -> None:
         """Store the argument on the host and copy to the device in a non-blocking fashion.
 
         Args:
             name: Name of the argument to store.
             tnsr_like: List of values to store.
-            reset: Whether to reset the full tensor on the device to 0 before writing to it.
+            reset_val: Value to reset/fill the full tensor on the device to before writing to it.
         """
         with nvtx_range(f"ad_store_seq_info_arg_{name}"):
             tnsr_device = self._args_device[name]
@@ -586,8 +637,8 @@ class SequenceInfo:
             )
 
             # reset/copy to the device in a non-blocking fashion
-            if reset:
-                tnsr_device.zero_()
+            if reset_val is not None:
+                tnsr_device.fill_(reset_val)
             tnsr_device[: len(tnsr_like)].copy_(tnsr_host, non_blocking=True)
 
     def _store_extra_arg(
@@ -606,6 +657,18 @@ class SequenceInfo:
             else:
                 self._extra_args[name] = None
 
+    def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
+        """Get un unoccupied value from the range indicated by max_val.
+
+        In addition, this function performs a sanity check to ensure that no value in the occupied
+        set is out of bounds.
+        """
+        full_range = set(range(max_val))
+        free_values = full_range - occupied
+        out_of_range = occupied - full_range
+        assert not out_of_range, f"Out of range values: {out_of_range}"
+        return free_values.pop() if free_values else 0
+
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
         self,
@@ -613,6 +676,7 @@ class SequenceInfo:
         position_ids: Optional[Sequence[Sequence[int]]] = None,
         input_pos: Optional[Union[Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
+        slot_idx: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -622,22 +686,26 @@ class SequenceInfo:
             position_ids: List of sequences of position_ids for each token.
             input_pos: Absolute starting position in the cache for each sequence.
             page_assignments: List of sequences of page assignments for each sequence.
+            slot_idx: List of slot indices for each sequence.
             extra_args: Extra arguments to be stored in the interface.
 
-        This i/f will ensure that all sequence info args are updated accordingly.
+        This i/f will ensure that all sequence info args are updated accordingly. Reset values are
+        chosen as "neutral" values so that for cases like rounding up batch sizes for cudagraph we
+        only write to unused buffers/caches.
         """
         ### UPDATE METADATA ########################################################################
         # update metadata first since it's useful for other updates to have up-to-date information
 
         # set new sequence lengths --> resetting the remaining entries to zero is important to help
         # us discern the actual number of sequences in the batch.
-        self._store_arg("seq_len", [len(ids) for ids in input_ids], reset=True)
+        self._store_arg("seq_len", [len(ids) for ids in input_ids], reset_val=0)
 
         # check for updated input_pos (i.e. cache start position)
         if input_pos is not None:
             self._store_arg(
                 "input_pos",
                 [input_pos] * self.num_sequences if isinstance(input_pos, int) else input_pos,
+                reset_val=0,
             )
 
         # check for updated page_assignments
@@ -645,8 +713,14 @@ class SequenceInfo:
             cache_loc, pages_per_seq = self._get_cache_locations_and_pages_per_sequence(
                 page_assignments
             )
-            self._store_arg("cache_loc", cache_loc, reset=True)
-            self._store_arg("pages_per_seq", pages_per_seq, reset=True)
+            free_cache_loc = self._get_unique_value(set(cache_loc), self.num_pages)
+            self._store_arg("cache_loc", cache_loc, reset_val=free_cache_loc)
+            self._store_arg("pages_per_seq", pages_per_seq, reset_val=1)
+
+        # check for updated slot_idx
+        if slot_idx is not None:
+            free_slot_idx = self._get_unique_value(set(slot_idx), self.max_batch_size)
+            self._store_arg("slot_idx", slot_idx, reset_val=free_slot_idx)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
@@ -730,9 +804,6 @@ class SequenceInfo:
             self._extra_dynamic_shapes_callbacks[name] = dynamic_shape_callback
 
 
-Constant = Union[int, float, str, None]
-
-
 class MHACallable(Protocol):
     def __call__(
         self,
@@ -749,6 +820,7 @@ class PrepareMetadataCallable(Protocol):
         input_pos: torch.Tensor,
         cache_loc: torch.Tensor,
         pages_per_seq: torch.Tensor,
+        slot_idx: torch.Tensor,
         page_size: int,
     ) -> List[torch.Tensor]: ...
 
@@ -834,6 +906,9 @@ class AttentionDescriptor(ABC):
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,
             cache_loc: torch.Tensor,
+            pages_per_seq: torch.Tensor,
+            slot_idx: torch.Tensor,
+            page_size: int,
         ) -> List[torch.Tensor]: ...
         ```
         The metadata should contain all necessary global information required for the underlying

@@ -7,7 +7,6 @@ transforms:
   build_model:
     stage: factory
     device: meta
-    use_strict_forward: true
     # nothing to clean up
     run_graph_cleanup: false
     requires_clean_graph: false
@@ -29,8 +28,11 @@ transforms:
   ############################################################################################
   match_moe_pattern:
     stage: pattern_matcher
+  match_dense_moe_pattern:
+    stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
+    run_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
   match_grouped_attention:
@@ -50,6 +52,8 @@ transforms:
   # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
   optimize_rope:
     stage: pattern_matcher
+  quantize_int4_linear_from_config:
+    stage: pattern_matcher
   quantize_fp8_linear_from_config:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
@@ -64,6 +68,8 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_moe:
     stage: pattern_matcher
+  quantize_mxfp4_moe:
+    stage: pattern_matcher
   # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
     stage: sharding
@@ -71,6 +77,7 @@ transforms:
     use_sharding_from_factory: false
     support_partial_config: false
     sharding_dims: ['tp', 'ep', 'bmm']
+    requires_shape_prop: true
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
@@ -102,16 +109,17 @@ transforms:
     backend: trtllm
   fuse_moe:
     stage: post_load_fusion
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  fuse_collectives:
-    stage: post_load_fusion
+  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  # check if we can fuse rmsnorm
   fuse_rmsnorm:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
     stage: post_load_fusion
     backend: flashinfer
+    requires_shape_prop: true
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
@@ -122,6 +130,12 @@ transforms:
   insert_cached_mla_attention:
     stage: cache_init
     attn_backend: MultiHeadLatentAttention
+  insert_cached_ssm_attention:
+    stage: cache_init
+    attn_backend: triton_ssm
+  insert_cached_causal_conv:
+    stage: cache_init
+    attn_backend: cuda_causal_conv
   initialize_cache:
     stage: cache_init
   resize_kv_cache:
@@ -131,6 +145,3 @@ transforms:
   ############################################################################################
   compile_model:
     stage: compile
-  forward_with_cached_sequence_interface:
-    stage: compile
-    args_only: true

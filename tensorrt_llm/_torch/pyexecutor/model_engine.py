@@ -4,6 +4,7 @@ import functools
 import gc
 import inspect
 import math
+import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -59,8 +60,6 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
-
-MAX_UINT64 = (1 << 64) - 1
 
 
 class ModelEngine(ABC):
@@ -628,9 +627,11 @@ class PyTorchModelEngine(ModelEngine):
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
 
-        # TODO: current warmup_request is not suitable for star attention
+        # TODO: current warmup_request is not suitable for context parallelism.
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type == CpType.STAR:
+        if cp_type is not None:
+            logger.info("[ModelEngine::warmup] Skipping warmup for cp_type: ",
+                        cp_type.name)
             return
 
         if self._torch_compile_enabled:
@@ -662,7 +663,10 @@ class PyTorchModelEngine(ModelEngine):
                         torch.cuda.synchronize()
 
         if self.pytorch_backend_config.enable_autotuner:
-            with self.no_cuda_graph(), autotune():
+            # handle multiple rank issue
+            cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+            with self.no_cuda_graph(), autotune(cache_path=cache_path,
+                                                rank=self.mapping.rank):
                 result = get_autotune_warmup_request()
                 with release_batch(result) as batch:
                     if batch is None:
@@ -1330,7 +1334,13 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
-                position_ids.append(past_seen_token_num)
+                position_id = past_seen_token_num
+                if self.mapping.has_cp_helix():
+                    # Do an allgather among CP ranks to get the complete sequence length seen by all CP ranks.
+                    past_seen_token_nums = self.dist.cp_allgather(
+                        past_seen_token_num)
+                    position_id = sum(past_seen_token_nums)
+                position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
@@ -2107,13 +2117,17 @@ class PyTorchModelEngine(ModelEngine):
             if CpType.STAR == cp_type:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
+            elif CpType.HELIX == cp_type:
+                # Take the usual route of _prepare_tp_inputs.
+                pass
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
-        else:
-            return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                           attn_metadata, spec_metadata,
-                                           new_tensors_device,
-                                           cache_indirection_buffer)
+                raise NotImplementedError(
+                    f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
+
+        return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
+                                       attn_metadata, spec_metadata,
+                                       new_tensors_device,
+                                       cache_indirection_buffer)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)

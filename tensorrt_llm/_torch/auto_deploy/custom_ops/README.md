@@ -12,10 +12,9 @@ The table below lists the operators ordered by their backend.
 |--------------|-------------|
 | `torch.ops.auto_deploy.flashinfer_attention_mha_with_cache` | FlashInfer attention with KV cache support |
 | `torch.ops.auto_deploy.flashinfer_rope` | FlashInfer RoPE (Rotary Position Embedding) implementation |
-| `torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa` | Grouped SDPA (Scaled Dot Product Attention) with BSND format |
 | `torch.ops.auto_deploy.torch_attention_deepseek_fused_mla` | DeepSeek fused MLA (Multi-head Linear Attention) |
 | `torch.ops.auto_deploy.torch_attention_deepseek_mla` | DeepSeek MLA implementation |
-| `torch.ops.auto_deploy.torch_attention_grouped_sdpa` | Grouped SDPA implementation |
+| `torch.ops.auto_deploy.torch_attention` | Grouped SDPA implementation with `bsnd` and `bnsd` layout supported |
 | `torch.ops.auto_deploy.torch_attention_repeat_kv` | KV repetition for attention |
 | `torch.ops.auto_deploy.torch_attention_sdpa` | Standard SDPA implementation |
 | `torch.ops.auto_deploy.torch_dist_all_gather` | Distributed all-gather operation |

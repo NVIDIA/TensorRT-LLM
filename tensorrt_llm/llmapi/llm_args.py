@@ -192,6 +192,12 @@ class MoeConfig(StrictBaseModel):
         "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
     )
 
+    use_low_precision_moe_combine: bool = Field(
+        default=False,
+        description=
+        "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
+    )
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -404,6 +410,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
+            "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
@@ -584,6 +591,52 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_layers_to_capture is not None:
             return len(self.eagle3_layers_to_capture)
         return 3
+
+
+class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
+    output_directory: str
+    write_interval: int = 20
+    file_prefix: str = "data"
+    eagle3_layers_to_capture: Optional[Set[int]] = None
+
+    max_total_draft_tokens: Optional[int] = Field(default=1, init=False)
+    eagle_choices: Optional[List[List[int]]] = Field(default=None, init=False)
+
+    def model_post_init(self, __context):
+        self._last_hidden_in_save = True
+        if self.eagle3_layers_to_capture is None:
+            self._last_hidden_in_save = False
+        elif -1 not in self.eagle3_layers_to_capture:
+            self._last_hidden_in_save = False
+            self.eagle3_layers_to_capture.add(-1)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "SaveState"
+
+    def validate(self) -> None:
+        if self.output_directory is None or not self.eagle3_layers_to_capture:
+            raise ValueError(
+                "Save directory and layers to capture must be provided")
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).
+        """
+        if self.eagle3_layers_to_capture is None:
+            return 4
+        return len(self.eagle3_layers_to_capture)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -1074,6 +1127,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
 ]]
 
@@ -1526,6 +1580,13 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
+    orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
+        default=None,
+        description=
+        "The orchestrator type to use. Defaults to None, which uses MPI.",
+        status="prototype",
+    )
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
@@ -1892,6 +1953,20 @@ class BaseLlmArgs(StrictBaseModel):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.AUTO
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+            elif isinstance(self.speculative_config,
+                            SaveHiddenStatesDecodingConfig):
+                assert self.backend in ['pytorch']
+                logger.warning(
+                    "SaveHiddenStatesDecodingConfig is active, setting max_batch_size to 1, disabling overlap scheduler, and setting cuda_graph_config to None"
+                )
+                self.build_config.max_batch_size = 1
+                self.max_batch_size = 1
+                self.disable_overlap_scheduler = True
+                self.cuda_graph_config = None
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.SAVE_HIDDEN_STATES
+                self.build_config.max_draft_len = 1
+                self.speculative_config.max_draft_len = 1
 
             else:
                 raise ValueError(
@@ -2644,6 +2719,8 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
+            use_low_precision_moe_combine=self.moe_config.
+            use_low_precision_moe_combine,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,

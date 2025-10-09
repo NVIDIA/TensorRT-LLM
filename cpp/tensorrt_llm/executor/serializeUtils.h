@@ -21,12 +21,14 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/types.h"
+#include <array>
 #include <iostream>
 #include <istream>
 #include <list>
 #include <optional>
 #include <ostream>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -73,6 +75,44 @@ struct is_variant<std::variant<Ts...>> : std::true_type
 
 template <typename T>
 constexpr bool is_variant_v = is_variant<T>::value;
+
+// Detect std::array
+template <typename T>
+struct is_std_array : std::false_type
+{
+};
+
+template <typename U, std::size_t N>
+struct is_std_array<std::array<U, N>> : std::true_type
+{
+    using value_type = U;
+    static constexpr std::size_t size = N;
+};
+
+template <typename T>
+constexpr bool is_std_array_v = is_std_array<T>::value;
+
+template <typename T>
+using array_value_type_t = typename is_std_array<T>::value_type;
+
+template <typename T>
+constexpr std::size_t array_size_v = is_std_array<T>::size;
+
+// Detect std::pair
+template <typename T>
+struct is_std_pair : std::false_type
+{
+};
+
+template <typename A, typename B>
+struct is_std_pair<std::pair<A, B>> : std::true_type
+{
+    using first_type = A;
+    using second_type = B;
+};
+
+template <typename T>
+constexpr bool is_std_pair_v = is_std_pair<T>::value;
 
 // SerializedSize
 template <typename T>
@@ -160,6 +200,21 @@ size_t serializedSize(T const& data)
             size += serializedSize(elem);
         }
         return size;
+    }
+    // std::array
+    else if constexpr (is_std_array_v<T>)
+    {
+        size_t size = 0;
+        for (auto const& elem : data)
+        {
+            size += serializedSize(elem);
+        }
+        return size;
+    }
+    // std::pair
+    else if constexpr (is_std_pair_v<T>)
+    {
+        return serializedSize(data.first) + serializedSize(data.second);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
@@ -265,6 +320,20 @@ void serialize(T const& data, std::ostream& os)
         {
             serialize(element, os);
         }
+    }
+    // std::array
+    else if constexpr (is_std_array_v<T>)
+    {
+        for (auto const& element : data)
+        {
+            serialize(element, os);
+        }
+    }
+    // std::pair
+    else if constexpr (is_std_pair_v<T>)
+    {
+        serialize(data.first, os);
+        serialize(data.second, os);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
@@ -575,6 +644,10 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeUniqueToken(is);
     }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::batch_manager::kv_cache_manager::BlockKey>)
+    {
+        return Serialization::deserializeBlockKey(is);
+    }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
     {
@@ -603,6 +676,23 @@ T deserialize(std::istream& is)
             container.push_back(std::move(element));
         }
         return container;
+    }
+    // std::array
+    else if constexpr (is_std_array_v<T>)
+    {
+        T container{};
+        for (std::size_t i = 0; i < array_size_v<T>; ++i)
+        {
+            container[i] = deserialize<array_value_type_t<T>>(is);
+        }
+        return container;
+    }
+    // std::pair
+    else if constexpr (is_std_pair_v<T>)
+    {
+        auto first = deserialize<typename is_std_pair<T>::first_type>(is);
+        auto second = deserialize<typename is_std_pair<T>::second_type>(is);
+        return T{std::move(first), std::move(second)};
     }
     // std::variant
     else if constexpr (is_variant_v<T>)

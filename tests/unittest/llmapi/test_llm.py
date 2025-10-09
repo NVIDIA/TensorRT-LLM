@@ -550,6 +550,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
+@pytest.mark.mpi_ray_parity
 def test_llm_generate_async_with_stream_interval(chunked):
     model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
@@ -1862,6 +1863,18 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                 logprobs_result[0].keys()) in {logprobs, logprobs + 1}
             # Most contain log prob of the sample token, even if it's not within K
             assert token_ids[0] in logprobs_result[0].keys()
+            for step_logprobs in logprobs_result:
+                assert len(step_logprobs) == logprobs
+                logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
+                                 for logprob_obj in step_logprobs.values()]
+                sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+
+                for i in range(logprobs - 1):
+                    current_logprob, current_rank = sorted_by_rank[i]
+                    next_logprob, next_rank = sorted_by_rank[i + 1]
+                    assert current_logprob >= next_logprob
+                    assert current_rank == i + 1
+                    assert next_rank == current_rank + 1
             print("logprobs[0]: ", logprobs_result[0])
 
     if streaming:

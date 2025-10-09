@@ -73,6 +73,16 @@ void CublasMMWrapper::setScaleDescriptors(void* scale_a, void* scale_b)
         cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b, sizeof(void*)));
 }
 
+void CublasMMWrapper::setBiasDescriptor(void* bias)
+{
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(void*)));
+
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+}
+
 void CublasMMWrapper::destroyDescriptors()
 {
     check_cuda_error(cublasLtMatmulDescDestroy(mOperationDesc));
