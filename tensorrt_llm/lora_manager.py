@@ -1084,7 +1084,7 @@ class LoraManager(object):
                     # e.g. Convert [q, k, v] to [q_rank0, k_rank0, v_rank0, ..., q_rankN, k_rankN, v_rankN] where
                     # N=TP size
                     tp_size = self._mapping.tp_size
-                    interleaved_parts = []
+                    part_sizes = []
                     if lora_module == "mlp_gate_up":
                         assert t_out.shape[rank_dim] % 2 == 0
                         half_size = t_out.shape[rank_dim] // 2
