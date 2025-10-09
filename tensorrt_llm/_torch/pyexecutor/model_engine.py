@@ -2294,8 +2294,6 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info("KM Executing forward step without a graph")
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
-                    self._km_event = torch.cuda.Event(enable_timing=True)
-                    self._km_event.record()
             else:
                 batch_size = len(padded_requests.generation_requests)
                 if self.cuda_graph_runner.needs_capture(batch_size):
