@@ -1800,14 +1800,8 @@ def generateRerunReport(stageName, llmSrc) {
         echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
     }
 
-    // Copy rerun artifacts to a consolidated location for easier access
-    sh "mkdir -p ${WORKSPACE}/${stageName}/rerun_artifacts"
-    if (hasRegularReruns) {
-        sh "cp -r ${regularRerunDir}/* ${WORKSPACE}/${stageName}/rerun_artifacts/ 2>/dev/null || true"
-    }
-    if (hasIsolatedReruns) {
-        sh "cp -r ${isolatedRerunDir}/* ${WORKSPACE}/${stageName}/rerun_artifacts/ 2>/dev/null || true"
-    }
+    // Remove isolation results since they are merged into results.xml
+    sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml" || true
 
     echo "Rerun report generation completed for stage: ${stageName}"
 }
@@ -2118,10 +2112,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Generate comprehensive rerun report if any reruns occurred
         stage ("[${stageName}] Generate Rerun Report") {
             generateRerunReport(stageName, llmSrc)
-        }
-
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
+            if (rerunFailed) {
+                error "Some tests still failed after rerun attempts, please check the test report."
+            }
         }
 
         if (perfMode) {
