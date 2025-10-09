@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
@@ -206,11 +205,7 @@ class BaseWorker(GenerationExecutor):
                 # point in the TRT flow is currently not supported (it's at the CPP
                 # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
                 # optimization is not available in TRT-python flow.
-
-                # NOTE: In TRT-python flow, llm_args is not set, so we create Mapping() with default values here.
-                #       this would cause incorrect weight split on TP>1 for fused LoRA modules.
-                mapping = Mapping(
-                ) if self.llm_args is None else self.llm_args.parallel_config.to_mapping(
+                mapping = engine_config.pretrained_config.mapping if self.llm_args is None else self.llm_args.parallel_config.to_mapping(
                 )
                 self._lora_manager = LoraManager(
                     mapping=mapping,
