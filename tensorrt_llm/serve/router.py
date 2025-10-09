@@ -585,30 +585,6 @@ class KvCacheAwareRouter(Router):
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
-    async def add_server(self, server: str):
-        if server in self._servers:
-            logger.warning(f"Server {server} already exists")
-            return
-        async with self._lock:
-            if server not in self._servers:
-                self._servers.append(server)
-                self._server_state[server] = KvCacheAwareServerState(
-                    server, self._use_tokens)
-        logger.debug(
-            f"Added server {server}, current server list: {self._servers}")
-
-    # TODO: distinguish between a server is temporarily inactive because of heavy load or permanently dead
-    # A possible solution is to delay the removal of the server state for some time
-    async def remove_server(self, server: str):
-        if server not in self._servers:
-            logger.warning(f"Server {server} does not exist")
-            return
-        async with self._lock:
-            self._servers.remove(server)
-            self._server_state.pop(server)
-        logger.debug(
-            f"Removed server {server}, current server list: {self._servers}")
-
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         async with self._lock:
             servers = list(self._server_state.keys())

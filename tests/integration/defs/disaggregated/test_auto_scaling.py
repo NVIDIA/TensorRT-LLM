@@ -14,7 +14,8 @@ TEST_PORT = 18000
 HEARTBEAT_INTERVAL = 1
 INACTIVE_TIMEOUT = 2
 
-ROUTER_TYPES = ["round_robin", "load_balancing", "kv_cache_aware"]
+ROUTER_TYPES = ["round_robin",
+                "load_balancing"]  # kv_cache_aware doesn't support auto-scaling
 
 
 @pytest.fixture
@@ -216,8 +217,8 @@ async def test_service_discovery(model_name, disagg_server_config,
 
 
 @pytest.mark.parametrize(
-    "router", ["round_robin"],
-    indirect=True)  # use only round_robin to reduce the test time
+    "router", ["round_robin"], indirect=True
+)  # use only round_robin to reduce the test time, this router type doesn't matter for this test
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
 async def test_minimal_instances(model_name, disagg_server_config,
