@@ -1,6 +1,6 @@
 # Nemotron
 
-This document demonstrates how to build the Nemotron models using TensorRT-LLM and run on a single GPU or multiple GPUs.
+This document demonstrates how to build the Nemotron models using TensorRT LLM and run on a single GPU or multiple GPUs.
 
 - [Nemotron](#nemotron)
   - [Overview](#overview)
@@ -14,7 +14,7 @@ This document demonstrates how to build the Nemotron models using TensorRT-LLM a
 
 ## Overview
 
-The TensorRT-LLM Nemotron implementation is based on the GPT model, which can be found in [`tensorrt_llm/models/gpt/model.py`](../../../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM Nemotron example is located in [`examples/models/core/nemotron`](./).
+The TensorRT LLM Nemotron implementation is based on the GPT model, which can be found in [`tensorrt_llm/models/gpt/model.py`](../../../../tensorrt_llm/models/gpt/model.py). The TensorRT LLM Nemotron example is located in [`examples/models/core/nemotron`](./).
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -47,7 +47,7 @@ pip install -r requirements.txt
 git lfs install
 ```
 
-Download one or more Nemotron models that you would like to build to TensorRT-LLM engines. You can download from the [HuggingFace](https://huggingface.co) hub:
+Download one or more Nemotron models that you would like to build to TensorRT LLM engines. You can download from the [HuggingFace](https://huggingface.co) hub:
 
 ```bash
 # Download nemotron-3-8b-base-4k
@@ -61,9 +61,9 @@ git clone https://huggingface.co/nvidia/nemotron-3-8b-chat-4k-rlhf
 ```
 
 ### Build TensorRT engine(s)
-The [`examples/quantization/quantize.py`](../../../quantization/quantize.py) script can quantize the Nemotron models and export to TensorRT-LLM checkpoints. You may optionally skip the quantization step by specifying `--qformat full_prec` and thus export float16 or bfloat16 TensorRT-LLM checkpoints.
+The [`examples/quantization/quantize.py`](../../../quantization/quantize.py) script can quantize the Nemotron models and export to TensorRT LLM checkpoints. You may optionally skip the quantization step by specifying `--qformat full_prec` and thus export float16 or bfloat16 TensorRT LLM checkpoints.
 
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is same to the number of GPUs used to run inference. Normally, `trtllm-build` uses one GPU by default, but if you have already more GPUs available at build time, you may enable parallel builds to make the engine building process faster by adding the `--workers` argument.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The number of engine files is same to the number of GPUs used to run inference. Normally, `trtllm-build` uses one GPU by default, but if you have already more GPUs available at build time, you may enable parallel builds to make the engine building process faster by adding the `--workers` argument.
 
 Here are some examples:
 
@@ -177,10 +177,10 @@ mpirun -np 2 \
 If the engines are run successfully, you will see output like:
 ```
 ......
-[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT-LLM (total latency: 14.926485538482666 sec)
-[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2000)
-[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 133.99001357980129)
-[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT LLM (total latency: 14.926485538482666 sec)
+[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2000)
+[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT LLM (tokens per second: 133.99001357980129)
+[04/23/2024-09:55:54] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [04/23/2024-09:55:54] [TRT-LLM] [I]   rouge1 : 19.48743720965424
 [04/23/2024-09:55:54] [TRT-LLM] [I]   rouge2 : 6.272381295466071
 [04/23/2024-09:55:54] [TRT-LLM] [I]   rougeL : 15.011005943152721
@@ -196,12 +196,12 @@ pip install transformers>=4.44.0
 # Download hf minitron model
 git clone https://huggingface.co/nvidia/Minitron-4B-Base
 
-# Convert to TensorRT-LLM checkpoint
+# Convert to TensorRT LLM checkpoint
 python3 ../gpt/convert_checkpoint.py --model_dir Minitron-4B-Base \
         --dtype bfloat16 \
         --output_dir minitron/trt_ckpt/bf16/1-gpu
 
-# Build TensorRT-LLM engines
+# Build TensorRT LLM engines
 trtllm-build --checkpoint_dir minitron/trt_ckpt/bf16/1-gpu \
         --gemm_plugin auto \
         --output_dir minitron/trt_engines/bf16/1-gpu

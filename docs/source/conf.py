@@ -16,10 +16,9 @@ from docutils import nodes
 
 sys.path.insert(0, os.path.abspath('.'))
 
-project = 'TensorRT-LLM'
+project = 'TensorRT LLM'
 copyright = '2025, NVidia'
 author = 'NVidia'
-branch_name = pygit2.Repository('.').head.shorthand
 html_show_sphinx = False
 
 # Get the git commit hash
@@ -50,6 +49,7 @@ extensions = [
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
+    'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
@@ -78,7 +78,7 @@ myst_url_schemes = {
     "https":
     None,
     "source":
-    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
+    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + commit_hash + "/{{path}}",
 }
 
 myst_heading_anchors = 4
@@ -86,6 +86,8 @@ myst_heading_anchors = 4
 myst_enable_extensions = [
     "deflist",
     "substitution",
+    "dollarmath",
+    "amsmath",
 ]
 
 myst_substitutions = {
@@ -106,7 +108,7 @@ container published for a previous
 [GitHub pre-release or release](https://github.com/NVIDIA/TensorRT-LLM/releases)
 (see also [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)).
 ```
-    """,
+    """
 }
 
 autosummary_generate = True
@@ -165,15 +167,19 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 
 
 def setup(app):
-    from helper import generate_examples, generate_llmapi
+    from helper import generate_examples, generate_llmapi, update_version
 
-    from tensorrt_llm.llmapi.utils import tag_llm_params
-    tag_llm_params()
+    try:
+        from tensorrt_llm.llmapi.utils import tag_llm_params
+        tag_llm_params()
+    except ImportError:
+        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
 
     generate_examples()
     generate_llmapi()
+    update_version()
 
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):

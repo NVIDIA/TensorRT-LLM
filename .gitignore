@@ -7,6 +7,7 @@ __pycache__/
 *.npy
 .VSCodeCounter
 cpp/build*
+cpp/Release
 build
 !tensorrt_llm/bench/build
 !builders/
@@ -28,7 +29,6 @@ dump*/
 *.log
 *.pkl
 *.hdf5
-*.lock
 config.json
 /*.svg
 cpp/cmake-build-*
@@ -46,6 +46,7 @@ tensorrt_llm/deep_ep_cpp_tllm.pyi
 tensorrt_llm/deep_gemm/
 tensorrt_llm/deep_gemm_cpp_tllm.*.so
 tensorrt_llm/deep_gemm_cpp_tllm.pyi
+tensorrt_llm/pg_utils_bindings.*.so
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
@@ -66,6 +67,7 @@ llm-test-workspace/
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
+cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h
 .devcontainer/.env
 
 # User config files
@@ -75,3 +77,6 @@ compile_commands.json
 .dir-locals.el
 .devcontainer/devcontainer.env.user
 .devcontainer/docker-compose.override.yml
+
+# Enroot sqsh files
+enroot/tensorrt_llm.devel.sqsh

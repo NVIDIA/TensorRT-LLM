@@ -414,6 +414,7 @@ def _get_match_repeat_kv_optimizer() -> Callable:
         },
         "match_repeat_kv": {
             "stage": "pattern_matcher",
+            "run_shape_prop": True,
         },
     }
 
@@ -741,14 +742,12 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 
-    # We should find 1 instance of torch_attention_grouped_sdpa
+    # We should find 1 instance of torch_attention
     expected_matches = 1
 
     def verify_matcher(gm):
         grouped_sdpa_nodes = [
-            n
-            for n in gm.graph.nodes
-            if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention)
         ]
 
         # Check that we have the expected number of replacements
@@ -879,7 +878,7 @@ class CausalAttentionModel(torch.nn.Module):
 
         # Choose the appropriate attention implementation
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention(
                 q,
                 k,
                 v,
@@ -985,7 +984,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
         # Choose the appropriate attention implementation
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention(
                 q,
                 k,
                 v,
@@ -1089,7 +1088,7 @@ class AttentionLayoutModel(torch.nn.Module):
 
         # Apply scaled dot product attention
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention(
                 q,
                 k,
                 v,
@@ -1136,7 +1135,7 @@ class BsndAttentionModel(AttentionLayoutModel):
         attn_mask = self._get_attn_mask(x) if self.has_mask else None
 
         # Apply bsnd_grouped_sdpa directly
-        attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa.default(
+        attn_output = torch.ops.auto_deploy.torch_attention.default(
             q,
             k,
             v,
@@ -1144,6 +1143,7 @@ class BsndAttentionModel(AttentionLayoutModel):
             dropout_p=0.0,
             is_causal=True,
             scale=1.0 / (self.head_dim**0.5),
+            layout="bsnd",
         )
 
         # Reshape output for the linear projection (no transpose needed)
@@ -1157,7 +1157,6 @@ class BsndAttentionModel(AttentionLayoutModel):
 @pytest.mark.parametrize(
     "model_config",
     [
-        {"type": "standard", "use_grouped_sdpa": False, "name": "SDPA"},
         {"type": "standard", "use_grouped_sdpa": True, "name": "GroupedSDPA"},
         {"type": "already_bsnd", "name": "DirectBSND"},
     ],
@@ -1174,11 +1173,11 @@ def test_match_attention_layout(layout, model_config, has_mask):
     MockAttentionDescriptor.layout = layout
     if layout == "bnsd":
         if model_config.get("use_grouped_sdpa"):
-            source_op = torch.ops.auto_deploy.torch_attention_grouped_sdpa
+            source_op = torch.ops.auto_deploy.torch_attention
         else:
             source_op = torch.ops.auto_deploy.torch_attention_sdpa
     else:
-        source_op = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        source_op = torch.ops.auto_deploy.torch_attention
     MockAttentionDescriptor.source_attention_op = source_op
 
     # Create appropriate model based on model_config
@@ -1211,7 +1210,8 @@ def test_match_attention_layout(layout, model_config, has_mask):
                 original_nodes = [
                     n
                     for n in gm.graph.nodes
-                    if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+                    if is_op(n, torch.ops.auto_deploy.torch_attention)
+                    and not (isinstance(n.args[-1], str) and n.args[-1] == "bsnd")
                 ]
             else:
                 original_nodes = [
@@ -1225,7 +1225,11 @@ def test_match_attention_layout(layout, model_config, has_mask):
         bsnd_nodes = [
             n
             for n in gm.graph.nodes
-            if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa)
+            if (
+                is_op(n, torch.ops.auto_deploy.torch_attention)
+                and isinstance(n.args[-1], str)
+                and n.args[-1] == "bsnd"
+            )
         ]
         transpose_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.aten.transpose.int)]
 

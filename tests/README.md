@@ -9,7 +9,7 @@ Unit test should be small, fast, and test only for specific function.
 If you need to run them locally, the only dependencies are `requirements-dev.txt`.
 
 ```bash
-# in tensorrt-llm source repo root dir
+# in TensorRT LLM source repo root dir
 # use editable install, such that your local changes will be used immedietely in the tests w/o another install
 # see https://setuptools.pypa.io/en/latest/userguide/development_mode.html
 pip install -e ./

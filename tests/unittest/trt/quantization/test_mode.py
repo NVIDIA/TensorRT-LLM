@@ -44,7 +44,7 @@ class TestQuantMode(unittest.TestCase):
 
     def test_count(self):
         # Make sure the COUNT value is as expected - change that test if you add a new flag.
-        self.assertEqual(QuantMode.COUNT.value, 1 << 17)
+        self.assertEqual(QuantMode.COUNT.value, 1 << 18)
 
     def test_from_description(self):
         # Test weight only.

@@ -33,6 +33,9 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
     is_fp8 = quant == "fp8"
     is_fp4 = quant == "fp4"
 
+    if tp_size == 4:
+        pytest.skip(f"https://nvbugs/5515753")
+
     if torch.cuda.device_count() < tp_size:
         pytest.skip(f"Not enough GPUs available, need {tp_size} "
                     f"but only have {torch.cuda.device_count()}")

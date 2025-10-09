@@ -34,12 +34,14 @@ public:
     //! \param bufSize The total size of the buffer in bytes.
     //! \param groupSize The number of ranks in the communication group.
     //! \param groupRank The rank of the local process within the group.
+    //! \param splitColor The color of the split for topology split.
     //! \param device The CUDA device for buffer allocation.
     //! \param mnNvlink Flag indicating if multi-node NVLink is used.
-    McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, at::Device device, bool mnNvlink)
-        : mMcastDeviceMemory(bufSize, groupSize, groupRank, device.index(), mnNvlink)
+    McastGPUBuffer(
+        size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t splitColor, uint32_t deviceIdx, bool mnNvlink)
+        : mMcastDeviceMemory(bufSize, groupSize, groupRank, splitColor, deviceIdx, mnNvlink)
         , mBufSize(bufSize)
-        , mLocalDevice(device)
+        , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
     }
 
@@ -49,7 +51,7 @@ public:
     //! \param dtype The data type of the tensor elements.
     //! \param storageOffset The offset in elements from the start of the buffer.
     //! \return An ATen tensor wrapping the unicast buffer section.
-    at::Tensor getUCBuffer(uint32_t rank, c10::IntArrayRef sizes, c10::ScalarType dtype, int64_t storageOffset)
+    at::Tensor getUCBuffer(uint32_t rank, std::vector<long int> sizes, torch::ScalarType dtype, int64_t storageOffset)
     {
         size_t const numel = std::accumulate(sizes.begin(), sizes.end(), 1UL, std::multiplies<size_t>());
         size_t const elementSize = c10::elementSize(dtype);
@@ -59,7 +61,10 @@ public:
         auto* dataPtr = static_cast<uint8_t*>(mMcastDeviceMemory.getUnicastPtr(rank)) + storageOffset * elementSize;
 
         auto options = at::TensorOptions().dtype(dtype).device(mLocalDevice);
-        return at::for_blob(dataPtr, sizes).options(options).target_device(mLocalDevice).make_tensor();
+        return at::for_blob(dataPtr, c10::IntArrayRef(sizes))
+            .options(options)
+            .target_device(mLocalDevice)
+            .make_tensor();
     }
 
     //! \brief Returns a PyTorch tensor view of the multicast buffer portion.
@@ -67,7 +72,7 @@ public:
     //! \param dtype The data type of the tensor elements.
     //! \param storageOffset The offset in elements from the start of the buffer.
     //! \return An ATen tensor wrapping the multicast buffer section.
-    at::Tensor getMCBuffer(c10::IntArrayRef sizes, c10::ScalarType dtype, int64_t storageOffset)
+    at::Tensor getMCBuffer(std::vector<long int> sizes, torch::ScalarType dtype, int64_t storageOffset)
     {
         size_t const numel = std::accumulate(sizes.begin(), sizes.end(), 1UL, std::multiplies<size_t>());
         size_t const elementSize = c10::elementSize(dtype);
@@ -77,7 +82,10 @@ public:
         auto* dataPtr = static_cast<uint8_t*>(mMcastDeviceMemory.getMulticastPtr()) + storageOffset * elementSize;
 
         auto options = at::TensorOptions().dtype(dtype).device(mLocalDevice);
-        return at::for_blob(dataPtr, sizes).options(options).target_device(mLocalDevice).make_tensor();
+        return at::for_blob(dataPtr, c10::IntArrayRef(sizes))
+            .options(options)
+            .target_device(mLocalDevice)
+            .make_tensor();
     }
 
 private:

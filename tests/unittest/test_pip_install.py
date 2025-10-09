@@ -55,6 +55,7 @@ def test_pip_install():
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
         subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
 
+    subprocess.check_call("apt-get -y install libzmq3-dev", shell=True)
     subprocess.check_call("apt-get -y install python3-pip", shell=True)
     subprocess.check_call("pip3 install --upgrade pip || true", shell=True)
     subprocess.check_call("pip3 install --upgrade setuptools || true",

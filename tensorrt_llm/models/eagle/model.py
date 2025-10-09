@@ -736,7 +736,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             I|1|0|1|0
             J|0|1|0|1
             Note that we could've stored FG in KV cache and provide only IJ tokens here
-            with mask for past KV cache, but it is not supported in TensorRT-LLM attention at the moment.
+            with mask for past KV cache, but it is not supported in TensorRT LLM attention at the moment.
 
             Draft2 produces tokens K and L at positions 6 and 7.
         7. Resulting outputs are:

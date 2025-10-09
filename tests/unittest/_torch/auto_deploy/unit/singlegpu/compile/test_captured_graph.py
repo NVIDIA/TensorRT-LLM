@@ -6,8 +6,10 @@ from _model_test_utils import (
     generate_dynamic_shapes,
 )
 
-from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import CapturedGraph
-from tensorrt_llm._torch.auto_deploy.compile.compiler import _flatten_args
+from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
+    CapturedGraph,
+    _args_kwargs_flatten_spec,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
@@ -91,8 +93,6 @@ def test_cudagraph_capture_replay(
     print(dynamic_shapes)
 
     graph_module = torch_export_to_gm(model, args=args, dynamic_shapes=dynamic_shapes)
-    in_spec = graph_module._in_spec
-    out_spec = graph_module._out_spec
 
     # Apply torch.compile if needed
     if use_torch_compile:
@@ -100,9 +100,7 @@ def test_cudagraph_capture_replay(
 
     compiled_model = CapturedGraph(
         graph_module,
-        in_spec,
-        out_spec,
-        max_batch_size=batch_size,
+        cuda_graph_batch_sizes=[batch_size],
         num_batched_inputs=num_inputs,
     )
 
@@ -111,7 +109,7 @@ def test_cudagraph_capture_replay(
         compiled_model.capture_graph(*args)
 
         # Ensure the graph is stored for the combined shape of all inputs
-        assert combined_shape in compiled_model.graphs, (
+        assert combined_shape in compiled_model.cudagraphs, (
             f"Graph for combined shape {combined_shape} was not captured."
         )
 
@@ -125,7 +123,7 @@ def test_cudagraph_capture_replay(
         replay_args = tuple(replay_input_data)
 
         # Get flat inputs for manual replay
-        all_args_flat = _flatten_args(compiled_model._in_spec, *replay_args)
+        all_args_flat = _args_kwargs_flatten_spec(compiled_model._in_spec, *replay_args)
         input_args_flat = all_args_flat[:num_inputs]  # Extract just the batched inputs
 
         # Update input buffers for replay
@@ -133,7 +131,7 @@ def test_cudagraph_capture_replay(
             compiled_model._input_buffers[i][: input_tensor.shape[0]] = input_tensor
 
         # Get the appropriate graph and replay
-        graph = compiled_model.graphs[combined_shape]
+        graph = compiled_model.cudagraphs[combined_shape]
         graph.replay()
 
         # Get output from manual replay

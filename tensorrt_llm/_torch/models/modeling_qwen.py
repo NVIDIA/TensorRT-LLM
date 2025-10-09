@@ -32,7 +32,7 @@ class QwenAttention(Attention):
                 type=PositionEmbeddingType.from_string(
                     config.rope_scaling["type"]),
                 rope=RopeParams.from_config(config),
-            )
+                mrope_section=config.rope_scaling.get('mrope_section', None))
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
@@ -46,6 +46,7 @@ class QwenAttention(Attention):
             bias=True,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
+            rope_fusion=not getattr(config, 'disable_fuse_rope', False),
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,

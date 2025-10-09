@@ -32,3 +32,5 @@ l0_sanity_check:
       - llmapi/test_llm_examples.py::test_llmapi_runtime
       - llmapi/test_llm_examples.py::test_llmapi_tensorrt_engine
       - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+      - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[NIXL-mha-ctx_fp16_gen_fp16]
+      - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[UCX-mha-ctx_fp16_gen_fp16]

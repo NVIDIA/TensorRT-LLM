@@ -260,7 +260,7 @@ def main() -> None:
             trt_llm_config.query_pre_attn_scalar = ckpt_config.query_pre_attn_scalar
 
     trt_llm_config_dict = trt_llm_config.to_dict()
-    print(f"Determined TensorRT-LLM configuration {trt_llm_config_dict}")
+    print(f"Determined TensorRT LLM configuration {trt_llm_config_dict}")
 
     save_config(trt_llm_config, output_dir=args.output_model_dir, log=True)
 

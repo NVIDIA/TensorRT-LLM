@@ -1,0 +1,36 @@
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+hostname: localhost
+port: 8000
+backend: "pytorch"
+cuda_graph_config: null
+free_gpu_memory_fraction: 0.2
+context_servers:
+  num_instances: 1
+  max_batch_size: 1
+  max_num_tokens: 3000
+  max_seq_len: 4096
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 4
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+    enable_partial_reuse: False
+  disable_overlap_scheduler: True
+  cache_transceiver_config:
+    backend: DEFAULT
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  max_batch_size: 256
+  max_num_tokens: 4096
+  max_seq_len: 4096
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+    enable_partial_reuse: False
+  disable_overlap_scheduler: True
+  cache_transceiver_config:
+    backend: DEFAULT
+  urls:
+      - "localhost:8002"

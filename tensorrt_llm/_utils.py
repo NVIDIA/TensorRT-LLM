@@ -19,6 +19,7 @@ import json
 import linecache
 import math
 import os
+import socket
 import struct
 import tempfile
 import trace
@@ -468,6 +469,12 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
+def get_free_port():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
@@ -490,11 +497,44 @@ def local_mpi_comm():
     return local_comm
 
 
+# Global TorchDist instance for Ray orchestrator
+_torch_comm = None
+
+
+def set_torch_comm(torch_comm_instance):
+    """Set global TorchDist instance"""
+    global _torch_comm
+    _torch_comm = torch_comm_instance
+
+
+def torch_comm():
+    """Get global TorchDist instance"""
+    if _torch_comm is None:
+        raise RuntimeError(
+            "TorchDist not initialized. Call set_torch_comm() first.")
+    return _torch_comm
+
+
+def mpi_disabled() -> bool:
+    """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
+    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+
+
 def mpi_rank():
+    if mpi_disabled():
+        try:
+            return torch.distributed.get_rank()
+        except ValueError:
+            # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+            return 0
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_rank():
+    if mpi_disabled():
+        # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
+        return 0
+
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -691,10 +731,20 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+@lru_cache(maxsize=1)
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
         return True
+    if value == "-1":
+        # early return w/o calling global_mpi_rank() for Ray path
+        return False
     try:
         return int(value) == global_mpi_rank()
     except ValueError:
@@ -929,11 +979,13 @@ class TensorWrapper:
         data_ptr: int,
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
+        strides: Optional[Sequence[int]] = None,
     ):
         assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
+        self.strides = strides
 
     def data_ptr(self):
         return self._data_ptr
@@ -969,10 +1021,17 @@ class TensorWrapper:
     @property
     def __cuda_array_interface__(self):
         return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "shape":
+            self.shape,
+            "typestr":
+            torch_dtype_to_np_typestr(self.dtype),
             "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
+            "strides": [
+                i * torch.tensor([], dtype=self.dtype).element_size()
+                for i in self.strides
+            ] if self.strides is not None else None,
+            "version":
+            3,
         }
 
     @staticmethod
@@ -1116,7 +1175,7 @@ def is_multi_device_enable():
     This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
     So we can avoid broadcast calls on single GPU.
     Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
-    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
+    ENABLE_MULTI_DEVICE is true by default when building TensorRT LLM so we need to also check
     the number of devices
     """
     return local_mpi_size() > 1
@@ -1134,3 +1193,13 @@ def set_prometheus_multiproc_dir() -> object:
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.info(
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+
+
+TORCH_PYBIND11_ABI = None
+
+
+def torch_pybind11_abi() -> str:
+    global TORCH_PYBIND11_ABI
+    if TORCH_PYBIND11_ABI is None:
+        TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+    return TORCH_PYBIND11_ABI

@@ -14,11 +14,11 @@
 - [Engine Plan File Size Results](#engine-plan-file-size-results)
 - [Prototype](#prototype)
    * [Checkpoint Pruner](#checkpoint-pruner)
-      * [Pruning a TensorRT-LLM Checkpoint](#pruning-a-tensorrt-llm-checkpoint)
+      * [Pruning a TensorRT LLM Checkpoint](#pruning-a-tensorrt-llm-checkpoint)
 
 ## Overview
 
-This workflow introduces a new script `trtllm-refit`. `trtllm-refit` allows you to refit the generated engine with weights from any TensorRT-LLM checkpoint matching the same architecture, so long as you build the engine as refittable or stripped.
+This workflow introduces a new script `trtllm-refit`. `trtllm-refit` allows you to refit the generated engine with weights from any TensorRT LLM checkpoint matching the same architecture, so long as you build the engine as refittable or stripped.
 
 ### Build Weights Stripped Engine
 TensorRT can generate refittable engines with the same performance as the non-refittable ones when TensorRT builder optimize under the assumption that the engine will be refitted with weights identical to those provide at build time. Those refittable weights can be stripped to reduce the engine plan file size, with the option to subsequently supply them via the refit interface.
@@ -30,7 +30,7 @@ trtllm-build --strip_plan --checkpoint_dir ${CHECKPOINT_DIR} --output_dir ${ENGI
 ```
 
 ### Engine Refitter
-The refitter allows you to refit an engine with weights in a TensorRT-LLM checkpoint. It does this by doing a textual match between engine and checkpoint weight names. In order for the refitter to work, the engine must be built with refitting enabled. This can be accomplished by passing `--strip_plan` to `trtllm-build`.
+The refitter allows you to refit an engine with weights in a TensorRT LLM checkpoint. It does this by doing a textual match between engine and checkpoint weight names. In order for the refitter to work, the engine must be built with refitting enabled. This can be accomplished by passing `--strip_plan` to `trtllm-build`.
 
 After building a stripped engine via `trtllm-build`, run
 
@@ -61,7 +61,7 @@ wget https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/vocab.json
 wget https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/merges.txt
 ```
 
-2. Convert the Hugging Face checkpoint into TensorRT-LLM format.
+2. Convert the Hugging Face checkpoint into TensorRT LLM format.
 Run below command lines in [`examples/models/contrib/gpt`](../gptj) directory.
 ```bash
 # Build a float16 checkpoint using HF weights.
@@ -112,7 +112,7 @@ python3 ../summarize.py --engine_dir ./trt_engines/gptj_fp16_tp1.refit \
 
 1. Download the llama-7b-hf checkpoint and saved in /llm-models/llama-models/llama-7b-hf/.
 
-2. Calibrate the checkpoint and convert into TensorRT-LLM format.
+2. Calibrate the checkpoint and convert into TensorRT LLM format.
 Run below command lines in [`examples/models/core/llama`](../llama) directory.
 ```bash
 # Calibrate INT4 using AMMO.
@@ -153,7 +153,7 @@ python3 ../summarize.py --engine_dir trt_int4_AWQ_full_from_wtless \
 
 1. Download the llama-7b-hf checkpoint and saved in /llm-models/llama-models/llama-7b-hf/.
 
-2. Convert the checkpoint into TensorRT-LLM format.
+2. Convert the checkpoint into TensorRT LLM format.
 Run below command lines in [`examples/models/core/llama`](../llama) directory.
 ```bash
 python3 convert_checkpoint.py --model_dir /llm-models/llama-models/llama-7b-hf/ \
@@ -193,7 +193,7 @@ python3 ../summarize.py --engine_dir ./engines/llama-7b-hf-fp16-woq-1gpu-wtless-
 
 1. Download the llama-v2-70b-hf checkpoint and saved in /llm-models/llama-models-v2/llama-v2-70b-hf/.
 
-2. Calibrate the checkpoint and convert into TensorRT-LLM format.
+2. Calibrate the checkpoint and convert into TensorRT LLM format.
 Run below command lines in [`examples/models/core/llama`](../llama) directory.
 ```bash
 # Calibrate FP8 using AMMO.
@@ -241,16 +241,16 @@ python3 ../summarize.py --engine_dir engines/llama2-70b-hf-fp8-tp2.refit \
 
 ## Prototype
 ### Checkpoint Pruner
-The checkpoint pruner allows you to strip `Conv` and `Gemm` weights out of a TensorRT-LLM [checkpoint](https://nvidia.github.io/TensorRT-LLM/latest/architecture/checkpoint.html). Since these make up the vast majority of weights, the pruner will decrease the size of your checkpoint up to 99%.
+The checkpoint pruner allows you to strip `Conv` and `Gemm` weights out of a TensorRT LLM [checkpoint](https://nvidia.github.io/TensorRT-LLM/latest/architecture/checkpoint.html). Since these make up the vast majority of weights, the pruner will decrease the size of your checkpoint up to 99%.
 
-When building an engine with a pruned checkpoint, TensorRT-LLM fills in the missing weights with random ones. These weights should later be [refit](#engine-refitter) with the original weights to preserve the intended behavior.
+When building an engine with a pruned checkpoint, TensorRT LLM fills in the missing weights with random ones. These weights should later be [refit](#engine-refitter) with the original weights to preserve the intended behavior.
 
 Building an engine from a pruned checkpoint will also allow the engine to be [refit](#engine-refitter).
 
-#### Pruning a TensorRT-LLM Checkpoint
+#### Pruning a TensorRT LLM Checkpoint
 
 1. Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
-2. Download a model of your choice and convert it to a TensorRT-LLM checkpoint ([llama instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/llama/README.md#usage)).
+2. Download a model of your choice and convert it to a TensorRT LLM checkpoint ([llama instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/llama/README.md#usage)).
 3. (Optional) Run the `trtllm-prune` command.
 ```bash
 # Prunes the TRT-LLM checkpoint at ${CHECKPOINT_DIR}, and stores it in the directory ${CHECKPOINT_DIR}.pruned

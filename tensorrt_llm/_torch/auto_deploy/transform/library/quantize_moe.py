@@ -8,19 +8,24 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
-from ...utils.quantization_utils import QuantizationImpl, should_skip_quantization
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ...utils.quantization_utils import should_skip_quantization
+from ..interface import SharedConfig, TransformInfo, TransformRegistry
+from .quantization import (
+    FP8LinearQuantizationFromConfig,
+    NVFP4LinearQuantizationFromConfig,
+    Quantization,
+)
 
 quantized_moe_op_map = {
     "FP8": torch.ops.auto_deploy.torch_quant_fp8_moe,
-    "NVFP4": torch.ops.auto_deploy.torch_quant_fp4_moe,
+    "NVFP4": torch.ops.auto_deploy.torch_quant_nvfp4_moe,
 }
 
 
 def _quantize_moe_node(
     gm: GraphModule,
     node: Node,
-    quant_impl: QuantizationImpl,
+    quant_impl: Quantization,
     quantized_op: Callable[..., Node],
 ):
     """
@@ -131,12 +136,15 @@ def _extract_moe_weight_param_lists(moe_node: Node) -> Tuple[List[str], List[str
     return w1_names, w2_names, w3_names
 
 
-@TransformRegistry.register("quantize_moe")
-class QuantizeMOE(BaseTransform):
+@TransformRegistry.register("quantize_fp8_moe")
+class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
     """
     Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
     quantized version using the quant_algo from quant_config.
     """
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_quant_fp8_moe
 
     def _apply(
         self,
@@ -145,39 +153,86 @@ class QuantizeMOE(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        quant_config = factory.get_quant_config()
-        quant_algo = quant_config.get("quant_algo") if quant_config else None
-
-        if not quant_config or not quant_algo:
+        # Gate by algo in quant_config
+        qcfg = factory.get_quant_config()
+        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        excluded_patterns = quant_config.get("exclude_modules", [])
 
-        quant_impl = QuantizationImpl.create(quant_algo)
-        quantized_op = quantized_moe_op_map[quant_algo]
-
+        excluded_patterns = qcfg.get("exclude_modules", [])
         count = 0
 
         for node in list(gm.graph.nodes):
-            if is_op(node, torch.ops.auto_deploy.torch_moe):
-                # Check that all expert weights should be quantized
-                w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
-                if any(
-                    should_skip_quantization(n, excluded_patterns)
-                    for n in w1_names + w2_names + w3_names
-                ):
-                    continue
-                _quantize_moe_node(gm, node, quant_impl, quantized_op)
-                count += 1
+            if not is_op(node, torch.ops.auto_deploy.torch_moe):
+                continue
 
-        if count == 0:
-            return gm, TransformInfo(
-                skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+            # Check experts are allowed (no excludes)
+            w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
+            if any(
+                should_skip_quantization(n, excluded_patterns)
+                for n in (w1_names + w2_names + w3_names)
+            ):
+                continue
+
+            _quantize_moe_node(gm, node, self, self.target_op())
+            count += 1
 
         info = TransformInfo(
-            skipped=False, num_matches=count, is_clean=False, has_valid_shapes=False
+            skipped=(count == 0),
+            num_matches=count,
+            is_clean=(count == 0),
+            has_valid_shapes=True,
         )
+        return gm, info
 
+
+@TransformRegistry.register("quantize_nvfp4_moe")
+class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
+    """
+    Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
+    quantized version using the quant_algo from quant_config.
+    """
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_quant_nvfp4_moe
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        # Gate by algo in quant_config
+        qcfg = factory.get_quant_config()
+        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        excluded_patterns = qcfg.get("exclude_modules", [])
+        count = 0
+
+        for node in list(gm.graph.nodes):
+            if not is_op(node, torch.ops.auto_deploy.torch_moe):
+                continue
+
+            # Check experts are allowed (no excludes)
+            w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
+            if any(
+                should_skip_quantization(n, excluded_patterns)
+                for n in (w1_names + w2_names + w3_names)
+            ):
+                continue
+
+            _quantize_moe_node(gm, node, self, self.target_op())
+            count += 1
+
+        info = TransformInfo(
+            skipped=(count == 0),
+            num_matches=count,
+            is_clean=(count == 0),
+            has_valid_shapes=True,
+        )
         return gm, info

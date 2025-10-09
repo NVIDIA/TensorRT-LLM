@@ -2,7 +2,7 @@
 # https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
 import os
 import weakref
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -59,7 +59,7 @@ class VariableLengthBuffer:
 
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                 num_experts: int, global_expert_id_offset: int) -> \
+                 num_experts: int, global_expert_id_offset: int, all_rank_max_num_tokens: int, ep_size: int, use_cuda_graph: bool) -> \
             Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple]:
         # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
         # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
@@ -71,13 +71,16 @@ class VariableLengthBuffer:
         assert event.event is None
 
         # Do MoE dispatch
-        # NOTES: the CPU will wait for GPU's signal to arrive, so this is not compatible with CUDA graph
         # For more advanced usages, please refer to the docs of the `dispatch` function
+        if use_cuda_graph:
+            num_worst_tokens = all_rank_max_num_tokens * ep_size
+        else:
+            num_worst_tokens = 0
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
             self.buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
                                  num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
                                  is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-                                 global_expert_id_offset=global_expert_id_offset)
+                                 global_expert_id_offset=global_expert_id_offset, num_worst_tokens=num_worst_tokens)
         assert event.event is None
 
         # For event management, please refer to the docs of the `EventOverlap` class
@@ -179,12 +182,18 @@ class VariableLengthLowLatencyBuffer:
 
         return recv_hidden_states, recv_scales, recv_expert_count, handle
 
-    def low_latency_combine_fp4(self, hidden_states: torch.Tensor,
-                                global_scales: torch.Tensor,
-                                topk_idx: torch.Tensor,
-                                topk_weights: torch.Tensor, handle: Tuple):
+    def low_latency_combine_low_precision(self, precision: str,
+                                          hidden_states: torch.Tensor,
+                                          global_scales: Optional[torch.Tensor],
+                                          topk_idx: torch.Tensor,
+                                          topk_weights: torch.Tensor,
+                                          handle: Tuple):
+        """
+            Arguments:
+                precision: the precision of the low-precision kernel, "fp8" for FP8, "nvfp4" for NVFP4.
+        """
         combined_hidden_states, event, hook = \
-            self.buffer.low_latency_combine_fp4(hidden_states, global_scales, topk_idx, topk_weights, handle)
+            self.buffer.low_latency_combine_low_precision(precision, hidden_states, global_scales, topk_idx, topk_weights, handle)
         assert event.event is None
         assert hook is None
 

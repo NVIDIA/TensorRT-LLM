@@ -542,7 +542,8 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // kvCacheRetentionConfig
             std::nullopt,    // logitsPostProcessorName
             std::nullopt,    // logitsPostProcessor
-            encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
+            encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
+            std::nullopt);   // cacheSaltID
     request.setRequestType(tensorrt_llm::executor::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
     return request;
 }
@@ -1145,7 +1146,7 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
 int main(int argc, char* argv[])
 
 {
-    cxxopts::Options options("TensorRT-LLm DisaggServer Benchmark");
+    cxxopts::Options options("TensorRT LLM DisaggServer Benchmark");
     options.add_options()("h,help", "Print usage");
     options.add_options()("context_engine_dirs", "Directories that store context engines,separator is a ,",
         cxxopts::value<std::vector<std::string>>());

@@ -40,6 +40,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     INT8 = auto()
     MIXED_PRECISION = auto()
     NVFP4 = auto()
+    W4A8_NVFP4_FP8 = auto()
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
     W4A16_MXFP4 = auto()
@@ -90,6 +91,8 @@ class QuantMode(IntFlag):
     # FP4
     NVFP4 = auto()
     NVFP4_KV_CACHE = auto()
+    # W4A8 NVFP4
+    W4A8_NVFP4_FP8 = auto()
     # W4A8 MXFP4
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
@@ -179,6 +182,9 @@ class QuantMode(IntFlag):
     def has_nvfp4(self):
         return self._any(self.NVFP4)
 
+    def has_w4a8_nvfp4_fp8(self):
+        return self._any(self.W4A8_NVFP4_FP8)
+
     def has_w4a8_mxfp4_fp8(self):
         return self._any(self.W4A8_MXFP4_FP8)
 
@@ -203,6 +209,7 @@ class QuantMode(IntFlag):
                               | self.W4A8_QSERVE
                               | self.FP8_1x128_128x128
                               | self.NVFP4
+                              | self.W4A8_NVFP4_FP8
                               | self.W4A8_MXFP4_FP8
                               | self.W4A16_MXFP4
                               | self.W4A8_MXFP4_MXFP8)
@@ -240,6 +247,7 @@ class QuantMode(IntFlag):
                          use_fp8_block_scales=False,
                          use_fp8_rowwise=False,
                          use_nvfp4=False,
+                         use_w4a8_nvfp4_fp8=False,
                          use_w4a8_qserve=False,
                          use_w4a8_mxfp4_fp8=False,
                          use_w4a8_mxfp4_mxfp8=False,
@@ -312,6 +320,9 @@ class QuantMode(IntFlag):
 
         if use_nvfp4:
             mode = mode | QuantMode.NVFP4
+
+        if use_w4a8_nvfp4_fp8:
+            mode = mode | QuantMode.W4A8_NVFP4_FP8
 
         # W4A8 QServe
         if use_w4a8_qserve:
@@ -399,6 +410,8 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_fp8_block_scales=True)
         elif quant_algo == QuantAlgo.NVFP4:
             quant_mode = QuantMode.from_description(use_nvfp4=True)
+        elif quant_algo == QuantAlgo.W4A8_NVFP4_FP8:
+            quant_mode = QuantMode.from_description(use_w4a8_nvfp4_fp8=True)
         elif quant_algo == QuantAlgo.W4A8_MXFP4_FP8:
             quant_mode = QuantMode.from_description(use_w4a8_mxfp4_fp8=True)
         elif quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
@@ -437,6 +450,8 @@ class QuantMode(IntFlag):
             self.has_fp8_block_scales(),
             'enable_nvfp4':
             self.has_nvfp4(),
+            'enable_w4a8_nvfp4_fp8':
+            self.has_w4a8_nvfp4_fp8(),
             'enable_w4a8_mxfp4_fp8':
             self.has_w4a8_mxfp4_fp8(),
             'enable_w4a8_mxfp4_mxfp8':

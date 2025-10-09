@@ -1,6 +1,6 @@
 # ADP Balance Strategy
 
-By NVIDIA TensorRT-LLM team
+By NVIDIA TensorRT LLM team
 
 ## Table of Contents
 - [ADP Balance Strategy](#adp-balance-strategy)
@@ -45,44 +45,44 @@ To address this critical performance limitation, we introduce the **ADP (Attenti
 
 We model and quantify the performance impact of load imbalance in Attention DP. Since workloads across ranks can be heterogeneous, the execution time for the Attention module in any given iteration is bounded by the rank with the highest workload:
 
-```math
+$$
 time_i = \max_{0 \leq m < N} time_{i,m}
-```
+$$
 
 where $time_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
 
 To quantify load balance and theoretical performance bounds, we define two key metrics:
 
 #### 1. Balance Ratio
-The $balance\\_ratio$ measures the load distribution across ranks within the Attention module for each iteration:
+The balance ratio measures the load distribution across ranks within the Attention module for each iteration:
 
-```math
-balance\_ratio = \frac{avg\_tokens}{max\_tokens}
-```
+$$
+balance = \frac{tokens_{avg}}{tokens_{max}}
+$$
 
 where:
-- $avg\\_tokens$ represents the average number of tokens across all ranks
-- $max\\_tokens$ represents the maximum number of tokens across all ranks
+- $tokens_{avg}$ represents the average number of tokens across all ranks  
+- $tokens_{max}$ represents the maximum number of tokens across all ranks
 - $tokens_i$ represents the number of tokens processed by rank $i$
 
 Note: MoE module load balancing is handled separately by the Expert Parallel Load Balancer (EPLB) module and is not considered during the early scheduling phase.
 
 #### 2. Speed-of-Light Throughput (SOL TPS)
-The $sol\\_tps$ represents the theoretical upper-bound throughput achievable with perfect load balancing:
+The Speed-of-Light throughput represents the theoretical upper-bound throughput achievable with perfect load balancing:
 
-```math
-sol\_time = \sum_{i=0}^{\infty} time_i * balance\_ratio_i
-```
+$$
+time_{sol} = \sum_{i=0}^{\infty} time_i \times balance
+$$
 
-```math
-sol\_tps = \frac{elapsed\_time}{sol\_time} \times actual\_tps
-```
+$$
+tps_{sol} = \frac{time_{elapsed}}{time_{sol}} \times tps_{actual}
+$$
 
 where:
 - $time_i$: Measured execution time of iteration $i$
-- $elapsed\\_time$: Total empirically measured end-to-end execution time
-- $actual\\_tps$: Observed throughput in tokens per second
-- $sol\\_tps$: Theoretical maximum throughput under perfect load balance
+- $time_{elapsed}$: Total empirically measured end-to-end execution time
+- $tps_{actual}$: Observed throughput in tokens per second
+- $tps_{sol}$: Theoretical maximum throughput under perfect load balance
 
 This theoretical framework enables us to quantify the performance gap between current and optimal system utilization, providing clear targets for optimization.
 
@@ -96,7 +96,7 @@ The conventional approach employs a global load balancing strategy that sorts in
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_baseline_round_robin_strategy.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_baseline_round_robin_strategy.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Baseline round-robin strategy balances context request tokens across ranks through sorting and cyclic distribution</em></sub></p>
@@ -179,7 +179,7 @@ We evaluate our approach using a comprehensive dataset comprising 16,000 inferen
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_dataset_token_distribution.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_dataset_token_distribution.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Distribution of input and output token lengths</em></sub></p>
@@ -225,7 +225,7 @@ Figure 3 provides comprehensive insight into baseline system behavior, displayin
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_baseline_performance_overview.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_baseline_performance_overview.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: Baseline performance overview showing token distribution and balance ratios across all iterations</em></sub></p>
@@ -239,7 +239,7 @@ Figure 4 zooms into the critical imbalance period [100-12,000], revealing the dr
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_baseline_performance_detail.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_baseline_performance_detail.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: Detailed baseline analysis for iterations 100-12,000 showing severe balance fluctuations</em></sub></p>
@@ -260,7 +260,7 @@ The Context Wait mechanism (`timeout_iters=50`) demonstrates the effectiveness o
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_context_wait_performance.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_context_wait_performance.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Context Wait performance showing improved balance stability for iterations 100-12,000</em></sub></p>
@@ -300,7 +300,7 @@ The effectiveness of our complete ADP Balance implementation is clearly demonstr
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_full_strategy_performance.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_full_strategy_performance.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: Full ADP Balance strategy demonstrating superior balance stability for iterations 100-12,000</em></sub></p>
@@ -324,7 +324,7 @@ Understanding the performance trade-offs inherent in our ADP Balance strategy is
 
 <div align="center">
 <figure>
-  <img src="./../media/tech_blog10_tps_ttft_pareto_curve.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_tps_ttft_pareto_curve.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7: Pareto frontier analysis showing throughput-latency trade-offs across different ADP Balance configurations</em></sub></p>
@@ -364,4 +364,4 @@ The Pareto frontier analysis provides critical insights for real-world deploymen
 
 ## Acknowledgement
 
-The ADP Balance strategy was a great team effort, covering system performance analysis and optimization. While we cannot thank every contributor individually, we are proud to acknowledge the dedicated team of engineers whose collective expertise has propelled TensorRT-LLM to new heights of performance. Through this collaborative effort, we have gained valuable insights into improving GPU utilization for large language model inference. We hope the techniques and experiences shared in this blog post will empower the developer community to better leverage the performance of NVIDIA GPUs in their mission-critical LLM inference applications.
+The ADP Balance strategy was a great team effort, covering system performance analysis and optimization. While we cannot thank every contributor individually, we are proud to acknowledge the dedicated team of engineers whose collective expertise has propelled TensorRT LLM to new heights of performance. Through this collaborative effort, we have gained valuable insights into improving GPU utilization for large language model inference. We hope the techniques and experiences shared in this blog post will empower the developer community to better leverage the performance of NVIDIA GPUs in their mission-critical LLM inference applications.

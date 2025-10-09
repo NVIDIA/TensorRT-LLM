@@ -26,7 +26,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -45,7 +45,6 @@
 #include <gmock/gmock.h>
 #include <memory>
 #include <random>
-#include <tensorrt_llm/batch_manager/dataTransceiverImpl.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
 
@@ -70,7 +69,7 @@ std::unique_ptr<texec::kv_cache::ConnectionManager> makeOneUcxConnectionManager(
         void* ret = dllGetSym(handle, name);
 
         TLLM_CHECK_WITH_INFO(ret != nullptr,
-            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
             "built with UCX support, please rebuild in UCX-enabled environment.");
         return ret;
     };
@@ -84,6 +83,7 @@ class UcxCommTest : public ::testing::Test
 };
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using TransceiverTag = tensorrt_llm::batch_manager::TransceiverTag;
 
 TEST_F(UcxCommTest, Basic)
 {

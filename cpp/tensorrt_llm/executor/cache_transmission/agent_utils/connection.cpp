@@ -17,6 +17,7 @@
 
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <string>
 #include <unistd.h>
 
@@ -32,6 +33,28 @@ std::string genUniqueAgentName()
     gethostname(hostname, sizeof(hostname));
     auto pid = static_cast<uint64_t>(::getpid());
     return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(counter++);
+}
+
+// NIXL connection is specific ,and different from the UCX and mpi connection, since NIXL only support one-sided
+// communication. gen send buffer metaData to context when it sending requestInfo, but don't send buffer offset, since
+// unformmatter has not called yet, it didn't know the cacheSize and offset. We assume the recv_size is the same as the
+// send_size. and compute the buffer offset according to  the layer num of the selfPPrank ,and previous PP rank's layer
+// num, since the buffer size is ratio is equal to the layer num ratio except the VSWA case.
+
+auto computeSendOffsetRatio(
+    CacheState const& peerCacheState, int peerIdx, CacheState const& selfCacheState, int validConnectionIdx)
+{
+    auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
+    // int ppRank = valideConnectionIdx % peerTargetInfo.mDomainPPSize;
+    size_t offsetLayer = 0;
+    for (int i = 0; i < validConnectionIdx; i++)
+    {
+        offsetLayer += peerTargetInfo.getPeerPPDomainLayerNum(i);
+    }
+
+    size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(validConnectionIdx);
+
+    return std::make_pair(offsetLayer, selfSendLayer);
 }
 
 AgentConnection::AgentConnection(
@@ -81,8 +104,9 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     MemoryDesc srcDesc{
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
-    auto dstBaseDesc = mSenderState.mReceiverBufferDesc;
-    MemoryDesc dstDesc{dstBaseDesc.getAddr() + (mSenderState.validSegmentIdx * size), size, dstBaseDesc.getDeviceId()};
+    auto dstBaseDesc = mSenderState.mCacheReceiverBufferDesc;
+    auto offset = size / mSenderState.mOffsetRatio.second * mSenderState.mOffsetRatio.first;
+    MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
@@ -137,10 +161,12 @@ void AgentConnection::sendRequestAndBufferInfo(
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
-void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int validSegmentIdx)
+void AgentConnection::setSenderState(
+    MemoryDesc mCacheReceiverBufferDesc, int validSegmentIdx, std::pair<size_t, size_t> offsetRatio)
 {
-    mSenderState.mReceiverBufferDesc = mReceiverBufferDesc;
+    mSenderState.mCacheReceiverBufferDesc = mCacheReceiverBufferDesc;
     mSenderState.validSegmentIdx = validSegmentIdx;
+    mSenderState.mOffsetRatio = offsetRatio;
 }
 
 void AgentConnection::setHasLoadRemoteAgent(bool hasLoadRemoteAgent)
@@ -154,9 +180,26 @@ bool AgentConnection::hasLoadRemoteAgent() const
     return mHasLoadRemoteAgent;
 }
 
+void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) const
+{
+    ReadySignalInfo readySignalInfo{mRemoteAgentName, ctx, isReady};
+    NotificationInfo notificationInfo{readySignalInfo};
+    std::stringstream ss;
+    NotificationInfo::serialize(notificationInfo, ss);
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+}
+
+bool AgentConnection::recvReadySignal(DataContext const& ctx) const
+{
+    ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
+    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
+    return true;
+}
+
 AgentConnectionManager::AgentConnectionManager(
-    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager)
-    : mRegMemDescs(MemoryType::kVRAM, {})
+    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState)
+    : mCacheState(std::move(cacheState))
+    , mRegMemDescs(MemoryType::kVRAM, {})
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
@@ -234,17 +277,16 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
     while (true)
     {
-
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
         while (it != mUnhandledNotifications.end())
         {
             auto& [agent, notifs] = *it;
-            auto it2 = notifs.begin();
-            while (it2 != notifs.end())
+            auto notifIt = notifs.begin();
+            while (notifIt != notifs.end())
             {
-                std::stringstream ss(*it2);
+                std::stringstream ss(*notifIt);
                 NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
                 bool erase = false;
                 if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
@@ -260,8 +302,11 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto remoteAgentName = requestAndBufferInfo.mAgentName;
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
                     auto connection = connect(remoteAgentName, address, metadataOpt, true);
-                    connection->setSenderState(bufferDesc, validConnectionIdx);
-                    it2 = notifs.erase(it2);
+                    // to compute the offset.
+                    auto offsetRatio = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
+                        requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState, validConnectionIdx);
+                    connection->setSenderState(bufferDesc, validConnectionIdx, offsetRatio);
+                    notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {
                         it = mUnhandledNotifications.erase(it);
@@ -271,7 +316,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
                 if (!erase)
                 {
-                    it2++;
+                    notifIt++;
                 }
             }
             if (notifs.empty())
@@ -328,7 +373,7 @@ batch_manager::kv_cache_manager::CacheTransBufferManager* AgentConnectionManager
     return mCacheTransBufferManager;
 }
 
-AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connecitonInfo,
+AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
     std::optional<std::string> metadata, bool isSender)
 {
 
@@ -369,7 +414,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
             TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call connectRemoteAgent");
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with connectRemoteAgent",
                 mAgentName.c_str(), remoteAgentName.c_str());
-            m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
+            m_Agent->connectRemoteAgent(remoteAgentName, connectionInfo);
         }
     }
     else
@@ -401,7 +446,8 @@ int AgentConnectionManager::getDeviceId() const
     return mDeviceId;
 }
 
-void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo)
+template <typename NotificationType>
+void AgentConnectionManager::waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo)
 {
     while (true)
     {
@@ -417,30 +463,54 @@ void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName,
                 it++;
                 continue;
             }
-            auto it2 = notifs.begin();
-            while (it2 != notifs.end())
+            auto notifIt = notifs.begin();
+            while (notifIt != notifs.end())
             {
-                std::stringstream ss(*it2);
+                std::stringstream ss(*notifIt);
                 NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
                 bool erase = false;
-                if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
+                if constexpr (std::is_same_v<NotificationType, NotificationSyncInfo>)
                 {
-                    auto notificationSyncInfo = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
-                    if (notificationSyncInfo.mContext.getTag() == syncInfo.mContext.getTag()
-                        && notificationSyncInfo.mAgentName == syncInfo.mAgentName)
+                    if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
                     {
-                        erase = true;
-                        it2 = notifs.erase(it2);
-                        if (notifs.empty())
+                        auto notificationData = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
+                        if (notificationData.mContext.getTag() == expectedInfo.mContext.getTag()
+                            && notificationData.mAgentName == expectedInfo.mAgentName)
                         {
-                            it = mUnhandledNotifications.erase(it);
+                            erase = true;
+                            notifIt = notifs.erase(notifIt);
+                            if (notifs.empty())
+                            {
+                                it = mUnhandledNotifications.erase(it);
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
+                else if constexpr (std::is_same_v<NotificationType, ReadySignalInfo>)
+                {
+                    if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
+                    {
+                        auto readySignalData = std::get<ReadySignalInfo>(notificationInfo.mInfo);
+                        if (readySignalData.mContext.getTag() == expectedInfo.mContext.getTag()
+                            && readySignalData.mAgentName == expectedInfo.mAgentName)
+                        {
+                            expectedInfo.mIsReady = readySignalData.mIsReady;
+
+                            erase = true;
+                            notifIt = notifs.erase(notifIt);
+                            if (notifs.empty())
+                            {
+                                it = mUnhandledNotifications.erase(it);
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 if (!erase)
                 {
-                    it2++;
+                    notifIt++;
                 }
             }
             if (notifs.empty())
@@ -453,6 +523,22 @@ void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName,
             }
         }
     }
+}
+
+// Explicit template instantiations
+template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
+    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo);
+template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
+    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo);
+
+void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo)
+{
+    waitForNotification(remoteAgentName, syncInfo);
+}
+
+void AgentConnectionManager::waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo)
+{
+    waitForNotification(remoteAgentName, readySignalInfo);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const

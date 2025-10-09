@@ -1,6 +1,8 @@
 {
     "templates": {
         "GemmFp4LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e2m1",
             "dtypeC": "e2m1",
             "mmaM": 128,
@@ -12,7 +14,7 @@
             "epilogueTileM": 128,
             "epilogueTileN": 8,
             "numStages": 4,
-            "numMmaStages": 1,
+            "numStagesMma": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -32,6 +34,8 @@
             "usePdl": true
         },
         "GemmFp4Throughput": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e2m1",
             "dtypeC": "e2m1",
             "mmaM": 128,
@@ -43,7 +47,7 @@
             "epilogueTileM": 128,
             "epilogueTileN": 128,
             "numStages": 3,
-            "numMmaStages": 1,
+            "numStagesMma": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -64,6 +68,8 @@
             "usePdl": true
         },
         "GemmFp8DeepSeekLowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 64,
@@ -75,7 +81,7 @@
             "epilogueTileM": 64,
             "epilogueTileN": 8,
             "numStages": 3,
-            "numMmaStages": 1,
+            "numStagesMma": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -94,6 +100,8 @@
 
         },
         "GemmPerTensorScalingFp8Throughput": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 128,
@@ -105,7 +113,7 @@
             "epilogueTileM": 128,
             "epilogueTileN": 128,
             "numStages": 3,
-            "numMmaStages": 1,
+            "numStagesMma": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -124,6 +132,8 @@
             "usePdl": true
         },
         "GemmPerTensorScalingFp8LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 128,
@@ -135,7 +145,7 @@
             "epilogueTileM": 128,
             "epilogueTileN": 8,
             "numStages": 3,
-            "numMmaStages": 1,
+            "numStagesMma": 1,
             "numSlicesForSplitK": 2,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -153,6 +163,8 @@
             "usePdl": true
         },
         "GemmDeepSeekFp8LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 64,
@@ -182,10 +194,11 @@
             "numStagesMma": 2,
             "numStagesMmaWithinWorkTile": 2,
             "useTwoMmaWarps": true,
-            "useMetaFp8": false,
             "usePdl": true
         },
         "GemmDeepSeekFp8Throughput": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 64,
@@ -212,7 +225,6 @@
             "numStagesMma": 2,
             "numStagesMmaWithinWorkTile": 2,
             "useTwoMmaWarps": true,
-            "useMetaFp8": false,
             "usePdl": true,
             "gridTriggerSecondaryA": true,
             "gridTriggerSecondaryB": false,
@@ -220,6 +232,8 @@
             "gridWaitForPrimaryB": false
         },
         "GemmMxE2m1MxE4m3LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "mxe2m1",
             "dtypeB": "mxe4m3",
             "dtypeC": "mxe4m3",
@@ -232,7 +246,7 @@
             "epilogueTileM": 128,
             "epilogueTileN": 8,
             "numStages": 3,
-            "numMmaStages": 1,
+            "numStagesMma": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -246,11 +260,40 @@
             "useCustomMmaSchedule": true,
             "sfLayoutB": "8x4",
             "sfLayoutC": "8x4",
-            "useMetaFp8": false,
             "gridTriggerSecondaryB": true,
             "gridWaitForPrimaryA": false,
             "gridWaitForPrimaryB": true,
             "usePdl": true
+        },
+        "GemmFp4xFp8": {
+            "smVersion": "100f",
+            "patchF2fp": false,
+            "dtypeA": "e2m1",
+            "dtypeMmaA": "e4m3",
+            "dtypeB": "e4m3",
+            "dtypeC": "fp16",
+            "sfBlockSizeA": 32,
+            "sfLayoutA" : "128x4",
+            "mmaM": 128,
+            "mmaN": 8,
+            "mmaK": 32,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 512,
+            "epilogueTileM": 128,
+            "epilogueTileN": 8,
+            "numStages": 2,
+            "numSlicesForSplitK": 1,
+            "clusterDimZ": 1,
+            "useTwoTmaLoadWarps": true,
+            "sliceK": false,
+            "transposeMmaOutput": true,
+            "useShuffledMatrixA": true,
+            "useCustomMmaSchedule": true,
+            "numStagesMma": 1,
+            "useTwoMmaWarps": false,
+            "usePdl": true,
+            "tileScheduler": "persistent"
         }
     },
     "configs": [
@@ -323,6 +366,13 @@
         {
             "_template": "GemmMxE2m1MxE4m3LowLatency",
             "dtypeC": ["bf16", "fp16", "fp32", "mxe4m3"]
+        },
+        {
+            "_template": "GemmFp4xFp8",
+            "_comment": "Tile 8 to 128",
+            "dtypeC": ["bf16", "fp16", "e4m3"],
+            "useUnrollLoop2xForMma": [true, false],
+            "mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimZ": [[8, 8, 8, 512, 2, 2], [16, 16, 16, 512, 2, 2], [32, 32, 32, 512, 2, 2], [64, 64, 64, 512, 2, 2], [128, 128, 128, 256, 1, 1]]
         }
     ]
 }

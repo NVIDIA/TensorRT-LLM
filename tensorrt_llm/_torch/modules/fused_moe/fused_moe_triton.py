@@ -227,10 +227,6 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
-    def get_quant_scales(self, module: torch.nn.Module, slot_start,
-                         slot_end) -> tuple[torch.Tensor, ...]:
-        return tuple()
-
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
@@ -1287,6 +1283,7 @@ class TritonFusedMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            layer_idx=layer_idx,
         )
         if not IS_TRITON_KERNELS_AVAILABLE:
             raise ImportError("Triton kernels are not available.")
@@ -1359,10 +1356,11 @@ class TritonFusedMoE(MoE):
 
         self._weights_created = True
 
-    def forward(
+    def forward_impl(
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -1387,3 +1385,6 @@ class TritonFusedMoE(MoE):
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)

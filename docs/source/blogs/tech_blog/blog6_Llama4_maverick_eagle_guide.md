@@ -1,8 +1,8 @@
-# How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server
+# How to launch Llama4 Maverick + Eagle3 TensorRT LLM server
 
-Artificial Analysis has benchmarked the Llama4 Maverick with Eagle3 enabled TensorRT-LLM server running at over [1000 tokens per second per user on 8xB200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/). This implementation leverages NVIDIA's TensorRT-LLM combined with speculative decoding using the Eagle3 model to further boost performance.
+Artificial Analysis has benchmarked the Llama4 Maverick with Eagle3 enabled TensorRT LLM server running at over [1000 tokens per second per user on 8xB200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/). This implementation leverages NVIDIA's TensorRT LLM combined with speculative decoding using the Eagle3 model to further boost performance.
 
-In the guide below, we will walk you through how to launch your own high-performance Llama4 Maverick with Eagle3 enabled TensorRT-LLM server, from build to deployment.  (Note that your specific performance numbers may vary—speculative decoding speedups depend upon the dataset!)
+In the guide below, we will walk you through how to launch your own high-performance Llama4 Maverick with Eagle3 enabled TensorRT LLM server, from build to deployment.  (Note that your specific performance numbers may vary—speculative decoding speedups depend upon the dataset!)
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ In the guide below, we will walk you through how to launch your own high-perform
 * [NVIDIA Llama 4 Maverick 17B 128E Instruct FP8](https://huggingface.co/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8)
 * [NVIDIA Llama 4 Maverick 17B 128E Eagle3 BF16](https://huggingface.co/nvidia/Llama-4-Maverick-17B-128E-Eagle3)
 
-In [Step 4: Start the TensorRT-LLM server](#step-4-start-the-tensorrt-llm-server), `/path/to/maverick` and `/path/to/eagle` refer to the download paths of the above respective models.
+In [Step 4: Start the TensorRT LLM server](#step-4-start-the-tensorrt-llm-server), `/path/to/maverick` and `/path/to/eagle` refer to the download paths of the above respective models.
 
 ## Launching the server
 
@@ -33,14 +33,14 @@ git lfs pull
 
 The last command, `git lfs pull`, ensures all large files stored with Git LFS are properly downloaded. If `git lfs` is not installed, please install following [Install Git LFS](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage)
 
-### Step 2: Prepare the TensorRT-LLM release Docker image
+### Step 2: Prepare the TensorRT LLM release Docker image
 
 
 #### Option 1. Use weekly release NGC docker image
-TensorRT-LLM provides weekly release [docker image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release)
+TensorRT LLM provides weekly release [docker image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release)
 
-#### Option 2. Build TensorRT-LLM Docker image (Alternative way)
-If you want to compile a specific TensorRT-LLM commit, you can build the docker image by checking out the specific branch or commit and running a make command. This may take 15-30 minutes depending on your system.
+#### Option 2. Build TensorRT LLM Docker image (Alternative way)
+If you want to compile a specific TensorRT LLM commit, you can build the docker image by checking out the specific branch or commit and running a make command. This may take 15-30 minutes depending on your system.
 
 ```
 make -C docker release_build
@@ -57,7 +57,7 @@ docker push docker.io/<username>/tensorrt_llm:main
 
 Replace `<username>` with your Docker Hub username or your private registry path.
 
-### Step 4: Start the TensorRT-LLM server
+### Step 4: Start the TensorRT LLM server
 
 This command launches the server with Llama4 Maverick as the main model and Eagle3 as the draft model for speculative decoding. Make sure you have downloaded both model checkpoints before running this command.
 

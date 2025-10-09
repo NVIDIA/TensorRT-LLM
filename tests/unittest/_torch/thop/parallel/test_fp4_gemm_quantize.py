@@ -127,6 +127,49 @@ class TestFunctional(unittest.TestCase):
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
         self.assertTrue(torch.allclose(c_pt, c, atol=1e-2, rtol=1e-2))
 
+    @parameterized.expand(
+        list([
+            [1024, 1024, 1024],
+            [128, 8, 256],
+        ]),
+        name_func=unittest_name_func,
+    )
+    @skip_pre_blackwell_unittest
+    @skip_blackwell_geforce
+    def test_fp4_fp8_gemm_trtllmgen(self, m, n, k):
+        a = torch.randn([m, k], dtype=torch.float32)
+        b = torch.randn([n, k], dtype=torch.float32)
+        b_fp8, b_global_sf = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+            b.cuda())
+        b_fp8 = b_fp8.view(torch.float8_e4m3fn)
+        a_global_sf = 448.0 / a.abs().max().float()
+
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
+        sf_vec_size = 32
+
+        a_fp4, a_sf, rep_float = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+            a * a_global_sf, sf_vec_size, 1, False)
+        a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4, a_sf,
+                                                      1.0 / a_global_sf,
+                                                      sf_vec_size, 1, False)
+        b_pt = (b_fp8.to(torch.float32) * b_global_sf).cpu()
+        c_pt = torch.nn.functional.linear(b_pt, a_pt)
+
+        a_fp4_shuffled = fp4_utils.shuffle_matrix_a(a_fp4, epilogue_tile_m)
+        # sf is swizzled as well.
+        a_sf_shuffled = fp4_utils.shuffle_matrix_sf_a(a_sf.reshape(
+            (m, -1)), epilogue_tile_m, sf_vec_size)
+
+        ab_global_sf = b_global_sf / a_global_sf
+        c = torch.ops.trtllm.fp4_fp8_gemm_trtllmgen(
+            b_fp8, a_fp4_shuffled.cuda(),
+            a_sf_shuffled.view(dtype=torch.float8_e4m3fn).cuda(),
+            ab_global_sf.cuda())
+        torch.cuda.synchronize()
+        c = c.float().cpu()
+        self.assertTrue(torch.allclose(c_pt, c, atol=1e-2, rtol=1e-2))
+
     @parameterized.expand(list([[1024, 1024, torch.half, False, True],
                                 [2, 512, torch.bfloat16, False, True],
                                 [2, 512, torch.bfloat16, True, True],

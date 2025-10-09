@@ -1,5 +1,5 @@
 # DeepSeek R1 MTP Implementation and Optimization
-by NVIDIA TensorRT-LLM team
+by NVIDIA TensorRT LLM team
 ## Table of Contents
 - [DeepSeek R1 MTP Implementation and Optimization](#deepseek-r1-mtp-implementation-and-optimization)
   - [Table of Contents](#table-of-contents)
@@ -7,7 +7,7 @@ by NVIDIA TensorRT-LLM team
     - [Background](#background)
     - [MTP Vanilla](#mtp-vanilla)
     - [MTP Eagle](#mtp-eagle)
-  - [MTP implementation in TensorRT-LLM](#mtp-implementation-in-tensorrt-llm)
+  - [MTP implementation in TensorRT LLM](#mtp-implementation-in-tensorrt-llm)
     - [Basic Implementation](#basic-implementation)
     - [MTP Modules](#mtp-modules)
     - [Attention for MTP](#attention-for-mtp)
@@ -25,7 +25,7 @@ by NVIDIA TensorRT-LLM team
   - [Acknowledgment](#acknowledgment)
 
 
-TensorRT-LLM achieves world-record inference performance for DeepSeek-R1 on NVIDIA Blackwell GPUs, where Multi-Token Prediction (MTP) delivers a significant speedup. In our [previous blog post](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md), we discussed the key optimizations that enable the outstanding inference latency of the DeepSeek-R1 model. This article dives deeper into the implementation and optimization of MTP in TensorRT-LLM.
+TensorRT LLM achieves world-record inference performance for DeepSeek-R1 on NVIDIA Blackwell GPUs, where Multi-Token Prediction (MTP) delivers a significant speedup. In our [previous blog post](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md), we discussed the key optimizations that enable the outstanding inference latency of the DeepSeek-R1 model. This article dives deeper into the implementation and optimization of MTP in TensorRT LLM.
 
 ## MTP for inference
 Inspired by a previous [research work](https://arxiv.org/pdf/2404.19737), MTP is designed to help the DeepSeek-V3 training. It adds additional MTP modules at the end of the main model and uses them to predict additional tokens. In this way, MTP can extend the prediction scope to multiple future tokens at each position to achieve better model accuracy. During inference, those MTP modules can also be used for speculative decoding to improve the generation latency further. In this section, we will introduce the MTP speculative decoding algorithm for LLM inference.
@@ -74,18 +74,18 @@ Figure 3 gives an MTP Eagle example. In the context phase, the inputs of the fir
 
 In the generation phase, the verification stage is the same as MTP Vanilla. Once we get the accepted tokens, we use all of them along with their corresponding hidden states as inputs for the first MTP module forward. Unlike MTP Vanilla, which needs to store past tokens and hidden states, this approach is much easier to implement. Subsequent MTP module forwards follow the same input preparation method as the context phase. After predicting all draft tokens, we need to evict the key/value pairs of any rejected draft tokens from the main model’s KV cache.
 
-## MTP implementation in TensorRT-LLM
+## MTP implementation in TensorRT LLM
 ### Basic Implementation
-TensorRT-LLM has two different paths for MTP, one for [MTP Vanilla](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/mtp.py#L1047) and another for [MTP Eagle](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/mtp.py#L1047). MTP Eagle is the default path for DeepSeek-V3 and DeepSeek-R1 models.
+TensorRT LLM has two different paths for MTP, one for [MTP Vanilla](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/mtp.py#L1047) and another for [MTP Eagle](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/mtp.py#L1047). MTP Eagle is the default path for DeepSeek-V3 and DeepSeek-R1 models.
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4. MTP workflow in TensorRT-LLM</em></sub></p>
+<p align="center"><sub><em>Figure 4. MTP workflow in TensorRT LLM</em></sub></p>
 
-Figure 4 shows the overall workflow of MTP in TensorRT-LLM. Both paths share the runtime workflow, and the differences are in the MTP modules forward. In the context phase, there is no draft token in the inputs. TensorRT-LLM model engine fetches the input IDs from the requests and inputs to the model engine forward to get the next token and the hidden state. Then we prepare the MTP module inputs, and the MTP modules forward the inputs to predict the draft tokens.
+Figure 4 shows the overall workflow of MTP in TensorRT LLM. Both paths share the runtime workflow, and the differences are in the MTP modules forward. In the context phase, there is no draft token in the inputs. TensorRT LLM model engine fetches the input IDs from the requests and inputs to the model engine forward to get the next token and the hidden state. Then we prepare the MTP module inputs, and the MTP modules forward the inputs to predict the draft tokens.
 
 The generation workflow is more complicated. We need to do both the verification and draft stages. The predicted new token and draft tokens are the inputs for the main model. After the main model forward, we can sample from the output logits and get the following new tokens. Then compare them with the input draft tokens to get the final accepted tokens. The verification stage will be finished here. We will use the accepted tokens and hidden states to start a new draft stage, which uses the MTP layers to predict new draft tokens for the next iteration. Finally, we need to rewind the KV cache to evict keys/values corresponding to those rejected tokens.
 
@@ -107,7 +107,7 @@ The MTP module follows the design in DeepSeek-V3. The embedding layer and output
 
 ### Attention for MTP
 
-Attention is also a very important component in supporting MTP inference. The changes are mainly in the attention kernels for the generation phase. For the normal request, there will be only one input token in the generation phase, but for MTP, there will be $K+1$ input tokens. Since MTP sequentially predicts additional tokens, the predicted draft tokens are chained. Though we have an MTP Eagle path, currently, we only have the chain-based support for MTP Eagle. So, a causal mask is enough for the attention kernel to support MTP. In our implementation, TensorRT-LLM will use the fp8 flashMLA generation kernel on Hopper GPU, while using TRTLLM customized attention kernels on Blackwell for better performance.
+Attention is also a very important component in supporting MTP inference. The changes are mainly in the attention kernels for the generation phase. For the normal request, there will be only one input token in the generation phase, but for MTP, there will be $K+1$ input tokens. Since MTP sequentially predicts additional tokens, the predicted draft tokens are chained. Though we have an MTP Eagle path, currently, we only have the chain-based support for MTP Eagle. So, a causal mask is enough for the attention kernel to support MTP. In our implementation, TensorRT LLM will use the fp8 flashMLA generation kernel on Hopper GPU, while using TRTLLM customized attention kernels on Blackwell for better performance.
 
 ### How to run DeepSeek models with MTP
 Run DeepSeek-V3/R1 models with MTP, use [examples/llm-api/quickstart_advanced.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py) with additional options:
@@ -237,12 +237,12 @@ We validated the Relaxed Acceptance on different datasets. In Figure 8, we show 
 </div>
 <p align="center"><sub><em>Figure 9. Comparison between the chain-based and tree-based speculative decoding</em></sub></p>
 
-TensorRT-LLM PyTorch backend can only support chain-based speculative decoding now, both MTP Vanilla and MTP Eagle. However, the tree-based speculative decoding technique is widely used in previous advanced methods, such as Ealge2 and Eagle3, to increase the acceptance rate. MTPs in TensorRT-LLM can also be extended to support the tree-based technique. Figure 9 compares the chain-based method with the tree-based method. Both full tree and dynamic tree methods can help expand the candidate combinations, so that we can have more choices for the draft tokens.
+TensorRT LLM PyTorch backend can only support chain-based speculative decoding now, both MTP Vanilla and MTP Eagle. However, the tree-based speculative decoding technique is widely used in previous advanced methods, such as Ealge2 and Eagle3, to increase the acceptance rate. MTPs in TensorRT LLM can also be extended to support the tree-based technique. Figure 9 compares the chain-based method with the tree-based method. Both full tree and dynamic tree methods can help expand the candidate combinations, so that we can have more choices for the draft tokens.
 
 ### Eagle3 support
 
-Another important method is Eagle3. From the [Eagle3 paper](https://arxiv.org/pdf/2503.01840), the promising results show that it can help greatly increase the acceptance rate by leveraging different levels’ hidden states to predict draft tokens. Since TensorRT-LLM already has [Eagle-3 support](https://github.com/NVIDIA/TensorRT-LLM/pull/3035) now, in the future, we also want to train an Eagle3 head to support DeepSeek-V3/R1+Eagle3 to achieve better speedup.
+Another important method is Eagle3. From the [Eagle3 paper](https://arxiv.org/pdf/2503.01840), the promising results show that it can help greatly increase the acceptance rate by leveraging different levels’ hidden states to predict draft tokens. Since TensorRT LLM already has [Eagle-3 support](https://github.com/NVIDIA/TensorRT-LLM/pull/3035) now, in the future, we also want to train an Eagle3 head to support DeepSeek-V3/R1+Eagle3 to achieve better speedup.
 
 ## Acknowledgment
 
-This was a remarkable cross-team effort to support and optimize MTP in TensorRT-LLM. We would like to extend our gratitude to everyone who contributed to making this possible, as it involved a typical system/algorithm co-design approach spanning multiple technical layers—including kernel optimization, runtime enhancements, algorithmic improvements, and performance measurement & analysis. And a special thanks goes to the DeepSeek team for developing the MTP method, which lays down the foundation of this blog.
+This was a remarkable cross-team effort to support and optimize MTP in TensorRT LLM. We would like to extend our gratitude to everyone who contributed to making this possible, as it involved a typical system/algorithm co-design approach spanning multiple technical layers—including kernel optimization, runtime enhancements, algorithmic improvements, and performance measurement & analysis. And a special thanks goes to the DeepSeek team for developing the MTP method, which lays down the foundation of this blog.

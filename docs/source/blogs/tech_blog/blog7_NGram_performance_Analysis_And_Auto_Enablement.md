@@ -1,4 +1,4 @@
-# N-Gram Speculative Decoding in TensorRT‑LLM
+# N-Gram Speculative Decoding in TensorRT LLM
 N-Gram speculative decoding leverages the natural repetition in many LLM workloads. It splits previously seen text into configurable (key, value) n‑gram pairs and, during generation, swiftly proposes draft tokens by matching the current key against n-gram pools in memory.
 
 In this blog, we introduce design choices in TensorRT‑LLM’s N-Gram speculative decoding algorithm, share our experimental results of performance gains, and explain N-Gram's low barrier to adoption by deriving a simple heuristic to enable it.
@@ -35,7 +35,7 @@ Speculative decoding drafts several tokens, verifies them on the model, and keep
 
 
 ## Algorithm & Complexity
-`NGramDecodingConfig` in TensorRT-LLM:
+`NGramDecodingConfig` in TensorRT LLM:
 ```python
 spec_config = NGramDecodingConfig(
     max_draft_len = v ,             # max length of draft tokens

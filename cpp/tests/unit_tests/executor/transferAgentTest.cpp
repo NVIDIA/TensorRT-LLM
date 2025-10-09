@@ -16,6 +16,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
 using namespace tensorrt_llm::executor::kv_cache;
 
 class RegisteredHostMemory
@@ -341,3 +345,118 @@ TEST_F(TransferAgentTest, SyncMessage)
     nixlAgent0->invalidateRemoteAgent(agent1);
     nixlAgent1->invalidateRemoteAgent(agent0);
 }
+
+class LoopbackAgentTest : public ::testing::Test,
+                          public ::testing::WithParamInterface<bool> // NOLINT(cppcoreguidelines-pro-type-member-init)
+{
+public:
+    void SetUp() override
+    {
+        static int file_num = 0;
+        std::string filename = std::string("test_agent") + std::to_string(file_num++);
+        auto dirPath = fs::absolute(filename);
+        std::error_code ec;
+        fs::create_directories(dirPath, ec);
+        TLLM_CHECK_WITH_INFO(!ec, "Failed to create test directory: %s", ec.message().c_str());
+        mDirectory = dirPath.string();
+    }
+
+    void TearDown() override
+    {
+        std::error_code ec;
+        fs::remove_all(mDirectory, ec);
+        if (ec)
+            std::cerr << "Warning: Failed to clean up test directory: " << ec.message() << std::endl;
+    }
+
+    [[nodiscard]] std::shared_ptr<BaseLoopbackAgent> makeLoopbackAgent(BaseAgentConfig const& config)
+    {
+        return tensorrt_llm::executor::kv_cache::makeLoopbackAgent("nixl", &config);
+    }
+
+    [[nodiscard]] std::string getDirectory() const
+    {
+        return mDirectory;
+    }
+
+private:
+    std::string mDirectory;
+};
+
+TEST_P(LoopbackAgentTest, FileToGpu)
+{
+    std::string const agentName{"loopbackAgent"};
+    BaseAgentConfig config{agentName, true, GetParam()};
+    auto loopbackAgent = makeLoopbackAgent(config);
+
+    TLLM_CHECK(loopbackAgent);
+
+    std::vector<char> memory(100, 1);
+    char* cuda_mem;
+    TLLM_CUDA_CHECK(cudaMalloc(&cuda_mem, 100));
+    TLLM_CUDA_CHECK(cudaMemcpy(cuda_mem, memory.data(), 100, cudaMemcpyHostToDevice));
+    std::string filename = getDirectory() + std::string("/file2gpu.bin");
+
+    int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0664);
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for writing", filename.c_str());
+
+    std::vector<char> fileData(100, 10);
+    ssize_t bytesWritten = ::write(fd, fileData.data(), fileData.size());
+    TLLM_CHECK_WITH_INFO(bytesWritten == static_cast<ssize_t>(fileData.size()), "Failed to write to file");
+    ::close(fd);
+
+    {
+        MemoryDesc mem_desc(cuda_mem, 100, 0);
+        MemoryDescs memDescs{MemoryType::kVRAM, {mem_desc}};
+
+        std::vector<FileDesc> fileDescVec;
+        fileDescVec.emplace_back(filename, O_RDONLY, 0664, 100);
+        FileDescs fileDescs{std::move(fileDescVec)};
+
+        loopbackAgent->executeLoopbackRequest(memDescs, fileDescs, false);
+    }
+
+    TLLM_CUDA_CHECK(cudaMemcpy(memory.data(), cuda_mem, 100, cudaMemcpyDeviceToHost));
+
+    TLLM_CHECK(memory == fileData);
+    TLLM_CUDA_CHECK(cudaFree(cuda_mem));
+}
+
+TEST_P(LoopbackAgentTest, GpuToFile)
+{
+    std::string const agentName{"loopbackAgent"};
+    BaseAgentConfig config{agentName, true, GetParam()};
+    auto loopbackAgent = makeLoopbackAgent(config);
+
+    TLLM_CHECK(loopbackAgent);
+
+    std::vector<char> memory(100, 1);
+    char* cuda_mem;
+    TLLM_CUDA_CHECK(cudaMalloc(&cuda_mem, 100));
+    TLLM_CUDA_CHECK(cudaMemcpy(cuda_mem, memory.data(), 100, cudaMemcpyHostToDevice));
+    std::string filename = getDirectory() + std::string("/gpu2file.bin");
+
+    {
+        MemoryDesc mem_desc(cuda_mem, 100, 0);
+        MemoryDescs memDescs{MemoryType::kVRAM, {mem_desc}};
+
+        std::vector<FileDesc> fileDescVec;
+        fileDescVec.emplace_back(filename, O_CREAT | O_WRONLY, 0664, 100);
+        FileDescs fileDescs{std::move(fileDescVec)};
+
+        loopbackAgent->executeLoopbackRequest(memDescs, fileDescs, true);
+    }
+
+    int fd = ::open(filename.c_str(), O_RDONLY, 0664);
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for reading", filename.c_str());
+
+    std::vector<char> fileData(100);
+    ssize_t bytesRead = ::read(fd, fileData.data(), fileData.size());
+    TLLM_CHECK_WITH_INFO(bytesRead == static_cast<ssize_t>(fileData.size()), "Failed to read from file");
+    ::close(fd);
+
+    TLLM_CHECK(fileData == memory);
+    TLLM_CUDA_CHECK(cudaFree(cuda_mem));
+}
+
+INSTANTIATE_TEST_SUITE_P(, LoopbackAgentTest, ::testing::Values(true, false));

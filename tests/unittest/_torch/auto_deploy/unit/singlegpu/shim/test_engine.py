@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Optional, Type
 
 import pytest
 import torch
@@ -22,7 +22,7 @@ class TransformerLikeModelwithFakeCachePool(nn.Module):
         )
         self.output_projection = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, input_ids, *cache_args):
+    def forward(self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         embeddings = self.embedding(input_ids)
         hidden_states = self.mlp(embeddings)
         logits = self.output_projection(hidden_states)
@@ -47,7 +47,7 @@ def get_inference_model(cache_seq_interface):
 def test_engine(engine_cls: Type[ADEngine], attn_backend: str, attn_page_size: int):
     """Test the SimpleEngine functionality."""
 
-    seed = 1234  # Set random seed for model param init
+    seed = 42  # Set random seed for model param init
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -71,7 +71,6 @@ def test_engine(engine_cls: Type[ADEngine], attn_backend: str, attn_page_size: i
         input_ids = [torch.tensor([0, 1, 2], device=device)]
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
-        engine.cache_seq_interface.info.sync(sequence_info)
         logits = engine._compute_logits()
         logits = torch.stack(logits)
         assert logits is not None, "Logits are None"
@@ -106,7 +105,6 @@ def test_demo_engine_sampling(attn_page_size: int):
         input_ids = [torch.tensor([1, 2, 3, 4], device=device)]
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
-        engine.cache_seq_interface.info.sync(sequence_info)
         logits = engine._compute_logits()
         logits = torch.stack(logits)
 

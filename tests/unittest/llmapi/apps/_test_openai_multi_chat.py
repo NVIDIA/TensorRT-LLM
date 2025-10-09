@@ -65,7 +65,10 @@ def engine_from_fp8_quantization(model_name):
 @pytest.fixture(scope="module")
 def server(model_name: str, engine_from_fp8_quantization: str):
     model_path = get_model_path(model_name)
-    args = ["--tp_size", "2", "--tokenizer", model_path]
+    args = [
+        "--tp_size", "2", "--tokenizer", model_path, "--backend", "trt",
+        "--max_num_tokens", "20480", "--max_batch_size", "128"
+    ]
     with RemoteOpenAIServer(engine_from_fp8_quantization,
                             args) as remote_server:
         yield remote_server

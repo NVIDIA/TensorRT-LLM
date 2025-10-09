@@ -2,6 +2,7 @@ import re
 import unittest
 from copy import deepcopy
 
+import pytest
 import torch
 from _torch.helpers import create_mock_engine
 from parameterized import parameterized
@@ -289,6 +290,8 @@ class TestMLlama(unittest.TestCase):
         """
         Compare output to HF
         """
+        if scenario.backend == "FLASHINFER":
+            pytest.skip("https://nvbugspro.nvidia.com/bug/5458945")
         backend = scenario.backend
         metadata_cls = get_attention_backend(backend).Metadata
 
@@ -434,14 +437,16 @@ class TestMLlama(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1, lambda inputs: mllama.forward(**inputs),
+                key = (1, 0, False)
+                graph_runner.capture(key,
+                                     lambda inputs: mllama.forward(**inputs),
                                      inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if scenario.use_cuda_graph:

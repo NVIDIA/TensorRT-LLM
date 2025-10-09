@@ -1,9 +1,13 @@
+import importlib.util
 import logging
+import os
 import re
 from dataclasses import dataclass
 from itertools import chain, groupby
 from pathlib import Path
 from typing import Optional
+
+import pygit2
 
 
 def underline(title: str, character: str = "=") -> str:
@@ -80,14 +84,16 @@ def generate_examples():
     llmapi_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in llmapi_script_paths
     ]
-    llmapi_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api"
+    repo = pygit2.Repository('.')
+    commit_hash = str(repo.head.target)
+    llmapi_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/llm-api"
 
     # Collect source paths for trtllm-serve examples
     serve_script_paths = collect_script_paths("serve")
     serve_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in serve_script_paths
     ]
-    serve_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve"
+    serve_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/serve"
 
     def _get_lines_without_metadata(filename: str) -> str:
         """Get line ranges that exclude metadata lines.
@@ -145,7 +151,6 @@ def generate_examples():
                 logging.warning(f"Ignoring file: {script_path.name}")
                 continue
             script_url = f"{base_url}/{script_path.name}"
-
             # Determine language based on file extension
             language = "python" if script_path.suffix == ".py" else "bash"
 
@@ -310,6 +315,14 @@ def generate_llmapi():
     public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
 
     content = underline("API Reference", "-") + "\n\n"
+    content += ".. note::\n"
+    content += "    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.\n\n"
+    content += "    1. :tag:`stable` - The item is stable and will keep consistent.\n"
+    content += '    2. :tag:`prototype` - The item is a prototype and is subject to change.\n'
+    content += '    3. :tag:`beta` - The item is in beta and approaching stability.\n'
+    content += '    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
+    content += "\n"
+
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
         options = [
@@ -328,9 +341,31 @@ def generate_llmapi():
 
         content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         content += "\n".join(options) + "\n\n"
-
     with open(doc_path, "w+") as f:
         f.write(content)
+
+
+def update_version():
+    version_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__),
+                     "../../tensorrt_llm/version.py"))
+    spec = importlib.util.spec_from_file_location("version_module",
+                                                  version_path)
+    version_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(version_module)
+    version = version_module.__version__
+    file_list = [
+        "docs/source/quick-start-guide.md",
+        "docs/source/commands/trtllm-serve/run-benchmark-with-trtllm-serve.md"
+    ]
+    for file in file_list:
+        file_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../" + file))
+        with open(file_path, "r") as f:
+            content = f.read()
+        content = content.replace("x.y.z", version)
+        with open(file_path, "w") as f:
+            f.write(content)
 
 
 if __name__ == "__main__":

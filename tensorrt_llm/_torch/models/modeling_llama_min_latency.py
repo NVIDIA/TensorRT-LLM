@@ -1,5 +1,4 @@
 from collections.abc import Callable
-from functools import partial
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -66,7 +65,6 @@ class Llama4MinLatencyLinear(Linear):
         enable_fused_gemm_swiglu: bool = False,
         enable_fused_gemm_attn_scaling: bool = False,
         enable_trtllm_gen: bool = False,
-        post_load_weights_hook: Optional[Callable] = None,
     ):
         # First, initialize the base class.
         super().__init__(
@@ -88,7 +86,6 @@ class Llama4MinLatencyLinear(Linear):
         self.enable_fused_gemm_swiglu = enable_fused_gemm_swiglu
         self.enable_fused_gemm_attn_scaling = enable_fused_gemm_attn_scaling
         self.enable_trtllm_gen = enable_trtllm_gen
-        self.post_load_weights_hook = post_load_weights_hook
         self.position_ids = None
 
     def load_weights(self, weights: List[Dict]):
@@ -122,9 +119,6 @@ class Llama4MinLatencyLinear(Linear):
                 self.trtllm_gen_weight = shuffle_matrix_a(
                     self.weight.view(torch.uint8),
                     128).view(torch.float8_e4m3fn)
-
-        if self.post_load_weights_hook is not None:
-            self.post_load_weights_hook(self)
 
     # Override apply_linear instead of forward so that we can reuse the AllReduce/AllGather logic in the parent class.
     def apply_linear(
@@ -298,17 +292,6 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
                 enable_trtllm_gen=True,
             )
 
-            # After loading both gate_up_proj and down_proj, we need to set the scales needed by the special kernels and by
-            # the trtllm-gen gemm+swiglu kernel.
-            def post_load_weights_hook(gate_up_proj, down_proj):
-                if gate_up_proj.has_fp8_qdq:
-                    # For the special gemm+swiglu kernel, we need to set the inverse of the output scale, which is the inverse
-                    # of down_proj's combined input scale.
-                    gate_up_proj.inv_output_scale = 1.0 / down_proj.input_scale
-                    # For the trtllm-gen gemm+swiglu kernel, we need to set the global scale, which is gate_up_proj's
-                    # combined input scale times inv_output_scale.
-                    gate_up_proj.trtllm_gen_global_scale = gate_up_proj.combined_scale * gate_up_proj.inv_output_scale
-
             self.down_proj = Llama4MinLatencyLinear(
                 self.intermediate_size,
                 self.hidden_size,
@@ -320,9 +303,18 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
                 reduce_output=reduce_output,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 enable_trtllm_gen=True,
-                post_load_weights_hook=partial(post_load_weights_hook,
-                                               self.gate_up_proj),
             )
+
+    # After loading both gate_up_proj and down_proj, we need to set the scales needed by the special kernels and by
+    # the trtllm-gen gemm+swiglu kernel.
+    def post_load_weights(self):
+        if self.gate_up_proj.has_fp8_qdq:
+            # For the special gemm+swiglu kernel, we need to set the inverse of the output scale, which is the inverse
+            # of down_proj's combined input scale.
+            self.gate_up_proj.inv_output_scale = 1.0 / self.down_proj.input_scale
+            # For the trtllm-gen gemm+swiglu kernel, we need to set the global scale, which is gate_up_proj's
+            # combined input scale times inv_output_scale.
+            self.gate_up_proj.trtllm_gen_global_scale = self.gate_up_proj.combined_scale * self.gate_up_proj.inv_output_scale
 
     def forward(
         self,
@@ -417,7 +409,6 @@ class Llama4MinLatencyAttention(Llama4Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         # If we are going to use min-latency gemm+attn_scaling kernel, pass position_ids to QKV gemm and set
@@ -431,8 +422,8 @@ class Llama4MinLatencyAttention(Llama4Attention):
             skip_attn_scaling = True
 
         return super()._forward_nope(position_ids, hidden_states, attn_metadata,
-                                     attention_mask, mrope_config,
-                                     all_reduce_params, skip_attn_scaling)
+                                     attention_mask, all_reduce_params,
+                                     skip_attn_scaling)
 
 
 class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
@@ -451,7 +442,6 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
-        post_load_weights_hook: Optional[Callable] = None,
     ):
 
         super().__init__(
@@ -467,8 +457,6 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        self.post_load_weights_hook = post_load_weights_hook
-
         # Enable min-latency mode for Llama4 Maverick TP8 EP1.
         self.enable_min_latency_fused_moe = False
         if num_experts == 128 \
@@ -481,12 +469,6 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
             and routing_method.top_k == 1 \
             and apply_router_weight_on_input:
             self.enable_min_latency_fused_moe = True
-
-    def load_weights(self, weights: List[Dict]):
-        super().load_weights(weights)
-
-        if self.post_load_weights_hook:
-            self.post_load_weights_hook(self)
 
     def forward(
         self,
@@ -561,22 +543,6 @@ class Llama4MinLatencyMoE(Llama4MoE):
             overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
-        def post_load_weights_hook(shared_expert, experts):
-            # Set min-latency quant scales for routed experts if we plan to use min-latency MoE kernels.
-            # This is because the routed experts' input scale is after the score multiplication, so we must use the
-            # pre-score scaling input scale, which happens to be shared expert's input scale.
-            if experts.enable_min_latency_fused_moe and hasattr(
-                    shared_expert.gate_up_proj, "input_scale"):
-                pre_score_scaling_input_scale = shared_expert.gate_up_proj.input_scale
-                experts.min_latency_quant_scales = FusedMoEQuantScalesFP8(
-                    fc1_dequant=experts.fc31_dequant.data /
-                    experts.fc31_input_dequant.data *
-                    pre_score_scaling_input_scale,
-                    fc2_quant=experts.fc2_quant,
-                    fc2_dequant=experts.fc2_dequant,
-                    fc1_input_dequant=pre_score_scaling_input_scale,
-                )
-
         self.experts = Llama4MinLatencyFusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -588,8 +554,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True,
-            post_load_weights_hook=partial(post_load_weights_hook,
-                                           self.shared_expert))
+        )
 
         self.router = Llama4MinLatencyLinear(
             hidden_size,
@@ -597,6 +562,22 @@ class Llama4MinLatencyMoE(Llama4MoE):
             bias=False,
             dtype=model_config.pretrained_config.torch_dtype,
             quant_config=None)
+
+    def post_load_weights(self):
+        # Set min-latency quant scales for routed experts if we plan to use min-latency MoE kernels.
+        # This is because the routed experts' input scale is after the score multiplication, so we must use the
+        # pre-score scaling input scale, which happens to be shared expert's input scale.
+        if self.experts.enable_min_latency_fused_moe and hasattr(
+                self.shared_expert.gate_up_proj, "input_scale"):
+            pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
+            self.experts.min_latency_quant_scales = FusedMoEQuantScalesFP8(
+                fc1_dequant=self.experts.fc31_dequant.data /
+                self.experts.fc31_input_dequant.data *
+                pre_score_scaling_input_scale,
+                fc2_quant=self.experts.fc2_quant,
+                fc2_dequant=self.experts.fc2_dequant,
+                fc1_input_dequant=pre_score_scaling_input_scale,
+            )
 
     def compute_routed_output(
             self,
@@ -826,7 +807,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale,
+                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
+                            self.next_attn.qkv_proj, 'input_scale') else None,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             elif use_fp4_allreduce and self.next_attn is not None:
@@ -837,7 +819,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale,
+                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
+                            self.next_attn.qkv_proj, 'input_scale') else None,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:

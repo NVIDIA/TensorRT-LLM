@@ -210,14 +210,14 @@ def get_hf_target_modules(lora_weights, hf_modules):
 def invert_module_mapping(
     trtllm_modules_to_hf_modules: Dict[str, Union[str, List[str]]],
 ) -> Dict[str, str]:
-    """Invert module mapping from TensorRT-LLM -> HF to HF -> TensorRT-LLM.
+    """Invert module mapping from TensorRT LLM -> HF to HF -> TensorRT-LLM.
 
     Args:
-        trtllm_modules_to_hf_modules: Mapping from TensorRT-LLM module names to HF module names
+        trtllm_modules_to_hf_modules: Mapping from TensorRT LLM module names to HF module names
                                      (values can be strings or lists of strings)
 
     Returns:
-        Dictionary mapping HF module names to TensorRT-LLM module names
+        Dictionary mapping HF module names to TensorRT LLM module names
     """
     hf_modules_to_trtllm_modules: Dict[str, str] = {}
     for k, hf_modules in trtllm_modules_to_hf_modules.items():

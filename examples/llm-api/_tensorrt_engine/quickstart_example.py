@@ -1,11 +1,17 @@
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import BuildConfig, SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM  # NOTE the change
 
 
 def main():
 
+    build_config = BuildConfig()
+    build_config.max_batch_size = 256
+    build_config.max_num_tokens = 1024
+
     # Model could accept HF model name, a path to local HF model,
     # or TensorRT Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.
-    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+              build_config=build_config)
 
     # Sample prompts.
     prompts = [

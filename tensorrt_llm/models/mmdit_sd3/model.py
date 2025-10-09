@@ -599,7 +599,7 @@ class SD3ModelWeightsLoader(ModelWeightsLoader):
 
     def translate_to_external_key(self, tllm_key: str,
                                   tllm_to_externel_key_dict: dict):
-        """Convert and load external checkpoint into a TensorRT-LLM model.
+        """Convert and load external checkpoint into a TensorRT LLM model.
         """
         trtllm_to_hf_name = {
             r"transformer_blocks.(\d+).ff(\w*).net.1.weight":
