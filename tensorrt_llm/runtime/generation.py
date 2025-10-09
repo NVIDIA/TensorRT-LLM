@@ -655,8 +655,7 @@ class ModelConfig:
     language_adapter_config: Optional[LanguageAdapterConfig] = None
 
     @classmethod
-    def from_model_config_cpp(cls, model_config_cpp,
-                              mapping: Mapping) -> 'ModelConfig':
+    def from_model_config_cpp(cls, model_config_cpp) -> 'ModelConfig':
         """Create a partially initialized ModelConfig instance from a given ModelConfig CPP binding instance.
 
         Note that each of these classes have fields that don't exist in the other, so the created ModelConfigPython
@@ -666,10 +665,7 @@ class ModelConfig:
             max_batch_size=model_config_cpp.max_batch_size,
             max_beam_width=model_config_cpp.max_beam_width,
             vocab_size=model_config_cpp.vocab_size,
-            num_layers=model_config_cpp.num_layers(
-                pipeline_parallelism=mapping.pp_size,
-                pipeline_parallelism_rank=mapping.pp_rank,
-            ),
+            num_layers=model_config_cpp.num_layers(),
             num_heads=model_config_cpp.num_heads,
             num_kv_heads=model_config_cpp.num_kv_heads(0),
             hidden_size=model_config_cpp.hidden_size,

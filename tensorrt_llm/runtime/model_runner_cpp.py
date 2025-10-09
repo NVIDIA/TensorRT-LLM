@@ -282,7 +282,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             lora_manager = LoraManager(
                 mapping=mapping,
                 model_config=ModelConfigPython.from_model_config_cpp(
-                    model_config, mapping))
+                    model_config))
             if lora_dir is None:
                 config_lora_dir = engine_config.build_config.lora_config.lora_dir
                 if len(config_lora_dir) > 0:
