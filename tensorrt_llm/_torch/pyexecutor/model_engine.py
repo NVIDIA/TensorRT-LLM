@@ -281,7 +281,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
     ):
-        self._km_event = None
+        self._km_event = torch.cuda.Event(enable_timing=True)
         self.ub_buffers = None
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
@@ -2301,39 +2301,24 @@ class PyTorchModelEngine(ModelEngine):
                 if self.cuda_graph_runner.needs_capture(batch_size):
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
-                        result = {}
                         with MoeLoadBalancerIterContext(moe_load_balancer):
-                            result = self._forward_step(
+                            return self._forward_step(
                                 inputs,
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
-                        self._km_event = torch.cuda.Event(enable_timing=True)
-                        self._km_event.record()
-                        return result
 
                     logger.info("KM Capturing the graph of a forward step")
                     self.cuda_graph_runner.capture(batch_size,
                                                    capture_forward_fn, inputs)
-                    assert self._km_event, "KM: Event was not created"
-                    torch.cuda.synchronize()
-                    logger.info(
-                        f"KM query_event_after_graph_capture: {self._km_event}")
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
                     outputs = self.cuda_graph_runner.replay(batch_size, inputs)
-                    logger.info(
-                        f"KM query_event_after_replay_of_graph_capture: {self._km_event}"
-                    )
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         logger.info("KM Replaying the graph which was captured")
                         outputs = self.cuda_graph_runner.replay(
                             batch_size, inputs)
-                        logger.info(
-                            f"KM km_event_graph_replay: {self._km_event}")
-            self._km_event = torch.cuda.Event(enable_timing=True)
-            self._km_event.record()
 
             # We have inserted this event at the end of the forward pass regardless of
             # whether the graph was captured/replayed or eager mode execution. KVBM
@@ -2341,6 +2326,8 @@ class PyTorchModelEngine(ModelEngine):
             # be triggered. This is the whole point of cuda events and cuda streams.
             # One stream can await on work to be done on a different stream without
             # blocking work on the first stream.
+            self._km_event.record()
+
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
