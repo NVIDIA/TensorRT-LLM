@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
@@ -205,7 +206,12 @@ class BaseWorker(GenerationExecutor):
                 # point in the TRT flow is currently not supported (it's at the CPP
                 # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
                 # optimization is not available in TRT-python flow.
-                self._lora_manager = LoraManager(cpp_peft_cache_manager=None)
+                self._lora_manager = LoraManager(
+                    # TODO ZUKER: Somehow create Mapping with real info when self.llm_args is None
+                    mapping=Mapping() if self.llm_args is None else
+                    self.llm_args.parallel_config.to_mapping(),
+                    model_config=self._runtime_model_config,
+                    cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
@@ -216,8 +222,7 @@ class BaseWorker(GenerationExecutor):
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
                 ResourceManagerType.PEFT_CACHE_MANAGER)
-            self._lora_manager = LoraManager(
-                cpp_peft_cache_manager=peft_cache_manager.impl)
+            self._lora_manager = peft_cache_manager._lora_manager
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
