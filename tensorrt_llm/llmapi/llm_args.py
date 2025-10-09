@@ -1795,13 +1795,15 @@ class BaseLlmArgs(StrictBaseModel):
 
         if self.max_batch_size is not None:
             if self.max_batch_size > self.build_config.max_batch_size:
-                raise ValueError(
-                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
+                self.max_batch_size = self.build_config.max_batch_size
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] is overridden by build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
         if self.max_num_tokens is not None:
             if self.max_num_tokens > self.build_config.max_num_tokens:
-                raise ValueError(
-                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
+                self.max_num_tokens = self.build_config.max_num_tokens
+                logger.warning(
+                    f"max_num_tokens [{self.max_num_tokens}] is overridden by build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
         if self.max_seq_len is not None:
             if self.max_seq_len != self.build_config.max_seq_len:
