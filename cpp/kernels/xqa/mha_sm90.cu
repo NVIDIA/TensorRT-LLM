@@ -44,7 +44,7 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 #define SWAP_AB (!SPEC_DEC)
 #endif
 
-#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
+#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
 
 inline constexpr bool swapAB = SWAP_AB;
 
