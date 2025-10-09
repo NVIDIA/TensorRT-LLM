@@ -13,7 +13,7 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
-from tensorrt_llm.runtime import ModelConfig as ModelConfigRuntime
+from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_str_dtype, get_size_in_bytes, nvtx_range
@@ -33,7 +33,7 @@ BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
-ModelConfig = tensorrt_llm.bindings.ModelConfig
+ModelConfigCpp = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
 KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
 RequestList = list[LlmRequest]
@@ -161,7 +161,7 @@ class KVCacheManager(BaseResourceManager):
         spec_config: Optional["DecodingBaseConfig"] = None,
         layer_mask: Optional[List[bool]] = None,
         max_num_tokens: int = 8192,
-        model_config: Optional[ModelConfig] = None,
+        model_config: Optional[ModelConfigCpp] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
@@ -372,7 +372,7 @@ class KVCacheManager(BaseResourceManager):
 
     @classmethod
     def from_model_config(cls,
-                          model_config: ModelConfig,
+                          model_config: ModelConfigCpp,
                           kv_cache_config: KvCacheConfigCpp,
                           mapping: Mapping,
                           kv_cache_type: CacheTypeCpp = CacheTypeCpp.SELF,
@@ -773,7 +773,7 @@ class KVCacheManager(BaseResourceManager):
         window_size_to_layers: Dict[int, List[int]],
         max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfigCpp,
-        model_config: ModelConfig,
+        model_config: ModelConfigCpp,
         pool_memory_bytes: int,
         kv_factor: int,
         dtype: DataType,
@@ -888,7 +888,7 @@ class KVCacheManager(BaseResourceManager):
     def calculate_max_num_blocks_from_cpp(
             self,
             kv_cache_config: KvCacheConfigCpp,
-            model_config: ModelConfig,
+            model_config: ModelConfigCpp,
             extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
         """
         This function is a wrapper of KVCacheManagerCpp.calculate_max_num_blocks.
@@ -1134,7 +1134,7 @@ class PeftCacheManager(BaseResourceManager):
     def __init__(self,
                  peft_cache_config: PeftCacheConfig,
                  lora_config: LoraConfig,
-                 model_config: ModelConfig,
+                 model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
 
@@ -1179,26 +1179,11 @@ class PeftCacheManager(BaseResourceManager):
         )
         self._lora_manager = LoraManager(
             mapping=mapping,
-            model_config=self._model_config_binding_to_model_config_runtime(
-                model_config))
+            model_config=ModelConfigPython.from_model_config_cpp(
+                model_config, mapping))
 
-    @staticmethod
-    def _model_config_binding_to_model_config_runtime(
-            model_config_binding: ModelConfig) -> ModelConfigRuntime:
-        # TODO ZUKER: Init the rest of the fields as well?
-        return ModelConfigRuntime(
-            max_batch_size=model_config_binding.max_batch_size,
-            max_beam_width=model_config_binding.max_beam_width,
-            vocab_size=model_config_binding.vocab_size,
-            num_layers=model_config_binding.num_layers(
-            ),  # TODO ZUKER: Should num_layers get the PP args from mapping?
-            num_heads=model_config_binding.num_heads,
-            num_kv_heads=model_config_binding.num_kv_heads(0),
-            hidden_size=model_config_binding.hidden_size,
-            head_size=model_config_binding.head_size,
-            gpt_attention_plugin=model_config_binding.use_gpt_attention_plugin,
-            dtype=binding_to_str_dtype(model_config_binding.data_type),
-        )
+    def get_lora_manager(self) -> LoraManager:
+        return self._lora_manager
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:

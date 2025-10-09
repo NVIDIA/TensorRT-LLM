@@ -175,7 +175,9 @@ class EncDecModelRunner:
             # encoder lora manager setup
             if self.encoder_model_config.lora_plugin:
                 self.encoder_lora_manager = LoraManager(
-                    mapping=self.encoder_runtime_mapping)
+                    mapping=self.encoder_runtime_mapping,
+                    model_config=self.encoder_model_config,
+                )
                 # TODO: this is only for bart
                 self.encoder_lora_manager.load_from_hf(
                     model_dirs=lora_dir,
@@ -198,7 +200,9 @@ class EncDecModelRunner:
         # decoder lora manager setup
         if self.decoder_model_config.lora_plugin:
             self.decoder_lora_manager = LoraManager(
-                mapping=self.decoder_runtime_mapping)
+                mapping=self.decoder_runtime_mapping,
+                model_config=self.decoder_model_config,
+            )
             # TODO: this is only for bart
             self.decoder_lora_manager.load_from_hf(
                 model_dirs=lora_dir,
