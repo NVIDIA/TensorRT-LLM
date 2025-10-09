@@ -657,7 +657,7 @@ class ModelConfig:
     @classmethod
     def from_model_config_cpp(cls, model_config_cpp,
                               mapping: Mapping) -> 'ModelConfig':
-        """Create a partially initialized ModelConfigPython from a given ModelConfigCpp.
+        """Create a partially initialized ModelConfig instance from a given ModelConfig CPP binding instance.
 
         Note that each of these classes have fields that don't exist in the other, so the created ModelConfigPython
         won't have all of its fields initialized.
