@@ -244,15 +244,6 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
         return true;
     }
 
-    if (params.kv_cache_data_type == DATA_TYPE_E4M3
-        && (params.data_type == DATA_TYPE_BF16 || params.data_type == DATA_TYPE_FP16))
-    {
-        TLLM_LOG_DEBUG(
-            "XQA kernels are selected in the generation phase for fp16/bf16 input and e4m3 kv cache because MMHA does "
-            "not support this combination.");
-        return true;
-    }
-
     return mDecoderXqaRunner->shouldUse(params, /*forConfigurePlugin=*/false);
 }
 
