@@ -6,7 +6,7 @@ import traceback
 import torch
 
 from tensorrt_llm._ipc_utils import IpcMemory
-from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_comm
+from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.mapping import Mapping
 
 from ..logger import logger
@@ -77,41 +77,34 @@ class FlashInferAllReduceWorkspace:
             raise
 
         self._is_capturing = False
-        self._graph_registered = False
         logger.info(
-            f"FlashInferAllReduceWorkspace initialized for rank {mapping.tp_rank}")
+            f"FlashInferAllReduceWorkspace initialized for rank {mapping.tp_rank}"
+        )
 
     @contextlib.contextmanager
     def capture(self):
         try:
             self._is_capturing = True
-            logger.info(
-                f"Rank {self.mapping.tp_rank}: Starting CUDA graph capture")
             yield
         finally:
             self._is_capturing = False
             # Register graph buffers after capture if not already done
-            if not self._graph_registered:
-                self.register_graph_buffers()
-            logger.info(
-                f"Rank {self.mapping.tp_rank}: Finished CUDA graph capture")
+            self.register_graph_buffers()
 
     def register_graph_buffers(self):
         # add error handling
-        handle, offsets = flashinfer_comm.vllm_get_graph_buffer_ipc_meta(self.fa)
-        logger.info(
-            f"Rank {self.mapping.tp_rank}: Registering {len(handle)} graph buffer(s)"
-        )
+        handle, offsets = flashinfer_comm.vllm_get_graph_buffer_ipc_meta(
+            self.fa)
 
         world_size = self.mapping.tp_size
         tp_rank = self.mapping.tp_rank
-        tp_group_ranks = sorted(self.mapping.tp_group)
 
         all_data = [[None, None] for _ in range(world_size)]
         all_data[tp_rank] = [handle, offsets]
 
         comm = mpi_comm().Split(
-            self.mapping.pp_rank * self.mapping.cp_size + self.mapping.cp_rank, self.mapping.tp_rank)
+            self.mapping.pp_rank * self.mapping.cp_size + self.mapping.cp_rank,
+            self.mapping.tp_rank)
 
         for i in range(world_size):
             all_data[i] = comm.bcast(all_data[i], i)
@@ -119,11 +112,8 @@ class FlashInferAllReduceWorkspace:
         handles = [d[0] for d in all_data]
         offsets_list = [d[1] for d in all_data]
 
-        flashinfer_comm.vllm_register_graph_buffers(self.fa, handles, offsets_list)
-        self._graph_registered = True
-        logger.info(
-            f"Rank {self.mapping.tp_rank}: Registered {len(handle)} graph buffer(s)"
-        )
+        flashinfer_comm.vllm_register_graph_buffers(self.fa, handles,
+                                                    offsets_list)
 
 
 flashinfer_allreduce_workspace = None
