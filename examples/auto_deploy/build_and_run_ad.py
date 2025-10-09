@@ -62,7 +62,7 @@ class PromptConfig(BaseModel):
         "apply_chat_template.",
     )
     sp_kwargs: Dict[str, Any] = Field(
-        default_factory=lambda: {"max_tokens": 100, "top_k": 200, "temperature": 1.0},
+        default_factory=lambda: {"max_tokens": 100, "top_k": None, "temperature": 1.0},
         description="Sampling parameter kwargs passed on the SamplingParams class. "
         "Defaults are set to the values used in the original model.",
     )

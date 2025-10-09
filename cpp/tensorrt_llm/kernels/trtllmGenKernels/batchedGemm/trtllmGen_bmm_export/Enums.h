@@ -104,6 +104,24 @@ enum class TileScheduler
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class CtaSwizzleType : uint32_t
+{
+    // Rasterize CTAs along the M dimension.
+    RasterizeAlongM = 0,
+    // Rasterize CTAs along the N dimension.
+    RasterizeAlongN,
+    // Swizzle CTAs in zig-zag pattern along M dimension, Zig-zag width is 2.
+    ZigZagAlongM2,
+    // Swizzle CTAs in zig-zag pattern along N dimension, Zig-zag width is 2.
+    ZigZagAlongN2,
+    // Swizzle CTAs in zig-zag pattern along M dimension, Zig-zag width is 4.
+    ZigZagAlongM4,
+    // Swizzle CTAs in zig-zag pattern along N dimension, Zig-zag width is 4.
+    ZigZagAlongN4,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Helper functions to check the SplitK type.
 
 #define SPLIT_K_FUNCTION(Mode)                                                                                         \

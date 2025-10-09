@@ -32,8 +32,12 @@ class Qwen3Attention(QKNormRoPEAttention):
         model_config: ModelConfig[Qwen3Config],
         layer_idx: Optional[int] = None,
         fuse_qk_norm_rope: bool = True,
+        attn_output_gate: bool = False,
+        use_gemma_rms_norm: bool = False,
     ):
         config = model_config.pretrained_config
+        self.pretrained_config = config
+        self.attn_output_gate = attn_output_gate
 
         if getattr(config, "rope_scaling", None) is not None:
             if "type" in config.rope_scaling:
@@ -58,13 +62,15 @@ class Qwen3Attention(QKNormRoPEAttention):
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
+            bias=getattr(config, "attention_bias", None),
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=fuse_qk_norm_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
+            dense_bias=getattr(config, "attention_bias", None),
             config=model_config,
+            attn_output_gate=self.attn_output_gate,
+            use_gemma_rms_norm=use_gemma_rms_norm,
         )
 
 

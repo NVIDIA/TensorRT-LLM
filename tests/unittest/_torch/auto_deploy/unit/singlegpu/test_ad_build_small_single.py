@@ -49,6 +49,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             attn_backend="flashinfer",
             compile_backend="torch-opt",
+            free_mem_ratio=0.0001,
         ),
         get_small_model_config_pytest_param(
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -94,12 +95,18 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             attn_backend="flashinfer",
             compile_backend="torch-simple",
         ),
+        get_small_model_config_pytest_param(
+            "nvidia/NVIDIA-Nemotron-Nano-12B-v2",
+            attn_backend="flashinfer",
+            compile_backend="torch-simple",
+        ),
     ],
 )
 def test_build_ad(experiment_config: Dict, mode: str):
     if (
         "DeepSeek-V3" in experiment_config["args"]["model"]
         or "Phi-3-mini-4k-instruct" in experiment_config["args"]["model"]
+        or "NVIDIA-Nemotron-Nano-12B-v2" in experiment_config["args"]["model"]
         and mode == "transformers"
     ):
         pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")

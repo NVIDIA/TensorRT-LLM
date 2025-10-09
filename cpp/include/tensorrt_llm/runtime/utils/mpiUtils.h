@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #if ENABLE_MULTI_DEVICE
@@ -425,7 +426,29 @@ public:
         return !(rhs == *this);
     }
 
+    bool couldUseMPI() const
+    {
+        if (!mDisableMPI.has_value())
+        {
+            char* val = std::getenv("TLLM_DISABLE_MPI");
+            if (val != NULL && std::string(val) == "1")
+            {
+                mDisableMPI = true;
+            }
+            else
+            {
+                mDisableMPI = false;
+            }
+        }
+        if (mDisableMPI.value())
+        {
+            throw std::runtime_error("MPI is disabled, DON\'T USE MPI");
+        }
+        return true;
+    }
+
 private:
+    mutable std::optional<bool> mDisableMPI;
     //! \brief Corresponds to `world()` by default, but can be overridden per process.
     static MpiComm& mutableSession();
 
