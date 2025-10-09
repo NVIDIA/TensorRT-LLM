@@ -1088,9 +1088,7 @@ class LoraManager(object):
                     if lora_module == "mlp_gate_up":
                         assert t_out.shape[rank_dim] % 2 == 0
                         half_size = t_out.shape[rank_dim] // 2
-                        interleaved_parts = interleave_fused_lora_weights_for_tp(
-                            t_out, rank_dim, tp_size, [half_size, half_size]
-                        )
+                        part_sizes = [half_size, half_size]
                     elif lora_module == "attn_qkv":
                         q_size = (
                             self._model_config.head_size * self._model_config.num_heads * tp_size
@@ -1098,12 +1096,14 @@ class LoraManager(object):
                         kv_size = (
                             self._model_config.head_size * self._model_config.num_kv_heads * tp_size
                         )
+                        part_sizes = [q_size, kv_size, kv_size]
+
+                    if part_sizes:
                         interleaved_parts = interleave_fused_lora_weights_for_tp(
-                            t_out, rank_dim, tp_size, [q_size, kv_size, kv_size]
+                            t_out, rank_dim, tp_size, part_sizes
                         )
-                    # We have to concatenate them all back after interleaving, as the CPP expects the full non-split
-                    # weights.
-                    if interleaved_parts:
+                        # We have to concatenate them all back after interleaving, as the CPP expects the full non-split
+                        # weights.
                         t_out = torch.cat(interleaved_parts, dim=rank_dim)
 
                     effective_rank = t_in.shape[rank_dim]
