@@ -20,9 +20,9 @@ _RU_LORA_ADAPTER_PROMPTS = [
 ]
 
 
-def _generate_llm_response_lora_fused_modules(llm_class: Type[BaseLLM],
-                                              prompts: List[str],
-                                              **extra_llm_kwargs) -> List[str]:
+def _generate_phi3_response_lora_fused_modules(llm_class: Type[BaseLLM],
+                                               prompts: List[str],
+                                               **extra_llm_kwargs) -> List[str]:
     """Generates responses with LoRA requests with the Phi-3-mini-4k-instruct-ru-lora adapter.
     The used LoRA adapter has fused attention QKV and fused MLP gate up proj modules.
     Returns the generated texts.
@@ -48,18 +48,18 @@ def _generate_llm_response_lora_fused_modules(llm_class: Type[BaseLLM],
     return [output.outputs[0].text for output in outputs]
 
 
-def check_lora_fused_modules_output_tp2_identical_to_tp1(
+def check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(
         llm_class: Type[BaseLLM], **extra_llm_kwargs) -> None:
     """Tests the output with LoRA requests with the Phi-3-mini-4k-instruct-ru-lora adapter with TP=2 is identical to
     the output with TP=1.
     That LoRA adapter has fused attention QKV and fused MLP gate up proj modules.
     """  # noqa: D205
     extra_llm_kwargs["tensor_parallel_size"] = 1
-    outputs_tp1 = _generate_llm_response_lora_fused_modules(
+    outputs_tp1 = _generate_phi3_response_lora_fused_modules(
         llm_class, _RU_LORA_ADAPTER_PROMPTS, **extra_llm_kwargs)
 
     extra_llm_kwargs["tensor_parallel_size"] = 2
-    outputs_tp2 = _generate_llm_response_lora_fused_modules(
+    outputs_tp2 = _generate_phi3_response_lora_fused_modules(
         llm_class, _RU_LORA_ADAPTER_PROMPTS, **extra_llm_kwargs)
 
     assert outputs_tp1 == outputs_tp2

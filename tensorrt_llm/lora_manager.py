@@ -671,7 +671,7 @@ class LoraManager(object):
 
         Args:
             mapping (Mapping): Parallelism related information.
-            model_config (ModelConfig): model configuration python class (not CPP binding).
+            model_config (ModelConfig): model configuration python class instance.
             cpp_peft_cache_manager (PeftCacheManager, optional): used by is_adapter_in_cpu_cache method, that's used for
                 a performance optimization with LoRA of not sending the LoRA adapter weights with every LLM request when
                 the adapter is already loaded in the LoRA CPU cache.
@@ -1001,6 +1001,38 @@ class LoraManager(object):
             # -> [Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN] where N is TP size, for attn_qkv.
             return list(itertools.chain.from_iterable(zip(*weight_parts_tp_weights)))
 
+        def prepare_fused_lora_modules_for_tp(
+            lora_module: str, t_out: torch.Tensor, rank_dim: int
+        ) -> torch.Tensor:
+            """Interleaves fused LoRA modules weights for TP. This is required since HF stores the parts weights
+            sequentially, whereas with TP>1 we need them to be interleaved.
+            e.g.  In case of attn_qkv: Convert t_out=torch.cat([Wq, Wk, Wv]) to
+                  torch.cat([Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN])
+                  where N=TP size.
+            """  # noqa: D205
+            tp_size = self._mapping.tp_size
+            if tp_size == 1:
+                return t_out
+            part_sizes = []
+            if lora_module == "mlp_gate_up":
+                assert t_out.shape[rank_dim] % 2 == 0
+                half_size = t_out.shape[rank_dim] // 2
+                part_sizes = [half_size, half_size]
+            elif lora_module == "attn_qkv":
+                # The sizes are multiplied by tp_size because num_heads and num_kv_heads here were already
+                # divided by tp_size
+                q_size = self._model_config.head_size * self._model_config.num_heads * tp_size
+                kv_size = self._model_config.head_size * self._model_config.num_kv_heads * tp_size
+                part_sizes = [q_size, kv_size, kv_size]
+
+            if part_sizes:
+                interleaved_parts = interleave_fused_lora_weights_for_tp(
+                    t_out, rank_dim, tp_size, part_sizes
+                )
+                # Concatenate them all after interleaving, as the CPP implementation expects the full non-split weights.
+                t_out = torch.cat(interleaved_parts, dim=rank_dim)
+            return t_out
+
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._cpp_lora_weights:
                 self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
@@ -1079,36 +1111,7 @@ class LoraManager(object):
 
                     is_dora = t_mag is not None
                     rank_dim = 1 if has_expert_indices else 0
-
-                    # Prepare fused modules weights for TP
-                    # For fused modules, HF stores the parts weights sequentially, whereas with TP>1 we need them to be
-                    # interleaved.
-                    # e.g. Convert [Wq, Wk, Wv] to [Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN]
-                    # where N=TP size, for attn_qkv.
-                    tp_size = self._mapping.tp_size
-                    part_sizes = []
-                    if lora_module == "mlp_gate_up":
-                        assert t_out.shape[rank_dim] % 2 == 0
-                        half_size = t_out.shape[rank_dim] // 2
-                        part_sizes = [half_size, half_size]
-                    elif lora_module == "attn_qkv":
-                        # The sizes are multiplied by tp_size because num_heads and num_kv_heads here were already
-                        # divided by tp_size
-                        q_size = (
-                            self._model_config.head_size * self._model_config.num_heads * tp_size
-                        )
-                        kv_size = (
-                            self._model_config.head_size * self._model_config.num_kv_heads * tp_size
-                        )
-                        part_sizes = [q_size, kv_size, kv_size]
-
-                    if part_sizes:
-                        interleaved_parts = interleave_fused_lora_weights_for_tp(
-                            t_out, rank_dim, tp_size, part_sizes
-                        )
-                        # We have to concatenate them all back after interleaving, as the CPP expects the full non-split
-                        # weights.
-                        t_out = torch.cat(interleaved_parts, dim=rank_dim)
+                    t_out = prepare_fused_lora_modules_for_tp(lora_module, t_out, rank_dim)
 
                     effective_rank = t_in.shape[rank_dim]
 
