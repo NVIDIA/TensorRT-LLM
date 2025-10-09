@@ -62,7 +62,6 @@ def test_llama_7b_multi_lora_tp2():
         cuda_graph_config=None)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5560921")
 @skip_ray
 @pytest.mark.gpu2
 def test_llm_rpc_tp2():
@@ -81,7 +80,6 @@ def test_llm_rpc_tp2():
         assert len(res.outputs[0].token_ids) == 10
 
 
-@pytest.mark.skip(reason="https://nvbugs/5560921")
 @skip_ray
 @pytest.mark.gpu2
 @pytest.mark.asyncio
