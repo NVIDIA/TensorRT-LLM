@@ -166,10 +166,9 @@ class QKNormRoPEAttention(Attention):
         if use_gemma_rms_norm:
             assert fuse_qk_norm_rope is False, "fused_qk_norm_rope is not supported for gemma rms norm."
 
-        # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
-        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope
-        if attn_output_gate and use_gemma_rms_norm:
-            rope_fusion = False
+        # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
+        # will be skipped in the overridden apply_rope.
+        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope and not attn_output_gate and not use_gemma_rms_norm
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
 
@@ -180,8 +179,6 @@ class QKNormRoPEAttention(Attention):
             max_position_embeddings=max_position_embeddings,
             bias=bias,
             pos_embd_params=pos_embd_params,
-            # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP,
-            # and self.rotary_emb will be skipped in the overridden apply_rope.
             rope_fusion=rope_fusion,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -196,12 +193,12 @@ class QKNormRoPEAttention(Attention):
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
                               has_weights=True,
-                              use_gemma_rms_norm=use_gemma_rms_norm)
+                              use_gemma=use_gemma_rms_norm)
         self.k_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
                               has_weights=True,
-                              use_gemma_rms_norm=use_gemma_rms_norm)
+                              use_gemma=use_gemma_rms_norm)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 

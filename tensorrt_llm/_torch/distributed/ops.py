@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import mpi_comm
+from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -146,6 +146,7 @@ def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     group: List[int],
     rank: int,
+    group_boxed: object,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -168,7 +169,9 @@ def _allgather(
 
     Args:
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
-        mapping (Mapping):  The parallel mapping.
+        group (List[int]): The list of ranks to participate in the all-gather.
+        rank (int): The rank of the current process.
+        group_boxed (object): The boxed ProcessGroup object for the list of ranks.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
@@ -186,26 +189,32 @@ def _allgather(
                 val.shape[dim] == sizes[rank] for val in input
                 if val is not None
             ])
-
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
-        torch_op = torch.ops.trtllm.allgather
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.allgather_pg
+        else:
+            torch_op = torch.ops.trtllm.allgather
+
         output_info = get_output_info(input, dim)
         input = input.contiguous().view(-1, output_info['numel_base'])
     else:
         input, valid = filter_valid_input(input)
-        torch_op = torch.ops.trtllm.allgather_list
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.allgather_list_pg
+        else:
+            torch_op = torch.ops.trtllm.allgather_list
+
         output_info = [get_output_info(val, dim) for val in input]
         input = [
             val.contiguous().view(-1, val_info['numel_base'])
             for val, val_info in zip(input, output_info)
         ]
 
-    output = torch_op(
-        input,
-        sizes,
-        group,
-    )
+    if mpi_disabled():
+        output = torch_op(input, sizes, group, group_boxed)
+    else:
+        output = torch_op(input, sizes, group)
 
     def convert_output(x, x_info):
         if dim == 0:
@@ -236,7 +245,8 @@ def allgather(
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    return _allgather(input, mapping.tp_group, mapping.tp_rank, dim, sizes)
+    return _allgather(input, mapping.tp_group, mapping.tp_rank,
+                      mapping.tp_group_pg.boxed(), dim, sizes)
 
 
 def cp_allgather(
@@ -245,7 +255,8 @@ def cp_allgather(
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    return _allgather(input, mapping.cp_group, mapping.cp_rank, dim, sizes)
+    return _allgather(input, mapping.cp_group, mapping.cp_rank,
+                      mapping.cp_group_pg.boxed(), dim, sizes)
 
 
 def alltoall_helix(
@@ -319,23 +330,29 @@ def reducescatter(
         return x
 
     if isinstance(input, torch.Tensor):
-        torch_op = torch.ops.trtllm.reducescatter
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.reducescatter_pg
+        else:
+            torch_op = torch.ops.trtllm.reducescatter
         output_info = get_output_info(input, dim)
         input = convert_input(input, output_info)
     else:
         input, valid = filter_valid_input(input)
-        torch_op = torch.ops.trtllm.reducescatter_list
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.reducescatter_list_pg
+        else:
+            torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
             convert_input(val, val_info)
             for val, val_info in zip(input, output_info)
         ]
 
-    output = torch_op(
-        input,
-        sizes,
-        mapping.tp_group,
-    )
+    if mpi_disabled():
+        output = torch_op(input, sizes, mapping.tp_group,
+                          mapping.tp_group_pg.boxed())
+    else:
+        output = torch_op(input, sizes, mapping.tp_group)
 
     if isinstance(input, torch.Tensor):
         output = output.view(output_info['output_shape'])
@@ -508,6 +525,9 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
+        self._disable_mpi = mpi_disabled()
+
+        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
@@ -591,7 +611,17 @@ class AllReduce(nn.Module):
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
         if allreduce_strategy == AllReduceStrategy.MNNVL:
             allreduce_strategy = AllReduceStrategy.AUTO
-        output = torch.ops.trtllm.allreduce(
+
+        additional_args = {}
+        if self._disable_mpi:
+            pg = self.mapping.tp_group_pg
+            assert pg is not None, "TP ProcessGroup not initialised"
+            additional_args = {
+                "rank": torch.distributed.get_rank(),
+                "pg": pg.boxed(),
+            }
+
+        output = self.all_reduce_op(
             input=input,
             residual=all_reduce_params.residual,
             norm_weight=all_reduce_params.norm_weight,
@@ -604,6 +634,7 @@ class AllReduce(nn.Module):
             eps=all_reduce_params.eps,
             trigger_completion_at_end=all_reduce_params.
             trigger_completion_at_end,
+            **additional_args,
         )
 
         return output if len(output) > 1 else output[0]

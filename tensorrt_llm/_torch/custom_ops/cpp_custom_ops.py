@@ -10,7 +10,7 @@ from ..._utils import get_sm_version
 def _register_fake():
 
     @torch.library.register_fake("trtllm::allreduce")
-    def _(
+    def allreduce(
         input,
         residual,
         norm_weight,
@@ -55,6 +55,25 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    @torch.library.register_fake("trtllm::allreduce_pg")
+    def _(
+        input,
+        residual,
+        norm_weight,
+        scale,
+        bias,
+        workspace,
+        group,
+        rank,
+        pg,
+        strategy,
+        op,
+        eps,
+        trigger_completion_at_end,
+    ):
+        return allreduce(input, residual, norm_weight, scale, bias, workspace,
+                         group, strategy, op, eps, trigger_completion_at_end)
+
     #MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
     def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
@@ -76,12 +95,16 @@ def _register_fake():
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
-    def _(input, sizes, group):
+    def allgather(input, sizes, group):
         if sizes is None:
             output_shape = (len(group) * input.shape[0], *input.shape[1:])
         else:
             output_shape = (sum(sizes), *input.shape[1:])
         return input.new_empty(output_shape)
+
+    @torch.library.register_fake("trtllm::allgather_pg")
+    def _(input, sizes, group, process_group):
+        return allgather(input, sizes, group)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
     def _(
@@ -439,7 +462,7 @@ def _register_fake():
                                       dtype=gemm2_output.dtype)
 
     @torch.library.register_fake("trtllm::allgather_list")
-    def _(input_list, sizes, group):
+    def allgather_list(input_list, sizes, group):
         assert len(input_list) > 0
 
         def create_output_tensor(i):
@@ -452,8 +475,12 @@ def _register_fake():
 
         return [create_output_tensor(i) for i in input_list]
 
+    @torch.library.register_fake("trtllm::allgather_list_pg")
+    def _(input_list, sizes, group, process_group):
+        return allgather_list(input_list, sizes, group)
+
     @torch.library.register_fake("trtllm::reducescatter")
-    def _(input, sizes, group):
+    def reducescatter(input, sizes, group):
         import tensorrt_llm
         local_rank = tensorrt_llm.mpi_rank()
 
@@ -463,6 +490,10 @@ def _register_fake():
         else:
             shape[0] = sizes[local_rank]
         return input.new_empty(shape)
+
+    @torch.library.register_fake("trtllm::reducescatter_pg")
+    def _(input, sizes, group, process_group):
+        return reducescatter(input, sizes, group)
 
     @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
@@ -517,3 +548,11 @@ def _register_fake():
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):
         return gathered_o.new_empty(*gathered_o.shape[1:])
+
+    @torch.library.register_fake("trtllm::tinygemm2")
+    def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+        # input [M, K], weight [N, K], bias [N]
+        # Output should be [M, N]
+        m = input.shape[0]
+        n = weight.shape[0]
+        return input.new_empty((m, n), dtype=input.dtype)

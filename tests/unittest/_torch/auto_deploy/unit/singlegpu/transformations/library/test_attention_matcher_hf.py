@@ -16,6 +16,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import Atten
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 torch.manual_seed(0)
 
@@ -31,7 +32,7 @@ class MockAttentionDescriptor(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> Callable:
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
 
 class HFWrapper(nn.Module):
@@ -50,6 +51,7 @@ def _joint_transform(gm: GraphModule) -> None:
         {
             "match_repeat_kv": {
                 "stage": "pattern_matcher",
+                "run_shape_prop": True,
             },
             "match_eager_attention": {
                 "stage": "pattern_matcher",
@@ -82,12 +84,18 @@ def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str)
         pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
 
     def verify_matcher(gm: GraphModule):
-        """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention (layout="bsnd")
         call in the graph. Also check that there is no repeat_kv pattern left.
         """
-        nodes = gm.graph.find_nodes(
-            op="call_function", target=torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
-        )
+        nodes = [
+            n
+            for n in gm.graph.nodes
+            if (
+                is_op(n, torch.ops.auto_deploy.torch_attention)
+                and isinstance(n.args[-1], str)
+                and n.args[-1] == "bsnd"
+            )
+        ]
         assert len(nodes) == 1, "Expected exactly one bsnd_grouped_sdpa call in the graph"
 
         # TODO: check non-qkv args of node

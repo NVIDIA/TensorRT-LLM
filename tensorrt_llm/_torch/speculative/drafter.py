@@ -67,3 +67,15 @@ class Drafter(ABC):
             num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))
+
+    def run_drafter_post(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+        is_warmup: bool = False,
+    ) -> None:
+        """
+        If draft forward needs to be run directly after the target model forward,
+        this method can be overridden to do that.
+        Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
+        """

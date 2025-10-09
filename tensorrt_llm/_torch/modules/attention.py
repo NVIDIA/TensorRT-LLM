@@ -128,6 +128,7 @@ class Attention(nn.Module):
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
         attn_output_gate: Optional[bool] = None,
+        use_custom_cublas_mm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -177,8 +178,7 @@ class Attention(nn.Module):
         self.attn_output_gate = attn_output_gate
 
         if self.attn_output_gate:
-            logger.warning_once("using attn output gate!",
-                                key="attn_output_gate")
+            logger.info_once("using attn output gate!", key="attn_output_gate")
 
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
@@ -226,7 +226,7 @@ class Attention(nn.Module):
 
         self.qkv_proj = Linear(
             self.hidden_size,
-            tp_size * self.q_size * (1 + (1 if self.attn_output_gate else 0)) +
+            tp_size * self.q_size * (2 if self.attn_output_gate else 1) +
             2 * tp_size * self.kv_size,
             bias=bias,
             dtype=dtype,
@@ -239,7 +239,7 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -257,7 +257,7 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -535,10 +535,11 @@ class Attention(nn.Module):
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
             orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # Single line: view -> chunk -> reshape both q and gate
+            q, gate = [
+                t.reshape(*orig_shape, -1) for t in torch.chunk(
+                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
+            ]
             ### TODO: avoid the redundant split and concat
             qkv = torch.concat([q, k, v], dim=-1)
 
@@ -586,8 +587,7 @@ class Attention(nn.Module):
         """
         # If RoPE is fused into the attention OP, do not apply RoPE here.
         if not self.rope_fusion and position_ids is not None:
-            if k is None and v is None:
-                q, k, v = self.split_qkv(q, k, v)
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
