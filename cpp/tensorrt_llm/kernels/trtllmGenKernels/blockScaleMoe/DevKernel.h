@@ -168,6 +168,53 @@ namespace moe::dev
         TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                                       \
     }
 
+#define LAUNCH_ROUTING_WITH_EXTRA_TWO_FLAGS(                                                                           \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag1, extraFlag2)                         \
+    if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1 && extraFlag2)                                                \
+    {                                                                                                                  \
+        LAUNCH_PDL(                                                                                                    \
+            data, coopLaunch, LAUNCH_ESC(float, float, true, true), kernel, numBlocks, numThreads, smemSize, stream);  \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1)                                                         \
+    {                                                                                                                  \
+        LAUNCH_PDL(                                                                                                    \
+            data, coopLaunch, LAUNCH_ESC(float, float, true, false), kernel, numBlocks, numThreads, smemSize, stream); \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag2)                                                         \
+    {                                                                                                                  \
+        LAUNCH_PDL(                                                                                                    \
+            data, coopLaunch, LAUNCH_ESC(float, float, false, true), kernel, numBlocks, numThreads, smemSize, stream); \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                       \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float, false, false), kernel, numBlocks, numThreads, smemSize,  \
+            stream);                                                                                                   \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1 && extraFlag2)                                       \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, true, true), kernel, numBlocks,          \
+            numThreads, smemSize, stream);                                                                             \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1)                                                     \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, true, false), kernel, numBlocks,         \
+            numThreads, smemSize, stream);                                                                             \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag2)                                                     \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, false, true), kernel, numBlocks,         \
+            numThreads, smemSize, stream);                                                                             \
+    }                                                                                                                  \
+    else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, false, false), kernel, numBlocks,        \
+            numThreads, smemSize, stream);                                                                             \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_LOG_ERROR("Unsupported dtypeExpW");                                                                       \
+    }
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace activation
