@@ -611,11 +611,10 @@ class ModelRunner(ModelRunnerMixin):
             session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
-            lora_manager = LoraManager()
+            lora_manager = LoraManager(mapping=runtime_mapping)
             if lora_dir is not None:
                 lora_manager.load_from_ckpt(lora_dir,
                                             model_config=model_config,
-                                            runtime_mapping=runtime_mapping,
                                             ckpt_source=lora_ckpt_source)
         else:
             lora_manager = None
@@ -720,11 +719,10 @@ class ModelRunner(ModelRunnerMixin):
                                   debug_mode=debug_mode,
                                   stream=stream)
             if session.use_lora_plugin:
-                lora_manager = LoraManager()
+                lora_manager = LoraManager(mapping=runtime_mapping)
                 if lora_dir is not None:
                     lora_manager.load_from_ckpt(lora_dir,
                                                 model_config=model_config,
-                                                runtime_mapping=runtime_mapping,
                                                 ckpt_source=lora_ckpt_source)
             else:
                 lora_manager = None

@@ -1169,7 +1169,14 @@ class PeftCacheManager(BaseResourceManager):
             lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
             binding_to_str_dtype(model_config.data_type),
             lora_config.swap_gate_up_proj_lora_b_weight)
-        self._lora_manager = LoraManager()
+        mapping = Mapping(
+            world_size=world_config.size,
+            rank=world_config.rank,
+            tp_size=world_config.tensor_parallelism,
+            pp_size=world_config.pipeline_parallelism,
+            gpus_per_node=world_config.gpus_per_node,
+        )
+        self._lora_manager = LoraManager(mapping=mapping)
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:
@@ -1183,7 +1190,6 @@ class PeftCacheManager(BaseResourceManager):
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
                     model_config=self._lora_model_config,
-                    runtime_mapping=None,
                     uids=[request.lora_task_id],
                     ckpt_source=self._lora_config.lora_ckpt_source)
                 request.lora_weights = self._lora_manager.cpp_lora_weights[
