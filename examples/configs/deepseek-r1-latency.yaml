@@ -1,4 +1,3 @@
-backend: pytorch
 max_batch_size: 4
 tensor_parallel_size: 8
 moe_expert_parallel_size: 2
