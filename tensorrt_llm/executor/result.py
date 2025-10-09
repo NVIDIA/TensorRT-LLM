@@ -16,7 +16,8 @@ try:
 except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
-from .._utils import mpi_disabled, nvtx_range_debug, unwrap_ray_errors
+from .._ray_utils import unwrap_ray_errors
+from .._utils import mpi_disabled, nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer

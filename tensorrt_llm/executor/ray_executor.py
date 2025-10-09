@@ -12,7 +12,8 @@ from ray.util.placement_group import (PlacementGroup,
                                       get_current_placement_group,
                                       placement_group)
 
-from tensorrt_llm._utils import get_free_port, unwrap_ray_errors
+from tensorrt_llm._ray_utils import unwrap_ray_errors
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_range_debug
