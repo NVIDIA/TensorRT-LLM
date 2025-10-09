@@ -319,3 +319,72 @@ def _fake(
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_int4_gptq_linear", mutates_args=())
+def torch_fake_quant_int4_gptq_linear(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    pack_factor = 8
+    maxq = 15
+    dequant_dtype = torch.int8
+    dev = qweight.device
+
+    if qweight.dim() != 2:
+        raise RuntimeError("qweight must be 2D [K/8, N]")
+    K = qweight.size(0) * pack_factor
+    N = qweight.size(1)
+
+    if scales.dim() != 2 or scales.size(1) != N:
+        raise RuntimeError(f"scales must be [G, N={N}]")
+    G = scales.size(0)
+
+    if K % G != 0:
+        raise RuntimeError(f"K ({K}) must be divisible by G ({G})")
+    block_size = K // G
+
+    if qzeros.dim() != 2 or qzeros.size(0) != G or qzeros.size(1) * pack_factor != N:
+        raise RuntimeError(f"qzeros must be [G={G}, N/8={N // 8}]")
+
+    # Build g_idx and shift tables
+    g_idx = torch.arange(K, device=dev, dtype=torch.int32) // block_size  # [K]
+    wf = torch.arange(pack_factor, device=dev, dtype=torch.int32) * 4  # [8]
+    wf_unsqueeze_zero = wf.view(1, 1, pack_factor)  # [1,1,8]
+    wf_unsqueeze_neg_one = wf.view(1, pack_factor, 1)  # [1,8,1]
+
+    zeros = torch.bitwise_right_shift(
+        torch.unsqueeze(qzeros, 2).expand(-1, -1, pack_factor),
+        wf_unsqueeze_zero,
+    ).to(dequant_dtype)
+    zeros = torch.bitwise_and(zeros, maxq).reshape(scales.shape)
+
+    weight = torch.bitwise_and(
+        torch.bitwise_right_shift(
+            torch.unsqueeze(qweight, 1).expand(-1, pack_factor, -1),
+            wf_unsqueeze_neg_one,
+        ).to(dequant_dtype),
+        maxq,
+    )
+    weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+
+    # scales[g_idx] and zeros[g_idx] are per-group; cast to input dtype at the end
+    weights = scales[g_idx.long()] * (weight - zeros[g_idx.long()]).to(input.dtype)
+
+    out = torch.matmul(input, weights)
+    return out
+
+
+@torch_fake_quant_int4_gptq_linear.register_fake
+def torch_fake_quant_int4_gptq_linear_fake(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    A, out_features = qweight.shape
+    batch_shape = input.shape[:-1]
+    out_shape = (*batch_shape, out_features)
+    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
