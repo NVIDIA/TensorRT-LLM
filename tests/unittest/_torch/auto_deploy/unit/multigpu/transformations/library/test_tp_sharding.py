@@ -1,5 +1,6 @@
 """Tests for basic graph sharding."""
 
+# add to the path directory 4 directories up
 from functools import partial
 from typing import Type
 
@@ -7,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 from _model_test_utils import FakeFP8Linear
@@ -193,12 +195,21 @@ def _run_job(
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
+    sharding_source = ["custom"] if from_config else ["heuristic"]
+
+    if sharding_source == ["custom"]:
+        # write predefined_config to tp_sharding.yaml file
+        with open("tp_sharding.yaml", "w") as f:
+            yaml.dump(predefined_config, f, sort_keys=False)
     gm_transformed = InferenceOptimizer(
         None,
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "sharding_source": sharding_source,
+                "custom_sharding_config": "tp_sharding.yaml",
+                "support_partial_config": False,
+                "sharding_dims": ["tp"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -338,18 +349,50 @@ def _run_pattern_detection_job(
                         )
                     )
 
+    sharding_source = ["custom"] if from_config else ["heuristic"]
+
+    if sharding_source == ["custom"]:
+        # write predefined_config to tp_sharding.yaml file
+        with open("tp_sharding.yaml", "w") as f:
+            yaml.dump(predefined_config, f, sort_keys=False)
+    InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_source": sharding_source,
+                "custom_sharding_config": "tp_sharding.yaml",
+                "support_partial_config": False,
+                "sharding_dims": ["tp"],
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
+
+    sharding_source = ["custom"] if from_config else ["heuristic"]
+
+    if sharding_source == ["custom"]:
+        # write predefined_config to tp_sharding.yaml file
+        with open("tp_sharding.yaml", "w") as f:
+            yaml.dump(predefined_config, f, sort_keys=False)
     # get detected transformations
     optimizer = InferenceOptimizer(
         None,
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": from_config,
+                "sharding_source": sharding_source,
+                "custom_sharding_config": "tp_sharding.yaml",
+                "support_partial_config": False,
+                "sharding_dims": ["tp"],
             },
         },
     )
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
+    optimizer.shared_config.sharding_config.predefined_config = predefined_config
     _ = optimizer(None, gm)
     detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
 
@@ -409,7 +452,3 @@ def test_sharding_pattern_detection(
     No need to run distributed job, can be run on single process.
     """
     _run_pattern_detection_job(model_cls, bias, 0, world_size, from_config)
-
-
-if __name__ == "__main__":
-    _run_pattern_detection_job(nn.Linear, False, 0, 8, False)
