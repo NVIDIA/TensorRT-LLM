@@ -33,9 +33,12 @@ enum MoeA2AMetaInfoIndex {
     LOCAL_TOKEN_COUNTER_OFFSET_INDEX = 1,
     SEND_COUNTERS_OFFSET_INDEX = 2,
     RECV_COUNTERS_OFFSET_INDEX = 3,
-    COMPLETION_FLAGS_OFFSET_INDEX = 4,
-    PAYLOAD_DATA_OFFSET_INDEX = 5,
-    NUM_METAINFO_FIELDS = 6
+    // Dispatch completion flags offset
+    DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = 4,
+    // Combine completion flags offset
+    COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = 5,
+    PAYLOAD_DATA_OFFSET_INDEX = 6,
+    NUM_METAINFO_FIELDS = 7
 };
 
 namespace
@@ -54,7 +57,8 @@ struct MoeA2ADataOffsets
     size_t local_token_counter_offset;
     size_t send_counters_offset;
     size_t recv_counters_offset;
-    size_t completion_flags_offset;
+    size_t dispatch_completion_flags_offset;
+    size_t combine_completion_flags_offset;
     size_t topk_target_ranks_offset;
     size_t topk_send_indices_offset;
     size_t payload_data_offset;
@@ -85,9 +89,14 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokensPerRank)
     offsets.recv_counters_offset = offset;
     offset += epSize * SIZEOF_INT32;
     
-    // completion_flags
+    // dispatch completion flags
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets.completion_flags_offset = offset;
+    offsets.dispatch_completion_flags_offset = offset;
+    offset += epSize * SIZEOF_INT32;
+
+    // combine completion flags
+    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+    offsets.combine_completion_flags_offset = offset;
     offset += epSize * SIZEOF_INT32;
     
 
@@ -277,7 +286,7 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
         uint8_t* target_workspace = workspace_ptr + (target_rank * workspace.stride(0));
 
         params.recv_counters[target_rank] = reinterpret_cast<int*>(target_workspace + offsets.recv_counters_offset);
-        params.completion_flags[target_rank] = reinterpret_cast<uint32_t*>(target_workspace + offsets.completion_flags_offset);
+        params.completion_flags[target_rank] = reinterpret_cast<uint32_t*>(target_workspace + offsets.dispatch_completion_flags_offset);
 
         int64_t offset = offsets.payload_data_offset;  // Start after auxiliary data
 
@@ -455,11 +464,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tenso
         }
     }
 
-    // completion flags for all ranks
+    // completion flags for all ranks (combine)
     for (int rank = 0; rank < epSize; rank++)
     {
         uint8_t* rank_base = workspace_ptr + rank * workspace.stride(0);
-        params.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
+        params.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.combine_completion_flags_offset);
     }
     params.flag_val = reinterpret_cast<uint32_t*>(workspace_ptr + epRank * workspace.stride(0) + offsets.flag_val_offset);
 
@@ -517,7 +526,8 @@ torch::Tensor moeA2AInitializeOp(
     moe_a2a_metainfo[LOCAL_TOKEN_COUNTER_OFFSET_INDEX] = static_cast<int64_t>(offsets.local_token_counter_offset);
     moe_a2a_metainfo[SEND_COUNTERS_OFFSET_INDEX] = static_cast<int64_t>(offsets.send_counters_offset);
     moe_a2a_metainfo[RECV_COUNTERS_OFFSET_INDEX] = static_cast<int64_t>(offsets.recv_counters_offset);
-    moe_a2a_metainfo[COMPLETION_FLAGS_OFFSET_INDEX] = static_cast<int64_t>(offsets.completion_flags_offset);
+    moe_a2a_metainfo[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX] = static_cast<int64_t>(offsets.dispatch_completion_flags_offset);
+    moe_a2a_metainfo[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX] = static_cast<int64_t>(offsets.combine_completion_flags_offset);
     moe_a2a_metainfo[PAYLOAD_DATA_OFFSET_INDEX] = static_cast<int64_t>(offsets.payload_data_offset);
 
     // Memset workspace to 0 and synchronize among ranks
@@ -564,7 +574,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def("MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::LOCAL_TOKEN_COUNTER_OFFSET_INDEX); });
     module.def("MOE_A2A_SEND_COUNTERS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::SEND_COUNTERS_OFFSET_INDEX); });
     module.def("MOE_A2A_RECV_COUNTERS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::RECV_COUNTERS_OFFSET_INDEX); });
-    module.def("MOE_A2A_COMPLETION_FLAGS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::COMPLETION_FLAGS_OFFSET_INDEX); });
+    // Backward-compat: legacy COMPLETION_FLAGS returns dispatch flags
+    module.def("MOE_A2A_COMPLETION_FLAGS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX); });
+    // New explicit exports
+    module.def("MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX); });
+    module.def("MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::COMBINE_COMPLETION_FLAGS_OFFSET_INDEX); });
     module.def("MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX() -> int", []() -> int64_t { return static_cast<int64_t>(torch_ext::PAYLOAD_DATA_OFFSET_INDEX); });
     
     module.def(
