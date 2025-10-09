@@ -101,7 +101,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
             self._buffer = ""
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning_content)
-        raise RuntimeError("Unreachable code reached.")
+        raise RuntimeError(
+            "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
 
 class ReasoningParserFactory:
@@ -118,7 +119,7 @@ class ReasoningParserFactory:
             if reasoning_parser == "deepseek-r1":
                 return reasoning_parser_class(reasoning_at_start=True)
             return reasoning_parser_class()
-        except Exception as e:
+        except KeyError as e:
             raise ValueError(
                 f"Invalid reasoning parser: {reasoning_parser}\n"
                 f"Supported parsers: {list(ReasoningParserFactory.parsers.keys())}"
