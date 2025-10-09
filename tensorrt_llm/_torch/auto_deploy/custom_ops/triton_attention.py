@@ -5,24 +5,17 @@ from typing import List, Optional, Tuple
 
 import torch
 import triton
-from torch._ops import OpOverloadPacket
-from torch._subclasses import FakeTensor
 from torch.fx import Node
 
 from ..utils.logger import ad_logger
-from ..utils.node_utils import extract_op_args
 from .attention_interface import (
-    AttentionDescriptor,
-    AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
     SequenceInfo,
 )
+from .torch_backend_attention import TorchBackendAttention
 from .triton_kernels.attention_with_kv_cache import (
     attention_kv_stage2,
     context_attention_kv_flattened,
@@ -122,7 +115,7 @@ def _flattened_context_mha(
     k: torch.Tensor,
     v: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     seq_len: torch.Tensor,
@@ -147,7 +140,7 @@ def _flattened_context_mha(
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idx,
         max_cache_seq_len,
         n_kv_heads,
         q_d_head,
@@ -167,7 +160,7 @@ def _flattened_context_mha(
         k_cache,
         v_cache,
         input_pos,
-        cache_loc,
+        slot_idx,
         out,
         scale,
         n_heads,
@@ -191,7 +184,7 @@ def flattened_mha_with_cache(
     # METADATA
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
@@ -239,7 +232,7 @@ def flattened_mha_with_cache(
     if s == 1:
         # generate-only phase
         _generate_mha(
-            q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y, sinks, sliding_window
+            q, k, v, k_cache, v_cache, slot_idx, input_pos, scale, y, sinks, sliding_window
         )
     else:
         # mixed context + generate phase
@@ -248,7 +241,7 @@ def flattened_mha_with_cache(
             k,
             v,
             input_pos,
-            cache_loc,
+            slot_idx,
             k_cache,
             v_cache,
             seq_len,
@@ -269,7 +262,7 @@ def flattened_mha_fake(
     v: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -300,7 +293,7 @@ def prepare_fused_mha_metadata(
     return (
         seq_len[:num_seq].clone(),
         input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
+        slot_idx[:num_seq].clone(),
         seq_start,
     )
 
@@ -315,32 +308,13 @@ def prepare_fused_mha_metadata_fake(
     return (
         torch.empty_like(seq_len[:num_seq]),
         torch.empty_like(input_pos[:num_seq]),
-        torch.empty_like(cache_loc[:num_seq]),
+        torch.empty_like(slot_idx[:num_seq]),
         torch.empty_like(seq_len[:num_seq]),
     )
 
 
 @AttentionRegistry.register("triton")
-class TritonAttention(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        """Return if the attention op is paged or not."""
-        return False
-
-    @classmethod
-    def get_attention_layout(cls) -> AttentionLayout:
-        """Get the attention layout expected by the source op and the cached attention op."""
-        return "bsnd"
-
-    @classmethod
-    def get_num_qkv_args(cls) -> int:
-        """Get the number of qkv arguments expected by the source op."""
-        return 3
-
-    @classmethod
-    def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_attention
-
+class TritonAttention(TorchBackendAttention):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache
@@ -350,87 +324,17 @@ class TritonAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.triton_attention_prepare_fused_mha_metadata, 4
 
     @classmethod
-    def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
-        # source op is [bsnd] layout already
-        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        v_fake: FakeTensor = source_attn_node.args[2].meta["val"]
-        num_kv_heads = k_fake.shape[2]
-        k_head_dim = k_fake.shape[3]
-        v_head_dim = v_fake.shape[3]
-
-        def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for triton"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                k_head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or k_fake.dtype,
-            )
-
-        def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for triton"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                v_head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or v_fake.dtype,
-            )
-
-        return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
-
-    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        # Sanity check: layout == "bsnd"
-        # Prefer kwargs; fall back to the final positional arg if it's a string.
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
-        if layout != "bsnd":
-            raise RuntimeError(
-                f"Expected torch_attention layout='bsnd' but got {layout!r} "
-                f"for node: {source_attn_node.format_node()}"
+        scale, sinks, sliding_window, logit_cap = super().get_constants(source_attn_node)
+
+        if logit_cap is not None:
+            ad_logger.warning(
+                f"Provided {logit_cap=} is not supported. Using default logit_cap instead."
             )
+            logit_cap = None
 
-        # retrieve head_dim from k_fake
-        attn_mask, dropout_p, is_causal = extract_op_args(
-            source_attn_node, "attn_mask", "dropout_p", "is_causal"
-        )
-        if attn_mask is not None or dropout_p != 0.0 or not is_causal:
-            ad_logger.debug(
-                "Unsupported attention arguments for "
-                f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
-            )
-
-        # Get scale from args or kwargs
-        if len(source_attn_node.args) > 6:
-            scale = source_attn_node.args[6]
-        else:
-            scale = source_attn_node.kwargs.get("scale", None)
-
-        # do a sanity check on the scale if it is not None, we only support the default scale
-        # of 1/sqrt(head_dim) and so we should do an approximate check for that one
-        if not (isinstance(scale, float) or scale is None):
-            ad_logger.warning(f"Provided {scale=} is not a float. Using default scale instead.")
-            scale = None
-        # Get sinks and sliding_window from args or kwargs
-        sinks = extract_op_args(source_attn_node, "sinks")[0]
-        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
         return [
-            scale,  # softmax scale
+            scale,
             sinks,
             sliding_window,
         ]

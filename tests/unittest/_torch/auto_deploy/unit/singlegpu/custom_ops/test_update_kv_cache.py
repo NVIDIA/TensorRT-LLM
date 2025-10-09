@@ -33,7 +33,7 @@ def test_update_kv_cache():
         v_cache,
         torch.tensor([3, 1]).long(),
         torch.tensor([0, 0]),
-        cache_loc=torch.tensor([0, 1]),
+        slot_idx=torch.tensor([0, 1]),
         seq_start=torch.tensor([0, 3]).long(),
     )
 

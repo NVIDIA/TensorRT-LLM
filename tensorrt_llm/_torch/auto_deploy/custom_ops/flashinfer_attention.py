@@ -14,14 +14,16 @@ from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
+    BufferHandler,
+    BufferHandlerDict,
     CacheConfig,
-    CacheInitializerDict,
+    CacheHandlerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
     SequenceInfo,
 )
+from .torch_backend_attention import UnpagedKVCacheHandler
 
 
 @dataclass
@@ -331,12 +333,42 @@ def flashinfer_mha_with_cache_fake(
     return torch.empty_like(q.contiguous())
 
 
+class PagedKVCacheHandler(UnpagedKVCacheHandler):
+    """A cache handler for paged KV cache."""
+
+    @property
+    def is_paged(self) -> bool:
+        return True
+
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.num_pages,
+            sequence_info.page_size,
+            self.num_kv_heads,
+            self.k_or_vhead_dim,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+    def _resize(self, cache_pool: torch.Tensor, num_pages: int) -> None:
+        current_shape = cache_pool.shape
+        new_shape = (num_pages, *current_shape[1:])
+        cache_pool.resize_(new_shape)
+
+
+class FlashInferWorkspaceHandler(BufferHandler):
+    """A buffer handler for flashinfer workspace."""
+
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        # NOTE (lucaslie): avoid OOM for many cudagraphs,
+        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
+        buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=sequence_info.device)
+        _GlobalFlashInferPlanner.init_workspace(buffer)
+        return buffer
+
+
 @AttentionRegistry.register("flashinfer")
 class FlashInferAttention(AttentionDescriptor):
-    @classmethod
-    def _get_planner(cls) -> _FlashInferPlanner:
-        return _GlobalFlashInferPlanner
-
     @classmethod
     def is_paged(cls):
         """Return if the attention op is paged or not."""
@@ -366,36 +398,23 @@ class FlashInferAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.flashinfer_attention_prepare_metadata, 6
 
     @classmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+    ) -> CacheHandlerDict:
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
+        dtype = cache_config.dtype or k_fake.dtype
 
-        def _get_cache(si: SequenceInfo):
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or k_fake.dtype,
-            )
-
-        return {"k_cache": _get_cache, "v_cache": _get_cache}
+        return {
+            "k_cache": PagedKVCacheHandler(num_kv_heads, head_dim, dtype),
+            "v_cache": PagedKVCacheHandler(num_kv_heads, head_dim, dtype),
+        }
 
     @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        def _init_workspace(si: SequenceInfo) -> torch.Tensor:
-            # NOTE (lucaslie): avoid OOM for many cudagraphs,
-            # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
-            buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            cls._get_planner().init_workspace(buffer)
-            return buffer
-
-        return {"workspace_buffer": _init_workspace}
+    def get_global_buffer_handlers(cls, source_attn_node: Node) -> BufferHandlerDict:
+        return {"workspace_buffer": FlashInferWorkspaceHandler()}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
