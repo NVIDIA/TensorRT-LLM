@@ -1,4 +1,5 @@
 import io
+import itertools
 import json
 import logging
 import re
@@ -660,7 +661,10 @@ class LoraManager(object):
     }
 
     def __init__(
-        self, cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None
+        self,
+        *,
+        mapping: Mapping,
+        cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None = None,
     ):
         """Constructor.
 
@@ -704,6 +708,7 @@ class LoraManager(object):
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
         self.lora_target_modules: List[str] = []
+        self._mapping = mapping
         self._cpp_peft_cache_manager = cpp_peft_cache_manager
 
     def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:
@@ -730,7 +735,6 @@ class LoraManager(object):
         self,
         model_dirs_or_files: List[str],
         model_config: Union["ModelConfig", LoraModelConfig],
-        runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         ckpt_source: str = "hf",
     ) -> List[str]:
@@ -743,7 +747,6 @@ class LoraManager(object):
             return self.load_from_hf(
                 model_dirs=model_dirs_or_files,
                 model_config=model_config,
-                runtime_mapping=runtime_mapping,
                 uids=uids,
             )
         elif ckpt_source == "nemo":
@@ -754,7 +757,6 @@ class LoraManager(object):
             return self.load_from_nemo(
                 model_files=nemo_files,
                 model_config=model_config,
-                runtime_mapping=runtime_mapping,
                 uids=uids,
             )
         else:
@@ -764,7 +766,6 @@ class LoraManager(object):
         self,
         model_files: List[str],
         model_config: Union["ModelConfig", LoraModelConfig],
-        runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
     ) -> List[str]:
         """Returns the adapter UIDs that were loaded by this call.
@@ -772,11 +773,6 @@ class LoraManager(object):
         Note that when an adapter was already loaded before this call, it would not be
         included in the returned list of UIDs.
         """
-        if runtime_mapping is None:
-            runtime_mapping = Mapping()
-        tp_size = runtime_mapping.tp_size
-        tp_rank = runtime_mapping.tp_rank
-
         if uids is None:
             uids = [self._generate_uid() for _ in range(len(model_files))]
         assert len(uids) == len(model_files)
@@ -829,10 +825,6 @@ class LoraManager(object):
 
                         t_in = all_lora_weights[layer_idx]["in"]
                         t_out = all_lora_weights[layer_idx]["out"]
-                        assert t_out.shape[0] % tp_size == 0
-                        t_out = torch.split(t_out, t_out.shape[0] // tp_size, dim=0)[
-                            tp_rank
-                        ].contiguous()
                     else:
                         t_in = None
                         t_out = None
@@ -882,7 +874,6 @@ class LoraManager(object):
         self,
         model_dirs: List[str],
         model_config: Union["ModelConfig", LoraModelConfig],
-        runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         component: Optional[str] = None,
     ) -> List[str]:
@@ -939,11 +930,6 @@ class LoraManager(object):
             ...
 
         """
-        if runtime_mapping is None:
-            runtime_mapping = Mapping()
-        tp_size = runtime_mapping.tp_size
-        tp_rank = runtime_mapping.tp_rank
-
         if uids is None:
             uids = [self._generate_uid() for _ in range(len(model_dirs))]
         assert len(uids) == len(model_dirs)
@@ -1060,36 +1046,37 @@ class LoraManager(object):
                         t_mag = module_weights.get("magnitude", None)
 
                     is_dora = t_mag is not None
-
-                    if lora_module in ["moe_router", "mlp_router"]:
-                        pass
-                    elif "moe" in lora_module and runtime_mapping.has_moe_ep():
-                        pass
-                    elif lora_module in [
-                        "attn_dense",
-                        "cross_attn_dense",
-                        "mlp_4h_to_h",
-                        "moe_4h_to_h",
-                    ]:
-                        # split by row
-                        dim = 2 if has_expert_indices else 1
-                        assert t_in.shape[dim] % tp_size == 0
-                        t_in = torch.split(t_in, t_in.shape[dim] // tp_size, dim=dim)[
-                            tp_rank
-                        ].contiguous()
-                    else:
-                        # split by column
-                        dim = 1 if has_expert_indices else 0
-                        assert t_out.shape[dim] % tp_size == 0
-                        t_out = torch.split(t_out, t_out.shape[dim] // tp_size, dim=dim)[
-                            tp_rank
-                        ].contiguous()
-                        if dim == 0 and is_dora and t_mag is not None:
-                            t_mag = torch.split(t_mag, t_mag.shape[0] // tp_size, dim=0)[
-                                tp_rank
-                            ].contiguous()
-
                     rank_dim = 1 if has_expert_indices else 0
+
+                    if lora_module in ["mlp_gate_up"]:
+                        # Special handling for fused module mlp_gate_up:
+                        # HF stores each part's weights sequentially, whereas we need to interleave them for TP.
+                        # We have to concatenate them all back after interleaving, as the CPP expects the full
+                        # non-split weights.
+                        assert t_out.shape[rank_dim] % 2 == 0
+                        half_size = t_out.shape[rank_dim] // 2
+                        tp_size = self._mapping.tp_size
+                        assert half_size % tp_size == 0
+
+                        first_half = t_out.narrow(rank_dim, 0, half_size)
+                        second_half = t_out.narrow(rank_dim, half_size, half_size)
+                        tp_parts_a = [
+                            torch.split(
+                                first_half, first_half.shape[rank_dim] // tp_size, dim=rank_dim
+                            )[r]
+                            for r in range(tp_size)
+                        ]
+                        tp_parts_b = [
+                            torch.split(
+                                second_half, second_half.shape[rank_dim] // tp_size, dim=rank_dim
+                            )[r]
+                            for r in range(tp_size)
+                        ]
+                        interleaved_parts = list(
+                            itertools.chain.from_iterable(zip(tp_parts_a, tp_parts_b))
+                        )
+                        t_out = torch.cat(interleaved_parts, dim=rank_dim)
+
                     effective_rank = t_in.shape[rank_dim]
 
                     t_in = t_in.cuda().contiguous()
