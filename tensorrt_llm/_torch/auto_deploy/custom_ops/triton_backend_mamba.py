@@ -124,7 +124,12 @@ def _triton_cached_ssm_transform(
 
     # Decode: batch single-token updates via selective_state_update
     if num_decode > 0:
-        decode_idx = seq_start[num_prefill:].to(torch.long)
+        # In generate-only (s == 1), each batch element has one token and seq_start entries
+        # are typically zeros. Use arange over the flattened batch to index tokens correctly.
+        if s == 1:
+            decode_idx = torch.arange(bs, device=device, dtype=torch.long)
+        else:
+            decode_idx = seq_start[num_prefill:].to(torch.long)
         slot_idx_decode = slot_idx[num_prefill:].to(torch.long)
 
         x_decode = hs_flat.index_select(0, decode_idx)  # [nd, H, D]
@@ -237,7 +242,8 @@ class TritonBackendSSM(AttentionDescriptor):
             ssm_state_size = max(1, B_fake.shape[-1])
 
         def _get_ssm_cache(si: SequenceInfo):
-            return torch.empty(
+            # Initialize to zeros so brand-new sequences start from a clean state.
+            return torch.zeros(
                 si.max_batch_size,
                 num_heads,
                 head_dim,
