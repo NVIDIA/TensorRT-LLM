@@ -138,8 +138,8 @@ class OpenAIServer:
             self.use_harmony = (self.model_config.model_type == "gpt_oss")
 
         # as disagg-worker
-        self.cluster_storage = None
-        self.cluster_worker = None
+        self.disagg_cluster_storage = None
+        self.disagg_cluster_worker = None
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -158,9 +158,9 @@ class OpenAIServer:
 
             if self.cluster_config:
                 logger.info(f"Cluster config: {self.cluster_config}")
-                self.cluster_storage = create_cluster_storage_client(self.cluster_config.cluster_uri, self.cluster_config.cluster_name)
-                self.cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.cluster_config, self.cluster_storage)
-                await self.cluster_worker.register_worker()
+                self.disagg_cluster_storage = create_cluster_storage_client(self.cluster_config.cluster_uri, self.cluster_config.cluster_name)
+                self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.cluster_config, self.disagg_cluster_storage)
+                await self.disagg_cluster_worker.register_worker()
 
             # terminate rank0 worker
             yield
@@ -168,6 +168,8 @@ class OpenAIServer:
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
+            if self.disagg_cluster_worker:
+                await self.disagg_cluster_worker.deregister_worker()
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
