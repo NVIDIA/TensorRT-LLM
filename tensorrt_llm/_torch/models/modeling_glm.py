@@ -51,7 +51,6 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
@@ -59,7 +58,7 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.qk_norm_attention import compute_yarn_parameters
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -132,70 +131,34 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
-# class GLM4Attention(QKNormRoPEAttention):
-
-#     def __init__(
-#         self,
-#         model_config: ModelConfig[PretrainedConfig],
-#         layer_idx: Optional[int] = None,
-#         fuse_qk_norm_rope: bool = True,
-#         aux_stream: Optional[torch.cuda.Stream] = None,
-#     ):
-#         config = model_config.pretrained_config
-
-#         if getattr(config, "rope_scaling", None) is not None:
-#             if "type" in config.rope_scaling:
-#                 pos_type = config.rope_scaling["type"]
-#             elif "rope_type" in config.rope_scaling:
-#                 pos_type = config.rope_scaling["rope_type"]
-#             else:
-#                 raise ValueError(
-#                     "rope_scaling must have type or rope_type field")
-#             pos_embd_params = PositionalEmbeddingParams(
-#                 type=PositionEmbeddingType.from_string(pos_type),
-#                 rope=RopeParams.from_config(config),
-#             )
-#         else:
-#             pos_embd_params = PositionalEmbeddingParams(
-#                 type=PositionEmbeddingType.yarn,
-#                 rope=RopeParams.from_config(config),
-#             )
-
-#         super().__init__(
-#             hidden_size=config.hidden_size,
-#             num_attention_heads=config.num_attention_heads,
-#             num_key_value_heads=config.num_key_value_heads,
-#             max_position_embeddings=config.max_position_embeddings,
-#             bias=config.attention_bias,
-#             pos_embd_params=pos_embd_params,
-#             fuse_qk_norm_rope=fuse_qk_norm_rope,
-#             layer_idx=layer_idx,
-#             dtype=config.torch_dtype,
-#             dense_bias=False,
-#             config=model_config,
-#             aux_stream=aux_stream,
-#         )
-
-
-class GLM4Attention(Attention):
+class GLM4Attention(QKNormRoPEAttention):
 
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        fuse_qk_norm_rope: bool = False,
+        fuse_qk_norm_rope: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        self.pretrained_config = config
 
-        pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.yarn,
-            rope=RopeParams.from_config(config),
-            is_neox=True,
-        )
-
-        self.fuse_qk_norm_rope = fuse_qk_norm_rope
+        if getattr(config, "rope_scaling", None) is not None:
+            if "type" in config.rope_scaling:
+                pos_type = config.rope_scaling["type"]
+            elif "rope_type" in config.rope_scaling:
+                pos_type = config.rope_scaling["rope_type"]
+            else:
+                raise ValueError(
+                    "rope_scaling must have type or rope_type field")
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.from_string(pos_type),
+                rope=RopeParams.from_config(config),
+            )
+        else:
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.yarn,
+                rope=RopeParams.from_config(config),
+            )
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -204,73 +167,13 @@ class GLM4Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            rope_fusion=not self.
-            fuse_qk_norm_rope,  # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
+            fuse_qk_norm_rope=fuse_qk_norm_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
+            aux_stream=aux_stream,
         )
-        self.use_qk_norm = config.use_qk_norm
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(hidden_size=self.head_dim,
-                                  eps=config.rms_norm_eps,
-                                  dtype=config.torch_dtype,
-                                  has_weights=True)
-            self.k_norm = RMSNorm(hidden_size=self.head_dim,
-                                  eps=config.rms_norm_eps,
-                                  dtype=config.torch_dtype,
-                                  has_weights=True)
-        # Create own stream if none provided (like Qwen3)
-        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-        )
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-
-    def apply_qk_norm(self, q, k):
-
-        def q_l2norm():
-            return self.q_norm(q.reshape(-1, self.head_dim)).reshape(
-                -1, self.q_size)
-
-        def k_l2norm():
-            return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
-                -1, self.kv_size)
-
-        q, k = maybe_execute_in_parallel(
-            q_l2norm,
-            k_l2norm,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
-        return q, k
-
-    def apply_qk_norm_rope(self, qkv, position_ids):
-        factor, low, high, attention_factor = compute_yarn_parameters(
-            self.pretrained_config)
-        torch.ops.trtllm.fused_qk_norm_rope(
-            qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim,
-            self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight,
-            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
-            position_ids.view(-1), factor, low, high, attention_factor)
-        return qkv, None, None
-
-    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
-                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
-        if not self.use_qk_norm:
-            return super().apply_rope(q, k, v, position_ids)
-        # Qwen3 applies QK norm before RoPE.
-        if not self.fuse_qk_norm_rope:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.apply_qk_norm(q, k)
-            return super().apply_rope(q, k, v, position_ids)
-
-        assert k is None and v is None, "The input should be a concatenated qkv tensor to apply_qk_norm_rope"
-        qkv = q
-        return self.apply_qk_norm_rope(qkv, position_ids)
 
 
 class Deepseekv3RoutingImpl():
@@ -664,6 +567,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.self_attn = GLM4Attention(
             model_config,
             layer_idx=layer_idx_for_attention,
+            fuse_qk_norm_rope=False,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.enable_attention_dp = mapping.enable_attention_dp
 

@@ -351,7 +351,7 @@ class MTPForCausalLM(nn.Module):
     ):
         super().__init__()
         # Import here to avoid circular import
-        from .modeling_deepseekv3 import DeepseekV3MTP
+        from .modeling_glm import DeepseekV3MTP
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
