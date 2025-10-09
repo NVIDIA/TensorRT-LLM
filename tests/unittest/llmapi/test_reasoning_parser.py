@@ -61,6 +61,8 @@ def test_qwen3_reasoning_parser(text: str, content: str,
     (["<think>a</th", "ink>b"], ["", "b"], ["a", ""]),
     (["<think>", "a</think>b"], ["", "b"], ["", "a"]),
     (["<think>a</think>", "b"], ["", "b"], ["a", ""]),
+    (["<think>a</th", "ank></th", "ink>b"], ["", "", "b"
+                                             ], ["a", "</thank>", ""]),
 ])
 def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
                                        reasoning_context: list):
