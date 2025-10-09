@@ -57,7 +57,7 @@ ordered-set
 peft
 patchelf
 einops
-flashinfer-python>=0.3.0
+flashinfer-python>=0.3.0,<0.4.0
 opencv-python-headless
 xgrammar==0.1.25
 llguidance==0.7.29
