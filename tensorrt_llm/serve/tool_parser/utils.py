@@ -1,3 +1,4 @@
+# Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/qwen25_detector.py
 import json
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
