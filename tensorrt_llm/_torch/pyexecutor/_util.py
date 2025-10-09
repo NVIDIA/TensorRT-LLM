@@ -160,13 +160,10 @@ class KvCacheCreator:
 
         max_num_tokens = len(prompt_token_ids)
         assert max_num_tokens > 0, "the length of the prompt of the dummy mm req is less than or equal to 0"
-        remaining_tokens = max(max_num_tokens, input_seq_len)
+        remaining_tokens = min(max_num_tokens, input_seq_len)
         if remaining_tokens > input_seq_len:
             logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len. " \
                            f"Multimodal prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
-        ## add + 1 to avoid error: RuntimeError: The max KV cache length of input sequences (X + 1) exceeds the KV cache manager's maximum supported length X.
-        ## at line "/code/tensorrt_llm/tensorrt_llm/_torch/attention_backend/trtllm.py", line 837
-        self._max_seq_len = remaining_tokens + 1
         while remaining_tokens > 0:
             req_mm_input = trtllm.MultimodalInput(
                 multimodal_hashes=multimodal_input.multimodal_hashes,
@@ -181,6 +178,9 @@ class KvCacheCreator:
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1,
                                      multimodal_input=req_mm_input)
+            # TODO:
+            # create_input_processor_with_hash shouldn’t be required during profiling,
+            # but is temporarily needed due to the multimodal input dependency for chunked prefill
             request.py_multimodal_data = multimodal_data
             remaining_tokens -= max_num_tokens
             requests.append(request)
@@ -193,11 +193,10 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(
-                self._model_engine.model,
-                "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                    self._model_engine.model.original_arch, None
-                ) and self._model_engine.attn_runtime_features.chunked_prefill:
+        if hasattr(self._model_engine.model,
+                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                       self._model_engine.model.original_arch, None):
+            input_seq_len = min(self._max_num_tokens, input_seq_len)
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case

@@ -22,9 +22,7 @@ def test_profile_kvcache():
     VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
 
-    build_config = BuildConfig(max_batch_size=2048,
-                               max_beam_width=1,
-                               max_seq_len=8192)
+    build_config = BuildConfig(max_beam_width=1, max_num_tokens=16384)
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
