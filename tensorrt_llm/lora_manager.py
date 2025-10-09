@@ -1020,7 +1020,7 @@ class LoraManager(object):
                 part_sizes = [half_size, half_size]
             elif lora_module == "attn_qkv":
                 # The sizes are multiplied by tp_size because num_heads and num_kv_heads here were already
-                # divided by tp_size
+                # divided by tp_size in tensorrt_llm/_torch/model_config.py::ModelConfig.get_bindings_model_config
                 q_size = self._model_config.head_size * self._model_config.num_heads * tp_size
                 kv_size = self._model_config.head_size * self._model_config.num_kv_heads * tp_size
                 part_sizes = [q_size, kv_size, kv_size]
