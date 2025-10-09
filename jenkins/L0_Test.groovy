@@ -1766,8 +1766,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
                     """
-                    throw new Exception("Infrastructure error")
-                } catch (hudson.AbortException e) {
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
                     def failedSigs = trtllm_utils.getFailSignaturesList()
                     def isMachineOrInfraError = failedSigs.any { sig -> e.message?.toLowerCase().contains(sig.toLowerCase()) }
                     if (isMachineOrInfraError) {
