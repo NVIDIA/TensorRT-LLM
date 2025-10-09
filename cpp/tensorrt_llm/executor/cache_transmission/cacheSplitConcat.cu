@@ -584,7 +584,7 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
     using VecType = typename common::BytesToType<vecSizeByte>::type;
 #pragma unroll 1
 
-    for (int blockId = blockIdx.y; blockId < inputBlockNum; blockId += gridDim.y)
+    for (int64_t blockId = blockIdx.y; blockId < inputBlockNum; blockId += gridDim.y)
     {
 #pragma unroll 1
 
