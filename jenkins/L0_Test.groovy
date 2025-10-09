@@ -1706,9 +1706,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         }
     }
 
-    // Specify the stage name correctly for rerun results
-    sh "cd ${rerunDir} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
-
     echo "isRerunFailed for ${testType}: ${isRerunFailed}"
     return isRerunFailed
 }
@@ -1801,7 +1798,10 @@ def generateRerunReport(stageName, llmSrc) {
     }
 
     // Remove isolation results since they are merged into results.xml
-    sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml" || true
+    sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml || true"
+
+    // Specify the stage name correctly for merged results.xml
+    sh "cd cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
     echo "Rerun report generation completed for stage: ${stageName}"
 }
