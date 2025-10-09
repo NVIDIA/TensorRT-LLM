@@ -606,7 +606,8 @@ def main(*,
         build_deep_ep = "OFF"
         build_deep_gemm = "OFF"
     else:
-        targets.extend(["th_common", "bindings", "deep_ep", "deep_gemm"])
+        targets.extend(
+            ["th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils"])
         build_pyt = "ON"
         build_deep_ep = "ON"
         build_deep_gemm = "ON"
@@ -811,6 +812,8 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
+        install_file(build_dir / "tensorrt_llm/runtime/utils/libpg_utils.so",
+                     lib_dir / "libpg_utils.so")
 
     deep_ep_dir = pkg_dir / "deep_ep"
     if deep_ep_dir.is_symlink():
@@ -835,6 +838,15 @@ def main(*,
     if not on_windows:
         install_file(build_dir / "tensorrt_llm/executor_worker/executorWorker",
                      bin_dir / "executorWorker")
+
+    scripts_dir = pkg_dir / "scripts"
+    if scripts_dir.exists():
+        clear_folder(scripts_dir)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    if not on_windows:
+        install_file(project_dir / "docker/common/install_tensorrt.sh",
+                     scripts_dir / "install_tensorrt.sh")
 
     if not cpp_only:
 

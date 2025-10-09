@@ -36,6 +36,25 @@ using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
 
+constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
+{
+    if (gpuSM == 103)
+    {
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
+    }
+    else if (gpuSM == 100)
+    {
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm100a;
+    }
+    else if (gpuSM == 90)
+    {
+        return kernelSM == SmVersion::Sm90a;
+    }
+
+    TLLM_THROW("Unexpected gpuSM %d", gpuSM);
+    return false;
+}
+
 std::vector<int64_t> prioritizePredefinedConfigs(int m, int n, int k, std::vector<int64_t> const& sortedIndices,
     batchedGemm::batchedGemm::BatchedGemmConfig const* configs)
 {
@@ -98,6 +117,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
     mPassingConfigIndices.clear();
 
+    int gpuSM = tensorrt_llm::common::getSMVersion();
     for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i)
     {
         auto const options = configs[i].mOptions;
@@ -108,8 +128,22 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
             && (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
-            && tileSize == mOptions.tileSize)
+            && tileSize == mOptions.tileSize && isSMCompatible(gpuSM, configs[i].mSm))
         {
+            auto sm = configs[i].mSm;
+            if (sm != SmVersion::Sm100f)
+            {
+                int smVersion = tensorrt_llm::common::getSMVersion();
+                if (smVersion == 100 && sm != SmVersion::Sm100a)
+                {
+                    continue;
+                }
+                else if (smVersion == 103 && sm != SmVersion::Sm103a)
+                {
+                    continue;
+                }
+            }
+
             // FIXME: Disable split-k for now.
             if (options.mClusterDimZ != 1)
             {

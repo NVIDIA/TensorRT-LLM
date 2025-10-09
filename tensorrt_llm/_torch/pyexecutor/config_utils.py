@@ -14,4 +14,7 @@ def is_mla(config):
 
 
 def is_qwen3_next(config):
-    return getattr(config, 'linear_key_head_dim', 0) > 0
+    return hasattr(
+        config, 'architectures'
+    ) and config.architectures is not None and config.architectures[
+        0] == 'Qwen3NextForCausalLM'

@@ -40,6 +40,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
+#include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
@@ -125,6 +126,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     // Create submodule for executor bindings.
     auto mExecutor = m.def_submodule("executor", "Executor bindings");
     auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+    auto mInternalProcessGroup = mInternal.def_submodule("process_group", "PyTorch ProcessGroup internal bindings");
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
@@ -485,6 +487,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("pinned", &tr::MemoryCounters::getPinned)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
+    tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

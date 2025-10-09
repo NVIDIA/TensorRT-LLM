@@ -12,7 +12,6 @@ from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...transformations._graph import add_graph_input
-from ...utils.logger import ad_logger
 from ...utils.node_utils import get_all_input_output_nodes, is_op
 from ..interface import (
     BaseTransform,
@@ -157,12 +156,10 @@ class InsertCachedAttention(BaseTransform):
         if cm.info.is_paged:
             assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
-        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
-        m_arg_keys = list(cm.info.named_standard_args.keys())
-        m_const_args = cm.info.const_args_for_prepare_metadata
-
         # insert metadata computation and extract each argument as a node
-        metadata_nodes = self._process_get_metadata(gm, m_arg_keys, m_const_args)
+        metadata_nodes = self._process_get_metadata(
+            gm, cm.info.args_for_prepare_metadata, cm.info.const_args_for_prepare_metadata
+        )
 
         buffer_in_lookup: Dict[str, Node] = {}
 
@@ -226,10 +223,6 @@ class ResizeKVCacheConfig(TransformConfig):
     free_mem_ratio: float = Field(
         description="The fraction of available memory to occupy.", default=0.8
     )
-    args_only: bool = Field(
-        description="Use ``*cm.args`` (default) or use ``**cm.named_args`` for the forward pass.",
-        default=True,
-    )
 
 
 @TransformRegistry.register("resize_kv_cache")
@@ -244,13 +237,6 @@ class ResizeKVCache(BaseTransform):
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
         return ResizeKVCacheConfig
-
-    def _run_forward(self, gm: GraphModule, cm: CachedSequenceInterface):
-        """Run a forward pass to get the memory usage."""
-        if self.config.args_only:
-            gm(*cm.args)
-        else:
-            gm(**cm.named_args)
 
     def _apply(
         self,
@@ -288,7 +274,7 @@ class ResizeKVCache(BaseTransform):
         free_mem_pre, _ = _get_mem_info_in_mb()
         self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-        self._run_forward(gm, cm)
+        gm(**cm.named_args)
 
         free_mem_post, _ = _get_mem_info_in_mb()
         self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
@@ -306,10 +292,11 @@ class ResizeKVCache(BaseTransform):
         self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
 
         cm.resize_cache(new_num_pages)
+
         # Log the final cache size for performance measurement, do not remove this log.
         final_cache_size_bytes = cm.current_cache_size_bytes()
         final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
-        ad_logger.info(
+        self._log_info(
             f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
         )
 

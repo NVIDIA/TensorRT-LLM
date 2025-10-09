@@ -7,7 +7,6 @@ transforms:
   build_model:
     stage: factory
     device: meta
-    use_strict_forward: true
     # nothing to clean up
     run_graph_cleanup: false
     requires_clean_graph: false
@@ -33,6 +32,7 @@ transforms:
     stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
+    run_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
   match_grouped_attention:
@@ -51,6 +51,8 @@ transforms:
   # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
   # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
   optimize_rope:
+    stage: pattern_matcher
+  quantize_int4_linear_from_config:
     stage: pattern_matcher
   quantize_fp8_linear_from_config:
     stage: pattern_matcher
@@ -110,13 +112,14 @@ transforms:
     enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  fuse_collectives:
-    stage: post_load_fusion
+  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  # check if we can fuse rmsnorm
   fuse_rmsnorm:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
     stage: post_load_fusion
     backend: flashinfer
+    requires_shape_prop: true
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
@@ -127,6 +130,12 @@ transforms:
   insert_cached_mla_attention:
     stage: cache_init
     attn_backend: MultiHeadLatentAttention
+  insert_cached_ssm_attention:
+    stage: cache_init
+    attn_backend: triton_ssm
+  insert_cached_causal_conv:
+    stage: cache_init
+    attn_backend: cuda_causal_conv
   initialize_cache:
     stage: cache_init
   resize_kv_cache:
@@ -136,6 +145,3 @@ transforms:
   ############################################################################################
   compile_model:
     stage: compile
-  forward_with_cached_sequence_interface:
-    stage: compile
-    args_only: true

@@ -114,6 +114,7 @@ class DemoEngine(ADEngine):
             input_ids=input_ids,
             input_pos=0,
             page_assignments=self._assign_pages(total_lens),
+            slot_idx=list(range(len(input_ids))),
             **extra_args,
         )
 
@@ -233,8 +234,10 @@ class DemoEngine(ADEngine):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits_shape = logits.shape
         logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
-        if isinstance(sampling_params.top_k, int):
-            idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        if isinstance(sampling_params.top_k, int) and sampling_params.top_k > 1:
+            idx_next, probs = top_k_sampling_batch(
+                logits, top_k=sampling_params.top_k, temperature=1.0
+            )
         else:
             idx_next, probs = greedy_search_sampling_batch(logits)
         idx_next = idx_next.view(logits_shape[:-1])
