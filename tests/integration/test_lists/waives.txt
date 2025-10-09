@@ -305,8 +305,6 @@ accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram SKIP
 test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5448523)
 cpp/test_unit_tests.py::test_unit_tests[kernels-80] SKIP (https://nvbugs/5504078)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5513237)
-accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm] SKIP (https://nvbugs/5516666)
-accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/5516666)
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype SKIP (https://nvbugs/5520319)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[ep2-cutlass-auto] SKIP (https://nvbugs/5519530)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass-auto] SKIP (https://nvbugs/5519530)
