@@ -40,8 +40,9 @@ from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
 from tensorrt_llm.runtime.redrafter_utils import *
 
-from .._utils import (binding_to_str_dtype, pad_vocab_size, str_dtype_to_torch,
-                      torch_to_numpy, trt_dtype_to_torch)
+from .._utils import (binding_layer_type_to_str, binding_to_str_dtype,
+                      pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
+                      trt_dtype_to_torch)
 from ..bindings import KVCacheType, ipc_nvls_allocate, ipc_nvls_free
 from ..layers import LanguageAdapterConfig
 from ..logger import logger
@@ -672,16 +673,24 @@ class ModelConfig:
             num_heads=model_config_cpp.num_heads,
             num_kv_heads=model_config_cpp.num_kv_heads(0),
             hidden_size=model_config_cpp.hidden_size,
+            remove_input_padding=model_config_cpp.use_packed_input,
             kv_cache_type=model_config_cpp.kv_cache_type,
             cross_attention=model_config_cpp.use_cross_attention,
             head_size=model_config_cpp.head_size,
             max_prompt_embedding_table_size=model_config_cpp.
             max_prompt_embedding_table_size,
+            quant_mode=QuantMode(model_config_cpp.quant_mode.value),
+            gather_context_logits=model_config_cpp.compute_context_logits,
+            gather_generation_logits=model_config_cpp.compute_generation_logits,
             gpt_attention_plugin=model_config_cpp.use_gpt_attention_plugin,
             dtype=binding_to_str_dtype(model_config_cpp.data_type),
             num_kv_heads_per_layer=model_config_cpp.num_kv_heads_per_layer,
             tokens_per_block=model_config_cpp.tokens_per_block,
             lora_plugin=model_config_cpp.use_lora_plugin,
+            layer_types=[
+                binding_layer_type_to_str(lt)
+                for lt in model_config_cpp.layer_types
+            ],
         )
 
 

@@ -42,7 +42,7 @@ import torch
 import tensorrt as trt
 # isort: on
 
-from tensorrt_llm.bindings import DataType, GptJsonConfig
+from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -196,6 +196,10 @@ _binding_dtype_bits = {
     DataType.UINT8: 8,
     DataType.NVFP4: 4,
 }
+
+
+def binding_layer_type_to_str(layer_type: LayerType) -> str:
+    return layer_type.name.lower()
 
 
 def binding_to_str_dtype(binding_dtype) -> str:
