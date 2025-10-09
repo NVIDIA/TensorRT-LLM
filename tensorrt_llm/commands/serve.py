@@ -390,8 +390,7 @@ def serve(
         cluster_config = extract_cluster_config(cluster_config,
                                                 disagg_cluster_uri)
     elif disagg_cluster_uri:
-        cluster_config = DisaggClusterConfig(
-            cluster_storage_uri=disagg_cluster_uri)
+        cluster_config = DisaggClusterConfig(cluster_uri=disagg_cluster_uri)
 
     # server_role is required when metadata_server_cfg or cluster_config/disagg_cluster_uri is provided
     if metadata_server_cfg is not None or cluster_config is not None:

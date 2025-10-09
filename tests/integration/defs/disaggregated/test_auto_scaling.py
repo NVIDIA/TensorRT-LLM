@@ -176,8 +176,9 @@ def verify_cluster_info(ready,
 def terminate(*args):
     try:
         for arg in args:
-            arg.terminate()
-            arg.wait()
+            if arg and isinstance(arg, subprocess.Popen):
+                arg.terminate()
+                arg.wait(timeout=10)
     except Exception:
         pass
 
@@ -196,6 +197,9 @@ def request_completion(model_name, prompt, port=TEST_PORT):
 @pytest.mark.timeout(600)
 async def test_service_discovery(model_name, disagg_server_config,
                                  worker_config, router):
+    ctx_worker1 = None
+    gen_worker1 = None
+    disagg_server = None
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
         ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
@@ -226,10 +230,14 @@ async def test_minimal_instances(model_name, disagg_server_config,
     disagg_server_config["cluster"]["minimal_instances"] = minimal_instances
     worker_config["cluster"]["minimal_instances"] = minimal_instances
 
+    processes = []
+
     try:
-        ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
-        gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
-        disagg_server = run_disagg_server(disagg_server_config, TEST_PORT)
+        processes.append(
+            run_ctx_worker(model_name, worker_config, TEST_PORT + 100))
+        processes.append(
+            run_gen_worker(model_name, worker_config, TEST_PORT + 200))
+        processes.append(run_disagg_server(disagg_server_config, TEST_PORT))
         await wait_for_worker_ready(TEST_PORT + 100)
         await wait_for_worker_ready(TEST_PORT + 200)
         verify_cluster_info(False, 1, 1)
@@ -240,8 +248,10 @@ async def test_minimal_instances(model_name, disagg_server_config,
                                           port=TEST_PORT)
             print(response)
 
-        ctx_worker2 = run_ctx_worker(model_name, worker_config, TEST_PORT + 101)
-        gen_worker2 = run_gen_worker(model_name, worker_config, TEST_PORT + 201)
+        processes.append(
+            run_ctx_worker(model_name, worker_config, TEST_PORT + 101))
+        processes.append(
+            run_gen_worker(model_name, worker_config, TEST_PORT + 201))
         await wait_for_disagg_server_ready(TEST_PORT)
         verify_cluster_info(True, 2, 2)
         response = request_completion(model_name,
@@ -249,8 +259,7 @@ async def test_minimal_instances(model_name, disagg_server_config,
                                       port=TEST_PORT)
         print(response)
     finally:
-        terminate(ctx_worker1, ctx_worker2, gen_worker1, gen_worker2,
-                  disagg_server)
+        terminate(*processes)
 
 
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
@@ -258,6 +267,12 @@ async def test_minimal_instances(model_name, disagg_server_config,
 @pytest.mark.timeout(600)
 async def test_worker_restart(model_name, disagg_server_config, worker_config,
                               router):
+    ctx_worker1 = None
+    ctx_worker2 = None
+    gen_worker1 = None
+    gen_worker2 = None
+    disagg_server = None
+
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
         ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
@@ -271,7 +286,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         print(response)
         # kill gen1, the request should fail
         terminate(gen_worker1)
-        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
+        await asyncio.sleep(INACTIVE_TIMEOUT)
         verify_cluster_info(False, 1, 0)
         with pytest.raises(Exception):
             request_completion(model_name, "Hello, my name is", port=TEST_PORT)
@@ -281,7 +296,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         # add gen2, the request should succeed
         gen_worker2 = run_gen_worker(model_name, worker_config, TEST_PORT + 201)
         await wait_for_worker_ready(TEST_PORT + 201)
-        await asyncio.sleep(HEARTBEAT_INTERVAL + 1)
+        await asyncio.sleep(INACTIVE_TIMEOUT)
         verify_cluster_info(True, 1, 1)
 
         response = request_completion(model_name, test_prompt, port=TEST_PORT)
@@ -291,7 +306,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 
         # kill ctx1, the request should fail
         terminate(ctx_worker1)
-        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
+        await asyncio.sleep(INACTIVE_TIMEOUT)
         verify_cluster_info(False, 0, 1)
         with pytest.raises(Exception):
             request_completion(model_name, test_prompt, port=TEST_PORT)
@@ -310,7 +325,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
         await wait_for_worker_ready(TEST_PORT + 100)
         await wait_for_worker_ready(TEST_PORT + 200)
-        # await asyncio.sleep(INACTIVE_TIMEOUT + 1)
+        await asyncio.sleep(INACTIVE_TIMEOUT)
         verify_cluster_info(True, 2, 2)
 
         # send 10 requests, the responses will be generated by the different ctx/gen workers (but we can't verify it now)
@@ -330,6 +345,9 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 @pytest.mark.timeout(300)
 async def test_disagg_server_restart(model_name, disagg_server_config,
                                      worker_config, router):
+    ctx_worker1 = None
+    gen_worker1 = None
+    disagg_server = None
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
         ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
@@ -345,7 +363,7 @@ async def test_disagg_server_restart(model_name, disagg_server_config,
 
         # kill disagg server, the request should fail
         terminate(disagg_server)
-        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
+        await asyncio.sleep(INACTIVE_TIMEOUT)
         with pytest.raises(Exception):
             verify_cluster_info(False, 1, 1, expected_code=500)
 

@@ -168,19 +168,29 @@ class Router(ABC):
     def servers(self) -> List[str]:
         return self._servers
 
-    @abstractmethod
-    async def add_server(self, server):
-        """
-        Args:
-            server: The server to add
-        """
+    async def add_server(self, server: str):
+        if server in self._servers:
+            logger.warning(f"Server {server} already exists")
+            return
+        async with self._lock:
+            old_servers = self._servers.copy()
+            self._servers = [*old_servers, server]
+            self._on_servers_updated(old_servers, self._servers)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
 
-    @abstractmethod
-    async def remove_server(self, server):
-        """
-        Args:
-            server: The server to remove
-        """
+    async def remove_server(self, server: str):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+            return
+        async with self._lock:
+            old_servers = self._servers.copy()
+            self._servers = [
+                server for server in old_servers if server != server
+            ]
+            self._on_servers_updated(old_servers, self._servers)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
 
     @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
@@ -441,31 +451,6 @@ class RoundRobinRouter(Router):
     async def finish_request(self, request: OpenAIRequest):
         pass
 
-    async def add_server(self, server: str):
-        if server in self._servers:
-            logger.warning(f"Server {server} already exists")
-            return
-        async with self._lock:
-            old_servers = self._servers
-            new_servers = old_servers.copy() + [server]
-            self._servers = new_servers
-            self._on_servers_updated(old_servers, new_servers)
-        logger.debug(
-            f"Added server {server}, current server list: {self._servers}")
-
-    async def remove_server(self, server):
-        if server not in self._servers:
-            logger.warning(f"Server {server} does not exist")
-            return
-        async with self._lock:
-            old_servers = self._servers
-            new_servers = old_servers.copy()
-            new_servers.remove(server)
-            self._servers = new_servers
-            self._on_servers_updated(old_servers, new_servers)
-        logger.debug(
-            f"Removed server {server}, current server list: {self._servers}")
-
 
 class LoadBalancingRouter(Router):
 
@@ -506,31 +491,6 @@ class LoadBalancingRouter(Router):
         for server in new_servers:
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
-
-    async def add_server(self, server: str):
-        if server in self._servers:
-            logger.warning(f"Server {server} already exists")
-            return
-        async with self._lock:
-            self._servers.append(server)
-            old_servers = self._servers
-            new_servers = old_servers.copy() + [server]
-            self._on_servers_updated(old_servers, new_servers)
-        logger.debug(
-            f"Added server {server}, current server list: {self._servers}")
-
-    async def remove_server(self, server: str):
-        if server not in self._servers:
-            logger.warning(f"Server {server} does not exist")
-            return
-        async with self._lock:
-            old_servers = self._servers
-            new_servers = old_servers.copy()
-            new_servers.remove(server)
-            self._servers = new_servers
-            self._on_servers_updated(old_servers, new_servers)
-        logger.debug(
-            f"Removed server {server}, current server list: {self._servers}")
 
     def _init_heap(self):
         for server in self._servers:
@@ -732,14 +692,14 @@ def create_router(router_config: Optional[RouterConfig],
         "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
     }
-    default_router_type = "round_robin"
-    router_type = router_config.type if router_config else default_router_type
+    router_type = router_config.type if router_config else "round_robin"
     router_class = router_map.get(router_type.lower())
 
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
+    extra_args = router_config.args if router_config else {}
 
     return router_class(router_config.server_role if router_config else None,
                         servers, metadata_server_cfg, metadata_server,
-                        **router_config.args)
+                        **extra_args)

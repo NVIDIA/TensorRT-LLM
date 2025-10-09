@@ -56,10 +56,6 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(
             config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = config.conditional_disagg_config
-        self.cluster_config = config.cluster_config
-        self.cluster_storage = None
-        self.cluster_manager = None
-        logger.info(f"Cluster config: {self.cluster_config}")
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
             # record corresponding keys of context and generation servers for perf metrics
@@ -88,9 +84,14 @@ class OpenAIDisaggServer:
         self._metrics_task = None
         self.metrics_interval_secs = metrics_interval_secs
 
+        self.disagg_cluster_config = config.disagg_cluster_config
+        self.disagg_cluster_storage = None
+        self.disagg_cluster_manager = None
+        self._update_worker_task = None
+
         logger.info(f"Server max retries: {self.max_retries}")
 
-        if self.cluster_config is None:
+        if self.disagg_cluster_config is None:
             if (len(self.gen_servers) == 0):
                 raise ValueError("At least one generation server must be provided")
 
@@ -101,7 +102,7 @@ class OpenAIDisaggServer:
                 not isinstance(self.gen_router, KvCacheAwareRouter):
             raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
 
-        if self.cluster_config and self.metadata_server:
+        if self.disagg_cluster_config and self.metadata_server:
             raise ValueError("Cluster manager and metadata server cannot be used together")
 
         # Session will be initialized in lifespan
@@ -114,9 +115,9 @@ class OpenAIDisaggServer:
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
-            if self.cluster_manager:
-                await self.cluster_manager.start()
-                await self.cluster_manager.watch_workers()
+            if self.disagg_cluster_manager:
+                await self.disagg_cluster_manager.start()
+                await self.disagg_cluster_manager.watch_workers()
                 self._update_worker_task = asyncio.create_task(self._update_router_by_watch_events())
 
             logger.info("Waiting for context and generation servers to be ready")
@@ -150,8 +151,9 @@ class OpenAIDisaggServer:
                     pass
 
             await self.session.close()  # Ensure session cleanup
-            if self._update_worker_task:
+            if self.disagg_cluster_manager:
                 self._update_worker_task.cancel()
+                await self.disagg_cluster_manager.stop()
 
         self.app = FastAPI(lifespan=lifespan)
 
@@ -162,9 +164,9 @@ class OpenAIDisaggServer:
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
-        if self.cluster_config:
-            self.cluster_storage = create_cluster_storage(self.cluster_config.cluster_uri, self.cluster_config.cluster_name, server=self.app)
-            self.cluster_manager = DisaggClusterManager(self.cluster_config, self.cluster_storage)
+        if self.disagg_cluster_config:
+            self.disagg_cluster_storage = create_cluster_storage(self.disagg_cluster_config.cluster_uri, self.disagg_cluster_config.cluster_name, server=self.app)
+            self.disagg_cluster_manager = DisaggClusterManager(self.disagg_cluster_config, self.disagg_cluster_storage)
 
 
     async def _increment_metric(self, key: str, amount: int = 1):
@@ -218,10 +220,9 @@ class OpenAIDisaggServer:
         return JSONResponse(content=ver)
 
     async def cluster_info(self) -> JSONResponse:
-        if self.cluster_manager:
-            cluster_info = await self.cluster_manager.cluster_info()
+        if self.disagg_cluster_manager:
+            cluster_info = await self.disagg_cluster_manager.cluster_info()
             cluster_info["is_ready"] = await self.is_ready()
-            logger.info(f"Cluster info: {cluster_info}")
             return JSONResponse(content=cluster_info)
         return JSONResponse(content={})
 
@@ -610,8 +611,8 @@ class OpenAIDisaggServer:
         logger.info("Context and generation servers are ready")
 
     async def is_ready(self) -> bool:
-        if self.cluster_manager:
-            return await self.cluster_manager.is_ready_with_router(len(self.ctx_router.servers), len(self.gen_router.servers))
+        if self.disagg_cluster_manager:
+            return await self.disagg_cluster_manager.is_ready_with_router(len(self.ctx_router.servers), len(self.gen_router.servers))
         return True
 
     async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
@@ -626,7 +627,7 @@ class OpenAIDisaggServer:
         logger.info("Start updating routers by worker events")
         while True:
             try:
-                worker_events = await self.cluster_manager.get_worker_events()
+                worker_events = await self.disagg_cluster_manager.get_worker_events()
                 for worker_info, event_type in worker_events:
                     if event_type == WatchEventType.SET:
                         await router_map[worker_info.role].add_server(worker_repr(worker_info))

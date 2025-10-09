@@ -243,6 +243,11 @@ def get_server_configs_dict(
 def extract_cluster_config(
         cluster_config_dict: Dict[str, Any],
         cluster_uri: Optional[str] = None) -> DisaggClusterConfig:
+    """
+    Build the DisaggClusterConfig from the cluster_config_dict.
+    Use the default value of DisaggClusterConfig and MinimalInstances if the corresponding fields are not provided.
+    If cluster_uri is provided, it will override the cluster_uri in the cluster_config_dict.
+    """
 
     def update_dataclass(obj, data_dict: Dict[str, Any]):
         for key, value in data_dict.items():
