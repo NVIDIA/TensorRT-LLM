@@ -243,7 +243,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -390,7 +391,19 @@ public:
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
         std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        torch::Tensor output;
+        if (out_tensor.has_value())
+        {
+            auto const& provided = out_tensor.value();
+            CHECK_INPUT(provided, mOutputDtype);
+            TORCH_CHECK(provided.sizes() == output_shape,
+                "Provided out tensor has incorrect shape. Expected ", output_shape, ", got ", provided.sizes());
+            output = provided;
+        }
+        else
+        {
+            output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        }
 
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
@@ -443,7 +456,7 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -541,7 +554,19 @@ public:
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
         std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        torch::Tensor output;
+        if (out_tensor.has_value())
+        {
+            auto const& provided = out_tensor.value();
+            CHECK_INPUT(provided, mOutputDtype);
+            TORCH_CHECK(provided.sizes() == output_shape,
+                "Provided out tensor has incorrect shape. Expected ", output_shape, ", got ", provided.sizes());
+            output = provided;
+        }
+        else
+        {
+            output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        }
 
         auto num_active_experts_per_node = torch::empty({1}, input.options().dtype(at::ScalarType::Int));
         auto experts_to_token_score

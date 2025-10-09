@@ -443,6 +443,11 @@ class CutlassFusedMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
 
+        # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
+        moe_output: Optional[torch.Tensor] = None
+        if self.enable_alltoall and self.moe_alltoall_backend == "new":
+            # Retrieve a workspace-backed output tensor
+            moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(self.unpadded_hidden_size, output_dtype)
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -475,6 +480,7 @@ class CutlassFusedMoE(MoE):
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
             unpadded_hidden_size=self.unpadded_hidden_size,
+            out_tensor=moe_output,
         )
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
@@ -497,7 +503,7 @@ class CutlassFusedMoE(MoE):
             elif self.moe_alltoall_backend == "new":
                 hidden = final_hidden_states.shape[-1]
                 final_hidden_states = self.moe_a2a.combine(
-                    final_hidden_states.view(self.ep_size, self.moe_a2a.max_num_tokens_per_rank, hidden)
+                    final_hidden_states.view(self.ep_size, self.moe_a2a.max_num_tokens_per_rank, hidden), payload_in_workspace=True
                 )
             else:
                 raise ValueError(f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}")

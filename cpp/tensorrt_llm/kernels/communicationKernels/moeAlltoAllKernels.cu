@@ -404,7 +404,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
                     asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
                     // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
                     #if ENABLE_DEBUG_PRINT
-                    printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
+                    printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: %d, address: %p\n", rank_id, source_rank, flag_value, expected_value, flag_ptr);
                     #endif
                     all_flags_set = all_flags_set && (flag_value == expected_value);
                 }
@@ -645,11 +645,11 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
  __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uint8_t* payload_bytes, 
      int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, const int* recv_counters)
  {    
-     if (blockIdx.x == 0 && threadIdx.x == 0)
-     {
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
          // Increment flag_val for this combine round
-         *flag_val_ptr = *flag_val_ptr + 1;
-     }
+        *flag_val_ptr = *flag_val_ptr + 1;
+    }
 
      if(payload_bytes == nullptr)
          return;
@@ -725,7 +725,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
                  // Acquire load to ensure visibility of peer's release-store
                  asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
                  #if ENABLE_DEBUG_PRINT
-                 printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][peer_rank]: %d address: %p\n", rank_id, peer_rank, flag_value, *flag_ptr, flag_ptr);
+                 printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: %d, address: %p\n", rank_id, peer_rank, flag_value, expected_value, flag_ptr);
                  #endif
                  all_flags_set = all_flags_set && (flag_value == expected_value);
              }

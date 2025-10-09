@@ -154,6 +154,7 @@ def fused_moe(
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
     unpadded_hidden_size: Optional[int] = None,
+    out_tensor: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -240,6 +241,7 @@ def fused_moe(
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
         unpadded_hidden_size,
+        out_tensor
     )
 
     return output if min_latency_mode else [output]
@@ -278,6 +280,7 @@ def _(
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
     unpadded_hidden_size: Optional[int] = None,
+    out_tensor: Optional[torch.Tensor] = None
 ):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:

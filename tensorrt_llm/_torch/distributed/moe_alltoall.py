@@ -194,3 +194,21 @@ class MoeAlltoAll:
         self.topk_send_indices = None
         self.combine_payload_offset = None
         return output
+
+    def get_combine_payload_tensor_in_workspace(self, hidden_size: int, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Return the combine payload tensor in the workspace, which could be used as the output of MoE kernel to avoid extra copy.
+        See "payload_in_workspace" in combine method.
+        """
+        if self._state != "dispatched":
+            raise RuntimeError("get_combine_payload_tensor_in_workspace called before a successful dispatch")
+
+        return torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+            self.workspace,
+            int(self.ep_rank),
+            int(self.ep_size),
+            int(self.max_num_tokens_per_rank),
+            int(self.combine_payload_offset),
+            dtype,
+            int(hidden_size),
+        )

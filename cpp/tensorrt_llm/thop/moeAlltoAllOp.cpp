@@ -405,8 +405,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tenso
         TORCH_CHECK(false, "Unsupported data type for payload");
     }
 
-    // Compute per-rank slice size in bytes
-    int elementSize = static_cast<int>(payload.element_size());
     
     // Create output tensor (local on current rank), no need for initialization
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, payload.options());
@@ -437,31 +435,22 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& topkTargetRanks, torch::Tenso
     int64_t sizePerRank = workspace.size(1);
     uint8_t* workspace_currank_base = workspace_ptr + epRank * workspace.stride(0);
 
-    
-
-    int64_t payloadSize = payload.numel() * payload.element_size();
-    // If user claims payload is in workspace, ensure payload tensor lies fully within this rank's workspace slice
+    // If user claims payload is in workspace, ensure payload tensor matches combinePayloadOffset
     if (payloadInWorkspace)
     {
-        uint8_t* rank_end = workspace_currank_base + sizePerRank;
-        auto* payloadStart = static_cast<uint8_t const*>(payload.data_ptr());
-        auto* payloadEnd = payloadStart + payloadSize;
-        TORCH_CHECK(payloadStart >= workspace_currank_base && payloadEnd <= rank_end,
-            "payload_in_workspace is true but 'payload' falls outside this rank's workspace slice");
-        for(int src_rank = 0; src_rank < epSize; src_rank++)
-        {
-            params.recv_buffers[src_rank] = payload[src_rank].data_ptr();
-        }
+        TORCH_CHECK(payload.data_ptr() == workspace_currank_base + combinePayloadOffset,
+            "payload_in_workspace is true but 'payload' dataptr does not match combinePayloadOffset");
     }
-    else
-    {
-        TORCH_CHECK(combinePayloadOffset >= 0 && combinePayloadOffset + payloadSize <= sizePerRank,
-            "workspace does not contain enough space for the payload region for combine");
 
-        for (int src_rank = 0; src_rank < epSize; src_rank++)
-        {
-            params.recv_buffers[src_rank] = workspace_ptr + src_rank * workspace.stride(0) + combinePayloadOffset;
-        }
+    int64_t payloadSize = payload.numel() * payload.element_size();
+    TORCH_CHECK(combinePayloadOffset >= 0 && combinePayloadOffset + payloadSize <= sizePerRank,
+        "workspace does not contain enough space for the payload region for combine. combine payload offset=", combinePayloadOffset,
+        ", payload size needed=", payloadSize,
+        ", workspace size per rank=", sizePerRank);
+
+    for (int src_rank = 0; src_rank < epSize; src_rank++)
+    {
+        params.recv_buffers[src_rank] = workspace_ptr + src_rank * workspace.stride(0) + combinePayloadOffset;
     }
 
     // completion flags for all ranks (combine)
@@ -562,6 +551,47 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor expert_ids, torch::Tensor recv_coun
 }
 
 
+// Return a workspace-backed tensor for combine payload region using from_blob
+torch::Tensor moeA2AGetCombinePayloadTensorOp(
+    torch::Tensor const& workspace,
+    int64_t epRank,
+    int64_t epSize,
+    int64_t maxTokensPerRank,
+    int64_t combinePayloadOffset,
+    c10::ScalarType outDtype,
+    int64_t hiddenSize)
+{
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be [ep_size, size_per_rank_bytes]");
+    TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "epRank out of range");
+    TORCH_CHECK(epSize == workspace.size(0), "epSize mismatch with workspace");
+    TORCH_CHECK(maxTokensPerRank > 0, "maxTokensPerRank must be positive");
+    TORCH_CHECK(hiddenSize > 0, "hidden must be positive");
+
+    int64_t sizePerRank = workspace.size(1); // bytes
+    int64_t elementSize = static_cast<int64_t>(c10::elementSize(outDtype));
+    int64_t bytesNeeded = epSize * maxTokensPerRank * hiddenSize * elementSize;
+    TORCH_CHECK(combinePayloadOffset >= 0, "combine_payload_offset must be non-negative");
+    TORCH_CHECK(
+        combinePayloadOffset + bytesNeeded <= sizePerRank,
+        "workspace does not have enough space for combine payload tensor. combine payload offset=", combinePayloadOffset,
+        ", payload size needed=", bytesNeeded,
+        ", workspace size per rank=", sizePerRank
+    );
+
+    uint8_t* base = workspace.data_ptr<uint8_t>();
+    uint8_t* rankBase = base + epRank * workspace.stride(0);
+    uint8_t* dataPtr = rankBase + combinePayloadOffset;
+
+    auto options = workspace.options().dtype(outDtype);
+    torch::Tensor t = torch::from_blob(
+        dataPtr,
+        {epSize * maxTokensPerRank, hiddenSize},
+        options);
+    return t;
+}
+
 } // anonymous namespace
 
 } // namespace torch_ext
@@ -592,6 +622,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_initialize(Tensor workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor expert_ids, Tensor recv_counters, int invalid_expert_id) -> ()");
+    module.def(
+        "moe_a2a_get_combine_payload_tensor(Tensor workspace, int ep_rank, int ep_size, int max_tokens_per_rank, int combine_payload_offset, ScalarType out_dtype, int hidden) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
@@ -600,4 +632,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_combine", &torch_ext::moeA2ACombineOp);
     module.impl("moe_a2a_initialize", &torch_ext::moeA2AInitializeOp);
     module.impl("moe_a2a_sanitize_expert_ids", &torch_ext::moeA2ASanitizeExpertIdsOp);
+    module.impl("moe_a2a_get_combine_payload_tensor", &torch_ext::moeA2AGetCombinePayloadTensorOp);
 }
