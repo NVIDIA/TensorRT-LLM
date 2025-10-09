@@ -490,11 +490,8 @@ class Indexer(nn.Module):
             -1) * q_scale * self.softmax_scale * self.n_heads**-0.5
         weights = weights.squeeze(-1)
 
-        topk_indices_buffer = self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k, weights)
-        # TODO: from topk_indices_buffer ([num_tokens, index_topk]), retrieve sparse_attn_indices, sparse_attn_offsets
-
-        return None, None  # sparse_attn_indices, sparse_attn_offsets
-
+        # Return topk indices buffer for sparse attention [num_tokens, index_topk]
+        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k, weights)
 
 class DSATrtllmAttention(TrtllmAttention, nn.Module):
     Metadata = DSAtrtllmAttentionMetadata
@@ -568,6 +565,8 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
 
 
 class DSACacheManager(KVCacheManager):
+    # TODO: Override add_sequence() and add_token() to also add to low_rank_cache_manager
+    # Currently only add_dummy_requests() properly initializes both main KV cache and low_rank cache.
 
     def __init__(
         self,

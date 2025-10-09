@@ -898,6 +898,8 @@ class MLA(nn.Module):
             dtype=dtype,
         )
 
+        self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
+
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
@@ -1571,10 +1573,9 @@ class MLA(nn.Module):
         Forward sparse MLA (DSA) for BF16 KV cache for both context and generation phases using FlashMLA kernels
 
         To form the input for FlashMLA kernel and adapt our KV cache manager, we need to:
-        1. Cannot fuse RoPE into attn anymore; instead, we need to apply RoPE for q/k separately in this kernel
-        2. Load full kv cache from paged kv cache via load_paged_kv_cache_for_mla
-        3. Append and update kv cache and apply RoPE to q via mla_rope_append_paged_kv_assign_q
-        3. Call FlashMLA sparse attention kernel (fmla.sparse_prefill_fwd for ctxa and generation phase)
+        1. Append current tokens to paged cache and apply rope to q/k via mla_rope_append_paged_kv_assign_q
+        2. Load full kv cache from paged memory (with k rope applied)
+        3. Call FlashMLA sparse attention kernel for sparse prefill/decode
         """
         assert isinstance(attn_metadata, TrtllmAttentionMetadata), \
             "DSA requires TrtllmAttentionMetadata for now"
@@ -1627,8 +1628,9 @@ class MLA(nn.Module):
 
         num_tokens = q.shape[0]
         # find topk_indicies
-        top_k_indices = self.mqa.indexer(q, k_pe, attn_metadata, hidden_states, qr, position_ids)
-        topk_indices_reshaped = topk_indices.view(num_tokens, 1, -1)
+        topk_indices = self.mqa.indexer(q, k_pe, attn_metadata, hidden_states, qr, position_ids)
+
+        # TODO: this is the local topk indices, we need to convert it to global topk indices
 
         q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1699,8 +1701,8 @@ class MLA(nn.Module):
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
         if flash_mla_sparse_fwd is not None:
-            attn_out_latent, _ = flash_mla_sparse_fwd(q_concat, kv_c_and_k_pe_cache, topk_indices,
-                                                       self.softmax_scale)
+            attn_out_latent = flash_mla_sparse_fwd(q_concat, kv_c_and_k_pe_cache, topk_indices,
+                                                       self.softmax_scale)[0]
         else:
             raise RuntimeError("flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built.")
         # output: [seq, num_heads, kv_lora_rank]
