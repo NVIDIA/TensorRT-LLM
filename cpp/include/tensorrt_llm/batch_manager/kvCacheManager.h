@@ -248,6 +248,8 @@ public:
 
     [[nodiscard]] BlockPtr getBlock(SizeType32 windowSize) const;
 
+    [[nodiscard]] bool hasBlocks() const;
+
     [[nodiscard]] bool isFull() const;
 
     [[nodiscard]] bool isLeaf() const;

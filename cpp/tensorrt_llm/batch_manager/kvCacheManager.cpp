@@ -682,7 +682,7 @@ LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey
         return result;
     }
     auto itr = mNextNodes.find(blockKey);
-    if (itr != mNextNodes.end())
+    if (itr != mNextNodes.end() && itr->second->hasBlocks())
     {
         // found exact match
         auto node = itr->second;
@@ -695,7 +695,7 @@ LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey
         for (auto const& [key, node] : mNextNodes)
         {
             SizeType32 numMatched = key.partialMatch(blockKey);
-            if (numMatched > 0)
+            if (numMatched > 0 && node != nullptr && node->hasBlocks())
             {
                 result.emplace_back(std::make_tuple(true, numMatched, node));
             }
@@ -770,6 +770,11 @@ BlockPtr KVCachePromptLookupNode::getBlock(SizeType32 windowSize) const
     {
 	return nullptr;
     }
+}
+
+bool KVCachePromptLookupNode::hasBlocks() const
+{
+    return !mBlocks.empty();
 }
 
 bool KVCachePromptLookupNode::isFull() const
@@ -1348,7 +1353,9 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(LookupResults const& matched
                     {
                         partialMatch = true;
                         numMatched = thisNodeNumMatched;
+                        matchingNode = thisNode;
                         matchingBlock = partiallyMatchedBlock;
+                        break;
                     }
                 }
             }
@@ -1834,10 +1841,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 
     // Lookup prompt nodes once for all window block managers
     auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, false, false, true);
-    printf("BlockManager::storeNewBlock - nodes = ");
-    fflush(stdout);
-    mLookup->printNodes(matchedPromptNodes);
-    printf("\n");
+    TLLM_LOG_DEBUG("BlockManager::storeNewBlock - nodes = " + mLookup->printNodes(matchedPromptNodes));
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
