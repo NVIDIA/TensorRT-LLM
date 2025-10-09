@@ -113,7 +113,7 @@ class DetectHFAttnLayers(BaseTransform):
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         # Register profiler attn operator
         ALL_ATTENTION_FUNCTIONS.register("ad_profile_mha", fake_profiler_mha)
 

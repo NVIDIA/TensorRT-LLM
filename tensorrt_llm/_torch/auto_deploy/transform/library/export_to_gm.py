@@ -88,7 +88,7 @@ def set_exact_signature(mod: nn.Module, kwargs: Dict[str, Any]):
 
     reset_signature = False
     if hasattr(forward_func, "__signature__"):
-        signature_attribute = mod.forward.__signature__
+        signature_attribute = forward_func.__signature__
         reset_signature = True
 
     # construct signature object from kwargs
@@ -139,8 +139,13 @@ class ExportToGM(BaseTransform):
         # independent, which would conflict with graph capture logic, i.e., you cannot graph-capture
         # "model" and "model.text_model" for example. However, you can export "model.text_model" and
         # "model.vision_model" separately.
+        def _is_child(child: str, parent: str) -> bool:
+            """Check if ``child`` is a child of ``parent``."""
+            # covers "a.b.c" is a parent of "a.b" or parent being "", i.e., root (a parent of all!)
+            return parent == "" or child.startswith(f"{parent}.")
+
         sub_keys = [info.submodule_name for info in export_infos]
-        assert all(not k1.startswith(k2) for k1 in sub_keys for k2 in sub_keys if k1 != k2), (
+        assert all(not _is_child(k1, k2) for k1 in sub_keys for k2 in sub_keys if k1 != k2), (
             f"Cannot export submodules of already exported submodules, {sub_keys=}"
         )
 
