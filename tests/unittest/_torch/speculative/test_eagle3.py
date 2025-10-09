@@ -418,5 +418,55 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     llm_spec.shutdown()
 
 
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
+def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
+    """Test CDL sampling with 2 requests and max_batch_size=2."""
+    attn_backend = "TRTLLM"
+    enable_block_reuse = False
+    use_one_model = False
+    enable_chunked_prefill = False
+
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    max_batch_size = 1
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                    max_tokens=8192)
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
+                                        enable_padding=True)
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend=attn_backend,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=8192,
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
+
+    spec_config = EagleDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model_dir=eagle_model_dir,
+        eagle3_one_model=use_one_model,
+    )
+
+    # Create the LLM instance
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+    prompts = ["The president of the United States is"]
+
+    sampling_params = SamplingParams(max_tokens=20, temperature=0, top_p=0.9)
+    llm_spec.generate(prompts, sampling_params)
+    llm_spec.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()
