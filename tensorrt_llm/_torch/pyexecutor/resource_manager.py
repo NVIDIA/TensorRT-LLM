@@ -13,6 +13,7 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
+from tensorrt_llm.runtime import ModelConfig as ModelConfigRuntime
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_str_dtype, get_size_in_bytes, nvtx_range
@@ -1176,7 +1177,28 @@ class PeftCacheManager(BaseResourceManager):
             pp_size=world_config.pipeline_parallelism,
             gpus_per_node=world_config.gpus_per_node,
         )
-        self._lora_manager = LoraManager(mapping=mapping)
+        self._lora_manager = LoraManager(
+            mapping=mapping,
+            model_config=self._model_config_binding_to_model_config_runtime(
+                model_config))
+
+    @staticmethod
+    def _model_config_binding_to_model_config_runtime(
+            model_config_binding: ModelConfig) -> ModelConfigRuntime:
+        # TODO ZUKER: Init the rest of the fields as well?
+        return ModelConfigRuntime(
+            max_batch_size=model_config_binding.max_batch_size,
+            max_beam_width=model_config_binding.max_beam_width,
+            vocab_size=model_config_binding.vocab_size,
+            num_layers=model_config_binding.num_layers(
+            ),  # TODO ZUKER: Should num_layers get the PP args from mapping?
+            num_heads=model_config_binding.num_heads,
+            num_kv_heads=model_config_binding.num_kv_heads(0),
+            hidden_size=model_config_binding.hidden_size,
+            head_size=model_config_binding.head_size,
+            gpt_attention_plugin=model_config_binding.use_gpt_attention_plugin,
+            dtype=binding_to_str_dtype(model_config_binding.data_type),
+        )
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:
