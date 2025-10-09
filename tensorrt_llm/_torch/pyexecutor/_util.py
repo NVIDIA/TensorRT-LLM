@@ -21,7 +21,7 @@ from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
+from ..speculative import get_spec_decoder
 from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
@@ -188,50 +188,12 @@ class KvCacheCreator:
             requests = requests * self._mapping.tp_size
         return requests
 
-    def _get_token_num_for_estimation(self) -> int:
-        """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
-        if 'cp_type' in self._mapping.cp_config:
-            raise ValueError(
-                "KV cache size estimation not supported with context parallelism."
-            )
-        # estimate_max_kv_cache_tokens submits self._dummy_reqs
-        num_cache_blocks = 0
-        num_extra_tokens_per_seq = 1  # account for generated tokens
-        pytorch_backend_config = self._pytorch_backend_config
-        spec_cfg = self._speculative_config
-        if not pytorch_backend_config.disable_overlap_scheduler:
-            num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
-            if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_len
-
-        if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_len
-            num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
-
-        if self._dummy_reqs is None:
-            self._dummy_reqs = self._create_dummy_context_requests(
-                max(1, self._net_max_seq_len - 1))
-        for req in self._dummy_reqs:
-            num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
-            # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
-            num_cache_blocks += (num_req_tokens + self._tokens_per_block -
-                                 1) // self._tokens_per_block
-        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return num_cache_blocks * self._tokens_per_block * self._dummy_reqs[
-            0].sampling_config.beam_width
-
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
 
-        This updates `kv_cache_config` and returns a boolean indicating whether KV cache
-        estimation is to be performend.
+        Returns a boolean indicating whether KV cache estimation is to be performed.
         """
-        estimating_kv_cache = False
-        if 'cp_type' not in self._mapping.cp_config:
-            estimating_kv_cache = True
-            self._kv_cache_config.max_tokens = self._get_token_num_for_estimation(
-            )
-        return estimating_kv_cache
+        return 'cp_type' not in self._mapping.cp_config
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
         """Perform KV cache capacity estimation.
