@@ -41,7 +41,6 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
@@ -58,11 +57,10 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.qk_norm_attention import compute_yarn_parameters
 from ..modules.rms_norm import RMSNorm
-from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
@@ -134,58 +132,6 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
-class DeepseekV3Linear(Linear):
-    """
-    A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        mapping: Optional[Mapping] = None,
-        tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        gather_output: bool = False,  # COLUMN parallel only
-        quant_config: Optional[QuantConfig] = None,
-        weights_loading_config: Optional[WeightsLoadingConfig] = None,
-        reduce_output: bool = True,  # ROW parallel only
-        skip_create_weights_in_init: bool = False,
-        use_custom_cublas_mm: bool = False,
-        lora: Optional[LoraLayer] = None,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            bias,
-            dtype,
-            mapping,
-            tensor_parallel_mode,
-            gather_output,
-            quant_config,
-            weights_loading_config,
-            reduce_output,
-            skip_create_weights_in_init,
-            use_custom_cublas_mm,
-            lora,
-        )
-
-    def apply_linear(self,
-                     input,
-                     bias,
-                     lora_params: Optional[dict] | None = None,
-                     layer_idx: Optional[int] | None = None):
-        num_tokens = input.shape[0]
-        if (not self.has_any_quant and 1 <= num_tokens <= 16
-                and get_sm_version() != 120):
-            output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
-                input, self.weight.t(), bias, None)
-        else:
-            output = super().apply_linear(input, bias, lora_params, layer_idx)
-        return output
-
-
 # class GLM4Attention(QKNormRoPEAttention):
 
 #     def __init__(
@@ -237,7 +183,7 @@ class GLM4Attention(Attention):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        fuse_qk_norm_rope: bool = True,
+        fuse_qk_norm_rope: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
@@ -511,7 +457,7 @@ class Deepseekv3MoE(nn.Module):
             topk_group=config.topk_group,
             routed_scaling_factor=config.routed_scaling_factor,
             dtype=dtype,
-            fuse_routing_kernel=True,
+            fuse_routing_kernel=False,
             apply_routing=False,
             moe_backend=model_config.moe_backend)
         self.experts = create_moe(
