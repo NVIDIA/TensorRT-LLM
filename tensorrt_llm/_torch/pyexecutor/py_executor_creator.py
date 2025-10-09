@@ -249,9 +249,6 @@ def create_py_executor(
         max_batch_size,
     ) = llm_args.get_runtime_sizes()
 
-    if max_num_tokens is None:
-        max_num_tokens = 8192
-
     tokens_per_block = llm_args.kv_cache_config.tokens_per_block
 
     if pytorch_backend_config.attn_backend in [

@@ -1496,7 +1496,7 @@ class BaseLlmArgs(StrictBaseModel):
                                           description="The maximum beam width.")
 
     max_num_tokens: Optional[int] = Field(
-        default=None, description="The maximum number of tokens.")
+        default=8192, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
         default=False,
