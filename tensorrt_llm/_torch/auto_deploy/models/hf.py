@@ -525,12 +525,12 @@ class TextModelExportInfo(SubModuleExportInfo):
         )
 
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
-        batch_size_dyn = Dim.DYNAMIC
-        seq_len_dyn = Dim.DYNAMIC
+        batch_size_dynamic = Dim.DYNAMIC
+        seq_len_dynamic = Dim.DYNAMIC
         return {
-            "input_ids": {0: batch_size_dyn, 1: seq_len_dyn},
-            "inputs_embeds": {0: batch_size_dyn, 1: seq_len_dyn},
-            "position_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+            "input_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            "inputs_embeds": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            "position_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
         }
 
     @classmethod

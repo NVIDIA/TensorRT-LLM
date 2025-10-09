@@ -137,6 +137,9 @@ def move_to_device(mod: nn.Module, device: DeviceLikeType) -> None:
     # get device
     device = torch.device(device)
 
+    # move the model to the device
+    mod.to(device)
+
     for _, subgm in reversed(list(named_graphmodules(mod))):
         # recompile graph to update self generated codes in subgraph
         _move_single_gm_to_device(subgm, device)
