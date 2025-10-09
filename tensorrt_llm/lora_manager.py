@@ -670,6 +670,8 @@ class LoraManager(object):
         """Constructor.
 
         Args:
+            mapping (Mapping): Parallelism related information.
+            model_config (ModelConfig): model configuration python class (not CPP binding).
             cpp_peft_cache_manager (PeftCacheManager, optional): used by is_adapter_in_cpu_cache method, that's used for
                 a performance optimization with LoRA of not sending the LoRA adapter weights with every LLM request when
                 the adapter is already loaded in the LoRA CPU cache.
@@ -976,7 +978,7 @@ class LoraManager(object):
         ) -> list[torch.Tensor]:
             assert weight.shape[rank_dim] == sum(part_sizes)
 
-            # Split the weights into their respective parts. e.g. weight -> [q, k, v] for attn_qkv.
+            # Split the weights into their respective parts. e.g. weight -> [Wq, Wk, Wv] for attn_qkv.
             weight_parts = [
                 weight.narrow(rank_dim, sum(part_sizes[:i]), part_sizes[i])
                 for i in range(len(part_sizes))
@@ -985,7 +987,7 @@ class LoraManager(object):
                 assert weight_parts[i].shape[rank_dim] % tp_size == 0
 
             # Split each part into tp_size chunks.
-            # e.g. [q, k, v] -> [[q_rank0, ..., q_rankN], [k_rank0, ..., k_rankN], [v_rank0, ..., v_rankN]]
+            # e.g. [Wq, Wk, Wv] -> [[Wq_rank0, ..., Wq_rankN], [Wk_rank0, ..., Wk_rankN], [Wv_rank0, ..., Wv_rankN]]
             # where N is TP size, for attn_qkv.
             weight_parts_tp_weights = [
                 torch.split(
@@ -995,8 +997,8 @@ class LoraManager(object):
             ]
 
             # Interleave the parts across TP ranks and flatten the list of lists into a single list.
-            # e.g. [[q_rank0, ..., q_rankN], [k_rank0, ..., k_rankN], [v_rank0, ..., v_rankN]]
-            # -> [q_rank0, k_rank0, v_rank0, ..., q_rankN, k_rankN, v_rankN] where N is TP size, for attn_qkv.
+            # e.g. [[Wq_rank0, ..., Wq_rankN], [Wk_rank0, ..., Wk_rankN], [Wv_rank0, ..., Wv_rankN]]
+            # -> [Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN] where N is TP size, for attn_qkv.
             return list(itertools.chain.from_iterable(zip(*weight_parts_tp_weights)))
 
         def load_from_model_dir(uid, model_dir, hf_config):
@@ -1081,8 +1083,8 @@ class LoraManager(object):
                     # Prepare fused modules weights for TP
                     # For fused modules, HF stores the parts weights sequentially, whereas with TP>1 we need them to be
                     # interleaved.
-                    # e.g. Convert [q, k, v] to [q_rank0, k_rank0, v_rank0, ..., q_rankN, k_rankN, v_rankN] where
-                    # N=TP size
+                    # e.g. Convert [Wq, Wk, Wv] to [Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN]
+                    # where N=TP size, for attn_qkv.
                     tp_size = self._mapping.tp_size
                     part_sizes = []
                     if lora_module == "mlp_gate_up":
