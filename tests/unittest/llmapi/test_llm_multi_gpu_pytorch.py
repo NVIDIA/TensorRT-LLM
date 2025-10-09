@@ -62,6 +62,7 @@ def test_llama_7b_multi_lora_tp2():
         cuda_graph_config=None)
 
 
+@pytest.mark.gpu2
 def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1() -> None:
     check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(
         LLM,

@@ -976,6 +976,11 @@ class LoraManager(object):
         def interleave_fused_lora_weights_for_tp(
             weight: torch.Tensor, rank_dim: int, tp_size: int, part_sizes: List[int]
         ) -> List[torch.Tensor]:
+            """Interleaves fused LoRA modules weights for TP.
+            e.g.  In case of attn_qkv: Convert t_out=torch.cat([Wq, Wk, Wv]) to
+                  torch.cat([Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN])
+                  where N=TP size.
+            """  # noqa: D205
             assert weight.shape[rank_dim] == sum(part_sizes)
 
             # Split the weights into their respective parts. e.g. weight -> [Wq, Wk, Wv] for attn_qkv.
@@ -1004,11 +1009,10 @@ class LoraManager(object):
         def prepare_fused_lora_modules_for_tp(
             lora_module: str, t_out: torch.Tensor, rank_dim: int
         ) -> torch.Tensor:
-            """Interleaves fused LoRA modules weights for TP. This is required since HF stores the parts weights
-            sequentially, whereas with TP>1 we need them to be interleaved.
-            e.g.  In case of attn_qkv: Convert t_out=torch.cat([Wq, Wk, Wv]) to
-                  torch.cat([Wq_rank0, Wk_rank0, Wv_rank0, ..., Wq_rankN, Wk_rankN, Wv_rankN])
-                  where N=TP size.
+            """Reorders fused LoRA modules weights for TP. This is required since HF stores the parts weights
+            sequentially, whereas with TP>1 we need them to be interleaved so they would be sharded correctly.
+
+            See interleave_fused_lora_weights_for_tp for more details.
             """  # noqa: D205
             tp_size = self._mapping.tp_size
             if tp_size == 1:
