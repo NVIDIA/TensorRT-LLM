@@ -2,7 +2,7 @@ import json
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import OrderedDict, Type
+from typing import List, OrderedDict, Type
 
 import torch
 from utils.llm_data import llm_models_root
@@ -21,8 +21,8 @@ _RU_LORA_ADAPTER_PROMPTS = [
 
 
 def _generate_llm_response_lora_fused_modules(llm_class: Type[BaseLLM],
-                                              prompts: list[str],
-                                              **extra_llm_kwargs) -> list[str]:
+                                              prompts: List[str],
+                                              **extra_llm_kwargs) -> List[str]:
     """Generates responses with LoRA requests with the Phi-3-mini-4k-instruct-ru-lora adapter.
     The used LoRA adapter has fused attention QKV and fused MLP gate up proj modules.
     Returns the generated texts.
@@ -66,7 +66,7 @@ def check_lora_fused_modules_output_tp2_identical_to_tp1(
 
 
 def check_llama_7b_multi_unique_lora_adapters_from_request(
-        lora_adapter_count_per_call: list[int], repeat_calls: int,
+        lora_adapter_count_per_call: List[int], repeat_calls: int,
         repeats_per_call: int, llm_class: Type[BaseLLM], **llm_kwargs):
     """Calls llm.generate s.t. for each C in lora_adapter_count_per_call, llm.generate is called with C requests
     repeated 'repeats_per_call' times, where each request is configured with a unique LoRA adapter ID.
