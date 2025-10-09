@@ -767,7 +767,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
      }
      
      int bytes_per_token = params.elements_per_token * element_size;
-     int total_slots = params.ep_size * params.max_tokens_per_rank;
+     int total_slots = params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
      int grid_size_warp = ceilDiv(total_slots, kWarpsPerBlock);
      int grid_size_block = total_slots; // one block per token
      
