@@ -10,7 +10,6 @@ from typing import Callable, List, Optional, Union
 import zmq
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from .._utils import mpi_comm, mpi_rank
 from ..bindings import executor as tllm
