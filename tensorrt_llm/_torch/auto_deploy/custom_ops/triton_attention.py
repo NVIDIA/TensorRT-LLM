@@ -284,7 +284,6 @@ def flattened_mha_fake(
     "auto_deploy::triton_attention_prepare_fused_mha_metadata", mutates_args=()
 )
 def prepare_fused_mha_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
@@ -294,7 +293,7 @@ def prepare_fused_mha_metadata(
     page_size: int,
 ) -> List[torch.Tensor]:
     # TODO: maybe use slot_idx instead of pages_per_seq??
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
     seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
     return (
@@ -309,9 +308,9 @@ def prepare_fused_mha_metadata(
 # SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     return (
         torch.empty_like(seq_len[:num_seq]),
         torch.empty_like(input_pos[:num_seq]),

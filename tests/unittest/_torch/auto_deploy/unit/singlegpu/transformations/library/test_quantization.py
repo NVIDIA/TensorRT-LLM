@@ -2,6 +2,8 @@
 Tests for basic graph sharding.
 """
 
+from typing import List
+
 import pytest
 import torch
 import torch.nn as nn
@@ -10,7 +12,11 @@ from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import (
+    FullModelExportInfo,
+    ModelFactory,
+    SubModuleExportInfo,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale, pack_int4_in_uint8
@@ -30,6 +36,9 @@ class DummyFactory(ModelFactory):
 
     def get_quant_config(self):
         return self.quant_config
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 @pytest.mark.parametrize(

@@ -176,7 +176,7 @@ def test_prepare_metadata_cuda(conv_env):
     device = conv_env["device"]
 
     b, s = 4, 6
-    input_ids = torch.randint(0, 1000, (b, s), device=device)
+    # input_ids = torch.randint(0, 1000, (b, s), device=device)
     position_ids = torch.arange(s, device=device).expand(b, -1)
     seq_len = torch.tensor([2, 1, 0, 0], device=device, dtype=torch.int32)
     input_pos = torch.tensor([0, 3, 0, 0], device=device, dtype=torch.int32)
@@ -186,7 +186,6 @@ def test_prepare_metadata_cuda(conv_env):
     page_size = 128
 
     out = torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata(
-        input_ids,
         position_ids,
         seq_len,
         input_pos,
