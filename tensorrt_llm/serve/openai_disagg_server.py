@@ -55,13 +55,13 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(
             config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = config.conditional_disagg_config
-        self.observability_cfg = config.observability_config
+        self.otlp_cfg = config.otlp_config
 
         try:
-            if self.observability_cfg and self.observability_cfg.otlp_traces_endpoint:
-                tracing.init_tracer("trt.llm", self.observability_cfg.otlp_traces_endpoint)
+            if self.otlp_cfg and self.otlp_cfg.otlp_traces_endpoint:
+                tracing.init_tracer("trt.llm", self.otlp_cfg.otlp_traces_endpoint)
                 logger.info(
-                    f"Initialized OTLP tracer successfully, endpoint: {self.observability_cfg.otlp_traces_endpoint}"
+                    f"Initialized OTLP tracer successfully, endpoint: {self.otlp_cfg.otlp_traces_endpoint}"
                 )
         except Exception as e:
             logger.error(f"Failed to initialize OTLP tracer: {e}")

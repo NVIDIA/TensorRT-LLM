@@ -80,6 +80,6 @@ generation_servers:
   num_instances: 1
   urls:
     - "127.0.0.1:8002"
-observability_config:
+otlp_config:
   otlp_traces_endpoint: "grpc://0.0.0.0:4317"
 ```

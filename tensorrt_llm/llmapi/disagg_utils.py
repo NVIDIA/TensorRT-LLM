@@ -44,7 +44,7 @@ class ConditionalDisaggConfig():
 
 
 @dataclass
-class ObservabilityConfig():
+class OtlpConfig():
     otlp_traces_endpoint: Optional[
         str] = None  # Target URL to which OpenTelemetry traces will be sent
 
@@ -72,7 +72,7 @@ class DisaggServerConfig():
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
     max_retries: int = 1
-    observability_config: Optional[ObservabilityConfig] = None
+    otlp_config: Optional[OtlpConfig] = None
     perf_metrics_max_requests: int = 0
 
 
@@ -117,7 +117,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
-                       observability_config: Optional[dict] = None,
+                       otlp_config: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -151,12 +151,11 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
 
-    observability_config = ObservabilityConfig(
-        **observability_config) if observability_config else None
+    otlp_config = OtlpConfig(**otlp_config) if otlp_config else None
 
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
-                                conditional_disagg_config, observability_config,
+                                conditional_disagg_config, otlp_config,
                                 max_retries, perf_metrics_max_requests)
 
     return config
