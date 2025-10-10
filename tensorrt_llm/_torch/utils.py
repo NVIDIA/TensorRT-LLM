@@ -335,12 +335,11 @@ def get_shared_pool():
     Returns:
         The current memory pool, or None if not set.
     """
-    global _buffer_pool
     return _buffer_pool
 
 
 @contextlib.contextmanager
-def set_shared_mem_pool(mem_pool) -> contextlib.AbstractContextManager:
+def with_shared_pool(buffer_pool) -> contextlib.AbstractContextManager:
     """Temporarily sets a preferred memory pool and restores the previous one on exit.
 
     This context manager allows temporarily switching to a different memory pool
@@ -354,7 +353,7 @@ def set_shared_mem_pool(mem_pool) -> contextlib.AbstractContextManager:
         None
 
     Example:
-        >>> with set_shared_mem_pool(buffer_pool):
+        >>> with with_shared_pool(buffer_pool):
         ...     # Allocations within this block use buffer_pool
         ...     tensor = allocate_buffer(...)
     """
