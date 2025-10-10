@@ -7,6 +7,7 @@ import torch.nn as nn
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -14,8 +15,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    LlmRequestState, get_draft_token_length)
+from tensorrt_llm._torch.pyexecutor.llm_request import get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
                                                              KVCacheManager)
 from tensorrt_llm._utils import get_size_in_bytes
@@ -23,8 +23,8 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm import deep_gemm
-from tensorrt_llm.deep_gemm import fp8_mqa_logits, fp8_paged_mqa_logits, get_paged_mqa_logits_metadata
+from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
+                                    get_paged_mqa_logits_metadata)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -80,12 +80,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
 
+    def __init__(self, *args, **kwargs):
+        # TODO: Required for sparse MLA to use load_paged_kv_cache_for_mla&mla_rope_append_paged_kv_assign_q kernels
+        kwargs["enable_context_mla_with_cached_kv"] = True
+        super().__init__(*args, **kwargs)
+
     def __post_init__(self):
         super().__post_init__()
         self.low_rank_cache_block_offsets = torch.empty(
             [
                 self.max_num_sequences,
-                self.kv_cache_manager.max_low_rank_blocks_per_seq
+                self.kv_cache_manager.max_indexer_k_cache_blocks_per_seq
             ],
             dtype=torch.int32,
             device='cuda',
@@ -95,7 +100,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super().prepare()
         if self.kv_cache_manager is not None:
             self.host_low_rank_cache_block_offsets = \
-                self.kv_cache_manager.get_low_rank_block_offsets(self.request_ids)
+                self.kv_cache_manager.get_indexer_k_cache_offsets(self.request_ids)
             self.low_rank_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_low_rank_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
@@ -107,7 +112,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
 class Indexer(nn.Module):
 
-    def __init__(self, quant_config: Optional[QuantConfig],
+    def __init__(self,
+                 quant_config: Optional[QuantConfig],
                  pos_embd_params: Optional[PositionalEmbeddingParams],
                  mla_params: Optional[MLAParams],
                  skip_create_weights_in_init: bool,
@@ -163,18 +169,18 @@ class Indexer(nn.Module):
         self.quant_block_size = 128
         self._tokens_per_block = None  # Will be retrieved from cache_manager
         # Separate slot mappings for non-interleaved layout (flat byte indices)
-        self.slot_mapping_fp8 = None    # [total_tokens] flat byte indices for FP8 data start
+        self.slot_mapping_fp8 = None  # [total_tokens] flat byte indices for FP8 data start
         self.slot_mapping_scale = None  # [total_tokens] flat byte indices for scale start
 
         # TODO: Consolidate these parameters into decoder metadata.
         # Preparation stage buffers
         self.num_sms = deep_gemm.get_num_sms()
         self.scheduler_metadata_buffer = torch.empty((self.num_sms + 1, 2),
-                                                dtype=torch.int32,
-                                                device='cuda')
+                                                     dtype=torch.int32,
+                                                     device='cuda')
         # Decode phase metadata
         self.decode_context_lens = None  # Context lengths for decode phase
-        self.decode_block_table = None   # Block table for decode phase
+        self.decode_block_table = None  # Block table for decode phase
 
     def set_cache_manager(self, cache_manager):
         """Set the cache manager reference for KV cache operations."""
@@ -205,24 +211,25 @@ class Indexer(nn.Module):
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
 
-
         # Prepare for decode phase if there are generation requests
         if num_generations > 0:
             # Get context_lens for generation requests (total tokens including history + new token)
-            context_lens = metadata.kv_lens[num_contexts:num_contexts + num_generations].to(torch.int32)
+            context_lens = metadata.kv_lens[num_contexts:num_contexts +
+                                            num_generations].to(torch.int32)
 
             # Get generation request IDs
-            gen_request_ids = metadata.request_ids[num_contexts:num_contexts + num_generations]
+            gen_request_ids = metadata.request_ids[num_contexts:num_contexts +
+                                                   num_generations]
 
             # Get block table for generation requests
-            block_table = self.cache_manager.get_indexer_k_block_offsets(gen_request_ids)
+            block_table = self.cache_manager.get_indexer_k_block_offsets(
+                gen_request_ids)
 
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
             blocksize = self.tokens_per_block
             self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
-                context_lens, blocksize, self.num_sms
-            )
+                context_lens, blocksize, self.num_sms)
 
             # Store decode metadata for use in forward pass
             self.decode_context_lens = context_lens
@@ -245,7 +252,8 @@ class Indexer(nn.Module):
         start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
         # Compute the flat slot mapping for all tokens (separate FP8 and scale offsets)
-        self._compute_slot_mapping(request_ids, start_positions, num_tokens_per_request)
+        self._compute_slot_mapping(request_ids, start_positions,
+                                   num_tokens_per_request)
 
     def _compute_slot_mapping(self, request_ids: List[int],
                               start_positions: torch.Tensor,
@@ -263,16 +271,24 @@ class Indexer(nn.Module):
             self.slot_mapping_fp8: [total_tokens] - flat byte index for FP8 data start
             self.slot_mapping_scale: [total_tokens] - flat byte index for scale start
         """
-        block_offsets = self.cache_manager.get_indexer_k_block_offsets(request_ids)
+        block_offsets = self.cache_manager.get_indexer_k_block_offsets(
+            request_ids)
         total_tokens = num_tokens_per_request.sum().item()
         head_dim = self.head_dim
         scale_size = head_dim // self.quant_block_size * 4  # float32 = 4 bytes
-        block_stride = self.tokens_per_block * (head_dim + scale_size)  # Bytes per block
+        block_stride = self.tokens_per_block * (head_dim + scale_size
+                                                )  # Bytes per block
         scale_base_offset = self.tokens_per_block * head_dim  # Offset to scale region in block
 
         # Preallocate slot mappings: [total_tokens] flat byte indices
-        self.slot_mapping_fp8 = torch.full((total_tokens,), -1, dtype=torch.int64, device=start_positions.device)
-        self.slot_mapping_scale = torch.full((total_tokens,), -1, dtype=torch.int64, device=start_positions.device)
+        self.slot_mapping_fp8 = torch.full((total_tokens, ),
+                                           -1,
+                                           dtype=torch.int64,
+                                           device=start_positions.device)
+        self.slot_mapping_scale = torch.full((total_tokens, ),
+                                             -1,
+                                             dtype=torch.int64,
+                                             device=start_positions.device)
 
         token_idx = 0
         for req_idx, req_id in enumerate(request_ids):
@@ -300,10 +316,11 @@ class Indexer(nn.Module):
                 token_idx += 1
 
         self.slot_mapping_fp8 = self.slot_mapping_fp8.cuda(non_blocking=True)
-        self.slot_mapping_scale = self.slot_mapping_scale.cuda(non_blocking=True)
+        self.slot_mapping_scale = self.slot_mapping_scale.cuda(
+            non_blocking=True)
 
-
-    def _update_k_cache(self, k_fp8: torch.Tensor, k_scale: torch.Tensor) -> None:
+    def _update_k_cache(self, k_fp8: torch.Tensor,
+                        k_scale: torch.Tensor) -> None:
         """
         Insert/append k values and scales into the indexer k cache using pre-computed slot mappings.
         Uses flat byte indices with vectorized scatter.
@@ -326,19 +343,27 @@ class Indexer(nn.Module):
         scale_size = k_scale.shape[1] * 4  # Convert to bytes (float32 = 4 bytes)
 
         # Convert to bytes: flatten first, then view as uint8, then reshape
-        k_fp8_bytes = k_fp8.contiguous().view(-1).view(torch.uint8).view(num_tokens, head_dim)
-        k_scale_bytes = k_scale.contiguous().view(-1).view(torch.uint8).view(num_tokens, scale_size)
+        k_fp8_bytes = k_fp8.contiguous().view(-1).view(torch.uint8).view(
+            num_tokens, head_dim)
+        k_scale_bytes = k_scale.contiguous().view(-1).view(torch.uint8).view(
+            num_tokens, scale_size)
 
         # Scatter FP8 data
-        flat_indices_fp8 = self.slot_mapping_fp8[:num_tokens]  # [num_tokens] start indices
-        byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
-        scatter_indices_fp8 = flat_indices_fp8.unsqueeze(1) + byte_offsets  # [num_tokens, head_dim]
+        flat_indices_fp8 = self.slot_mapping_fp8[:
+                                                 num_tokens]  # [num_tokens] start indices
+        byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(
+            0)  # [1, head_dim]
+        scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
+            1) + byte_offsets  # [num_tokens, head_dim]
         k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
 
         # Scatter scales
-        flat_indices_scale = self.slot_mapping_scale[:num_tokens]  # [num_tokens] start indices
-        byte_offsets = torch.arange(scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
-        scatter_indices_scale = flat_indices_scale.unsqueeze(1) + byte_offsets  # [num_tokens, scale_size]
+        flat_indices_scale = self.slot_mapping_scale[:
+                                                     num_tokens]  # [num_tokens] start indices
+        byte_offsets = torch.arange(
+            scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
+        scatter_indices_scale = flat_indices_scale.unsqueeze(
+            1) + byte_offsets  # [num_tokens, scale_size]
         k_cache_flat[scatter_indices_scale] = k_scale_bytes
 
     def sparse_attn_indexer(
@@ -404,56 +429,61 @@ class Indexer(nn.Module):
         if has_decode:
             max_seq_len = self.cache_manager.max_seq_len
             # Get decode lengths per request (from seq_lens) for validation
-            gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts + num_generations]
+            gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
+                                             num_generations]
             max_decode_len = gen_seq_lens.max().item()
             min_decode_len = gen_seq_lens.min().item()
             assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
-            q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens, ...]
+            q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
+                             ...]
             q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
             batch_size = q_decode.shape[0]
             next_n = q_decode.shape[1]
             assert num_gen_tokens == batch_size * next_n
-            weights_decode = weights[num_ctx_tokens:num_ctx_tokens + num_gen_tokens, ...]
+            weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
+                                     num_gen_tokens, ...]
 
             # Get k cache and call fp8_paged_mqa_logits with prepared decode metadata
-            k_cache = self.cache_manager.get_indexer_k_cache_buffers(self.layer_idx) # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
+            k_cache = self.cache_manager.get_indexer_k_cache_buffers(
+                self.layer_idx
+            )  # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             logits_decode = fp8_paged_mqa_logits(
                 q_decode,
                 k_cache,
                 weights_decode,
                 self.decode_context_lens,  # context_lens prepared in prepare()
-                self.decode_block_table,    # block_table prepared in prepare()
+                self.decode_block_table,  # block_table prepared in prepare()
                 self.scheduler_metadata_buffer,
-                max_seq_len
-            )
+                max_seq_len)
             # padded
-            positions = torch.arange(max_seq_len,
-                                    device=q_decode.device).unsqueeze(0).expand(
-                                        num_gen_tokens, -1)
+            positions = torch.arange(
+                max_seq_len,
+                device=q_decode.device).unsqueeze(0).expand(num_gen_tokens, -1)
             row_indices = torch.arange(num_gen_tokens,
-                                    device=q_decode.device) // next_n
-            next_n_offset = torch.arange(
-                num_gen_tokens,
-                device=q_decode.device) % next_n
+                                       device=q_decode.device) // next_n
+            next_n_offset = torch.arange(num_gen_tokens,
+                                         device=q_decode.device) % next_n
             index_end_pos = (self.decode_context_lens[row_indices] - next_n +
-                            next_n_offset).unsqueeze(1)
+                             next_n_offset).unsqueeze(1)
 
             # index_end_pos: [B * N, 1]
             mask = positions <= index_end_pos
             # mask: [B * N, L]
             logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
-            topk_indices_decode = logits_decode.topk(self.index_topk,
-                                    dim=-1)[1].to(torch.int32)  # [B * N, K]
+            topk_indices_decode = logits_decode.topk(
+                self.index_topk, dim=-1)[1].to(torch.int32)  # [B * N, K]
             # ensure we don't set indices for the top k
             # that is out of range(masked already)
             # this will happen if context length is shorter than K
             topk_indices_decode[topk_indices_decode > index_end_pos] = -1
 
             # Store in buffer
-            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
-                               :topk_indices_decode.shape[-1]] = topk_indices_decode.to(dtype=torch.int32)
+            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                num_gen_tokens, :topk_indices_decode.
+                                shape[-1]] = topk_indices_decode.to(
+                                    dtype=torch.int32)
 
         return topk_indices_buffer
 
@@ -491,7 +521,9 @@ class Indexer(nn.Module):
         weights = weights.squeeze(-1)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k, weights)
+        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k,
+                                        weights)
+
 
 class DSATrtllmAttention(TrtllmAttention, nn.Module):
     Metadata = DSAtrtllmAttentionMetadata
@@ -565,8 +597,6 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
 
 
 class DSACacheManager(KVCacheManager):
-    # TODO: Override add_sequence() and add_token() to also add to low_rank_cache_manager
-    # Currently only add_dummy_requests() properly initializes both main KV cache and low_rank cache.
 
     def __init__(
         self,
@@ -615,21 +645,14 @@ class DSACacheManager(KVCacheManager):
             **kwargs,
         )
 
-        # Per layer low rank cache pool
         self.num_blocks = self.blocks_in_primary_pool
-        self.low_rank_cache_pool_per_layer = [
-            torch.empty(
-                (self.num_blocks, tokens_per_block, 1, self.index_head_dim +
-                 self.index_head_dim // self.quant_block_size * 4),
-                device="cuda",
-                dtype=torch.uint8) for _ in range(self.num_local_layers)
-        ]
-        self.max_low_rank_blocks_per_seq = self.num_blocks
+        self.max_indexer_k_cache_blocks_per_seq = self.num_blocks
 
-        # Block manager to manage the low rank cache blocks for each request. Different layers share the
+        # Block manager to manage the indexer k cache blocks for each request. Different layers share the
         # same block ids.
-        self.low_rank_cache_manager = BlockManager(self.num_local_layers, self.num_blocks,
-                                                   tokens_per_block)
+        self.indexer_k_cache_manager = BlockManager(self.num_local_layers,
+                                                    self.num_blocks,
+                                                    tokens_per_block)
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, tokens_per_block * (index_head_dim + scale_size)]
@@ -638,10 +661,10 @@ class DSACacheManager(KVCacheManager):
         assert tokens_per_block == 64, "Current DeepGEMM kernels (e.g., fp8_paged_mqa_logits) only support block size of 64"
         scale_size = self.index_head_dim // self.quant_block_size * 4
         self.indexer_k_cache_pool_per_layer = [
-            torch.empty(
-                (self.num_blocks, tokens_per_block * (self.index_head_dim + scale_size)),
-                device="cuda",
-                dtype=torch.uint8) for _ in range(self.num_local_layers)
+            torch.empty((self.num_blocks, tokens_per_block *
+                         (self.index_head_dim + scale_size)),
+                        device="cuda",
+                        dtype=torch.uint8) for _ in range(self.num_local_layers)
         ]
 
     def add_dummy_requests(
@@ -666,26 +689,25 @@ class DSACacheManager(KVCacheManager):
         if prepare_resource:
             for req in requests:
                 request_id = req.py_request_id
-                self.low_rank_cache_manager.add_tokens(request_id,
-                                                       req.max_beam_num_tokens)
+                self.indexer_k_cache_manager.add_tokens(request_id,
+                                                        req.max_beam_num_tokens)
         return requests
 
-    def get_low_rank_buffers(self, layer_idx: int):
-        return self.low_rank_cache_pool_per_layer[layer_idx]
-
-    def get_low_rank_block_offsets(self,
-                                   request_ids: List[int]) -> torch.Tensor:
-        return self.low_rank_cache_manager.get_block_offsets(request_ids)
+    def get_indexer_k_cache_offsets(self,
+                                    request_ids: List[int]) -> torch.Tensor:
+        return self.indexer_k_cache_manager.get_block_offsets(request_ids)
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
-        block_size = self.low_rank_cache_manager.tokens_per_block
+        block_size = self.indexer_k_cache_manager.tokens_per_block
         per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
-        return self.indexer_k_cache_pool_per_layer[layer_idx].view(self.num_blocks, block_size, 1, per_token_size)
+        return self.indexer_k_cache_pool_per_layer[layer_idx].view(
+            self.num_blocks, block_size, 1, per_token_size)
 
-    def get_indexer_k_block_offsets(self, request_ids: List[int]) -> torch.Tensor:
+    def get_indexer_k_block_offsets(self,
+                                    request_ids: List[int]) -> torch.Tensor:
         """Get block offsets for indexer k cache """
-        return self.low_rank_cache_manager.get_block_offsets(request_ids)
+        return self.indexer_k_cache_manager.get_block_offsets(request_ids)
 
     def prepare_resources(self, scheduled_batch):
         """
@@ -699,38 +721,25 @@ class DSACacheManager(KVCacheManager):
         for req in context_batch:
             request_id = req.py_request_id
             if req.is_first_context_chunk:
-                self.low_rank_cache_manager.add_tokens(request_id, req.prompt_len)
-                # TODO: Add support for num_extra_kv_tokens
-                # for _ in range(self.num_extra_kv_tokens):
-                #     self.low_rank_cache_manager.add_tokens(request_id, 1)
-
-                # Add draft tokens
-                draft_token_len = get_draft_token_length(req)
-                if draft_token_len > 0:
-                    self.low_rank_cache_manager.add_tokens(request_id, draft_token_len)
+                self.indexer_k_cache_manager.add_tokens(request_id,
+                                                        req.prompt_len)
+                self.indexer_k_cache_manager.add_tokens(
+                    request_id, self.num_extra_kv_tokens)
+                self.indexer_k_cache_manager.add_tokens(
+                    request_id, get_draft_token_length(req))
 
         # Allocate blocks for generation requests
         for req in generation_batch:
             request_id = req.py_request_id
-            self.low_rank_cache_manager.add_tokens(request_id, 1)
-            # Add draft tokens
-            draft_token_len = get_draft_token_length(req)
-            if draft_token_len > 0:
-                self.low_rank_cache_manager.add_tokens(request_id, draft_token_len)
+            self.indexer_k_cache_manager.add_tokens(request_id, 1)
+            self.indexer_k_cache_manager.add_tokens(request_id,
+                                                    get_draft_token_length(req))
 
         # TODO: Support beam search, current assume beam_width=1
 
-    def update_resources(self, scheduled_batch):
-        for request in scheduled_batch.context_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                seq_len = request.get_num_tokens(0)
-                rewind_len = max(seq_len - 1 - self.prompt_budget, 0)
-                self.rewind_kv_cache(request, rewind_len)
-                self.low_rank_cache_manager.rewind_cache(request, rewind_len)
-
     def free_resources(self, request):
         super().free_resources(request)
-        self.low_rank_cache_manager.free_resources(request)
+        self.indexer_k_cache_manager.free_resources(request)
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping):
