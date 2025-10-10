@@ -633,15 +633,15 @@ public:
     void releaseLastBlock(GenerationRequest& sequence);
 
     //! \brief Detach front block from the sequence
-    void detachFrontBlock(GenerationRequest& sequence, bool isEnableBlockReuse);
+    void detachFrontBlock(GenerationRequest& sequence);
 
     //! \brief Add/detach block(s) to/from the sequence if needed
     //! \details When we need a new block, we add it. For sliding window
     //! attention (SWA), when a block goes out-of-window (OOW), we detach it
-    //! and store it if reuse is enabled. If this called in the first step of
-    //! the generation phase, we may detach more than a single block since
-    //! there may be more than one context block that goes OOW.
-    void adjustBlocksIfNeeded(GenerationRequest& sequence, bool isEnableBlockReuse);
+    //! If this called in the first step of the generation phase, we may detach
+    //! more than a single block since there may be more than one context block
+    //! that goes OOW.
+    void adjustBlocksIfNeeded(GenerationRequest& sequence);
 
     [[nodiscard]] SizeType32 getWindowSize() const noexcept
     {
@@ -1268,10 +1268,10 @@ public:
     //! \brief Add/detach block(s) to/from the sequence if needed
     //! \details When we need a new block, we add it. For sliding window
     //! attention (SWA), when a block goes out-of-window (OOW), we detach it
-    //! and store it if reuse is enabled. If this called in the first step of
-    //! the generation phase, we may detach more than a single block since
-    //! there may be more than one context block that goes OOW.
-    void adjustBlocksIfNeeded(GenerationRequest& sequence, bool isEnableBlockReuse);
+    //! If this called in the first step of the generation phase, we may
+    //! detach more than a single block since there may be more than one
+    //! context block that goes OOW.
+    void adjustBlocksIfNeeded(GenerationRequest& sequence);
 
     //! \brief Return whether the sequence is already managed by the block manager
     [[nodiscard]] bool isSequenceHeld(LlmRequest::RequestIdType requestId) const
