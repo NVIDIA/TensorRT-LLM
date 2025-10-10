@@ -28,6 +28,7 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.inputs import create_input_processor
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -149,7 +150,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 @optgroup.option(
     "--data_device",
     type=click.Choice(["cuda", "cpu"]),
-    default="cuda",
+    default="cpu",
     help="Device to load the multimodal data on.",
 )
 @optgroup.option(
@@ -301,11 +302,13 @@ def throughput_command(
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
     tokenizer = initialize_tokenizer(options.checkpoint_path)
+    processor = create_input_processor(options.checkpoint_path, tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
     max_num_tokens = params.get("max_num_tokens")
-    enable_chunked_context: bool = params.get("enable_chunked_context")
+    enable_chunked_context: bool = params.get(
+        "enable_chunked_context") and not params.get("disable_chunked_context")
     scheduler_policy: str = params.get("scheduler_policy")
 
     custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
@@ -331,7 +334,7 @@ def throughput_command(
             modality=options.modality,
             image_data_format=image_data_format,
             data_device=data_device,
-            max_input_seq_len_for_multimodal=options.max_input_len)
+            processor=processor)
         metadata.dataset_path = options.dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
@@ -427,7 +430,8 @@ def throughput_command(
         # Perform warmup if requested.
         if options.warmup > 0:
             logger.info("Setting up for warmup...")
-            warmup_dataset = generate_warmup_dataset(requests, options.warmup)
+            warmup_dataset = generate_warmup_dataset(requests, options.warmup,
+                                                     options.modality)
             logger.info("Running warmup.")
             asyncio.run(
                 async_benchmark(llm,
