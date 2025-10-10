@@ -132,7 +132,10 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
-    auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
+    auto priority = block->getPriority();
+    auto priorityIdx = getPriorityIdx(priority);
+    TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::releaseBlock :: blockId=%d, priority=%d, priorityIdx=%d",__FILE__,__LINE__,id,priority,priorityIdx);
+    auto& q = mFreeQueues[cacheLevel][priorityIdx];
     if (toFront)
     {
         mFreeBlockIterators[id] = q.insert(q.begin(), block);

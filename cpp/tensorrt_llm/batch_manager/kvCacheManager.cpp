@@ -532,6 +532,50 @@ std::string KVCachePromptLookup::printNodes(LookupResults const& matches)
     return out.str();
 }
 
+std::string KVCachePromptLookup::printMatchedBlock(std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr> const& match)
+{
+    std::stringstream out;
+    [[maybe_unused]] auto const [partialMatch,nuMatched,matchedNode,matchedBlock] = match;
+    if (matchedNode != nullptr)
+    {
+        out << printBlockKey(matchedNode->getBlockKey());
+    }
+    else
+    {
+        out << "nil";
+    }
+    return out.str();
+}
+
+std::string KVCachePromptLookup::printMatchedBlocks(std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matches)
+{
+    std::stringstream out;
+    bool firstIteration = true;
+    for (auto const& match : matches)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+	}
+	else
+	{
+            out << ", ";
+	}
+        out << "[" << printMatchedBlock(match) << "]";
+    }
+    return out.str();
+}
+
+std::string KVCachePromptLookup::printMatchedBlocks(std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> const& matches)
+{
+    std::stringstream out;
+    for (auto [windowSize,singleWindowMatches] : matches)
+    {
+        out << "windowSize=" << windowSize << " :: " << printMatchedBlocks(singleWindowMatches) << std::endl;
+    }
+    return out.str();
+}
+
 std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const
 {
     auto constexpr beamIdx = 0;
@@ -552,19 +596,19 @@ std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmReq
 // Rewrite so this function returns a vector of matching blocks for each window size.
 // This is the only way to get correct results since the next node depends on which of the current nodes have available blocks, which is a local decision for each window size.
 
-std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>> KVCachePromptLookup::lookupBlocks(
-        std::unordered_map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
+std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> KVCachePromptLookup::lookupBlocks(
+        std::map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
         LlmRequest const& llmRequest, SizeType32 inputLength, 
         bool allowPartiallyFilledBlock, bool enablePartialReuse)
 {
     // Return value
-    std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>> results;
+    std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> results;
     // Keep track of all window sizes that are still looking for matching blocks
     std::unordered_set<SizeType32> stillLooking;
     for ([[maybe_unused]] auto const& [windowSize,dummy1] : windowBlockManagers)
     {
         stillLooking.insert(windowSize);
-        results.emplace(std::make_pair(windowSize,std::vector<std::tuple<bool,SizeType32,BlockPtr>>()));
+        results.emplace(std::make_pair(windowSize,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>()));
     }
 
     // Search tree
@@ -581,6 +625,7 @@ std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>>
         else
         {
             // Consider exact match
+            LookupNodePtr nextSearchRoot = nullptr;
             std::unordered_set<SizeType32> needPartials;
             auto exactMatch = searchRoot->findMatchingNodes(blockKey, false);
             TLLM_CHECK_WITH_INFO(exactMatch.size() == 0 || exactMatch.size() == 1, "exactMatch must contain either one node or no node");
@@ -588,6 +633,7 @@ std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>>
             {
                 // found exact matching node
                 [[maybe_unused]] auto const& [dummy1, dummy2, exactMatchingNode] = exactMatch[0];
+                nextSearchRoot = exactMatchingNode;
                 for (auto windowSize : stillLooking)
                 {
                     auto block = exactMatchingNode->getBlock(windowSize);
@@ -596,7 +642,7 @@ std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>>
                         // found exact matching block 
                         auto& winres = results[windowSize];
                         // TODO: verify these outputs
-                        winres.emplace_back(std::make_tuple(!block->isFull(),0,block));
+                        winres.emplace_back(std::make_tuple(!block->isFull(),0,block,exactMatchingNode));
                     }
                     else
                     {
@@ -644,13 +690,16 @@ std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>>
                         {
                             // found partial match
                             auto& winres = results[windowSize];
-                            winres.emplace_back(std::make_tuple(true,numMatched,block));
+                            winres.emplace_back(std::make_tuple(true,numMatched,block,node));
                             break;
                         }
                     }
                     stillLooking.erase(windowSize);
                 }
             }
+
+            // Advance searchRoot to exact matching node if found, otherwise set to nullptr
+            searchRoot = nextSearchRoot;
         }
 
         if (stillLooking.empty()) break;
@@ -1281,8 +1330,8 @@ BlockPtr WindowBlockManager::getFreeBlock(
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
-    // remove block from free queue
-    mEvictionPolicy->claimBlock(block);
+    // remove block from free queue and set priority
+    mEvictionPolicy->claimBlock(block, priority, durationMs);
     // Offloading is an option only when these conditions are met:
     // 1. Block contains state (evidenced by presence of tokens)
     // 2. Eviction policy indicated block can be offloaded
@@ -1427,8 +1476,9 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-SizeType32 WindowBlockManager::loadOrAllocateBlocks(LookupResults const& matchedPromptNodes, SizeType32 numContextBlocks,
-    GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
+SizeType32 WindowBlockManager::loadOrAllocateBlocks(
+        std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matchedBlocks, SizeType32 numContextBlocks,
+        GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
 {
     SizeType32 numMatchedTokens{0};
 
@@ -1437,42 +1487,10 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(LookupResults const& matched
     auto const beamWidth = sequence.getBeamWidth();
     SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
 
-    auto nodeItr = matchedPromptNodes.begin();
+    auto blockItr = matchedBlocks.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
-        // Assume no matching node
-        bool partialMatch = false;
-        SizeType32 numMatched = 0;
-        LookupNodePtr matchingNode = nullptr;
-        BlockPtr matchingBlock = nullptr;
-        if (nodeItr != matchedPromptNodes.end())
-        {
-            auto matchedPromptNode = *(nodeItr++);
-            if (matchedPromptNode.size() == 1)
-            {
-                // Exactly one match returned
-                std::tie(partialMatch, numMatched, matchingNode) = matchedPromptNode[0];
-                matchingBlock = matchingNode->getBlock(mWindowSize);
-            }
-            else if (matchedPromptNode.size() > 1)
-            {
-                // More than one match returned
-                // Find longest match with attached block
-                for (auto partiallyMatched : matchedPromptNode)
-                {
-                    [[maybe_unused]] auto [dummy1, thisNodeNumMatched, thisNode] = partiallyMatched;
-                    auto partiallyMatchedBlock = thisNode->getBlock(mWindowSize);
-                    if (partiallyMatchedBlock != nullptr)
-                    {
-                        partialMatch = true;
-                        numMatched = thisNodeNumMatched;
-                        matchingNode = thisNode;
-                        matchingBlock = partiallyMatchedBlock;
-                        break;
-                    }
-                }
-            }
-        }
+        auto [partialMatch, numMatched, matchingBlock, matchingNode] = blockItr != matchedBlocks.end() ? *(blockItr++) : std::make_tuple(false,0,nullptr,nullptr);
         if (matchingBlock != nullptr)
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
@@ -1591,18 +1609,18 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
 {
     TLLM_LOG_DEBUG("BlockManager::addSequence - prompt = " + mLookup->printPrompt(llmRequest));
 
-    // Lookup prompt nodes once for all window block managers
-    // TODO: Should this be inputLength - 1, or should caller do the subtraction? Leaning towards caller doing subtraction
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength - 1, true, mEnablePartialReuse, false);
-    TLLM_LOG_DEBUG("BlockManager::addSequence - nodes = " + mLookup->printNodes(matchedPromptNodes));
+    // Find matching blocks that can be reused
+    auto matchedBlocks = mLookup->lookupBlocks(mWindowBlockManagers, llmRequest, inputLength - 1, true, mEnablePartialReuse);
+    TLLM_LOG_DEBUG("BlockManager::addSequence - blocks = " + mLookup->printMatchedBlocks(matchedBlocks));
     // Find kv cache blocks to reuse for each window manager
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedPromptNodes);
+    mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedBlocks[windowSize]);
 }
 
 // There are two versions of WindowBlockManager::addSequence function.
 // This is called when block reuse is enabled.
 void WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, LookupResults const& matchedPromptNodes)
+    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, 
+    std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matchedBlocks)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1624,13 +1642,21 @@ void WindowBlockManager::addSequence(
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
     auto config = llmRequest.getKvCacheRetentionConfig();
+    if (config.has_value())
+    {
+        TLLM_LOG_DEBUG("%s;%d - KvCacheRetentionConfig = %s",__FILE__,__LINE__,config.value().print().c_str());
+    }
 
     auto perBlockRetentions = config.value_or(executor::KvCacheRetentionConfig())
                                   .getPerBlockRetentionPriorityDuration(getTokensPerBlock(), inputLength);
+    for (auto perBlockRetention : perBlockRetentions)
+    {
+        TLLM_LOG_DEBUG("%s;%d - per Block KvCacheRetentionConfig = %s",__FILE__,__LINE__,perBlockRetention.print().c_str());
+    }
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    auto const prepopulatedPromptLen = loadOrAllocateBlocks(matchedPromptNodes, numContextBlocks, sequence, perBlockRetentions);
+    auto const prepopulatedPromptLen = loadOrAllocateBlocks(matchedBlocks, numContextBlocks, sequence, perBlockRetentions);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
 

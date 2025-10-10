@@ -289,14 +289,18 @@ public:
 
     //! \brief Find matching blocks for a given prompt prefix for all window sizes.
     //! return map of matching blocks vs window size. Matching blocks is a vector of varying size.
-    std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr>>> lookupBlocks(
-            std::unordered_map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
+    std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> lookupBlocks(
+            std::map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
             LlmRequest const& llmRequest, SizeType32 inputLength, 
             bool allowPartiallyFilledBlock, bool enablePartialReuse);
 
     // Debugging functions
+    //
     std::string printNode(LookupResult const& match);
     std::string printNodes(LookupResults const& matches);
+    std::string printMatchedBlock(std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr> const& match);
+    std::string printMatchedBlocks(std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matches);
+    std::string printMatchedBlocks(std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> const& matches);
     std::string printPrompt(LlmRequest const& llmRequest);
 
 private:
@@ -646,7 +650,7 @@ public:
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     void addSequence(
-        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, LookupResults const& matchedPromptNodes);
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matchedBlocks);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock);
@@ -853,8 +857,9 @@ private:
     //! \param blockKeys Key of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(LookupResults const& matchedPromptNodes, SizeType32 numContextBlocks,
-        GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
+    SizeType32 loadOrAllocateBlocks(
+            std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matchedBlocks, SizeType32 numContextBlocks,
+            GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     [[nodiscard]] BlockPtr getFreeBlock(

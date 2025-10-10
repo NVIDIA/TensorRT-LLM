@@ -1785,6 +1785,11 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, 90),
                                    KvCacheRetentionConfig::TokenRangeRetentionConfig(4, 8, 10)},
             20));
+    auto kvCacheRetentionconfig = llmRequest0->getKvCacheRetentionConfig();
+    if (kvCacheRetentionconfig.has_value())
+    {
+        TLLM_LOG_DEBUG("%s%d - KvCacheRetentionConfig = %s",__FILE__,__LINE__,kvCacheRetentionconfig.value().print().c_str());
+    }
     GenerationRequest seq0{0, inputLength0, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks0 = tc::ceilDiv(inputLength0, blockManager.getTokensPerBlock());
     blockManager.addSequence(seq0, llmRequest0->getNumTokens(0), numContextBlocks0, *llmRequest0, maxAttentionWindow);

@@ -539,6 +539,32 @@ struct RetentionPriorityAndDuration
 
     std::optional<RetentionPriority> retentionPriority;
     std::optional<std::chrono::milliseconds> durationMs;
+
+    std::string print()
+    {
+        std::stringstream out;
+        out << "RetentionPriorityAndDuration{";
+        bool needComma = false;
+        if (retentionPriority.has_value())
+        {
+            out << "retentionPriority=" << retentionPriority.value();
+            needComma = true;
+        }
+        if (durationMs.has_value())
+        {
+            if (needComma)
+            {
+                out << ",";
+            }
+            else
+            {
+                needComma = true;
+            }
+            out << "durationMs=" << durationMs.value().count();
+        }
+        out << "}";
+        return out.str();
+    }
 };
 
 /// @brief Configuration for the request's retention in the KV Cache
@@ -572,6 +598,24 @@ public:
         /// have no expiration time, and keep the block at the given priority level until it gets reclaimed. After the
         /// duration has passed, the block will be moved back to the `kDefaultRetentionPriority` level.
         std::optional<std::chrono::milliseconds> durationMs;
+
+        std::string print() const
+        {
+            std::stringstream out;
+            out << "TokenRangeRetentionConfig={";
+            out << "tokenStart=" << tokenStart;
+            if (tokenEnd.has_value())
+            {
+                out << ",tokenEnd=" << tokenEnd.value();
+            }
+            out << ",priority=" << priority;
+            if (durationMs.has_value())
+            {
+                out << ",durationMs=" << durationMs.value().count();
+            }
+            out << "}";
+            return out.str();
+        }
     };
 
     explicit KvCacheRetentionConfig()
@@ -602,6 +646,27 @@ public:
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
             && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
             && mDirectory == other.mDirectory;
+    }
+
+    std::string print() const
+    {
+        std::stringstream out;
+        out << "KvCacheRetentionConfig={";
+        bool firstIteration = true;
+        for (auto trrc : mTokenRangeRetentionConfigs)
+        {
+            if (firstIteration)
+            {
+                firstIteration = false;
+            }
+            else
+            {
+                out << ",";
+            }
+            out << trrc.print();
+        }
+        out << "}";
+        return out.str();
     }
 
 private:
