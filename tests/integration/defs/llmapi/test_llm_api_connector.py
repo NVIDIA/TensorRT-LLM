@@ -18,8 +18,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
+                                          KvCacheConnectorConfig)
 
 from ..conftest import llm_models_root
 
@@ -253,11 +254,13 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
             assert len(request.new_block_ids) == math.ceil(NUM_INPUT_TOKENS /
                                                            BLOCK_SIZE)
             assert request.computed_position == 0
+            assert request.num_scheduled_tokens == NUM_INPUT_TOKENS
         elif i == 1 and use_overlap_scheduler:
             assert len(sched_output.new_requests) == 0
             assert len(sched_output.cached_requests) == 1
 
             assert len(sched_output.cached_requests[0].new_tokens) == 0
+            assert sched_output.cached_requests[0].num_scheduled_tokens == 1
         else:
             assert len(sched_output.cached_requests) == 1
             assert len(sched_output.new_requests) == 0
@@ -270,6 +273,8 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
                 assert len(request.new_block_ids) == 1
             else:
                 assert request.new_block_ids == []
+
+            assert request.num_scheduled_tokens == 1
 
     scheduler.build_connector_meta.reset_mock()
 
@@ -334,15 +339,63 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
             assert len(req.new_tokens) == CHUNK_SIZE * 2
             assert len(req.new_block_ids) == math.ceil(CHUNK_SIZE * 2 /
                                                        BLOCK_SIZE)
+            assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 1:
             # The second prefill chunk.
             assert req.computed_position == CHUNK_SIZE
             assert len(req.new_tokens) == 0
             assert len(req.new_block_ids) == 0
+            assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 2 and use_overlap_scheduler:
             assert len(req.new_tokens) == 0
+            assert req.num_scheduled_tokens == 1
         else:
             assert len(req.new_tokens) == 1
-
+            assert req.num_scheduled_tokens == 1
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (CHUNK_SIZE * 2 + BLOCK_SIZE) / BLOCK_SIZE)
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("save_async", [False, True])
+def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
+                                  save_async):
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        disable_overlap_scheduler=True,
+        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
+
+    sampling_params = SamplingParams(ignore_eos=True)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+
+    if save_async:
+        scheduler.request_finished.return_value = True
+
+        worker.get_finished.side_effect = lambda finished_gen, load_async: (
+            finished_gen, load_async)
+    else:
+        scheduler.request_finished.return_value = False
+        worker.get_finished.return_value = [], []
+
+    model.generate([0] * 48,
+                   sampling_params=sampling_params,
+                   disaggregated_params=disaggregated_params)
+
+    assert scheduler.build_connector_meta.call_count == 1
+
+    scheduler_output = scheduler.build_connector_meta.call_args.args[0]
+
+    assert len(scheduler_output.new_requests) == 1
+    assert len(scheduler_output.cached_requests) == 0
+
+    req = scheduler_output.new_requests[0]
+
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == 48
+    assert len(req.new_tokens) == 48
+
+    assert scheduler.request_finished.call_count == 1
