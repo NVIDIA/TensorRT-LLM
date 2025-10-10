@@ -352,6 +352,5 @@ unittest/_torch/modules/test_fused_moe.py::test_fused_moe_fp8_blockwise_wide_ep[
 unittest/_torch/modules/test_fused_moe.py::test_fused_moe_fp8_blockwise_wide_ep[NotEnabled] SKIP (https://nvbugs/5565565)
 unittest/_torch/multi_gpu_modeling/test_llama3.py::test_llama_3_3 SKIP (https://nvbugs/5565559)
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct] SKIP (https://nvbugs/5565549)
-accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype SKIP (https://nvbugs/5565530)
 accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized SKIP (https://nvbugs/5565521)
 unittest/bindings/test_executor_bindings.py::test_request_perf_metrics_draft SKIP (https://nvbugs/5565590)
