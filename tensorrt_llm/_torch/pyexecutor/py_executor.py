@@ -2066,7 +2066,8 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
-                if (self.model_engine.enable_spec_decode
+                if (self.drafter is not None and getattr(
+                        self.model_engine, 'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled
                         and not request.is_dummy and not self.is_warmup):
                     if self.speculation_gate is not None:
