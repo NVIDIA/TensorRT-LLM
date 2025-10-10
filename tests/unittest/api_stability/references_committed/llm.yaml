@@ -57,10 +57,6 @@ methods:
       guided_decoding_backend:
         annotation: Optional[Literal["xgrammar", "llguidance"]]
         default: null
-      # Sparse attention
-      sparse_attention_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
-        default: null
       # Speculative decoding
       speculative_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig, tensorrt_llm.llmapi.llm_args.EagleDecodingConfig,tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig, tensorrt_llm.llmapi.llm_args.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig, tensorrt_llm.llmapi.llm_args.AutoDecodingConfig, tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig, NoneType]

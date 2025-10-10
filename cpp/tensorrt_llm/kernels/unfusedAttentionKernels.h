@@ -423,26 +423,6 @@ void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params
             invokeUpdateSparseKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
         }
     }
-
-    // handle cyclic KV cache update if needed
-    // now we don't update cyclic KV cache
-    if (false)
-    {
-        if (params.cache_type == KvCacheDataType::INT8)
-        {
-            invokeUpdateCyclicKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
-        }
-#ifdef ENABLE_FP8
-        else if (params.cache_type == KvCacheDataType::FP8)
-        {
-            invokeUpdateCyclicKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
-        }
-#endif // ENABLE_FP8
-        else
-        {
-            invokeUpdateCyclicKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
-        }
-    }
 }
 
 template <typename T, typename BT>
