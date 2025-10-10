@@ -60,6 +60,7 @@ from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
+from .kv_cache_connector import KvCacheConnectorWorker
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -281,7 +282,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
     ):
-        self._forward_pass_event = None
+        self.forward_pass_callback = None
         self.ub_buffers = None
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
@@ -470,9 +471,9 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.cache_indirection_attention = None
 
-    def register_forward_pass_event(self, event: torch.cuda.Event):
-        logger.info(f"Registering forward_pass_event: {event}")
-        self._forward_pass_event = event
+    def register_forward_pass_callback(
+            self, callback: KvCacheConnectorWorker.ForwardPassCallback):
+        self.forward_pass_callback = callback
 
     @property
     def runtime_draft_len(self):
@@ -2231,6 +2232,7 @@ class PyTorchModelEngine(ModelEngine):
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
+        logger.info("KM Executing forward")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -2328,16 +2330,24 @@ class PyTorchModelEngine(ModelEngine):
             # be triggered. This is the whole point of cuda events and cuda streams.
             # One stream can await on work to be done on a different stream without
             # blocking work on the first stream.
-            if self._forward_pass_event:
-                self._forward_pass_event.record()
+            if self.forward_pass_callback is not None:
+                # now we have to notify kvbm to await on this event or callback.
+                # 1. record the event, 2. immediately call the callable attached to the event
+                self.forward_pass_callback.event.record()
                 logger.info(
-                    f"KM forward_pass_event recorded: {self._forward_pass_event}"
+                    f"KM forward_pass_event recorded: {self.forward_pass_callback.event}"
                 )
+                self.forward_pass_callback.test("end_of_forward_pass")
+                self.forward_pass_callback.callback()
             else:
                 # TODO: take this out for check in
-                logger.info("KM forward_pass_event NOT recorded")
+                logger.info(
+                    "KM forward_pass_callback is NOT defined and will not be called."
+                )
 
+            logger.info("KM Post processing logits")
             self._execute_logit_post_processors(scheduled_requests, outputs)
+            logger.info("KM Did we break the forward pass?")
 
             return outputs
 
