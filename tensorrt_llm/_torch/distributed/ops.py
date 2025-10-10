@@ -142,9 +142,11 @@ def restore_full_output(valid_outputs: List[torch.Tensor],
     return full_outputs
 
 
-def allgather(
+def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
-    mapping: Mapping,
+    group: List[int],
+    rank: int,
+    group_boxed: object,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -167,22 +169,24 @@ def allgather(
 
     Args:
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
-        mapping (Mapping):  The parallel mapping.
+        group (List[int]): The list of ranks to participate in the all-gather.
+        rank (int): The rank of the current process.
+        group_boxed (object): The boxed ProcessGroup object for the list of ranks.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
         The gathered tensor or tensor list.
     '''
-    if mapping.tp_size == 1:
+    if len(group) == 1:
         return input
 
     if sizes is not None:
-        assert len(sizes) == len(mapping.tp_group)
+        assert len(sizes) == len(group)
         if isinstance(input, torch.Tensor):
-            assert input.shape[dim] == sizes[mapping.tp_rank]
+            assert input.shape[dim] == sizes[rank]
         else:
             assert all([
-                val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                val.shape[dim] == sizes[rank] for val in input
                 if val is not None
             ])
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
@@ -208,17 +212,16 @@ def allgather(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, mapping.tp_group,
-                          mapping.tp_group_pg.boxed())
+        output = torch_op(input, sizes, group, group_boxed)
     else:
-        output = torch_op(input, sizes, mapping.tp_group)
+        output = torch_op(input, sizes, group)
 
     def convert_output(x, x_info):
         if dim == 0:
             x = x.view(x_info['output_shape'])
         else:
             if sizes is None:
-                x_list = x.chunk(mapping.tp_size)
+                x_list = x.chunk(len(group))
             else:
                 x_list = x.split(sizes)
             x = torch.cat([x.reshape(x_info['output_shape']) for x in x_list],
@@ -234,6 +237,26 @@ def allgather(
         ]
         output = restore_full_output(output, valid)
     return output
+
+
+def allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    return _allgather(input, mapping.tp_group, mapping.tp_rank,
+                      mapping.tp_group_pg.boxed(), dim, sizes)
+
+
+def cp_allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    return _allgather(input, mapping.cp_group, mapping.cp_rank,
+                      mapping.cp_group_pg.boxed(), dim, sizes)
 
 
 def alltoall_helix(
