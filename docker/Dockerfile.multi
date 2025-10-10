@@ -73,20 +73,12 @@ RUN bash ./install.sh --opencv && bash ./install.sh --protobuf && rm install.sh
 
 # wait for new triton to be published
 # Rename pytorch_triton package to triton
+COPY docker/common/rename_pytorch_triton_to_triton.sh rename_pytorch_triton_to_triton.sh
 RUN if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+        rm rename_pytorch_triton_to_triton.sh; \
     else \
-        cd /usr/local/lib/python3.12/dist-packages/ && \
-        ls -la | grep pytorch_triton && \
-        mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
-        cd triton-3.3.1+gitc8757738.dist-info && \
-        echo "Current directory: $(pwd)" && \
-        echo "Files in directory:" && \
-        ls -la && \
-        sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
-        sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
-        echo "METADATA after update:" && \
-        grep "^Name:" METADATA; \
+        bash ./install.sh --rename_pytorch_triton_to_triton && rm rename_pytorch_triton_to_triton.sh
     fi
 
 
