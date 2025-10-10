@@ -25,14 +25,11 @@
 # SOFTWARE.
 # --------------------------------------------------
 
-import copy
 import math
 import os
-import warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -40,7 +37,6 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
@@ -49,89 +45,26 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe)
+from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     create_lm_head_tp_mapping)
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from .modeling_deepseekv3 import (DeepseekV3Gate, DeepseekV3MTPHead,
+                                  moe_reduce_add_shared_output)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig,
                              _load_weights_impl, register_auto_model)
 
 
-# @torch.compile(dynamic=True)
-def moe_reduce_add_shared_output(routed_output, shared_output):
-    routed_output = torch.sum(routed_output, dim=1, keepdim=False)
-    return shared_output + routed_output
-
-
-class DeepseekV3MTPHead(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        super().__init__()
-        config = model_config.pretrained_config
-        self.model_config = model_config
-
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
-        if self.model_config.mapping.enable_attention_dp and \
-            getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
-            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
-                self.model_config.mapping)
-        else:
-            self.mapping_lm_head_tp = self.model_config.mapping
-
-    @torch.compile(options={"max-autotune": True})
-    def get_last_token_states(self, hidden_states, attn_metadata):
-        last_tokens = torch.cumsum(
-            attn_metadata.seq_lens_cuda,
-            dim=0,
-            dtype=torch.long,
-        ) - 1
-        return hidden_states[last_tokens]
-
-    def forward(self,
-                hidden_states: torch.Tensor,
-                lm_head: Linear,
-                attn_metadata: AttentionMetadata,
-                return_context_logits: bool = False) -> torch.Tensor:
-        if not return_context_logits:
-            if attn_metadata is not None:
-                hidden_states = self.get_last_token_states(
-                    hidden_states, attn_metadata)
-            else:
-                hidden_states = hidden_states[-1].unsqueeze(0)
-
-        enable_attention_dp = self.model_config.mapping.enable_attention_dp
-        enable_lm_head_tp_in_adp = self.model_config.mapping.enable_lm_head_tp_in_adp
-
-        # Add pre-lm gather logic
-        if enable_lm_head_tp_in_adp:
-            # ADP + LM TP mode: perform All-Gather before LM_head
-            hidden_states = allgather(hidden_states,
-                                      self.mapping_lm_head_tp,
-                                      dim=0)
-
-        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
-        if not enable_attention_dp or enable_lm_head_tp_in_adp:
-            lm_head.gather_output = False
-        logits = lm_head(hidden_states, is_spec_decoding_head=True)
-        if not enable_attention_dp or enable_lm_head_tp_in_adp:
-            lm_head.gather_output = True
-        return logits
-
-
-class GLM4Attention(QKNormRoPEAttention):
+class Glm4Attention(QKNormRoPEAttention):
 
     def __init__(
         self,
@@ -176,163 +109,7 @@ class GLM4Attention(QKNormRoPEAttention):
         )
 
 
-class Deepseekv3RoutingImpl():
-
-    def __init__(
-        self,
-        top_k: int,
-        n_group: int,
-        topk_group: int,
-        routed_scaling_factor: float,
-        is_fused: bool = True,
-    ):
-        super().__init__()
-        self.top_k = top_k
-        self.topk_group = topk_group
-        self.n_group = n_group
-        self.routed_scaling_factor = routed_scaling_factor
-        self.is_fused = is_fused
-
-    @staticmethod
-    @torch.compile(options={"max-autotune": True})
-    def get_scores(logits, e_score_correction_bias):
-        scores = F.sigmoid(logits)
-        scores_with_bias = scores + e_score_correction_bias
-        return scores, scores_with_bias
-
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
-        scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
-            logits, e_score_correction_bias)
-        scores_shape = list(scores_with_bias.shape)
-
-        if enable_llm_debug():
-            has_nan = torch.isnan(scores_with_bias).any()
-            if has_nan:
-                warnings.warn(
-                    "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
-                )
-
-        if not self.is_fused:
-            group_scores = torch.sum(torch.topk(
-                scores_with_bias.view(scores_shape[:-1] +
-                                      [n_group, scores_shape[-1] // n_group]),
-                k=2,
-                dim=-1,
-                largest=True,
-                sorted=True)[0],
-                                     dim=-1)
-            _, group_idx = torch.topk(group_scores,
-                                      k=self.topk_group,
-                                      dim=-1,
-                                      largest=True,
-                                      sorted=True)
-            group_mask = torch.zeros_like(group_scores)
-            group_mask.scatter_(-1, group_idx, 1)
-            score_mask = group_mask.unsqueeze(-1).expand(
-                scores_shape[:-1] +
-                [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
-            scores_with_bias = scores_with_bias * score_mask
-            _, topk_idx = torch.topk(scores_with_bias,
-                                     k=self.top_k,
-                                     dim=-1,
-                                     largest=True,
-                                     sorted=True)
-            new_mask = torch.zeros_like(scores)
-            new_mask.scatter_(-1, topk_idx, 1)
-            scores = scores * new_mask
-            score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
-            scores = scores / score_sum * \
-                self.routed_scaling_factor
-            topk_values, topk_indices = torch.topk(scores,
-                                                   k=self.top_k,
-                                                   dim=-1,
-                                                   largest=True)
-            return topk_values, topk_indices
-        else:
-            topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
-                scores, scores_with_bias, n_group, self.topk_group, self.top_k,
-                self.routed_scaling_factor)
-            return topk_values, topk_indices
-
-    def apply(
-        self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_values, topk_indices = self.noaux_tc(logits,
-                                                  e_score_correction_bias)
-        return topk_indices.to(torch.int32), topk_values.to(torch.float32)
-
-
-class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        top_k: int,
-        n_group: int,
-        topk_group: int,
-        routed_scaling_factor: float,
-        dtype: Optional[torch.dtype] = None,
-        fuse_routing_kernel: bool = True,
-        apply_routing: bool = False,
-        moe_backend: str = 'CUTLASS',
-    ):
-        super().__init__(top_k=top_k)
-        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
-                                               dtype=dtype),
-                                   requires_grad=False)
-        self.moe_backend = moe_backend
-        if moe_backend == 'TRTLLM':
-            bias_dtype = torch.bfloat16
-        else:
-            bias_dtype = torch.float32
-
-        self.e_score_correction_bias = nn.Parameter(torch.empty(
-            (num_experts), dtype=bias_dtype),
-                                                    requires_grad=False)
-
-        assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
-
-        # TODO: e_score_correction_bias belongs in this gate class but is required by the routing impl.
-        # To avoid weight-loading issues, we treat this gate as the BaseMoeRoutingMethod and dispatch to the routing impl.
-        # This is a temporary hack that should be refactored later.
-        self.routing_impl = Deepseekv3RoutingImpl(
-            top_k=top_k,
-            n_group=n_group,
-            topk_group=topk_group,
-            routed_scaling_factor=routed_scaling_factor,
-            is_fused=fuse_routing_kernel)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
-                                                      self.weight.t(),
-                                                      bias=None,
-                                                      out_dtype=torch.float32)
-        return logits
-
-    def load_weights(self, weights: List[Dict]):
-        assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
-
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
-                self.e_score_correction_bias.dtype))
-
-    def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # topk routing
-        return self.routing_impl.apply(logits, self.e_score_correction_bias)
-
-    @property
-    def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
-        return self
-
-    def get_experts_per_token(self):
-        return self.routing_impl.top_k
-
-
-class Deepseekv3MoE(nn.Module):
+class Glm4MoE(nn.Module):
 
     def __init__(self,
                  *,
@@ -539,7 +316,7 @@ class Deepseekv3MoE(nn.Module):
             return final_hidden_states
 
 
-class DeepseekV3DecoderLayer(DecoderLayer):
+class Glm4DecoderLayer(DecoderLayer):
 
     def __init__(self,
                  model_config: ModelConfig[PretrainedConfig],
@@ -564,7 +341,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        self.self_attn = GLM4Attention(
+        self.self_attn = Glm4Attention(
             model_config,
             layer_idx=layer_idx_for_attention,
             fuse_qk_norm_rope=False,
@@ -599,7 +376,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
-            self.mlp = Deepseekv3MoE(
+            self.mlp = Glm4MoE(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
                 hidden_size=self.hidden_size,
@@ -719,7 +496,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        if isinstance(self.mlp, Deepseekv3MoE):
+        if isinstance(self.mlp, Glm4MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
@@ -882,7 +659,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
-class DeepseekV3MTP(DeepseekV3DecoderLayer):
+class Glm4MTP(Glm4DecoderLayer):
 
     def __init__(self,
                  model_config: ModelConfig[PretrainedConfig],
@@ -1022,7 +799,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         return hidden_states
 
 
-class DeepseekV3Model(DecoderModel):
+class Glm4Model(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
@@ -1044,8 +821,7 @@ class DeepseekV3Model(DecoderModel):
         )
 
         self.layers = nn.ModuleList([
-            DeepseekV3DecoderLayer(model_config, layer_idx,
-                                   self.aux_stream_dict)
+            Glm4DecoderLayer(model_config, layer_idx, self.aux_stream_dict)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -1085,24 +861,11 @@ class DeepseekV3Model(DecoderModel):
 
 
 @register_auto_model("Glm4MoeForCausalLM")
-class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
+class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model,
                                                      PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        # Rename some keys of quant_config_dict to support legacy checkpoints
-        if model_config.quant_config_dict is not None:
-            model_config = copy.deepcopy(model_config)
-            quant_config_dict = {}
-            for key, val in model_config.quant_config_dict.items():
-                key_split = key.split(".")
-                if key_split[-1] == "fused_a":
-                    key = ".".join(key_split[:-1] + ["kv_a_proj_with_mqa"])
-                quant_config_dict[key] = val
-            model_config._frozen = False
-            model_config.quant_config_dict = quant_config_dict
-            model_config._frozen = True
-
-        super().__init__(model=DeepseekV3Model(model_config),
+        super().__init__(model=Glm4Model(model_config),
                          model_config=model_config)
 
         self.model_nextn = 0
@@ -1154,123 +917,8 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                return_context_logits=return_context_logits,
                                **kwargs)
 
-    def _check_weight_coverage(self, weights: Dict):
-        """Check coverage of checkpoint weights vs model parameters."""
-        import logging
-        logger = logging.getLogger(__name__)
-
-        # Quantization-related parameters that are OK to not be in checkpoint
-        quant_params_ok_to_skip = [
-            'alpha', 'input_scale', 'inv_input_scale', 'weight_scale',
-            'weight_scale_2', 'kv_scales', 'inv_kv_scales', 'pre_quant_scale',
-            'scale', 'inv_scale', 'qweight', 'qzeros', 'scales'
-        ]
-
-        # Collect all model parameter names
-        model_params = set()
-        for name, param in self.named_parameters():
-            if param is not None:
-                model_params.add(name)
-
-        # Get checkpoint keys
-        checkpoint_keys = set(weights.keys())
-
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Weight Coverage Summary:")
-        logger.info(f"  Model parameters: {len(model_params)}")
-        logger.info(f"  Checkpoint keys: {len(checkpoint_keys)}")
-
-        # Find mismatches with intelligent handling of fused weights
-        missing_in_checkpoint = []
-        for param_name in model_params:
-            # Skip special parameters
-            skip_patterns = [
-                'next_layer_layernorm', 'v_b_proj', 'k_b_proj_trans'
-            ]
-            skip_patterns.extend(quant_params_ok_to_skip)
-            if any(skip in param_name for skip in skip_patterns):
-                continue
-
-            # Check if this is a fused weight that should exist as separate parts in checkpoint
-            found = False
-
-            # Handle qkv_proj fusion: model has qkv_proj, checkpoint has q_proj, k_proj, v_proj
-            if '.qkv_proj.' in param_name:
-                # Replace qkv_proj with q_proj/k_proj/v_proj and check if any exist
-                q_name = param_name.replace('.qkv_proj.', '.q_proj.')
-                k_name = param_name.replace('.qkv_proj.', '.k_proj.')
-                v_name = param_name.replace('.qkv_proj.', '.v_proj.')
-                if q_name in checkpoint_keys or k_name in checkpoint_keys or v_name in checkpoint_keys:
-                    found = True
-
-            # Handle gate_up_proj fusion: model has gate_up_proj, checkpoint has gate_proj, up_proj
-            elif '.gate_up_proj.' in param_name:
-                gate_name = param_name.replace('.gate_up_proj.', '.gate_proj.')
-                up_name = param_name.replace('.gate_up_proj.', '.up_proj.')
-                if gate_name in checkpoint_keys or up_name in checkpoint_keys:
-                    found = True
-
-            # Handle MoE expert fused weights: these are loaded differently via MoE's load_weights
-            elif '.experts.w3_w1_weight' in param_name or '.experts.w2_weight' in param_name:
-                # These are fused from individual expert weights by the MoE module
-                # Check if individual expert weights exist in checkpoint
-                layer_match = param_name.split(
-                    '.mlp.experts.'
-                )[0] if '.mlp.experts.' in param_name else None
-                if layer_match:
-                    # Check for any expert weights in this layer
-                    expert_pattern = f"{layer_match}.mlp.experts."
-                    if any(expert_pattern in str(k) for k in checkpoint_keys):
-                        found = True
-
-            # Handle expert weights: model has w1/w2/w3, checkpoint might have gate_proj/down_proj/up_proj
-            elif '.w1.' in param_name or '.w2.' in param_name or '.w3.' in param_name:
-                # These are expert weights that get renamed by the regex
-                gate_name = param_name.replace('.w1.', '.gate_proj.')
-                down_name = param_name.replace('.w2.', '.down_proj.')
-                up_name = param_name.replace('.w3.', '.up_proj.')
-                if gate_name in checkpoint_keys or down_name in checkpoint_keys or up_name in checkpoint_keys:
-                    found = True
-
-            # Direct match
-            elif param_name in checkpoint_keys:
-                found = True
-
-            if not found:
-                missing_in_checkpoint.append(param_name)
-
-        # Separate into expected missing (quant params) and unexpected missing
-        expected_missing = [
-            p for p in missing_in_checkpoint
-            if any(q in p for q in quant_params_ok_to_skip)
-        ]
-        unexpected_missing = [
-            p for p in missing_in_checkpoint if p not in expected_missing
-        ]
-
-        logger.info(
-            f"  Expected missing (quantization params): {len(expected_missing)}"
-        )
-        logger.info(
-            f"  Potentially problematic missing: {len(unexpected_missing)}")
-        logger.info(f"{'='*80}")
-
-        if unexpected_missing:
-            logger.warning(
-                f"\n⚠️  {len(unexpected_missing)} model parameters may not be in checkpoint:"
-            )
-            for name in sorted(unexpected_missing)[:20]:
-                logger.warning(f"  - {name}")
-
     def load_weights(self, weights: Dict):
         # model.layers.91.mlp.experts.75.up_proj.weight_scale_2
-        import logging
-        logger = logging.getLogger(__name__)
-
-        # Check weight coverage before loading
-        logger.info("Checking weight coverage before loading...")
-        self._check_weight_coverage(weights)
-
         _load_weights_impl(
             self,
             weights,
@@ -1282,84 +930,6 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 r'(?!.*shared_experts)(?=.*experts?)(.*?)gate_proj(.*)':
                 r'\1w1\2',
             })
-
-    def _validate_loaded_weights(self):
-        """Validate that all critical weights are loaded and initialized."""
-        import logging
-        logger = logging.getLogger(__name__)
-
-        issues = []
-        suspicious_params = []
-
-        # Quantization-related parameters that are OK to be zero or computed later
-        quant_params_ok_to_skip = [
-            'alpha',
-            'input_scale',
-            'inv_input_scale',
-            'weight_scale',
-            'weight_scale_2',
-            'kv_scales',
-            'inv_kv_scales',
-            'pre_quant_scale',
-            'scale',
-            'inv_scale',
-            'qweight',
-            'qzeros',
-            'scales'  # AWQ/GPTQ quantization params
-        ]
-
-        for name, param in self.named_parameters():
-            # Skip parameters that are intentionally not loaded or managed differently
-            skip_patterns = [
-                'next_layer_layernorm',
-                'draft_model',
-                'v_b_proj',
-                'k_b_proj_trans',
-            ]
-            # Add quantization parameters to skip list
-            skip_patterns.extend(quant_params_ok_to_skip)
-
-            if any(skip in name for skip in skip_patterns):
-                continue
-
-            # Check for uninitialized or problematic values
-            if param.numel() == 0:
-                continue  # Skip empty parameters
-
-            # Only check core weights (weight, bias) for being all zeros
-            is_core_weight = name.endswith('.weight') or name.endswith('.bias')
-
-            if is_core_weight and torch.all(param == 0):
-                issues.append(f"{name}: all zeros (uninitialized)")
-            elif torch.any(torch.isnan(param)):
-                issues.append(f"{name}: contains NaN")
-            elif torch.any(torch.isinf(param)):
-                issues.append(f"{name}: contains Inf")
-            # Check for suspiciously large values (potential torch.empty() garbage)
-            elif is_core_weight and param.abs().max() > 1e8:
-                suspicious_params.append(
-                    f"{name}: very large values (max={param.abs().max():.2e})")
-
-        if issues:
-            logger.error(
-                f"❌ Found {len(issues)} uninitialized or invalid parameters:")
-            for issue in issues[:20]:  # Show first 20
-                logger.error(f"  {issue}")
-            raise RuntimeError(
-                f"Weight loading validation failed: {len(issues)} parameters not properly initialized"
-            )
-
-        if suspicious_params:
-            logger.warning(
-                f"⚠️  Found {len(suspicious_params)} parameters with suspicious values:"
-            )
-            for param_info in suspicious_params[:10]:  # Show first 10
-                logger.warning(f"  {param_info}")
-
-        if not issues and not suspicious_params:
-            logger.info(
-                "✅ Weight validation passed: all parameters appear properly initialized"
-            )
 
     def post_load_weights(self):
         all_named_modules = dict(self.model.named_modules())
@@ -1389,6 +959,3 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-
-        # Validate all weights are properly loaded
-        self._validate_loaded_weights()
