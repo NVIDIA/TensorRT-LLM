@@ -23,9 +23,7 @@ cd libfabric
     --disable-rstream \
     --enable-efa \
     --with-cuda=/usr/local/cuda \
-    --enable-cuda-dlopen \
-    --with-gdrcopy \
-    --enable-gdrcopy-dlopen
+    --enable-cuda-dlopen
 
 make install -j$(nproc)
 cd ..
