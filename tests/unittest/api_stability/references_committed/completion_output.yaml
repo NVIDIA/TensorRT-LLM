@@ -19,12 +19,6 @@ methods:
       generation_logits:
         annotation: Optional[torch.Tensor]
         default: null
-      additional_context_outputs:
-        annotation: Optional[Dict[str, torch.Tensor]]
-        default: null
-      additional_generation_outputs:
-        annotation: Optional[Dict[str, torch.Tensor]]
-        default: null
       logprobs:
         annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]] | List[float]]
         default: null

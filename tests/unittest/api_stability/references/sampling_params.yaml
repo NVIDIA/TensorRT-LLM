@@ -5,6 +5,7 @@ methods:
       additional_model_outputs:
         annotation: Optional[List[str]]
         default: null
+        status: prototype
       return_perf_metrics:
         annotation: bool
         default: false
