@@ -44,7 +44,7 @@ def disagg_server_config(disagg_cluster_config, router):
     return {
         "hostname": "localhost",
         "port": TEST_PORT,
-        "cluster": disagg_cluster_config,
+        "disagg_cluster": disagg_cluster_config,
         "context_servers": {
             "router": {
                 "type": router
@@ -61,7 +61,7 @@ def disagg_server_config(disagg_cluster_config, router):
 @pytest.fixture
 def worker_config(disagg_cluster_config):
     return {
-        "cluster": disagg_cluster_config,
+        "disagg_cluster": disagg_cluster_config,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {
             "backend": "DEFAULT"
@@ -75,29 +75,27 @@ def worker_config(disagg_cluster_config):
 
 
 def _run_worker(model_name, worker_config, role, port=8000, device=-1):
-    worker_config_path = tempfile.NamedTemporaryFile(
-        delete=False)  #f"/tmp/{role}_{port}_config.yaml"
+    worker_config_path = tempfile.NamedTemporaryFile(delete=False)
     with open(worker_config_path.name, "w+") as f:
         yaml.dump(worker_config, f)
         f.flush()
-    cmd = [
-        "trtllm-serve",
-        "serve",
-        model_name,
-        "--host",
-        "localhost",
-        "--port",
-        str(port),
-        "--extra_llm_api_options",
-        worker_config_path.name,
-        "--server_role",
-        "context" if role.startswith("ctx") else "generation",
-    ]
-    f = open(f"{role}_{port}.log", "w+")
-    env = os.environ.copy()
-    if device != -1:
-        env["CUDA_VISIBLE_DEVICES"] = str(device)
-    return subprocess.Popen(cmd, stdout=f, stderr=f, env=env)
+        cmd = [
+            "trtllm-serve",
+            "serve",
+            model_name,
+            "--host",
+            "localhost",
+            "--port",
+            str(port),
+            "--extra_llm_api_options",
+            worker_config_path.name,
+            "--server_role",
+            "context" if role.startswith("ctx") else "generation",
+        ]
+        env = os.environ.copy()
+        if device != -1:
+            env["CUDA_VISIBLE_DEVICES"] = str(device)
+        return subprocess.Popen(cmd, env=env)
 
 
 def run_ctx_worker(model_name,

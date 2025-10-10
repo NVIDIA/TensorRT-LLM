@@ -25,7 +25,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage)
-from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager
+from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
+                                                    WorkerInfo)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -619,7 +620,8 @@ class OpenAIDisaggServer:
         await self.wait_for_all_servers_ready(self.session, self.ctx_servers, self.gen_servers, server_start_timeout_secs)
 
     async def _update_router_by_watch_events(self):
-        worker_repr = lambda worker_info: f"http://{worker_info.host}:{worker_info.port}"
+        def worker_repr(worker_info: WorkerInfo):
+            return f"http://{worker_info.host}:{worker_info.port}"
         router_map = {
             ServerRole.CONTEXT: self.ctx_router,
             ServerRole.GENERATION: self.gen_router

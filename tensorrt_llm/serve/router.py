@@ -186,7 +186,7 @@ class Router(ABC):
         async with self._lock:
             old_servers = self._servers.copy()
             self._servers = [
-                server for server in old_servers if server != server
+                old_server for old_server in old_servers if old_server != server
             ]
             self._on_servers_updated(old_servers, self._servers)
         logger.debug(

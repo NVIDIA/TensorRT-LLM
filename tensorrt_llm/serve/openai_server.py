@@ -79,11 +79,11 @@ class OpenAIServer:
                  model: str,
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
-                 cluster_config: Optional[DisaggClusterConfig] = None):
+                 disagg_cluster_config: Optional[DisaggClusterConfig] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.cluster_config = cluster_config
+        self.disagg_cluster_config = disagg_cluster_config
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -156,10 +156,9 @@ class OpenAIServer:
                 self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
                 logger.info(f"trtllm/{self.llm.llm_id} is registered")
 
-            if self.cluster_config:
-                logger.info(f"Cluster config: {self.cluster_config}")
-                self.disagg_cluster_storage = create_cluster_storage_client(self.cluster_config.cluster_uri, self.cluster_config.cluster_name)
-                self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.cluster_config, self.disagg_cluster_storage)
+            if self.disagg_cluster_config:
+                self.disagg_cluster_storage = create_cluster_storage_client(self.disagg_cluster_config.cluster_uri, self.disagg_cluster_config.cluster_name)
+                self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
 
             # terminate rank0 worker
