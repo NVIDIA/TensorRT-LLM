@@ -16,7 +16,7 @@ import os
 
 import pytest
 import torch
-from defs.conftest import get_sm_version
+from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
@@ -2168,7 +2168,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend):
-        if get_sm_version() == 100 or get_sm_version() == 103:
+        if is_sm_100f():
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
@@ -2217,7 +2217,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                                             mtp_nextn, fp8kv, attention_dp,
                                             cuda_graph, overlap_scheduler,
                                             max_batch_size):
-        if get_sm_version() == 100:
+        if is_sm_100f():
             moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
