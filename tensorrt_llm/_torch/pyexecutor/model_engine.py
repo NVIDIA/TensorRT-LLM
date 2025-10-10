@@ -1499,16 +1499,16 @@ class PyTorchModelEngine(ModelEngine):
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
-                #    1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
-                #    2) 'requests that already have previous batch': previous iteration's requests.
-                #    3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                #   1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #   2) 'requests that already have previous batch': previous iteration's requests.
+                #   3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 # Therefore, both of self.previous_pos_id_offsets_cuda and self.previous_kv_lens_offsets_cuda are also 3 segments.
-                #    For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #   For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
                 #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to '0' to skip the value changes in _preprocess_inputs.
                 #       Already set to '0' during initialization.
-                #    For 2) 'requests that already have previous batch': enable overlap scheduler.
+                #   For 2) 'requests that already have previous batch': enable overlap scheduler.
                 #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
-                #    For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 #       Already set to '0' during initialization.
 
                 num_extend_reqeust_wo_dummy = len(extend_requests) - len(
