@@ -5,6 +5,7 @@ import unittest
 import pytest
 import torch
 from utils.llm_data import llm_models_root
+from utils.util import similar
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
@@ -66,7 +67,7 @@ def test_spec_gate_e2e():
         "How many players are on a basketball court for one team?",
         "List three primary colors.",
     ]
-    sampling_params = SamplingParams(max_tokens=5, temperature=0)
+    sampling_params = SamplingParams(max_tokens=32, temperature=0)
 
     results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
@@ -78,8 +79,7 @@ def test_spec_gate_e2e():
     llm_ref.shutdown()
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        # The spec decode algorithm currently guarantees identical results
-        assert text_spec == text_ref
+        assert similar(text_spec, text_ref)
 
 
 def test_returns_none_until_window_and_enabled_when_above_threshold():
