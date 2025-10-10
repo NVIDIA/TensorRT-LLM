@@ -1373,15 +1373,15 @@ void WindowBlockManager::addSequence(
         llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
 }
 
-void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool isEnableBlockReuse)
+void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
 {
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        mWindowBlockManagers.at(windowSize).adjustBlocksIfNeeded(sequence, isEnableBlockReuse);
+        mWindowBlockManagers.at(windowSize).adjustBlocksIfNeeded(sequence);
     }
 }
 
-void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool isEnableBlockReuse)
+void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
 {
     auto const minTokensForBlockDetach = mWindowSize + mTokensPerBlock;
     while (
@@ -1390,7 +1390,7 @@ void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool 
         // Detaching block for SWA is non-trivial due to the radix tree structure.
         // For now, when reuse is enabled, we do not detach blocks for SWA.
         TLLM_CHECK_WITH_INFO(mIsSWA, "A block only go out-of-window in SWA");
-        detachFrontBlock(sequence, isEnableBlockReuse);
+        detachFrontBlock(sequence);
     }
 
     if ((sequence.getNumTokens() - 1) % getTokensPerBlock() == 0)
@@ -2216,10 +2216,10 @@ void KVCacheManager::addToken(RequestIdType requestId)
     // TODO: add streamLLM support
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
-    mBlockManager.adjustBlocksIfNeeded(sequence, mEnableBlockReuse);
+    mBlockManager.adjustBlocksIfNeeded(sequence);
 }
 
-void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence, bool const isEnableBlockReuse)
+void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
 {
     // streamLLM is not supported at the moment. The out of window block will
     // always be the 0th block.
@@ -2247,7 +2247,6 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence, bool cons
         }
         if (!outOfWindowBlock->hasRefs())
         {
-            // For now, OOW block is not released when reused is enabled.
             mEvictionPolicy->releaseBlock(outOfWindowBlock);
         }
     }
