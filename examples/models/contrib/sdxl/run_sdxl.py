@@ -57,7 +57,7 @@ if __name__ == "__main__":
 
     pipeline = StableDiffusionXLPipeline.from_pretrained(
         model_dir,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         use_safetensors=True,
     )
     pipeline.set_progress_bar_config(disable=rank != 0)

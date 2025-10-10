@@ -120,7 +120,7 @@ def load_hf_model(args):
     model_class = getattr(__import__('transformers'),
                           SUPPORTED_MODEL_TYPES[args.model_type])
     hf_model = model_class.from_pretrained(args.hf_model_dir,
-                                           torch_dtype=torch.float16,
+                                           dtype=torch.float16,
                                            device_map="cuda:0",
                                            trust_remote_code=True)
     profiler.stop('load HF model')

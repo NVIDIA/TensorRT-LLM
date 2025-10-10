@@ -223,7 +223,7 @@ def main(args):
         config = json.load(f)
 
     pipe = StableDiffusion3Pipeline.from_pretrained(
-        config['pretrained_config']['model_path'], torch_dtype=torch.float16)
+        config['pretrained_config']['model_path'], dtype=torch.float16)
     pipe.to("cuda")
 
     # replace sd3.5 transformer with TRTLLM model

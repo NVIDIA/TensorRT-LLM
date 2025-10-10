@@ -157,7 +157,7 @@ def remap_model(model_name="facebook/DiT-XL-2-512",
                 output_ckpt="dit.converted.pt",
                 fuse_qkv=True,
                 dtype=torch.float32):
-    pipe = DiTPipeline.from_pretrained(model_name, torch_dtype=dtype)
+    pipe = DiTPipeline.from_pretrained(model_name, dtype=dtype)
     transformer = pipe.transformer
 
     # fuse qkv gemm

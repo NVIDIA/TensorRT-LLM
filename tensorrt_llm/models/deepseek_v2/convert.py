@@ -168,7 +168,7 @@ def load_hf_deepseek(model_dir, load_model_on_cpu=False):
         model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                      config=hf_config,
                                                      device_map='cpu',
-                                                     torch_dtype='auto',
+                                                     dtype='auto',
                                                      trust_remote_code=True)
     else:
         # Deepseek-v2 236B parameters with FP16 dtype need at least 472G GPU memory
@@ -197,7 +197,7 @@ def load_hf_deepseek(model_dir, load_model_on_cpu=False):
                                                      config=hf_config,
                                                      device_map=device_map,
                                                      max_memory=max_memory,
-                                                     torch_dtype='auto',
+                                                     dtype='auto',
                                                      trust_remote_code=True)
 
     return model

@@ -59,8 +59,7 @@ builder_config = builder.create_builder_config(
     None,  # do not use obey or the precision error will be too large
 )
 
-pipeline = DiffusionPipeline.from_pretrained(model_dir,
-                                             torch_dtype=torch.float16)
+pipeline = DiffusionPipeline.from_pretrained(model_dir, dtype=torch.float16)
 model = UNet2DConditionModel(
     sample_size=sample_size,
     in_channels=4,
