@@ -175,9 +175,7 @@ class Indexer(nn.Module):
         # TODO: Consolidate these parameters into decoder metadata.
         # Preparation stage buffers
         self.num_sms = deep_gemm.get_num_sms()
-        self.scheduler_metadata_buffer = torch.empty((self.num_sms + 1, 2),
-                                                     dtype=torch.int32,
-                                                     device='cuda')
+        self.scheduler_metadata_buffer = None
         # Decode phase metadata
         self.decode_context_lens = None  # Context lengths for decode phase
         self.decode_block_table = None  # Block table for decode phase
@@ -228,12 +226,14 @@ class Indexer(nn.Module):
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
             blocksize = self.tokens_per_block
-            self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
-                context_lens, blocksize, self.num_sms)
+
+            self.scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                context_lens, blocksize, self.num_sms
+            )
 
             # Store decode metadata for use in forward pass
-            self.decode_context_lens = context_lens
-            self.decode_block_table = block_table
+            self.decode_context_lens = context_lens.cuda(non_blocking=True)
+            self.decode_block_table = block_table.cuda(non_blocking=True)
         else:
             # Clear decode metadata if no generation requests
             self.decode_context_lens = None
