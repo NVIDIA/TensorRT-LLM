@@ -1614,7 +1614,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             expert_idx = local_slot_id
 
             if not torch.allclose(w1_weight_scale_2, w3_weight_scale_2):
-                logger.warning(
+                trtllm_logger.logger.warning(
                     f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_weight_scale_2} != {w3_weight_scale_2}), selecting the larger value. Accuracy may be affected."
                 )
                 w1_weight_scale_2 = torch.max(w1_weight_scale_2,
