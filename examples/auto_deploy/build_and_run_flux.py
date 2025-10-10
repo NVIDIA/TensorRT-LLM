@@ -117,7 +117,7 @@ def main():
     )
     args = parser.parse_args()
     DiffusionPipeline._execution_device = property(execution_device_getter, execution_device_setter)
-    pipe = DiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+    pipe = DiffusionPipeline.from_pretrained(args.model, dtype=torch.bfloat16)
     pipe.to("cuda")
 
     if args.hf_inference:

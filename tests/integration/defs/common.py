@@ -750,7 +750,7 @@ def generate_dummy_loras(
     try:
         model = AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map=None,  # Load everything to CPU first
             trust_remote_code=True,
             low_cpu_mem_usage=False,
@@ -762,7 +762,7 @@ def generate_dummy_loras(
         )
         model = AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True,
         )

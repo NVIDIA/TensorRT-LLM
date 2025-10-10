@@ -514,7 +514,7 @@ class SD3Transformer2DModel(PretrainedModel):
 
         transformer = StableDiffusion3Pipeline.from_pretrained(
             pretrained_model_name_or_path,
-            torch_dtype=str_dtype_to_torch(dtype)).transformer
+            dtype=str_dtype_to_torch(dtype)).transformer
 
         config = SD3Transformer2DModelConfig.from_hugging_face_config(
             transformer.config, dtype=dtype, mapping=mapping, **kwargs)

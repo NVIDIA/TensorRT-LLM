@@ -421,7 +421,7 @@ def main():
         # TODO: When ReDrafter is added to Transformers
         # hf_drafter_model = AutoModel.from_pretrained(
         #     args.drafter_model_dir,
-        #     torch_dtype="auto",
+        #     dtype="auto",
         # )
         ckpt_file = Path(args.drafter_model_dir, "model.safetensors")
         if not Path.exists(ckpt_file):

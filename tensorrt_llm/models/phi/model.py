@@ -203,9 +203,7 @@ class PhiForCausalLM(DecoderModelForCausalLM):
             trust_remote_code = kwargs.pop('trust_remote_code', True)
 
             hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                torch_dtype="auto",
-                trust_remote_code=trust_remote_code)
+                hf_model_dir, dtype="auto", trust_remote_code=trust_remote_code)
 
         assert isinstance(hf_model, transformers.PreTrainedModel)
 
