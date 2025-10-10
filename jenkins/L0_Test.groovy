@@ -2114,12 +2114,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Generate comprehensive rerun report if any reruns occurred
-        stage ("[${stageName}] Generate Rerun Report") {
+        stage ("[${stageName}] Generate Report") {
             generateRerunReport(stageName, llmSrc)
-            if (rerunFailed) {
+        }
+
+        if (rerunFailed) {
                 error "Some tests still failed after rerun attempts, please check the test report."
             }
-        }
 
         if (perfMode) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
