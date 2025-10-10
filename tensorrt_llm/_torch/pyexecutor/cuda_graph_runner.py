@@ -80,7 +80,7 @@ class CUDAGraphRunner:
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
-        max_draft_len = self.config.original_max_draft_len if self.config.is_spec_decode else 0
+        max_draft_len = self.config.original_max_draft_len if self.config.spec_config is not None else 0
         token_per_request = max_draft_len + 1
         max_total_tokens = (self.max_supported_batch_size *
                             self.max_beam_width * token_per_request)
@@ -192,7 +192,7 @@ class CUDAGraphRunner:
                 key: Tuple[int, int, int],
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
-                enable_spec_decode: bool,
+                enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
         batch_size = key[0]
@@ -358,8 +358,10 @@ class CUDAGraphRunner:
         return self.supported_batch_sizes[idx]
 
     @contextlib.contextmanager
-    def pad_batch(self, scheduled_requests: ScheduledRequests,
-                  resource_manager: ResourceManager, runtime_draft_len: int):
+    def pad_batch(self,
+                  scheduled_requests: ScheduledRequests,
+                  resource_manager: ResourceManager,
+                  runtime_draft_len: int = 0):
         """Context manager to pad a batch to a graph-compatible size."""
         padding_size = self._get_padded_batch(scheduled_requests,
                                               resource_manager,
