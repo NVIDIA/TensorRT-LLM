@@ -1204,7 +1204,8 @@ class TorchSampler(Sampler):
             new_tokens: list[list[list[int]]],
             new_tokens_tensor: torch.Tensor,
             resource_manager: Optional[ResourceManager] = None) -> int:
-        if request.py_draft_logits is None:
+        if _request_strategy(request, vocab_size=2**
+                             31) == GREEDY or request.py_draft_logits is None:
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:
                 num_accepted = self._process_draft_tokens_tree(
