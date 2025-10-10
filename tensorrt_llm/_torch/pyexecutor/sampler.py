@@ -1247,6 +1247,12 @@ class TorchSampler(Sampler):
             model_outputs: dict[str, torch.Tensor],
             num_context_logits_prefix_sum: list[int],
             resource_manager: Optional[ResourceManager] = None) -> SampleState:
+        # NB: The sampler is either called directly by PyExecutor, for the target model,
+        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
+        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
+        #     latter case, there is always only 1 token per request because draft
+        #     tokens are sampled one-by-one.
+
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
         log_probs_host = self.log_probs_host(scheduled_requests)
@@ -1396,8 +1402,6 @@ class TorchSampler(Sampler):
             requests, pin_memory=True, vocab_size=logits_cuda.size(1))
         generator_cuda = self.get_generator(cuda_device)
 
-        # FIXME: This check should/could be performed in ModelDrafter.prepare_draft_tokens
-        #
         # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
         #     breaking _process_draft_tokens_rejection_sampling.
         needs_d2t = "d2t" in model_outputs
@@ -1523,15 +1527,12 @@ class TorchSampler(Sampler):
             (batch_req_indices, batch_next_tokens_cuda_int,
              batch_softmax_cuda), = batched_results
 
-        # FIXME: This should be done in ModelDrafter.prepare_draft_tokens, but for performance
-        #        parity py_draft_tokens might need to be replaced / backed by a torch.Tensor, so
-        #        that d2t can be applied in a batched manner similar to the code below.
+        # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
+        #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
+        #     is the target vocab, whereas the output logits correspond to the draft
+        #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
+        #     they currently need to be handled within TorchSampler.
         if needs_d2t:
-            # NB: The sampler is either called directly by PyExecutor, for the target model,
-            #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
-            #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-            #     latter case, only there is always only 1 token per request because draft
-            #     tokens are sampled one-by-one.
             self._apply_d2t(batch_next_tokens_cuda_int, model_outputs)
 
         return _BatchedSamplingResult(
@@ -1982,7 +1983,6 @@ class TRTLLMSampler(Sampler):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None
     ) -> SampleStateTRTLLM:
-
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1
