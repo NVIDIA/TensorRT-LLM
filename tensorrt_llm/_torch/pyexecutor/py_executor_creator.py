@@ -223,7 +223,7 @@ def create_py_executor(
             llm_args.peft_cache_config)
 
     assert llm_args.kv_cache_config, "Expect llm_args.kv_cache_config is not None"
-    kv_cache_config = PybindMirror.maybe_to_pybind(llm_args.kv_cache_config)
+    kv_cache_config = llm_args.kv_cache_config
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
@@ -251,7 +251,7 @@ def create_py_executor(
     if max_num_tokens is None:
         max_num_tokens = 8192
 
-    tokens_per_block = llm_args.kv_cache_config.tokens_per_block
+    tokens_per_block = kv_cache_config.tokens_per_block
 
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"

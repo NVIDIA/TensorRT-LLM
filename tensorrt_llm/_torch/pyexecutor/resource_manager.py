@@ -11,6 +11,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PybindMirror
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
@@ -31,7 +32,6 @@ if ENABLE_MULTI_DEVICE:
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfigCpp = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -145,7 +145,7 @@ class KVCacheManager(BaseResourceManager):
 
     def __init__(
         self,
-        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
@@ -268,8 +268,8 @@ class KVCacheManager(BaseResourceManager):
                 )
             # kv cache config check
             assert isinstance(
-                kv_cache_config, KvCacheConfigCpp
-            ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp"
+                kv_cache_config, KvCacheConfig
+            ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfig"
             blocks_per_window = self.calculate_max_num_blocks_from_cpp(
                 kv_cache_config=kv_cache_config,
                 model_config=model_config,
@@ -369,28 +369,6 @@ class KVCacheManager(BaseResourceManager):
 
     def shutdown(self):
         self.impl.release_pools()
-
-    @classmethod
-    def from_model_config(cls,
-                          model_config: ModelConfigCpp,
-                          kv_cache_config: KvCacheConfigCpp,
-                          mapping: Mapping,
-                          kv_cache_type: CacheTypeCpp = CacheTypeCpp.SELF,
-                          dtype: DataType = DataType.HALF) -> "KVCacheManager":
-        return cls(
-            kv_cache_config,
-            kv_cache_type,
-            num_layers=model_config.num_attention_layers(mapping.pp_size),
-            # NOTE: this preserves existing behavior in KV cache manager.
-            # But we should change this to pass a list at some point.
-            # We're assuming the KV cache is homogeneous here.
-            num_kv_heads=model_config.num_kv_heads(0),
-            head_dim=model_config.size_per_head,
-            tokens_per_block=model_config.tokens_per_block,
-            max_seq_len=model_config.max_seq_len,
-            max_batch_size=model_config.max_batch_size,
-            mapping=mapping,
-            dtype=dtype)
 
     def get_max_resource_count(self) -> int:
         return self.impl.max_num_blocks
@@ -566,7 +544,7 @@ class KVCacheManager(BaseResourceManager):
                                  scaling_factor_dtype)
 
     def calculate_max_num_blocks(self,
-                                 kv_cache_config: KvCacheConfigCpp,
+                                 kv_cache_config: KvCacheConfig,
                                  head_dim: int,
                                  tokens_per_block: int,
                                  mapping: Mapping,
@@ -772,7 +750,7 @@ class KVCacheManager(BaseResourceManager):
     def adjust_window_sizes_for_vswa(
         window_size_to_layers: Dict[int, List[int]],
         max_attention_window_vec: List[int],
-        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_config: KvCacheConfig,
         model_config: ModelConfigCpp,
         pool_memory_bytes: int,
         kv_factor: int,
@@ -887,7 +865,7 @@ class KVCacheManager(BaseResourceManager):
 
     def calculate_max_num_blocks_from_cpp(
             self,
-            kv_cache_config: KvCacheConfigCpp,
+            kv_cache_config: KvCacheConfig,
             model_config: ModelConfigCpp,
             extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
         """
@@ -945,7 +923,7 @@ class KVCacheManager(BaseResourceManager):
         self.max_attention_window_vec = max_attention_window_vec
 
         blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
-            config=kv_cache_config,
+            config=PybindMirror.maybe_to_pybind(kv_cache_config),
             # TODO: support cross attention
             is_cross_attention=is_cross_attention,
             dtype=self.dtype,
