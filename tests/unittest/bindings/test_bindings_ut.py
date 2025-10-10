@@ -475,8 +475,6 @@ def test_KvCache_events_binding():
         max_sequence_length,
         'enable_block_reuse':
         True,
-        'onboard_blocks':
-        False,
         'cache_type':
         _tb.internal.batch_manager.CacheType.SELF,
         'event_manager':
