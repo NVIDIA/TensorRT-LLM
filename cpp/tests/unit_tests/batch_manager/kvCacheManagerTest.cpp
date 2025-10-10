@@ -1931,26 +1931,25 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
 
     // no reuse, blocks are evicted by new request:
-    // evict block 7 (lowest priority leaf), block 6 becomes leaf
-    // evict block 3 (lowest and oldest priority leaf), block 2 becomes leaf
-    // evict block 2 (lowest and oldest priority leaf), block 1 becomes leaf
-    // uses up 3 blocks 7, 3, 2. [24, 25, 26, 27], [28, 29, 30, 31], [32, 33, 34]
+    // evict block 2 (last block in sequence with lowest priority == 5)
+    // evict block 1 (second last block in sequence with lowest priority == 5)
+    // evict block 0 (third last block in sequence with lowest priority == 5)
+    // uses up 3 blocks 2, 1, 0. [24, 25, 26, 27], [28, 29, 30, 31], [32, 33, 34]
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35});
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
-    // leaf block 2 (priority 35), context blocks 3, 7 (priority 35)
     kvCacheManager.removeSequence(2, llmRequest2);
 
-    // reuse blocks 0 and 1, new block 2 (lowest priority leaf)
+    // no reuse since blocks 0, 1 and 2 were evicted
     // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10]
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
 
-    // Two blocks reused
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 8);
+    // Two new blocks, since blocks 0 and 1 were evicted
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 0);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
