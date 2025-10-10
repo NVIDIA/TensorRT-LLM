@@ -48,6 +48,8 @@ option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
 option(CUBLAS_DYNAMIC_LINKING
        "Link against the dynamic cublas/cublasLt libraries" ON)
 option(CURAND_DYNAMIC_LINKING "Link against the dynamic curand library" ON)
+option(TRT_DYNAMIC_LINKING
+       "Link against the dynamic TensorRT libraries (nvInfer,...)" ON)
 
 option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
