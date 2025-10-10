@@ -14,6 +14,7 @@ import transformers
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
@@ -127,6 +128,7 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
 
         log_level = logger.level
@@ -137,6 +139,12 @@ class BaseLLM:
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
+                if self._orchestrator_type == "ray" or mpi_disabled():
+                    self._orchestrator_type = "ray"
+                    os.environ["TLLM_DISABLE_MPI"] = "1"
+                    # Propagate to args construction
+                    kwargs["orchestrator_type"] = "ray"
+
             elif backend == '_autodeploy':
                 logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
@@ -616,10 +624,6 @@ class BaseLLM:
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            if sampling_params.logprobs and sampling_params.logprobs > 1:
-                raise ValueError(
-                    f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
-                )
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
@@ -785,7 +789,7 @@ class BaseLLM:
 
 @append_docstring(TRT_LLM_DOCSTRING)
 class _TrtLLM(BaseLLM):
-    """LLM class is the main class for running a LLM model using TensorRT-LLM backend.
+    """LLM class is the main class for running a LLM model using TensorRT LLM backend.
 
     Parameters:
 """
@@ -1005,6 +1009,34 @@ class _TorchLLM(BaseLLM):
                          tokenizer_revision,
                          backend=backend,
                          **kwargs)
+
+    @set_api_status("prototype")
+    def _collective_rpc(self,
+                        method: str,
+                        args: tuple[Any, ...] = (),
+                        kwargs: Optional[dict] = None,
+                        non_block: bool = False,
+                        unique_reply_rank: Optional[int] = None) -> list[Any]:
+        """
+        Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
+
+        Args:
+            method (str): The name of the worker method to execute.
+            args (tuple[Any, ...]): Positional arguments to pass to the worker method. Defaults to ().
+            kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
+            non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.
+            unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.
+
+        Returns:
+            list[Any]: A list of results from each worker.
+        """
+        if hasattr(self._executor, 'collective_rpc'):
+            return self._executor.collective_rpc(method, args, kwargs,
+                                                 non_block, unique_reply_rank)
+        else:
+            raise ValueError(
+                f"Executor type {type(self._executor)} does not support collective RPC."
+            )
 
     def _build_model(self):
         super()._build_model()

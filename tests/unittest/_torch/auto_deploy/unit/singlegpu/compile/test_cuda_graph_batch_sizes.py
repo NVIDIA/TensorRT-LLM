@@ -71,10 +71,10 @@ class TestCudaGraphBatchSizes:
         requested_batch_sizes = [1, 4, 8, 16, 32, 64]  # 32 and 64 should be clamped to 16
 
         compiler = TorchCudagraphCompiler(
-            gm=data["gm"],
+            model=data["gm"],
             args=(data["input_tensor"],),
-            dynamic_shapes=data["dynamic_shapes"],
-            compiler_kwargs={"cuda_graph_batch_sizes": requested_batch_sizes},
+            max_batch_size=max_batch_size,
+            cuda_graph_batch_sizes=requested_batch_sizes,
         )
 
         # Check that batch sizes are clamped to max_batch_size
@@ -94,10 +94,9 @@ class TestCudaGraphBatchSizes:
         requested_batch_sizes = [1, 4, 8, 12]
 
         compiler = TorchCudagraphCompiler(
-            gm=data["gm"],
+            model=data["gm"],
             args=(data["input_tensor"],),
-            dynamic_shapes=data["dynamic_shapes"],
-            compiler_kwargs={"cuda_graph_batch_sizes": requested_batch_sizes},
+            cuda_graph_batch_sizes=requested_batch_sizes,
         )
 
         # Check that batch sizes are preserved
@@ -113,10 +112,9 @@ class TestCudaGraphBatchSizes:
         max_batch_size = data["batch_size"]  # 16
 
         compiler = TorchCudagraphCompiler(
-            gm=data["gm"],
+            model=data["gm"],
             args=(data["input_tensor"],),
-            dynamic_shapes=data["dynamic_shapes"],
-            compiler_kwargs={},  # No cuda_graph_batch_sizes provided
+            max_batch_size=max_batch_size,  # No cuda_graph_batch_sizes provided
         )
 
         # Check that heuristic batch sizes were generated
@@ -133,9 +131,8 @@ class TestCudaGraphBatchSizes:
 
         captured_graph = CapturedGraph(
             model=data["model"],
-            in_spec=data["gm"]._in_spec,
-            out_spec=data["gm"]._out_spec,
             cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+            num_batched_inputs=1,
         )
 
         assert captured_graph.cuda_graph_max_batch_size == max(cuda_graph_batch_sizes)
@@ -149,9 +146,8 @@ class TestCudaGraphBatchSizes:
         cuda_graph_batch_sizes = [1, 2, 4]
         captured_graph = CapturedGraph(
             model=data["model"],
-            in_spec=data["gm"]._in_spec,
-            out_spec=data["gm"]._out_spec,
             cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+            num_batched_inputs=1,
         )
 
         # Capture with small input
@@ -184,9 +180,8 @@ class TestCudaGraphBatchSizes:
         cuda_graph_batch_sizes = [1, 2, 4, 8]
         captured_graph = CapturedGraph(
             model=data["model"],
-            in_spec=data["gm"]._in_spec,
-            out_spec=data["gm"]._out_spec,
             cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+            num_batched_inputs=1,
         )
 
         # Capture with full-size input
@@ -231,10 +226,10 @@ class TestCudaGraphBatchSizes:
             expected_max = max_batch_size
 
         compiler = TorchCudagraphCompiler(
-            gm=data["gm"],
+            model=data["gm"],
             args=(data["input_tensor"],),
-            dynamic_shapes=data["dynamic_shapes"],
-            compiler_kwargs=compiler_kwargs,
+            max_batch_size=max_batch_size,
+            **compiler_kwargs,
         )
 
         # Check that max batch size is as expected

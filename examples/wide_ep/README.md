@@ -125,6 +125,14 @@ rm -f /dev/shm/moe_shared_l0_lr0_all
 
 **Warning:** Be careful when removing shared memory manually, as this may affect running processes that depend on these shared memory segments.
 
+### Hang issue caused by `UnpicklingError`
+
+It's possible to see hang issue that is caused by an `UnpicklingError`, we've noticed that and recorded it as a known issue. The issue seems to be existing in MPI, because we are not reproducing again after by-passing the MPI route by implementing customized InfiniBand communicator and replacing MPI API calls with that. We did not proceed because:
+1. The implementation only works on InfiniBand, hence not general enough.
+2. The implementation largely duplicated with InfiniBand communicator implementation in NCCL, which is hard to maintain.
+
+That being said, we are aware of the `UnpicklingError`, but instead of pushing further, we decided to keep observing for a while to see if it would be gone with further 3rd-party dependency upgrade. Please let us know if it's a blocker in your workload, and we will do necessary adjustment based on the feedback.
+
 ### Disaggregated serving related issues
 
 Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md#troubleshooting-and-faq) section of Disaggregated-Service.

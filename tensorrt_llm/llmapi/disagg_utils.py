@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import IntEnum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 
-class ServerRole(Enum):
+class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
@@ -45,8 +45,21 @@ class ConditionalDisaggConfig():
 
 @dataclass
 class ObservabilityConfig():
-    otlp_traces_endpoint: Optional[str] = None
-    """Target URL to which OpenTelemetry traces will be sent."""
+    otlp_traces_endpoint: Optional[str] = None # Target URL to which OpenTelemetry traces will be sent
+
+
+class MinimalInstances:
+    context_servers: int = 1  # the minimal number of context servers
+    generation_servers: int = 1  # the minimal number of generation servers
+
+
+@dataclass
+class DisaggClusterConfig:
+    cluster_uri: str  # the uri of the cluster storage
+    cluster_name: str = ""  # the name of the cluster, used like a namespace
+    minimal_instances: Optional[MinimalInstances] = None
+    heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
+    inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
 
 
 @dataclass

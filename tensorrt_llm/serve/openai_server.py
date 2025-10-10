@@ -9,10 +9,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, List, Optional, Union
+from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
+                    Optional, Union)
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
@@ -49,9 +50,11 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_harmony_post_processor, chat_harmony_streaming_post_processor,
     chat_response_post_processor, chat_stream_post_processor,
     completion_response_post_processor, completion_stream_post_processor)
-from tensorrt_llm.serve.responses_utils import ConversationHistoryStore
+from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
+                                                ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     process_streaming_events as responses_api_process_streaming_events
 from tensorrt_llm.serve.responses_utils import \
@@ -105,6 +108,8 @@ class OpenAIServer:
         self.metrics_collector = None
         self.perf_metrics = None
         self.perf_metrics_lock = None
+        # The steady clock offset (in seconds) between this server and the disagg server
+        self.disagg_server_steady_clock_offset = 0
         if self.llm.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
@@ -159,6 +164,9 @@ class OpenAIServer:
             assert isinstance(self.llm, MultimodalEncoder), "llm must be a MultimodalEncoder for multimodal encoder"
             self.register_mm_encoder_routes()
 
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
+
+
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
             return
@@ -206,6 +214,9 @@ class OpenAIServer:
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
         self.app.add_api_route("/perf_metrics", self.get_perf_metrics, methods=["GET"])
+        self.app.add_api_route("/steady_clock_offset", self.get_steady_clock_offset, methods=["GET"])
+        # Called by the disagg server to set the disagg_server_steady_clock_offset
+        self.app.add_api_route("/steady_clock_offset", self.set_steady_clock_offset, methods=["POST"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
@@ -257,7 +268,7 @@ class OpenAIServer:
     async def health(self) -> Response:
         return Response(status_code=200)
 
-    async def health_generate(self) -> Response:
+    async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
         try:
             # Create a minimal chat request
@@ -269,10 +280,8 @@ class OpenAIServer:
                 temperature=0.0 # Deterministic output
             )
 
-            mock_request = None
-
             # Call the chat completion logic
-            response = await self.openai_chat(health_request, mock_request)
+            response = await self.openai_chat(health_request, raw_request)
 
             # Check if the response indicates success (status code 200)
             if response.status_code == 200:
@@ -288,7 +297,7 @@ class OpenAIServer:
                 return Response(status_code=500, content="Generation health check failed")
 
         except Exception as e:
-            logger.error(f"Health generate check encountered exception: {e}", exc_info=True)
+            logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500, content=f"Generation health check failed: {str(e)}")
 
     async def version(self) -> JSONResponse:
@@ -304,6 +313,17 @@ class OpenAIServer:
         async for stat in self.llm.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def set_steady_clock_offset(self, offset: Annotated[float, Body(embed=True)]) -> Response:
+        self.disagg_server_steady_clock_offset = offset
+        logger.info(f"The steady clock offset between local and disagg server: {offset} second")
+        return Response(status_code=200)
+
+    async def get_steady_clock_offset(self) -> JSONResponse:
+        receive_ts = get_steady_clock_now_in_seconds()
+        await asyncio.sleep(0.2)
+        transmit_ts = get_steady_clock_now_in_seconds()
+        return JSONResponse(content={"receive_ts": receive_ts, "transmit_ts": transmit_ts})
 
     async def get_perf_metrics(self) -> JSONResponse:
         if self.perf_metrics is None:
@@ -321,11 +341,19 @@ class OpenAIServer:
                 "last_iter": metrics.last_iter,
                 # exclude metrics.iter since it is only meaningful when the request is not finished
             }
+            server_arrival_time = metrics_dict.pop("server_arrival_time", None)
+            if server_arrival_time is not None:
+                server_arrival_time += self.disagg_server_steady_clock_offset
+            server_first_token_time = metrics_dict.pop("server_first_token_time", None)
+            if server_first_token_time is not None:
+                server_first_token_time += self.disagg_server_steady_clock_offset
             metrics_json["timing_metrics"] = {
-                "arrival_time": timing_metrics.arrival_time.total_seconds(),
-                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
-                "first_token_time": timing_metrics.first_token_time.total_seconds(),
-                "last_token_time": timing_metrics.last_token_time.total_seconds(),
+                "server_arrival_time": server_arrival_time,
+                "arrival_time": timing_metrics.arrival_time.total_seconds() + self.disagg_server_steady_clock_offset,
+                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds() + self.disagg_server_steady_clock_offset,
+                "first_token_time": timing_metrics.first_token_time.total_seconds() + self.disagg_server_steady_clock_offset,
+                "server_first_token_time": server_first_token_time,
+                "last_token_time": timing_metrics.last_token_time.total_seconds() + self.disagg_server_steady_clock_offset,
             }
             metrics_json["kv_cache_metrics"] = {
                 "num_total_allocated_blocks": kv_cache_metrics.num_total_allocated_blocks,
@@ -337,8 +365,8 @@ class OpenAIServer:
                 metrics_json["timing_metrics"].update({
                     # TODO: move to kv_cache_metrics
                     "kv_cache_size": timing_metrics.kv_cache_size,
-                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds(),
-                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds(),
+                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds() + self.disagg_server_steady_clock_offset,
+                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds() + self.disagg_server_steady_clock_offset,
                 })
             if speculative_decoding.total_draft_tokens > 0:
                 metrics_json["speculative_decoding"] = {
@@ -359,7 +387,7 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
-    async def _extract_metrics(self, res: RequestOutput):
+    async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
         if self.metrics_collector:
@@ -370,6 +398,9 @@ class OpenAIServer:
                 "request_id": res.request_id,
                 "perf_metrics": res.outputs[0].request_perf_metrics
             }
+            if raw_request:
+                item["server_arrival_time"] = getattr(raw_request.state, "server_arrival_time", None)
+                item["server_first_token_time"] = getattr(raw_request.state, "server_first_token_time", None)
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
             if self.perf_metrics is not None:
@@ -390,12 +421,19 @@ class OpenAIServer:
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                pp_results = first_response.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(first_response, args)
+                for pp_res in pp_results:
+                    yield pp_res
+                # Making sure we can handling the situation where there is only one response
+                res = first_response
                 async for res in promise:
                     pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                    await self._extract_metrics(res)
                     for pp_res in pp_results:
                         yield pp_res
                 yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
             except:
                 logger.error(traceback.format_exc())
@@ -413,7 +451,8 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
-            await self._extract_metrics(promise)
+            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+            await self._extract_metrics(promise, raw_request)
             return chat_response
 
         try:
@@ -585,7 +624,8 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            await self._extract_metrics(response)
+            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+            await self._extract_metrics(response, raw_request)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -622,9 +662,9 @@ class OpenAIServer:
                         pp_result = post_processor(output, args)
                     else:
                         pp_result = output.outputs[0]._postprocess_result
-                    await self._extract_metrics(output)
                     for pp_res in pp_result:
                         yield pp_res
+                await self._extract_metrics(output, raw_request)
             except:
                 logger.error(traceback.format_exc())
                 raise
@@ -649,6 +689,9 @@ class OpenAIServer:
             await asyncio.gather(*tasks)
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
+            first_response = await anext(generator)
+            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+            yield first_response
             async for output in generator:
                 yield output
             yield "data: [DONE]\n\n"

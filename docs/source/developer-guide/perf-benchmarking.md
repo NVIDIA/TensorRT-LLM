@@ -14,8 +14,8 @@ easier for users to reproduce our officially published [performance overview](./
 - An entirely Python workflow for benchmarking.
 - Ability to benchmark various flows and features within TensorRT LLM.
 
-`trtllm-bench` executes all benchmarks using [in-flight batching] -- for more information see
-the [in-flight batching section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
+`trtllm-bench` executes all benchmarks using `in-flight batching` -- for more information see
+the [in-flight batching section](../features/attention.md#inflight-batching) that describes the concept
 in further detail.
 
 ## Before Benchmarking
@@ -98,8 +98,8 @@ Export your token in the `HF_TOKEN` environment variable.
 - `FP8`
 - `NVFP4`
 
-For more information about quantization, refer to [](../reference/precision.md) and
-the [support matrix](../reference/precision.md#support-matrix) of the supported quantization methods for each network.
+For more information about quantization, refer to [](../features/quantization.md) and
+the [support matrix](../features/quantization.md#model-supported-matrix) of the supported quantization methods for each network.
 
 ```{tip}
 Although TensorRT LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for
@@ -155,11 +155,9 @@ python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3
 
 ### Running with the PyTorch Workflow
 
-To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following command with [dataset](#preparing-a-dataset) generated from previous steps. The `throughput` benchmark initializes the backend by tuning against the
-dataset provided via `--dataset` (or the other build mode settings described [above](#other-build-modes)).
-Note that CUDA graph is enabled by default. You can add additional pytorch config with
-`--extra_llm_api_options` followed by the path to a YAML file. For more details, please refer to the
-help text by running the command with `--help`.
+To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following command with [dataset](#preparing-a-dataset) generated from previous steps. The `throughput` benchmark initializes the backend by tuning against the dataset provided via `--dataset` (or the other build mode settings described above).
+
+Note that CUDA graph is enabled by default. You can add additional pytorch config with `--extra_llm_api_options` followed by the path to a YAML file. For more details, please refer to the help text by running the command with `--help`.
 
 ```{tip}
 The command below specifies the `--model_path` option. The model path is optional and used only when you want to run a locally
@@ -181,7 +179,7 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
 ===========================================================
 Model:                  meta-llama/Llama-3.1-8B
 Model Path:             /Ckpt/Path/To/Llama-3.1-8B
-TensorRT-LLM Version:   0.17.0
+TensorRT LLM Version:   0.17.0
 Dtype:                  bfloat16
 KV Cache Dtype:         None
 Quantization:           FP8
@@ -310,7 +308,7 @@ Each subdirectory should contain the LoRA adapter files for that specific task.
 To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.
 
 First, prepare the dataset:
-```
+```python
 python ./benchmarks/cpp/prepare_dataset.py \
   --tokenizer Qwen/Qwen2-VL-2B-Instruct \
   --stdout \
@@ -334,7 +332,7 @@ Sample dataset for multimodal:
 ```
 
 Run the benchmark:
-```
+```python
 trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
   throughput \
   --dataset mm_data.jsonl \

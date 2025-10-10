@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import List
 
+import pytest
 import torch
 from _torch.helpers import create_mock_engine
 from parameterized import parameterized
@@ -234,6 +235,7 @@ class TestQwen2_5_VL(unittest.TestCase):
         ).to(device)
         return processor_inputs
 
+    @pytest.mark.skip(reason="https://nvbugs/5550722")
     def test_qwen2_5_vl_sanity(self):
 
         config_dict = deepcopy(QWEN2_5_VL_7B_CONFIG)
@@ -352,6 +354,7 @@ class TestQwen2_5_VL(unittest.TestCase):
                  use_cuda_graph=False,
                  disable_fuse_rope=False),
     ])
+    @pytest.mark.skip(reason="https://nvbugs/5550722")
     @torch.no_grad()
     def test_qwen2_5_vl_allclose_to_hf(self, scenario: Scenario) -> None:
         """
@@ -498,8 +501,9 @@ class TestQwen2_5_VL(unittest.TestCase):
                     "attn_metadata": attn_metadata,
                     "multimodal_params": multimodal_params,
                 }
+                key = (1, 0, False)
                 graph_runner.capture(
-                    batch_size=1,
+                    key=key,
                     forward_fn=lambda inputs: qwen2_5_vl.forward(**inputs),
                     initial_inputs=inputs)
 
@@ -507,8 +511,7 @@ class TestQwen2_5_VL(unittest.TestCase):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(batch_size=1,
-                                                 current_inputs=inputs)
+                    logits = graph_runner.replay(key=key, current_inputs=inputs)
                 return logits
 
         if scenario.use_cuda_graph:

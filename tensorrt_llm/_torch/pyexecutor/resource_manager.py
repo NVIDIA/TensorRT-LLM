@@ -9,6 +9,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
@@ -545,8 +546,15 @@ class KVCacheManager(BaseResourceManager):
         for request in scheduled_batch.context_requests:
             self.impl.store_context_blocks(request)
 
-    def free_resources(self, request: LlmRequest):
-        self.impl.remove_sequence(request.py_request_id, request)
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        return self.impl.remove_sequence(request.py_request_id, request,
+                                         pin_on_release)
+
+    def store_blocks_for_reuse(self,
+                               request: LlmRequest,
+                               pin_blocks: bool = False):
+        return self.impl.store_blocks_for_reuse(request.py_request_id, request,
+                                                pin_blocks)
 
     @staticmethod
     def calculate_scaling_factor_size_bytes(
@@ -603,7 +611,12 @@ class KVCacheManager(BaseResourceManager):
 
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
-            max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
+            if mpi_disabled():
+                from tensorrt_llm._utils import torch_comm
+                max_tokens = torch_comm().allreduce(
+                    max_tokens, op=torch.distributed.ReduceOp.MIN)
+            else:
+                max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
 
         # get number of blocks
         blocks_in_primary_pool = math.ceil(max_tokens / tokens_per_block)
@@ -643,6 +656,12 @@ class KVCacheManager(BaseResourceManager):
                                                window_size)
         assert len(result) == 1
         return result[0]
+
+    def unpin_blocks_by_id(self, kv_cache_block_id: int):
+        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+
+    def get_last_block_id(self, request_id: int) -> int:
+        return self.impl.get_last_block_id(request_id)
 
     def get_batch_cache_indices(
         self,
@@ -1005,6 +1024,9 @@ class KVCacheManager(BaseResourceManager):
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
 
+    def pin_blocks(self, request_id: int):
+        self.impl.pin_blocks(request_id)
+
     def _set_temp_attention_window_inputs(
             self) -> Optional[TempAttentionWindowInputs]:
         """
@@ -1042,6 +1064,13 @@ class SlotManager:
                 raise ValueError(f"Request {request.request_id} has no slot id")
 
     def add_slot(self, request_id: int):
+        if request_id in self.slot_mapping:
+            # CUDA graph dummy request could be added for different batches,
+            # but we only need to reserve slot for it once.
+            from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+            assert request_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+            return self.slot_mapping[request_id]
+
         if len(self.free_slots) == 0:
             raise ValueError("No free slots")
         slot = self.free_slots.pop()

@@ -11,8 +11,7 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, AllReduceStrategy,
-                                             MoEAllReduce)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version
@@ -564,7 +563,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
@@ -650,12 +650,7 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
-        # TODO: This is a temporary fix to disable oneshot kernel for pre-Blackwell arch to avoid perf regressions
-        self.all_reduce = AllReduce(
-            strategy=model_config.allreduce_strategy
-            if get_sm_version() >= 100 else AllReduceStrategy.NCCL,
-            mapping=model_config.mapping,
-        )
+        self.all_reduce = AllReduce(mapping=model_config.mapping)
 
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
@@ -778,7 +773,8 @@ class LlamaDecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
@@ -1002,7 +998,8 @@ class Llama4VisionEncoder(nn.Module):
                  **kwargs):
         super().__init__()
         self.pretrained_config = model_config.pretrained_config
-        self.device = f"cuda:{model_config.mapping.rank}"
+        # TODO: use config.mapping.get_local_rank() instead
+        self.device = f"cuda:{torch.cuda.current_device()}"
 
         self.dtype = self.pretrained_config.text_config.torch_dtype
 

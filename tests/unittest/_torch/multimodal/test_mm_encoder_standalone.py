@@ -199,10 +199,12 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
 
     encoder = MultimodalEncoder(model=encoder_model_dir,
                                 max_batch_size=max_batch_size)
-    llm = LLM(model=encoder_model_dir,
-              backend='pytorch',
-              kv_cache_config=kv_cache_config,
-              trust_remote_code=True)
+    llm = LLM(
+        model=encoder_model_dir,
+        backend='pytorch',
+        kv_cache_config=kv_cache_config,
+        max_batch_size=1,  # fix batch size to reduce non-determinism in tests
+        trust_remote_code=True)
 
     config_path = os.path.join(llm._hf_model_dir, 'config.json')
     assert os.path.exists(

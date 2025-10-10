@@ -11,6 +11,7 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
+from .save_hidden_state import SaveHiddenStatesDrafter
 
 
 def get_spec_metadata(spec_config,
@@ -27,20 +28,6 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
         )
-    if spec_config.spec_dec_mode.is_eagle3():
-        return Eagle3SpecMetadata(
-            max_draft_len=spec_config.max_draft_len,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-            num_layers=model_config.num_hidden_layers,
-            hidden_size=model_config.hidden_size,
-            max_num_tokens=max_num_tokens,
-            dtype=model_config.torch_dtype,
-            is_draft_model=is_draft_model,
-            eagle3_resource_manager=spec_resource_manager,
-            layers_to_capture=spec_config.eagle3_layers_to_capture,
-            is_mtp_eagle=False,
-        )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -55,6 +42,24 @@ def get_spec_metadata(spec_config,
             layers_to_capture=None,
             is_mtp_eagle=True,
         )
+    if spec_config.spec_dec_mode.is_eagle3():
+        return Eagle3SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            layers_to_capture=spec_config.eagle3_layers_to_capture,
+            is_mtp_eagle=False,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            eagle_choices=spec_config.eagle_choices,
+            is_spec_dec_tree=spec_config.eagle_choices is not None,
+            is_spec_dec_dynamic_tree=spec_config.use_dynamic_tree,
+        )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -64,6 +69,25 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+        )
+    if spec_config.spec_dec_mode.is_save_hidden_states():
+        if spec_config.eagle3_layers_to_capture is None:
+            spec_config.eagle3_layers_to_capture = {
+                1, model_config.num_hidden_layers // 2 - 1,
+                model_config.num_hidden_layers - 4, -1
+            }
+        return Eagle3SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            layers_to_capture=spec_config.eagle3_layers_to_capture,
+            max_total_draft_tokens=1,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
@@ -107,6 +131,15 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return Eagle3ResourceManager(
             spec_config,
             draft_model_engine.model.config.torch_dtype,
+            model_config.hidden_size,
+            max_num_requests,
+            max_seq_len,
+            max_num_tokens,
+        )
+    if spec_dec_mode.is_save_hidden_states():
+        return Eagle3ResourceManager(
+            spec_config,
+            model_engine.model.config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
             max_seq_len,
@@ -160,6 +193,9 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
+
+    if spec_config.spec_dec_mode.is_save_hidden_states():
+        return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
 
     return None
 

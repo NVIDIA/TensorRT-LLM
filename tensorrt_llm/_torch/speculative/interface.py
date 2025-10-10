@@ -7,6 +7,7 @@ import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
+from ..pyexecutor.resource_manager import BaseResourceManager
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -18,6 +19,7 @@ class SpeculativeDecodingMode(IntEnum):
     NGRAM = auto()
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -54,6 +56,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
+    def is_save_hidden_states(self):
+        return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
+
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
@@ -62,6 +67,10 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_ngram()
 
     def support_overlap_scheduler(self):
+        # TODO: fix accuracy issue
+        if self.is_mtp_eagle():
+            return False
+
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.has_draft_model()
 
@@ -94,29 +103,42 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided() or self.is_mtp_eagle()
+        return self.is_eagle3(
+        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
+        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
-        chunked context requests at the kernel level. Required for
-        any spec dec mode that uses the SpecExecutor.
+        chunked context requests at the kernel level.
         """
 
         if self.use_one_engine():
             # 1-model has separate logic for handling draft tokens
             return False
 
-        # The special XQA generation kernels only exist with the TRTLLM backend on blackwell.
+        if issubclass(attention_backend,
+                      TrtllmAttention) and self.is_mtp_eagle():
+            # TRTLLM MLA does not work with the chunked context mode.
+            return False
+
         return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 
-    def attention_need_spec_dec_mode(self):
+    def attention_need_spec_dec_mode(
+        self,
+        spec_resource_manager: BaseResourceManager,
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
+        use_chain_drafter: bool,
+    ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         """
-        return self.is_eagle3_one_model()
+        is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
+        return self.is_eagle3_one_model() or (
+            self.is_eagle3() and spec_resource_manager.is_first_draft
+            and is_trtllm_attention and use_chain_drafter and is_draft_model)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
@@ -151,6 +173,8 @@ class SpecMetadata:
     seq_lens: Optional[List[int]] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
+    # The number of accepted draft tokens for each request.
+    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank

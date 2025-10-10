@@ -1870,6 +1870,10 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('DeepSeek-R1-Distill-Qwen-32B',
                  'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
                  marks=skip_pre_blackwell),
+    pytest.param('GPT-OSS-20B', 'gpt_oss/gpt-oss-20b',
+                 marks=skip_pre_blackwell),
+    pytest.param(
+        'GPT-OSS-120B', 'gpt_oss/gpt-oss-120b', marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
@@ -1949,18 +1953,17 @@ def test_ptp_quickstart_advanced_mtp_eagle(llm_root, llm_venv, model_name,
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        llm_venv.run_cmd(
-            [
-                str(example_root / "quickstart_advanced.py"),
-                "--use_cuda_graph",
-                "--spec_decode_max_draft_len",
-                "1",  # test 1 MTP module
-                "--spec_decode_algo",
-                "MTP",
-                "--model_dir",
-                f"{llm_models_root()}/{model_path}",
-            ],
-            stdout=running_log)
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--use_cuda_graph",
+            "--spec_decode_max_draft_len",
+            "3",
+            "--spec_decode_algo",
+            "MTP",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ],
+                         stdout=running_log)
         # 74.60 is the memory usage for DeepSeek-V3-Lite-BF16 with MTP Eagle 2 two model style as one extra kv cache is needed for draft model.
         _check_mem_usage(running_log, [74.60, 0, 0, 0])
 
@@ -2303,6 +2306,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--tp_size=8",
             "--max_batch_size=32",
+            "--max_num_tokens=256",
         ],
                          stdout=running_log)
         if model_name in mapping:
@@ -2366,6 +2370,7 @@ def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         "--tp_size=2",
+        "--max_num_tokens=256",
     ])
 
 

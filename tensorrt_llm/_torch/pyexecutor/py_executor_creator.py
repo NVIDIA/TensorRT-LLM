@@ -12,7 +12,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
                                             GuidedDecodingConfig)
@@ -28,9 +28,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..distributed import MPIDist
+from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
+from ..utils import _get_allow_chain_drafter
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -40,12 +41,6 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-
-
-# Development function to control chain drafter feature.
-# It's here so that unit tests can mock it and turn it off.
-def _get_allow_chain_drafter() -> bool:
-    return True
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -86,9 +81,8 @@ class _ExecutorMemoryMonitor():
         elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
               and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
               in str(e)):
-            msg = (
-                "Executor creation failed with an error which might indicate "
-                "insufficient GPU memory.")
+            msg = (f"Executor creation failed with NCCL error: {str(e)}")
+            return msg
         else:
             return None
 
@@ -128,8 +122,8 @@ class _ExecutorMemoryMonitor():
                f"{self._bytes_to_gib(sample.free_gpu_memory_bytes_pre):.2f} / {self._bytes_to_gib(sample.free_gpu_memory_bytes_post):.2f}"
                ) for sample in self._samples),
             "",
-            ("Please refer to the TensorRT-LLM documentation for information on how "
-             "to control the memory usage through TensorRT-LLM configuration options. "
+            ("Please refer to the TensorRT LLM documentation for information on how "
+             "to control the memory usage through TensorRT LLM configuration options. "
              "Possible options include:"),
             *(f"  {stage.value}: {tuning_knobs[stage]}"
               for stage in chain((sample.creation_stage
@@ -299,7 +293,10 @@ def create_py_executor(
         pytorch_backend_config.disable_overlap_scheduler = True
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    dist = MPIDist(mapping=mapping)
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
 
     cache_transceiver_config = None
     if llm_args.cache_transceiver_config is not None:
@@ -346,9 +343,6 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            # The draft model won't have any draft tokens attached to
-            # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_len = 0
 
             if _get_allow_chain_drafter():
                 use_chain_drafter = (
