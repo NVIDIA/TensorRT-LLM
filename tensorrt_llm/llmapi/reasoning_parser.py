@@ -35,6 +35,7 @@ class DeepSeekR1Parser(BaseReasoningParser):
     """
 
     def __init__(self):
+        self.reasoning_begin = "<think>"
         self.reasoning_end = "</think>"
         self.in_reasoning = True
 
@@ -57,6 +58,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
 
         splits = text.split(self.reasoning_end, maxsplit=1)
         reasoning_content = splits[0]
+        if reasoning_content.startswith(self.reasoning_begin):
+            reasoning_content = reasoning_content[len(self.reasoning_begin):]
         content = splits[1]
 
         reasoning_parser_result = self._create_reasoning_end_result(
@@ -74,6 +77,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
             return reasoning_parser_result
 
         if self.in_reasoning:
+            if delta_text.startswith(self.reasoning_begin):
+                delta_text = delta_text[len(self.reasoning_begin):]
             return ReasoningParserResult(self.in_reasoning,
                                          reasoning_content=delta_text)
 
