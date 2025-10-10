@@ -2094,6 +2094,12 @@ def pytest_addoption(parser):
         help=
         "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
         "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
+        "--save-per-case-junit",
+        action="store_true",
+        default=False,
+        help=
+        "Save a separate junit XML report for each test case as it completes, then merge all reports at the end. "
+        "This ensures test results are not lost if the test run is interrupted.",
     )
 
 
@@ -2538,3 +2544,293 @@ def ray_cleanup(llm_venv) -> None:
             "ray.scripts.scripts",
             "stop",
         ])
+
+
+# Per-case junit report functionality
+@pytest.fixture(scope="session")
+def per_case_junit_manager(request, output_dir):
+    """
+    Fixture to manage per-case junit report generation and merging.
+    """
+    save_per_case = request.config.getoption("--save-per-case-junit")
+
+    if not save_per_case or not output_dir:
+        yield None
+        return
+
+    # Create directory for individual test case reports
+    per_case_dir = os.path.join(output_dir, "per_case_junit")
+    os.makedirs(per_case_dir, exist_ok=True)
+
+    manager = {
+        'enabled': True,
+        'per_case_dir': per_case_dir,
+        'output_dir': output_dir,
+        'test_cases': [],  # Store test case information
+    }
+
+    yield manager
+
+    # Merge all individual reports at the end of the session
+    if manager['test_cases']:
+        _merge_per_case_junit_reports(manager)
+
+
+def _merge_per_case_junit_reports(manager):
+    """
+    Merge all per-case junit XML reports into a single consolidated report.
+    """
+    import xml.etree.ElementTree as ET
+
+    per_case_dir = manager['per_case_dir']
+    output_dir = manager['output_dir']
+
+    # Find all per-case XML files
+    xml_files = [f for f in os.listdir(per_case_dir) if f.endswith('.xml')]
+
+    if not xml_files:
+        print_info("No per-case junit reports found to merge.")
+        return
+
+    print_info(f"Merging {len(xml_files)} per-case junit reports...")
+
+    # Create merged root element
+    merged_root = ET.Element('testsuites')
+    merged_suite = ET.SubElement(merged_root, 'testsuite')
+    merged_suite.set('name', 'Merged Test Suite')
+
+    # Statistics for the merged suite
+    stats = {'tests': 0, 'errors': 0, 'failures': 0, 'skipped': 0, 'time': 0.0}
+
+    # Parse and merge each XML file
+    for xml_file in sorted(xml_files):
+        xml_path = os.path.join(per_case_dir, xml_file)
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+
+            # Find testsuite element (could be at root or nested)
+            suite = root.find('testsuite')
+            if suite is None and root.tag == 'testsuite':
+                suite = root
+
+            if suite is not None:
+                # Update statistics
+                stats['tests'] += int(suite.get('tests', 0))
+                stats['errors'] += int(suite.get('errors', 0))
+                stats['failures'] += int(suite.get('failures', 0))
+                stats['skipped'] += int(suite.get('skipped', 0))
+                stats['time'] += float(suite.get('time', 0.0))
+
+                # Add all test cases to merged suite
+                for testcase in suite.findall('testcase'):
+                    merged_suite.append(testcase)
+        except Exception as e:
+            print_warning(f"Failed to parse {xml_file}: {e}")
+
+    # Set merged suite attributes
+    merged_suite.set('tests', str(stats['tests']))
+    merged_suite.set('errors', str(stats['errors']))
+    merged_suite.set('failures', str(stats['failures']))
+    merged_suite.set('skipped', str(stats['skipped']))
+    merged_suite.set('time', f"{stats['time']:.3f}")
+    merged_suite.set('timestamp', datetime.datetime.now().isoformat())
+
+    # Write merged report
+    merged_file = os.path.join(output_dir, 'results-merged-per-case.xml')
+    tree = ET.ElementTree(merged_root)
+    ET.indent(tree, space='  ')  # Pretty print (Python 3.9+)
+    tree.write(merged_file, encoding='utf-8', xml_declaration=True)
+
+    print_info(f"Merged junit report saved to: {merged_file}")
+    print_info(f"Total tests: {stats['tests']}, Failures: {stats['failures']}, "
+               f"Errors: {stats['errors']}, Skipped: {stats['skipped']}")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """
+    Hook to capture test results and save individual junit reports per test case.
+    """
+    outcome = yield
+    report = outcome.get_result()
+
+    # Only process on teardown phase (when test is complete)
+    if report.when != 'teardown':
+        return
+
+    # Check if per-case junit is enabled
+    manager = item.session.config._per_case_junit_manager if hasattr(
+        item.session.config, '_per_case_junit_manager') else None
+
+    if not manager or not manager.get('enabled'):
+        return
+
+    # Generate individual junit XML for this test case
+    _save_individual_junit_report(item, manager)
+
+
+def _save_individual_junit_report(item, manager):
+    """
+    Save an individual junit XML report for a single test case.
+    """
+    import xml.etree.ElementTree as ET
+
+    per_case_dir = manager['per_case_dir']
+
+    # Create safe filename from test nodeid
+    safe_name = item.nodeid.replace('/', '_').replace('::', '_').replace(
+        '[', '_').replace(']', '_')
+    safe_name = safe_name[:200]  # Limit filename length
+    xml_file = os.path.join(per_case_dir, f'test_{safe_name}.xml')
+
+    # Create XML structure
+    testsuites = ET.Element('testsuites')
+    testsuite = ET.SubElement(testsuites, 'testsuite')
+    testsuite.set('name', item.nodeid)
+    testsuite.set('tests', '1')
+    testsuite.set('timestamp', datetime.datetime.now().isoformat())
+
+    # Create testcase element
+    testcase = ET.SubElement(testsuite, 'testcase')
+    testcase.set(
+        'classname',
+        item.nodeid.split('::')[0] if '::' in item.nodeid else item.nodeid)
+    testcase.set('name', item.name)
+    testcase.set('file', str(item.fspath) if hasattr(item, 'fspath') else '')
+
+    # Get test duration from reports
+    setup_report = item.stash.get(_setup_report_key, None) if hasattr(
+        item, 'stash') else None
+    call_report = item.stash.get(_call_report_key, None) if hasattr(
+        item, 'stash') else None
+    teardown_report = item.stash.get(_teardown_report_key, None) if hasattr(
+        item, 'stash') else None
+
+    total_duration = 0.0
+    outcome = 'passed'
+
+    # Collect information from all test phases
+    for report_key, phase in [(_setup_report_key, 'setup'),
+                              (_call_report_key, 'call'),
+                              (_teardown_report_key, 'teardown')]:
+        if hasattr(item, 'stash'):
+            report = item.stash.get(report_key, None)
+            if report:
+                total_duration += report.duration
+                if report.outcome == 'failed':
+                    outcome = 'failed'
+                    # Add failure element
+                    failure = ET.SubElement(testcase, 'failure')
+                    failure.set('message', f'Failed in {phase} phase')
+                    if hasattr(report, 'longrepr'):
+                        failure.text = str(report.longrepr)
+                elif report.outcome == 'skipped':
+                    if outcome != 'failed':  # Don't override failed status
+                        outcome = 'skipped'
+                    skipped = ET.SubElement(testcase, 'skipped')
+                    if hasattr(report, 'longrepr'):
+                        skipped.set('message', str(report.longrepr))
+
+    testcase.set('time', f'{total_duration:.3f}')
+
+    # Set testsuite statistics
+    testsuite.set('time', f'{total_duration:.3f}')
+    testsuite.set('failures', '1' if outcome == 'failed' else '0')
+    testsuite.set('errors', '0')
+    testsuite.set('skipped', '1' if outcome == 'skipped' else '0')
+
+    # Write XML file
+    tree = ET.ElementTree(testsuites)
+    try:
+        ET.indent(tree, space='  ')  # Pretty print (Python 3.9+)
+    except AttributeError:
+        pass  # indent not available in older Python versions
+
+    tree.write(xml_file, encoding='utf-8', xml_declaration=True)
+
+    # Track this test case
+    manager['test_cases'].append({
+        'nodeid': item.nodeid,
+        'outcome': outcome,
+        'duration': total_duration,
+        'xml_file': xml_file,
+    })
+
+    print_info(
+        f"Saved per-case junit report: {os.path.basename(xml_file)} [{outcome}]"
+    )
+
+
+# Store report keys for accessing test phase reports
+from _pytest.stash import StashKey
+
+_setup_report_key = StashKey()
+_call_report_key = StashKey()
+_teardown_report_key = StashKey()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    """Store setup report."""
+    outcome = yield
+    if hasattr(item, 'stash'):
+        report = outcome.get_result()
+        if report:
+            item.stash[_setup_report_key] = report
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """Store call report."""
+    outcome = yield
+    if hasattr(item, 'stash'):
+        report = outcome.get_result()
+        if report:
+            item.stash[_call_report_key] = report
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item):
+    """Store teardown report."""
+    outcome = yield
+    if hasattr(item, 'stash'):
+        report = outcome.get_result()
+        if report:
+            item.stash[_teardown_report_key] = report
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """
+    Configure hook to initialize per-case junit manager.
+    """
+    save_per_case = config.getoption("--save-per-case-junit", default=False)
+    output_dir = config.getoption("--output-dir", default=None)
+
+    if save_per_case and output_dir:
+        per_case_dir = os.path.join(output_dir, "per_case_junit")
+        os.makedirs(per_case_dir, exist_ok=True)
+
+        config._per_case_junit_manager = {
+            'enabled': True,
+            'per_case_dir': per_case_dir,
+            'output_dir': output_dir,
+            'test_cases': [],
+        }
+        print_info(
+            f"Per-case junit reporting enabled. Reports will be saved to: {per_case_dir}"
+        )
+    else:
+        config._per_case_junit_manager = {'enabled': False}
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """
+    Session finish hook to merge all per-case junit reports.
+    """
+    if hasattr(session.config, '_per_case_junit_manager'):
+        manager = session.config._per_case_junit_manager
+        if manager.get('enabled') and manager.get('test_cases'):
+            _merge_per_case_junit_reports(manager)
