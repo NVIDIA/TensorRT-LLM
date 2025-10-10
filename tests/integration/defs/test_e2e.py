@@ -1853,9 +1853,10 @@ def test_ptp_quickstart(llm_root, llm_venv):
         'Qwen3-30B-A3B_nvfp4_hf',
         'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
         marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
-    pytest.param('Llama3.3-70B-FP8',
-                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
-                 marks=skip_pre_blackwell),
+    pytest.param(
+        'Llama3.3-70B-FP8',
+        'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
+        marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(96000))),
     pytest.param('Llama3.3-70B-FP4',
                  'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4',
                  marks=skip_pre_blackwell),
