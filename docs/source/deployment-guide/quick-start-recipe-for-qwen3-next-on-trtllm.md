@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support (such as Blackwell) will be rolled out in future updates. 
+This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support (such as Blackwell) will be rolled out in future updates.
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LO
 
 ### Creating the TRT-LLM Server config
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server. Note that we should set kv_cache_reuse to false. 
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server. Note that we should set kv_cache_reuse to false.
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
@@ -54,7 +54,7 @@ EOF
 
 ### Launch the TRT-LLM Server
 
-Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container. Note that we currently only support pytorch backend. 
+Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container.
 
 ```shell
 trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
