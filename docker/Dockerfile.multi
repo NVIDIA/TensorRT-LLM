@@ -124,7 +124,6 @@ FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
 COPY benchmarks benchmarks
 COPY cpp cpp
-COPY docker docker
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
