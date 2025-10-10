@@ -2094,12 +2094,23 @@ def pytest_addoption(parser):
         help=
         "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
         "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
+    )
+    parser.addoption(
         "--save-per-case-junit",
         action="store_true",
         default=False,
         help=
         "Save a separate junit XML report for each test case as it completes, then merge all reports at the end. "
         "This ensures test results are not lost if the test run is interrupted.",
+    )
+    parser.addoption(
+        "--incremental-merge",
+        action="store_true",
+        default=False,
+        help=
+        "When used with --save-per-case-junit, incrementally append each test case to the merged report "
+        "immediately after it completes. This ensures a merged report always exists even if pytest is killed. "
+        "Uses efficient append-only writes with minimal overhead (O(1) per test instead of O(n)).",
     )
 
 
@@ -2197,10 +2208,41 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    """
+    Configure hook to initialize pytest settings and per-case junit manager.
+    """
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
+
+    # Initialize per-case junit manager
+    save_per_case = config.getoption("--save-per-case-junit", default=False)
+    incremental_merge = config.getoption("--incremental-merge", default=False)
+    output_dir = config.getoption("--output-dir", default=None)
+
+    if save_per_case and output_dir:
+        per_case_dir = os.path.join(output_dir, "per_case_junit")
+        os.makedirs(per_case_dir, exist_ok=True)
+
+        config._per_case_junit_manager = {
+            'enabled': True,
+            'incremental_merge': incremental_merge and save_per_case,
+            'per_case_dir': per_case_dir,
+            'output_dir': output_dir,
+            'test_cases': [],
+        }
+
+        if incremental_merge:
+            print_info(
+                f"Per-case junit reporting enabled with incremental merge. "
+                f"Reports will be saved to: {per_case_dir}")
+        else:
+            print_info(
+                f"Per-case junit reporting enabled. Reports will be saved to: {per_case_dir}"
+            )
+    else:
+        config._per_case_junit_manager = {'enabled': False}
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
@@ -2750,16 +2792,120 @@ def _save_individual_junit_report(item, manager):
     tree.write(xml_file, encoding='utf-8', xml_declaration=True)
 
     # Track this test case
-    manager['test_cases'].append({
+    test_info = {
         'nodeid': item.nodeid,
         'outcome': outcome,
         'duration': total_duration,
         'xml_file': xml_file,
-    })
+        'testcase_element':
+        testcase,  # Keep the testcase element for incremental merge
+    }
+    manager['test_cases'].append(test_info)
 
     print_info(
         f"Saved per-case junit report: {os.path.basename(xml_file)} [{outcome}]"
     )
+
+    # Incremental merge if enabled
+    if manager.get('incremental_merge'):
+        _incremental_merge_testcase(manager, test_info, testcase, outcome,
+                                    total_duration)
+
+
+def _incremental_merge_testcase(manager, test_info, testcase, outcome,
+                                duration):
+    """
+    Incrementally merge a single testcase into the merged report file.
+    Uses a lock file to ensure thread-safety and atomic writes with minimal overhead.
+
+    This is O(1) complexity per test case, much more efficient than rescanning all files.
+    """
+    import fcntl  # For file locking on Unix-like systems
+    import xml.etree.ElementTree as ET
+
+    output_dir = manager['output_dir']
+    merged_file = os.path.join(output_dir, 'results-merged-per-case.xml')
+    lock_file = os.path.join(output_dir, 'results-merged-per-case.lock')
+
+    # Acquire lock for thread-safe writes
+    with open(lock_file, 'w') as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)  # Exclusive lock
+        except (ImportError, AttributeError, OSError):
+            # fcntl not available on Windows, skip locking
+            pass
+
+        # Read existing merged file or create new one
+        if os.path.exists(merged_file):
+            try:
+                tree = ET.parse(merged_file)
+                root = tree.getroot()
+                suite = root.find('testsuite')
+
+                # Update statistics
+                tests = int(suite.get('tests', 0)) + 1
+                failures = int(suite.get('failures',
+                                         0)) + (1 if outcome == 'failed' else 0)
+                errors = int(suite.get('errors', 0))
+                skipped = int(suite.get('skipped',
+                                        0)) + (1 if outcome == 'skipped' else 0)
+                total_time = float(suite.get('time', 0.0)) + duration
+
+                # Append the new testcase
+                suite.append(testcase)
+
+            except Exception as e:
+                print_warning(
+                    f"Failed to parse existing merged file, creating new one: {e}"
+                )
+                # Create new merged file
+                root = ET.Element('testsuites')
+                suite = ET.SubElement(root, 'testsuite')
+                suite.set('name', 'Merged Test Suite')
+                suite.append(testcase)
+
+                tests = 1
+                failures = 1 if outcome == 'failed' else 0
+                errors = 0
+                skipped = 1 if outcome == 'skipped' else 0
+                total_time = duration
+                tree = ET.ElementTree(root)
+        else:
+            # Create new merged file
+            root = ET.Element('testsuites')
+            suite = ET.SubElement(root, 'testsuite')
+            suite.set('name', 'Merged Test Suite')
+            suite.append(testcase)
+
+            tests = 1
+            failures = 1 if outcome == 'failed' else 0
+            errors = 0
+            skipped = 1 if outcome == 'skipped' else 0
+            total_time = duration
+            tree = ET.ElementTree(root)
+
+        # Update suite attributes
+        suite.set('tests', str(tests))
+        suite.set('failures', str(failures))
+        suite.set('errors', str(errors))
+        suite.set('skipped', str(skipped))
+        suite.set('time', f'{total_time:.3f}')
+        suite.set('timestamp', datetime.datetime.now().isoformat())
+
+        # Write atomically using a temporary file
+        temp_file = merged_file + '.tmp'
+        try:
+            ET.indent(tree, space='  ')  # Pretty print (Python 3.9+)
+        except AttributeError:
+            pass
+
+        tree.write(temp_file, encoding='utf-8', xml_declaration=True)
+
+        # Atomic rename (on most systems)
+        if os.path.exists(merged_file):
+            os.replace(temp_file, merged_file)  # Atomic on POSIX
+        else:
+            os.rename(temp_file, merged_file)
 
 
 # Store report keys for accessing test phase reports
@@ -2798,31 +2944,6 @@ def pytest_runtest_teardown(item):
         report = outcome.get_result()
         if report:
             item.stash[_teardown_report_key] = report
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config):
-    """
-    Configure hook to initialize per-case junit manager.
-    """
-    save_per_case = config.getoption("--save-per-case-junit", default=False)
-    output_dir = config.getoption("--output-dir", default=None)
-
-    if save_per_case and output_dir:
-        per_case_dir = os.path.join(output_dir, "per_case_junit")
-        os.makedirs(per_case_dir, exist_ok=True)
-
-        config._per_case_junit_manager = {
-            'enabled': True,
-            'per_case_dir': per_case_dir,
-            'output_dir': output_dir,
-            'test_cases': [],
-        }
-        print_info(
-            f"Per-case junit reporting enabled. Reports will be saved to: {per_case_dir}"
-        )
-    else:
-        config._per_case_junit_manager = {'enabled': False}
 
 
 @pytest.hookimpl(trylast=True)
