@@ -305,7 +305,9 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (Exception e) {
             def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated")
             if (isRerunFailed) {
-                echo "The tests still failed after rerun attempt."
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    error "Isolated tests failed after rerun attempt"
+                }
                 rerunFailed = true
             }
         } finally {
@@ -2087,7 +2089,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (Exception e) {
                     def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine, "results.xml", "regular")
                     if (isRerunFailed) {
-                        echo "The tests still failed after rerun attempt."
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            error "Regular tests failed after rerun attempt"
+                        }
                         rerunFailed = true
                     }
                 }
