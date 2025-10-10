@@ -3,6 +3,8 @@ ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.08-py3
 ARG TRITON_BASE_TAG=25.08-py3
+ARG BASE_TAG_12_9=25.06-py3
+ARG TRITON_BASE_TAG_12_9=25.06-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -75,6 +77,8 @@ RUN bash ./install.sh --opencv && bash ./install.sh --protobuf && rm install.sh
 # Rename pytorch_triton package to triton
 RUN if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+    elif [ ! -d /usr/local/lib/python3.12/dist-packages/pytorch_triton-3.3.1+gitc8757738.dist-info ]; then \
+        echo "pytorch_triton directory not found, skipping rename operation"; \
     else \
         cd /usr/local/lib/python3.12/dist-packages/ && \
         ls -la | grep pytorch_triton && \
