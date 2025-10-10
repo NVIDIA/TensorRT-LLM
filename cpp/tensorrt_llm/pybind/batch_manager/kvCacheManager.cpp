@@ -344,7 +344,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
         // ===== hstu modification start =====
-        .def("add_sequence_with_eviction", &BaseKVCacheManager::addSequenceWithEviction)
+        .def("add_sequence_with_eviction", &BaseKVCacheManager::addSequenceWithEviction,
+            py::arg("requestId"), py::arg("start_pos"), py::arg("length"), py::arg("beamWidth"), py::arg("llmRequest"),
+            py::arg("freezedIdGroup") = std::unordered_set<int>())
         .def("offload_sequence", &BaseKVCacheManager::offloadSequence)
         .def("get_num_tokens_cached", &BaseKVCacheManager::getNumTokensCached)
         .def("get_cached_start_position", &BaseKVCacheManager::getCacheStartPos)

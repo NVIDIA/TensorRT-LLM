@@ -601,13 +601,13 @@ BlockPtr BlockManager::getFreeBlock(
 
 // ===== hstu modification start =====
 LlmRequest::RequestIdType BlockManager::getRequestIdToEvict(
-    OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup) const
+    std::unordered_set<int> freezedIdGroup) const
 {
-    if (!freezedIdGroup.has_value())
+    if (freezedIdGroup.size() == 0)
         return mSeqLRUList.back();
     
     for (auto it = std::rbegin(mSeqLRUList); it != std::rend(mSeqLRUList); ++it) {
-        if (freezedIdGroup->find(*it) != freezedIdGroup->end())
+        if (freezedIdGroup.find((SizeType32)*it) != freezedIdGroup.end())
             continue;
         return *it;
     }
@@ -1824,8 +1824,7 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 // ===== hstu modification start =====
 void KVCacheManager::addSequenceWithEviction(
     RequestIdType requestId, SizeType32 start_pos, SizeType32 length, SizeType32 beamWidth, 
-    OptionalRef<std::unordered_set<SizeType32>> freezedIdGroup,
-    OptionalRef<LlmRequest> llmRequest)
+    OptionalRef<LlmRequest> llmRequest, std::unordered_set<int> freezedIdGroup)
 {
     TLLM_CHECK_WITH_INFO(length <= mMaxBlocksPerSeq * mTokensPerBlock, 
         "Do not accept delta length %d, %d x %d.", length, mMaxBlocksPerSeq, mTokensPerBlock);
