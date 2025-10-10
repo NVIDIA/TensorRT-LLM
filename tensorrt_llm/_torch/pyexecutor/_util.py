@@ -10,7 +10,7 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
+from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SpeculativeConfig,
                                           TorchLlmArgs)
@@ -58,7 +58,7 @@ class KvCacheCreator:
         tokens_per_block: int,
         max_seq_len: int,
         max_batch_size: int,
-        kv_cache_config: trtllm.KvCacheConfig,
+        kv_cache_config: KvCacheConfig,
         pytorch_backend_config: PyTorchConfig,
         speculative_config: SpeculativeConfig,
     ):
@@ -790,7 +790,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
                         max_seq_len: int, mm_encoder_only: bool,
                         speculative_config: SpeculativeConfig,
                         decoding_config: trtllm.DecodingConfig,
-                        kv_cache_config: trtllm.KvCacheConfig):
+                        kv_cache_config: KvCacheConfig):
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,

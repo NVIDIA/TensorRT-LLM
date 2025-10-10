@@ -17,7 +17,7 @@ from tensorrt_llm._utils import mpi_disabled, nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
-                                            FinishReason, KvCacheConfig)
+                                            FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
     DecoderInputBuffers, add_new_tokens_to_requests, make_decoding_batch_input)
@@ -25,6 +25,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
                                                     DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
