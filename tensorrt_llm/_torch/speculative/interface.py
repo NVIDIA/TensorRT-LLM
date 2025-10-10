@@ -110,13 +110,18 @@ class SpeculativeDecodingMode(IntEnum):
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
-        chunked context requests at the kernel level. Required for
-        any spec dec mode that uses the SpecExecutor.
+        chunked context requests at the kernel level.
         """
 
         if self.use_one_engine():
             # 1-model has separate logic for handling draft tokens
             return False
+
+        if issubclass(attention_backend,
+                      TrtllmAttention) and self.is_mtp_eagle():
+            # TRTLLM MLA does not work with the chunked context mode.
+            return False
+
         return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 

@@ -154,13 +154,25 @@ class SamplingParams:
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
         use_beam_search (bool): Whether to use beam search. Defaults to False.
 
-        top_k (int, optional): Controls number of logits to sample from. None means using C++ runtime default 0, i.e., all logits. Defaults to None.
-        top_p (float, optional): Controls the top-P probability to sample from. None means using C++ runtime default 0.f. Defaults to None.
+        top_k (int, optional): Controls number of logits to sample from. Can assume non-negative values, where 0 means 'all logits'. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If temperature > 0 and/or top_p < 1 are specified, sampling will proceed accordingly and top_k will default to top_k = 0.
+            Setting top_k = 1 results in greedy sampling.
+        top_p (float, optional): Controls the top-P probability to sample from. Can have values between 0 and 1. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If temperature > 0 and/or top_k > 1 are specified, sampling will proceed accordingly and top_p will default to top_p = 1.
+            Setting top_p = 0 should result in greedy sampling, but is currently disallowed in the backend.
         top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.
         top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
         top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
         seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
-        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. None means using C++ runtime default 1.0f. Defaults to None.
+        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values >= 0.f. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If top_p < 1 and/or top_k > 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.
+            Setting temperature = 0 results in greedy sampling.
         min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
         beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
@@ -296,11 +308,19 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
-        if self.best_of < self.n:
+        if self.top_p is not None and (self.top_p < 0 or self.top_p > 1):
+            raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
+        if self.top_k is not None and self.top_k < 0:
+            raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.temperature is not None and self.temperature < 0:
+            raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
+
+        if self.best_of is not None and self.best_of < self.n:
             raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
 
         if (
-            self.best_of > 1
+            self.best_of is not None
+            and self.best_of > 1
             and self._greedy_decoding
             and not os.environ.get("TLLM_ALLOW_N_GREEDY_DECODING", None)
         ):
@@ -324,12 +344,25 @@ class SamplingParams:
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
+    # NB: Static, because downstream code only holds instances of
+    #     bindings.SamplingConfig (not SamplingParams).
+    @staticmethod
+    def params_imply_greedy_decoding(
+        *, temperature: Optional[float], top_p: Optional[float], top_k: Optional[int]
+    ):
+        return (
+            (temperature is None and top_p is None and top_k is None)
+            or top_k == 1
+            or top_p == 0.0
+            or temperature == 0
+        )
+
     @property
     def _greedy_decoding(self) -> bool:
-        return (
-            not self.use_beam_search
-            and (self.top_k is None or self.top_k == 1)
-            and (self.top_p is None or self.top_p == 0.0)
+        return not self.use_beam_search and self.params_imply_greedy_decoding(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
         )
 
     @property

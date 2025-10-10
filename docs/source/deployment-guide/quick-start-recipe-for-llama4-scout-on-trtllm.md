@@ -51,7 +51,7 @@ Note:
 
 If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
 
-### Creating the TRT-LLM Server config
+### Creating the TensorRT LLM Server config
 
 We create a YAML configuration file /tmp/config.yml for the TensorRT LLM Server and populate it with the following recommended performance settings.
 
@@ -68,15 +68,14 @@ kv_cache_config:
 EOF
 ```
 
-### Launch the TRT-LLM Server
+### Launch the TensorRT LLM Server
 
-Below is an example command to launch the TRT-LLM server with the Llama-4-Scout-17B-16E-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
+Below is an example command to launch the TensorRT LLM server with the Llama-4-Scout-17B-16E-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
 
 ```shell
 trtllm-serve nvidia/Llama-4-Scout-17B-16E-Instruct-FP8 \
     --host 0.0.0.0 \
     --port 8000 \
-    --backend pytorch \
     --max_batch_size 1024 \
     --max_num_tokens 2048 \
     --max_seq_len 2048 \
@@ -105,10 +104,6 @@ These options are used directly on the command line when you start the `trtllm-s
 
 * **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 * **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
-
-#### `--backend pytorch`
-
-&emsp;**Description:** Tells TensorRT LLM to use the **pytorch** backend.
 
 #### `--max_batch_size`
 
@@ -191,7 +186,7 @@ curl -s -o /dev/null -w "Status: %{http_code}\n" "http://localhost:8000/health"
 
 When the `Status: 200` code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.
 
-After the TRT-LLM server is set up and shows Application startup complete, you can send requests to the server.
+After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.
 
 ```shell
 curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -d '{
@@ -202,7 +197,7 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -
 }'
 ```
 
-Here is an example response, showing that the TRT-LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.
+Here is an example response, showing that the TensorRT LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.
 
 ```json
 {"id":"cmpl-bc1393d529ce485c961d9ffee5b25d72","object":"text_completion","created":1753843963,"model":"$MODEL","choices":[{"index":0,"text":" New York is a state located in the northeastern United States. It is bordered by","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
