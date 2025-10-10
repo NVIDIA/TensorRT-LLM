@@ -379,6 +379,8 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
+                                             False),
             )
 
             if self.has_custom_lm_head:
@@ -955,6 +957,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                         module, module_name, module_weights)
 
                 elif hasattr(module, 'load_weights'):
+                    if "linear_attn.conv1d" in name:
+                        module_weights['weight'] = module_weights[
+                            'weight'].squeeze(dim=1)
                     module.load_weights(weights=[module_weights])
                 else:
                     for n, p in module._parameters.items():

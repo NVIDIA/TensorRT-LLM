@@ -181,6 +181,11 @@ static auto makeTmaShapeStrideAbc(
     // Alternate layouts (MajorMn and BlockMajorK) do not apply to matrixC
     if (matrixType != MatrixType::MatrixC)
     {
+        // When using 2CTA MMA, we only need to load half of the tile in each CTA for B.
+        if (matrixType == MatrixType::MatrixB && tileShape[1] > 1 && options.mClusterDimX == 2)
+        {
+            tileShape[1] /= 2;
+        }
         gemm::MatrixLayout layout = (matrixType == MatrixType::MatrixA) ? options.mLayoutA : options.mLayoutB;
         // Note, only the weights support non MajorK layouts
         if (layout == gemm::MatrixLayout::MajorMn)
@@ -457,7 +462,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         {
             tg::Dtype const dTypeSf = (options.mDtypeB == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
-            if (batchedGemm::doesRouteImplUseTma(options.mRouteImpl))
+            if (batchedGemm::doesRouteImplUseTma(options.mRouteSfsImpl.value()))
             {
 
                 // The input is NOT padded:
@@ -477,7 +482,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
                     tileShapesSfB, const_cast<void*>(dSfB),
                     /*doSwizzle*/ true);
             }
-            else if (batchedGemm::doesRouteImplUseNoRoute(options.mRouteImpl))
+            else if (batchedGemm::doesRouteImplUseNoRoute(options.mRouteSfsImpl.value()))
             {
 
                 // The input is padded:
@@ -544,7 +549,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         {
             tg::Dtype const dTypeSf = (options.mDtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
-            if (options.mRouteImpl == batchedGemm::RouteImpl::NoRoute)
+            if (options.mRouteSfsImpl.value() == batchedGemm::RouteImpl::NoRoute)
             {
 
                 // The input is padded:

@@ -222,7 +222,7 @@ protected:
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && ANY_FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100) && ANY_FP4;
         return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -253,7 +253,7 @@ protected:
         assert(mBufferManager);
 
         int sm = getSMVersion();
-        if (sm >= 100 && sm < 120)
+        if (sm >= 100)
         {
             mDeviceMinimumAlignment
                 = std::max(MINIMUM_ALIGNMENT_CONST, int64_t(WEIGHT_ELEM_PER_BYTE * 32 / sizeof(WeightStorage)));
@@ -1690,7 +1690,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
         bool is_finalize_fusion = gemm2.epilogue_fusion_type
             == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
-        bool should_be_deterministic = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+        bool should_be_deterministic = !is_finalize_fusion || mK < 3;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);

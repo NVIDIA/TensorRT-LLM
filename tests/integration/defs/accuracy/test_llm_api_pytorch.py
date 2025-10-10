@@ -31,7 +31,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper)
+                        skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness)
 
@@ -1403,6 +1403,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
+    @skip_ray
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -1903,13 +1904,14 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,enable_lm_head_tp_in_adp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             #  Use a larger batch_size to speed up the tests
             pytest.param(8,
                          1,
                          4,
                          3,
+                         False,
                          False,
                          False,
                          True,
@@ -1923,6 +1925,31 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          3,
                          False,
                          False,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "TRTLLM",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         True,
+                         True,
                          True,
                          True,
                          32,
@@ -1934,6 +1961,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          0,
                          True,
                          True,
+                         False,
                          True,
                          True,
                          32,
@@ -1945,6 +1973,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          0,
                          True,
                          True,
+                         False,
                          True,
                          True,
                          32,
@@ -1956,6 +1985,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          0,
                          True,
                          True,
+                         False,
                          True,
                          True,
                          16,
@@ -1967,6 +1997,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          1,
                          True,
                          True,
+                         False,
                          True,
                          True,
                          32,
@@ -1978,6 +2009,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          1,
                          True,
                          True,
+                         False,
                          True,
                          True,
                          8,
@@ -1985,12 +2017,14 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
         ],
         ids=[
-            "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
+            "latency", "latency_trtllmgen", "latency_adp_lmtp",
+            "latency_trtllmgen_adp_lmtp", "throughput", "throughput_tp8",
             "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
-                              attention_dp, cuda_graph, overlap_scheduler,
-                              max_batch_size, moe_backend):
+                              attention_dp, enable_lm_head_tp_in_adp,
+                              cuda_graph, overlap_scheduler, max_batch_size,
+                              moe_backend):
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
                                         or get_sm_version() == 121):
             pytest.skip(
@@ -2016,6 +2050,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
+                 enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
                  speculative_config=mtp_config) as llm:
 
             assert llm.args.moe_config.backend == moe_backend
@@ -2096,42 +2131,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_nvfp4_multi_gpus_corner_case(self):
-        """
-        This test is used to test the corner case of the NVFP4 model.
-        When using the same value for max_seq_len and max_num_tokens, there will be no
-        enough kv block for the dummy requests in CUDA graph warmup when creating
-        the py_executor before estimating kv cache. Then CUDA graph capture will be
-        triggered when estimating kv cache. This may cause some errors.
-        More info in https://nvbugs/5485325.
-        """
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
-                                        dtype="fp8",
-                                        enable_block_reuse=False)
-        pytorch_config = dict(disable_overlap_scheduler=False,
-                              cuda_graph_config=CudaGraphConfig(
-                                  enable_padding=True, max_batch_size=1024),
-                              moe_config=MoeConfig(backend="TRTLLM"))
-
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
-        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
-                 tensor_parallel_size=8,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=8,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=False,
-                 speculative_config=mtp_config,
-                 max_seq_len=5120,
-                 max_num_tokens=5120) as llm:
-
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
+    @skip_pre_blackwell
     def test_nvfp4_multi_gpus_corner_case(self):
         """
         This test is used to test the corner case of the NVFP4 model.
