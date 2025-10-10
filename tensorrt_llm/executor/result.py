@@ -1,7 +1,7 @@
 import asyncio
 import json
-import time
 import threading
+import time
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue

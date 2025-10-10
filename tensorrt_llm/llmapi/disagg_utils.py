@@ -45,7 +45,8 @@ class ConditionalDisaggConfig():
 
 @dataclass
 class ObservabilityConfig():
-    otlp_traces_endpoint: Optional[str] = None # Target URL to which OpenTelemetry traces will be sent
+    otlp_traces_endpoint: Optional[
+        str] = None  # Target URL to which OpenTelemetry traces will be sent
 
 
 class MinimalInstances:
