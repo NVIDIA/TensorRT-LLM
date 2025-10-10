@@ -23,7 +23,7 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
-                                              extract_cluster_config,
+                                              extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -159,7 +159,7 @@ def launch_server(host: str,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
                   server_role: Optional[ServerRole] = None,
-                  cluster_config: Optional[DisaggClusterConfig] = None):
+                  disagg_cluster_config: Optional[DisaggClusterConfig] = None):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -181,7 +181,7 @@ def launch_server(host: str,
                           model=model,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg,
-                          cluster_config=cluster_config)
+                          disagg_cluster_config=disagg_cluster_config)
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -383,25 +383,27 @@ def serve(
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    # Specify cluster config in config file or through command line "--disagg_cluster_uri",
+    # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
     # but disagg_cluster_uri takes precedence over cluster uri in config file
-    cluster_config = llm_args.pop("cluster", None)
-    if cluster_config:
-        cluster_config = extract_cluster_config(cluster_config,
-                                                disagg_cluster_uri)
+    disagg_cluster_config = llm_args.pop("disagg_cluster", None)
+    if disagg_cluster_config:
+        disagg_cluster_config = extract_disagg_cluster_config(
+            disagg_cluster_config, disagg_cluster_uri)
     elif disagg_cluster_uri:
-        cluster_config = DisaggClusterConfig(cluster_uri=disagg_cluster_uri)
+        disagg_cluster_config = DisaggClusterConfig(
+            cluster_uri=disagg_cluster_uri)
 
-    # server_role is required when metadata_server_cfg or cluster_config/disagg_cluster_uri is provided
-    if metadata_server_cfg is not None or cluster_config is not None:
-        assert server_role is not None, "server_role is required when metadata_server_cfg or cluster_config is provided"
+    if metadata_server_cfg is not None or disagg_cluster_config is not None:
+        assert (
+            server_role is not None
+        ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
         try:
             server_role = ServerRole[server_role.upper()]
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
     launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  cluster_config)
+                  disagg_cluster_config)
 
 
 @click.command("mm_embedding_serve")

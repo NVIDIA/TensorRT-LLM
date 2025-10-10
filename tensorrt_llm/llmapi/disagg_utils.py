@@ -68,7 +68,7 @@ class DisaggServerConfig():
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
-    cluster_config: Optional[DisaggClusterConfig] = None
+    disagg_cluster_config: Optional[DisaggClusterConfig] = None
 
 
 @dataclass
@@ -112,7 +112,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
-                       cluster: Optional[dict] = None,
+                       disagg_cluster: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -134,13 +134,13 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 servers[key] = value
 
     server_configs = []
-    cluster_config = None
+    disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
-    if cluster:
-        cluster_config = extract_cluster_config(cluster)
+    if disagg_cluster:
+        disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
     else:
         server_configs = extract_ctx_gen_cfgs(
             type="ctx", **context_servers) + extract_ctx_gen_cfgs(
@@ -152,7 +152,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
                                 conditional_disagg_config, max_retries,
-                                perf_metrics_max_requests, cluster_config)
+                                perf_metrics_max_requests,
+                                disagg_cluster_config)
 
     return config
 
@@ -240,7 +241,7 @@ def get_server_configs_dict(
     return num_workers, server_dict
 
 
-def extract_cluster_config(
+def extract_disagg_cluster_config(
         cluster_config_dict: Dict[str, Any],
         cluster_uri: Optional[str] = None) -> DisaggClusterConfig:
     """

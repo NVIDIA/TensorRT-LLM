@@ -44,7 +44,7 @@ def disagg_server_config(disagg_cluster_config, router):
     return {
         "hostname": "localhost",
         "port": TEST_PORT,
-        "cluster": disagg_cluster_config,
+        "disagg_cluster": disagg_cluster_config,
         "context_servers": {
             "router": {
                 "type": router
@@ -61,7 +61,7 @@ def disagg_server_config(disagg_cluster_config, router):
 @pytest.fixture
 def worker_config(disagg_cluster_config):
     return {
-        "cluster": disagg_cluster_config,
+        "disagg_cluster": disagg_cluster_config,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {
             "backend": "DEFAULT"

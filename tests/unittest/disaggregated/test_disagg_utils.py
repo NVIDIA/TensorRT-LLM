@@ -35,9 +35,44 @@ def get_yaml_config():
     return config
 
 
+def get_yaml_config_with_disagg_cluster():
+    config = {
+        "hostname": "test_host",
+        "port": 9000,
+        "context_servers": {
+            "max_batch_size": 1,
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+        },
+        "generation_servers": {
+            "router": {
+                "type": "load_balancing",
+                "use_tokens": False,
+            },
+            "max_batch_size": 1,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+        },
+        "disagg_cluster": {
+            "cluster_uri": "http://test_host:9000",
+            "cluster_name": "test_cluster",
+            "minimal_instances": {
+                "context_servers": 2,
+                "generation_servers": 2,
+            },
+            "heartbeat_interval_sec": 1,
+            "inactive_timeout_sec": 2,
+        },
+    }
+    return config
+
+
 @pytest.fixture
-def sample_yaml_config():
-    config = get_yaml_config()
+def sample_yaml_config(request):
+    if request.param == "with_disagg_cluster":
+        config = get_yaml_config_with_disagg_cluster()
+    else:
+        config = get_yaml_config()
     return config
 
 
@@ -59,12 +94,16 @@ def verify_disagg_config(config: DisaggServerConfig):
     assert len(config.server_configs) == 3
 
 
+@pytest.mark.parametrize("sample_yaml_config", ["with_disagg_cluster", ""],
+                         indirect=True)
 def test_parse_disagg_config_file(sample_yaml_file):
     config = parse_disagg_config_file(sample_yaml_file)
     assert isinstance(config, DisaggServerConfig)
     verify_disagg_config(config)
 
 
+@pytest.mark.parametrize("sample_yaml_config", ["with_disagg_cluster", ""],
+                         indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
