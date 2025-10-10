@@ -58,6 +58,36 @@ TargetRanksInfo targetIRanks(
 TargetRanksInfo TargetRanksInfoForDP(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
+/**
+ * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
+ *
+ * This function determines how many blocks should be allocated to a given CP rank when
+ * distributing a total number of blocks across multiple CP ranks.
+ *
+ * @param cpRank The rank (index) of the current CP process. Must be in range [0, cpSize).
+ * @param cpSize The total number of CP ranks/processes in the parallel group.
+ * @param numTotalBlocks The total number of blocks to be distributed across all CP ranks.
+ *
+ * @return The number of blocks allocated to the specified CP rank.
+ */
+int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
+
+/**
+ * @brief Convert a local block index to a global block ID when Context Parallelism (CP) is enabled.
+ *
+ * This function maps a local block index (within a specific CP rank) to its corresponding
+ * global block ID across all CP ranks. It supports two distribution strategies controlled
+ * by the environment variable TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP.
+ *
+ * @param localBlockIdx The local block index within the current CP rank (0-based).
+ * @param cpSize The total number of CP ranks in the parallel group.
+ * @param cpRank The rank of the current CP process. Must be in range [0, cpSize).
+ * @param numTotalBlocks The total number of blocks distributed across all CP ranks.
+ *
+ * @return The global block ID corresponding to the local block index.
+ */
+int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks);
+
 void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
     runtime::ITensor::SharedPtr* outputBlocks, int outputBlockNum, int selfRank,
