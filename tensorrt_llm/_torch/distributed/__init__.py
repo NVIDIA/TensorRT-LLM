@@ -1,8 +1,10 @@
 from tensorrt_llm.functional import AllReduceFusionOp
 
 from .communicator import Distributed, MPIDist, PPComm, TorchDist
-from .ops import (AllReduce, AllReduceParams, AllReduceStrategy, MoEAllReduce,
-                  MoEAllReduceParams, allgather, alltoall_helix, reducescatter,
+from .ops import (AllReduce, AllReduceParams, AllReduceStrategy,
+                  FlashInferAllReduceParams,
+                  FlashInferVLLMAllReduce, MoEAllReduce, MoEAllReduceParams,
+                  allgather, alltoall_helix, reducescatter,
                   userbuffers_allreduce_finalize)
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "PPComm",
     "MPIDist",
     "Distributed",
+    "FlashInferAllReduceParams",
+    "FlashInferVLLMAllReduce",
 ]
