@@ -32,6 +32,8 @@ llm_perf_sanity:
   # Ministral-8B
   - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-pytorch-bfloat16-input_output_len:500,2000]
+  # gpt_oss_20b_fp4
+  - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-input_output_len:512,512]
 
   # Test list validation
   - test_list_validation.py::test_list_validation
@@ -115,8 +117,6 @@ llm_perf_sanity:
   tests:
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-pytorch-float16-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:5250,8250-gpus:2]
-  - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:5250,8250-gpus:2]
 
 # Tests for systems with 4+ GPUs
 - condition:
