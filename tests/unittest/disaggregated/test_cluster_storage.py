@@ -132,7 +132,7 @@ class TestClusterStorage:
     async def test_unwatch(self, storage_server_client, storage_client):
         assert await storage_server_client.watch("test_key")
         await storage_server_client.unwatch("test_key")
-        with pytest.raises(ValueError):
+        with pytest.raises(KeyError):
             await storage_server_client.unwatch("test_key")
 
     @pytest.mark.threadleak(enabled=False)
@@ -210,8 +210,7 @@ class TestHttpClusterStorage(TestClusterStorage):
 
 
 class TestEtcdClusterStorage(TestClusterStorage):
-    # Disable this test until Etcd functionality is ready.
-    __test__ = False
+    __test__ = True
 
     @pytest.fixture(scope="class")
     def storage_server(self):
