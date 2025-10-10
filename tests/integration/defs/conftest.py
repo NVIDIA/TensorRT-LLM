@@ -2753,6 +2753,10 @@ def _save_individual_junit_report(item, manager):
     outcome = 'passed'
 
     # Collect information from all test phases
+    stdout_sections = []
+    stderr_sections = []
+    all_sections = []  # Collect all history sections
+
     for report_key, phase in [(_setup_report_key, 'setup'),
                               (_call_report_key, 'call'),
                               (_teardown_report_key, 'teardown')]:
@@ -2760,6 +2764,43 @@ def _save_individual_junit_report(item, manager):
             report = item.stash.get(report_key, None)
             if report:
                 total_duration += report.duration
+
+                # Collect all sections from report (includes captured output and history)
+                if hasattr(report, 'sections') and report.sections:
+                    for section_name, section_content in report.sections:
+                        if section_content:
+                            all_sections.append(
+                                f'--- {phase} {section_name} ---\n{section_content}'
+                            )
+                            # Categorize sections
+                            if 'stdout' in section_name.lower(
+                            ) or 'Captured stdout' in section_name:
+                                stdout_sections.append(
+                                    f'--- {phase} {section_name} ---\n{section_content}'
+                                )
+                            elif 'stderr' in section_name.lower(
+                            ) or 'Captured stderr' in section_name:
+                                stderr_sections.append(
+                                    f'--- {phase} {section_name} ---\n{section_content}'
+                                )
+                            elif 'log' in section_name.lower(
+                            ) or 'Captured log' in section_name:
+                                stdout_sections.append(
+                                    f'--- {phase} {section_name} ---\n{section_content}'
+                                )
+
+                # Fallback to direct capture attributes if sections is empty
+                if not hasattr(report, 'sections') or not report.sections:
+                    if hasattr(report, 'capstdout') and report.capstdout:
+                        stdout_sections.append(
+                            f'--- {phase} stdout ---\n{report.capstdout}')
+                    if hasattr(report, 'capstderr') and report.capstderr:
+                        stderr_sections.append(
+                            f'--- {phase} stderr ---\n{report.capstderr}')
+                    if hasattr(report, 'caplog') and report.caplog:
+                        stdout_sections.append(
+                            f'--- {phase} log ---\n{report.caplog}')
+
                 if report.outcome == 'failed':
                     outcome = 'failed'
                     # Add failure element
@@ -2775,6 +2816,44 @@ def _save_individual_junit_report(item, manager):
                         skipped.set('message', str(report.longrepr))
 
     testcase.set('time', f'{total_duration:.3f}')
+
+    # Add captured output to XML with complete history
+    if all_sections:
+        # Include all sections with complete history information
+        system_out = ET.SubElement(testcase, 'system-out')
+        system_out.text = '\n\n'.join(all_sections)
+    elif stdout_sections:
+        # Fallback to categorized stdout if no sections
+        system_out = ET.SubElement(testcase, 'system-out')
+        system_out.text = '\n\n'.join(stdout_sections)
+
+    if stderr_sections:
+        system_err = ET.SubElement(testcase, 'system-err')
+        system_err.text = '\n\n'.join(stderr_sections)
+
+    # Add properties element for additional metadata
+    properties = ET.SubElement(testcase, 'properties')
+
+    # Add test metadata as properties
+    prop = ET.SubElement(properties, 'property')
+    prop.set('name', 'nodeid')
+    prop.set('value', item.nodeid)
+
+    prop = ET.SubElement(properties, 'property')
+    prop.set('name', 'outcome')
+    prop.set('value', outcome)
+
+    if hasattr(item, 'location'):
+        prop = ET.SubElement(properties, 'property')
+        prop.set('name', 'location')
+        prop.set('value', f'{item.location[0]}::{item.location[1]}')
+
+    # Add markers as properties
+    if hasattr(item, 'own_markers'):
+        for marker in item.own_markers:
+            prop = ET.SubElement(properties, 'property')
+            prop.set('name', f'marker.{marker.name}')
+            prop.set('value', str(marker.args) if marker.args else '')
 
     # Set testsuite statistics
     testsuite.set('time', f'{total_duration:.3f}')
