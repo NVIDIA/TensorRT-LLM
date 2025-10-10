@@ -364,6 +364,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -374,6 +375,7 @@ class TransformerBlock(DecoderLayer):
                                 hidden_states,
                                 attn_metadata,
                                 residual=residual,
+                                lora_params=lora_params,
                                 **kwargs)
         x, residual = self.post_attention_layernorm(x, residual)
 
@@ -393,6 +395,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -405,6 +408,7 @@ class TransformerBlock(DecoderLayer):
             attn_metadata,
             residual=residual,
             all_reduce_params=AllReduceParams(enable_allreduce=False),
+            lora_params=lora_params,
             **kwargs)
 
         x, residual = self.allreduce(
@@ -453,6 +457,7 @@ class TransformerBlock(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.is_tp:
@@ -464,6 +469,7 @@ class TransformerBlock(DecoderLayer):
                         attn_metadata,
                         residual,
                         spec_metadata=spec_metadata,
+                        lora_params=lora_params,
                         **kwargs)
 
 
@@ -526,6 +532,7 @@ class Transformer(DecoderModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -543,6 +550,7 @@ class Transformer(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         return hidden_states
