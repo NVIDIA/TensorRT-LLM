@@ -77,7 +77,7 @@ def enforce_single_worker(monkeypatch):
             False, "FLASHINFER", False, False, False, False, True, False, False,
             False
         ],
-        [True, "TRTLLM", False, True, True, True, True, True, True, True, True],
+        [True, "TRTLLM", False, True, True, True, True, True, True, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
