@@ -2232,7 +2232,6 @@ class PyTorchModelEngine(ModelEngine):
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
-        logger.info("KM Executing forward")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -2270,14 +2269,8 @@ class PyTorchModelEngine(ModelEngine):
                                               gather_context_logits)
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager) as padded_requests:
-
-            logger.info(
-                f"KM self.cuda_graph_runner.enabled: {self.cuda_graph_runner.enabled}"
-            )
-
             maybe_graph, maybe_attn_metadata, maybe_spec_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests)
-            logger.info(f"KM maybe_graph: {maybe_graph}")
             if maybe_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -2297,7 +2290,6 @@ class PyTorchModelEngine(ModelEngine):
             if not maybe_graph:
                 # Fallback to eager execution if graph was not used
                 with MoeLoadBalancerIterContext(moe_load_balancer):
-                    logger.info("KM Executing forward step without a graph")
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
             else:
@@ -2311,7 +2303,6 @@ class PyTorchModelEngine(ModelEngine):
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
 
-                    logger.info("KM Capturing the graph of a forward step")
                     self.cuda_graph_runner.capture(batch_size,
                                                    capture_forward_fn, inputs)
 
@@ -2320,34 +2311,14 @@ class PyTorchModelEngine(ModelEngine):
                     outputs = self.cuda_graph_runner.replay(batch_size, inputs)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        logger.info("KM Replaying the graph which was captured")
                         outputs = self.cuda_graph_runner.replay(
                             batch_size, inputs)
 
-            # We have inserted this event at the end of the forward pass regardless of
-            # whether the graph was captured/replayed or eager mode execution. KVBM
-            # then waits on this event in a different cuda stream for the event to
-            # be triggered. This is the whole point of cuda events and cuda streams.
-            # One stream can await on work to be done on a different stream without
-            # blocking work on the first stream.
             if self.forward_pass_callback is not None:
-                # now we have to notify kvbm to await on this event or callback.
-                # 1. record the event, 2. immediately call the callable attached to the event
                 self.forward_pass_callback.event.record()
-                logger.info(
-                    f"KM forward_pass_event recorded: {self.forward_pass_callback.event}"
-                )
-                self.forward_pass_callback.test("end_of_forward_pass")
                 self.forward_pass_callback.callback()
-            else:
-                # TODO: take this out for check in
-                logger.info(
-                    "KM forward_pass_callback is NOT defined and will not be called."
-                )
 
-            logger.info("KM Post processing logits")
             self._execute_logit_post_processors(scheduled_requests, outputs)
-            logger.info("KM Did we break the forward pass?")
 
             return outputs
 

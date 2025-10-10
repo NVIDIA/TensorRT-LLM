@@ -477,15 +477,8 @@ def create_py_executor(
             forward_pass_callback = connector_worker.register_forward_pass_callback(
             )
             if forward_pass_callback:
-                logger.info(
-                    "KM Worker class has a register_forward_pass_callback() method. Calling..."
-                )
                 model_engine.register_forward_pass_callback(
                     forward_pass_callback)
-            else:
-                logger.info(
-                    "KM Worker class does NOT have a register_forward_pass_callback() method. Skipping..."
-                )
 
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)
