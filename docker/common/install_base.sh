@@ -102,9 +102,6 @@ install_python_rockylinux() {
     zlib-devel \
     xz-devel \
     sqlite-devel \
-    zeromq-devel \
-    hwloc \
-    hwloc-devel \
     -y
   echo "Installing Python ${PYTHON_VERSION}..."
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
@@ -137,7 +134,11 @@ install_gcctoolset_rockylinux() {
     openmpi-devel \
     pigz \
     rdma-core-devel \
+    -y
+  dnf install \
     zeromq-devel \
+    hwloc \
+    hwloc-devel \
     -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
