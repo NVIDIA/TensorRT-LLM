@@ -1578,7 +1578,6 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         && (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2
             || use_v1_for_mrope))
     {
-        TLLM_LOG_DEBUG("Using v1 KVcache update kernel");
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         return;
     }
@@ -1604,7 +1603,6 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     default:
         // Fall back to v1 kernel.
         // GPTJ Rotary embedding needs at least two elements per thread.
-        TLLM_LOG_DEBUG("Using v1 KVcache update kernel");
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         break;
     }
@@ -1722,7 +1720,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
     int const batch_idx = blockIdx.z;
     int const kv_head_idx = blockIdx.y;
 
-    int const num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
+    int const total_num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
 
     int const sparse_start_idx = params.sparse_kv_offsets[batch_idx];
     int const sparse_end_idx = params.sparse_kv_offsets[batch_idx + 1];
@@ -1735,15 +1733,14 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
     uint4* k_smem = smem;
     uint4* v_smem = k_smem + tokens_per_block * VECS_PER_HEAD;
 
-    for (int token_block_offset = blockIdx.x * tokens_per_block; token_block_offset < num_sparse_tokens;
-         token_block_offset += gridDim.x * tokens_per_block)
+    for (int token_block_offset = 0; token_block_offset < num_sparse_tokens; token_block_offset += tokens_per_block)
     {
         int const sparse_token_offset = token_block_offset + threadIdx.y;
 
         if (sparse_token_offset < num_sparse_tokens)
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
-            int const sparse_idx_offset = kv_head_idx * num_sparse_kv_tokens + global_sparse_idx;
+            int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
 
             int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
 
@@ -1768,7 +1765,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
         if (sparse_token_offset < num_sparse_tokens)
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
-            int const sparse_idx_offset = kv_head_idx * num_sparse_kv_tokens + global_sparse_idx;
+            int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
 
             int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
             int const dst_token_idx = sparse_token_offset;
@@ -1805,6 +1802,8 @@ void kernelSparseDispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> param
     dim3 block(32, 32); // x: head vectors, y: tokens
 
     int smem_size = 2 * block.y * VECS_PER_HEAD * sizeof(uint4);
+
+    // grid.x is always 1 to avoid data races
     dim3 grid(1, params.kv_head_num, params.batch_size);
 
     updateSparseKvCacheAfterFmha<T, TCache, BLOCK_SIZE, Dh, KVCacheBuffer><<<grid, block, smem_size, stream>>>(params);

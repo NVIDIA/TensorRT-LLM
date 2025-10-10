@@ -166,7 +166,7 @@ class CudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
-class SparseAttentionBaseConfig(BaseModel):
+class SparseAttentionBaseConfig(StrictBaseModel):
     """
     Configuration for sparse attention.
     """
@@ -1160,9 +1160,9 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     AutoDecodingConfig,
 ]]
 
-SparseAttentionConfig: TypeAlias = Optional[Union[
+SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
-]]
+]
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
