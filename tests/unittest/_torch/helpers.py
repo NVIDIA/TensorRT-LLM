@@ -3,6 +3,11 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner, CUDAGraphRunnerConfig)
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.mapping import Mapping
+
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -164,42 +169,21 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-class MockPytorchBackendConfig:
-
-    def __init__(self, use_cuda_graph, cuda_graph_padding_enabled):
-        self.use_cuda_graph = use_cuda_graph
-        self.cuda_graph_padding_enabled = cuda_graph_padding_enabled
-
-
-class MockEngine:
-    """A replacement for SimpleNamespace that supports weak references."""
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-def create_mock_engine(batch_size: int):
-
-    class MockSpecConfig:
-
-        class SpecDecMode:
-
-            def needs_kv_cache_recompute(self):
-                return False
-
-        spec_dec_mode = SpecDecMode()
-
-    return MockEngine(
-        pytorch_backend_config=MockPytorchBackendConfig(
-            use_cuda_graph=True, cuda_graph_padding_enabled=False),
-        _cuda_graph_batch_sizes=[batch_size],
-        _max_cuda_graph_batch_size=batch_size,
+def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
+    config = CUDAGraphRunnerConfig(
+        use_cuda_graph=True,
+        cuda_graph_padding_enabled=False,
+        supported_batch_sizes=[batch_size],
+        max_supported_batch_size=batch_size,
+        max_batch_size=batch_size,
         max_beam_width=1,
-        max_num_tokens=8192,
-        is_spec_decode=False,
-        enable_spec_decode=False,
-        spec_config=MockSpecConfig(),
-        is_draft_model=False,
-        _cuda_graph_mem_pool=None,
-        use_mrope=False,
-    )
+        max_draft_len=0,
+        max_num_tokens=1,
+        use_mrope=use_mrope,
+        spec_config=None,
+        cuda_graph_mem_pool=None,
+        enable_attention_dp=False,
+        mapping=Mapping(),
+        dist=None,
+        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
+    return CUDAGraphRunner(config)

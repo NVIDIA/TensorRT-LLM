@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from parameterized import parameterized
 from test_modeling_llama import Scenario, reduce_llama_config
 from transformers import MllamaConfig
@@ -17,7 +17,6 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_mllama import \
     MllamaForConditionalGeneration
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -420,10 +419,8 @@ class TestMLlama(unittest.TestCase):
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-        graph_runner = None
-        if scenario.use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(
+            1) if scenario.use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
