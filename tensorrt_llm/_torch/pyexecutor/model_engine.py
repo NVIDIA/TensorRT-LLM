@@ -51,7 +51,7 @@ from ..utils import (get_model_extra_attrs,
                      set_torch_compiling, with_model_extra_attrs)
 from .config import PyTorchConfig
 from .config_utils import is_mla
-from .cuda_graph_runner import CUDAGraphRunner
+from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
@@ -336,7 +336,28 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_runner = CUDAGraphRunner(self)
+
+        # Create config and runner
+        cuda_graph_runner_config = CUDAGraphRunnerConfig(
+            use_cuda_graph=pytorch_backend_config.use_cuda_graph,
+            cuda_graph_padding_enabled=pytorch_backend_config.
+            cuda_graph_padding_enabled,
+            cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
+            max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
+            max_beam_width=self.max_beam_width,
+            spec_config=self.spec_config,
+            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            max_num_tokens=self.max_num_tokens,
+            use_mrope=self.use_mrope,
+            original_max_draft_len=self.original_max_draft_len,
+            is_draft_model=self.is_draft_model,
+            enable_attention_dp=self.enable_attention_dp,
+            batch_size=self.batch_size,
+            mapping=self.mapping,
+            dist=self.dist,
+            kv_cache_manager_key=self.kv_cache_manager_key,
+        )
+        self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -1443,16 +1464,16 @@ class PyTorchModelEngine(ModelEngine):
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
-                #   1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
-                #   2) 'requests that already have previous batch': previous iteration's requests.
-                #   3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                #    1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #    2) 'requests that already have previous batch': previous iteration's requests.
+                #    3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 # Therefore, both of self.previous_pos_id_offsets_cuda and self.previous_kv_lens_offsets_cuda are also 3 segments.
-                #   For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
+                #    For 1) 'requests that do not have previous batch': disable overlap scheduler or the first step in the generation server of disaggregated serving.
                 #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to '0' to skip the value changes in _preprocess_inputs.
                 #       Already set to '0' during initialization.
-                #   For 2) 'requests that already have previous batch': enable overlap scheduler.
+                #    For 2) 'requests that already have previous batch': enable overlap scheduler.
                 #       Set their previous_pos_id_offsets and previous_kv_lens_offsets according to new_tokens_lens_device and kv_len_offsets_device.
-                #   For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
+                #    For 3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
                 #       Already set to '0' during initialization.
 
                 num_extend_reqeust_wo_dummy = len(extend_requests) - len(
@@ -2177,10 +2198,19 @@ class PyTorchModelEngine(ModelEngine):
                     return self._forward_step(inputs, gather_ids,
                                               gather_context_logits)
         with self.cuda_graph_runner.pad_batch(
-                scheduled_requests, resource_manager) as padded_requests:
+                scheduled_requests, resource_manager,
+                self.runtime_draft_len) as padded_requests:
 
             maybe_graph, maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_requests, spec_resource_manager)
+                padded_requests,
+                iter_counter=self.iter_counter,
+                enable_spec_decode=self.enable_spec_decode,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_tokens_cuda=self.draft_tokens_cuda
+                if self.is_spec_decode else None,
+                spec_resource_manager=spec_resource_manager,
+            )
             if maybe_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -2215,9 +2245,12 @@ class PyTorchModelEngine(ModelEngine):
                     def capture_postprocess_fn(inputs: Dict[str, Any]):
                         self._postprocess_inputs(inputs)
 
-                    self.cuda_graph_runner.capture(key, capture_forward_fn,
-                                                   inputs,
-                                                   capture_postprocess_fn)
+                    self.cuda_graph_runner.capture(
+                        key,
+                        capture_forward_fn,
+                        inputs,
+                        enable_spec_decode=self.enable_spec_decode,
+                        postprocess_fn=capture_postprocess_fn)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
