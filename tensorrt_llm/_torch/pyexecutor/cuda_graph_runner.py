@@ -309,6 +309,7 @@ class CUDAGraphRunner:
     def pad_batch(self, scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager):
         """Context manager to pad a batch to a graph-compatible size."""
+
         padding_size = self._get_padded_batch(scheduled_requests,
                                               resource_manager)
         try:
