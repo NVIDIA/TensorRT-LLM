@@ -236,7 +236,6 @@ def test_gpt_ib_lad(tritonserver_test_root, test_name, llm_root, model_path,
 @pytest.mark.parametrize("test_name", ["gpt-2b-ib-lora"], indirect=True)
 def test_gpt_2b_ib_lora(tritonserver_test_root, test_name, llm_root, model_path,
                         engine_dir):
-    pytest.fail("Emma test rerun")
     build_model(test_name, llm_root, tritonserver_test_root)
     tokenizer_type = "auto"
     run_shell_command(
