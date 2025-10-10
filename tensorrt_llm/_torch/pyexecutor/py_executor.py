@@ -1967,6 +1967,7 @@ class PyExecutor:
                 # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
+                self.executor_request_queue.canceled_req_ids.remove(req_id)
 
         if self.enable_attention_dp:
             # TODO: revisit the cancel logic of attention dp
