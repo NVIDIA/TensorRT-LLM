@@ -180,7 +180,7 @@ struct alignas(128) SharedMem
         {
             XBuffer x;
             VBuffer v;
-#if !SWAP_AB
+#if !SWAP_AB && CACHE_ELEM_ENUM != 0
             VTBuffer vt;
 #endif
             // @fixme: also put xColMax and xColSum here
@@ -201,7 +201,7 @@ struct alignas(128) SharedMem
     {
         return reusedXVOutSwizzleBuf[i].xv.v;
     }
-#if !SWAP_AB
+#if !SWAP_AB && CACHE_ELEM_ENUM != 0
     __device__ inline VTBuffer& vtBuf(uint32_t i)
     {
         return reusedXVOutSwizzleBuf[i].xv.vt;
@@ -243,7 +243,7 @@ struct alignas(128) SharedMem
     CtaBarrierPair qBar;
     CtaBarrierPair kBar[nbKBuf];
     CtaBarrierPair vBar[nbVBuf];
-#if !SWAP_AB
+#if !SWAP_AB && CACHE_ELEM_ENUM != 0
     CtaBarrierPair vtBar[nbVBuf];
 #endif
     CtaBarrierPair xBar[nbXBuf];
@@ -832,7 +832,7 @@ CUBIN_EXPORT __global__
                 smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #endif
 
-#if !SWAP_AB
+#if !SWAP_AB && CACHE_ELEM_ENUM != 0
                 smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
 #endif
                 smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
@@ -1097,7 +1097,7 @@ CUBIN_EXPORT __global__
         {
             unused(b.consumed.arrive());
         }
-#if !SWAP_AB
+#if !SWAP_AB && CACHE_ELEM_ENUM != 0
         for (auto& b : smem.vtBar)
         {
             unused(b.consumed.arrive());
@@ -1152,7 +1152,7 @@ CUBIN_EXPORT __global__
 #endif
             {
                 arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
-#if !SWAP_AB
+#if !SWAP_AB && CACHE_ELEM_ENUM != 0
                 CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
                 auto& vtBuf = smem.vtBuf(idxVBuf);
                 vtBar.consumed.arrive_and_wait();
@@ -1328,10 +1328,12 @@ CUBIN_EXPORT __global__
                     gmma::wait_group<0>();
                 }
 #else
+#if CACHE_ELEM_ENUM == 2
                 auto const descVTBase = gmma::makeMatDesc(
                     nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
                                             .raw();
                 vtBar.produced.arrive_and_wait();
+#endif
 // if (idxIter == 1 && threadIdx.x == 0) {
 //     printf("vtBuf:\n");
 //     dbg::printArray2D<__nv_fp8_e4m3, true>(vtBuf);
@@ -1346,11 +1348,24 @@ CUBIN_EXPORT __global__
                         auto const descX = addAddr(descXBase,
                             &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
                                 gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
+#if CACHE_ELEM_ENUM == 0
+#pragma unroll
+                        for (uint32_t cachePartIdx = 0; cachePartIdx < cacheHeadNbParts; cachePartIdx++)
+                        {
+                            auto const descV
+                                = addAddr(descVBase, &vBuf[cachePartIdx](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
+                            gmma::mma_async_shmA<MathElem, cacheHeadPartElems, false, true>(
+                                reinterpret_cast<float(&)[exactDiv(cacheHeadPartElems, gmma::instNBase)][2][2]>(
+                                    acc(m, cachePartIdx * exactDiv(cacheHeadPartElems, gmma::instNBase))),
+                                descX, descV, true);
+                        }
+#elif CACHE_ELEM_ENUM == 2
                         auto const descVT = addAddr(
                             descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
                         gmma::mma_async_shmA<MathElem, headElems>(
                             reinterpret_cast<float(&)[exactDiv(headElems, gmma::instNBase)][2][2]>(acc(m, 0)), descX,
                             descVT, true);
+#endif
                     }
                 }
                 gmma::commit_group();
@@ -1413,7 +1428,7 @@ CUBIN_EXPORT __global__
                 }
             }
             unused(xBar.consumed.arrive());
-#if SWAP_AB
+#if SWAP_AB || CACHE_ELEM_ENUM == 0
             unused(vBar.consumed.arrive());
 #else
             unused(vtBar.consumed.arrive());
