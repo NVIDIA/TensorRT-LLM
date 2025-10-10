@@ -28,6 +28,7 @@ cd libfabric
 make install -j$(nproc)
 cd ..
 rm -rf libfabric
+echo "export LD_LIBRARY_PATH=/usr/local/libfabric/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
 
 # install nixl
 ARCH_NAME="x86_64-linux-gnu"

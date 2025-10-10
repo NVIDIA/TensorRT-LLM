@@ -102,6 +102,9 @@ install_python_rockylinux() {
     zlib-devel \
     xz-devel \
     sqlite-devel \
+    libzmq3-dev \
+    hwloc \
+    libhwloc-dev
     -y
   echo "Installing Python ${PYTHON_VERSION}..."
   curl -L ${PYTHON_URL} | tar -zx -C /tmp

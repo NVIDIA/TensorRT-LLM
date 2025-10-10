@@ -16,7 +16,25 @@
    # Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform
    pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-   sudo apt-get -y install libopenmpi-dev libzmq3-dev
+   sudo apt-get -y install libopenmpi-dev
+   
+   # Optional step: Only required for disagg-serving
+   sudo apt-get -y install libzmq3-dev hwloc libhwloc-dev
+   export LIBFABRIC_REPO="https://github.com/ofiwg/libfabric.git"
+   export LIBFABRIC_VERSION="v2.3.0"
+   git clone --depth 1 -b ${LIBFABRIC_VERSION} ${LIBFABRIC_REPO}
+   cd libfabric
+   ./autogen.sh
+   ./configure --prefix=/path/to/install/path \
+        --disable-verbs \
+        --disable-psm3 \
+        --disable-opx \
+        --disable-usnic \
+        --disable-rstream \
+        --enable-efa \
+        --with-cuda=/path/to/cuda \
+        --enable-cuda-dlopen
+    make install -j$(nproc)
    ```
 
    PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell GPUs and SBSA platform. On prior GPUs or Linux x86_64 platform, this extra installation is not required.
