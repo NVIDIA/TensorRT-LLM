@@ -101,7 +101,7 @@ class BuilderConfig(object):
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
-            config['plugin_config'] = self.plugin_config.to_dict()
+            config['plugin_config'] = self.plugin_config.model_dump(mode="json")
         return config
 
 
