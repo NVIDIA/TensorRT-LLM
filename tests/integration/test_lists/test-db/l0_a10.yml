@@ -50,6 +50,8 @@ l0_a10:
   - unittest/llmapi/test_llm_args.py
   # executor
   - unittest/executor/test_rpc.py
+  # trtllm-serve CPU-only
+  - unittest/llmapi/apps/test_tool_parsers.py
 - condition:
     ranges:
       system_gpu_count:
