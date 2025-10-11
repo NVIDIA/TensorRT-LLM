@@ -4,7 +4,6 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
-from tqdm import tqdm
 from transformers import GptOssConfig
 
 from tensorrt_llm._utils import get_sm_version
@@ -22,20 +21,24 @@ from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
+from ..modules.fused_moe import (MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod, TritonFusedMoE,
                                  create_moe)
 from ..modules.fused_moe.routing import (get_cached_perfect_router_logits,
                                          precompute_common_perfect_router_logits
                                          )
 # isort: on
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.gpt_oss_weight_mapper import \
+    GptOssHfWeightMapper
+
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
-                             register_auto_model)
+from .modeling_utils import DecoderModel, register_auto_model
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
@@ -619,16 +622,12 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
-    def load_weights(self, weights: Dict):
-        is_ori_model = True
-        for k, v in weights.items():
-            if 'q_proj' in k:
-                is_ori_model = False
-
-        if is_ori_model:
-            self.load_ori_weights(weights)
-        else:
-            self.load_hf_weights(weights)
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional[BaseWeightMapper] = None):
+        mapper = weight_mapper or GptOssHfWeightMapper()
+        mapper.init_model_and_config(self, self.model_config)
+        super().load_weights(weights, mapper)
 
         for idx, layer in enumerate(
                 self.model.block[:self.config.num_hidden_layers]):
@@ -641,300 +640,3 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = self.model.block[idx + 1].attn.norm
-
-    def load_hf_weights(self, weights: Dict):
-        num_expert = self.config.num_local_experts
-
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
-                continue
-
-            module_weights = {}
-            for k, v in self.hf_params_map.items():
-                name = name.replace(k, v)
-            module_weights = filter_weights(name, weights)
-
-            if isinstance(module, MoE):
-                try:
-                    # For BF16 ckpt.
-                    # Deinterleave for gate and up.
-                    gate_up_weight = module_weights['gate_up_proj']
-                    gate, up = gate_up_weight[:, :, ::2], gate_up_weight[:, :,
-                                                                         1::2]
-                    gate_up_weight = torch.cat([gate, up], dim=-1)
-                    gate_up_bias = module_weights['gate_up_proj_bias']
-                    gate, up = gate_up_bias[:, ::2], gate_up_bias[:, 1::2]
-                    gate_up_bias = torch.cat([gate, up], dim=-1)
-                    moe_weights = {
-                        'gate_up_proj': [
-                            gate_up_weight.to(self.model.dtype)[i, :, :]
-                            for i in range(num_expert)
-                        ],
-                        'down_proj': [
-                            module_weights['down_proj'][i, :, :].to(
-                                self.model.dtype) for i in range(num_expert)
-                        ],
-                        'gate_up_proj.bias':
-                        [gate_up_bias[i, :] for i in range(num_expert)],
-                        'down_proj.bias': [
-                            module_weights['down_proj_bias'][i, :]
-                            for i in range(num_expert)
-                        ]
-                    }
-                except:
-                    # For MXFP4 ckpt.
-                    # Deinterleave for gate and up.
-                    gate_up_weight = module_weights[
-                        'gate_up_proj_blocks'].flatten(-2, -1)
-                    gate_weight, up_weight = gate_up_weight[:, ::
-                                                            2, :], gate_up_weight[:,
-                                                                                  1::
-                                                                                  2, :]
-                    gate_up_weight = torch.cat([gate_weight, up_weight], dim=-2)
-                    gate_up_bias = module_weights['gate_up_proj_bias']
-                    gate_bias, up_bias = gate_up_bias[:, ::
-                                                      2], gate_up_bias[:, 1::2]
-                    gate_up_bias = torch.cat([gate_bias, up_bias], dim=-1)
-                    gate_up_weight_scale = module_weights['gate_up_proj_scales']
-                    gate_weight_scale, up_weight_scale = gate_up_weight_scale[:, ::
-                                                                              2, :], gate_up_weight_scale[:,
-                                                                                                          1::
-                                                                                                          2, :]
-                    gate_up_weight_scale = torch.cat(
-                        [gate_weight_scale, up_weight_scale], dim=-2)
-                    moe_weights = {
-                        'gate_up_proj': [
-                            gate_up_weight[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'down_proj': [
-                            module_weights['down_proj_blocks'].flatten(
-                                -2, -1)[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'gate_up_proj.bias':
-                        [gate_up_bias[i, :] for i in range(num_expert)],
-                        'down_proj.bias': [
-                            module_weights['down_proj_bias'][i, :]
-                            for i in range(num_expert)
-                        ],
-                        'gate_up_proj_weight_scale': [
-                            gate_up_weight_scale[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'down_proj_weight_scale': [
-                            module_weights['down_proj_scales']
-                            [i, :, :].transpose(0, 1) for i in range(num_expert)
-                        ]
-                    }
-
-                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
-                        for i in range(num_expert):
-                            moe_weights[
-                                f"{i}.w1.weight_scale_inv"] = gate_weight_scale[
-                                    i, :, :]
-                            moe_weights[
-                                f"{i}.w3.weight_scale_inv"] = up_weight_scale[
-                                    i, :, :]
-                            moe_weights[
-                                f"{i}.w2.weight_scale_inv"] = module_weights[
-                                    'down_proj_scales'][i, :, :]
-
-                module.load_weights(weights=[moe_weights])
-            elif hasattr(module, "load_weights"):
-                if 'qkv' in name:
-                    # For qkv_proj
-                    q_weight_bias = filter_weights(
-                        name.replace('qkv_proj', 'q_proj'), weights)
-                    k_weight_bias = filter_weights(
-                        name.replace('qkv_proj', 'k_proj'), weights)
-                    v_weight_bias = filter_weights(
-                        name.replace('qkv_proj', 'v_proj'), weights)
-                    module.load_weights(
-                        weights=[q_weight_bias, k_weight_bias, v_weight_bias])
-                else:
-                    # For o_proj, sinks.
-                    module.load_weights(weights=[module_weights])
-            else:
-                # Load four LN weights (attn.norm, mlp.norm, input_layernorm, post_attention_layernorm).
-                if 'next_layer_layernorm' in name:
-                    continue
-
-                for n, p in module._parameters.items():
-                    if p is not None:
-                        p.data.copy_(module_weights[n][:])
-
-    def load_ori_weights(self, weights: Dict):
-        head_dim = self.config.head_dim
-        num_q_head = self.config.num_attention_heads
-        num_kv_head = self.config.num_key_value_heads
-        num_expert = self.config.num_local_experts
-        enable_attention_dp = self.model_config.mapping.enable_attention_dp
-        tp_size = self.model_config.mapping.tp_size
-
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
-                continue
-            names = name.split(".")
-            module_weights = {}
-            if names[-1] in self.params_map:
-                names[-1] = self.params_map[names[-1]]
-
-            # Drop the first "model" prefix
-            if names[0] == 'model':
-                name = '.'.join(names[1:])
-            else:
-                name = '.'.join(names)
-            module_weights = filter_weights(name, weights)
-            if isinstance(module, MoE):
-                # [num_experts, intermediate_size * 2, hidden_size]
-                gate_up_proj = filter_weights(name.replace("experts", "mlp1"),
-                                              weights)
-                # [num_experts, intermediate_size, hidden_size]
-                down_proj = filter_weights(name.replace("experts", "mlp2"),
-                                           weights)
-                try:
-                    # Official MXFP4 ckpt.
-                    gate_up_weight = gate_up_proj['weight.blocks'].flatten(
-                        -2, -1)
-                    gate, up = gate_up_weight[:, ::2, :], gate_up_weight[:, 1::
-                                                                         2, :]
-                    gate_up_weight = torch.cat([gate, up], dim=-2)
-                    gate_up_bias = gate_up_proj['bias']
-                    gate, up = gate_up_bias[:, ::2], gate_up_bias[:, 1::2]
-                    gate_up_bias = torch.cat([gate, up], dim=-1)
-                    moe_weights = {
-                        'gate_up_proj': [
-                            gate_up_weight[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'down_proj': [
-                            down_proj['weight.blocks'].flatten(
-                                -2, -1)[i, :, :].transpose(0, 1)
-                            for i in range(num_expert)
-                        ],
-                        'gate_up_proj.bias':
-                        [gate_up_bias[i, :] for i in range(num_expert)],
-                        'down_proj.bias':
-                        [down_proj['bias'][i, :] for i in range(num_expert)]
-                    }
-                except:
-                    # For BF16 ckpt.
-                    moe_weights = {
-                        'gate_up_proj': [
-                            gate_up_proj['weight'][i, :, :].transpose(0, 1).to(
-                                self.model.dtype) for i in range(num_expert)
-                        ],
-                        'down_proj': [
-                            down_proj['weight'][i, :, :].transpose(0, 1).to(
-                                self.model.dtype) for i in range(num_expert)
-                        ],
-                        'gate_up_proj.bias':
-                        [gate_up_proj['bias'][i, :] for i in range(num_expert)],
-                        'down_proj.bias':
-                        [down_proj['bias'][i, :] for i in range(num_expert)]
-                    }
-                # Only for Official MXFP4 ckpt.
-                if 'weight.scales' in gate_up_proj:
-                    gate_up_weight_scale = gate_up_proj['weight.scales']
-                    gate, up = gate_up_weight_scale[:, ::
-                                                    2, :], gate_up_weight_scale[:,
-                                                                                1::
-                                                                                2, :]
-                    gate_up_weight_scale = torch.cat([gate, up], dim=-2)
-                    moe_weights['gate_up_proj_weight_scale'] = [
-                        gate_up_weight_scale[i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
-                    ]
-
-                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
-                        for i in range(num_expert):
-                            moe_weights[f"{i}.w1.weight_scale_inv"] = gate[
-                                i, :, :]
-                            moe_weights[f"{i}.w3.weight_scale_inv"] = up[
-                                i, :, :]
-
-                if 'weight.scales' in down_proj:
-                    moe_weights['down_proj_weight_scale'] = [
-                        down_proj['weight.scales'][i, :, :].transpose(0, 1)
-                        for i in range(num_expert)
-                    ]
-
-                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
-                        for i in range(num_expert):
-                            moe_weights[f"{i}.w2.weight_scale_inv"] = down_proj[
-                                'weight.scales'][i, :, :]
-
-                module.load_weights(weights=[moe_weights])
-            elif hasattr(module, "load_weights"):
-                # Load Attention module weights.
-                if 'qkv' in name:
-                    q_weight = module_weights['weight'][:head_dim *
-                                                        num_q_head, :]
-                    k_weight = module_weights['weight'][head_dim *
-                                                        num_q_head:head_dim *
-                                                        (num_q_head +
-                                                         num_kv_head), :]
-                    v_weight = module_weights['weight'][-head_dim *
-                                                        num_kv_head:, :]
-                    q_bias = module_weights['bias'][:head_dim * num_q_head]
-                    k_bias = module_weights['bias'][head_dim *
-                                                    num_q_head:head_dim *
-                                                    (num_q_head + num_kv_head)]
-                    v_bias = module_weights['bias'][-head_dim * num_kv_head:]
-
-                    # Handle KV weight duplication for GQA
-                    tensors_need_duplication = ['weight', 'bias']
-                    if module.quant_config.quant_mode.has_mxfp4():
-                        tensors_need_duplication.append('weight_scale')
-
-                    # Duplicate KV weights if needed
-                    tensor_parallel_size = tp_size if not enable_attention_dp else 1
-
-                    k_weight_dict = {'weight': k_weight, 'bias': k_bias}
-                    v_weight_dict = {'weight': v_weight, 'bias': v_bias}
-
-                    if 'weight_scale' in module_weights:
-                        k_weight_dict['weight_scale'] = module_weights[
-                            'weight_scale'][head_dim * num_q_head:head_dim *
-                                            (num_q_head + num_kv_head), :]
-                        v_weight_dict['weight_scale'] = module_weights[
-                            'weight_scale'][-head_dim * num_kv_head:, :]
-
-                    k_weight_dict = {
-                        k: (duplicate_kv_weight(
-                            weight=v,
-                            num_kv_heads=num_kv_head,
-                            tensor_parallel_size=tensor_parallel_size)
-                            if k in tensors_need_duplication else v)
-                        for k, v in k_weight_dict.items()
-                    }
-
-                    v_weight_dict = {
-                        k: (duplicate_kv_weight(
-                            weight=v,
-                            num_kv_heads=num_kv_head,
-                            tensor_parallel_size=tensor_parallel_size)
-                            if k in tensors_need_duplication else v)
-                        for k, v in v_weight_dict.items()
-                    }
-
-                    qkv_weights = [{
-                        'weight': q_weight,
-                        'bias': q_bias
-                    }, k_weight_dict, v_weight_dict]
-                    module.load_weights(weights=qkv_weights)
-                else:
-                    # Dense & gate & sinks
-                    module.load_weights(weights=[module_weights])
-            else:
-                # Load LN weights.
-                if names[-1].endswith("layernorm") and names[-3] == "block":
-                    # skip loading weights for the fused norms
-                    continue
-                for n, p in module._parameters.items():
-                    if p is not None:
-                        p.data.copy_(module_weights[n.replace(
-                            "weight", "scale")][:])
