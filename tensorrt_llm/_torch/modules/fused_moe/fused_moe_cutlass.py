@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
@@ -142,11 +143,24 @@ class CutlassFusedMoE(MoE):
         self.alltoall_workspace = None
         self.alltoall_prepare_workspace = None
         if self.enable_alltoall:
-            MnnvlMemory.initialize()
-            self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+            if self.moe_alltoall_backend == "mnnvl":
+                MnnvlMemory.initialize()
+                self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                    model_config.mapping)
+                self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                 model_config.mapping)
-            self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                model_config.mapping)
+            elif self.moe_alltoall_backend == "new":
+                workspace_mb = int(os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
+                self.moe_a2a = MoeAlltoAll(
+                    mapping=self.mapping,
+                    max_num_tokens_per_rank=model_config.max_num_tokens,
+                    top_k=self.routing_method.experts_per_token,
+                    num_experts=self.num_experts,
+                    workspace_size_per_rank=workspace_mb * 1024 * 1024,
+                )
+            else:
+                raise ValueError(f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}")
+
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -194,7 +208,12 @@ class CutlassFusedMoE(MoE):
                 and self.mapping.enable_attention_dp
                 and self.mapping.tp_size > 1
                 and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
-                and MnnvlMemory.supports_mnnvl())
+                and (MnnvlMemory.supports_mnnvl() or os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND", "mnnvl").strip().lower() == "new"))
+
+    @cached_property
+    def moe_alltoall_backend(self):
+        # "mnnvl" (default) or "new"
+        return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND", "mnnvl").strip().lower()
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -352,26 +371,60 @@ class CutlassFusedMoE(MoE):
                 token_final_scales = torch.ones_like(token_selected_experts,
                                                      dtype=torch.float32)
 
-            assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
-            alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-                token_selected_experts, None, self.alltoall_prepare_workspace,
-                max_num_token, self.ep_rank, self.ep_size, self.num_experts,
-                self.num_experts, top_k)
+            if self.moe_alltoall_backend == "mnnvl":
+                assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+                alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                    token_selected_experts, None, self.alltoall_prepare_workspace,
+                    max_num_token, self.ep_rank, self.ep_size, self.num_experts,
+                    self.num_experts, top_k)
 
-            if x_sf is not None:
-                x_sf = x_sf.view(x_row, ceil_div(x_col,
-                                                 self.scaling_vector_size))
-                is_sf_swizzled = False
+                if x_sf is not None:
+                    x_sf = x_sf.view(x_row, ceil_div(x_col,
+                                                     self.scaling_vector_size))
+                    is_sf_swizzled = False
 
-            # Dispatch x, x_sf, token_selected_experts, token_final_scales in one alltoall kernel
-            x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                alltoall_info, self.alltoall_workspace, self.ep_rank,
-                self.ep_size)
+                # Dispatch x, x_sf, token_selected_experts, token_final_scales in one alltoall kernel
+                x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                    [x, x_sf, token_selected_experts, token_final_scales],
+                    alltoall_info, self.alltoall_workspace, self.ep_rank,
+                    self.ep_size)
 
-            torch.ops.trtllm.memset_expert_ids(
-                token_selected_experts, alltoall_info.recv_rank_count_cumsum,
-                max_num_token, top_k, self.num_experts, self.ep_size)
+                torch.ops.trtllm.memset_expert_ids(
+                    token_selected_experts, alltoall_info.recv_rank_count_cumsum,
+                    max_num_token, top_k, self.num_experts, self.ep_size)
+            elif self.moe_alltoall_backend == "new":
+                # Python MoeAlltoAll path
+                if x_sf is not None:
+                    x_sf = x_sf.view(x_row, ceil_div(x_col, self.scaling_vector_size))
+                    is_sf_swizzled = False
+
+                payloads = []
+                payloads.append(x)
+                if x_sf is not None:
+                    payloads.append(x_sf)
+                    expert_id_payload_index = 2
+                else:
+                    expert_id_payload_index = 1
+                payloads.append(token_selected_experts)
+                payloads.append(token_final_scales)
+
+                recv_buffers = self.moe_a2a.dispatch(
+                    token_selected_experts,
+                    payloads,
+                    invalid_token_expert_id=self.num_experts,
+                    expert_id_payload_index=expert_id_payload_index,
+                )
+
+                if x_sf is not None:
+                    x_recv, x_sf_recv, token_selected_experts_recv, token_final_scales_recv = recv_buffers
+                    x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
+                else:
+                    x_recv, token_selected_experts_recv, token_final_scales_recv = recv_buffers
+                x = x_recv.view(-1, x_recv.shape[-1])
+                token_selected_experts = token_selected_experts_recv.view(-1, token_selected_experts_recv.shape[-1])
+                token_final_scales = token_final_scales_recv.view(-1, token_final_scales_recv.shape[-1])
+            else:
+                raise ValueError(f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}")
 
         elif run_post_quant_allgather:
             # Original allgather logic
@@ -429,16 +482,25 @@ class CutlassFusedMoE(MoE):
         final_hidden_states = final_hidden_states[0]
 
         # Combine results if using alltoall
-        if self.enable_alltoall and alltoall_info is not None:
-            top_k = self.routing_method.experts_per_token
-            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-                final_hidden_states,
-                alltoall_info,
-                self.alltoall_workspace,
-                ep_rank=self.ep_rank,
-                ep_size=self.ep_size,
-                top_k=top_k,
-                token_count=token_count)
+        if self.enable_alltoall:
+            if self.moe_alltoall_backend == "mnnvl":
+                if alltoall_info is not None:
+                    top_k = self.routing_method.experts_per_token
+                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                        final_hidden_states,
+                        alltoall_info,
+                        self.alltoall_workspace,
+                        ep_rank=self.ep_rank,
+                        ep_size=self.ep_size,
+                        top_k=top_k,
+                        token_count=token_count)
+            elif self.moe_alltoall_backend == "new":
+                hidden = final_hidden_states.shape[-1]
+                final_hidden_states = self.moe_a2a.combine(
+                    final_hidden_states.view(self.ep_size, self.moe_a2a.max_num_tokens_per_rank, hidden)
+                )
+            else:
+                raise ValueError(f"Unsupported moe alltoall backend: {self.moe_alltoall_backend}")
 
         return final_hidden_states
 
