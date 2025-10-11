@@ -1063,8 +1063,7 @@ class TorchSampler(Sampler):
                     torch.int)
 
         # 5) Append eagle3 d2t.
-        self._apply_d2t(new_tokens_cuda[seq_slots, :top_k_list_cumsum[-1]],
-                        model_outputs)
+        self._apply_d2t(new_tokens_cuda, model_outputs)
 
         # 6) Copy back to the output tensor.
         new_tokens_cuda = new_tokens_cuda.transpose(0, 1).to(

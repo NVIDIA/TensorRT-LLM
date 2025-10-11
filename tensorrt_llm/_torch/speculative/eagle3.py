@@ -143,6 +143,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
+        spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         is_first_draft = self.eagle3_resource_manager.is_first_draft
         # Update start indices
         # Here, we assume the sequence lengths (seq_lens) during the draft model
@@ -169,9 +170,40 @@ class Eagle3SpecMetadata(SpecMetadata):
                 hidden_states_write_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
             else:
-                old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
-                hidden_states_read_indices.append(start_idx + old_seq_len - 1)
-                hidden_states_write_indices.append(start_idx + seq_len - 1)
+                if spec_tree_manager is not None:
+                    cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
+                    if cur_draft_layer_idx == 1:
+                        # copy the last hidden states to the beginning of the buffer
+                        old_seq_len = self.eagle3_resource_manager.seq_lens[
+                            slot_id]
+                        last_hidden_states_idx = start_idx + old_seq_len - 1
+                        eagle3_hidden_states = self.eagle3_resource_manager.hidden_states
+                        eagle3_hidden_states[start_idx, :].copy_(
+                            eagle3_hidden_states[last_hidden_states_idx, :],
+                            non_blocking=True)
+
+                    for gather_ids, top_k_list in zip(
+                            spec_tree_manager.
+                            gather_ids_per_layer[:cur_draft_layer_idx],
+                            spec_tree_manager.top_k_list[:cur_draft_layer_idx]):
+                        for gather_id, top_k_list_i in zip(
+                                gather_ids, top_k_list):
+                            hidden_states_read_indices.extend([gather_id] *
+                                                              top_k_list_i)
+
+                    hidden_states_write_indices.extend(
+                        list(
+                            range(
+                                start_idx + 1, start_idx + 1 +
+                                spec_tree_manager.get_cumulative_draft_lens(
+                                    cur_draft_layer_idx - 1))))
+                    assert len(hidden_states_read_indices) == self.num_tokens
+                    assert len(hidden_states_write_indices) == self.num_tokens
+                else:
+                    old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
+                    hidden_states_read_indices.append(start_idx + old_seq_len -
+                                                      1)
+                    hidden_states_write_indices.append(start_idx + seq_len - 1)
             self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
         # Prepare hidden states gather ids
         self.hidden_states_read_indices_host = torch.tensor(
