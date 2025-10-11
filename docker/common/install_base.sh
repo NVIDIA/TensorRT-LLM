@@ -135,11 +135,9 @@ install_gcctoolset_rockylinux() {
     pigz \
     rdma-core-devel \
     -y
-  dnf install \
-    zeromq-devel \
-    hwloc \
-    hwloc-devel \
-    -y
+  dnf install -y dnf-plugins-core
+  dnf config-manager --set-enabled powertools
+  dnf install -y zeromq-devel hwloc hwloc-devel
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
