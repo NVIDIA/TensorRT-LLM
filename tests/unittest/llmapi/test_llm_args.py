@@ -331,11 +331,7 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
         SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
                         GUARANTEED_NO_EVICT)
     }
-    plugin_config_dict = {
-        "_dtype": 'float16',
-        "nccl_plugin": None,
-    }
-    plugin_config = PluginConfig.from_dict(plugin_config_dict)
+    plugin_config = PluginConfig(dtype='float16', nccl_plugin=None)
     build_config = BuildConfig(max_input_len=1024,
                                lora_config=LoraConfig(lora_ckpt_source='hf'),
                                auto_parallel_config=AutoParallelConfig(
