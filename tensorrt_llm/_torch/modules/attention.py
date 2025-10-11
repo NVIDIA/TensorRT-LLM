@@ -1054,7 +1054,6 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        qr = q
         q, latent_cache = maybe_execute_in_parallel(
             lambda: self.q_b_proj(q),
             lambda: torch.concat([compressed_kv, k_pe], dim=-1),
@@ -1073,8 +1072,6 @@ class MLA(nn.Module):
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            hidden_states_ctx = hidden_states[:num_ctx_tokens, ...]
-            qr_ctx = qr[:num_ctx_tokens, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
@@ -1086,9 +1083,6 @@ class MLA(nn.Module):
                 attn_metadata,
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
-                hidden_states_ctx,
-                qr_ctx,
-                position_ids,
             )
 
         if num_generations > 0:
@@ -1096,8 +1090,6 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            hidden_states_gen = hidden_states[num_ctx_tokens:, ...]
-            qr_gen = qr[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -1109,9 +1101,101 @@ class MLA(nn.Module):
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
-                hidden_states_gen,
-                qr_gen,
-                position_ids,
+            )
+
+    def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
+                     hidden_states: torch.Tensor,
+                     attn_metadata: AttentionMetadata,
+                     output: torch.Tensor) -> None:
+        """
+        Forward pass for the MLA module with DSA (always in MQA mode).
+
+        Args:
+            position_ids (Optional[torch.IntTensor]): The position IDs.
+            hidden_states (torch.Tensor): The hidden states.
+            attn_metadata (AttentionMetadata): The attention metadata.
+            all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        assert self.mha is None and self.mqa is not None, "DSA is only supported in MQA mode"
+        # split q, k, v into context and gen batches
+        num_contexts = attn_metadata.num_contexts
+        num_generations = attn_metadata.num_generations
+        num_ctx_tokens = attn_metadata.num_ctx_tokens
+        num_tokens = attn_metadata.num_tokens
+
+        hidden_states = hidden_states[:num_tokens, ...]
+        if position_ids is not None:
+            position_ids = position_ids[..., :num_tokens]
+
+  
+        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+            hidden_states).split([
+                self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+            ], -1)
+
+        q, compressed_kv = maybe_execute_in_parallel(
+            lambda: self.q_a_layernorm(q),
+            lambda: self.kv_a_layernorm(compressed_kv),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        qr = q
+        q, latent_cache = maybe_execute_in_parallel(
+            lambda: self.q_b_proj(q),
+            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+        assert q.shape[
+            0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
+
+        assert output is not None, "output must be provided"
+
+        # Indexer
+        topk_indices = self.mqa.indexer(qr, hidden_states, attn_metadata, position_ids)
+
+        if num_contexts > 0:
+            q_ctx = q[:num_ctx_tokens, ...]
+            compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
+            k_pe_ctx = k_pe[:num_ctx_tokens, ...]
+            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
+
+            self.forward_context_dsa(
+                q_ctx,
+                compressed_kv_ctx,
+                k_pe_ctx,
+                attn_metadata,
+                output[:num_ctx_tokens, :],
+                latent_cache_ctx,
+                topk_indices=topk_indices[:num_ctx_tokens, :],
+            )
+
+        if num_generations > 0:
+            q_gen = q[num_ctx_tokens:, ...]
+            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
+            k_pe_gen = k_pe[num_ctx_tokens:, ...]
+            latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
+
+            self.forward_generation_dsa(
+                q_gen,
+                compressed_kv_gen,
+                k_pe_gen,
+                attn_metadata,
+                output[num_ctx_tokens:num_tokens, :],
+                latent_cache_gen,
+                topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
             )
 
     def forward_context_default(
@@ -1161,19 +1245,16 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+    # TODO: implement other paths
         return self.forward_sparse_mla_kvcache_bf16(q,
                                                     compressed_kv,
                                                     k_pe,
                                                     attn_metadata,
                                                     output,
                                                     latent_cache,
-                                                    hidden_states,
-                                                    qr,
-                                                    position_ids,
+                                                    topk_indices,
                                                     is_generation=False)
 
     def forward_generation_dsa(
@@ -1184,19 +1265,16 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # TODO: implement other paths
         return self.forward_sparse_mla_kvcache_bf16(q,
                                                     compressed_kv,
                                                     k_pe,
                                                     attn_metadata,
                                                     output,
                                                     latent_cache,
-                                                    hidden_states,
-                                                    qr,
-                                                    position_ids,
+                                                    topk_indices,
                                                     is_generation=True)
 
     def forward_context_with_cached_kv(
@@ -1437,15 +1515,8 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.is_dsa:
-            return self.forward_context_dsa(q, compressed_kv, k_pe,
-                                            attn_metadata, output, latent_cache,
-                                            hidden_states, qr, position_ids)
-        elif isinstance(self.mha, TrtllmAttention):
+        if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
@@ -1467,16 +1538,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.is_dsa:
-            return self.forward_generation_dsa(q, compressed_kv, k_pe,
-                                               attn_metadata, output,
-                                               latent_cache, hidden_states, qr,
-                                               position_ids)
-
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1578,9 +1640,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
         is_generation: bool = False,
     ) -> torch.Tensor:
         """
@@ -1606,9 +1666,6 @@ class MLA(nn.Module):
         full_latent_cache = torch.cat([full_compressed_kv, full_k_pe], dim=-1)
 
         num_tokens = q.shape[0]
-        # find topk_indicies
-        topk_indices = trtllm_attention.indexer(q, k_pe, attn_metadata,
-                                                hidden_states, qr, position_ids)
 
         # TODO: this is the local topk indices, we need to convert it to global topk indices
         # Global indices related to the gen part cache; or prefill part cache
@@ -1734,6 +1791,11 @@ class MLA(nn.Module):
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
                                                    attn_output)
+        elif self.is_dsa:
+            self.forward_impl_with_dsa(position_ids,
+                                      hidden_states,
+                                      attn_metadata,
+                                      output=attn_output)
         else:
             self.forward_impl(position_ids,
                               hidden_states,

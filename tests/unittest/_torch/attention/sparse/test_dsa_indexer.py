@@ -375,7 +375,7 @@ def test_deepgemm_fp8_mqa_logits_basic():
 
 def _create_mock_metadata(request_ids, batch_size, num_contexts,
                           num_generations, seq_lens, kv_lens, num_cached_tokens,
-                          cache_manager):
+                          cache_manager, num_ctx_tokens, num_tokens):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -412,7 +412,8 @@ def _create_mock_metadata(request_ids, batch_size, num_contexts,
             self.slot_mapping_fp8 = None
             self.slot_mapping_scale = None
             self.scheduler_metadata_buffer = None
-
+            self.num_ctx_tokens = num_ctx_tokens
+            self.num_tokens = num_tokens
     return MockMetadata()
 
 
@@ -505,6 +506,8 @@ def test_indexer_paged_kv_cache_block_management(batch_size, next_n):
         kv_lens=context_lens_context.clone(),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
+        num_ctx_tokens=total_context_tokens,
+        num_tokens=total_context_tokens,
     )
     Indexer.prepare(metadata_context)
 
@@ -528,6 +531,8 @@ def test_indexer_paged_kv_cache_block_management(batch_size, next_n):
         kv_lens=final_lens.clone(),
         num_cached_tokens=context_lens_context.tolist(),
         cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size * num_gen_tokens,
     )
     Indexer.prepare(metadata_gen)
 
@@ -792,6 +797,8 @@ def test_fp8_scale_roundtrip():
         kv_lens=torch.tensor(num_tokens_per_req, dtype=torch.int32),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
+        num_ctx_tokens=total_tokens,
+        num_tokens=total_tokens,
     )
     Indexer.prepare(metadata)
 

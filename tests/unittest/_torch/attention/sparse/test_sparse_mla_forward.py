@@ -603,31 +603,27 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     
     if num_contexts > 0:
         mla.mqa.indexer = MockIndexer(create_causal_indices(ctx_indices))
-        mla.forward_context(
+        mla.forward_context_dsa(
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
             attn_metadata=attn_metadata,
             output=output[:num_ctx_tokens],
             latent_cache=latent_cache[:num_ctx_tokens],
-            hidden_states=hidden_states[:num_ctx_tokens],
-            qr=qr[:num_ctx_tokens],
-            position_ids=position_ids[:num_ctx_tokens],
+            topk_indices=mla.mqa.indexer.topk_indices_buffer,
         )
         print(f"  ✓ Context forward: {num_ctx_tokens} tokens from {num_contexts} requests")
     
     if num_generations > 0:
         mla.mqa.indexer = MockIndexer(create_causal_indices(gen_indices, cache_offset_start=0))
-        mla.forward_generation(
+        mla.forward_generation_dsa(
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],
             attn_metadata=attn_metadata,
             output=output[num_ctx_tokens:],
             latent_cache=latent_cache[num_ctx_tokens:],
-            hidden_states=hidden_states[num_ctx_tokens:],
-            qr=qr[num_ctx_tokens:],
-            position_ids=position_ids[num_ctx_tokens:],
+            topk_indices=mla.mqa.indexer.topk_indices_buffer,
         )
         print(f"  ✓ Generation forward: {sum(query_lens[i] for i in gen_indices)} tokens from {num_generations} requests")
     

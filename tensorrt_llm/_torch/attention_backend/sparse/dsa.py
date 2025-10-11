@@ -325,16 +325,13 @@ class Indexer(nn.Module):
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
 
-        # num_tokens_per_request is the same for both context and generation
-        num_tokens_per_request = seq_lens
-
         # start_positions: where to start inserting tokens for each request
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
         # Compute the flat slot mapping for all tokens (separate FP8 and scale offsets)
         Indexer._compute_slot_mapping(request_ids, start_positions,
-                                      num_tokens_per_request, metadata)
+                                      seq_lens, metadata)
 
     @staticmethod
     def _compute_slot_mapping(request_ids: List[int],
@@ -348,7 +345,7 @@ class Indexer(nn.Module):
         Args:
             request_ids: List of request IDs
             start_positions: Starting position in cache for each request
-            num_tokens_per_request: Number of tokens to insert for each request
+            num_tokens_per_request: Number of tokens for each request
 
         Sets:
             metadata.slot_mapping_fp8: [total_tokens] - flat byte index for FP8 data start
@@ -406,8 +403,7 @@ class Indexer(nn.Module):
             non_blocking=True)
 
     def _update_k_cache(self, k_fp8: torch.Tensor, k_scale: torch.Tensor,
-                        metadata: DSAtrtllmAttentionMetadata,
-                        is_generation: bool) -> None:
+                        metadata: DSAtrtllmAttentionMetadata) -> None:
         """
         Insert/append k values and scales into the indexer k cache using pre-computed slot mappings.
         Uses flat byte indices with vectorized scatter.
@@ -434,25 +430,14 @@ class Indexer(nn.Module):
             num_tokens, scale_size)
 
         # Scatter FP8 data
-        if is_generation:
-            flat_indices_fp8 = metadata.slot_mapping_fp8[
-                metadata.num_ctx_tokens:metadata.num_tokens]
-        else:
-            flat_indices_fp8 = metadata.slot_mapping_fp8[:metadata.
-                                                         num_ctx_tokens]
+        flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
         byte_offsets = torch.arange(head_dim, device=k_cache.device).unsqueeze(
             0)  # [1, head_dim]
         scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
             1) + byte_offsets  # [num_tokens, head_dim]
         k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
-
-        # Scatter scales
-        if is_generation:
-            flat_indices_scale = metadata.slot_mapping_scale[
-                metadata.num_ctx_tokens:metadata.num_tokens]
-        else:
-            flat_indices_scale = metadata.slot_mapping_scale[:metadata.
-                                                             num_ctx_tokens]
+        
+        flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]                                                      
         byte_offsets = torch.arange(
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
         scatter_indices_scale = flat_indices_scale.unsqueeze(
@@ -486,7 +471,7 @@ class Indexer(nn.Module):
         # Quantize k and store into indexer k cache
         k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k[:num_tokens])
         k_scale = k_scale.contiguous().transpose(0, 1)
-        self._update_k_cache(k_fp8, k_scale, metadata, is_generation=has_decode)
+        self._update_k_cache(k_fp8, k_scale, metadata)
 
         if has_prefill:
             # Compute attention window bounds for each query token in batched sequences
@@ -585,12 +570,10 @@ class Indexer(nn.Module):
         return topk_indices_buffer
 
     def forward(self,
-                q: torch.Tensor,
-                k: torch.Tensor,
-                metadata: DSAtrtllmAttentionMetadata,
-                hidden_states: Optional[torch.Tensor] = None,
-                qr: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.Tensor] = None):
+                qr: torch.Tensor,
+                hidden_states: torch.Tensor,
+                metadata: DSAtrtllmAttentionMetadata,                
+                position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         q = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim)
