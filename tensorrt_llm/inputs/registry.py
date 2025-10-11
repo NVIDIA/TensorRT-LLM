@@ -42,6 +42,16 @@ class InputProcessor(Protocol):
         ...
 
 
+class BaseDummyInputsBuilder:
+    """
+    Base class for generating dummy inputs. Specially for profiling
+    """
+
+    def get_dummy_prompt(self, input_seq_len: int):
+        raise NotImplementedError(
+            "Please ensure this method is implemented in your inherited class")
+
+
 class BaseMultimodalInputProcessor:
     """
     Base class for multimodal input processors with default implementations
