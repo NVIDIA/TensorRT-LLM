@@ -52,13 +52,17 @@ class ModelDrafter(Drafter):
         spec_resource_manager: Optional[BaseResourceManager] = None,
         guided_decoder: Optional[GuidedDecoder] = None,
     ):
-        super().__init__(spec_config.max_concurrency)
-
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
         if max_draft_tokens < 0:
             raise ValueError("max_draft_tokens must be >= 0")
+
+        super().__init__(
+            max_draft_tokens=spec_config.max_draft_len,
+            max_concurrency=spec_config.max_concurrency,
+            draft_len_schedule=spec_config.draft_len_schedule,
+        )
 
         # Model and resource management
         self.draft_model_engine = draft_model_engine
@@ -67,7 +71,6 @@ class ModelDrafter(Drafter):
 
         # Configuration
         self.spec_config = spec_config
-        self.max_draft_tokens = max_draft_tokens
         # Sampling
         self.sampler = sampler
         self.guided_decoder = guided_decoder
@@ -77,6 +80,16 @@ class ModelDrafter(Drafter):
             # TODO: enable sampling/guided decoding on static draft loop
             assert guided_decoder is None
             assert spec_config._allow_greedy_draft_tokens
+
+            # Currently dynamic draft length is not compatible with static draft loops
+            # TODO: support static draft loops with dynamic draft_len
+            if self.draft_len_schedule is not None:
+                raise ValueError(
+                    "Dynamic draft length (draft_len_schedule) is not supported with "
+                    "static draft loops (fused ChainDrafter/Eagle3). Static loops have "
+                    "fixed iteration counts compiled into the model.\n"
+                    "To use draft_len_schedule, please use ModelDrafter (2-model setup) "
+                    "or NGramDrafter instead.")
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
@@ -682,6 +695,17 @@ class ModelDrafter(Drafter):
                 - Updated target inputs or None
                 - Draft sample state or None
         """
+        # # Use pre-determined draft_len (set by executor BEFORE scheduling)
+        # if self.draft_len_schedule is not None and hasattr(self, '_current_batch_draft_len'):
+        #     # Use pre-determined value from executor
+        #     dynamic_draft_len = self._current_batch_draft_len
+
+        #     # Override max_draft_tokens to the dynamic value
+        #     self.max_draft_tokens = dynamic_draft_len
+
+        #     # Note: If draft_len=0, this method won't be called anyway
+        #     # (executor sets use_spec_decode=False and clears py_draft_tokens)
+
         draft_batch, req_id_to_old_request = self._setup_draft_batch_and_resources(
             scheduled_batch)
         if draft_batch is None:

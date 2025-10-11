@@ -192,7 +192,8 @@ class PyExecutor:
         # enqueue and _fetch_new_requests used data
         self.active = True
         self.max_beam_width = max_beam_width
-        self.max_draft_len = max_draft_len
+        self.max_draft_len = max_draft_len  # It's dynamic if draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled). It's static in other cases.
+        self._static_max_draft_len = max_draft_len  # It's always static
         self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
@@ -1017,22 +1018,36 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self.use_spec_decode = self.drafter.should_use_spec_decode(
-                self.active_requests, self.max_batch_size,
-                self.model_engine.max_num_tokens,
-                self.model_engine.spec_config.max_draft_len)
-            self.model_engine.enable_spec_decode = self.use_spec_decode
+            # Update draft_len based on schedule (if exists)
+            if self.drafter.draft_len_schedule is not None:
+                batch_size_input = len(self.active_requests)
 
-            # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
+                self.max_draft_len = self.drafter.get_draft_len_for_batch_size(
+                    batch_size_input)
+
+                self.drafter.update_max_draft_tokens(self.max_draft_len)
+
+            # Check if draft_len=0 → immediately disable
+            # max_draft_len==0 is only possible when draft_len_schedule is provided
+            # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
+            if self.drafter.draft_len_schedule is not None and self.max_draft_len == 0:
+                self.use_spec_decode = False
+                self.model_engine.enable_spec_decode = False
+            else:
+                # Check should_use_spec_decode (max_concurrency logic)
+                self.use_spec_decode = self.drafter.should_use_spec_decode(
+                    self.active_requests, self.max_batch_size,
+                    self.model_engine.max_num_tokens, self.max_draft_len)
+                self.model_engine.enable_spec_decode = self.use_spec_decode
+
             for request in self.active_requests:
                 if request.state not in (
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
-                max_draft_len = self.model_engine.spec_config.max_draft_len
                 request.draft_tokens = [
                     0
-                ] * max_draft_len if max_draft_len > 0 else []
+                ] * self.max_draft_len if self.max_draft_len > 0 else []
 
             # When overlap scheduler is enabled, and we already prepared the draft tokens in the previous batch,
             # we don't need to initialize py_draft_tokens at this stage because we haven't append the accepted tokens to the request yet.
@@ -1203,11 +1218,10 @@ class PyExecutor:
                     continue
 
                 req.py_last_draft_tokens = req.py_draft_tokens
-                max_draft_len = self.model_engine.spec_config.max_draft_len
 
-                if max_draft_len > 0 and self.use_spec_decode:
-                    req.py_draft_tokens = [0] * max_draft_len
-                    req.py_draft_pages_allocated = max_draft_len
+                if self.max_draft_len > 0 and self.use_spec_decode:
+                    req.py_draft_tokens = [0] * self.max_draft_len
+                    req.py_draft_pages_allocated = self.max_draft_len
                 else:
                     req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0
@@ -1595,7 +1609,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=True,
                 prepare_resource=True,
-                max_num_draft_tokens=self.max_draft_len,
+                max_num_draft_tokens=self.static_max_draft_len,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
