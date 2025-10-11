@@ -296,7 +296,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                         + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));
 
                     auto const N2 = mOutHiddenSizes[loraModuleIdx];
-                    cutlass::gemm::GemmCoord problem_2(M, N2, N);
+                    cutlass::gemm::GemmCoord problem_2(M, N2, N); // token_num, module_output_size, lora_rank
                     problem_sizes_2.push_back(problem_2);
                     ptrA_2.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
                         + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));

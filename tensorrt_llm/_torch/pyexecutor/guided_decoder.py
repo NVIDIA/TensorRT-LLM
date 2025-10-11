@@ -195,6 +195,8 @@ class GuidedDecoder:
         self.requests: Optional[GuidedRequests] = None
 
         self.stream = torch.cuda.Stream()
+        print(
+            f'guided decoder stream: {self.stream}: {self.stream.cuda_stream}')
         self.token_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
 

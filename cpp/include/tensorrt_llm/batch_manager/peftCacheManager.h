@@ -115,6 +115,8 @@ public:
 
     [[nodiscard]] bool isTaskDoneDevice(uint64_t taskId) const;
 
+    [[nodiscard]] bool isTaskCachedDevice(uint64_t const taskId) const;
+
     void resetDeviceCache() override;
 
     void markRequestDone(LlmRequest const& llmReq, bool pause = false) override;

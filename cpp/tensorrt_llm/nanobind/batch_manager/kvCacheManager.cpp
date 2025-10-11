@@ -531,6 +531,8 @@ void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, nb::arg("taskId"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_task_cached_device", &tb::PeftCacheManager::isTaskCachedDevice, nb::arg("taskId"),
             nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager")

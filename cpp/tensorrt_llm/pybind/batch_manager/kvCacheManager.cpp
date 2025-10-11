@@ -524,6 +524,8 @@ void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)
             py::arg("config"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
             py::call_guard<py::gil_scoped_release>())
         .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, py::arg("taskId"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("is_task_cached_device", &tb::PeftCacheManager::isTaskCachedDevice, py::arg("taskId"),
             py::call_guard<py::gil_scoped_release>());
 
     py::classh<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager")
