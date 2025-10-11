@@ -120,12 +120,12 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     th::optional<th::Tensor> runtime_top_k_opt, th::optional<th::Tensor> runtime_top_p_opt,
     th::optional<th::Tensor> temperature_opt, th::optional<th::Tensor> repetition_penalty_opt,
     th::optional<th::Tensor> presence_penalty_opt, th::optional<th::Tensor> frequency_penalty_opt,
-    th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-    th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
-    th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> min_p_opt, bool output_log_probs,
-    bool cum_log_probs)
+    th::optional<th::Tensor> prompt_ignore_length_opt, th::optional<th::Tensor> min_length_opt,
+    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
+    th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
+    th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
+    th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+    th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     mBeamWidth = beam_width;
@@ -137,6 +137,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     safeInsert(repetition_penalty_opt, penaltyParams->repetitionPenalty);
     safeInsert(presence_penalty_opt, penaltyParams->presencePenalty);
     safeInsert(frequency_penalty_opt, penaltyParams->frequencyPenalty);
+    safeInsert(prompt_ignore_length_opt, penaltyParams->promptIgnoreLength);
     safeInsert(min_length_opt, penaltyParams->minLength);
     safeInsert(no_repeat_ngram_size_opt, banWordsParams->noRepeatNgramSize);
     if (beam_width == 1)
@@ -328,10 +329,10 @@ void DynamicDecodeOp::createInstance()
 void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th::optional<th::Tensor> runtimeTopKOpt,
     th::optional<th::Tensor> runtimeTopPOpt, th::optional<th::Tensor> temperatureOpt,
     th::optional<th::Tensor> repetitionPenaltyOpt, th::optional<th::Tensor> presencePenaltyOpt,
-    th::optional<th::Tensor> frequencyPenaltyOpt, th::optional<th::Tensor> minLengthOpt,
-    th::optional<th::Tensor> lengthPenaltyOpt, th::optional<th::Tensor> earlyStoppingOpt,
-    th::optional<th::Tensor> beamSearchDiversityRateOpt, th::optional<th::Tensor> randomSeedOpt,
-    th::optional<th::Tensor> topPDecayOpt, th::optional<th::Tensor> topPMinOpt,
+    th::optional<th::Tensor> frequencyPenaltyOpt, th::optional<th::Tensor> promptIgnoreLengthOpt,
+    th::optional<th::Tensor> minLengthOpt, th::optional<th::Tensor> lengthPenaltyOpt,
+    th::optional<th::Tensor> earlyStoppingOpt, th::optional<th::Tensor> beamSearchDiversityRateOpt,
+    th::optional<th::Tensor> randomSeedOpt, th::optional<th::Tensor> topPDecayOpt, th::optional<th::Tensor> topPMinOpt,
     th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt,
     th::optional<th::Tensor> minPOpt, bool outputLogProbs, bool cumLogProbs)
 {
@@ -343,6 +344,7 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     CHECK_OPTIONAL_CPU_INPUT(repetitionPenaltyOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(presencePenaltyOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(frequencyPenaltyOpt, torch::kFloat);
+    CHECK_OPTIONAL_CPU_INPUT(promptIgnoreLengthOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(minLengthOpt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(lengthPenaltyOpt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(earlyStoppingOpt, torch::kInt32);
@@ -356,8 +358,9 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
 
     dynamicDecode_->setup(static_cast<tr::SizeType32>(batchSize), static_cast<tr::SizeType32>(beamWidth),
         runtimeTopKOpt, runtimeTopPOpt, temperatureOpt, repetitionPenaltyOpt, presencePenaltyOpt, frequencyPenaltyOpt,
-        minLengthOpt, lengthPenaltyOpt, earlyStoppingOpt, beamSearchDiversityRateOpt, randomSeedOpt, topPDecayOpt,
-        topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, minPOpt, outputLogProbs, cumLogProbs);
+        promptIgnoreLengthOpt, minLengthOpt, lengthPenaltyOpt, earlyStoppingOpt, beamSearchDiversityRateOpt,
+        randomSeedOpt, topPDecayOpt, topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, minPOpt, outputLogProbs,
+        cumLogProbs);
 }
 
 th::Tensor DynamicDecodeOp::forward(

@@ -64,6 +64,9 @@ methods:
       frequency_penalty:
         annotation: Optional[float]
         default: null
+      prompt_ignore_length:
+        annotation: Optional[int]
+        default: null
       length_penalty:
         annotation: Optional[float]
         default: null
