@@ -1165,9 +1165,16 @@ class MLA(nn.Module):
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.forward_sparse_mla_kvcache_bf16(q, compressed_kv, k_pe, attn_metadata,
-                                       output, latent_cache, hidden_states, qr,
-                                       position_ids, is_generation = False)
+        return self.forward_sparse_mla_kvcache_bf16(q,
+                                                    compressed_kv,
+                                                    k_pe,
+                                                    attn_metadata,
+                                                    output,
+                                                    latent_cache,
+                                                    hidden_states,
+                                                    qr,
+                                                    position_ids,
+                                                    is_generation=False)
 
     def forward_generation_dsa(
         self,
@@ -1181,9 +1188,16 @@ class MLA(nn.Module):
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.forward_sparse_mla_kvcache_bf16(q, compressed_kv, k_pe, attn_metadata,
-                                       output, latent_cache, hidden_states, qr,
-                                       position_ids, is_generation = True)
+        return self.forward_sparse_mla_kvcache_bf16(q,
+                                                    compressed_kv,
+                                                    k_pe,
+                                                    attn_metadata,
+                                                    output,
+                                                    latent_cache,
+                                                    hidden_states,
+                                                    qr,
+                                                    position_ids,
+                                                    is_generation=True)
 
     def forward_context_with_cached_kv(
         self,
@@ -1459,8 +1473,9 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
         if self.is_dsa:
             return self.forward_generation_dsa(q, compressed_kv, k_pe,
-                                            attn_metadata, output, latent_cache,
-                                            hidden_states, qr, position_ids)
+                                               attn_metadata, output,
+                                               latent_cache, hidden_states, qr,
+                                               position_ids)
 
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
@@ -1555,7 +1570,6 @@ class MLA(nn.Module):
 
         return output
 
-
     def forward_sparse_mla_kvcache_bf16(
         self,
         q: torch.Tensor,
@@ -1579,65 +1593,32 @@ class MLA(nn.Module):
         """
         assert isinstance(attn_metadata, TrtllmAttentionMetadata), \
             "DSA requires TrtllmAttentionMetadata for now"
+        # Step 1: Append current tokens to paged cache and apply RoPE to q
+        # This writes latent_cache to paged KV and modifies q in-place
+        trtllm_attention = self.mqa
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata, is_generation=is_generation)
 
-        trtllm_attention = cast(TrtllmAttention, self.mqa)
-
-        # Step 1: Append current tokens to paged cache and apply RoPE to q/k and load full kv cache from paged memory
-        num_gen_seqs = 0
-        num_contexts = attn_metadata.num_contexts
-        if is_generation:
-            num_gen_seqs = attn_metadata.num_seqs - num_contexts
-            gen_block_offsets = attn_metadata.kv_cache_block_offsets[:, num_contexts:]
-            gen_host_block_offsets = attn_metadata.host_kv_cache_block_offsets[:, num_contexts:]
-
-            gen_kv_lens = attn_metadata.kv_lens_runtime[num_contexts:attn_metadata.num_seqs]
-            total_gen_kv_tokens = attn_metadata.host_gen_kv_indptr[num_gen_seqs].item()
-            max_gen_kv_len = gen_kv_lens.max().item()
-
-            trtllm_attention.mla_rope_append_paged_kv_assign_q(
-                q, latent_cache, attn_metadata,
-                num_seqs=num_gen_seqs,
-                cached_token_indptr=attn_metadata.gen_cached_token_indptr,
-                kv_indptr=attn_metadata.gen_kv_indptr,
-                max_seq_len=attn_metadata.max_gen_seq_len,
-                kv_cache_block_offsets=gen_block_offsets,
-                host_kv_cache_block_offsets=gen_host_block_offsets,
-            )
-            full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
-                attn_metadata,
-                q.dtype,
-                num_seqs=num_gen_seqs,
-                total_tokens=total_gen_kv_tokens,
-                max_seq_len=max_gen_kv_len,
-                kv_indptr=attn_metadata.gen_kv_indptr,
-                kv_cache_block_offsets=gen_block_offsets,
-                host_kv_cache_block_offsets=gen_host_block_offsets,
-            )
-        else:
-            # Apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
-            trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
-            # Load full latent cache from paged memory
-            full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
-                attn_metadata, q.dtype)
+        # Step 2: Load full latent cache from paged memory
+        full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
+            attn_metadata, q.dtype, is_generation=is_generation)
 
         full_latent_cache = torch.cat([full_compressed_kv, full_k_pe], dim=-1)
 
         num_tokens = q.shape[0]
         # find topk_indicies
-        topk_indices = self.mqa.indexer(q, k_pe, attn_metadata, hidden_states, qr, position_ids)
+        topk_indices = trtllm_attention.indexer(q, k_pe, attn_metadata,
+                                                hidden_states, qr, position_ids)
 
         # TODO: this is the local topk indices, we need to convert it to global topk indices
-        # Global indices related to the gen part cache; or prefill part cache 
+        # Global indices related to the gen part cache; or prefill part cache
         # Not for the entire batch global indices (batch-wide)
 
         q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         q_nope_out = torch.empty(
-            [
-                num_tokens, self.num_heads,
-                (self.kv_lora_rank)
-            ],
+            [num_tokens, self.num_heads, (self.kv_lora_rank)],
             dtype=q.dtype,
             device=q.device,
         )
@@ -1673,45 +1654,50 @@ class MLA(nn.Module):
         q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
         # Shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
 
-         # Step 2: Reshape inputs for sparse kernel
-        kv_c_and_k_pe_cache = full_latent_cache.view(-1, 1, full_latent_cache.shape[-1])
+        # Step 2: Reshape inputs for sparse kernel
+        kv_c_and_k_pe_cache = full_latent_cache.view(
+            -1, 1, full_latent_cache.shape[-1])
 
         # Step 3: Handle head padding (kernel requirement)
         sm_version = get_sm_version()
         # TODO: avoid sm version check in the runtime
-        padding = 128 if sm_version >= 100 else 64 # kernel limition to 128 for SM100 and 64 for SM90
+        padding = 128 if sm_version >= 100 else 64  # kernel limitation to 128 for SM100 and 64 for SM90
         if self.num_heads % padding != 0:
             # Assert that padding is mathematically valid
             assert padding % self.num_heads == 0, (
                 f"Cannot pad num_heads={self.num_heads} to {padding}. "
-                f"Padding must be a multiple of num_heads."
-            )
+                f"Padding must be a multiple of num_heads.")
 
             logger.warning_once(
                 f"Padding num_heads from {self.num_heads} to {padding} "
-                f"due to FlashMLA sparse attention kernel requirement"
-            )
+                f"due to FlashMLA sparse attention kernel requirement")
 
             # Create padded tensor with zeros for extra heads
-            q_padded = q_concat.new_empty((num_tokens, padding, q_concat.shape[2]))
+            q_padded = q_concat.new_empty(
+                (num_tokens, padding, q_concat.shape[2]))
             q_padded[:, :self.num_heads, :] = q_concat
             q_concat = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
         if flash_mla_sparse_fwd is not None:
-            attn_out_latent = flash_mla_sparse_fwd(q_concat, kv_c_and_k_pe_cache, topk_indices,
-                                                       self.softmax_scale)[0]
+            attn_out_latent = flash_mla_sparse_fwd(q_concat,
+                                                   kv_c_and_k_pe_cache,
+                                                   topk_indices,
+                                                   self.softmax_scale)[0]
         else:
-            raise RuntimeError("flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built.")
+            raise RuntimeError(
+                "flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built."
+            )
         # output: [seq, num_heads, kv_lora_rank]
         # [seq, num_heads, kv_lora_rank]
-        attn_out_latent = attn_out_latent[:, :self.num_heads, :] # account for padding
+        attn_out_latent = attn_out_latent[:, :self.
+                                          num_heads, :]  # account for padding
         # TODO: seems we need .contiguous() here when padding enabled before pass to bmm?
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads, self.kv_lora_rank])
 
-        assert (attn_out_latent.shape[0] == q.shape[0] and
-                attn_out_latent.shape[1] == self.num_heads)
+        assert (attn_out_latent.shape[0] == q.shape[0]
+                and attn_out_latent.shape[1] == self.num_heads)
 
         attn_output = output.view([num_tokens, self.num_heads, self.v_head_dim])
 

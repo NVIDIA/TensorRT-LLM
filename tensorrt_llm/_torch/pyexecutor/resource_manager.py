@@ -1226,19 +1226,15 @@ class BlockManager:
                     block_count_needed - len(self.block_ids[request_id]))
                 self.block_ids[request_id].extend(new_blocks)
 
-    def get_block_offsets(self, request_ids: List[int]) -> torch.Tensor:
-        kt_block_offsets = torch.empty(
-            [len(request_ids), self.max_blocks_per_seq],
-            device="cpu",
-            dtype=torch.int32)
+    def copy_block_offsets(self, request_ids: List[int],
+                           block_offsets: torch.Tensor) -> torch.Tensor:
         for i in range(len(request_ids)):
             block_ids = self.block_ids[request_ids[i]]
             block_num = len(block_ids)
-            kt_block_offsets[i, 0:block_num].copy_(
+            block_offsets[i, 0:block_num].copy_(
                 self.base_block_offsets[torch.tensor(block_ids,
                                                      dtype=torch.int32,
                                                      device="cpu")])
-        return kt_block_offsets
 
     def compute_block_count(self, token_count: int,
                             tokens_per_page: int) -> int:
@@ -1254,8 +1250,8 @@ class BlockManager:
             return
         request_id = request.py_request_id
         num_tokens = request.max_beam_num_tokens
-        updated_kt_token_num = num_tokens - rewind_len
-        block_count_needed = self.compute_block_count(updated_kt_token_num,
+        updated_token_num = num_tokens - rewind_len
+        block_count_needed = self.compute_block_count(updated_token_num,
                                                       self.tokens_per_block)
         num_rewind_pages = len(self.block_ids[request_id]) - block_count_needed
         if num_rewind_pages > 0:

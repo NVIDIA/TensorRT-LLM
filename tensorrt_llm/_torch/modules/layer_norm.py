@@ -92,7 +92,7 @@ class LayerNorm(nn.Module):
             weight=self.weight,
             bias=self.bias,
             eps=self.variance_epsilon,
-        )
+        ).to(input_dtype)
 
         if residual is ...:
             return hidden_states

@@ -765,32 +765,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
 
-            # Separate buffers for generation MLA with cached KV
-            # Note: Could be enabled independently via enable_generation_mla_with_cached_kv
-            # For now, automatically enable if context MLA is enabled (simplifies configuration)
-            if self.enable_generation_mla_with_cached_kv:
-                # Indptr arrays for generation sequences
-                self.gen_cached_token_indptr = get_empty(
-                    (self.max_num_requests + 1, ),
-                    cache_name="gen_cached_token_indptr",
-                    dtype=torch.int64,
-                )
-                self.host_gen_cached_token_indptr = torch.zeros_like(
-                    self.gen_cached_token_indptr,
-                    device='cpu',
-                    pin_memory=True,
-                )
-                self.gen_kv_indptr = get_empty(
-                    (self.max_num_requests + 1, ),
-                    cache_name="gen_kv_indptr",
-                    dtype=torch.int64,
-                )
-                self.host_gen_kv_indptr = torch.zeros_like(
-                    self.gen_kv_indptr,
-                    device='cpu',
-                    pin_memory=True,
-                )
-
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
@@ -848,10 +822,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # prepare for kv cache reuse/chunked context in MLA
         if self.enable_context_mla_with_cached_kv:
             self.prepare_context_mla_with_cached_kv(cached_token_lens, kv_lens)
-
-        # Prepare for generation MLA with cached KV
-        if self.enable_generation_mla_with_cached_kv and self.num_generations > 0:
-            self.prepare_generation_mla_with_cached_kv(cached_token_lens, kv_lens)
 
         # kv block offsets
         assert self.request_ids is not None
@@ -1077,34 +1047,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                      out=self.host_ctx_kv_indptr[1:self.num_contexts + 1])
         self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
             self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
-
-    def prepare_generation_mla_with_cached_kv(self,
-                                              cached_token_lens: torch.Tensor,
-                                              kv_lens: torch.Tensor) -> None:
-        """
-        Prepare indptr buffers for GENERATION sequences in MLA.
-        Handles generation-only or mixed batches (when num_generations > 0).
-        """
-        if self.num_generations > 0:
-            gen_cached_lens = cached_token_lens[self.num_contexts:self.num_seqs]
-            gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
-            gen_new_token_lens = self.seq_lens[self.num_contexts:self.num_seqs]
-
-            # Build cumulative indptr arrays for generation sequences
-            self.host_gen_cached_token_indptr[0] = 0
-            torch.cumsum(gen_cached_lens, dim=0, dtype=torch.int64,
-                        out=self.host_gen_cached_token_indptr[1:self.num_generations + 1])
-            self.gen_cached_token_indptr[:self.num_generations + 1].copy_(
-                self.host_gen_cached_token_indptr[:self.num_generations + 1], non_blocking=True)
-
-            self.host_gen_kv_indptr[0] = 0
-            torch.cumsum(gen_kv_lens, dim=0, dtype=torch.int64,
-                        out=self.host_gen_kv_indptr[1:self.num_generations + 1])
-            self.gen_kv_indptr[:self.num_generations + 1].copy_(
-                self.host_gen_kv_indptr[:self.num_generations + 1], non_blocking=True)
-
-            # Max new tokens for generation (typically 1)
-            self.max_gen_seq_len = gen_new_token_lens.max().item()
 
     def update_spec_dec_param(
         self,
@@ -1475,54 +1417,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         out_dtype: torch.dtype,
-        num_seqs: Optional[int] = None,
-        total_tokens: Optional[int] = None,
-        max_seq_len: Optional[int] = None,
-        kv_indptr: Optional[torch.Tensor] = None,
-        kv_cache_block_offsets: Optional[torch.Tensor] = None,
-        host_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Load paged KV cache for MLA.
-
-        Args:
-            metadata: Attention metadata
-            out_dtype: Output data type (fp16, bf16, or fp32)
-            num_seqs: Number of sequences (defaults to metadata.num_contexts)
-            total_tokens: Total number of tokens (defaults to metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens)
-            max_seq_len: Max sequence length (defaults to metadata.max_ctx_kv_len)
-            kv_indptr: Cumulative KV counts (defaults to metadata.ctx_kv_indptr)
-            kv_cache_block_offsets: Block offsets (defaults to metadata.kv_cache_block_offsets)
-            host_kv_cache_block_offsets: Host block offsets (defaults to metadata.host_kv_cache_block_offsets)
-        """
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-
-        # Backward compatibility
-        num_seqs = num_seqs if num_seqs is not None else metadata.num_contexts
-        total_tokens = total_tokens if total_tokens is not None else (metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens)
-        max_seq_len = max_seq_len if max_seq_len is not None else metadata.max_ctx_kv_len
-        kv_indptr = kv_indptr if kv_indptr is not None else metadata.ctx_kv_indptr
-        kv_cache_block_offsets = kv_cache_block_offsets if kv_cache_block_offsets is not None else metadata.kv_cache_block_offsets
-        host_kv_cache_block_offsets = host_kv_cache_block_offsets if host_kv_cache_block_offsets is not None else metadata.host_kv_cache_block_offsets
-
-        # Validate only when using context defaults
-        if total_tokens == metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens:
-            assert metadata.max_ctx_kv_len > 0
-            assert total_tokens == metadata.host_ctx_kv_indptr[metadata.num_contexts]
+        assert metadata.max_ctx_kv_len > 0
+        assert metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens == metadata.host_ctx_kv_indptr[
+            metadata.num_contexts]
 
         sink_token_length = 0
         beam_width = 1
 
         compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
             out_dtype,
-            num_seqs,
-            total_tokens,
-            max_seq_len,
-            kv_indptr,
-            kv_cache_block_offsets,
-            host_kv_cache_block_offsets,
+            metadata.num_contexts,
+            metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens,
+            metadata.max_ctx_kv_len,
+            metadata.ctx_kv_indptr,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
@@ -1592,37 +1506,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-        num_seqs: Optional[int] = None,
-        cached_token_indptr: Optional[torch.Tensor] = None,
-        kv_indptr: Optional[torch.Tensor] = None,
-        max_seq_len: Optional[int] = None,
-        kv_cache_block_offsets: Optional[torch.Tensor] = None,
-        host_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> None:
-        """
-        Apply RoPE and append to paged KV cache for MLA.
-
-        Args:
-            q: Query tensor to apply RoPE to (modified in-place)
-            latent_cache: Latent cache containing compressed_kv and k_pe
-            metadata: Attention metadata
-            num_seqs: Number of sequences (defaults to metadata.num_contexts)
-            cached_token_indptr: Cumulative cached token counts (defaults to metadata.ctx_cached_token_indptr)
-            kv_indptr: Cumulative KV counts (defaults to metadata.ctx_kv_indptr)
-            max_seq_len: Max sequence length (defaults to metadata.max_ctx_seq_len)
-            kv_cache_block_offsets: Block offsets (defaults to metadata.kv_cache_block_offsets)
-            host_kv_cache_block_offsets: Host block offsets (defaults to metadata.host_kv_cache_block_offsets)
-        """
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-
-        # Backward compatibility
-        num_seqs = num_seqs if num_seqs is not None else metadata.num_contexts
-        cached_token_indptr = cached_token_indptr if cached_token_indptr is not None else metadata.ctx_cached_token_indptr
-        kv_indptr = kv_indptr if kv_indptr is not None else metadata.ctx_kv_indptr
-        max_seq_len = max_seq_len if max_seq_len is not None else metadata.max_ctx_seq_len
-        kv_cache_block_offsets = kv_cache_block_offsets if kv_cache_block_offsets is not None else metadata.kv_cache_block_offsets
-        host_kv_cache_block_offsets = host_kv_cache_block_offsets if host_kv_cache_block_offsets is not None else metadata.host_kv_cache_block_offsets
 
         sink_token_length = 0
         beam_width = 1
@@ -1630,17 +1517,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
             q,
             latent_cache,
-            num_seqs,
-            cached_token_indptr,
-            kv_indptr,
-            max_seq_len,
+            metadata.num_contexts,
+            metadata.ctx_cached_token_indptr,
+            metadata.ctx_kv_indptr,
+            metadata.max_ctx_seq_len,
             self.wrapper.rotary_cos_sin,
             self.num_heads,
             self.mla_params.qk_nope_head_dim,
             self.mla_params.qk_rope_head_dim,
             self.mla_params.kv_lora_rank,
-            kv_cache_block_offsets,
-            host_kv_cache_block_offsets,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,

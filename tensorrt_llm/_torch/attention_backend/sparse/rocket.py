@@ -43,6 +43,11 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             device='cuda',
         )
+        self.host_kt_cache_block_offsets = torch.zeros_like(
+            self.kt_cache_block_offsets,
+            device='cpu',
+            pin_memory=True,
+        )
 
     @property
     def kt_tokens_per_block(self) -> Optional[int]:
@@ -84,8 +89,8 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
 
             # for kt cache
-            self.host_kt_cache_block_offsets = self.kv_cache_manager.get_kt_block_offsets(
-                self.request_ids)
+            self.kv_cache_manager.copy_kt_block_offsets(
+                self.request_ids, self.host_kt_cache_block_offsets)
             self.kt_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_kt_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
@@ -926,8 +931,9 @@ class RocketKVCacheManager(KVCacheManager):
     def get_kt_buffers(self, layer_idx: int):
         return self.kt_cache_pool_per_layer[layer_idx]
 
-    def get_kt_block_offsets(self, request_ids: List[int]) -> torch.Tensor:
-        return self.kt_cache_manager.get_block_offsets(request_ids)
+    def copy_kt_block_offsets(self, request_ids: List[int],
+                              block_offsets: torch.Tensor) -> torch.Tensor:
+        self.kt_cache_manager.copy_block_offsets(request_ids, block_offsets)
 
     def prepare_resources(self, scheduled_batch):
         super().prepare_resources(scheduled_batch)

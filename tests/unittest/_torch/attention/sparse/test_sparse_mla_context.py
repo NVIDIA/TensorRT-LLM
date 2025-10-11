@@ -529,7 +529,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0] * len(gen_with_cache)),
             mapping=mapping,
-            enable_context_mla_with_cached_kv=True,
         )
         cached_metadata.prepare()
                 
@@ -577,7 +576,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             num_cached_tokens_per_seq=[cached_lens[i] for i in batch_order],
         ),
         mapping=mapping,
-        enable_context_mla_with_cached_kv=num_contexts > 0,
     )
     attn_metadata.prepare()
     
