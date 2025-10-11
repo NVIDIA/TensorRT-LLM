@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
@@ -287,6 +288,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.output_sf = generationsParams.context_buf_sf;
     xqaParams.fp4_out_sf_scale = generationsParams.attention_output_sf_scale;
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
+    // Parameters for sparse attention
+    xqaParams.sparse_params = mRuntimeSparseAttentionParams;
+    xqaParams.use_sparse_attention = useTllmGenSparseAttention();
 
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
@@ -813,7 +817,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 }
 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
-    int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
+    int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -909,11 +913,15 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     size_t xqa_workspace_size = 0;
     if (mEnableXQA)
     {
-        int const XQA_NUM_BUFFERS = 7;
+        int const XQA_NUM_BUFFERS = 8;
         size_t xqa_workspaces[XQA_NUM_BUFFERS];
         size_t const cu_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
+        // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
+        size_t const sparse_attn_cache_size = useTllmGenSparseAttention()
+            ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
+            : 0;
         xqa_workspaces[0] = cu_seqlens_size;
         xqa_workspaces[1] = cu_kv_seqlens_size;
         xqa_workspaces[2] = rotary_inv_freq_size;
@@ -922,7 +930,8 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         // Scales used for trtllm-gen kernels.
         xqa_workspaces[4] = sizeof(float) * 2;
         xqa_workspaces[5] = sizeof(float);
-        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
+        xqa_workspaces[6] = sparse_attn_cache_size;
+        xqa_workspaces[7] = mXqaDispatcher->getWorkspaceSize(
             std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
@@ -1647,6 +1656,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.spec_decoding_position_offsets = nullptr;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
+        // Sparse KV write
+        preprocessingParams.sparse_kv_indices = mRuntimeSparseAttentionParams.sparse_kv_indices;
+        preprocessingParams.sparse_kv_offsets = mRuntimeSparseAttentionParams.sparse_kv_offsets;
+
         // Scalars
         preprocessingParams.batch_size = params.batch_size;
         preprocessingParams.max_input_seq_len = params.input_seq_length;
@@ -1676,6 +1689,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         preprocessingParams.rotary_vision_start = mVisionStart;
         preprocessingParams.rotary_vision_length = mVisionLength;
+        preprocessingParams.is_last_chunk
+            = !mAttentionChunkSize.has_value() || (params.input_seq_length == params.max_past_kv_length);
 
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
@@ -1839,6 +1854,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             this->template ulyssesContextPostprocess<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
                 gatherInBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, stream);
+            sync_check_cuda_error(stream);
+        }
+
+        if (!mIsMLAEnabled) // Only for non-MLA attention
+        {
+            invokeKvCachePostprocessing(preprocessingParams, stream);
             sync_check_cuda_error(stream);
         }
     }
