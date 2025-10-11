@@ -4,10 +4,33 @@ set -ex
 GITHUB_URL="https://github.com"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="0.5.0"
+NIXL_VERSION="0.6.1"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
+# install libfabric
+LIBFABRIC_INSTALL_PATH="/usr/local/libfabric/"
+LIBFABRIC_REPO="https://github.com/ofiwg/libfabric.git"
+LIBFABRIC_VERSION="v2.3.0"
+git clone --depth 1 -b ${LIBFABRIC_VERSION} ${LIBFABRIC_REPO}
+cd libfabric
+./autogen.sh
+./configure --prefix=${LIBFABRIC_INSTALL_PATH} \
+    --disable-verbs \
+    --disable-psm3 \
+    --disable-opx \
+    --disable-usnic \
+    --disable-rstream \
+    --enable-efa \
+    --with-cuda=/usr/local/cuda \
+    --enable-cuda-dlopen
+
+make install -j$(nproc)
+cd ..
+rm -rf libfabric
+echo "export LD_LIBRARY_PATH=/usr/local/libfabric/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
+
+# install nixl
 ARCH_NAME="x86_64-linux-gnu"
 GDS_PATH="$CUDA_PATH/targets/x86_64-linux"
 if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
@@ -31,6 +54,7 @@ CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
+    -Dlibfabric_path=$LIBFABRIC_INSTALL_PATH \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
@@ -40,5 +64,3 @@ cd builddir && ninja install
 cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
-
-echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
