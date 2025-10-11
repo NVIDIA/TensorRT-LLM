@@ -1579,48 +1579,44 @@ class MLA(nn.Module):
         """
         assert isinstance(attn_metadata, TrtllmAttentionMetadata), \
             "DSA requires TrtllmAttentionMetadata for now"
-        # Step 1: Append current tokens to paged cache and apply RoPE to q
-        # This writes latent_cache to paged KV and modifies q in-place
-        trtllm_attention = cast(TrtllmAttention, self.mqa)
-        trtllm_attention.mla_rope_append_paged_kv_assign_q(
-            q, latent_cache, attn_metadata)
 
-        # Step 2: Load full latent cache from paged memory
+        trtllm_attention = cast(TrtllmAttention, self.mqa)
+
+        # Step 1: Append current tokens to paged cache and apply RoPE to q/k and load full kv cache from paged memory
+        num_gen_seqs = 0
+        num_contexts = attn_metadata.num_contexts
         if is_generation:
-            # Generation: load per-request with variable lengths
-            num_generations = attn_metadata.num_generations
-            gen_kv_lens = attn_metadata.kv_lens_runtime[attn_metadata.num_contexts:attn_metadata.num_seqs]
-            total_gen_kv_tokens = gen_kv_lens.sum().item()
+            num_gen_seqs = attn_metadata.num_seqs - num_contexts
+            gen_block_offsets = attn_metadata.kv_cache_block_offsets[:, num_contexts:]
+            gen_host_block_offsets = attn_metadata.host_kv_cache_block_offsets[:, num_contexts:]
+
+            gen_kv_lens = attn_metadata.kv_lens_runtime[num_contexts:attn_metadata.num_seqs]
+            total_gen_kv_tokens = attn_metadata.host_gen_kv_indptr[num_gen_seqs].item()
             max_gen_kv_len = gen_kv_lens.max().item()
 
-            # Build cumulative indptr
-            gen_kv_indptr = torch.zeros(num_generations + 1, dtype=torch.int64, device='cuda')
-            torch.cumsum(gen_kv_lens, dim=0, dtype=torch.int64, out=gen_kv_indptr[1:])
-
-            # Load from paged cache
-            full_compressed_kv, full_k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
+            trtllm_attention.mla_rope_append_paged_kv_assign_q(
+                q, latent_cache, attn_metadata,
+                num_seqs=num_gen_seqs,
+                cached_token_indptr=attn_metadata.gen_cached_token_indptr,
+                kv_indptr=attn_metadata.gen_kv_indptr,
+                max_seq_len=attn_metadata.max_gen_seq_len,
+                kv_cache_block_offsets=gen_block_offsets,
+                host_kv_cache_block_offsets=gen_host_block_offsets,
+            )
+            full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
+                attn_metadata,
                 q.dtype,
-                num_generations,
-                total_gen_kv_tokens,
-                max_gen_kv_len,
-                gen_kv_indptr,
-                attn_metadata.kv_cache_block_offsets[:, attn_metadata.num_contexts:attn_metadata.num_seqs],
-                attn_metadata.host_kv_cache_block_offsets[:, attn_metadata.num_contexts:attn_metadata.num_seqs],
-                attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
-                attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
-                trtllm_attention.kv_scale_orig_quant,
-                trtllm_attention.kv_scale_quant_orig,
-                trtllm_attention.get_local_layer_idx(attn_metadata),
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                attn_metadata.kv_cache_manager.tokens_per_block,
-                attn_metadata.kv_cache_manager.max_seq_len,
-                0,  # sink_token_length
-                attn_metadata.beam_width,
-                trtllm_attention.wrapper.quant_mode,
+                num_seqs=num_gen_seqs,
+                total_tokens=total_gen_kv_tokens,
+                max_seq_len=max_gen_kv_len,
+                kv_indptr=attn_metadata.gen_kv_indptr,
+                kv_cache_block_offsets=gen_block_offsets,
+                host_kv_cache_block_offsets=gen_host_block_offsets,
             )
         else:
-            # Context: use existing metadata-based loading
+            # Apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+            trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+            # Load full latent cache from paged memory
             full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
                 attn_metadata, q.dtype)
 
@@ -1631,6 +1627,8 @@ class MLA(nn.Module):
         topk_indices = self.mqa.indexer(q, k_pe, attn_metadata, hidden_states, qr, position_ids)
 
         # TODO: this is the local topk indices, we need to convert it to global topk indices
+        # Global indices related to the gen part cache; or prefill part cache 
+        # Not for the entire batch global indices (batch-wide)
 
         q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)

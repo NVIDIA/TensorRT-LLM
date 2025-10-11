@@ -83,6 +83,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __init__(self, *args, **kwargs):
         # TODO: Required for sparse MLA to use load_paged_kv_cache_for_mla&mla_rope_append_paged_kv_assign_q kernels
         kwargs["enable_context_mla_with_cached_kv"] = True
+        kwargs["enable_generation_mla_with_cached_kv"] = True
         super().__init__(*args, **kwargs)
 
     def __post_init__(self):
