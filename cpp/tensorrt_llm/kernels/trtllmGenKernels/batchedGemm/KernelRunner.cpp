@@ -18,11 +18,11 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 // DO NOT include cudaUtils.h and logger.h before BatchedGemmInterface.h as it #undef TLLM_LOG_INFO and co.
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm
