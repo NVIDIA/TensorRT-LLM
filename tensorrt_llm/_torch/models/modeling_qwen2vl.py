@@ -979,7 +979,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
         return [
             "image.pixel_values", "image.image_grid_thw",
             "video.pixel_values_videos", "video.video_grid_thw",
-            "multimodal_embedding", "mrope_config.mrope_position_ids"
+            "multimodal_embedding"
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
@@ -1032,12 +1032,12 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
             return [
                 "image.pixel_values", "video.pixel_values_videos",
                 "image.image_grid_thw", "video.video_grid_thw",
-                "multimodal_embedding", "mrope_config.mrope_position_ids"
+                "multimodal_embedding"
             ]
         else:
             return [
                 "image.pixel_values", "video.pixel_values_videos",
-                "multimodal_embedding", "mrope_config.mrope_position_ids"
+                "multimodal_embedding"
             ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
