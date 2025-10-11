@@ -13,6 +13,12 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
 ])
 @pytest.mark.parametrize("dtype",
                          [torch.float16, torch.bfloat16, torch.float32])
+# @pytest.mark.parametrize("seq_len", [1])
+# @pytest.mark.parametrize("num_experts, n_group, topk_group, top_k", [
+#     (256, 8, 4, 8),
+# ])
+# @pytest.mark.parametrize("dtype",
+#                          [torch.float16])
 def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     ROUTED_SCALING_FACTOR = 2.5
     HIDDEN_SIZE = 7168
@@ -69,6 +75,10 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     sorted_selected_values, _ = torch.sort(selected_values)
     ref_sorted_selected_values, _ = torch.sort(ref_selected_values)
 
+    print(sorted_selected_values)
+    print(ref_sorted_selected_values)
+    print(selected_indices)
+    print(ref_selected_indices)
     # compare
     torch.cuda.synchronize()
 
