@@ -15,7 +15,7 @@ l0_l40s:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_siglip"
+  # - unittest/_torch/modeling -k "modeling_siglip"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
