@@ -960,39 +960,36 @@ class TestLlmError:
             llm.generate([ids])
 
 
-@pytest.mark.skip(reason="https://nvbugs/5560921")
 @skip_ray
 def test_llm_rpc():
     # TODO: remove the with-statement when shutdown hang issue is fixed
-    with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config,
-             orchestrator_type="rpc") as llm:
-        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              orchestrator_type="rpc")
+    assert isinstance(llm._executor, GenerationExecutorRpcProxy)
 
-        res = llm.generate("Tell me a joke",
-                           sampling_params=SamplingParams(max_tokens=10,
-                                                          end_id=-1))
-        print(f"get result: {res}")
+    res = llm.generate("Tell me a joke",
+                       sampling_params=SamplingParams(max_tokens=10, end_id=-1))
+    print(f"get result: {res}")
 
-        assert len(res.outputs) == 1
-        assert len(res.outputs[0].token_ids) == 10
+    assert len(res.outputs) == 1
+    assert len(res.outputs[0].token_ids) == 10
 
 
-@pytest.mark.skip(reason="https://nvbugs/5560921")
 @skip_ray
 @pytest.mark.asyncio
 async def test_llm_rpc_streaming():
     # TODO: remove the with-statement when shutdown hang issue is fixed
-    with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config,
-             orchestrator_type="rpc") as llm:
-        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              orchestrator_type="rpc")
+    assert isinstance(llm._executor, GenerationExecutorRpcProxy)
 
-        outputs = []
-        async for output in llm.generate_async("Tell me a joke",
-                                               sampling_params=SamplingParams(
-                                                   max_tokens=10, end_id=-1),
-                                               streaming=True):
-            outputs.append(output.outputs[0].text)
-        "".join(outputs)
-        print(f"get result: {outputs}")
+    outputs = []
+    async for output in llm.generate_async("Tell me a joke",
+                                           sampling_params=SamplingParams(
+                                               max_tokens=10, end_id=-1),
+                                           streaming=True):
+        outputs.append(output.outputs[0].text)
+    "".join(outputs)
+    print(f"get result: {outputs}")
