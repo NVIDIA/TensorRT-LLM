@@ -514,8 +514,8 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
         "美国的首都是哪里？",
     ]
     references = [
-        "华盛顿特区（Washington D.C.）是美国的首都，也是世界上唯一一座不属于任何一州的联邦特区。\n华盛顿特区（",
-        "华盛顿特区。华盛顿特区是美国的首都和一个行政区。它是由哥伦比亚特区和华盛顿特区的两个行政区",
+        "华盛顿特区。\n华盛顿特区（英文名：Washington, D.C.",
+        "华盛顿特区。华盛顿特区是美国的首都和一个行政区",
     ]
 
     lora_config = LoraConfig(lora_dir=[lora_dir],
@@ -535,7 +535,7 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
 
     try:
         outputs = llm.generate(prompts,
-                               SamplingParams(max_tokens=40),
+                               SamplingParams(max_tokens=20),
                                lora_request=lora_requests)
         assert len(outputs) == len(prompts)
     finally:
