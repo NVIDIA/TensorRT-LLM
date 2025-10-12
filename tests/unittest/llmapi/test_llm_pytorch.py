@@ -26,7 +26,8 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        prompts, run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
+                        skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -507,6 +508,7 @@ def test_nemotron_nas_lora() -> None:
 
 @skip_gpu_memory_less_than_80gb
 def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
+    skip_fp8_pre_ada(use_fp8=True)
     model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
     lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
     prompt = "美国的首都是哪里？"
