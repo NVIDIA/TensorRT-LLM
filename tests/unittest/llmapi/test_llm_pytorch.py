@@ -32,8 +32,6 @@ from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 import tempfile
 
 import torch
@@ -508,64 +506,42 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-@pytest.mark.skip(reason="https://nvbugs/5521949")
-def test_codellama_fp8_with_bf16_lora() -> None:
-    model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
-    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
-                               kv_cache_quant_algo=QuantAlgo.FP8)
+def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
+    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
 
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
+    lora_config = LoraConfig(lora_dir=[lora_dir],
+                             max_lora_rank=64,
+                             max_loras=2,
+                             max_cpu_loras=2)
+    llm = LLM(
+        model_dir,
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
+    prompts = [
+        "美国的首都是哪里？",
+        "美国的首都是哪里？",
+    ]
+    references = [
+        "华盛顿特区（Washington D.C.）是美国的首都，也是世界上唯一一座不属于任何一州的联邦特区。\n华盛顿特区（",
+        "华盛顿特区。华盛顿特区是美国的首都和一个行政区。它是由哥伦比亚特区和华盛顿特区的两个行政区",
+    ]
 
-    # Set up temporary directory for LoRA adapters
-    with tempfile.TemporaryDirectory() as lora_dir:
-        print("Creating dummy LoRAs...")
+    lora_req = LoRARequest("lora-chinese", 0, lora_dir)
+    lora_requests = [None, lora_req]
+    assert len(lora_requests) == len(prompts)
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-
-        lora_config = PeftLoraConfig(r=8,
-                                     target_modules=hf_modules,
-                                     bias="none",
-                                     task_type="CAUSAL_LM")
-
-        lora_paths = []
-        for i in range(2):
-            lora_model = get_peft_model(model, lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        lora_config = LoraConfig(lora_dir=lora_paths,
-                                 lora_target_modules=target_modules,
-                                 max_lora_rank=8,
-                                 max_loras=2,
-                                 max_cpu_loras=2)
-
-        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
-
-        prompts = [
-            "Write a function that calculates the Fibonacci sequence.",
-            "Convert this C++ code to Python: int x = 0; x++;",
-        ]
-
-        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
-        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
-        lora_requests = [lora_req1, lora_req2]
-        sampling_params = SamplingParams(max_tokens=200)
-
+    try:
         outputs = llm.generate(prompts,
-                               sampling_params,
+                               SamplingParams(max_tokens=40),
                                lora_request=lora_requests)
-
-        assert len(outputs) == 2
+        assert len(outputs) == len(prompts)
+    finally:
+        llm.shutdown()
+    for output, ref in zip(outputs, references):
+        assert similar(output.outputs[0].text, ref)
 
 
 @skip_gpu_memory_less_than_80gb
