@@ -12,7 +12,10 @@
    Install CUDA Toolkit following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) and
    make sure `CUDA_HOME` environment variable is properly set.
 
-   > TensorRT LLM 1.1 supports both CUDA 12.9 and 13.0. The wheel package release only supports CUDA 12.9, while CUDA 13.0 is only supported through NGC container release.
+   ```{tip}
+   :name: installation-linux-tip-cuda-version
+   TensorRT LLM 1.1 supports both CUDA 12.9 and 13.0. The wheel package release only supports CUDA 12.9, while CUDA 13.0 is only supported through NGC container release.
+   ```
 
    ```bash
    # Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform

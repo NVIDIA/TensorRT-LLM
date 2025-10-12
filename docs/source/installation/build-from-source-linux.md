@@ -147,7 +147,10 @@ check <https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker>.
 
 ## Build TensorRT LLM
 
-   > TensorRT LLM 1.1 supports both CUDA 12.9 and 13.0 while some dependency changes are required. The `requirements.txt` contains dependencies needed by CUDA 13.0. If you are using CUDA 12.9, please uncomment lines end with `# <For CUDA 12.9>` and comment out the next lines.
+```{tip}
+:name: build-from-source-tip-cuda-version
+TensorRT LLM 1.1 supports both CUDA 12.9 and 13.0 while some dependency changes are required. The `requirements.txt` contains dependencies needed by CUDA 13.0. If you are using CUDA 12.9, please uncomment lines end with `# <For CUDA 12.9>` and comment out the next lines.
+```
 
 ### Option 1: Full Build with C++ Compilation
 
