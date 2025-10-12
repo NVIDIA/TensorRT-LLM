@@ -97,7 +97,7 @@ def BUILD_CONFIGS = [
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
+BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
 
 SLURM_CORES_REQUEST = "1"
@@ -967,16 +967,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
-    // TODO: remove this after GH200 driver upgrade
-    def hostnameMatch = ""
-    if (type == "gh200") {
-        hostnameMatch = """
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "lego-cg1-qct-070.ipp3a2.colossus"
-                                - "lego-cg1-qct-079.ipp3a2.colossus\""""
-    }
 
     def podConfig = [
         cloud: targetCould,
@@ -997,7 +987,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
-                                - "core"${hostnameMatch}
+                                - "core"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -1278,6 +1268,15 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         makoArgs += ["auto_trigger=gpt_oss"]
     } else {
         makoArgs += ["auto_trigger=others"]
+    }
+    if (stageName.contains("-Ray-")) {
+        // If stageName contains "-Ray-", add "orchestrator=ray" to makoArgs
+        // At this point, only tests with orchestrator=ray or unspecified orchestrator will be run.
+        // Mark tests with orchestrator=mpi to exclude them from Ray stage.
+        makoArgs += ["orchestrator=ray"]
+    } else {
+        // Otherwise select tests with orchestrator=mpi or unspecified orchestrator
+        makoArgs += ["orchestrator=mpi"]
     }
 
     if (parseSysinfo) {
@@ -1708,6 +1707,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "--perf-log-formats yaml"
             ]
         }
+        if (stageName.contains("-Ray-")) {
+            testCmdLine += ["--run-ray"]
+
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
+        }
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
         sh "echo ${TRTLLM_WHL_PATH}"
@@ -2049,6 +2053,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-2_GPUs-PyTorch-Ray-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
@@ -2071,6 +2076,7 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
+        "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
@@ -2158,6 +2164,7 @@ def launchTestJobs(pipeline, testFilter)
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],

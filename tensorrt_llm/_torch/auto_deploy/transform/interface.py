@@ -3,17 +3,26 @@
 This module defines the base classes and interfaces for all transforms.
 """
 
+import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum
-from functools import total_ordering
+from functools import total_ordering, wraps
 from typing import Any, Callable, Dict, Mapping, Tuple, Type, Union, final
 
+import torch.nn as nn
 from pydantic import BaseModel, Field
 from torch.fx import GraphModule
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
-from ..transformations._graph import canonicalize_graph, lift_to_meta, run_shape_prop
+from ..transformations._graph import (
+    canonicalize_graph,
+    lift_to_meta,
+    named_graphmodules,
+    placeholders_on_meta,
+    run_shape_prop,
+)
 from ..utils.logger import ad_logger
 from ..utils.sharding_utils import ShardingConfig
 
@@ -71,6 +80,10 @@ class TransformConfig(BaseModel):
     )
 
     ### OPTIONAL CONFIG ###########################################################################
+    run_per_gm: bool = Field(
+        description="Whether to run the transform per graph (sub)module or on whole module.",
+        default=False,
+    )
     enabled: bool = Field(
         default=True,
         description="Whether to enable this transform.",
@@ -136,6 +149,39 @@ class TransformInfo(BaseModel):
 TransformHistory = Dict[str, TransformInfo]
 
 
+def with_transform_logging(call_fn: Callable) -> Callable:
+    """Decorator to prepend transform-specific prefix to all ad_logger logs during __call__.
+
+    Temporarily patches `ad_logger.log` so that any logs emitted within the call automatically
+    include the `[stage=..., transform=...]` prefix that `_log_info` would otherwise add manually.
+    The original logger behavior is restored after the call, even if an exception occurs.
+    """
+
+    @wraps(call_fn)
+    def _wrapper(
+        self,
+        gm: nn.Module,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> nn.Module:
+        prefix = f"[stage={self.config.stage.value}, transform={self.get_transform_key()}]"
+        original_log = ad_logger.log
+
+        def _patched_log(severity, *msg):
+            if msg and isinstance(msg[0], str) and msg[0].startswith(prefix):
+                return original_log(severity, *msg)
+            return original_log(severity, prefix, *msg)
+
+        ad_logger.log = _patched_log  # type: ignore[assignment]
+        try:
+            return call_fn(self, gm, cm, factory, shared_config)
+        finally:
+            ad_logger.log = original_log  # type: ignore[assignment]
+
+    return _wrapper
+
+
 class BaseTransform(ABC):
     """A base class for all transforms."""
 
@@ -198,14 +244,15 @@ class BaseTransform(ABC):
         config = cls.get_config_class()(**kwargs)
         return cls(config=config)
 
+    @with_transform_logging
     @final
     def __call__(
         self,
-        gm: GraphModule,
+        gm: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> GraphModule:
+    ) -> nn.Module:
         """Apply the transform to the graph.
 
         Args:
@@ -239,22 +286,32 @@ class BaseTransform(ABC):
         # show debug info for debug config
         ad_logger.debug(f"{t_name} config: {self.config}")
 
+        # store some timing information
+        elapsed_time_total = -time.time()
+        elapsed_time_pre_cleanup = 0.0
+        elapsed_time_apply = 0.0
+        elapsed_time_post_cleanup = 0.0
+
         # run or skip the transform
         if self.config.enabled:
             # run graph pre-cleanup
+            elapsed_time_pre_cleanup = -time.time()
             is_clean_pre, has_valid_shapes_pre = self._run_pre_cleanup(gm, info_last)
+            elapsed_time_pre_cleanup += time.time()
 
             # run the transform in a error-handling wrapper if desired
+            elapsed_time_apply = -time.time()
             if self.config.skip_on_error:
                 try:
-                    gm, info = self._apply(gm, cm, factory, shared_config)
+                    gm, info = self._apply_per_gm(gm, cm, factory, shared_config)
                 except Exception as e:
                     error_msg = f"Transform {t_name} failed"
                     ad_logger.warning(f"{error_msg}: {e}")
                     info = TransformInfo(skipped=True, num_matches=0)
             else:
                 # handle this here normally to improve debugging and error message
-                gm, info = self._apply(gm, cm, factory, shared_config)
+                gm, info = self._apply_per_gm(gm, cm, factory, shared_config)
+            elapsed_time_apply += time.time()
 
             # we cannot say it's clean if the previous wasn't clean even if this one is
             # create new info object with updated cleanup status
@@ -264,13 +321,17 @@ class BaseTransform(ABC):
             info = TransformInfo(**info_dict)
 
             # run graph post-cleanup
+            elapsed_time_post_cleanup = -time.time()
             info = self._run_post_cleanup(gm, info)
+            elapsed_time_post_cleanup += time.time()
         else:
             # skip the transform and set info object using the last transform info
             info_dict = info_last.model_dump()
             info_dict["skipped"] = True
             info_dict["num_matches"] = 0
             info = TransformInfo(**info_dict)
+
+        elapsed_time_total += time.time()
 
         # log the result of the transform
         log_msgs = [
@@ -280,6 +341,13 @@ class BaseTransform(ABC):
             f"has_valid_shapes={info.has_valid_shapes}",
         ]
         self._log_info(", ".join(log_msgs))
+        log_msgs_timing = [
+            f"elapsed time: total={elapsed_time_total:.3f}s",
+            f"pre_cleanup={elapsed_time_pre_cleanup:.3f}s",
+            f"apply={elapsed_time_apply:.3f}s",
+            f"post_cleanup={elapsed_time_post_cleanup:.3f}s",
+        ]
+        self._log_info(", ".join(log_msgs_timing))
         ad_logger.debug(f"Graph after {t_name}: {gm}")
 
         # update + store new meta data
@@ -291,14 +359,36 @@ class BaseTransform(ABC):
         return gm
 
     @final
+    def _apply_per_gm(
+        self,
+        gm: nn.Module,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if not self.config.run_per_gm:
+            return self._apply(gm, cm, factory, shared_config)
+
+        # just run it on first graph module we are encountering for now...
+        for k, graph_sub in named_graphmodules(gm):
+            graph_sub, info = self._apply(graph_sub, cm, factory, shared_config)
+            if k == "":
+                gm = graph_sub
+            else:
+                gm.set_submodule(k, graph_sub)
+            break
+        return gm, info
+
+    @final
     def _log_info(self, *args: any):
         """Log a message with the transform key."""
-        prefix = f"[stage={self.config.stage.value}, transform={self.get_transform_key()}]"
-        ad_logger.info(f"{prefix} " + " ".join(map(str, args)))
+        ad_logger.info(*args)
 
     @final
     def _get_autodeploy_meta(self, gm: GraphModule) -> AutodeployMeta:
         """Get the autodeploy metadata from the graphmodule."""
+        if not hasattr(gm, "meta"):
+            gm.meta = {}
         return gm.meta.get(self._autodeploy_meta_key, {})
 
     @final
@@ -328,11 +418,13 @@ class BaseTransform(ABC):
         is_clean = info.is_clean
         has_valid_shapes = is_clean and info.has_valid_shapes
 
+        use_meta = isinstance(gm, GraphModule) and placeholders_on_meta(gm)
+
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
             self._log_info("running pre-cleanup with shape_prop")
             canonicalize_graph(gm)
-            with lift_to_meta(gm):
+            with lift_to_meta(gm) if use_meta else nullcontext():
                 run_shape_prop(gm)
             is_clean = True
             has_valid_shapes = True
@@ -356,11 +448,13 @@ class BaseTransform(ABC):
         if not self.config.run_graph_cleanup:
             return info
 
+        use_meta = isinstance(gm, GraphModule) and placeholders_on_meta(gm)
+
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
             self._log_info("running post-cleanup with shape_prop")
             canonicalize_graph(gm)
-            with lift_to_meta(gm):
+            with lift_to_meta(gm) if use_meta else nullcontext():
                 run_shape_prop(gm)
         elif self.config.run_graph_cleanup and not info.is_clean:
             self._log_info("running post-cleanup (no shape_prop)")
