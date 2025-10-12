@@ -506,7 +506,9 @@ _SMALL_MODEL_CONFIGS = {
 }
 
 
-def get_transforms_config(mode: str, attn_backend: str, compile_backend: str, free_mem_ratio: float = 0.0) -> Dict[str, Any]:
+def get_transforms_config(
+    mode: str, attn_backend: str, compile_backend: str, free_mem_ratio: float = 0.0
+) -> Dict[str, Any]:
     """Set the transforms configuration for a given mode, attn_backend and compile_backend."""
     return (
         {

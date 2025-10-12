@@ -2,7 +2,7 @@
 
 from inspect import Parameter, Signature
 from itertools import product
-from typing import Any, Callable, Dict, List, Tuple, Type, Literal
+from typing import Any, Callable, Dict, List, Literal, Tuple, Type
 
 import torch
 import torch.nn.functional as F
@@ -722,7 +722,6 @@ class MatchAttentionLayout(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-
         # If backend expects bnsd, nothing to do.
         if self.config.attn_layout == "bnsd":
             return gm, TransformInfo(

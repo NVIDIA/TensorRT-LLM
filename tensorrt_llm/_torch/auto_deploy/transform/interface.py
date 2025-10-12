@@ -16,7 +16,13 @@ from torch.fx import GraphModule
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
-from ..utils._graph import canonicalize_graph, lift_to_meta, run_shape_prop, named_graphmodules, placeholders_on_meta
+from ..utils._graph import (
+    canonicalize_graph,
+    lift_to_meta,
+    named_graphmodules,
+    placeholders_on_meta,
+    run_shape_prop,
+)
 from ..utils.logger import ad_logger
 from ..utils.sharding_utils import ShardingConfig
 

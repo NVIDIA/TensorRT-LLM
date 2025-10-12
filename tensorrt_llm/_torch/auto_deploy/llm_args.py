@@ -133,7 +133,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     enable_chunked_prefill: bool = Field(
         default=False, description="Enable chunked prefill.", frozen=True
     )
-    
+
     ### INFERENCE OPTIMIZER CONFIG #############################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
