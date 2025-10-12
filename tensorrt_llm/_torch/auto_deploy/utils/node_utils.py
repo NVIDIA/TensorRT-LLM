@@ -244,6 +244,7 @@ def filtered_nodes(
             for t in target:
                 if t(node):
                     yield node
+                    break
     else:
         # Handle the case where target or ops contains operations
         operations = ops if ops is not None else target
