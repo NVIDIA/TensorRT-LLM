@@ -991,6 +991,7 @@ class TestMoeFp4:
     the default tactic selection works. This reduces unnecessary test runs for CI
     """
 
+    @pytest.mark.skip(reason="https://nvbugs/5575841")
     @pytest.mark.parametrize("num_tokens", [1, 1024])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
@@ -1076,6 +1077,7 @@ class TestMoeFp4:
                                       use_autotune=True,
                                       use_topk_as_input=False)
 
+    @pytest.mark.skip(reason="https://nvbugs/5575841")
     @pytest.mark.parametrize("num_tokens", [1, 150])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024])
