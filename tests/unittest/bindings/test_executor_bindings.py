@@ -2188,7 +2188,7 @@ def test_request_perf_metrics_kv_cache(model_path):
     assert kv_cache_metrics.kv_cache_hit_rate == 1.0
 
 
-@pytest.mark.skip(reason="https://nvbugs/5404000")
+# Skip test for pre-Hopper: https://nvbugs/5404000
 @skip_pre_hopper
 @pytest.mark.parametrize("exclude_input_from_output", [False, True])
 def test_request_perf_metrics_draft(model_path_draft_tokens_external,
