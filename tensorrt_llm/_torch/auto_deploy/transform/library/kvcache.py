@@ -12,7 +12,7 @@ from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegi
 from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import add_graph_input
+from ...utils._graph import add_graph_input
 from ...utils.node_utils import get_all_input_output_nodes, is_op
 from ..interface import (
     BaseTransform,
@@ -222,7 +222,7 @@ class ResizeKVCacheConfig(TransformConfig):
     """Configuration for the resize kv cache transform."""
 
     free_mem_ratio: float = Field(
-        description="The fraction of available memory to occupy.", default=0.8
+        default=0.8, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
     )
 
 

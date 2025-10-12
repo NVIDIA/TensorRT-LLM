@@ -75,8 +75,14 @@ def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
         with open(extra_llm_api_options_path, "w") as f:
             yaml.dump(
                 {
-                    "compile_backend": compile_backend,
                     **config["args"],
+                    "transforms": {
+                        "compile_model": {
+                            "stage": "compile",
+                            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                            "compile_backend": compile_backend,
+                        }
+                    },
                 },
                 f,
             )

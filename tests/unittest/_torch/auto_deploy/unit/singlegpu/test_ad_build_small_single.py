@@ -1,13 +1,11 @@
 """Testing build_and_run_ad end2end."""
 
-from typing import Dict
-
 import pytest
-from _model_test_utils import get_small_model_config_pytest_param
+from _model_test_utils import get_small_model_config, get_transforms_config
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
-from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
@@ -43,85 +41,111 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
 
 @pytest.mark.parametrize("mode", ["graph", "transformers"])
 @pytest.mark.parametrize(
-    "experiment_config",
+    "modle_hub_id, transform_args",
     [
-        get_small_model_config_pytest_param(
+        (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            attn_backend="flashinfer",
-            compile_backend="torch-opt",
-            free_mem_ratio=0.0001,
+            {
+                "attn_backend": "flashinfer",
+                "compile_backend": "torch-opt",
+                "free_mem_ratio": 0.0001,
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            attn_backend="triton",
-            compile_backend="torch-simple",
+            {
+                "attn_backend": "triton",
+                "compile_backend": "torch-simple",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "Qwen/Qwen3-30B-A3B",
-            attn_backend="triton",
-            compile_backend="torch-simple",
+            {
+                "attn_backend": "triton",
+                "compile_backend": "torch-simple",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "microsoft/Phi-3-mini-4k-instruct",
-            attn_backend="triton",
-            compile_backend="torch-simple",
+            {
+                "attn_backend": "triton",
+                "compile_backend": "torch-simple",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "microsoft/Phi-3-mini-4k-instruct",
-            attn_backend="torch",
-            compile_backend="torch-simple",
+            {
+                "attn_backend": "torch",
+                "compile_backend": "torch-simple",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            attn_backend="flashinfer",
-            compile_backend="torch-opt",
+            {
+                "attn_backend": "flashinfer",
+                "compile_backend": "torch-opt",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "deepseek-ai/DeepSeek-V3",
-            attn_backend="triton",
-            compile_backend="torch-simple",
+            {
+                "attn_backend": "triton",
+                "compile_backend": "torch-simple",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "Qwen/Qwen2.5-3B-Instruct",
-            attn_backend="triton",
-            compile_backend="torch-compile",
+            {
+                "attn_backend": "triton",
+                "compile_backend": "torch-compile",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
-            attn_backend="flashinfer",
-            compile_backend="torch-cudagraph",
+            {
+                "attn_backend": "flashinfer",
+                "compile_backend": "torch-cudagraph",
+            },
         ),
-        get_small_model_config_pytest_param(
+        (
             "nvidia/NVIDIA-Nemotron-Nano-12B-v2",
-            attn_backend="flashinfer",
-            compile_backend="torch-simple",
+            {
+                "attn_backend": "flashinfer",
+                "compile_backend": "torch-simple",
+            },
         ),
     ],
 )
-def test_build_ad(experiment_config: Dict, mode: str):
+def test_build_ad(modle_hub_id: str, transform_args: dict, mode: str):
+    transforms_config = get_transforms_config(mode, **transform_args)
+    experiment_config = get_small_model_config(
+        modle_hub_id, mode=mode, transforms=transforms_config
+    )
     if (
-        "DeepSeek-V3" in experiment_config["args"]["model"]
-        or "Phi-3-mini-4k-instruct" in experiment_config["args"]["model"]
-        or "NVIDIA-Nemotron-Nano-12B-v2" in experiment_config["args"]["model"]
+        "DeepSeek-V3" in modle_hub_id
+        or "Phi-3-mini-4k-instruct" in modle_hub_id
+        or "NVIDIA-Nemotron-Nano-12B-v2" in modle_hub_id
         and mode == "transformers"
     ):
         pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")
 
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
-    experiment_config["args"]["mode"] = mode
+
+    print(f"Experiment Config: {experiment_config}")
     experiment_config = ExperimentConfig(**experiment_config)
-    original_init = InferenceOptimizer.__init__
+    original_build_from_config = ADEngine.build_from_config
 
-    def check_and_original_init(self, factory, ad_config):
+    @classmethod
+    def check_and_original_build(cls, ad_config):
         _check_ad_config(experiment_config, ad_config)
-        return original_init(self, factory, ad_config=ad_config)
+        return original_build_from_config.__func__(cls, ad_config)
 
-    # Temporarily replace the __init__ method
-    InferenceOptimizer.__init__ = check_and_original_init
+    # Temporarily replace the build_from_config classmethod
+    ADEngine.build_from_config = check_and_original_build
 
     try:
         main(experiment_config)
     finally:
-        # Restore original __init__
-        InferenceOptimizer.__init__ = original_init
+        # Restore original build_from_config
+        ADEngine.build_from_config = original_build_from_config

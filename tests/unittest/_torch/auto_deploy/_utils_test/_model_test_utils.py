@@ -2,7 +2,6 @@ import copy
 import os
 from typing import Any, Dict, Optional
 
-import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -507,6 +506,37 @@ _SMALL_MODEL_CONFIGS = {
 }
 
 
+def get_transforms_config(mode: str, attn_backend: str, compile_backend: str, free_mem_ratio: float = 0.0) -> Dict[str, Any]:
+    """Set the transforms configuration for a given mode, attn_backend and compile_backend."""
+    return (
+        {
+            "resize_kv_cache": {
+                "stage": "cache_init",
+                "free_mem_ratio": free_mem_ratio,
+            },
+            "match_attention_layout": {
+                "stage": "pattern_matcher",
+                "attn_backend": attn_backend,
+            },
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "attn_backend": attn_backend,
+            },
+            "compile_model": {
+                "stage": "compile",
+                "compile_backend": compile_backend,
+            },
+        }
+        if mode == "graph"
+        else {
+            "transformers_replace_cached_attn": {
+                "stage": "cache_init",
+                "attn_backend": attn_backend,
+            },
+        }
+    )
+
+
 def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:
     """
     Get the small model configuration for a given HuggingFace model hub ID.
@@ -531,10 +561,8 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
     # add some defaults to llm_args
     llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
-    llm_args["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
     llm_args["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
-
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
 
@@ -549,13 +577,3 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
     }
 
     return experiment_config
-
-
-def get_small_model_config_pytest_param(
-    model_hub_id: str, pytest_param_kwargs=None, **llm_args_kwargs
-):
-    return pytest.param(
-        get_small_model_config(model_hub_id, **llm_args_kwargs),
-        id=model_hub_id,
-        **(pytest_param_kwargs or {}),
-    )

@@ -1,7 +1,9 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
+import gc
 from typing import Optional
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 
@@ -26,7 +28,10 @@ class InferenceOptimizer:
             local_rank, world_size = 0, 1
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
-        self.shared_config = SharedConfig(local_rank=local_rank, world_size=world_size)
+        self.shared_config = SharedConfig(
+            local_rank=local_rank,
+            world_size=world_size,
+        )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""
@@ -71,4 +76,6 @@ class InferenceOptimizer:
         ############################################################################################
         # RETURN OPTIMIZED MODEL
         ############################################################################################
+        torch.cuda.empty_cache()
+        gc.collect()
         return mod

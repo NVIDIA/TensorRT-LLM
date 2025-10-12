@@ -38,10 +38,12 @@ transforms:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
+    attn_layout: bsnd
   match_rope_pattern:
     stage: pattern_matcher
   match_rope_layout:
     stage: pattern_matcher
+    expected_layout: bsnd
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -87,6 +89,7 @@ transforms:
   load_weights:
     stage: weight_load
     run_per_gm: false
+    checkpoint_device: null
   move_inputs_to_device:
     stage: weight_load
     run_per_gm: false
@@ -122,12 +125,19 @@ transforms:
     backend: flashinfer
     requires_shape_prop: true
   ############################################################################################
+  # VISUALIZE GRAPH
+  ############################################################################################
+  visualize_namespace:
+    stage: visualize
+    enabled: false #TODO (hg): visualization has some errors now
+  ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
   update_in_out_nodes:
     stage: cache_init
   insert_cached_attention:
     stage: cache_init
+    attn_backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
     attn_backend: MultiHeadLatentAttention
@@ -143,9 +153,12 @@ transforms:
   resize_kv_cache:
     stage: cache_init
     run_per_gm: false
+    free_mem_ratio: 0.8
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
   compile_model:
     stage: compile
     run_per_gm: false
+    cuda_graph_batch_sizes: null
+    compile_backend: torch-compile
