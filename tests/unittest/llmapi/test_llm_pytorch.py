@@ -509,17 +509,6 @@ def test_nemotron_nas_lora() -> None:
 def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
     model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
     lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-
-    lora_config = LoraConfig(lora_dir=[lora_dir],
-                             max_lora_rank=64,
-                             max_loras=2,
-                             max_cpu_loras=2)
-    llm = LLM(
-        model_dir,
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
     prompts = [
         "美国的首都是哪里？",
         "美国的首都是哪里？",
@@ -529,9 +518,20 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
         "华盛顿特区。华盛顿特区是美国的首都和一个行政区。它是由哥伦比亚特区和华盛顿特区的两个行政区",
     ]
 
+    lora_config = LoraConfig(lora_dir=[lora_dir],
+                             max_lora_rank=64,
+                             max_loras=2,
+                             max_cpu_loras=2)
     lora_req = LoRARequest("lora-chinese", 0, lora_dir)
     lora_requests = [None, lora_req]
     assert len(lora_requests) == len(prompts)
+
+    llm = LLM(
+        model_dir,
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
 
     try:
         outputs = llm.generate(prompts,
