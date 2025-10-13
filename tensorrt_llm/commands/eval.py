@@ -23,7 +23,6 @@ from .._tensorrt_engine import LLM
 from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
                         GPQAExtended, GPQAMain, JsonModeEval)
 from ..llmapi import BuildConfig, KvCacheConfig
-from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 
 
@@ -107,6 +106,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
          extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
+    # TODO
     logger.set_level(log_level)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
@@ -129,9 +129,10 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "kv_cache_config": kv_cache_config,
     }
 
-    if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(llm_args,
-                                                      extra_llm_api_options)
+    # TODO
+    # if extra_llm_api_options is not None:
+    #     llm_args = update_llm_args_with_extra_options(llm_args,
+    #                                                   extra_llm_api_options)
 
     profiler.start("trtllm init")
     if backend == 'pytorch':

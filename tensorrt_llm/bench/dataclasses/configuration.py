@@ -14,7 +14,6 @@ from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 SPECULATIVE_MAP = {
@@ -39,6 +38,7 @@ class RuntimeConfig(BaseModel):
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
 
+        # TODO
         llm_args = {
             "scheduler_config":
             self.settings_config.get_scheduler_config(),
@@ -84,8 +84,9 @@ class RuntimeConfig(BaseModel):
         backend_cache_config = llm_args.pop("kv_cache_config", {})
         llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
 
-        updated_llm_args = update_llm_args_with_extra_options(
-            llm_args, self.extra_llm_api_options)
+        # TODO
+        # updated_llm_args = update_llm_args_with_extra_options(
+        #     llm_args, self.extra_llm_api_options)
 
         if self.backend == "pytorch":
             cuda_graph_config = updated_llm_args.pop(

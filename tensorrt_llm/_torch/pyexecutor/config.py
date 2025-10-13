@@ -1,19 +1,19 @@
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
+
+from pydantic import BaseModel, Field
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
-from ...llmapi.llm_args import LoadFormat, SamplerType
+from ...llmapi.llm_args import DecodingBaseConfig, LoadFormat, SamplerType
 from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
 from .resource_manager import BaseResourceManager
 
 
-@dataclass
-class PyTorchConfig:
+class PyTorchConfig(BaseModel):
     """
     Extra arguments for the pytorch backend.
     """
@@ -24,7 +24,7 @@ class PyTorchConfig:
     # is called when a request finishes.
     # The KV cache manager is guaranteed to be invoked after all of these extra
     # managers in all stages.
-    extra_resource_managers: Dict[str, BaseResourceManager] = field(
+    extra_resource_managers: Dict[str, BaseResourceManager] = Field(
         default_factory=dict)
 
     # If true, use CUDA graphs for decoding. CUDA graphs are only created
@@ -132,7 +132,7 @@ def update_executor_config(
         backend: Optional[str] = None,
         pytorch_backend_config: Optional[PyTorchConfig] = None,
         mapping: Optional[Mapping] = None,
-        speculative_config: Optional["DecodingBaseConfig"] = None,
+        speculative_config: Optional[DecodingBaseConfig] = None,
         hf_model_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
         max_seq_len: Optional[int] = None,
