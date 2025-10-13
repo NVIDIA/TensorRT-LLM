@@ -12,8 +12,9 @@ import functools
 import os
 import typing
 from collections.abc import Mapping
-from enum import StrEnum
 from typing import Optional
+
+from strenum import StrEnum
 
 from tensorrt_llm._utils import run_once
 from tensorrt_llm.logger import logger
