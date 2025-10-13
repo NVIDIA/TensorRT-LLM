@@ -63,13 +63,15 @@ We maintain YAML configuration files with recommended performance settings in th
 For low-latency with `TRTLLM` MOE backend:
 
 ```shell
-EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/gpt-oss-120b-latency.yaml
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml
 ```
 
 For max-throughput with `CUTLASS` MOE backend:
 
 ```shell
-EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/gpt-oss-120b-throughput.yaml
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml
 ```
 
 ### Launch the TensorRT LLM Server
