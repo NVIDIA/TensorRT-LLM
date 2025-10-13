@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
                       mpi_broadcast, mpi_rank, release_gc)
-from ..auto_parallel import AutoParallelConfig
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
@@ -134,17 +133,12 @@ class ModelLoader:
             assert self.llm_args.build_config
             self.build_config = self.llm_args.build_config
 
-            self.auto_parallel_config = AutoParallelConfig(
-                world_size=llm_args.parallel_config.world_size if llm_args.
-                parallel_config.auto_parallel else 1)
-
-            default_config = self.llm_args.auto_parallel_config
-            self.auto_parallel_config.set_defaults(
-                cluster_key=default_config.cluster_key,
-                cluster_info=default_config.cluster_info,
-                same_buffer_io=default_config.same_buffer_io,
-                sharded_io_allowlist=default_config.sharded_io_allowlist,
-            )
+            self.auto_parallel_config = self.llm_args.auto_parallel_config.model_copy(
+                update={
+                    "world_size":
+                    self.llm_args.parallel_config.world_size if self.llm_args.
+                    parallel_config.auto_parallel else 1
+                })
 
         self._gather_build_steps()
 

@@ -659,9 +659,9 @@ class BuildConfig:
                                         defaults.get('input_timing_cache'))
         output_timing_cache = config.pop('output_timing_cache',
                                          defaults.get('output_timing_cache'))
-        lora_config = LoraConfig.from_dict(config.get('lora_config', {}))
-        auto_parallel_config = AutoParallelConfig.from_dict(
-            config.get('auto_parallel_config', {}))
+        lora_config = LoraConfig(**config.get('lora_config', {}))
+        auto_parallel_config = AutoParallelConfig(
+            **config.get('auto_parallel_config', {}))
         max_encoder_input_len = config.pop(
             'max_encoder_input_len', defaults.get('max_encoder_input_len'))
         weight_streaming = config.pop('weight_streaming',
