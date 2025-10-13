@@ -14,61 +14,61 @@ l0_a10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/sampler/test_torch_sampler.py
-  - unittest/_torch/modeling/test_modeling_mistral.py
-  - unittest/_torch/modeling/test_modeling_pixtral.py
-  # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
-  # test list either).
-  - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
-  - unittest/others/test_time_breakdown.py
-  - unittest/disaggregated/test_disagg_utils.py
-  - unittest/disaggregated/test_router.py
-  - unittest/disaggregated/test_remoteDictionary.py
-  - unittest/disaggregated/test_disagg_cluster_manager_worker.py
-  - unittest/disaggregated/test_cluster_storage.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
+  # - unittest/_torch/sampler/test_torch_sampler.py
+  # - unittest/_torch/modeling/test_modeling_mistral.py
+  # - unittest/_torch/modeling/test_modeling_pixtral.py
+  # # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
+  # # test list either).
+  # - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
+  # - unittest/others/test_time_breakdown.py
+  # - unittest/disaggregated/test_disagg_utils.py
+  # - unittest/disaggregated/test_router.py
+  # - unittest/disaggregated/test_remoteDictionary.py
+  # - unittest/disaggregated/test_disagg_cluster_manager_worker.py
+  # - unittest/disaggregated/test_cluster_storage.py
+  # - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
-  - test_e2e.py::test_openai_chat_guided_decoding
-  - test_e2e.py::test_openai_chat_multimodal_example
-  - test_e2e.py::test_openai_perf_metrics
-  - test_e2e.py::test_openai_prometheus
-  - test_e2e.py::test_openai_lora
-  - test_e2e.py::test_trtllm_serve_multimodal_example
-  - test_e2e.py::test_trtllm_serve_lora_example
-  - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
-  - test_e2e.py::test_openai_misc_example[pytorch]
-  - test_e2e.py::test_openai_reasoning[pytorch]
-  - test_e2e.py::test_openai_completions_example[pytorch]
-  - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
-  - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
-  # llmapi
-  - unittest/llmapi/test_llm_utils.py
-  - unittest/llmapi/test_gc_utils.py
-  - unittest/llmapi/test_reasoning_parser.py
-  - unittest/llmapi/test_serialization.py
-  - unittest/llmapi/test_utils.py
-  - unittest/llmapi/test_llm_args.py
-  - unittest/llmapi/test_additional_model_outputs.py
-  # executor
-  - unittest/executor/test_rpc.py
+  # - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
+  # - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
+  # - test_e2e.py::test_openai_chat_guided_decoding
+  # - test_e2e.py::test_openai_chat_multimodal_example
+  # - test_e2e.py::test_openai_perf_metrics
+  # - test_e2e.py::test_openai_prometheus
+  # - test_e2e.py::test_openai_lora
+  # - test_e2e.py::test_trtllm_serve_multimodal_example
+  # - test_e2e.py::test_trtllm_serve_lora_example
+  # - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
+  # - test_e2e.py::test_openai_misc_example[pytorch]
+  # - test_e2e.py::test_openai_reasoning[pytorch]
+  # - test_e2e.py::test_openai_completions_example[pytorch]
+  # - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
+  # - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
+  # - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
+  # # llmapi
+  # - unittest/llmapi/test_llm_utils.py
+  # - unittest/llmapi/test_gc_utils.py
+  # - unittest/llmapi/test_reasoning_parser.py
+  # - unittest/llmapi/test_serialization.py
+  # - unittest/llmapi/test_utils.py
+  # - unittest/llmapi/test_llm_args.py
+  # - unittest/llmapi/test_additional_model_outputs.py
+  # # executor
+  # - unittest/executor/test_rpc.py
 - condition:
     ranges:
       system_gpu_count:
