@@ -695,29 +695,29 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
      }
  
 #if !DISABLE_SYNC_FOR_PROFILING
-     bool is_first_warp = threadIdx.x / warpSize == 0;
-     int lane_id = threadIdx.x % warpSize;
      // In-kernel readiness synchronization at start of combine:
      // - One warp signals readiness to all peers with current flag_val.
      // - The first warp of each block waits for all peers' readiness (equality), then __syncthreads.
-     if (blockIdx.x == 0 && is_first_warp)
-     {
-        // asm volatile("fence.release.sys;");
-         uint32_t cur_val = *ptrs.flag_val;
-         #pragma unroll 1  // No unroll
-         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-         {
-             uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
-             asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
-             #if ENABLE_DEBUG_PRINT
-             printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, cur_val, peer_rank);
-             #endif
-         }
-     }
-
+     bool is_first_warp = threadIdx.x / warpSize == 0;
      if (is_first_warp)
      {
-         uint32_t expected_value = *ptrs.flag_val;
+        int lane_id = threadIdx.x % warpSize;
+        uint32_t expected_value = *ptrs.flag_val;
+
+        if (blockIdx.x == 0)
+        {
+           // asm volatile("fence.release.sys;");
+            #pragma unroll 1  // No unroll
+            for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+            {
+                uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(expected_value));
+                #if ENABLE_DEBUG_PRINT
+                printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value, peer_rank);
+                #endif
+            }
+        }
+
         #pragma unroll 1  // No unroll
          for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
          {
