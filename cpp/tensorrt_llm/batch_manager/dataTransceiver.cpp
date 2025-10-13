@@ -244,11 +244,6 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     return totalSize;
 }
 
-std::unordered_map<SizeType32, std::vector<size_t>> const& RequestInfo::getBlockHashesPerWindow() const noexcept
-{
-    return mBlockHashesPerWindow;
-}
-
 class CacheSender::Impl
 {
 public:
@@ -801,7 +796,7 @@ public:
                 lastBlockKey.extraKeys = std::move(extraKeys);
             }
             // Compute indexFromEnd from the number of requested blocks
-            int32_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
+            int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             int32_t indexFromEnd = requestedBlockSize - 1;
 

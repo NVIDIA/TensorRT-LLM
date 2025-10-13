@@ -56,13 +56,11 @@ BlockRange getBlockRangeForSending(
 
         auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
 
-        if (common::getEnvDisableSelectiveCacheTransfer() && (windowsMetadata.size() == 1 || needSendAllForWindow))
+        if ((windowsMetadata.size() == 1 || needSendAllForWindow))
         {
             return blockRange;
         }
         auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
-
-        bool const onlyOneWindow = requestedBlockHashesPerWindow.size() == 1;
 
         for (auto const& [windowSize, metadata] : windowsMetadata)
         {
@@ -72,10 +70,8 @@ BlockRange getBlockRangeForSending(
                     - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
             // TODO: promptLen to get the startBlockIdx
             SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
-            TLLM_LOG_DEBUG(
-                "getBlockRangeForSending windowSize: %d, startBlockIdx: %d reuseStartBlockIdx: %d windowStartBlockIdx: "
-                "%d",
-                windowSize, startBlockIdx, reuseStartBlockIdx, windowStartBlockIdx);
+            TLLM_LOG_DEBUG("getBlockRangeForSending windowSize: %d, startBlockIdx: %d  windowStartBlockIdx: %d",
+                windowSize, startBlockIdx, windowStartBlockIdx);
             blockRange.setBlockIdsForWindow(windowSize,
                 std::vector<SizeType32>(
                     blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
