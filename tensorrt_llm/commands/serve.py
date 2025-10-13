@@ -4,7 +4,7 @@ import os
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Optional
 
 import click
 import torch
@@ -17,6 +17,7 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.commands.common_llm_options import common_llm_options
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
@@ -26,7 +27,6 @@ from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig, ServerRole,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
-from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
@@ -202,116 +202,17 @@ def launch_mm_encoder_server(
     asyncio.run(server(host, port))
 
 
-class ChoiceWithAlias(click.Choice):
-
-    def __init__(self,
-                 choices: Sequence[str],
-                 aliases: Mapping[str, str],
-                 case_sensitive: bool = True) -> None:
-        super().__init__(choices, case_sensitive)
-        self.aliases = aliases
-
-    def to_info_dict(self) -> Dict[str, Any]:
-        info_dict = super().to_info_dict()
-        info_dict["aliases"] = self.aliases
-        return info_dict
-
-    def convert(self, value: Any, param: Optional["click.Parameter"],
-                ctx: Optional["click.Context"]) -> Any:
-        if value in self.aliases:
-            value = self.aliases[value]
-        return super().convert(value, param, ctx)
-
-
 @click.command("serve")
 @click.argument("model", type=str)
-@click.option("--tokenizer",
-              type=str,
-              default=None,
-              help="Path | Name of the tokenizer."
-              "Specify this value only if using TensorRT engine as model.")
 @click.option("--host",
               type=str,
               default="localhost",
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option(
-    "--backend",
-    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
-                         {"trt": "tensorrt"}),
-    default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
-@click.option("--max_beam_width",
-              type=int,
-              default=BuildConfig.max_beam_width,
-              help="Maximum number of beams for beam search decoding.")
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.max_batch_size,
-              help="Maximum number of requests that the engine can schedule.")
-@click.option(
-    "--max_num_tokens",
-    type=int,
-    default=BuildConfig.max_num_tokens,
-    help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
-@click.option(
-    "--max_seq_len",
-    type=int,
-    default=BuildConfig.max_seq_len,
-    help="Maximum total length of one request, including prompt and outputs. "
-    "If unspecified, the value is deduced from the model config.")
-@click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
-@click.option("--pp_size",
-              type=int,
-              default=1,
-              help='Pipeline parallelism size.')
-@click.option("--ep_size",
-              type=int,
-              default=None,
-              help="expert parallelism size")
-@click.option("--cluster_size",
-              type=int,
-              default=None,
-              help="expert cluster parallelism size")
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
-@click.option("--kv_cache_free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help="Free GPU memory fraction reserved for KV Cache, "
-              "after allocating model weights and buffers.")
-@click.option(
-    "--num_postprocess_workers",
-    type=int,
-    default=0,
-    help="[Experimental] Number of workers to postprocess raw responses "
-    "to comply with OpenAI protocol.")
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help="Flag for HF transformers.")
-@click.option(
-    "--extra_llm_api_options",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
-@click.option(
-    "--reasoning_parser",
-    type=click.Choice(ReasoningParserFactory.parsers.keys()),
-    default=None,
-    help="[Experimental] Specify the parser for reasoning models.",
-)
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -322,50 +223,40 @@ class ChoiceWithAlias(click.Choice):
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
-@click.option(
-    "--fail_fast_on_attention_window_too_large",
-    is_flag=True,
-    default=False,
-    help=
-    "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
-)
-def serve(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool):
+@common_llm_options
+def serve(model: str, host: str, port: int, log_level: str,
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str], **params):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
 
+    # TODO: unify LlmArgs parsing via Pydantic
     llm_args, _ = get_llm_args(
         model=model,
-        tokenizer=tokenizer,
-        backend=backend,
-        max_beam_width=max_beam_width,
-        max_batch_size=max_batch_size,
-        max_num_tokens=max_num_tokens,
-        max_seq_len=max_seq_len,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        moe_expert_parallel_size=ep_size,
-        moe_cluster_parallel_size=cluster_size,
-        gpus_per_node=gpus_per_node,
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-        num_postprocess_workers=num_postprocess_workers,
-        trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser,
-        fail_fast_on_attention_window_too_large=
-        fail_fast_on_attention_window_too_large)
+        tokenizer=params.get("tokenizer"),
+        backend=params.get("backend", "pytorch"),
+        max_beam_width=params.get("max_beam_width"),
+        max_batch_size=params.get("max_batch_size"),
+        max_num_tokens=params.get("max_num_tokens"),
+        max_seq_len=params.get("max_seq_len"),
+        tensor_parallel_size=params.get("tensor_parallel_size", 1),
+        pipeline_parallel_size=params.get("pipeline_parallel_size", 1),
+        moe_expert_parallel_size=params.get("moe_expert_parallel_size"),
+        moe_cluster_parallel_size=params.get("moe_cluster_parallel_size"),
+        gpus_per_node=params.get("gpus_per_node"),
+        free_gpu_memory_fraction=params.get("kv_cache_free_gpu_memory_fraction",
+                                            0.9),
+        num_postprocess_workers=params.get("num_postprocess_workers", 0),
+        trust_remote_code=params.get("trust_remote_code", False),
+        reasoning_parser=params.get("reasoning_parser"),
+        fail_fast_on_attention_window_too_large=params.get(
+            "fail_fast_on_attention_window_too_large", False))
 
     llm_args_extra_dict = {}
+    extra_llm_api_options = params.get("extra_llm_api_options")
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_extra_dict = yaml.safe_load(f)
