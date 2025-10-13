@@ -702,10 +702,11 @@ def main(args: argparse.Namespace):
 
     elif args.dataset_name == "vllm_custom":
         dataset = vllmCustomDataset(dataset_path=args.dataset_path)
+        vllm_output_len = args.vllm_custom_dataset_output_length if args.vllm_custom_dataset_output_length is not None else 1
         input_requests = dataset.sample(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
-            output_len=1,  # TODO: fix this
+            output_len=vllm_output_len,
         )
 
     else:
@@ -1209,6 +1210,15 @@ if __name__ == "__main__":
         default=None,
         help="Output length for each request. Overrides the output lengths "
         "from the sampled HF dataset.",
+    )
+
+    vllm_custom_group = parser.add_argument_group("vllm_custom dataset options")
+    vllm_custom_group.add_argument(
+        "--vllm-custom-dataset-output-length",
+        type=int,
+        default=None,
+        help="Output length for each request when using vllm_custom dataset. "
+        "If not specified, defaults to 1.",
     )
 
     sampling_group = parser.add_argument_group("sampling parameters")
