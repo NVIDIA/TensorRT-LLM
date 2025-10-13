@@ -71,6 +71,8 @@ After the server is set up, the client can now send prompt requests to the serve
 
 ### LLM API Options (YAML Configuration)
 
+<!-- TODO: this section is duplicated across the deployment guides; they should be consolidated to a central file and imported as needed, or we can remove this and link to LLM API reference -->
+
 These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
 
 #### `tensor_parallel_size`
