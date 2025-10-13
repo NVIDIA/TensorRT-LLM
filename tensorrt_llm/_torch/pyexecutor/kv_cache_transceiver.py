@@ -145,7 +145,8 @@ class CacheTransBufferManager:
                                                max_num_tokens)
 
     @staticmethod
-    def pre_alloc_buffer_size(kv_cache_size_per_token: int,
+    def pre_alloc_buffer_size(tokens_per_block: int,
+                              kv_cache_size_per_token: int,
                               cache_transceiver_config: CacheTransceiverConfig):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            kv_cache_size_per_token, cache_transceiver_config)
+            tokens_per_block, kv_cache_size_per_token, cache_transceiver_config)
