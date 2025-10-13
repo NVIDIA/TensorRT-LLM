@@ -291,8 +291,9 @@ public:
         mSelfState.setCommState(std::move(commState));
     }
 
-    [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const
+    [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId)
     {
+        std::unique_lock<std::mutex> lk(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
         return it->second.getConnections().size();
@@ -472,8 +473,18 @@ private:
             // TODO(zhengd): pass the hashes directly instead of update llmRequest
             auto llmRequest = it->second.mRequest;
             llmRequest->setRequestedBlockHashes(std::move(blockHashes));
-
-            asyncSendAndRemoveResponse(it->first, std::move(it->second));
+            if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+            {
+                // our nixl impl seems only support recv and send in the same thread
+                //  if we use zmq as control path, we may avoid this issue
+                sendAndRemoveResponse(it->first, std::move(it->second));
+            }
+            else
+            {
+                // if we send data in another thread, multiple rank may send data for different requests at the same
+                // time with gen DP case.
+                asyncSendAndRemoveResponse(it->first, std::move(it->second));
+            }
             removeResponse(it);
         }
         mCurrentRequest = std::nullopt;
