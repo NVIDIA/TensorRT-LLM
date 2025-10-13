@@ -173,7 +173,7 @@ For tips on using Nsys to profile and analyze TensorRT LLM performance, refer to
 
 To better support communication fusion—including `hiddenStates` during dispatch, low-precision ScalingFactor, MoE's `tokenSelectedExpert` and scales, as well as supporting low-precision communication during dispatch and handling potential non-alignment issues in original data, we redesigned and reimplemented `AlltoAll`.
 
-Taking the dispatch of four fields as an example, the data flow is shown in Figure 4.
+Taking the dispatch of four fields as an example, the data flow is shown in Figure 6.
 
 <div align="center">
 <figure>
