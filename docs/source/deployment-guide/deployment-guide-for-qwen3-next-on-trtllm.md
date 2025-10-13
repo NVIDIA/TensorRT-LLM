@@ -34,7 +34,8 @@ make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LO
 We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. You can use these out-of-the-box, or adjust them to your specific use case.
 
 ```shell
-EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/qwen3-next.yaml
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/qwen3-next.yaml
 ```
 
 

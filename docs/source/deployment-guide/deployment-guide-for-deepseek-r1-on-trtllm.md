@@ -65,13 +65,15 @@ If you want to use latest main branch, you can choose to build from source to in
 We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
 
 ```shell
-EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/deepseek-r1-throughput.yaml
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/deepseek-r1-throughput.yaml
 ```
 
 To use the `DeepGEMM` MOE backend on B200/GB200, use this config instead:
 
 ```shell
-EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/deepseek-r1-deepgemm.yaml
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/deepseek-r1-deepgemm.yaml
 ```
 
 ### Launch the TensorRT LLM Server
