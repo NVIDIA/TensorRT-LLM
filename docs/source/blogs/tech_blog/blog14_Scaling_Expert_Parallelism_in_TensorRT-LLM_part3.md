@@ -33,7 +33,7 @@ Let's firstly take a look at how the network structure looks like before we did 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_overview_before_opt.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_overview_before_opt.png" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Network structure overview before optimization</em></sub></p>
@@ -85,7 +85,7 @@ Based on this analysis, we conducted experiments on the following scenario: a De
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_MTP_parallel_1.png" width="500">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_MTP_parallel_1.png" width="500">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: MTP LM head computation before optimization</em></sub></p>
@@ -94,7 +94,7 @@ In the optimization, we first perform an `AllGather` on every 4 GPUs, so that ea
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_MTP_parallel_2.png" width="500">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_MTP_parallel_2.png" width="500">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: MTP LM head computation after applying tensor parallelism</em></sub></p>
@@ -151,7 +151,7 @@ The effect of enabling PDL can be clearly observed using [NVIDIA Nsight Systems]
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_pdloff.png" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_pdloff.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: The profiling results of disabling PDL.</em></sub></p>
@@ -160,7 +160,7 @@ The following profiling results show how the three kernels overlap after enablin
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_pdlon.png" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_pdlon.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: The profiling results of enabling PDL.</em></sub></p>
@@ -177,7 +177,7 @@ Taking the dispatch of four fields as an example, the data flow is shown in Figu
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_alltoall_dataflow.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_alltoall_dataflow.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: The data flow of new Alltoall kernel</em></sub></p>
@@ -216,7 +216,7 @@ After adding all the optimizations mentioned above, the network structure now lo
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_overview_after_opt.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_overview_after_opt.png" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7: Network structure overview after optimization</em></sub></p>
@@ -224,7 +224,7 @@ After adding all the optimizations mentioned above, the network structure now lo
 We measured one round of performance and compared it with the baseline (main branch in July). With the optimizations mentioned above, we can see a significant performance improvement.
 <div align="center">
 <figure>
-  <img src="../media/tech_blog14_perf.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog14_perf.png" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8: End-to-End Performance on Aug 31st</em></sub></p>
