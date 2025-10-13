@@ -1309,11 +1309,11 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
 def test_fused_moe_nvfp4(dtype, moe_backend):
 
-    if moe_backend == "TRTLLM":
-        skip_blackwell_geforce()
     if moe_backend == "TRTLLM" and dtype == torch.float16:
         pytest.skip(
             reason="TRTLLM NVFP4 MoE backend does not support float16 yet", )
@@ -1823,12 +1823,11 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
 @pytest.mark.parametrize("bias", [True, False])
 def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
-
-    if moe_backend == "TRTLLM":
-        skip_blackwell_geforce()
 
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
