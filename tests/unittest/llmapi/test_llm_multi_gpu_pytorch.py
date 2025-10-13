@@ -66,39 +66,3 @@ def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1() -> None:
         # Disable CUDA graph
         # TODO: remove this once we have a proper fix for CUDA graph in LoRA
         cuda_graph_config=None)
-
-
-@pytest.mark.skip(reason="https://nvbugs/5560921")
-@skip_ray
-@pytest.mark.gpu2
-def test_llm_rpc_tp2():
-    with LLM(model=llama_model_path,
-             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-             orchestrator_type="rpc",
-             tensor_parallel_size=2) as llm:
-        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
-
-        res = llm.generate("Tell me a joke",
-                           sampling_params=SamplingParams(max_tokens=10,
-                                                          end_id=-1))
-        print(f"get result: {res}")
-
-        assert len(res.outputs) == 1
-        assert len(res.outputs[0].token_ids) == 10
-
-
-@pytest.mark.skip(reason="https://nvbugs/5560921")
-@skip_ray
-@pytest.mark.gpu2
-@pytest.mark.asyncio
-async def test_llm_rpc_streaming_tp2():
-    with LLM(model=llama_model_path,
-             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-             orchestrator_type="rpc",
-             tensor_parallel_size=2) as llm:
-        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
-
-        async for output in llm.generate_async("Tell me a joke",
-                                               sampling_params=SamplingParams(
-                                                   max_tokens=10, end_id=-1)):
-            print(f"get result: {output}")
