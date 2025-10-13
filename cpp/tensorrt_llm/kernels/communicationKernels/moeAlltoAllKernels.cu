@@ -695,14 +695,17 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
      }
  
 #if !DISABLE_SYNC_FOR_PROFILING
+     bool is_first_warp = threadIdx.x / warpSize == 0;
+     int lane_id = threadIdx.x % warpSize;
      // In-kernel readiness synchronization at start of combine:
-     // - Block 0, thread 0 signals readiness to all peers with current flag_val.
-     // - Thread 0 of each block waits for all peers' readiness (equality), then __syncthreads.
-     if (blockIdx.x == 0 && threadIdx.x == 0)
+     // - One warp signals readiness to all peers with current flag_val.
+     // - The first warp of each block waits for all peers' readiness (equality), then __syncthreads.
+     if (blockIdx.x == 0 && is_first_warp)
      {
         // asm volatile("fence.release.sys;");
          uint32_t cur_val = *ptrs.flag_val;
-         for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
+         #pragma unroll 1  // No unroll
+         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
          {
              uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
              asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
@@ -712,24 +715,24 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
          }
      }
 
-     if (threadIdx.x == 0)
+     if (is_first_warp)
      {
          uint32_t expected_value = *ptrs.flag_val;
-         bool all_flags_set;
-         do {
-             all_flags_set = true;
-             for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
-             {
-                 uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-                 uint32_t flag_value;
-                 // Acquire load to ensure visibility of peer's release-store
-                 asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-                 #if ENABLE_DEBUG_PRINT
-                 printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: %d, address: %p\n", rank_id, peer_rank, flag_value, expected_value, flag_ptr);
-                 #endif
-                 all_flags_set = all_flags_set && (flag_value == expected_value);
-             }
-         } while (!all_flags_set);
+        #pragma unroll 1  // No unroll
+         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+         {
+            bool flag_set = false;
+            do{
+                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+                uint32_t flag_value;
+                // Acquire load to ensure visibility of peer's release-store
+                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+                #if ENABLE_DEBUG_PRINT
+                printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: %d, address: %p\n", rank_id, peer_rank, flag_value, expected_value, flag_ptr);
+                #endif
+                flag_set = flag_value == expected_value;
+            } while (!flag_set);
+         }
         asm volatile("fence.acquire.sys;");
      }
      __syncthreads();
