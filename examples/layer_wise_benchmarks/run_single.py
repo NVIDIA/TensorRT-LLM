@@ -28,7 +28,7 @@ torch.cuda.set_device(local_rank)
 
 # Model definition
 pretrained_config = DeepseekV3Config.from_json_file(
-    pathlib.Path(__file__).parent / "config_DeepSeek-R1-FP4.json")
+    pathlib.Path(__file__).parent / "config_DeepSeek-R1-0528-FP4-v2.json")
 layer_indices = [5, 6]
 
 # KV cache related args
