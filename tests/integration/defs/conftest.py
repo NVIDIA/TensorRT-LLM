@@ -2112,6 +2112,33 @@ def pytest_addoption(parser):
         "immediately after it completes. This ensures a merged report always exists even if pytest is killed. "
         "Uses efficient append-only writes with minimal overhead (O(1) per test instead of O(n)).",
     )
+    parser.addoption(
+        "--lightweight-periodic-junit",
+        action="store_true",
+        default=False,
+        help=
+        "Enable lightweight periodic JUnit XML reporter. This reporter uses incremental append strategy "
+        "for ultra-fast periodic saves, ideal for very large test suites. Saves progress periodically "
+        "to prevent data loss on interruption. Requires --output-dir to be set.",
+    )
+    parser.addoption(
+        "--periodic-interval",
+        action="store",
+        type=int,
+        default=1800,
+        help=
+        "Time interval in seconds between periodic saves (default: 1800s = 30min). "
+        "Only used with --lightweight-periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-batch-size",
+        action="store",
+        type=int,
+        default=10,
+        help=
+        "Number of completed tests before triggering a periodic save (default: 10). "
+        "Only used with --lightweight-periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2243,6 +2270,38 @@ def pytest_configure(config):
             )
     else:
         config._per_case_junit_manager = {'enabled': False}
+
+    # Initialize LightweightPeriodicJUnitXML reporter if enabled
+    lightweight_periodic = config.getoption("--lightweight-periodic-junit",
+                                            default=False)
+
+    if lightweight_periodic and output_dir:
+        periodic_interval = config.getoption("--periodic-interval",
+                                             default=1800)
+        periodic_batch_size = config.getoption("--periodic-batch-size",
+                                               default=10)
+
+        # Create the reporter
+        xmlpath = os.path.join(output_dir, "junit_periodic_report.xml")
+        reporter = LightweightPeriodicJUnitXML(
+            xmlpath=xmlpath,
+            interval=periodic_interval,
+            batch_size=periodic_batch_size,
+        )
+
+        # Configure and register the reporter
+        reporter.pytest_configure(config)
+        config.pluginmanager.register(reporter, 'lightweight_periodic_junit')
+
+        print_info(f"LightweightPeriodicJUnitXML reporter registered")
+        print_info(
+            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
+        )
+        print_info(f"  Batch size: {periodic_batch_size} tests")
+    elif lightweight_periodic and not output_dir:
+        print_warning(
+            "Warning: --lightweight-periodic-junit requires --output-dir to be set. "
+            "Periodic reporting disabled.")
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
@@ -3034,3 +3093,468 @@ def pytest_sessionfinish(session, exitstatus):
         manager = session.config._per_case_junit_manager
         if manager.get('enabled') and manager.get('test_cases'):
             _merge_per_case_junit_reports(manager)
+
+
+# ============================================================================
+# Optimized Periodic JUnit XML Reporter (No Merge Required)
+# ============================================================================
+
+
+class EfficientPeriodicJUnitXML:
+    """
+    Efficient periodic JUnit XML reporter that avoids merge operations.
+
+    Features:
+    - Writes to a single report file throughout the test session
+    - Periodic saves to prevent data loss on interruption
+    - Atomic writes with backup for safety
+    - No merge needed at the end (saves time and disk space)
+
+    Usage:
+        Add to conftest.py:
+
+        def pytest_configure(config):
+            reporter = EfficientPeriodicJUnitXML(
+                xmlpath='results/junit_report.xml',
+                interval=1800,  # Save every 30 minutes
+                batch_size=10   # Or save every 10 tests
+            )
+            reporter.pytest_configure(config)
+            config.pluginmanager.register(reporter, 'efficient_periodic_junit')
+    """
+
+    def __init__(
+            self,
+            xmlpath: str,
+            interval: int = 1800,  # Default: 30 minutes
+            batch_size: int = 10,  # Default: save every 10 completed tests
+            keep_backup: bool = True,  # Keep backup file for safety
+    ):
+        """
+        Initialize the efficient periodic JUnit XML reporter.
+
+        Args:
+            xmlpath: Path to the output XML report file
+            interval: Time interval in seconds between saves (default: 1800s = 30min)
+            batch_size: Number of completed tests before triggering a save (default: 10)
+            keep_backup: Whether to keep a backup file (default: True)
+        """
+        self.xmlpath = os.path.abspath(xmlpath)
+        self.time_interval = interval
+        self.batch_size = batch_size
+        self.keep_backup = keep_backup
+
+        # Counters and timers
+        self.completed_tests = 0
+        self.last_save_time = time.time()
+        self.suite_start_time = time.time()
+
+        # Core components
+        self.logxml = None
+        self.config = None
+
+        # Performance tracking
+        self.save_count = 0
+        self.total_save_time = 0.0
+
+    def pytest_configure(self, config):
+        """Configure the plugin and initialize LogXML."""
+
+        from _pytest.junitxml import LogXML
+
+        self.config = config
+
+        # Ensure xmlpath directory exists
+        os.makedirs(os.path.dirname(self.xmlpath), exist_ok=True)
+
+        # Initialize pytest's built-in LogXML plugin
+        # This handles all the complex test report tracking
+        self.logxml = LogXML(
+            self.xmlpath,
+            prefix=None,
+            suite_name='pytest',
+            logging='all',
+            report_duration='total',
+            family='xunit2',
+            log_passing_tests=True,
+        )
+
+        # Initialize LogXML internal state
+        self.logxml.config = config
+        self.logxml.stats = dict.fromkeys(
+            ['error', 'passed', 'failure', 'skipped'], 0)
+        self.logxml.node_reporters = {}
+        self.logxml.node_reporters_ordered = []
+        self.logxml.global_properties = []
+
+        print_info(f"EfficientPeriodicJUnitXML: Initialized")
+        print_info(f"  Output: {self.xmlpath}")
+        print_info(
+            f"  Time interval: {self.time_interval}s ({self.time_interval/60:.1f} min)"
+        )
+        print_info(f"  Batch size: {self.batch_size} tests")
+
+    def pytest_runtest_logreport(self, report):
+        """Handle test reports and trigger periodic saves."""
+        if self.logxml is None:
+            return
+
+        # Let LogXML handle the report first
+        self.logxml.pytest_runtest_logreport(report)
+
+        # Only process teardown phase (when test is fully complete)
+        if report.when != 'teardown':
+            return
+
+        self.completed_tests += 1
+        current_time = time.time()
+        time_elapsed = current_time - self.last_save_time
+
+        # Determine if we should save
+        should_save = False
+        save_reason = ""
+
+        if self.completed_tests >= self.batch_size:
+            should_save = True
+            save_reason = f"batch size reached ({self.completed_tests} tests)"
+        elif time_elapsed >= self.time_interval:
+            should_save = True
+            save_reason = f"time interval reached ({time_elapsed:.0f}s)"
+
+        if should_save and self.completed_tests > 0:
+            try:
+                self._save_report(is_periodic=True, reason=save_reason)
+                self.completed_tests = 0  # Reset counter
+                self.last_save_time = current_time
+            except Exception as e:
+                print_warning(f"Failed to save periodic report: {e}")
+
+    def pytest_sessionfinish(self):
+        """Generate final report at session end."""
+        try:
+            self._save_report(is_periodic=False, reason="session finished")
+
+            # Print summary statistics
+            if self.save_count > 0:
+                avg_save_time = self.total_save_time / self.save_count
+                print_info(f"\nEfficientPeriodicJUnitXML Summary:")
+                print_info(f"  Total periodic saves: {self.save_count}")
+                print_info(f"  Average save time: {avg_save_time:.3f}s")
+                print_info(f"  Total save time: {self.total_save_time:.3f}s")
+                print_info(f"  Final report: {self.xmlpath}")
+        except Exception as e:
+            print_warning(f"Failed to generate final report: {e}")
+
+    def _save_report(self, is_periodic: bool, reason: str = ""):
+        """
+        Save the current state of the test report.
+
+        This method writes directly to the target file without creating
+        intermediate timestamped files, eliminating the need for merging.
+
+        Args:
+            is_periodic: Whether this is a periodic save or final save
+            reason: Human-readable reason for the save
+        """
+        import xml.etree.ElementTree as ET
+
+        if self.logxml is None or not self.logxml.node_reporters_ordered:
+            return
+
+        save_start_time = time.time()
+
+        try:
+            # Calculate statistics
+            suite_stop_time = time.time()
+            suite_time_delta = suite_stop_time - self.suite_start_time
+
+            stats = self.logxml.stats
+            numtests = sum(stats.values()) - getattr(self.logxml,
+                                                     'cnt_double_fail_tests', 0)
+
+            # Build XML structure
+            suite_node = ET.Element(
+                "testsuite",
+                name="pytest",
+                errors=str(stats["error"]),
+                failures=str(stats["failure"]),
+                skipped=str(stats["skipped"]),
+                tests=str(numtests),
+                time=f"{suite_time_delta:.3f}",
+                timestamp=datetime.datetime.fromtimestamp(
+                    self.suite_start_time).strftime("%Y-%m-%dT%H:%M:%S"),
+                hostname=platform.node(),
+            )
+
+            # Add global properties if any
+            if self.logxml.global_properties:
+                properties = ET.SubElement(suite_node, "properties")
+                for name, value in self.logxml.global_properties:
+                    ET.SubElement(properties,
+                                  "property",
+                                  name=name,
+                                  value=str(value))
+
+            # Add all test cases
+            for node_reporter in self.logxml.node_reporters_ordered:
+                suite_node.append(node_reporter.to_xml())
+
+            # Create root element
+            testsuites = ET.Element("testsuites")
+            testsuites.append(suite_node)
+
+            # Write to temporary file first (atomic write pattern)
+            temp_file = self.xmlpath + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write('<?xml version="1.0" encoding="utf-8"?>')
+
+                # Pretty print if available (Python 3.9+)
+                try:
+                    tree = ET.ElementTree(testsuites)
+                    ET.indent(tree, space='  ')
+                    f.write(ET.tostring(testsuites, encoding='unicode'))
+                except AttributeError:
+                    # Fallback for older Python versions
+                    f.write(ET.tostring(testsuites, encoding='unicode'))
+
+            # Create backup if requested and file exists
+            if self.keep_backup and os.path.exists(self.xmlpath):
+                backup_file = self.xmlpath + '.backup'
+                try:
+                    shutil.copy2(self.xmlpath, backup_file)
+                except Exception as e:
+                    print_warning(f"Failed to create backup: {e}")
+
+            # Atomic rename (overwrites existing file)
+            os.replace(temp_file, self.xmlpath)
+
+            # Update statistics
+            save_elapsed = time.time() - save_start_time
+            self.total_save_time += save_elapsed
+            if is_periodic:
+                self.save_count += 1
+
+            # Log the save operation
+            save_type = "Periodic" if is_periodic else "Final"
+            print_info(f"{save_type} JUnit report saved: {self.xmlpath} "
+                       f"({numtests} tests, {save_elapsed:.3f}s) - {reason}")
+
+        except Exception as e:
+            print_warning(f"Error saving report: {e}")
+            # Clean up temp file if it exists
+            temp_file = self.xmlpath + '.tmp'
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            raise
+
+
+# ============================================================================
+# Lightweight Periodic JUnit XML Reporter (Alternative Implementation)
+# ============================================================================
+
+
+class LightweightPeriodicJUnitXML:
+    """
+    Ultra-lightweight periodic JUnit XML reporter using incremental append.
+
+    This version is even more efficient by appending test results incrementally
+    instead of rewriting the entire file each time. Best for very large test suites.
+
+    Trade-offs:
+    + Extremely fast saves (constant time)
+    + Minimal memory usage
+    - More complex XML handling
+    - Final cleanup needed to consolidate statistics
+    """
+
+    def __init__(
+        self,
+        xmlpath: str,
+        interval: int = 1800,
+        batch_size: int = 10,
+    ):
+        """Initialize lightweight reporter."""
+        self.xmlpath = os.path.abspath(xmlpath)
+        self.time_interval = interval
+        self.batch_size = batch_size
+
+        self.completed_tests = 0
+        self.last_save_time = time.time()
+        self.suite_start_time = time.time()
+
+        # Statistics tracking
+        self.stats = {
+            'tests': 0,
+            'errors': 0,
+            'failures': 0,
+            'skipped': 0,
+            'passed': 0,
+            'time': 0.0,
+        }
+
+        # Pending test cases buffer
+        self.pending_cases = []
+
+        # File handle for incremental writes
+        self.xml_file = None
+        self.header_written = False
+
+    def pytest_configure(self, config):
+        """Configure and initialize output file."""
+        os.makedirs(os.path.dirname(self.xmlpath), exist_ok=True)
+
+        # Open file for incremental writing
+        self.xml_file = open(self.xmlpath, 'w', encoding='utf-8')
+
+        # Write XML header and opening tags
+        self.xml_file.write('<?xml version="1.0" encoding="utf-8"?>\n')
+        self.xml_file.write('<testsuites>\n')
+        self.xml_file.write('  <testsuite name="pytest">\n')
+        self.xml_file.flush()
+        self.header_written = True
+
+        print_info(
+            f"LightweightPeriodicJUnitXML: Initialized at {self.xmlpath}")
+
+    def pytest_runtest_logreport(self, report):
+        """Collect test results and save periodically."""
+        if report.when != 'teardown':
+            return
+
+        # Extract test case information
+        test_case = self._create_testcase_xml(report)
+        self.pending_cases.append(test_case)
+
+        # Update statistics
+        self.stats['tests'] += 1
+        self.stats['time'] += getattr(report, 'duration', 0.0)
+
+        if report.failed:
+            self.stats['failures'] += 1
+        elif report.skipped:
+            self.stats['skipped'] += 1
+        elif hasattr(report, 'wasxfail'):
+            self.stats['skipped'] += 1
+        else:
+            self.stats['passed'] += 1
+
+        self.completed_tests += 1
+        current_time = time.time()
+
+        # Check if we should flush pending cases
+        if (self.completed_tests >= self.batch_size
+                or current_time - self.last_save_time >= self.time_interval):
+            self._flush_pending_cases()
+            self.completed_tests = 0
+            self.last_save_time = current_time
+
+    def _create_testcase_xml(self, report):
+        """Create XML string for a single test case."""
+        import xml.etree.ElementTree as ET
+
+        testcase = ET.Element(
+            'testcase',
+            classname=report.location[0],
+            name=report.location[2],
+            time=f"{getattr(report, 'duration', 0.0):.3f}",
+        )
+
+        # Add failure/error/skip information
+        if report.failed:
+            if report.when == 'setup':
+                failure = ET.SubElement(testcase,
+                                        'error',
+                                        message='setup failure')
+            else:
+                failure = ET.SubElement(testcase,
+                                        'failure',
+                                        message='test failure')
+            if hasattr(report, 'longreprtext'):
+                failure.text = report.longreprtext
+        elif report.skipped:
+            skip = ET.SubElement(testcase, 'skipped', message='skipped')
+            if hasattr(report, 'longreprtext'):
+                skip.text = report.longreprtext
+
+        return ET.tostring(testcase, encoding='unicode')
+
+    def _flush_pending_cases(self):
+        """Write pending test cases to file."""
+        if not self.pending_cases or not self.xml_file:
+            return
+
+        try:
+            for case_xml in self.pending_cases:
+                # Indent for pretty printing
+                lines = case_xml.split('\n')
+                for line in lines:
+                    if line.strip():
+                        self.xml_file.write(f'    {line}\n')
+
+            self.xml_file.flush()
+            os.fsync(self.xml_file.fileno())  # Force write to disk
+
+            print_info(
+                f"Flushed {len(self.pending_cases)} test cases to report")
+            self.pending_cases.clear()
+
+        except Exception as e:
+            print_warning(f"Failed to flush test cases: {e}")
+
+    def pytest_sessionfinish(self):
+        """Finalize report with closing tags and statistics."""
+        try:
+            # Flush any remaining test cases
+            self._flush_pending_cases()
+
+            if self.xml_file:
+                # Write closing tags
+                self.xml_file.write('  </testsuite>\n')
+                self.xml_file.write('</testsuites>\n')
+                self.xml_file.close()
+                self.xml_file = None
+
+                # Update testsuite attributes using post-processing
+                self._update_suite_attributes()
+
+                print_info(f"\nLightweightPeriodicJUnitXML: Session finished")
+                print_info(f"  Tests: {self.stats['tests']}")
+                print_info(f"  Failures: {self.stats['failures']}")
+                print_info(f"  Errors: {self.stats['errors']}")
+                print_info(f"  Skipped: {self.stats['skipped']}")
+                print_info(f"  Total time: {self.stats['time']:.3f}s")
+
+        except Exception as e:
+            print_warning(f"Error finalizing report: {e}")
+
+    def _update_suite_attributes(self):
+        """Update testsuite element with final statistics."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            # Parse the file we just wrote
+            tree = ET.parse(self.xmlpath)
+            root = tree.getroot()
+            suite = root.find('testsuite')
+
+            if suite is not None:
+                # Update attributes
+                suite.set('tests', str(self.stats['tests']))
+                suite.set('failures', str(self.stats['failures']))
+                suite.set('errors', str(self.stats['errors']))
+                suite.set('skipped', str(self.stats['skipped']))
+                suite.set('time', f"{self.stats['time']:.3f}")
+                suite.set(
+                    'timestamp',
+                    datetime.datetime.fromtimestamp(
+                        self.suite_start_time).strftime("%Y-%m-%dT%H:%M:%S"))
+                suite.set('hostname', platform.node())
+
+                # Write back
+                tree.write(self.xmlpath, encoding='utf-8', xml_declaration=True)
+
+        except Exception as e:
+            print_warning(f"Failed to update suite attributes: {e}")
