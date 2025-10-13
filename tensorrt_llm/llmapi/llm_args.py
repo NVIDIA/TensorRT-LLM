@@ -21,6 +21,7 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.llmapi.utils import orchestrator_type_env
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -2093,6 +2094,20 @@ class BaseLlmArgs(StrictBaseModel):
                 f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
                 "while LoRA prefetch is not supported")
         return self
+
+    @field_validator('orchestrator_type', mode='before')
+    def validate_orchestrator_config(v):
+        # The environment variable will override the orchestrator_type field.
+        # TODO: remove the environment variable after RPC path is stable, then
+        # there will be only two stable options: None(RPC) and 'ray'.
+        if (ev := orchestrator_type_env()) is not None:
+            if ev not in ['rpc', 'ray']:
+                raise ValueError(
+                    f"Invalid orchestrator type: {ev}. Please set orchestrator_type to 'rpc' or 'ray'."
+                )
+            v = ev
+
+        return v
 
     def _update_plugin_config(self, key: str, value: Any):
         setattr(self.build_config.plugin_config, key, value)
