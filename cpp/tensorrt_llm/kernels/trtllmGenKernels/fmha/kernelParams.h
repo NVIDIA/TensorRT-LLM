@@ -814,9 +814,6 @@ struct KernelParams
         params.mStartTokenIdx = options.mSfStartTokenIdx;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
 
-        // Set the block sparse attention flag.
-        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
-
         return params;
     }
 };
