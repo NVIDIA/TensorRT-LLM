@@ -817,12 +817,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
     num_nextn_predict_layers_from_model_config: int = 1
 
-    # TODO: Hard code for DeepSeek R1
     # When encounter <think>, start thinking phase.
     # When encounter </think>, end thinking phase.
     # <think> [thinking phase] </think> [real output]
-    BEGIN_THINKING_PHASE_TOKEN: int = 128798
-    END_THINKING_PHASE_TOKEN: int = 128799
+    begin_thinking_phase_token: int = 128798
+    end_thinking_phase_token: int = 128799
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
