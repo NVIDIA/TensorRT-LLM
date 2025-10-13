@@ -80,6 +80,8 @@ class GroupedGemmParamsInput:
     b_ptrs: torch.Tensor
     b_prime_ptrs: torch.Tensor
     sorted_ids: torch.Tensor
+    output_hidden_sizes: torch.Tensor
+    output_sizes_offset: torch.Tensor
 
     @property
     def slot_offsets(self):
@@ -242,27 +244,14 @@ class LoraModuleType(IntEnum):
 
 
 class LoraLayer(torch.nn.Module):
-    PTR_DTYPE = torch.int64
-    LD_DTYPE = torch.int64
-    SIZES_DTYPE = torch.int32
 
     def __init__(self, lora_module_types: List[LoraModuleType],
                  output_hidden_sizes: List[int]):
         super().__init__()
 
         self.lora_module_types = lora_module_types
-        self.output_hidden_sizes = torch.tensor(output_hidden_sizes,
-                                                dtype=self.SIZES_DTYPE)
-        self.output_hidden_sizes_list = output_hidden_sizes
+        self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
-        self.output_sizes_offset = CudaGraphLoraParams.get_offset_from_counts(
-            self.output_hidden_sizes).to(
-                dtype=self.PTR_DTYPE)  # [num_layer_modules]
-        if PARAM_PREP:
-            self.output_sizes_offset_device = self.output_sizes_offset.to(
-                device='cuda')
-            self.output_hidden_size_device = self.output_hidden_sizes.to(
-                device='cuda')
 
     def forward(
         self,
@@ -307,7 +296,7 @@ class LoraLayer(torch.nn.Module):
         # a [bs, hidden]
         lda = torch.full(shape_2d,
                          input_hidden_size,
-                         dtype=self.LD_DTYPE,
+                         dtype=CudaGraphLoraParams.LD_DTYPE,
                          device=device)
 
         # b [input_hidden_size, lora_rank]
@@ -316,17 +305,17 @@ class LoraLayer(torch.nn.Module):
         # a_prime / d [num_layer_modules, bs, max_rank]
         ldd = torch.full(shape_2d,
                          input.max_rank,
-                         dtype=self.LD_DTYPE,
+                         dtype=CudaGraphLoraParams.LD_DTYPE,
                          device=device)
 
         # b_prime [lora_rank, module_output_size]
         ldb_prime = input.slot_ranks.unsqueeze(0).to(
-            dtype=self.LD_DTYPE).repeat(shape_2d[0], 1)
+            dtype=CudaGraphLoraParams.LD_DTYPE).repeat(shape_2d[0], 1)
 
         # d_prime [bs, sum_of_each_module_output_sizes]
         ldd_prime = torch.full(shape_2d,
                                sum_out_sizes,
-                               dtype=self.LD_DTYPE,
+                               dtype=CudaGraphLoraParams.LD_DTYPE,
                                device=device)
 
         # reordered a [bs, hidden], each module has the same offset
@@ -335,13 +324,13 @@ class LoraLayer(torch.nn.Module):
 
         # d [num_layer_modules, bs, max_rank]
         d_offset = (input.slot_offsets.unsqueeze(0) + torch.arange(
-            shape_2d[0], device=device, dtype=self.PTR_DTYPE).unsqueeze(1) *
-                    bs) * input.max_rank
+            shape_2d[0], device=device, dtype=CudaGraphLoraParams.PTR_DTYPE).
+                    unsqueeze(1) * bs) * input.max_rank
 
         # d' [bs, sum_of_each_module_output_sizes]
         bs_offset = input.slot_offsets.unsqueeze(0)  # [1, max_lora_size]
         bs_offset = bs_offset * sum_out_sizes
-        out_offset = self.output_sizes_offset_device.unsqueeze(
+        out_offset = input.output_sizes_offset.unsqueeze(
             1)  # [num_layer_modules, 1]
         d_prime_offset = bs_offset + out_offset
         '''
@@ -350,12 +339,14 @@ class LoraLayer(torch.nn.Module):
         '''
 
         # sizes
-        in_sizes = torch.empty(shape_3d, dtype=self.SIZES_DTYPE, device=device)
+        in_sizes = torch.empty(shape_3d,
+                               dtype=CudaGraphLoraParams.SIZES_DTYPE,
+                               device=device)
         out_sizes = torch.empty_like(in_sizes)
 
         slot_counts = input.slot_counts.unsqueeze(0)  # [1, max_lora_size]
         ranks = input.slot_ranks.unsqueeze(0)  # [1, max_lora_size]
-        output_hidden_sizes = self.output_hidden_size_device.unsqueeze(
+        output_hidden_sizes = input.output_hidden_sizes.unsqueeze(
             1)  # [num_layer_modules, 1]
 
         in_sizes[:, :, 0] = slot_counts
@@ -373,7 +364,7 @@ class LoraLayer(torch.nn.Module):
         # splitk_offsets: [num_layer_modules, max_lora_size]
         # splitk offtsets (m * n) for the first grouped gemm with (m, n, k) = (slot_counts, slot_ranks, input_hidden_size)
         splitk_offsets = torch.zeros(shape_2d,
-                                     dtype=self.LD_DTYPE,
+                                     dtype=CudaGraphLoraParams.LD_DTYPE,
                                      device=device)  # (layer_problem_count,)
 
         splitk_offsets.view(-1)[1:] = in_sizes.view(-1, 3)[:-1, 0]  #  = M
@@ -413,18 +404,24 @@ class LoraLayer(torch.nn.Module):
         shape_3d = shape_2d + (3, )
         sum_out_sizes = sum(self.output_hidden_sizes)
 
-        in_sizes = torch.empty(shape_3d, dtype=self.SIZES_DTYPE, device=device)
+        in_sizes = torch.empty(shape_3d,
+                               dtype=CudaGraphLoraParams.SIZES_DTYPE,
+                               device=device)
         out_sizes = torch.empty_like(in_sizes)
-        a_offset = torch.empty(shape_2d, dtype=self.PTR_DTYPE, device=device)
+        a_offset = torch.empty(shape_2d,
+                               dtype=CudaGraphLoraParams.PTR_DTYPE,
+                               device=device)
         d_offset = torch.empty_like(a_offset)
         d_prime_offset = torch.empty_like(a_offset)
-        lda = torch.empty(shape_2d, dtype=self.LD_DTYPE, device=device)
+        lda = torch.empty(shape_2d,
+                          dtype=CudaGraphLoraParams.LD_DTYPE,
+                          device=device)
         ldb = lda
         ldd = torch.empty_like(lda)
         ldb_prime = torch.empty_like(lda)
         ldd_prime = torch.empty_like(lda)
         splitk_offsets = torch.empty(shape_2d,
-                                     dtype=self.LD_DTYPE,
+                                     dtype=CudaGraphLoraParams.LD_DTYPE,
                                      device=device)  # (layer_problem_count,)
         reordered_input = torch.empty_like(input.x)
         torch.ops.trtllm.lora_group_gemm_param_fill_row_reorder_fusion(
@@ -450,8 +447,8 @@ class LoraLayer(torch.nn.Module):
             input.slot_counts,
             input.slot_ranks,
             input.slot_offsets,
-            self.output_hidden_size_device,
-            self.output_sizes_offset_device,
+            input.output_hidden_sizes,
+            input.output_sizes_offset,
             input.b_ptrs,
             input.b_prime_ptrs,
             input.x,
@@ -475,14 +472,16 @@ class LoraLayer(torch.nn.Module):
 
     def _prepare_max_sizes_cpu(self,
                                cuda_graph_lora_params: CudaGraphLoraParams,
+                               layer_key: CudaGraphLoraParams.LoraLayerKey,
                                bs: int, input_hidden_size: int):
+        layer_params = cuda_graph_lora_params.get_layer_params(layer_key)
         shape_2d = (len(self.lora_module_types),
                     cuda_graph_lora_params.max_lora_size
                     )  # [num_layer_modules, max_lora_size]
         shape_3d = shape_2d + (3, )
         # dummy max sizes, on CPU
         host_max_in_sizes = torch.empty(
-            shape_3d, dtype=self.SIZES_DTYPE
+            shape_3d, dtype=CudaGraphLoraParams.SIZES_DTYPE
         )  # m: batch_size, n: max_lora_rank, k: input_hidden_size
         host_max_out_sizes = torch.empty_like(
             host_max_in_sizes
@@ -492,7 +491,7 @@ class LoraLayer(torch.nn.Module):
         host_max_in_sizes[:, :, 2] = input_hidden_size
 
         host_max_out_sizes[:, :, 0] = bs
-        host_max_out_sizes[:, :, 1] = self.output_hidden_sizes.unsqueeze(1)
+        host_max_out_sizes[:, :, 1] = layer_params.h_output_sizes.unsqueeze(1)
         host_max_out_sizes[:, :, 2] = cuda_graph_lora_params.max_rank
 
         return host_max_in_sizes, host_max_out_sizes
@@ -546,7 +545,7 @@ class LoraLayer(torch.nn.Module):
                                     device=x.device)
 
         host_max_in_sizes, host_max_out_sizes = self._prepare_max_sizes_cpu(
-            cuda_graph_params, batch_size, hidden_size)
+            cuda_graph_params, layer_key, batch_size, hidden_size)
 
         if RETURN_0_DIRECTLY:
             return output_buffer
@@ -569,7 +568,9 @@ class LoraLayer(torch.nn.Module):
                 slot_offsets_full=cuda_graph_params.slot_offsets_full,
                 b_ptrs=layer_params.d_b_ptrs,
                 b_prime_ptrs=layer_params.d_b_prime_ptrs,
-                sorted_ids=cuda_graph_params.sorted_ids)
+                sorted_ids=cuda_graph_params.sorted_ids,
+                output_hidden_sizes=layer_params.d_output_sizes,
+                output_sizes_offset=layer_params.d_output_sizes_offset)
             grouped_gemm_params = self._prepare_grouped_gemm_buffers_fused(
                 params_fill_input)
 
@@ -692,17 +693,18 @@ class LoraLayer(torch.nn.Module):
         if PRINT_AND_ASSERT:
             assert output_buffer.is_contiguous()
             out_splitted = [
-                output_buffer[:, s:s + le] for s, le in zip(
-                    self.output_sizes_offset, self.output_hidden_sizes)
+                output_buffer[:, s:s + le]
+                for s, le in zip(layer_params.h_output_sizes_offset,
+                                 layer_params.h_output_sizes)
             ]
             # assert not any(out.is_contiguous() for out in out_splitted)
             pyt_strides = torch.tensor([out.stride(0) for out in out_splitted],
-                                       dtype=self.LD_DTYPE,
+                                       dtype=CudaGraphLoraParams.LD_DTYPE,
                                        device=x.device)  # nModules,
             assert torch.all(
                 grouped_gemm_params.ldd_prime == pyt_strides.unsqueeze(1))
             pyt_addr = torch.tensor([out.data_ptr() for out in out_splitted],
-                                    dtype=self.PTR_DTYPE,
+                                    dtype=CudaGraphLoraParams.PTR_DTYPE,
                                     device=x.device)
             assert torch.all(pyt_addr == grouped_gemm_params.d_prime_offset[:,
                                                                             0])
@@ -908,27 +910,27 @@ class LoraLayer(torch.nn.Module):
             # problem_sizes1 = torch.tensor([[24, 32, 16], [24, 32, 16]], dtype=self.SIZES_DTYPE, device=x.device)
             problem_sizes1 = torch.tensor(
                 [[m00, n00, k00], [0, 0, 0], [0, 0, 0], [m02, n02, k02]],
-                dtype=self.SIZES_DTYPE,
+                dtype=CudaGraphLoraParams.SIZES_DTYPE,
                 device=x.device)
             lda = torch.tensor([k00, 17, 16, k02],
-                               dtype=self.LD_DTYPE,
+                               dtype=CudaGraphLoraParams.LD_DTYPE,
                                device=x.device) + ld_offset
             ldb = torch.tensor([k00, 16, 16, k02],
-                               dtype=self.LD_DTYPE,
+                               dtype=CudaGraphLoraParams.LD_DTYPE,
                                device=x.device) + ld_offset
             ldd = torch.tensor([n00, 32, 32, n02],
-                               dtype=self.LD_DTYPE,
+                               dtype=CudaGraphLoraParams.LD_DTYPE,
                                device=x.device) + ld_offset
 
             problem_sizes2 = torch.tensor(
                 [[m10, n10, k10], [0, 0, 0], [0, 0, 0], [m12, n12, k12]],
-                dtype=self.SIZES_DTYPE,
+                dtype=CudaGraphLoraParams.SIZES_DTYPE,
                 device=x.device)
             ldb1 = torch.tensor([k10, 32, 32, k12],
-                                dtype=self.LD_DTYPE,
+                                dtype=CudaGraphLoraParams.LD_DTYPE,
                                 device=x.device) + ld_offset
             ldd1 = torch.tensor([n10, 48, 48, n12],
-                                dtype=self.LD_DTYPE,
+                                dtype=CudaGraphLoraParams.LD_DTYPE,
                                 device=x.device) + ld_offset
 
             a0_ptr = torch.tensor(
@@ -936,11 +938,11 @@ class LoraLayer(torch.nn.Module):
                  a0.data_ptr(),
                  a0.data_ptr(),
                  a02.data_ptr()],
-                dtype=self.PTR_DTYPE,
+                dtype=CudaGraphLoraParams.PTR_DTYPE,
                 device=x.device)
             b0_ptr = torch.tensor(
                 [b0.data_ptr(), 0, 0, b02.data_ptr()],
-                dtype=self.PTR_DTYPE,
+                dtype=CudaGraphLoraParams.PTR_DTYPE,
                 device=x.device)
             d0_ptr = torch.tensor([
                 d00.data_ptr(),
@@ -948,11 +950,11 @@ class LoraLayer(torch.nn.Module):
                 d01.data_ptr(),
                 d02.data_ptr()
             ],
-                                  dtype=self.PTR_DTYPE,
+                                  dtype=CudaGraphLoraParams.PTR_DTYPE,
                                   device=x.device)
             b1_ptr = torch.tensor(
                 [b1.data_ptr(), 0, 0, b12.data_ptr()],
-                dtype=self.PTR_DTYPE,
+                dtype=CudaGraphLoraParams.PTR_DTYPE,
                 device=x.device)
             d1_ptr = torch.tensor([
                 d10.data_ptr(),
@@ -960,7 +962,7 @@ class LoraLayer(torch.nn.Module):
                 d11.data_ptr(),
                 d12.data_ptr()
             ],
-                                  dtype=self.PTR_DTYPE,
+                                  dtype=CudaGraphLoraParams.PTR_DTYPE,
                                   device=x.device)
 
             torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
@@ -1081,7 +1083,7 @@ class LoraLayer(torch.nn.Module):
                 lora_ranks,
                 lora_weight_pointers,
                 lora_params['prompt_lens_cpu'][:num_seqs],
-                self.output_hidden_sizes_list,
+                self.output_hidden_sizes,
                 False,  # transA
                 True,  # transB
                 max([r.max() for r in lora_ranks]),
@@ -1101,7 +1103,7 @@ class LoraLayer(torch.nn.Module):
                     else:
                         lora_output.append(
                             torch.zeros(list(x.shape[:-1]) + [
-                                self.output_hidden_sizes_list[
+                                self.output_hidden_sizes[
                                     self.lora_module_types.index(module_idx)]
                             ],
                                         dtype=x.dtype,

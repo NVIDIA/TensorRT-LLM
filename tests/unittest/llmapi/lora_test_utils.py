@@ -361,11 +361,14 @@ def create_grouped_gemm_params_filler_input(
                                     test_params.sum_output_hidden_size,
                                     dtype=test_params.dtype,
                                     device="cuda")
-        b_ptrs = torch.randint(1, 1000000, shape_2d, dtype=LoraLayer.PTR_DTYPE)
+        b_ptrs = torch.randint(1,
+                               1000000,
+                               shape_2d,
+                               dtype=CudaGraphLoraParams.PTR_DTYPE)
         b_prime_ptrs = torch.randint(1,
                                      1000000,
                                      shape_2d,
-                                     dtype=LoraLayer.PTR_DTYPE)
+                                     dtype=CudaGraphLoraParams.PTR_DTYPE)
 
         b_ptrs *= test_params.layer_module_mask
         b_prime_ptrs *= test_params.layer_module_mask
@@ -373,7 +376,7 @@ def create_grouped_gemm_params_filler_input(
         b_ptrs = b_ptrs.to(device="cuda")
         b_prime_ptrs = b_prime_ptrs.to(device="cuda")
         slot_ranks = torch.tensor(test_params.slot_ranks,
-                                  dtype=LoraLayer.SIZES_DTYPE,
+                                  dtype=CudaGraphLoraParams.SIZES_DTYPE,
                                   device="cuda")
 
         intermediate_buffer = torch.randn(test_params.module_count,
@@ -393,19 +396,31 @@ def create_grouped_gemm_params_filler_input(
         slot_counts = slot_counts.to(device="cuda", dtype=torch.int32)
         sorted_ids = sorted_ids.to(device="cuda", dtype=torch.int64)
 
+        output_hidden_sizes = torch.tensor(
+            test_params.output_hidden_sizes,
+            dtype=CudaGraphLoraParams.SIZES_DTYPE,
+            device="cuda")
+        output_sizes_offset = CudaGraphLoraParams.get_offset_from_counts(
+            output_hidden_sizes).to(dtype=CudaGraphLoraParams.PTR_DTYPE,
+                                    device="cuda")
+
         layer = LoraLayer([0] * test_params.module_count,
                           test_params.output_hidden_sizes)
-        inputs = GroupedGemmParamsInput(x=x,
-                                        output_buffer=output_buffer,
-                                        intermediate_buffer=intermediate_buffer,
-                                        max_lora_size=test_params.slot_count,
-                                        max_rank=test_params.max_lora_rank,
-                                        slot_counts=slot_counts,
-                                        slot_ranks=slot_ranks,
-                                        slot_offsets_full=slot_offsets_full,
-                                        sorted_ids=sorted_ids,
-                                        b_ptrs=b_ptrs,
-                                        b_prime_ptrs=b_prime_ptrs)
+        inputs = GroupedGemmParamsInput(
+            x=x,
+            output_buffer=output_buffer,
+            intermediate_buffer=intermediate_buffer,
+            max_lora_size=test_params.slot_count,
+            max_rank=test_params.max_lora_rank,
+            slot_counts=slot_counts,
+            slot_ranks=slot_ranks,
+            slot_offsets_full=slot_offsets_full,
+            sorted_ids=sorted_ids,
+            b_ptrs=b_ptrs,
+            b_prime_ptrs=b_prime_ptrs,
+            output_hidden_sizes=output_hidden_sizes,
+            output_sizes_offset=output_sizes_offset,
+        )
         return inputs, layer
 
 

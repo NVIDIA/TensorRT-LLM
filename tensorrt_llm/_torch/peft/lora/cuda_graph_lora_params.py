@@ -26,6 +26,11 @@ class LoraLayerParams:
     h_b_ptrs: torch.Tensor  # Lora_in weight pointers in host
     h_b_prime_ptrs: torch.Tensor  # Lora_out weight pointers in host
 
+    d_output_sizes: torch.Tensor
+    d_output_sizes_offset: torch.Tensor
+    h_output_sizes: torch.Tensor
+    h_output_sizes_offset: torch.Tensor
+
 
 class CudaGraphLoraParams:
     """
@@ -36,6 +41,10 @@ class CudaGraphLoraParams:
     """
 
     LoraLayerKey = namedtuple('LoraLayerKey', ['layer_idx', 'module_ids'])
+
+    PTR_DTYPE = torch.int64
+    LD_DTYPE = torch.int64
+    SIZES_DTYPE = torch.int32
 
     @dataclass
     class LoraLayerInfo:
@@ -158,6 +167,14 @@ class CudaGraphLoraParams:
         # Base model requests are handled separately and don't participate in GEMM operations
         shape_2d = (layer_module_num, self.max_lora_size)
 
+        output_hidden_sizes = torch.tensor(module_output_sizes,
+                                           dtype=self.SIZES_DTYPE)
+        output_hidden_sizes_device = output_hidden_sizes.to(device='cuda')
+
+        output_sizes_offset = self.get_offset_from_counts(
+            output_hidden_sizes).to(dtype=self.PTR_DTYPE)  # [num_layer_modules]
+        output_sizes_offset_device = output_sizes_offset.to(device='cuda')
+
         return LoraLayerParams(
             # Weight pointers - managed by PEFT cache manager
             d_b_ptrs=torch.zeros(shape_2d,
@@ -169,7 +186,11 @@ class CudaGraphLoraParams:
             h_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=True),
             h_b_prime_ptrs=torch.zeros(shape_2d,
                                        dtype=torch.int64,
-                                       pin_memory=True))
+                                       pin_memory=True),
+            d_output_sizes=output_hidden_sizes_device,
+            d_output_sizes_offset=output_sizes_offset_device,
+            h_output_sizes=output_hidden_sizes,
+            h_output_sizes_offset=output_sizes_offset)
 
     @staticmethod
     def get_sorted_indices(slot_ids: List[int]) -> torch.Tensor:
