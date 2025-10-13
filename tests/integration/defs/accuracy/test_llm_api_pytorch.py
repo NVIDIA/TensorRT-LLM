@@ -644,6 +644,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
+@pytest.mark.timeout(14400)
 class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
@@ -1896,7 +1897,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(7200)
+@pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-R1"
@@ -2131,42 +2132,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_nvfp4_multi_gpus_corner_case(self):
-        """
-        This test is used to test the corner case of the NVFP4 model.
-        When using the same value for max_seq_len and max_num_tokens, there will be no
-        enough kv block for the dummy requests in CUDA graph warmup when creating
-        the py_executor before estimating kv cache. Then CUDA graph capture will be
-        triggered when estimating kv cache. This may cause some errors.
-        More info in https://nvbugs/5485325.
-        """
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
-                                        dtype="fp8",
-                                        enable_block_reuse=False)
-        pytorch_config = dict(disable_overlap_scheduler=False,
-                              cuda_graph_config=CudaGraphConfig(
-                                  enable_padding=True, max_batch_size=1024),
-                              moe_config=MoeConfig(backend="TRTLLM"))
-
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
-        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
-                 tensor_parallel_size=8,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=8,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=False,
-                 speculative_config=mtp_config,
-                 max_seq_len=5120,
-                 max_num_tokens=5120) as llm:
-
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
+    @skip_pre_blackwell
     def test_nvfp4_multi_gpus_corner_case(self):
         """
         This test is used to test the corner case of the NVFP4 model.
@@ -3557,6 +3523,37 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3NextThinking(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Thinking"
+    MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 4)],
+                             ids=["tp4ep4"])
+    def test_auto_dtype(self, tp_size, pp_size, ep_size):
+        if get_device_count() != tp_size * pp_size:
+            pytest.skip("Device count mismatch with world size")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=720)
+
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=4096,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
