@@ -243,7 +243,6 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
 
         return true;
     }
-
     return mDecoderXqaRunner->shouldUse(params, /*forConfigurePlugin=*/false);
 }
 
