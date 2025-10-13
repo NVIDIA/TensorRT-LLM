@@ -91,7 +91,7 @@ class ClusterStorage(abc.ABC):
     async def watch(self, key_prefix: str) -> WatchEventQueue:
         ...
 
-    # unwatch the key prefix, if the key prefix is not in the watch list, raise an error
+    # unwatch the key prefix, if the key prefix is not in the watch list, raise a KeyError
     async def unwatch(self, key_prefix: str) -> None:
         ...
 
@@ -451,6 +451,14 @@ class Etcd3ClusterStorage(ClusterStorage):
     @property
     def client(self):
         return self._client
+
+    async def start(self):
+        # nothing to do
+        ...
+
+    async def stop(self):
+        # nothing to do
+        ...
 
     async def set(self,
                   key: str,
