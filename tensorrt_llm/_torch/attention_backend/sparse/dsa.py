@@ -87,6 +87,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __post_init__(self):
         super().__post_init__()
 
+        capture_graph = torch.cuda.is_current_stream_capturing()
+
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
                       cache_name: str) -> torch.Tensor:
             if self.cuda_graph_buffers is None:
@@ -153,10 +155,29 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
-        self.slot_mapping_fp8 = None  # [total_tokens] flat byte indices for FP8 data start
-        self.slot_mapping_scale = None  # [total_tokens] flat byte indices for scale start
+        self.slot_mapping_fp8 = get_empty(
+            (self.max_num_tokens, ),
+            cache_name="slot_mapping_fp8",
+            dtype=torch.int64,
+        )
+        self.host_slot_mapping_fp8 = torch.zeros_like(
+            self.slot_mapping_fp8,
+            device='cpu',
+            pin_memory=True,
+        )
+        self.slot_mapping_scale = get_empty(
+            (self.max_num_tokens, ),
+            cache_name="slot_mapping_scale",
+            dtype=torch.int64,
+        )
+        self.host_slot_mapping_scale = torch.zeros_like(
+            self.slot_mapping_scale,
+            device='cpu',
+            pin_memory=True,
+        )
 
         # Preparation stage buffers
+        # TODO: move scheduler_metadata_buffer to device
         self.scheduler_metadata_buffer = None
 
     def prepare(self):
@@ -355,16 +376,6 @@ class Indexer(nn.Module):
                                            )  # Bytes per block
         scale_base_offset = tokens_per_block * head_dim  # Offset to scale region in block
 
-        # Preallocate slot mappings: [total_tokens] flat byte indices
-        metadata.slot_mapping_fp8 = torch.full((total_tokens, ),
-                                               -1,
-                                               dtype=torch.int64,
-                                               device=start_positions.device)
-        metadata.slot_mapping_scale = torch.full((total_tokens, ),
-                                                 -1,
-                                                 dtype=torch.int64,
-                                                 device=start_positions.device)
-
         token_idx = 0
         for req_idx, req_id in enumerate(request_ids):
             num_tokens = num_tokens_per_request[req_idx].item()
@@ -384,18 +395,19 @@ class Indexer(nn.Module):
                     if block_id >= 0:
                         # Flat byte index for FP8 data
                         fp8_flat_idx = block_id * block_stride + pos_in_block * head_dim
-                        metadata.slot_mapping_fp8[token_idx] = fp8_flat_idx
+                        metadata.host_slot_mapping_fp8[token_idx] = fp8_flat_idx
 
                         # Flat byte index for scale
                         scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
-                        metadata.slot_mapping_scale[token_idx] = scale_flat_idx
+                        metadata.host_slot_mapping_scale[
+                            token_idx] = scale_flat_idx
 
                 token_idx += 1
 
-        metadata.slot_mapping_fp8 = metadata.slot_mapping_fp8.cuda(
-            non_blocking=True)
-        metadata.slot_mapping_scale = metadata.slot_mapping_scale.cuda(
-            non_blocking=True)
+        metadata.slot_mapping_fp8[:total_tokens].copy_(
+            metadata.host_slot_mapping_fp8[:total_tokens], non_blocking=True)
+        metadata.slot_mapping_scale[:total_tokens].copy_(
+            metadata.host_slot_mapping_scale[:total_tokens], non_blocking=True)
 
     def _update_k_cache(self, k_fp8: torch.Tensor, k_scale: torch.Tensor,
                         metadata: DSAtrtllmAttentionMetadata) -> None:
@@ -876,6 +888,7 @@ class DSACacheManager(KVCacheManager):
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        num_extra_decoding_steps: int = 0,
     ):
         requests = super().add_dummy_requests(
             request_ids=request_ids,
@@ -885,12 +898,20 @@ class DSACacheManager(KVCacheManager):
             max_num_draft_tokens=max_num_draft_tokens,
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
+            num_extra_decoding_steps=num_extra_decoding_steps,
         )
         if prepare_resource:
             for req in requests:
                 request_id = req.py_request_id
                 self.indexer_k_cache_manager.add_tokens(request_id,
                                                         req.max_beam_num_tokens)
+                self.indexer_k_cache_manager.add_tokens(
+                    request_id, self.num_extra_kv_tokens)
+                self.indexer_k_cache_manager.add_tokens(
+                    request_id, num_extra_decoding_steps)
+                if is_gen:
+                    self.indexer_k_cache_manager.add_tokens(
+                        request_id, max_num_draft_tokens)
         return requests
 
     def copy_indexer_k_cache_offsets(

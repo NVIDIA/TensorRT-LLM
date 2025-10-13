@@ -409,11 +409,27 @@ def _create_mock_metadata(request_ids, batch_size, num_contexts,
             self.indexer_k_cache_block_offsets[:batch_size].copy_(
                 self.host_indexer_k_cache_block_offsets[:batch_size],
                 non_blocking=True)
-            self.slot_mapping_fp8 = None
-            self.slot_mapping_scale = None
+
+            self.slot_mapping_fp8 = torch.zeros((num_tokens, ),
+                                                device='cuda',
+                                                dtype=torch.int64)
+            self.slot_mapping_scale = torch.zeros((num_tokens, ),
+                                                  device='cuda',
+                                                  dtype=torch.int64)
             self.scheduler_metadata_buffer = None
+            self.host_slot_mapping_fp8 = torch.zeros_like(
+                self.slot_mapping_fp8,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.host_slot_mapping_scale = torch.zeros_like(
+                self.slot_mapping_scale,
+                device='cpu',
+                pin_memory=True,
+            )
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
+
     return MockMetadata()
 
 
