@@ -207,8 +207,8 @@ class ADEngine(ModelEngine):
 
             # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
-            num_active_block = kv_cache_manager.get_num_kv_blocks(end_compute)
-            page_assignments.append(cache_indices[:num_active_block])
+            num_active_blocks = kv_cache_manager.get_num_kv_blocks(end_compute)
+            page_assignments.append(cache_indices[:num_active_blocks])
 
             # store seq slot idx
             slot_idx.append(request.seq_slot)
