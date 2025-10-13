@@ -426,17 +426,6 @@ class TrtllmAttentionWrapper:
             self.rotary_embedding_max_positions,
             self.rotary_embedding_original_max_positions
         ]
-        rotary_embedding_int_params = [
-            self.rotary_embedding_dim, self.rotary_embedding_scale_type,
-            self.position_embedding_type
-        ]
-        attention_config_params = [
-            self.num_heads, self.num_kv_heads, self.head_size,
-            self.max_num_requests, self.max_context_length,
-            self.attention_window_size, self.sink_token_length, self.beam_width,
-            int(mask_type), self.quant_mode, self.predicted_tokens_per_seq,
-            self.layer_idx
-        ]
         spec_decoding_bool_params = [
             self.is_spec_decoding_enabled, self.use_spec_decoding,
             self.is_spec_dec_tree
@@ -483,11 +472,24 @@ class TrtllmAttentionWrapper:
             self.attention_sinks,
             is_fused_qkv,
             update_kv_cache,
-            attention_config_params,
+            self.predicted_tokens_per_seq,
+            self.layer_idx,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
             self.tokens_per_block,
+            self.max_num_requests,
+            self.max_context_length,
+            self.attention_window_size,
+            self.sink_token_length,
+            self.beam_width,
+            int(mask_type),
+            self.quant_mode,
             self.q_scaling,
-            rotary_embedding_int_params,
+            self.position_embedding_type,
+            self.rotary_embedding_dim,
             self.rotary_embedding_base,
+            self.rotary_embedding_scale_type,
             rotary_embedding_scales,
             rotary_embedding_max_position_info,
             self.use_paged_context_fmha,

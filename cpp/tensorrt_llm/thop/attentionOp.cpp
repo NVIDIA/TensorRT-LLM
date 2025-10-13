@@ -526,8 +526,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
     std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
     std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    std::vector<int64_t> attention_config_params, std::optional<int64_t> const tokens_per_block, double const q_scaling,
-    std::vector<int64_t> rotary_embedding_int_params, double const rotary_embedding_base,
+    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
+    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
+    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
+    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
+    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
+    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
     std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
@@ -539,27 +543,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
     std::vector<std::optional<torch::Tensor>> sparse_attention_params)
 {
-    // Decompress attention config parameters
-    TORCH_CHECK(attention_config_params.size() == 12, "Expected 12 attention config parameters");
-    int64_t const num_heads = attention_config_params[0];
-    int64_t const num_kv_heads = attention_config_params[1];
-    int64_t const head_size = attention_config_params[2];
-    int64_t const max_num_requests = attention_config_params[3];
-    int64_t const max_context_length = attention_config_params[4];
-    int64_t const attention_window_size = attention_config_params[5];
-    int64_t const sink_token_length = attention_config_params[6];
-    int64_t const beam_width = attention_config_params[7];
-    int64_t const mask_type = attention_config_params[8];
-    int64_t const quant_mode = attention_config_params[9];
-    int64_t const predicted_tokens_per_seq = attention_config_params[10];
-    int64_t const layer_idx = attention_config_params[11];
-
-    // Decompress rotary embedding int parameters
-    TORCH_CHECK(rotary_embedding_int_params.size() == 3, "Expected 3 rotary embedding int parameters");
-    int64_t const rotary_embedding_dim = rotary_embedding_int_params[0];
-    int64_t const rotary_embedding_scale_type = rotary_embedding_int_params[1];
-    int64_t const position_embedding_type = rotary_embedding_int_params[2];
-
+    // Decompress sparse attention parameters
     TORCH_CHECK(sparse_attention_params.size() == 4, "Expected 4 sparse attention parameters");
     torch::optional<torch::Tensor> sparse_kv_indices = sparse_attention_params[0];
     torch::optional<torch::Tensor> sparse_kv_offsets = sparse_attention_params[1];

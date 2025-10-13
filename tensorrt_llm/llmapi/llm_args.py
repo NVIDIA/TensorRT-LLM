@@ -166,7 +166,7 @@ class CudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
-class SparseAttentionBaseConfig(StrictBaseModel):
+class BaseSparseAttentionConfig(StrictBaseModel):
     """
     Configuration for sparse attention.
     """
@@ -201,7 +201,7 @@ class SparseAttentionBaseConfig(StrictBaseModel):
         return True
 
 
-class RocketSparseAttentionConfig(SparseAttentionBaseConfig):
+class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for rocket sparse attention.
     """
@@ -1543,7 +1543,9 @@ class BaseLlmArgs(StrictBaseModel):
 
     # Sparse attention config
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
-        default=None, description="Sparse attention config.")
+        default=None,
+        description="Sparse attention config.",
+        status="prototype")
 
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(

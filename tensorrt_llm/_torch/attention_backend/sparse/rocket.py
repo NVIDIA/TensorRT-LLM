@@ -292,7 +292,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         Predict sparse kv indices.
 
         For RocketKV:
-        - Context phase: predict SnapKV sparse kv indices
+        - Context phase: predict RocketKV sparse kv indices
 
         Returns:
             - flattened_indices: [total_selected_indices, num_kv_heads]
