@@ -207,6 +207,8 @@ public:
 
             // Prepare the kernel parameters.
             auto kernelParams = KernelParams::setKernelParams(params, kernelMeta, maxNumCtasQ, maxNumCtasKv);
+            // TODO: set the block sparse attention flag.
+            kernelParams.mUseBlockSparseAttention = false;
 
             // Prepare kernel parameters list for cuLaunchKernelEx.
             void* kernelParamsList[] = {&kernelParams};
