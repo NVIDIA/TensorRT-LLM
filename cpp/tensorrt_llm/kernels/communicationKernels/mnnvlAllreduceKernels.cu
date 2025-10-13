@@ -850,8 +850,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 #pragma unroll
             for (uint32_t j = 0; j < kELTS_PER_LOAD; j++)
             {
-                r_out.elements[j]
-                    = cuda_cast<T_OUT, float>(cuda_cast<float, T_IN>(gamma.elements[j]) * rInput[j] * rcpRms);
+                r_out.elements[j] = cuda_cast<T_OUT, float>(
+                    cuda_cast<float, T_IN>(gamma.elements[j]) * rInput[i * kELTS_PER_LOAD + j] * rcpRms);
             }
 
             *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = r_out.packed;
