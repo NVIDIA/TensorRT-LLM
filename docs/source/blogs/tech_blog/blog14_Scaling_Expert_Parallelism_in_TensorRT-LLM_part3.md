@@ -212,7 +212,7 @@ To optimize the operator, we simply added `torch.compile` decorator to the opera
 
 ## End-to-End Performance
 
-After adding all the optimizations mentioned above, the network structure now looks a bit cleaner. For examples, `o_proj` and `A2A tokens` are now computing in lower precision, and operators like sparse expert and shared expert `add` is not fused with `reduction`. The optimized parts are marked **bold**.
+After applying the optimizations above, the network structure is cleaner. For example, `o_proj` and `A2A tokens` now compute in lower precision, and operators like `add` of sparse‑expert and shared‑expert is now fused into the `reduction`. The optimized parts are marked in **bold**.
 
 <div align="center">
 <figure>
