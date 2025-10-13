@@ -396,6 +396,8 @@ class DecodingBaseConfig(StrictBaseModel):
                 f"acceptance_length_threshold must be >= 0, got {v}")
         return v
 
+    # If set, drafting is allowed to use chain drafter.
+    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
