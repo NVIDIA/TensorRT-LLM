@@ -3627,3 +3627,24 @@ class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestSeedOss_36B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
+
+    gsm8k_sampling_params = SamplingParams(temperature=1.1,
+                                           top_p=0.95,
+                                           max_tokens=16384)
+
+    def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        chat_template_kwargs = dict(thinking_budget=-1)
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=self.gsm8k_sampling_params,
+                          extra_evaluator_kwargs=dict(
+                              apply_chat_template=True,
+                              chat_template_kwargs=chat_template_kwargs))
