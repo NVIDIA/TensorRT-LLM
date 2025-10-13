@@ -1,7 +1,7 @@
 if(MOONCAKE_ROOT)
-  find_library(TRANSFER_ENGINE_LIB transfer_engine ${NIXL_ROOT}/lib)
+  find_library(TRANSFER_ENGINE_LIB transfer_engine ${MOONCAKE_ROOT}/lib)
   find_path(TRANSFER_ENGINE_INCLUDE_DIR transfer_engine_c.h
-            ${NIXL_ROOT}/include)
+            ${MOONCAKE_ROOT}/include)
 
   message(STATUS "Find transfer engine results:")
   message(STATUS "  TRANSFER_ENGINE_LIB = ${TRANSFER_ENGINE_LIB}")
