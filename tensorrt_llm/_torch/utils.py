@@ -308,12 +308,6 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     )
 
 
-# Development function to control chain drafter feature.
-# It's here so that unit tests can mock it and turn it off.
-def _get_allow_chain_drafter() -> bool:
-    return True
-
-
 def get_device_uuid(device_idx: int) -> str:
     """Get the UUID of a CUDA device using torch cuda api"""
 

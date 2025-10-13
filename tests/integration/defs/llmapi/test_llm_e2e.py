@@ -90,6 +90,7 @@ def test_llmapi_load_engine_from_build_command_with_lora(
     ])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5574355")
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"),
 ])
