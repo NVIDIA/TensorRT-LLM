@@ -358,61 +358,67 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters,
             payload_idx, ptrs, topk_target_ranks, topk_send_indices);
      }
  
-     ThreadingPolicy::sync();
+    ThreadingPolicy::sync();
  
-     // Finished sending this token. Check if we're the last token to complete.
-     if (thread_idx == 0)
-     {
-         int cnt;
-        cnt = atomicAdd(ptrs.local_token_counter, 1);
-         
-         if (cnt + 1 == local_num_tokens)  // The last token dispatched
-         {
-             // Signal to each target rank that this source rank has completed sending
-             for (int target_rank = 0; target_rank < ep_size; target_rank++)
-             {
-                 // Store the number of tokens sent by this rank to the recv_counters of the target rank
-                 // TODO: Are acquire and release necessary here?
-                 int send_count = ptrs.send_counters[target_rank];
-                 ptrs.recv_counters[target_rank][rank_id] = send_count;
-             }
-                 
+
+    bool is_first_warp = threadIdx.x / warpSize == 0;
+    if(is_first_warp)
+    {
+        int lane_id = threadIdx.x % warpSize;
+
+        bool is_last_token = false;
+        if(lane_id == 0)
+        {
+            int cnt = atomicAdd(ptrs.local_token_counter, 1);
+            is_last_token = cnt + 1 == local_num_tokens;
+        }
+        is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
+
+
+        if(is_last_token)
+        {
+            // Store send_counters to recv_counters
+            #pragma unroll 1  // No unroll as one iter is typically enough
+            for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
+            {
+                int send_count = ptrs.send_counters[target_rank];
+                ptrs.recv_counters[target_rank][rank_id] = send_count;
+            }
+
 #if !DISABLE_SYNC_FOR_PROFILING
+            uint32_t expected_value = *ptrs.flag_val;
+
             asm volatile("fence.release.sys;");
-            for (int target_rank = 0; target_rank < ep_size; target_rank++)
+            #pragma unroll 1  // No unroll as one iter is typically enough
+            for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-                uint32_t flag_value = *ptrs.flag_val;
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 
                 #if ENABLE_DEBUG_PRINT
-                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
+                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value, target_rank);
                 #endif
-            }             
-
-
-            // Busy wait until all source ranks targeting this rank have completed sending
-            uint32_t expected_value = *ptrs.flag_val;
-            bool all_flags_set;
-            do {
-                all_flags_set = true;
-                for (int source_rank = 0; source_rank < ep_size; source_rank++)
-                {
-                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
-                    uint32_t flag_value;
-                    // Acquire load to ensure visibility of peer's release-store
-                    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-                    // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
-                    #if ENABLE_DEBUG_PRINT
-                    printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: %d, address: %p\n", rank_id, source_rank, flag_value, expected_value, flag_ptr);
-                    #endif
-                    all_flags_set = all_flags_set && (flag_value == expected_value);
-                }
-            } while (!all_flags_set);
+            }    
+            
+            #pragma unroll 1  // No unroll
+            for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+            {
+               bool flag_set = false;
+               do{
+                   uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+                   uint32_t flag_value;
+                   // Acquire load to ensure visibility of peer's release-store
+                   asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+                   #if ENABLE_DEBUG_PRINT
+                   printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: %d, address: %p\n", rank_id, peer_rank, flag_value, expected_value, flag_ptr);
+                   #endif
+                   flag_set = flag_value == expected_value;
+               } while (!flag_set);
+            }
             // asm volatile("fence.acquire.sys;");
  #endif
         }
-     }
+    }
  }
  
  
