@@ -325,8 +325,8 @@ class Indexer(nn.Module):
         start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
         # Compute the flat slot mapping for all tokens (separate FP8 and scale offsets)
-        Indexer._compute_slot_mapping(request_ids, start_positions,
-                                      seq_lens, metadata)
+        Indexer._compute_slot_mapping(request_ids, start_positions, seq_lens,
+                                      metadata)
 
     @staticmethod
     def _compute_slot_mapping(request_ids: List[int],
@@ -419,18 +419,18 @@ class Indexer(nn.Module):
         scale_size = k_scale.shape[1] * 4  # Convert to bytes (float32 = 4 bytes)
 
         # Convert to bytes: flatten first, then view as uint8, then reshape
-        k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(num_tokens, head_dim)
-        
+        k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(
+            num_tokens, head_dim)
+
         # k_scale: for single-element tensors, contiguous() may be no-op
         # Fix stride(-1) for byte-level view
         k_scale_flat = k_scale.view(-1)
-        if k_scale_flat.stride(-1) != 1:            
-            k_scale_flat = torch.as_strided(
-                k_scale_flat.contiguous(),
-                size=(k_scale_flat.numel(),),
-                stride=(1,)
-            )
-        k_scale_bytes = k_scale_flat.view(torch.uint8).view(num_tokens, scale_size)
+        if k_scale_flat.stride(-1) != 1:
+            k_scale_flat = torch.as_strided(k_scale_flat.contiguous(),
+                                            size=(k_scale_flat.numel(), ),
+                                            stride=(1, ))
+        k_scale_bytes = k_scale_flat.view(torch.uint8).view(
+            num_tokens, scale_size)
 
         # Scatter FP8 data
         flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
@@ -439,8 +439,8 @@ class Indexer(nn.Module):
         scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
             1) + byte_offsets  # [num_tokens, head_dim]
         k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
-        
-        flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]                                                      
+
+        flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
         byte_offsets = torch.arange(
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
         scatter_indices_scale = flat_indices_scale.unsqueeze(
@@ -560,7 +560,8 @@ class Indexer(nn.Module):
             # mask: [B * N, L]
             logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
             topk_indices_decode = logits_decode.topk(
-                min(self.index_topk, logits_decode.shape[-1]), dim=-1)[1].to(torch.int32)  # [B * N, K]
+                min(self.index_topk, logits_decode.shape[-1]),
+                dim=-1)[1].to(torch.int32)  # [B * N, K]
             # ensure we don't set indices for the top k
             # that is out of range(masked already)
             # this will happen if context length is shorter than K
@@ -575,10 +576,8 @@ class Indexer(nn.Module):
         return topk_indices_buffer
 
     @torch.inference_mode()
-    def forward(self,
-                qr: torch.Tensor,
-                hidden_states: torch.Tensor,
-                metadata: DSAtrtllmAttentionMetadata,                
+    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
+                metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
         q = self.wq_b(qr)
@@ -824,6 +823,8 @@ class DSACacheManager(KVCacheManager):
         assert not kv_cache_config.enable_block_reuse, "DSA cache requires block reuse to be disabled in KV cache config"
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
+        # Use a fixed tokens_per_block for indexer k cache
+        self.indexer_k_cache_tokens_per_block = 64
 
         super().__init__(
             kv_cache_config,
@@ -846,8 +847,6 @@ class DSACacheManager(KVCacheManager):
 
         self.num_blocks = self.blocks_in_primary_pool
         self.max_indexer_k_cache_blocks_per_seq = self.num_blocks
-        # Use a fixed tokens_per_block for indexer t cache
-        self.indexer_k_cache_tokens_per_block = 64
 
         # Block manager to manage the indexer k cache blocks for each request. Different layers share the
         # same block ids.
@@ -948,9 +947,14 @@ class DSACacheManager(KVCacheManager):
         self.indexer_k_cache_manager.free_resources(request)
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping):
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+                                 **kwargs):
+        config = model_config.pretrained_config
         sparse_attn_config = model_config.sparse_attention_config
+        index_head_dim = sparse_attn_config.index_head_dim
+        tokens_per_block = kwargs['tokens_per_block']
         quant_block_size = 128
+        indexer_k_cache_tokens_per_block = 64
 
         # get kv cache dtype bytes
         mem_per_token = 2
@@ -959,29 +963,28 @@ class DSACacheManager(KVCacheManager):
         ):
             mem_per_token = 1
 
-        # get num key value heads
-        num_key_value_heads = 1
-
         # get head dim
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        head_dim = sparse_attn_config.index_head_dim
-        head_dim = head_dim * num_key_value_heads // tp_size
+        head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
         # provide at least 1 layer to prevent division by zero cache size
         num_attention_layers = max(
             len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
         mem_per_token *= num_attention_layers * head_dim
 
-        # 1 for K, others for low rank cache
-        kv_factor = 1 + (head_dim + head_dim // quant_block_size * 4) / head_dim
+        # 1 for K, others for indexer K cache
+        head_dim_factor = (index_head_dim +
+                           index_head_dim // quant_block_size * 4) / head_dim
+        tokens_per_block_factor = indexer_k_cache_tokens_per_block / tokens_per_block
+        kv_factor = 1 + head_dim_factor * tokens_per_block_factor
         mem_per_token *= kv_factor
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
-        # 1 for K, others for low rank cache
-        kv_factor = self.kv_factor + (
-            self.index_head_dim + self.index_head_dim // self.quant_block_size *
-            4) / self.index_head_dim
+        # self.kv_factor for K, others for indexer K cache
+        head_dim_factor = (self.index_head_dim + self.index_head_dim //
+                           self.quant_block_size * 4) / self.head_dim
+        tokens_per_block_factor = self.indexer_k_cache_tokens_per_block / self.tokens_per_block
+        kv_factor = self.kv_factor + head_dim_factor * tokens_per_block_factor
         cache_size_per_token = math.ceil(
             kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
