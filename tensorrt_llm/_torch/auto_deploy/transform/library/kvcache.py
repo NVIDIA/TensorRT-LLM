@@ -152,10 +152,6 @@ class InsertCachedAttention(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Sanity check
-        if cm.info.is_paged:
-            assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
-
         # insert metadata computation and extract each argument as a node
         metadata_nodes = self._process_get_metadata(
             gm, cm.info.args_for_prepare_metadata, cm.info.const_args_for_prepare_metadata
@@ -171,19 +167,17 @@ class InsertCachedAttention(BaseTransform):
 
             # setup + store cache initializers and caches as input nodes
             cache_in_nodes = []
-            for k, get_cache in attn_descriptor.get_cache_initializers(
-                attn_node, cache_config
-            ).items():
+            for k, c_handler in attn_descriptor.get_cache_handlers(attn_node, cache_config).items():
                 k_indexed = f"{k}_{idx}"
-                cm.add_cache(k_indexed, get_cache)
+                cm.add_buffer_or_cache(k_indexed, c_handler)
                 cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
 
             # setup + store global buffer initializers and buffers as input nodes
             # NOTE: we have to check against existing keys to make sure nothing is registered twice...
             buffer_in_nodes = []
-            for k, get_buffer in attn_descriptor.get_global_buffer_initializers(attn_node).items():
+            for k, b_handler in attn_descriptor.get_global_buffer_handlers(attn_node).items():
                 if k not in buffer_in_lookup:
-                    cm.add_cache(k, get_buffer)
+                    cm.add_buffer_or_cache(k, b_handler)
                     buffer_in_lookup[k] = self._process_cache_node(gm, k)
                 buffer_in_nodes.append(buffer_in_lookup[k])  # store buffer nodes for this op
 
@@ -322,7 +316,7 @@ class InitializeCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        num_caches = cm.initialize_caches()
+        num_caches = cm.initialize_buffers()
         self._log_info(f"Initialized {num_caches} caches for cached attention")
 
         info = TransformInfo(

@@ -35,7 +35,7 @@ class TorchAttentionReference:
 
         # Convert to flattened format for torch backend
         seq_len_tensor = torch.full((batch_size,), seq_len, device=q.device, dtype=torch.int32)
-        cache_loc = torch.arange(batch_size, device=q.device, dtype=torch.int32)
+        slot_idx = torch.arange(batch_size, device=q.device, dtype=torch.int32)
         seq_start = torch.arange(
             0, batch_size * seq_len, seq_len, device=q.device, dtype=torch.int32
         )
@@ -52,7 +52,7 @@ class TorchAttentionReference:
             v_flat,
             seq_len_tensor,
             input_positions,
-            cache_loc,
+            slot_idx,
             seq_start,
             k_cache,
             v_cache,
@@ -70,14 +70,14 @@ class TorchAttentionReference:
 
     @staticmethod
     def flattened_mha_with_cache(
-        q, k, v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache, scale=None
+        q, k, v, seq_len, input_positions, slot_idx, seq_start, k_cache, v_cache, scale=None
     ):
         """Reference implementation following triton flattened MHA pattern.
 
         This function directly calls the torch backend implementation via custom op registry.
         """
         return torch.ops.auto_deploy.torch_cached_attention_with_cache(
-            q, k, v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache, scale
+            q, k, v, seq_len, input_positions, slot_idx, seq_start, k_cache, v_cache, scale
         )
 
     @staticmethod
@@ -97,7 +97,7 @@ class TorchAttentionReference:
         """
         batch_size = q.shape[0]
         seq_len = torch.ones(batch_size, device=q.device, dtype=torch.int32)
-        cache_loc = torch.arange(batch_size, device=q.device, dtype=torch.int32)
+        slot_idx = torch.arange(batch_size, device=q.device, dtype=torch.int32)
         # Fix: Each sequence starts at its own position in the flattened tensor
         seq_start = torch.arange(batch_size, device=q.device, dtype=torch.int32)
 
@@ -120,7 +120,7 @@ class TorchAttentionReference:
             v_flat,
             seq_len,
             input_positions,
-            cache_loc,
+            slot_idx,
             seq_start,
             k_cache,
             v_cache,
@@ -137,7 +137,7 @@ class TorchAttentionReference:
         v,
         seq_len,
         input_positions,
-        cache_loc,
+        slot_idx,
         seq_start,
         k_cache,
         v_cache,
@@ -155,7 +155,7 @@ class TorchAttentionReference:
             v,
             seq_len,
             input_positions,
-            cache_loc,
+            slot_idx,
             seq_start,
             k_cache,
             v_cache,
@@ -176,7 +176,7 @@ class TorchAttentionReference:
             input_positions_list: List of input positions per sequence
 
         Returns:
-            Tuple of (q_flat, k_flat, v_flat, seq_len, input_positions, cache_loc, seq_start)
+            Tuple of (q_flat, k_flat, v_flat, seq_len, input_positions, slot_idx, seq_start)
         """
         device = q_list[0].device
 
@@ -196,6 +196,6 @@ class TorchAttentionReference:
 
         # Create metadata tensors
         input_positions = torch.tensor(input_positions_list, device=device, dtype=torch.int32)
-        cache_loc = torch.arange(len(q_list), device=device, dtype=torch.int32)
+        slot_idx = torch.arange(len(q_list), device=device, dtype=torch.int32)
 
-        return q_flat, k_flat, v_flat, seq_len, input_positions, cache_loc, seq_start
+        return q_flat, k_flat, v_flat, seq_len, input_positions, slot_idx, seq_start

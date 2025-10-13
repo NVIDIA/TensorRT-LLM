@@ -185,7 +185,7 @@ def test_prepare_metadata_cuda(conv_env):
     slot_idx = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.int32)
     page_size = 128
 
-    out = torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata(
+    out = torch.ops.auto_deploy.torch_causal_conv_prepare_metadata(
         input_ids,
         position_ids,
         seq_len,

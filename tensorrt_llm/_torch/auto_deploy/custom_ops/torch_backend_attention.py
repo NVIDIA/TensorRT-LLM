@@ -14,9 +14,9 @@ from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
     CacheConfig,
-    CacheInitializerDict,
+    CacheHandler,
+    CacheHandlerDict,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
@@ -38,7 +38,7 @@ def _torch_generate_mha(
     v: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     input_pos: torch.Tensor,
     scale: float,
     out: torch.Tensor,
@@ -53,14 +53,14 @@ def _torch_generate_mha(
 
     # Update KV cache for single token
     for i in range(b):
-        cache_idx = cache_loc[i].item()
+        cache_idx = slot_idx[i].item()
         pos = input_pos[i].item()
         k_cache[cache_idx, pos] = k[i, 0]  # Remove sequence dim
         v_cache[cache_idx, pos] = v[i, 0]  # Remove sequence dim
 
     # Compute attention for each sequence using manual computation
     for i in range(b):
-        cache_idx = cache_loc[i].item()
+        cache_idx = slot_idx[i].item()
         pos = input_pos[i].item()
 
         # Get query, key, value for this sequence
@@ -123,7 +123,7 @@ def _torch_context_mha(
     k: torch.Tensor,
     v: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     seq_len: torch.Tensor,
@@ -136,14 +136,14 @@ def _torch_context_mha(
 ) -> None:
     """Context attention (multiple tokens, potentially multiple sequences) using existing torch functions."""
     # Update KV cache first using existing function
-    update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, cache_loc, seq_start)
+    update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
 
     # Compute attention for each sequence
     attn_outputs = []
     for idx in range(seq_len.shape[0]):
         seq_len_i = seq_len[idx].item()
         input_pos_i = input_pos[idx].item()
-        cache_loc_i = cache_loc[idx].item()
+        cache_loc_i = slot_idx[idx].item()
         seq_start_i = seq_start[idx].item()
 
         # Skip sequences with zero length
@@ -256,7 +256,7 @@ def torch_backend_mha_with_cache(
     # METADATA
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     # CACHES
     k_cache: torch.Tensor,
@@ -305,7 +305,7 @@ def torch_backend_mha_with_cache(
             v,
             k_cache,
             v_cache,
-            cache_loc,
+            slot_idx,
             input_pos,
             scale,
             y,
@@ -320,7 +320,7 @@ def torch_backend_mha_with_cache(
             k,
             v,
             input_pos,
-            cache_loc,
+            slot_idx,
             k_cache,
             v_cache,
             seq_len,
@@ -342,7 +342,7 @@ def torch_backend_mha_with_cache_fake(
     v: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
+    slot_idx: torch.Tensor,
     seq_start: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -372,7 +372,7 @@ def torch_backend_prepare_metadata(
     return (
         seq_len[:num_seq].clone(),
         input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
+        slot_idx[:num_seq].clone(),
         seq_start,
     )
 
@@ -385,9 +385,32 @@ def torch_backend_prepare_metadata_fake(
     return (
         torch.empty_like(seq_len[:num_seq]),
         torch.empty_like(input_pos[:num_seq]),
-        torch.empty_like(cache_loc[:num_seq]),
+        torch.empty_like(slot_idx[:num_seq]),
         torch.empty_like(seq_len[:num_seq]),
     )
+
+
+class UnpagedKVCacheHandler(CacheHandler):
+    """A cache handler for unpaged KV cache."""
+
+    @property
+    def is_paged(self) -> bool:
+        return False
+
+    def __init__(self, num_kv_heads: int, k_or_vhead_dim: int, dtype: torch.dtype):
+        self.num_kv_heads = num_kv_heads
+        self.k_or_vhead_dim = k_or_vhead_dim
+        self.dtype = dtype
+
+    def init(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_batch_size,
+            sequence_info.max_seq_len,
+            self.num_kv_heads,
+            self.k_or_vhead_dim,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
 
 
 @AttentionRegistry.register("torch")
@@ -420,43 +443,21 @@ class TorchBackendAttention(AttentionDescriptor):
         return torch.ops.auto_deploy.torch_cached_attention_prepare_metadata, 4
 
     @classmethod
-    def get_cache_initializers(
+    def get_cache_handlers(
         cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+    ) -> CacheHandlerDict:
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         v_fake: FakeTensor = source_attn_node.args[2].meta["val"]
         num_kv_heads = k_fake.shape[2]
         k_head_dim = k_fake.shape[3]
         v_head_dim = v_fake.shape[3]
+        dtype = cache_config.dtype or k_fake.dtype
 
-        def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for torch backend"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                k_head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or k_fake.dtype,
-            )
-
-        def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for torch backend"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                num_kv_heads,
-                v_head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or v_fake.dtype,
-            )
-
-        return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        return {}
+        return {
+            "k_cache": UnpagedKVCacheHandler(num_kv_heads, k_head_dim, dtype),
+            "v_cache": UnpagedKVCacheHandler(num_kv_heads, v_head_dim, dtype),
+        }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

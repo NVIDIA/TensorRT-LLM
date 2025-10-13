@@ -17,7 +17,7 @@ def numpy_attention_reference(
     v_cache,
     seq_len,
     input_pos,
-    cache_loc,
+    slot_idx,
     seq_start,
     scale=None,
     logit_cap=None,
@@ -33,7 +33,7 @@ def numpy_attention_reference(
     v_cache_np = v_cache.detach().cpu().numpy().astype(np.float32)
     seq_len_np = seq_len.detach().cpu().numpy()
     input_pos_np = input_pos.detach().cpu().numpy()
-    cache_loc_np = cache_loc.detach().cpu().numpy()
+    slot_idx_np = slot_idx.detach().cpu().numpy()
     seq_start_np = seq_start.detach().cpu().numpy()
 
     # Get dimensions from cache (which has the actual dimensions)
@@ -59,7 +59,7 @@ def numpy_attention_reference(
     if is_generate:
         # Generate phase: single token per sequence
         for i in range(batch_size):
-            cache_idx = cache_loc_np[i]
+            cache_idx = slot_idx_np[i]
             pos = input_pos_np[i]
             if q_np.ndim == 3 and q_np.shape[0] > 1:
                 # True batch case
@@ -72,7 +72,7 @@ def numpy_attention_reference(
     else:
         # Context phase: multiple tokens
         for i in range(batch_size):
-            cache_idx = cache_loc_np[i]
+            cache_idx = slot_idx_np[i]
             pos = input_pos_np[i]
             seq_len_i = seq_len_np[i]
             seq_start_i = seq_start_np[i]
@@ -91,7 +91,7 @@ def numpy_attention_reference(
     outputs = []
 
     for i in range(batch_size):
-        cache_idx = cache_loc_np[i]
+        cache_idx = slot_idx_np[i]
         pos = input_pos_np[i]
         seq_len_i = seq_len_np[i]
         seq_start_i = seq_start_np[i]
@@ -242,7 +242,7 @@ class TestTorchBackendAttention:
             (batch_size,), cache_offset, device=self.device, dtype=torch.int
         )
         seq_len_tensor = torch.full((batch_size,), seq_len, device=self.device, dtype=torch.int32)
-        cache_loc = torch.arange(batch_size, device=self.device, dtype=torch.int32)
+        slot_idx = torch.arange(batch_size, device=self.device, dtype=torch.int32)
 
         if seq_len == 1:
             seq_start = torch.arange(batch_size, device=self.device, dtype=torch.int32)
@@ -263,7 +263,7 @@ class TestTorchBackendAttention:
             "v": v_flat,
             "seq_len": seq_len_tensor,
             "input_pos": input_positions,
-            "cache_loc": cache_loc,
+            "slot_idx": slot_idx,
             "seq_start": seq_start,
             "k_cache": k_cache,
             "v_cache": v_cache,
@@ -279,7 +279,7 @@ class TestTorchBackendAttention:
             data["v"],
             data["seq_len"],
             data["input_pos"],
-            data["cache_loc"],
+            data["slot_idx"],
             data["seq_start"],
             data["k_cache"],
             data["v_cache"],
@@ -353,7 +353,7 @@ class TestTorchBackendAttention:
             data["v_cache"],
             data["seq_len"],
             data["input_pos"],
-            data["cache_loc"],
+            data["slot_idx"],
             data["seq_start"],
             None,
             logit_cap,
@@ -400,7 +400,7 @@ class TestTorchBackendAttention:
                 data["v_cache"],
                 data["seq_len"],
                 data["input_pos"],
-                data["cache_loc"],
+                data["slot_idx"],
                 data["seq_start"],
             )
             reference_torch = torch.from_numpy(reference).to(output.device, output.dtype)
@@ -428,7 +428,7 @@ class TestTorchBackendAttention:
             context_data["v_cache"],
             context_data["seq_len"],
             context_data["input_pos"],
-            context_data["cache_loc"],
+            context_data["slot_idx"],
             context_data["seq_start"],
         )
         context_reference_torch = torch.from_numpy(context_reference).to(
@@ -453,7 +453,7 @@ class TestTorchBackendAttention:
             generate_data["v_cache"],
             generate_data["seq_len"],
             generate_data["input_pos"],
-            generate_data["cache_loc"],
+            generate_data["slot_idx"],
             generate_data["seq_start"],
         )
         generate_reference_torch = torch.from_numpy(generate_reference).to(
@@ -473,13 +473,13 @@ class TestTorchBackendAttention:
         position_ids = torch.arange(seq_len_val, device=device).expand(batch_size, -1)
         seq_len = torch.full((batch_size,), seq_len_val, device=device, dtype=torch.int32)
         input_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
-        cache_loc = torch.arange(batch_size, device=device, dtype=torch.int32)
+        slot_idx = torch.arange(batch_size, device=device, dtype=torch.int32)
         pages_per_seq = torch.ones(batch_size, device=device, dtype=torch.int32)
         slot_idx = torch.arange(batch_size, device=device, dtype=torch.int32)
 
         # Test metadata preparation
         result = torch.ops.auto_deploy.torch_cached_attention_prepare_metadata(
-            input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, 128
+            input_ids, position_ids, seq_len, input_pos, slot_idx, pages_per_seq, slot_idx, 128
         )
 
         # Verify result structure
