@@ -1491,6 +1491,14 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
 
+        # Append mqa prefix to indexer modules.
+        if hasattr(model_config, 'quant_config'):
+            exclude_modules = model_config.quant_config.exclude_modules
+            for idx, exclude_layers in enumerate(exclude_modules):
+                if 'indexer' in exclude_layers:
+                    exclude_modules[idx] = exclude_layers.replace(
+                        'indexer', 'mqa.indexer')
+
         super().__init__(model=DeepseekV3Model(model_config),
                          model_config=model_config)
 
