@@ -798,39 +798,6 @@ def trace_func(func):
 
     return wrapper
 
-
-class DictConversion:
-
-    @classmethod
-    def from_dict(cls, config: Dict[str, Any]):
-        obj = cls()
-        fields = obj.__dataclass_fields__
-        for key, value in config.items():
-            assert hasattr(obj, key), f"cannot find {key} in {obj}"
-            field_cls = fields[key].type
-            if (isinstance(field_cls, type)
-                    and issubclass(field_cls, DictConversion)
-                    and isinstance(value, dict)):
-                value = field_cls.from_dict(value)
-            setattr(obj, key, value)
-        return obj
-
-    def to_dict(self):
-        return asdict(self)
-
-    @classmethod
-    def from_json_file(cls, file):
-        with open(file) as f:
-            return cls.from_dict(json.load(f))
-
-    def set_defaults(self, **kwargs):
-        for key, default in kwargs.items():
-            value = getattr(self, key)
-            if (value is None
-                    or (isinstance(value, (list, dict)) and len(value) == 0)):
-                setattr(self, key, default)
-
-
 class BaseEnumMeta(EnumMeta):
 
     def __contains__(cls, item):

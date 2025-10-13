@@ -1,7 +1,8 @@
 import copy
 import re
-from dataclasses import dataclass, field
 from typing import Dict, Tuple, Union
+
+from pydantic import BaseModel, Field
 
 import pynvml
 import torch
@@ -11,13 +12,11 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import DictConversion
 from tensorrt_llm.logger import logger
 from tensorrt_llm.profiler import PyNVMLContext, _device_get_memory_info_fn
 
 
-@dataclass
-class MathThroughput(DictConversion):
+class MathThroughput(BaseModel):
     int4: int = 0  # Tflops
     int8: int = 0  # Tflops
     fp8: int = 0  # Tflops
@@ -32,15 +31,14 @@ class MathThroughput(DictConversion):
         clock_mhz: int,
     ) -> "MathThroughput":
         tflops = MathThroughput()
-        for name in ipc_per_sm.__dataclass_fields__:
+        for name in ipc_per_sm.__class__.__model_fields__:
             setattr(
                 tflops, name,
                 getattr(ipc_per_sm, name) * sm_count * clock_mhz // int(1e6))
         return tflops
 
 
-@dataclass
-class ClusterInfo(DictConversion):
+class ClusterInfo(BaseModel):
     inter_node_bw_per_device: int = 25  # GBps
     intra_node_bw_per_device: int = 0  # GBps
     inter_node_latency: int = 10  # us
@@ -51,7 +49,7 @@ class ClusterInfo(DictConversion):
     memory_bw: int = 0  # GBps
     memory_budget_per_device: int = 0  # GB
 
-    math_throughput: MathThroughput = field(default_factory=MathThroughput)
+    math_throughput: MathThroughput = Field(default_factory=MathThroughput)
 
     memory_efficiency: float = 1.0
     math_efficiency: float = 1.0

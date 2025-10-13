@@ -1,10 +1,11 @@
-from dataclasses import dataclass, field
 from enum import auto
 from typing import Dict, List, Optional, Union
 
+from pydantic import BaseModel, Field
+
 from strenum import LowercaseStrEnum
 
-from tensorrt_llm._utils import BaseEnumMeta, DictConversion
+from tensorrt_llm._utils import BaseEnumMeta
 
 from .cluster_info import ClusterInfo, cluster_infos
 
@@ -19,8 +20,7 @@ class CostModel(LowercaseStrEnum, metaclass=BaseEnumMeta):
     ZERO = auto()
 
 
-@dataclass
-class AutoParallelConfig(DictConversion):
+class AutoParallelConfig(BaseModel):
     # cluster configuration
     world_size: int = 1
     gpus_per_node: int = 8
@@ -42,16 +42,16 @@ class AutoParallelConfig(DictConversion):
     debug_mode: bool = False
     infer_shape: bool = True
     validation_mode: bool = False
-    same_buffer_io: Dict[str, str] = field(default_factory=dict)
-    same_spec_io: Dict[str, str] = field(default_factory=dict)
-    sharded_io_allowlist: List[str] = field(default_factory=list)
+    same_buffer_io: Dict[str, str] = Field(default_factory=dict)
+    same_spec_io: Dict[str, str] = Field(default_factory=dict)
+    sharded_io_allowlist: List[str] = Field(default_factory=list)
     fill_weights: bool = False
 
     # debug configuration
     parallel_config_cache: Optional[str] = None
     profile_cache: Optional[str] = None
     dump_path: Optional[str] = None
-    debug_outputs: Union[List[str], str] = field(default_factory=list)
+    debug_outputs: Union[List[str], str] = Field(default_factory=list)
 
     def get_cluster_info(self) -> ClusterInfo:
         return self.cluster_info or cluster_infos[self.cluster_key]
