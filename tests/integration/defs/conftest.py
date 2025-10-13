@@ -3385,6 +3385,87 @@ class LightweightPeriodicJUnitXML:
         self.last_save_time = time.time()
         self.suite_start_time = time.time()
 
+        # Initialize statistics and tracking structures
+        self.__init_stats()
+
+    @staticmethod
+    def _sanitize_xml_text(text):
+        """
+        Sanitize text for XML by removing illegal characters.
+
+        XML 1.0 only allows:
+        - #x9 (TAB)
+        - #xA (LF)
+        - #xD (CR)
+        - #x20-#xD7FF
+        - #xE000-#xFFFD
+        - #x10000-#x10FFFF
+
+        This removes:
+        - ANSI escape sequences (terminal colors)
+        - Other control characters
+        """
+        if not text:
+            return text
+
+        import re
+
+        # Remove ANSI escape sequences (e.g., \x1b[31m for colors)
+        # Pattern: ESC [ ... m (most common)
+        # Also handles: ESC ] ... BEL/ESC\ (less common)
+        ansi_escape_pattern = re.compile(
+            r'\x1b'  # ESC character
+            r'(?:'  # Start non-capturing group
+            r'\[[0-?]*[ -/]*[@-~]'  # CSI sequences: ESC [ ... letter
+            r'|].*?(?:\x07|\x1b\\)'  # OSC sequences: ESC ] ... BEL/ESC\
+            r'|[()][AB012]'  # Character set selection
+            r')')
+        text = ansi_escape_pattern.sub('', text)
+
+        # Remove other control characters except allowed ones
+        # Keep: tab(0x09), newline(0x0A), carriage return(0x0D)
+        def is_valid_xml_char(c):
+            codepoint = ord(c)
+            return (codepoint == 0x09 or codepoint == 0x0A or codepoint == 0x0D
+                    or (0x20 <= codepoint <= 0xD7FF)
+                    or (0xE000 <= codepoint <= 0xFFFD)
+                    or (0x10000 <= codepoint <= 0x10FFFF))
+
+        # Filter out invalid characters
+        text = ''.join(c if is_valid_xml_char(c) else '' for c in text)
+
+        return text
+
+    @staticmethod
+    def _format_classname(classname):
+        """
+        Format classname for JUnit XML report.
+
+        Removes .py extension and converts path separators to dots
+        to create a proper package/class hierarchy.
+
+        Examples:
+            'tests/integration/test_foo.py' -> 'tests.integration.test_foo'
+            'H100.examples.test_eagle' -> 'H100.examples.test_eagle'
+            'path/to/test_bar.py::TestClass' -> 'path.to.test_bar.TestClass'
+        """
+        if not classname:
+            return classname
+
+        # Remove .py extension
+        if classname.endswith('.py'):
+            classname = classname[:-3]
+
+        # Replace path separators with dots
+        classname = classname.replace('/', '.').replace('\\', '.')
+
+        # Remove leading/trailing dots
+        classname = classname.strip('.')
+
+        return classname
+
+    def __init_stats(self):
+        """Initialize test statistics tracking."""
         # Statistics tracking
         self.stats = {
             'tests': 0,
@@ -3497,7 +3578,7 @@ class LightweightPeriodicJUnitXML:
 
         testcase = ET.Element(
             'testcase',
-            classname=primary_report.location[0],
+            classname=self._format_classname(primary_report.location[0]),
             name=primary_report.location[2],
             time=f"{test_info['duration']:.3f}",
         )
@@ -3519,15 +3600,17 @@ class LightweightPeriodicJUnitXML:
             if report and report.failed:
                 failed_report = report
                 if phase == 'setup':
-                    failure = ET.SubElement(testcase,
-                                            'error',
-                                            message=f'{phase} failure')
+                    failure = ET.SubElement(
+                        testcase,
+                        'error',
+                        message=self._sanitize_xml_text(f'{phase} failure'))
                 else:
-                    failure = ET.SubElement(testcase,
-                                            'failure',
-                                            message=f'{phase} failure')
+                    failure = ET.SubElement(
+                        testcase,
+                        'failure',
+                        message=self._sanitize_xml_text(f'{phase} failure'))
                 if hasattr(report, 'longreprtext'):
-                    failure.text = report.longreprtext
+                    failure.text = self._sanitize_xml_text(report.longreprtext)
                 break
 
         # Check for skipped
@@ -3537,7 +3620,7 @@ class LightweightPeriodicJUnitXML:
                 if report and report.skipped:
                     skip = ET.SubElement(testcase, 'skipped', message='skipped')
                     if hasattr(report, 'longreprtext'):
-                        skip.text = report.longreprtext
+                        skip.text = self._sanitize_xml_text(report.longreprtext)
                     break
 
         # Collect captured output from ALL phases (setup, call, teardown)
@@ -3585,12 +3668,16 @@ class LightweightPeriodicJUnitXML:
         # Add system-out element if we have stdout content
         if stdout_content:
             system_out = ET.SubElement(testcase, 'system-out')
-            system_out.text = '\n\n'.join(stdout_content)
+            # Sanitize the combined stdout to remove ANSI codes and invalid XML chars
+            system_out.text = self._sanitize_xml_text(
+                '\n\n'.join(stdout_content))
 
         # Add system-err element if we have stderr content
         if stderr_content:
             system_err = ET.SubElement(testcase, 'system-err')
-            system_err.text = '\n\n'.join(stderr_content)
+            # Sanitize the combined stderr to remove ANSI codes and invalid XML chars
+            system_err.text = self._sanitize_xml_text(
+                '\n\n'.join(stderr_content))
 
         return ET.tostring(testcase, encoding='unicode')
 
@@ -3603,7 +3690,7 @@ class LightweightPeriodicJUnitXML:
 
         testcase = ET.Element(
             'testcase',
-            classname=report.location[0],
+            classname=self._format_classname(report.location[0]),
             name=report.location[2],
             time=f"{getattr(report, 'duration', 0.0):.3f}",
         )
@@ -3625,11 +3712,11 @@ class LightweightPeriodicJUnitXML:
                                         'failure',
                                         message='test failure')
             if hasattr(report, 'longreprtext'):
-                failure.text = report.longreprtext
+                failure.text = self._sanitize_xml_text(report.longreprtext)
         elif report.skipped:
             skip = ET.SubElement(testcase, 'skipped', message='skipped')
             if hasattr(report, 'longreprtext'):
-                skip.text = report.longreprtext
+                skip.text = self._sanitize_xml_text(report.longreprtext)
 
         # Add captured output (stdout, stderr, logs)
         stdout_content = []
@@ -3665,12 +3752,16 @@ class LightweightPeriodicJUnitXML:
         # Add system-out element if we have stdout content
         if stdout_content:
             system_out = ET.SubElement(testcase, 'system-out')
-            system_out.text = '\n\n'.join(stdout_content)
+            # Sanitize the combined stdout to remove ANSI codes and invalid XML chars
+            system_out.text = self._sanitize_xml_text(
+                '\n\n'.join(stdout_content))
 
         # Add system-err element if we have stderr content
         if stderr_content:
             system_err = ET.SubElement(testcase, 'system-err')
-            system_err.text = '\n\n'.join(stderr_content)
+            # Sanitize the combined stderr to remove ANSI codes and invalid XML chars
+            system_err.text = self._sanitize_xml_text(
+                '\n\n'.join(stderr_content))
 
         return ET.tostring(testcase, encoding='unicode')
 
