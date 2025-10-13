@@ -1717,7 +1717,7 @@ class MLA(nn.Module):
 
         # Step 3: Handle head padding (kernel requirement)
         sm_version = get_sm_version()
-        # TODO: avoid sm version check in the runtime
+        # sm checking at runtime due to FlashMLA kernel limitation
         padding = 128 if sm_version >= 100 else 64  # kernel limitation to 128 for SM100 and 64 for SM90
         if self.num_heads % padding != 0:
             # Assert that padding is mathematically valid

@@ -309,11 +309,6 @@ class Indexer(nn.Module):
             # Get context_lens for generation requests (total tokens including history + new token)
             context_lens = metadata.kv_lens[num_contexts:num_contexts +
                                             num_generations].to(torch.int32)
-
-            # Get generation request IDs
-            gen_request_ids = metadata.request_ids[num_contexts:num_contexts +
-                                                   num_generations]
-
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
             blocksize = metadata.kv_cache_manager.indexer_k_cache_tokens_per_block
@@ -424,10 +419,18 @@ class Indexer(nn.Module):
         scale_size = k_scale.shape[1] * 4  # Convert to bytes (float32 = 4 bytes)
 
         # Convert to bytes: flatten first, then view as uint8, then reshape
-        k_fp8_bytes = k_fp8.contiguous().view(-1).view(torch.uint8).view(
-            num_tokens, head_dim)
-        k_scale_bytes = k_scale.contiguous().view(-1).view(torch.uint8).view(
-            num_tokens, scale_size)
+        k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(num_tokens, head_dim)
+        
+        # k_scale: for single-element tensors, contiguous() may be no-op
+        # Fix stride(-1) for byte-level view
+        k_scale_flat = k_scale.view(-1)
+        if k_scale_flat.stride(-1) != 1:            
+            k_scale_flat = torch.as_strided(
+                k_scale_flat.contiguous(),
+                size=(k_scale_flat.numel(),),
+                stride=(1,)
+            )
+        k_scale_bytes = k_scale_flat.view(torch.uint8).view(num_tokens, scale_size)
 
         # Scatter FP8 data
         flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
@@ -535,7 +538,9 @@ class Indexer(nn.Module):
                 metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts +
                     num_generations],  # context_lens prepared in prepare()
-                metadata.indexer_k_cache_block_offsets,
+                metadata.indexer_k_cache_block_offsets[
+                    num_contexts:num_contexts +
+                    num_generations],  # Only pass generation request block tables
                 metadata.scheduler_metadata_buffer,
                 max_seq_len)
             # padded
@@ -555,7 +560,7 @@ class Indexer(nn.Module):
             # mask: [B * N, L]
             logits_decode = logits_decode.masked_fill(~mask, float('-inf'))
             topk_indices_decode = logits_decode.topk(
-                self.index_topk, dim=-1)[1].to(torch.int32)  # [B * N, K]
+                min(self.index_topk, logits_decode.shape[-1]), dim=-1)[1].to(torch.int32)  # [B * N, K]
             # ensure we don't set indices for the top k
             # that is out of range(masked already)
             # this will happen if context length is shorter than K
@@ -569,6 +574,7 @@ class Indexer(nn.Module):
 
         return topk_indices_buffer
 
+    @torch.inference_mode()
     def forward(self,
                 qr: torch.Tensor,
                 hidden_states: torch.Tensor,
@@ -585,9 +591,11 @@ class Indexer(nn.Module):
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
 
-        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
+        # k_pe needs unsqueeze to match n_heads
+        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
         q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
+        # Remove head dimension (size 1) for MQA k
+        k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)

@@ -97,17 +97,6 @@ BATCH_SPECS = {
     ),
 }
 
-class MockIndexer(torch.nn.Module):
-    """Mock indexer for testing that provides topk_indices_buffer."""
-
-    def __init__(self, topk_indices_buffer: torch.Tensor):
-        super().__init__()
-        self.topk_indices_buffer = topk_indices_buffer
-
-    def forward(self, *args, **kwargs):
-        """Mock forward that does nothing - indices are pre-computed."""
-        return self.topk_indices_buffer
-
 def apply_rotary_embedding(
     x: torch.Tensor,  # [seq_len, ..., rope_dim]
     cos_sin: torch.Tensor,  # [seq_len, 2, rope_dim]
@@ -301,10 +290,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     print(f"Requests: {len(seq_lens)} total ({num_contexts} ctx, {num_generations} gen)")
 
     # Model configuration
-    # q_lora_rank should not be used in this pure attention test
     # Since topk=2048 > seq_lens, indexer selects all tokens anyway
     num_heads = 128
-    q_lora_rank = None
+    q_lora_rank = 512
     kv_lora_rank = 512
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
@@ -419,7 +407,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
-        q_lora_rank=None,
+        q_lora_rank=q_lora_rank,
         kv_lora_rank=kv_lora_rank,
         predicted_tokens_per_seq=1,
         max_position_embeddings=max_position_embeddings,
@@ -447,12 +435,12 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
 
         # k_b_proj_trans: [num_heads, kv_lora_rank, qk_nope_head_dim]
         mla.k_b_proj_trans.data = kv_b_weight_reshaped[:, :qk_nope_head_dim, :].transpose(1, 2).contiguous()
+        
+        # Initialize indexer weights
+        mla.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=nn_init_std)
+        mla.mqa.indexer.wk.weight.normal_(mean=0.0, std=nn_init_std)
+        mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=nn_init_std)
 
-    # ========================================================================
-    # Phase 1: Setup KV cache and pre-populate for generation requests
-    # ========================================================================
-    
-    # For generation requests, we need to pre-populate their KV cache
     # Calculate cached token counts (context already in cache)
     cached_lens = [seq_lens[i] - query_lens[i] for i in range(len(seq_lens))]
     
@@ -555,7 +543,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     k_pe = torch.randn(total_query_tokens, qk_rope_head_dim, dtype=dtype, device=device)
     k_pe_original_for_ref = k_pe.clone()  # Save before kernel modifies it
     hidden_states = torch.randn(total_query_tokens, hidden_size, dtype=dtype, device=device)
-    qr = torch.randn(total_query_tokens, kv_lora_rank, dtype=dtype, device=device)
+    qr = torch.randn(total_query_tokens, q_lora_rank, dtype=dtype, device=device)
     
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
     position_ids = torch.cat([torch.arange(cached_lens[i], cached_lens[i] + query_lens[i], 
@@ -601,8 +589,36 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             kv_offset += seq_lens[req_idx]
         return torch.stack(indices, dim=0)
     
+    def local_to_global_indices(local_indices, req_indices, cache_offset_start=0):
+        """
+        Transform indexer's local indices to global indices.
+        """
+        global_indices = local_indices.clone()
+        kv_offset = cache_offset_start
+        token_idx = 0
+        
+        for req_idx in req_indices:
+            num_tokens = query_lens[req_idx]
+            # Add offset for this request's cache position
+            for local_pos in range(num_tokens):
+                # Only transform non-padding indices (>= 0)
+                mask = global_indices[token_idx] >= 0
+                global_indices[token_idx][mask] += kv_offset
+                token_idx += 1
+            kv_offset += seq_lens[req_idx]   
+        return global_indices
+    
+    topk_indices_local = mla.mqa.indexer(qr, hidden_states, attn_metadata, position_ids)
+    
+    # Validate indexer output against expected causal indices (since seq_len < topk=2048)
     if num_contexts > 0:
-        mla.mqa.indexer = MockIndexer(create_causal_indices(ctx_indices))
+        # Transform context indices from local to global
+        ctx_topk_local = topk_indices_local[:num_ctx_tokens]
+        ctx_topk_global = local_to_global_indices(ctx_topk_local, ctx_indices, cache_offset_start=0)
+        
+         # Create expected global indices (sorted) for validation (not used but can be used for validation)
+        expected_ctx_indices = create_causal_indices(ctx_indices, cache_offset_start=0)
+        
         mla.forward_context_dsa(
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
@@ -610,12 +626,19 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             attn_metadata=attn_metadata,
             output=output[:num_ctx_tokens],
             latent_cache=latent_cache[:num_ctx_tokens],
-            topk_indices=mla.mqa.indexer.topk_indices_buffer,
+            topk_indices=ctx_topk_global,  # Use global indices
         )
         print(f"  ✓ Context forward: {num_ctx_tokens} tokens from {num_contexts} requests")
     
     if num_generations > 0:
-        mla.mqa.indexer = MockIndexer(create_causal_indices(gen_indices, cache_offset_start=0))
+        # Transform generation indices from local to global
+        num_gen_tokens = sum(query_lens[i] for i in gen_indices)
+        gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
+        gen_topk_global = local_to_global_indices(gen_topk_local, gen_indices, cache_offset_start=0)
+        
+        # Create expected global indices (sorted) for validation (not used but can be used for validation)
+        expected_gen_indices = create_causal_indices(gen_indices, cache_offset_start=0)
+                
         mla.forward_generation_dsa(
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
@@ -623,7 +646,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             attn_metadata=attn_metadata,
             output=output[num_ctx_tokens:],
             latent_cache=latent_cache[num_ctx_tokens:],
-            topk_indices=mla.mqa.indexer.topk_indices_buffer,
+            topk_indices=gen_topk_global,  # Use global indices
         )
         print(f"  ✓ Generation forward: {sum(query_lens[i] for i in gen_indices)} tokens from {num_generations} requests")
     
