@@ -25,7 +25,6 @@ import tempfile
 import trace
 import weakref
 from contextlib import contextmanager
-from dataclasses import asdict
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -797,6 +796,7 @@ def trace_func(func):
         return result
 
     return wrapper
+
 
 class BaseEnumMeta(EnumMeta):
 

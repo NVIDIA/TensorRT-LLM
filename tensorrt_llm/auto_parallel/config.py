@@ -2,7 +2,6 @@ from enum import auto
 from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
-
 from strenum import LowercaseStrEnum
 
 from tensorrt_llm._utils import BaseEnumMeta

@@ -2,10 +2,9 @@ import copy
 import re
 from typing import Dict, Tuple, Union
 
-from pydantic import BaseModel, Field
-
 import pynvml
 import torch
+from pydantic import BaseModel, Field
 
 try:
     from cuda.bindings import runtime as cudart
