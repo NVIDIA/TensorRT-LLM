@@ -26,14 +26,13 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        prompts, run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
+                        skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 import tempfile
 
 import torch
@@ -268,9 +267,13 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         max_lora_rank=8,
         max_loras=2,
         max_cpu_loras=2)
-    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
-              lora_config=lora_config,
-              **llm_kwargs)
+    llm = LLM(
+        model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None,
+        **llm_kwargs)
     try:
         prompts = [
             "美国的首都在哪里? \n答案:",
@@ -286,10 +289,7 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         outputs = llm.generate(prompts,
                                sampling_params,
                                lora_request=lora_request)
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        # assert similar(outputs[0].outputs[0].text, references[0])
-        print(f"lora output: {outputs[0].outputs[0].text}")
-        print(f"ref output: {references[0]}")
+        assert similar(outputs[0].outputs[0].text, references[0])
     finally:
         llm.shutdown()
 
@@ -305,7 +305,12 @@ def test_llama_7b_lora_default_modules() -> None:
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
-    llm = LLM(model=hf_model_dir, lora_config=lora_config)
+    llm = LLM(
+        model=hf_model_dir,
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -324,9 +329,7 @@ def test_llama_7b_lora_default_modules() -> None:
                                sampling_params,
                                lora_request=lora_request)
 
-        # assert similar(outputs[0].outputs[0].text, references[0])
-        print(f"lora output: {outputs[0].outputs[0].text}")
-        print(f"ref output: {references[0]}")
+        assert similar(outputs[0].outputs[0].text, references[0])
     finally:
         llm.shutdown()
 
@@ -504,64 +507,33 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-@pytest.mark.skip(reason="https://nvbugs/5521949")
-def test_codellama_fp8_with_bf16_lora() -> None:
-    model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
-    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
-                               kv_cache_quant_algo=QuantAlgo.FP8)
+def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
+    skip_fp8_pre_ada(use_fp8=True)
+    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
+    prompt = "美国的首都是哪里？"
+    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
 
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
+    lora_config = LoraConfig(lora_dir=[lora_dir],
+                             max_lora_rank=64,
+                             max_loras=2,
+                             max_cpu_loras=2)
+    lora_req = LoRARequest("lora-chinese", 0, lora_dir)
 
-    # Set up temporary directory for LoRA adapters
-    with tempfile.TemporaryDirectory() as lora_dir:
-        print("Creating dummy LoRAs...")
+    llm = LLM(
+        model_dir,
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-
-        lora_config = PeftLoraConfig(r=8,
-                                     target_modules=hf_modules,
-                                     bias="none",
-                                     task_type="CAUSAL_LM")
-
-        lora_paths = []
-        for i in range(2):
-            lora_model = get_peft_model(model, lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        lora_config = LoraConfig(lora_dir=lora_paths,
-                                 lora_target_modules=target_modules,
-                                 max_lora_rank=8,
-                                 max_loras=2,
-                                 max_cpu_loras=2)
-
-        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
-
-        prompts = [
-            "Write a function that calculates the Fibonacci sequence.",
-            "Convert this C++ code to Python: int x = 0; x++;",
-        ]
-
-        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
-        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
-        lora_requests = [lora_req1, lora_req2]
-        sampling_params = SamplingParams(max_tokens=200)
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_requests)
-
-        assert len(outputs) == 2
+    try:
+        output = llm.generate(prompt,
+                              SamplingParams(max_tokens=20),
+                              lora_request=[lora_req])
+    finally:
+        llm.shutdown()
+    assert similar(output.outputs[0].text, reference)
 
 
 @skip_gpu_memory_less_than_80gb

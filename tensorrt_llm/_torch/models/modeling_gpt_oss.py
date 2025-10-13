@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -225,7 +226,9 @@ class MLPBlock(torch.nn.Module):
             dtype=pretrained_config.torch_dtype)
 
     def compute_gate_output(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
+        if get_sm_version() in [
+                90, 100, 103
+        ] and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS:
             weight = self.gate.weight
             bias = self.gate.bias
             g = torch.ops.trtllm.tinygemm2(x, weight, bias)
