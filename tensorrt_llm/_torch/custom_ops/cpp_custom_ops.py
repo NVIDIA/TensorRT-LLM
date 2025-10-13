@@ -127,9 +127,9 @@ def _register_fake():
         mat_b: torch.Tensor,
         scale_a: torch.Tensor,
         scale_b: torch.Tensor,
-        bias,
-        out_dtype,
-        userbuffers_id=False,
+        bias: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        userbuffers_id: bool = False,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
