@@ -97,7 +97,7 @@ def BUILD_CONFIGS = [
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
+BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
 
 SLURM_CORES_REQUEST = "1"
@@ -967,16 +967,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
-    // TODO: remove this after GH200 driver upgrade
-    def hostnameMatch = ""
-    if (type == "gh200") {
-        hostnameMatch = """
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "lego-cg1-qct-070.ipp3a2.colossus"
-                                - "lego-cg1-qct-079.ipp3a2.colossus\""""
-    }
 
     def podConfig = [
         cloud: targetCould,
@@ -997,7 +987,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
-                                - "core"${hostnameMatch}
+                                - "core"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -1278,6 +1268,15 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         makoArgs += ["auto_trigger=gpt_oss"]
     } else {
         makoArgs += ["auto_trigger=others"]
+    }
+    if (stageName.contains("-Ray-")) {
+        // If stageName contains "-Ray-", add "orchestrator=ray" to makoArgs
+        // At this point, only tests with orchestrator=ray or unspecified orchestrator will be run.
+        // Mark tests with orchestrator=mpi to exclude them from Ray stage.
+        makoArgs += ["orchestrator=ray"]
+    } else {
+        // Otherwise select tests with orchestrator=mpi or unspecified orchestrator
+        makoArgs += ["orchestrator=mpi"]
     }
 
     if (parseSysinfo) {
@@ -1708,6 +1707,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "--perf-log-formats yaml"
             ]
         }
+        if (stageName.contains("-Ray-")) {
+            testCmdLine += ["--run-ray"]
+
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
+        }
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
         sh "echo ${TRTLLM_WHL_PATH}"
@@ -1767,11 +1771,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
-                sh """
-                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
-                    ${stageName}/perf_script_test_results.csv \
-                    ${basePerfPath}
-                """
+                def perfCheckResult = sh(
+                    script: """
+                        python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
+                        ${stageName}/perf_script_test_results.csv \
+                        ${basePerfPath}
+                    """,
+                    returnStatus: true
+                )
+                if (perfCheckResult != 0) {
+                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                }
             }
             stage("Create perf report") {
                 sh """
@@ -2043,6 +2053,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-2_GPUs-PyTorch-Ray-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
@@ -2065,6 +2076,7 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
+        "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
@@ -2078,53 +2090,53 @@ def launchTestJobs(pipeline, testFilter)
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
-        "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
+        // "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
+        // "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
         "A10-FMHA-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
-        "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
-        "A30-TensorRT-Post-Merge-3": ["a30", "l0_a30", 3, 6],
-        "A30-TensorRT-Post-Merge-4": ["a30", "l0_a30", 4, 6],
-        "A30-TensorRT-Post-Merge-5": ["a30", "l0_a30", 5, 6],
-        "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
+        // "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
+        // "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
+        // "A30-TensorRT-Post-Merge-3": ["a30", "l0_a30", 3, 6],
+        // "A30-TensorRT-Post-Merge-4": ["a30", "l0_a30", 4, 6],
+        // "A30-TensorRT-Post-Merge-5": ["a30", "l0_a30", 5, 6],
+        // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 1],
         "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
-        "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
-        "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],
-        "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
-        "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
-        "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
+        // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
+        // "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
+        // "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],
+        // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
+        // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
+        // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
         "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
         "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
         "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
-        "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
-        "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
-        "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
-        "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
-        "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
+        // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
+        // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
+        // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
+        // "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
+        // "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
-        "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
-        "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
-        "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
-        "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
+        // "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
+        // "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
+        // "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
+        // "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
+        // "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
-        "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
+        // "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
+        // "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
-        "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
-        "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
+        // "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
+        // "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
+        // "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
         "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
@@ -2152,6 +2164,7 @@ def launchTestJobs(pipeline, testFilter)
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
@@ -2199,8 +2212,9 @@ def launchTestJobs(pipeline, testFilter)
         // "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     // ]
     multiNodesSBSAConfigs = [:]
-    multiNodesSBSAConfigs += (1..7).collectEntries { i ->
-        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-multi-node", "l0_gb200_multi_nodes", i, 7, 8, 2]]
+    def numMultiNodeTests = 9
+    multiNodesSBSAConfigs += (1..numMultiNodeTests).collectEntries { i ->
+        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-multi-node", "l0_gb200_multi_nodes", i, numMultiNodeTests, 8, 2]]
     }
     fullSet += multiNodesSBSAConfigs.keySet()
 

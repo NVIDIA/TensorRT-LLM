@@ -1,3 +1,4 @@
+import ast
 import copy
 import functools
 import json
@@ -191,6 +192,12 @@ class MoeConfig(StrictBaseModel):
         "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
     )
 
+    use_low_precision_moe_combine: bool = Field(
+        default=False,
+        description=
+        "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
+    )
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -359,6 +366,8 @@ class DecodingBaseConfig(StrictBaseModel):
 
     load_format: Optional[str] = None
 
+    # If set, drafting is allowed to use chain drafter.
+    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
@@ -373,6 +382,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
+            "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
@@ -443,12 +453,68 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle_choices: Optional[List[List[int]]] = None
     greedy_sampling: Optional[bool] = True
     posterior_threshold: Optional[float] = None
+    # Whether to use dynamic tree.
     use_dynamic_tree: Optional[bool] = False
+    # The topK value for each layer when enable dynamic tree.
     dynamic_tree_max_topK: Optional[int] = None
+    # The number of draft tokens in the draft tokens tree.
+    max_total_draft_tokens: Optional[int] = None
+    # The number of eagle layer. will not be used in pytorch flow, just for compatibility with TRT flow
     num_eagle_layers: Optional[int] = None
+    # The number of non-leaves in each layer.
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            if attr_name == 'max_draft_len':
+                self.num_eagle_layers = attr_value
+                self.max_total_draft_tokens = attr_value  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
+            # Convert the data type of Eagle choice from str to List[List[int]]
+            if attr_name == 'eagle_choices' and attr_value is not None:
+                logger.warning(
+                    "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                )
+                if not isinstance(attr_value, list):
+                    if isinstance(attr_value, str):
+                        attr_value = ast.literal_eval(
+                            attr_value.replace(" ", ""))
+                    else:
+                        raise ValueError(
+                            "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                        )
+            setattr(self, attr_name, attr_value)
+
+        assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
+
+        # Static tree logic
+        # Checks whether the input eagle choices is valid
+        # and reset the max_draft_len and num_eagle_layers if necessary
+        if self.eagle_choices is not None:
+            # If eagle_choices is provided, use_dynamic_tree will not be used
+            assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
+
+            # Get num_eagle_layers from eagle_choices
+            num_eagle_layers_from_choices = self.check_eagle_choices()
+            if num_eagle_layers_from_choices != self.num_eagle_layers:
+                logger.warning(
+                    f"Base on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
+                )
+                self.num_eagle_layers = num_eagle_layers_from_choices
+                self.max_draft_len = num_eagle_layers_from_choices
+
+            # Each draft node has a path(choice) from the root to it.
+            # So the number of choices also represents the number of max draft nodes.
+            self.max_total_draft_tokens = len(self.eagle_choices)
+
+        # Dynamic tree logic
+        if self.use_dynamic_tree:
+            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
+            assert self.max_draft_len is not None and self.max_draft_len > 0, "max_draft_len should be provided, which indicates the number of drafter layers"
+            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
+            assert self.max_total_draft_tokens is not None and self.max_total_draft_tokens > 0, "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -459,6 +525,25 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate(self) -> None:
         if self.speculative_model_dir is None:
             raise ValueError("Draft model must be provided for EAGLE")
+
+    def check_eagle_choices(self):
+        # 1) Check connectivity
+        unique_choices = set(
+            tuple(sub_choice)
+            for sub_choice in self.eagle_choices)  # remove repeated choices
+        self.eagle_choices = sorted([list(t) for t in unique_choices],
+                                    key=lambda x: (len(x), x))  # sort choices
+        for choice in self.eagle_choices:
+            if len(choice) > 1:
+                assert choice[
+                    0:
+                    -1] in self.eagle_choices, f"Error: choice {choice} is not connected"
+
+        # 2) Get num_eagle_layers_from_choices
+        num_eagle_layers_from_choices = max(
+            len(choice) for choice in self.eagle_choices)
+
+        return num_eagle_layers_from_choices
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -478,6 +563,52 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_layers_to_capture is not None:
             return len(self.eagle3_layers_to_capture)
         return 3
+
+
+class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
+    output_directory: str
+    write_interval: int = 20
+    file_prefix: str = "data"
+    eagle3_layers_to_capture: Optional[Set[int]] = None
+
+    max_total_draft_tokens: Optional[int] = Field(default=1, init=False)
+    eagle_choices: Optional[List[List[int]]] = Field(default=None, init=False)
+
+    def model_post_init(self, __context):
+        self._last_hidden_in_save = True
+        if self.eagle3_layers_to_capture is None:
+            self._last_hidden_in_save = False
+        elif -1 not in self.eagle3_layers_to_capture:
+            self._last_hidden_in_save = False
+            self.eagle3_layers_to_capture.add(-1)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "SaveState"
+
+    def validate(self) -> None:
+        if self.output_directory is None or not self.eagle3_layers_to_capture:
+            raise ValueError(
+                "Save directory and layers to capture must be provided")
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).
+        """
+        if self.eagle3_layers_to_capture is None:
+            return 4
+        return len(self.eagle3_layers_to_capture)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -968,6 +1099,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
 ]]
 
@@ -1421,6 +1553,13 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
+    orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
+        default=None,
+        description=
+        "The orchestrator type to use. Defaults to None, which uses MPI.",
+        status="prototype",
+    )
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
@@ -1787,6 +1926,20 @@ class BaseLlmArgs(StrictBaseModel):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.AUTO
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+            elif isinstance(self.speculative_config,
+                            SaveHiddenStatesDecodingConfig):
+                assert self.backend in ['pytorch']
+                logger.warning(
+                    "SaveHiddenStatesDecodingConfig is active, setting max_batch_size to 1, disabling overlap scheduler, and setting cuda_graph_config to None"
+                )
+                self.build_config.max_batch_size = 1
+                self.max_batch_size = 1
+                self.disable_overlap_scheduler = True
+                self.cuda_graph_config = None
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.SAVE_HIDDEN_STATES
+                self.build_config.max_draft_len = 1
+                self.speculative_config.max_draft_len = 1
 
             else:
                 raise ValueError(
@@ -2539,6 +2692,8 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
+            use_low_precision_moe_combine=self.moe_config.
+            use_low_precision_moe_combine,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,

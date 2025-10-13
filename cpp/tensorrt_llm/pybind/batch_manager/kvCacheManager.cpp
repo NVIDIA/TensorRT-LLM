@@ -103,10 +103,19 @@ public:
             void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth, llmRequest);
     }
 
-    void removeSequence(tb::LlmRequest::RequestIdType requestId,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt) override
+    std::optional<tbk::KVCacheBlock::IdType> removeSequence(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt,
+        bool pinOnRelease = false) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, removeSequence, requestId, llmRequest);
+        PYBIND11_OVERLOAD_PURE(std::optional<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, removeSequence,
+            requestId, llmRequest, pinOnRelease);
+    }
+
+    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
+    {
+        PYBIND11_OVERLOAD_PURE(std::optional<tbk::KVCacheBlock::IdType>, tbk::BaseKVCacheManager, storeBlocksForReuse,
+            requestId, llmRequest, pinBlocks);
     }
 
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
@@ -184,13 +193,6 @@ public:
     {
         PYBIND11_OVERLOAD_PURE(std::vector<std::vector<std::vector<SizeType32>>>, tbk::BaseKVCacheManager,
             getBatchCacheBlockIds, requestIds, windowSize);
-    }
-
-    std::vector<SizeType32> getNewlyAllocatedBlockIds(
-        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
-    {
-        PYBIND11_OVERLOAD_PURE(
-            std::vector<SizeType32>, tbk::BaseKVCacheManager, getNewlyAllocatedBlockIds, requestId, windowSize);
     }
 
     SizeType32 getUsedNumBlocks() const override
@@ -355,6 +357,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("add_token", &BaseKVCacheManager::addToken, py::call_guard<py::gil_scoped_release>())
         .def("add_sequence", &BaseKVCacheManager::addSequence, py::call_guard<py::gil_scoped_release>())
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, py::call_guard<py::gil_scoped_release>())
+        .def("pin_blocks", &BaseKVCacheManager::pinBlocks, py::call_guard<py::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             py::call_guard<py::gil_scoped_release>())
         .def(
@@ -461,13 +464,15 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, py::call_guard<py::gil_scoped_release>())
+        .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
+            py::call_guard<py::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, py::call_guard<py::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             py::call_guard<py::gil_scoped_release>())
-        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
-            py::call_guard<py::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
-            py::call_guard<py::gil_scoped_release>());
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, py::call_guard<py::gil_scoped_release>())
+        .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

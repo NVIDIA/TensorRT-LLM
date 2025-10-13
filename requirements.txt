@@ -55,9 +55,9 @@ uvicorn
 setuptools<80
 ordered-set
 peft
-patchelf==0.18.0
+patchelf
 einops
-flashinfer-python>=0.3.0
+flashinfer-python>=0.3.0,<0.4.0
 opencv-python-headless
 xgrammar==0.1.25
 llguidance==0.7.29
@@ -75,3 +75,4 @@ tiktoken
 blobfile
 openai-harmony==0.0.4
 nvidia-cutlass-dsl==4.2.1; python_version >= "3.10"
+numba-cuda>=0.19.0 # WAR for nvbugs/5501820

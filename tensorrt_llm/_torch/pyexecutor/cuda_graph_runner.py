@@ -7,6 +7,7 @@ import torch
 
 from ...inputs.multimodal import MultimodalParams
 from ..expert_statistic import ExpertStatistic
+from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..utils import make_weak_ref, piecewise_cuda_graph
@@ -53,6 +54,7 @@ class CUDAGraphRunner:
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
             self._create_shared_static_tensors()
+        self.cuda_graph_meta_buffers = get_memory_buffers()
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -177,7 +179,7 @@ class CUDAGraphRunner:
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, key[1])
+            num_sequences_in_batch, False, key[1], self.cuda_graph_meta_buffers)
         assert attn_metadata.is_cuda_graph
 
         if self.enable_spec_decode:
@@ -342,7 +344,7 @@ class CUDAGraphRunner:
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
-                max_num_draft_tokens=engine.max_draft_len,
+                max_num_draft_tokens=engine.runtime_draft_len,
                 use_mrope=engine.use_mrope,
                 max_beam_width=engine.max_beam_width)[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True

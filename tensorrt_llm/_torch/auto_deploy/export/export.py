@@ -197,7 +197,7 @@ def _clean_up_assertions(gm: fx.GraphModule):
 
 def torch_export_to_gm(
     model: nn.Module,
-    args: Tuple[Any, ...],
+    args: Optional[Tuple[Any, ...]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
     clone: bool = False,  # clone or don't clone the model state_dict
     *,
@@ -233,7 +233,7 @@ def torch_export_to_gm(
     # run export with patches and lifted to meta
     with apply_export_patches(patch_configs, patch_list), lift_to_meta(model) as state_dict:
         # clean up args, kwargs and move to correct device
-        args, kwargs = tree_to((args, kwargs or {}), device="meta")
+        args, kwargs = tree_to((args or (), kwargs or {}), device="meta")
 
         # NOTE (lucaslie): export is VERY sensitive to the location of the inference_mode
         # context manager. Do NOT move it unless absolutely necessary.

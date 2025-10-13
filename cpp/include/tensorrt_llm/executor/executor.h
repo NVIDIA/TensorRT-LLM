@@ -1479,7 +1479,8 @@ private:
 class ExecutorConfig
 {
 public:
-    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds = 180000000;
+    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds
+        = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::minutes(3)).count();
 
     static constexpr SizeType32 kDefaultIterStatsMaxIterations = 1000;
 

@@ -1,10 +1,10 @@
-from typing import Any, Callable, Dict, List, Optional, Tuple, final
+from typing import Callable, Dict, List, Optional, Tuple, final
 
 import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-from ..custom_ops.attention_interface import GetCacheCallable, SequenceInfo
+from ..custom_ops.attention_interface import DynamicShape, GetCacheCallable, SequenceInfo
 
 
 @final
@@ -35,9 +35,16 @@ class CachedSequenceInterface:
         return list(self.info.named_args.keys()) + list(self._cache_initializers.keys())
 
     @property
-    def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
+    def dynamic_shapes(self) -> Tuple[DynamicShape, ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
-        return self.info.dynamic_shapes + ({},) * len(self._caches)
+        return tuple(self.named_dynamic_shapes.values())
+
+    @property
+    def named_dynamic_shapes(self) -> Dict[str, DynamicShape]:
+        """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
+        named_dynamic_shapes = self.info.named_dynamic_shapes
+        named_dynamic_shapes.update({k: {} for k in self._caches})
+        return named_dynamic_shapes
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
@@ -73,7 +80,9 @@ class CachedSequenceInterface:
         self.info.num_pages = new_num_pages
         for name, cache in self._caches.items():
             # We assume cache is a tensor of shape (max_batch_size, page_size, n_heads, head_dim)
-            if "cache" in name:
+            # TODO: cache resize should ideally be handled via a callback to the AttentionDescriptor
+            # to avoid hard-coding any assumptions about the cache shape or its "pagedness"
+            if "k_cache" in name or "v_cache" in name:
                 current_shape = cache.shape
                 new_shape = (new_num_pages, *current_shape[1:])
                 cache.resize_(new_shape)

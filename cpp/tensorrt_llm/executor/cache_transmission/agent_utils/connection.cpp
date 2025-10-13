@@ -180,6 +180,22 @@ bool AgentConnection::hasLoadRemoteAgent() const
     return mHasLoadRemoteAgent;
 }
 
+void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) const
+{
+    ReadySignalInfo readySignalInfo{mRemoteAgentName, ctx, isReady};
+    NotificationInfo notificationInfo{readySignalInfo};
+    std::stringstream ss;
+    NotificationInfo::serialize(notificationInfo, ss);
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+}
+
+bool AgentConnection::recvReadySignal(DataContext const& ctx) const
+{
+    ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
+    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
+    return true;
+}
+
 AgentConnectionManager::AgentConnectionManager(
     batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState)
     : mCacheState(std::move(cacheState))
@@ -263,17 +279,16 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
     while (true)
     {
-
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
         while (it != mUnhandledNotifications.end())
         {
             auto& [agent, notifs] = *it;
-            auto it2 = notifs.begin();
-            while (it2 != notifs.end())
+            auto notifIt = notifs.begin();
+            while (notifIt != notifs.end())
             {
-                std::stringstream ss(*it2);
+                std::stringstream ss(*notifIt);
                 NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
                 bool erase = false;
                 if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
@@ -293,7 +308,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto offsetRatio = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
                         requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState, validConnectionIdx);
                     connection->setSenderState(bufferDesc, validConnectionIdx, offsetRatio);
-                    it2 = notifs.erase(it2);
+                    notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {
                         it = mUnhandledNotifications.erase(it);
@@ -303,7 +318,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
                 if (!erase)
                 {
-                    it2++;
+                    notifIt++;
                 }
             }
             if (notifs.empty())
@@ -433,7 +448,8 @@ int AgentConnectionManager::getDeviceId() const
     return mDeviceId;
 }
 
-void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo)
+template <typename NotificationType>
+void AgentConnectionManager::waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo)
 {
     while (true)
     {
@@ -449,30 +465,54 @@ void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName,
                 it++;
                 continue;
             }
-            auto it2 = notifs.begin();
-            while (it2 != notifs.end())
+            auto notifIt = notifs.begin();
+            while (notifIt != notifs.end())
             {
-                std::stringstream ss(*it2);
+                std::stringstream ss(*notifIt);
                 NotificationInfo notificationInfo = NotificationInfo::deserialize(ss);
                 bool erase = false;
-                if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
+                if constexpr (std::is_same_v<NotificationType, NotificationSyncInfo>)
                 {
-                    auto notificationSyncInfo = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
-                    if (notificationSyncInfo.mContext.getTag() == syncInfo.mContext.getTag()
-                        && notificationSyncInfo.mAgentName == syncInfo.mAgentName)
+                    if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
                     {
-                        erase = true;
-                        it2 = notifs.erase(it2);
-                        if (notifs.empty())
+                        auto notificationData = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
+                        if (notificationData.mContext.getTag() == expectedInfo.mContext.getTag()
+                            && notificationData.mAgentName == expectedInfo.mAgentName)
                         {
-                            it = mUnhandledNotifications.erase(it);
+                            erase = true;
+                            notifIt = notifs.erase(notifIt);
+                            if (notifs.empty())
+                            {
+                                it = mUnhandledNotifications.erase(it);
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
+                else if constexpr (std::is_same_v<NotificationType, ReadySignalInfo>)
+                {
+                    if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
+                    {
+                        auto readySignalData = std::get<ReadySignalInfo>(notificationInfo.mInfo);
+                        if (readySignalData.mContext.getTag() == expectedInfo.mContext.getTag()
+                            && readySignalData.mAgentName == expectedInfo.mAgentName)
+                        {
+                            expectedInfo.mIsReady = readySignalData.mIsReady;
+
+                            erase = true;
+                            notifIt = notifs.erase(notifIt);
+                            if (notifs.empty())
+                            {
+                                it = mUnhandledNotifications.erase(it);
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 if (!erase)
                 {
-                    it2++;
+                    notifIt++;
                 }
             }
             if (notifs.empty())
@@ -485,6 +525,22 @@ void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName,
             }
         }
     }
+}
+
+// Explicit template instantiations
+template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
+    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo);
+template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
+    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo);
+
+void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo)
+{
+    waitForNotification(remoteAgentName, syncInfo);
+}
+
+void AgentConnectionManager::waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo)
+{
+    waitForNotification(remoteAgentName, readySignalInfo);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const

@@ -12,7 +12,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
                                             GuidedDecodingConfig)
@@ -28,10 +28,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..distributed import MPIDist
+from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..utils import _get_allow_chain_drafter
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -81,9 +80,8 @@ class _ExecutorMemoryMonitor():
         elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
               and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
               in str(e)):
-            msg = (
-                "Executor creation failed with an error which might indicate "
-                "insufficient GPU memory.")
+            msg = (f"Executor creation failed with NCCL error: {str(e)}")
+            return msg
         else:
             return None
 
@@ -294,7 +292,10 @@ def create_py_executor(
         pytorch_backend_config.disable_overlap_scheduler = True
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    dist = MPIDist(mapping=mapping)
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
 
     cache_transceiver_config = None
     if llm_args.cache_transceiver_config is not None:
@@ -342,13 +343,11 @@ def create_py_executor(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            if _get_allow_chain_drafter():
-                use_chain_drafter = (
-                    guided_decoding_config is None
-                    and draft_spec_config._allow_greedy_draft_tokens
-                    and pytorch_backend_config.attn_backend == "TRTLLM")
-            else:
-                use_chain_drafter = False
+            use_chain_drafter = (
+                guided_decoding_config is None
+                and draft_spec_config._allow_chain_drafter
+                and draft_spec_config._allow_greedy_draft_tokens
+                and pytorch_backend_config.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
