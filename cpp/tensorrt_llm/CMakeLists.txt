@@ -177,7 +177,9 @@ if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
 endif()
 
-set(MOONCAKE_WRAPPER_TARGET tensorrt_llm_mooncake_wrapper)
+if(MOONCAKE_ROOT)
+  set(MOONCAKE_WRAPPER_TARGET tensorrt_llm_mooncake_wrapper)
+endif()
 
 add_subdirectory(executor)
 
