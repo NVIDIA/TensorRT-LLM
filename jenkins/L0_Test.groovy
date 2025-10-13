@@ -2204,7 +2204,7 @@ def launchTestJobs(pipeline, testFilter)
 
     // multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        // Disable GB200 multi-node testing in L0 pre-merge until the configuration issue is resolved (https://nvbugs/5455140)
+        // Disable GB200 multi-node testing in L0 pre-merge until related issues is resolved (https://nvbugs/5485182, https://nvbugs/5437384)
         // "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
         // "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
         // "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],

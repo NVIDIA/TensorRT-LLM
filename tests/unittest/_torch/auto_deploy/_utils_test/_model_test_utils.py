@@ -480,6 +480,12 @@ _SMALL_MODEL_CONFIGS = {
             "ssm_state_size": 32,
         },
     },
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+        "llm_models_subdir": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+        },
+    },
 }
 
 
