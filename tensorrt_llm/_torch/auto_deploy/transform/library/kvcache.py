@@ -222,7 +222,7 @@ class ResizeKVCacheConfig(TransformConfig):
     """Configuration for the resize kv cache transform."""
 
     free_mem_ratio: float = Field(
-        default=0.8, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
+        default=0.0, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
     )
 
 

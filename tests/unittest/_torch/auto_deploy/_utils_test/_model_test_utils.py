@@ -8,6 +8,8 @@ from torch import nn
 from torch.export import Dim
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionRegistry
+
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     freqs_cis = freqs_cis[None, : x.shape[1], None]  #             --> [1, s,   1, h_d//2, 2]
@@ -518,7 +520,7 @@ def get_transforms_config(
             },
             "match_attention_layout": {
                 "stage": "pattern_matcher",
-                "attn_backend": attn_backend,
+                "attn_layout": AttentionRegistry.get(attn_backend).get_attention_layout(),
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
