@@ -2282,7 +2282,7 @@ def pytest_configure(config):
                                                default=10)
 
         # Create the reporter
-        xmlpath = os.path.join(output_dir, "junit_periodic_report.xml")
+        xmlpath = os.path.join(output_dir, "results.xml")
         reporter = LightweightPeriodicJUnitXML(
             xmlpath=xmlpath,
             interval=periodic_interval,
@@ -3398,6 +3398,9 @@ class LightweightPeriodicJUnitXML:
         # Pending test cases buffer
         self.pending_cases = []
 
+        # Store test reports by nodeid to accumulate across phases (setup, call, teardown)
+        self.test_reports = {}
+
         # File handle for incremental writes
         self.xml_file = None
         self.header_written = False
@@ -3416,30 +3419,60 @@ class LightweightPeriodicJUnitXML:
         self.xml_file.flush()
         self.header_written = True
 
+        # Register signal handlers for graceful shutdown
+        self._register_signal_handlers()
+
         print_info(
             f"LightweightPeriodicJUnitXML: Initialized at {self.xmlpath}")
 
     def pytest_runtest_logreport(self, report):
         """Collect test results and save periodically."""
+        nodeid = report.nodeid
+
+        # Accumulate reports for all phases (setup, call, teardown)
+        if nodeid not in self.test_reports:
+            self.test_reports[nodeid] = {
+                'setup': None,
+                'call': None,
+                'teardown': None,
+                'duration': 0.0,
+                'outcome': 'passed',
+            }
+
+        # Store the report for this phase
+        self.test_reports[nodeid][report.when] = report
+        self.test_reports[nodeid]['duration'] += getattr(
+            report, 'duration', 0.0)
+
+        # Update outcome (failed takes precedence over skipped)
+        if report.failed:
+            self.test_reports[nodeid]['outcome'] = 'failed'
+        elif report.skipped and self.test_reports[nodeid]['outcome'] != 'failed':
+            self.test_reports[nodeid]['outcome'] = 'skipped'
+
+        # Only process on teardown phase (when test is fully complete)
         if report.when != 'teardown':
             return
 
-        # Extract test case information
-        test_case = self._create_testcase_xml(report)
+        # Extract test case information from all accumulated reports
+        test_case = self._create_testcase_xml_from_reports(
+            nodeid, self.test_reports[nodeid])
         self.pending_cases.append(test_case)
 
         # Update statistics
         self.stats['tests'] += 1
-        self.stats['time'] += getattr(report, 'duration', 0.0)
+        self.stats['time'] += self.test_reports[nodeid]['duration']
 
-        if report.failed:
+        outcome = self.test_reports[nodeid]['outcome']
+        if outcome == 'failed':
             self.stats['failures'] += 1
-        elif report.skipped:
-            self.stats['skipped'] += 1
-        elif hasattr(report, 'wasxfail'):
+        elif outcome == 'skipped':
             self.stats['skipped'] += 1
         else:
             self.stats['passed'] += 1
+
+        # Clean up stored reports for this test
+        del self.test_reports[nodeid]
 
         self.completed_tests += 1
         current_time = time.time()
@@ -3451,8 +3484,121 @@ class LightweightPeriodicJUnitXML:
             self.completed_tests = 0
             self.last_save_time = current_time
 
+    def _create_testcase_xml_from_reports(self, nodeid, test_info):
+        """Create XML string for a single test case from accumulated reports."""
+        import xml.etree.ElementTree as ET
+
+        # Get the primary report (prefer call, then teardown, then setup)
+        primary_report = (test_info.get('call') or test_info.get('teardown')
+                          or test_info.get('setup'))
+
+        if not primary_report:
+            return None
+
+        testcase = ET.Element(
+            'testcase',
+            classname=primary_report.location[0],
+            name=primary_report.location[2],
+            time=f"{test_info['duration']:.3f}",
+        )
+
+        # Add file and line attributes if available
+        if hasattr(primary_report, 'location') and len(
+                primary_report.location) > 1:
+            testcase.set('file', primary_report.location[0])
+            if primary_report.location[1] is not None:
+                testcase.set('line', str(primary_report.location[1]))
+
+        # Add failure/error/skip information
+        outcome = test_info['outcome']
+        failed_report = None
+
+        # Check each phase for failures
+        for phase in ['setup', 'call', 'teardown']:
+            report = test_info.get(phase)
+            if report and report.failed:
+                failed_report = report
+                if phase == 'setup':
+                    failure = ET.SubElement(testcase,
+                                            'error',
+                                            message=f'{phase} failure')
+                else:
+                    failure = ET.SubElement(testcase,
+                                            'failure',
+                                            message=f'{phase} failure')
+                if hasattr(report, 'longreprtext'):
+                    failure.text = report.longreprtext
+                break
+
+        # Check for skipped
+        if not failed_report and outcome == 'skipped':
+            for phase in ['setup', 'call', 'teardown']:
+                report = test_info.get(phase)
+                if report and report.skipped:
+                    skip = ET.SubElement(testcase, 'skipped', message='skipped')
+                    if hasattr(report, 'longreprtext'):
+                        skip.text = report.longreprtext
+                    break
+
+        # Collect captured output from ALL phases (setup, call, teardown)
+        # This is the key part for --junit_logging functionality
+        stdout_content = []
+        stderr_content = []
+
+        for phase in ['setup', 'call', 'teardown']:
+            report = test_info.get(phase)
+            if not report:
+                continue
+
+            # Method 1: Check for sections attribute (pytest's captured output)
+            if hasattr(report, 'sections') and report.sections:
+                for section_name, section_content in report.sections:
+                    if section_content:
+                        if 'stdout' in section_name.lower(
+                        ) or 'Captured stdout' in section_name:
+                            stdout_content.append(
+                                f'--- {phase} {section_name} ---\n{section_content}'
+                            )
+                        elif 'stderr' in section_name.lower(
+                        ) or 'Captured stderr' in section_name:
+                            stderr_content.append(
+                                f'--- {phase} {section_name} ---\n{section_content}'
+                            )
+                        elif 'log' in section_name.lower(
+                        ) or 'Captured log' in section_name:
+                            # Logs typically go to stdout
+                            stdout_content.append(
+                                f'--- {phase} {section_name} ---\n{section_content}'
+                            )
+
+            # Method 2: Fallback to direct capture attributes
+            if hasattr(report, 'capstdout') and report.capstdout:
+                stdout_content.append(
+                    f'--- {phase} stdout ---\n{report.capstdout}')
+            if hasattr(report, 'capstderr') and report.capstderr:
+                stderr_content.append(
+                    f'--- {phase} stderr ---\n{report.capstderr}')
+            if hasattr(report, 'caplog') and report.caplog:
+                stdout_content.append(
+                    f'--- {phase} Captured Log ---\n{report.caplog}')
+
+        # Add system-out element if we have stdout content
+        if stdout_content:
+            system_out = ET.SubElement(testcase, 'system-out')
+            system_out.text = '\n\n'.join(stdout_content)
+
+        # Add system-err element if we have stderr content
+        if stderr_content:
+            system_err = ET.SubElement(testcase, 'system-err')
+            system_err.text = '\n\n'.join(stderr_content)
+
+        return ET.tostring(testcase, encoding='unicode')
+
     def _create_testcase_xml(self, report):
-        """Create XML string for a single test case."""
+        """
+        Legacy method for single report (kept for backward compatibility).
+        Prefer _create_testcase_xml_from_reports for complete logging.
+        """
         import xml.etree.ElementTree as ET
 
         testcase = ET.Element(
@@ -3461,6 +3607,12 @@ class LightweightPeriodicJUnitXML:
             name=report.location[2],
             time=f"{getattr(report, 'duration', 0.0):.3f}",
         )
+
+        # Add file and line attributes if available
+        if hasattr(report, 'location') and len(report.location) > 1:
+            testcase.set('file', report.location[0])
+            if report.location[1] is not None:
+                testcase.set('line', str(report.location[1]))
 
         # Add failure/error/skip information
         if report.failed:
@@ -3478,6 +3630,47 @@ class LightweightPeriodicJUnitXML:
             skip = ET.SubElement(testcase, 'skipped', message='skipped')
             if hasattr(report, 'longreprtext'):
                 skip.text = report.longreprtext
+
+        # Add captured output (stdout, stderr, logs)
+        stdout_content = []
+        stderr_content = []
+
+        # Method 1: Check for sections attribute (pytest's captured output)
+        if hasattr(report, 'sections') and report.sections:
+            for section_name, section_content in report.sections:
+                if section_content:
+                    if 'stdout' in section_name.lower(
+                    ) or 'Captured stdout' in section_name:
+                        stdout_content.append(
+                            f'--- {section_name} ---\n{section_content}')
+                    elif 'stderr' in section_name.lower(
+                    ) or 'Captured stderr' in section_name:
+                        stderr_content.append(
+                            f'--- {section_name} ---\n{section_content}')
+                    elif 'log' in section_name.lower(
+                    ) or 'Captured log' in section_name:
+                        # Logs typically go to stdout
+                        stdout_content.append(
+                            f'--- {section_name} ---\n{section_content}')
+
+        # Method 2: Fallback to direct capture attributes
+        if not stdout_content and not stderr_content:
+            if hasattr(report, 'capstdout') and report.capstdout:
+                stdout_content.append(report.capstdout)
+            if hasattr(report, 'capstderr') and report.capstderr:
+                stderr_content.append(report.capstderr)
+            if hasattr(report, 'caplog') and report.caplog:
+                stdout_content.append(f'--- Captured Log ---\n{report.caplog}')
+
+        # Add system-out element if we have stdout content
+        if stdout_content:
+            system_out = ET.SubElement(testcase, 'system-out')
+            system_out.text = '\n\n'.join(stdout_content)
+
+        # Add system-err element if we have stderr content
+        if stderr_content:
+            system_err = ET.SubElement(testcase, 'system-err')
+            system_err.text = '\n\n'.join(stderr_content)
 
         return ET.tostring(testcase, encoding='unicode')
 
@@ -3558,3 +3751,58 @@ class LightweightPeriodicJUnitXML:
 
         except Exception as e:
             print_warning(f"Failed to update suite attributes: {e}")
+
+    def _register_signal_handlers(self):
+        """Register signal handlers for graceful shutdown on interruption."""
+        import signal
+
+        def signal_handler(signum, frame):
+            """Handle interrupt signals by saving current progress before exit."""
+            signal_name = signal.Signals(signum).name
+            print_warning(
+                f"\n\nReceived {signal_name} signal. Saving test results before exit..."
+            )
+
+            try:
+                # Flush any pending test cases
+                if self.pending_cases:
+                    print_info(
+                        f"Flushing {len(self.pending_cases)} pending test cases..."
+                    )
+                    self._flush_pending_cases()
+
+                # Close the file properly
+                if self.xml_file:
+                    self.xml_file.write('  </testsuite>\n')
+                    self.xml_file.write('</testsuites>\n')
+                    self.xml_file.close()
+                    self.xml_file = None
+
+                    # Update statistics
+                    self._update_suite_attributes()
+
+                    print_info(
+                        f"✅ Successfully saved {self.stats['tests']} test results to {self.xmlpath}"
+                    )
+                else:
+                    print_warning("XML file already closed")
+
+            except Exception as e:
+                print_warning(f"Failed to save results on interruption: {e}")
+
+            # Re-raise the signal to continue normal termination
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        # Register handlers for common interrupt signals
+        try:
+            signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+            signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+            print_info(
+                "Registered signal handlers for graceful shutdown (SIGINT, SIGTERM)"
+            )
+        except (AttributeError, ValueError) as e:
+            # Signal handling might not be available on all platforms
+            print_warning(
+                f"Could not register signal handlers (not supported on this platform): {e}"
+            )
