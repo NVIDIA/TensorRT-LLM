@@ -114,13 +114,16 @@ public:
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeKv, int numTokensPerPage,
-        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma) const
+        int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
-                && (headDimQk <= 1024) && (headDimV <= 1024) && (numTokensPerPage <= 128),
-            "Expect (32 <= headDim <= 1024) && (numTokensPerPage <= 128), got headDimPerCtaV=%d, headDimQk=%d, "
-            "headDimV=%d, numTokensPerPage=%d",
-            headDimPerCtaV, headDimQk, headDimV, numTokensPerPage);
+                && (headDimQk <= 1024) && (headDimV <= 1024),
+            "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
+            "headDimV=%d",
+            headDimPerCtaV, headDimQk, headDimV);
+        // The numTokensPerPage must be power of 2.
+        TLLM_CHECK_WITH_INFO(
+            (numTokensPerPage & (numTokensPerPage - 1)) == 0, "The numTokensPerPage must be power of 2.");
         TLLM_CHECK_WITH_INFO(maxNumHeadsQPerKvInCta <= 128, "The maxNumHeadsQPerKvInCta <= 128 is required.");
         TLLM_CHECK_WITH_INFO(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
         // Format of the hash key:
@@ -133,17 +136,18 @@ public:
         // Bit 26 - 33: (headDimQk >> 3).
         // Bit 34 - 41: (headDimV >> 3).
         // Bit 42 - 43: (tileSizeKv >> 6).
-        // Bit 44 - 48: (numTokensPerPage >> 3).
+        // Bit 44 - 48: (log2(numTokensPerPage)).
         // Bit 49 - 56: maxNumHeadsQPerKvInCta.
         // Bit 57 - 57: reuseSmemKForV.
         // Bit 58 - 58: uses2CtaMma.
+        // Bit 59 - 59: sparseMla.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
             | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
-            | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(numTokensPerPage >> 3) << 44)
+            | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(log2(numTokensPerPage)) << 44)
             | (static_cast<uint64_t>(maxNumHeadsQPerKvInCta) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 57)
-            | (static_cast<uint64_t>(uses2CtaMma) << 58);
+            | (static_cast<uint64_t>(uses2CtaMma) << 58) | (static_cast<uint64_t>(sparseMla) << 59);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -151,7 +155,7 @@ public:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mMaxNumHeadsQPerKvInCta,
-            kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma);
+            kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseMla);
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
@@ -161,10 +165,6 @@ public:
         if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
         {
             return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
-        }
-        if (params.mNumTokensPerPage % 8 != 0)
-        {
-            return std::make_pair(false, "NumTokensPerPage must be divisible by 8");
         }
 
         // The selectKernelParams that might be updated.
@@ -344,6 +344,11 @@ private:
         {
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
+            // The sparseMla only selects topK tokensKv.
+            if (params.mSparseMla)
+            {
+                maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
+            }
             // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
             if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
             {
@@ -455,6 +460,10 @@ private:
         // The number of Ctas.
         int const numCtas
             = static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16));
+        if (numCtas == 0)
+        {
+            return false;
+        }
         // Compute numCtasPerSeqKv.
         int const numCtasPerSeqKv
             = std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
@@ -477,9 +486,10 @@ private:
             // 1. The number of headsQPerKv is <= 32.
             // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
             //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
+            // The sparseMla kernel will always use the 2CTA high-throughput kernel.
 
             // Check the conditions.
-            if (params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params))
+            if ((params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params)) && !params.mSparseMla)
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
@@ -492,6 +502,9 @@ private:
                 {
                     selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
                 }
+                // The sparseMla only supports numHeadsQPerKv = 128.
+                TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
+                    "The sparseMla only supports numHeadsQPerKv = 128");
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {
@@ -545,8 +558,19 @@ private:
                 "Sliding window attention and chunked attention should not be used together");
             selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
-        // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
-        int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;
+
+        // The number of tokens per page.
+        int numTokensPerPage = params.mNumTokensPerPage;
+        // SparseMla kernels use a fixed numTokensPerPage of 4 (TMALDG.Gather4).
+        if (params.mSparseMla)
+        {
+            numTokensPerPage = 4;
+        }
+        else if (!isPagedKv(params.mQkvLayout))
+        {
+            // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
+            numTokensPerPage = 0;
+        }
 
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
@@ -560,8 +584,8 @@ private:
             + ", headDimQk=" + std::to_string(params.mHeadDimQk) + ", headDimV=" + std::to_string(params.mHeadDimV)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(numTokensPerPage) + ", maxNumHeadsQPerKvInCta=" + std::to_string(maxNumHeadsQPerKvInCta)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
-            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma);
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
+            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla);
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
         return std::make_pair(
@@ -569,7 +593,8 @@ private:
                 static_cast<int>(kernelType), static_cast<int>(selectKernelParams.mTileScheduler),
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
-                maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma),
+                maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
+                params.mSparseMla),
             info);
     }
 

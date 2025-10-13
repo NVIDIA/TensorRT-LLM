@@ -365,6 +365,11 @@ public:
         return mUseTllmGenSparseAttention && useSparseAttention();
     }
 
+    [[nodiscard]] bool useSparseMLA() const
+    {
+        return mUseSparseAttention && mUseTllmGen && mIsMLAEnabled;
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;

@@ -720,6 +720,7 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
+        self.sm_version = get_sm_version()
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -1264,13 +1265,22 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # TODO: implement other paths
-        return self.forward_sparse_mla_kvcache_bf16(q,
-                                                    latent_cache,
-                                                    attn_metadata,
-                                                    output,
-                                                    topk_indices,
-                                                    is_generation=False)
+        if self.sm_version >= 100:
+            return self.forward_generation(q,
+                                           compressed_kv,
+                                           k_pe,
+                                           attn_metadata,
+                                           output,
+                                           latent_cache,
+                                           topk_indices,
+                                           is_generation=False)
+        else:
+            return self.forward_sparse_mla_kvcache_bf16(q,
+                                                        latent_cache,
+                                                        attn_metadata,
+                                                        output,
+                                                        topk_indices,
+                                                        is_generation=False)
 
     def forward_generation_dsa(
         self,
@@ -1282,13 +1292,17 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # TODO: implement other paths
-        return self.forward_sparse_mla_kvcache_bf16(q,
-                                                    latent_cache,
-                                                    attn_metadata,
-                                                    output,
-                                                    topk_indices,
-                                                    is_generation=True)
+        if self.sm_version >= 100:
+            return self.forward_generation(q, compressed_kv, k_pe,
+                                           attn_metadata, output, latent_cache,
+                                           topk_indices)
+        else:
+            return self.forward_sparse_mla_kvcache_bf16(q,
+                                                        latent_cache,
+                                                        attn_metadata,
+                                                        output,
+                                                        topk_indices,
+                                                        is_generation=True)
 
     def forward_context_with_cached_kv(
         self,
@@ -1551,6 +1565,8 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        is_generation: bool = True,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
@@ -1601,15 +1617,19 @@ class MLA(nn.Module):
             self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
+        # Use generation_only for generation phase and context_only for context phase in DSA attention
+        attention_input_type = AttentionInputType.generation_only if is_generation else AttentionInputType.context_only
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,
             None,
             attn_metadata,
-            attention_input_type=AttentionInputType.generation_only,
+            attention_input_type=attention_input_type,
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            topk_indices=topk_indices,  # used by DSA attention
+            is_generation=is_generation,  # used by DSA attention
         )
         fused_q = None
 
@@ -1739,7 +1759,6 @@ class MLA(nn.Module):
         topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
             topk_indices,
             attn_metadata,
-            attn_metadata.kv_cache_manager,
             layer_idx=self.layer_idx,
             is_generation=is_generation,
         )
