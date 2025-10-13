@@ -4,6 +4,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from triton import next_power_of_2
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -13,7 +14,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata, repeat_kv)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes, next_power_of_two
+from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -849,7 +850,7 @@ class RocketKVCacheManager(KVCacheManager):
     ) -> None:
 
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
-        self.kt_tokens_per_block = next_power_of_two(
+        self.kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
 
         super().__init__(
@@ -1034,7 +1035,7 @@ class RocketKVCacheManager(KVCacheManager):
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
         tokens_per_block = kwargs['tokens_per_block']
         sparse_attn_config = model_config.sparse_attention_config
-        kt_tokens_per_block = next_power_of_two(
+        kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
         kv_factor = 2 + 2 * kt_tokens_per_block / tokens_per_block
         mem_per_token *= kv_factor

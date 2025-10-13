@@ -419,6 +419,7 @@ void XqaDispatcher::runImpl(
             // Paged KV
             tllmRunnerParams.mQkvLayout = QkvLayout::PagedKv;
             tllmRunnerParams.kvPtr = kv_cache_buffer.mPrimaryPoolPtr;
+            tllmRunnerParams.kvSfPtr = kv_cache_block_scales_buffer.mPrimaryPoolPtr;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(kv_cache_buffer.data);
             tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
             tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
