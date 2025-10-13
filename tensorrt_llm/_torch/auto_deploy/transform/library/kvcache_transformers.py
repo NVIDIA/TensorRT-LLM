@@ -12,7 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...custom_ops.attention_interface import AttentionDescriptor, Constant
-from ...custom_ops.torch_attention import HF_ATTN_KWARGS_MAPPING
+from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry

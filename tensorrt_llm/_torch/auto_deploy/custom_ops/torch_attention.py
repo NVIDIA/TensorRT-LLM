@@ -91,19 +91,6 @@ def scaled_dot_product_attention_fake(
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
-# Kwargs mapping for HF attention_interface to auto_deploy::torch_attention
-HF_ATTN_KWARGS_MAPPING = {
-    "dropout": "dropout_p",
-    "is_causal": "is_causal",
-    "scaling": "scale",
-    "scale": "scale",
-    "s_aux": "sinks",
-    "sinks": "sinks",
-    "sliding_window": "sliding_window",
-    "logit_cap": "logit_cap",
-}
-
-
 # Unified attention op
 @torch.library.custom_op("auto_deploy::torch_attention", mutates_args=())
 def torch_attention(
