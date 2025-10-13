@@ -54,6 +54,7 @@ class TestYaml:
             dict_content = yaml.safe_load(f)
         return dict_content
 
+    # TODO
     def test_update_llm_args_with_extra_dict_with_speculative_config(self):
         yaml_content = """
 speculative_config:
@@ -122,6 +123,7 @@ kv_cache_config:
             1024, 1024, 1024
         ]
 
+    # TODO
     def test_llm_args_with_pydantic_options(self):
         yaml_content = """
 max_batch_size: 16
@@ -310,6 +312,7 @@ def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
     assert config.lora_prefetch_dir == "."
 
 
+# TODO
 def test_update_llm_args_with_extra_dict_with_nested_dict():
     llm_api_args_dict = {
         "model":
@@ -451,8 +454,7 @@ class TestTorchLlmArgs:
             max_batch_size=8,
             max_num_tokens=256,
         )
-        args = TorchLlmArgs.from_kwargs(model=llama_model_path,
-                                        build_config=build_config)
+        args = TorchLlmArgs(model=llama_model_path, build_config=build_config)
 
         assert args.max_batch_size == build_config.max_batch_size
         assert args.max_num_tokens == build_config.max_num_tokens
@@ -501,7 +503,7 @@ class TestTrtLlmArgs:
         args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
         args_dict = args.model_dump()
 
-        new_args = TrtLlmArgs.from_kwargs(**args_dict)
+        new_args = TrtLlmArgs(**args_dict)
 
         assert new_args.model_dump() == args_dict
 

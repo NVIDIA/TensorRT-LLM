@@ -34,9 +34,7 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
                        UserProvidedDecodingConfig, _ModelFormatKind,
-                       _ModelWrapper, _ParallelConfig,
-                       update_llm_args_with_extra_dict,
-                       update_llm_args_with_extra_options)
+                       _ModelWrapper, _ParallelConfig)
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -923,6 +921,4 @@ __all__ = [
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',
-    'update_llm_args_with_extra_dict',
-    'update_llm_args_with_extra_options',
 ]
