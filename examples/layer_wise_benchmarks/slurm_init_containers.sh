@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-# DOCKER_IMAGE=
-# CONTAINER_MOUNTS=
+# CONTAINER_IMAGE=
+CONTAINER_MOUNTS=$(realpath "$(pwd)/../.."):$(realpath "$(pwd)/../..")
 
 if [ "${SLURM_JOB_ID:-}" == "" ]; then
     echo "Please set SLURM_JOB_ID"
@@ -12,9 +12,9 @@ fi
 
 NODES=$(squeue -j $SLURM_JOB_ID -h -o "%D")
 
-if [ "${DOCKER_IMAGE:-}" == "" ]; then
+if [ "${CONTAINER_IMAGE:-}" == "" ]; then
+    # Read Docker image from current_image_tags.properties
     source ../../jenkins/current_image_tags.properties
-
     MACHINE="$(uname -m)"
     if [ "$MACHINE" == "x86_64" ]; then
         DOCKER_IMAGE=$LLM_DOCKER_IMAGE
@@ -24,16 +24,27 @@ if [ "${DOCKER_IMAGE:-}" == "" ]; then
         echo "Unsupported machine hardware name \"$MACHINE\""
     fi
 
+    # Change "urm.nvidia.com/sw-tensorrt-docker/..." to "urm.nvidia.com#sw-tensorrt-docker/..." to bypass credentials
     DOCKER_IMAGE="${DOCKER_IMAGE/\//#}"
-    echo "DOCKER_IMAGE was not set, set to $DOCKER_IMAGE"
+    echo "CONTAINER_IMAGE was not set, using Docker image $DOCKER_IMAGE"
+
+    # Import to .sqsh file
+    SQSH_FILE_NAME=$(echo "$DOCKER_IMAGE" |
+                     awk -F'#' '{print $2}' |
+                     awk -F':' '{gsub(/\//,"+",$1); print $1"+"$2".sqsh"}')
+    CONTAINER_IMAGE="../../enroot/$SQSH_FILE_NAME"
+    if [ ! -f "$CONTAINER_IMAGE" ]; then
+        echo "Container image file $CONTAINER_IMAGE does not exist, importing ..."
+        srun -N 1 --pty enroot import -o "$CONTAINER_IMAGE" "docker://$DOCKER_IMAGE"
+    fi
 fi
 
 set -x
 srun --mpi=pmix \
     -N "$NODES" \
     --ntasks-per-node 1 \
-    --container-image "$DOCKER_IMAGE" \
+    --container-image "$CONTAINER_IMAGE" \
     --container-name "layer_wise_benchmarks" \
     --container-mounts "$CONTAINER_MOUNTS" \
-    --container-workdir "$(pwd)" \
+    --container-workdir "$(realpath $(pwd))" \
     pip install -e ../..

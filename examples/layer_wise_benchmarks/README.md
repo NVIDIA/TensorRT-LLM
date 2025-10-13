@@ -4,7 +4,7 @@
 
 ### Run with MPI
 
-Step 1: Start a container using Docker, Enroot or others. Please refer to `../../jenkins/current_image_tags.properties` for the image.
+Step 1: Start a container using Docker, Enroot or others. Please refer to `../../jenkins/current_image_tags.properties` for the Docker image URI.
 
 Step 2: In the container, Install `tensorrt_llm`:
 
