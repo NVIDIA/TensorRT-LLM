@@ -1,6 +1,7 @@
 """Tests for basic graph sharding."""
 
 # add to the path directory 4 directories up
+import os
 from functools import partial
 from typing import Type
 
@@ -198,9 +199,10 @@ def _run_job(
     sharding_source = ["custom"] if from_config else ["heuristic"]
 
     if sharding_source == ["custom"]:
-        # write predefined_config to tp_sharding.yaml file
-        with open("tp_sharding.yaml", "w") as f:
-            yaml.dump(predefined_config, f, sort_keys=False)
+        # If the file does not exist, write predefined_config to tp_sharding.yaml file
+        if not os.path.exists("tp_sharding.yaml"):
+            with open("tp_sharding.yaml", "w") as f:
+                yaml.dump(predefined_config, f, sort_keys=False)
     gm_transformed = InferenceOptimizer(
         None,
         {
@@ -352,31 +354,11 @@ def _run_pattern_detection_job(
     sharding_source = ["custom"] if from_config else ["heuristic"]
 
     if sharding_source == ["custom"]:
-        # write predefined_config to tp_sharding.yaml file
-        with open("tp_sharding.yaml", "w") as f:
-            yaml.dump(predefined_config, f, sort_keys=False)
-    InferenceOptimizer(
-        None,
-        {
-            "detect_sharding": {
-                "stage": "sharding",
-                "sharding_source": sharding_source,
-                "custom_sharding_config": "tp_sharding.yaml",
-                "support_partial_config": False,
-                "sharding_dims": ["tp"],
-            },
-            "sharding_transform_executor": {
-                "stage": "sharding",
-            },
-        },
-    )(None, gm)
+        # If the file does not exist, write predefined_config to tp_sharding.yaml file
+        if not os.path.exists("tp_sharding.yaml"):
+            with open("tp_sharding.yaml", "w") as f:
+                yaml.dump(predefined_config, f, sort_keys=False)
 
-    sharding_source = ["custom"] if from_config else ["heuristic"]
-
-    if sharding_source == ["custom"]:
-        # write predefined_config to tp_sharding.yaml file
-        with open("tp_sharding.yaml", "w") as f:
-            yaml.dump(predefined_config, f, sort_keys=False)
     # get detected transformations
     optimizer = InferenceOptimizer(
         None,
@@ -396,8 +378,6 @@ def _run_pattern_detection_job(
     _ = optimizer(None, gm)
     detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
 
-    print(f"detected_transformations: {detected_transformations}")
-    print(f"expected_transformations: {expected_transformations}")
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
 
