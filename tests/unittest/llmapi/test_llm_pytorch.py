@@ -17,10 +17,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
-    create_mock_nemo_lora_checkpoint,
-    compare_cuda_graph_lora_params_filler,
-    CUDAGraphLoRATestParams,
-    test_lora_with_and_without_cuda_graph)
+    create_mock_nemo_lora_checkpoint, compare_cuda_graph_lora_params_filler,
+    CUDAGraphLoRATestParams, test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
@@ -367,7 +365,9 @@ def test_llama_7b_lora_default_modules(cuda_graph_config) -> None:
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
-    llm = LLM(model=hf_model_dir, lora_config=lora_config, cuda_graph_config=cuda_graph_config)
+    llm = LLM(model=hf_model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     try:
@@ -393,7 +393,8 @@ def test_llama_7b_lora_default_modules(cuda_graph_config) -> None:
 
 def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int, **llm_kwargs):
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int,
+        **llm_kwargs):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
     # (2) provide a lora_dir to infer the lora_target_modules.
@@ -427,7 +428,8 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
 
 @skip_gpu_memory_less_than_40gb
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(cuda_graph_config):
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
+        cuda_graph_config):
     """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
     cache size < LoRA CPU cache size.
     """  # noqa: D205
@@ -455,8 +457,8 @@ def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
 
 @skip_gpu_memory_less_than_40gb
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(cuda_graph_config
-):
+def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
+        cuda_graph_config):
     """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
     cache over multiple llm.generate call repeated twice (two calls with the same requests):
     At the end of the 1st llm.generate call:
@@ -627,7 +629,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
                                         max_lora_rank=8,
                                         max_loras=2,
                                         max_cpu_loras=2)
-        llm = LLM(model_dir, lora_config=trtllm_lora_config, cuda_graph_config=cuda_graph_config)
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  cuda_graph_config=cuda_graph_config)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
