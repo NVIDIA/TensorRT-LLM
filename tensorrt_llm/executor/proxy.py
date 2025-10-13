@@ -202,7 +202,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             try:
                 _SyncQueue.notify_many(event_loop, async_queues)
             except AsyncQueue.EventLoopShutdownError:
-                logger.debug(
+                logger.warning(
                     "proxy.py: EventLoopShutdownError because event loop is not running"
                 )
 
