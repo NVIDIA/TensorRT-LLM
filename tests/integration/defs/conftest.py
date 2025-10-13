@@ -3464,6 +3464,77 @@ class LightweightPeriodicJUnitXML:
 
         return classname
 
+    @staticmethod
+    def _extract_error_message(report):
+        """
+        Extract a concise error message from a test report.
+
+        This extracts the most relevant error information for the 'message' attribute
+        of error/failure elements in JUnit XML.
+
+        Returns a string suitable for the message attribute.
+        """
+        # Try to get exception info first
+        if hasattr(report, 'longrepr') and report.longrepr:
+            try:
+                # For ExceptionInfo objects
+                if hasattr(report.longrepr, 'reprcrash'):
+                    crash = report.longrepr.reprcrash
+                    if crash:
+                        # Get the crash message (usually "file:line: ExceptionType: message")
+                        return str(crash.message) if hasattr(
+                            crash, 'message') else str(crash)
+
+                # For string representations
+                longrepr_str = str(report.longrepr)
+
+                # Try to extract the last line which usually contains the key error
+                lines = longrepr_str.strip().split('\n')
+
+                # Look for exception type and message (usually in the last few lines)
+                for line in reversed(lines[-10:]):  # Check last 10 lines
+                    line = line.strip()
+                    # Common patterns: "ExceptionType: message" or "E   AssertionError: ..."
+                    if line and (': ' in line or line.startswith('E ')):
+                        # Remove leading 'E ' from pytest output
+                        if line.startswith('E '):
+                            line = line[2:].strip()
+
+                        # Limit length to avoid too long messages
+                        if len(line) > 200:
+                            line = line[:197] + '...'
+
+                        return line
+
+                # Fallback: use first non-empty line
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('_'):
+                        if len(line) > 200:
+                            line = line[:197] + '...'
+                        return line
+
+            except Exception:
+                pass
+
+        # Fallback to longreprtext if available
+        if hasattr(report, 'longreprtext') and report.longreprtext:
+            lines = report.longreprtext.strip().split('\n')
+            for line in reversed(lines[-5:]):
+                line = line.strip()
+                if line:
+                    if len(line) > 200:
+                        line = line[:197] + '...'
+                    return line
+
+        # Last resort: generic message
+        if report.failed:
+            return f"{report.when} failed"
+        elif report.skipped:
+            return "skipped"
+        else:
+            return "test issue"
+
     def __init_stats(self):
         """Initialize test statistics tracking."""
         # Statistics tracking
@@ -3599,16 +3670,21 @@ class LightweightPeriodicJUnitXML:
             report = test_info.get(phase)
             if report and report.failed:
                 failed_report = report
+
+                # Extract meaningful error message
+                error_msg = self._extract_error_message(report)
+                error_msg = self._sanitize_xml_text(error_msg)
+
                 if phase == 'setup':
-                    failure = ET.SubElement(
-                        testcase,
-                        'error',
-                        message=self._sanitize_xml_text(f'{phase} failure'))
+                    failure = ET.SubElement(testcase,
+                                            'error',
+                                            message=error_msg)
                 else:
-                    failure = ET.SubElement(
-                        testcase,
-                        'failure',
-                        message=self._sanitize_xml_text(f'{phase} failure'))
+                    failure = ET.SubElement(testcase,
+                                            'failure',
+                                            message=error_msg)
+
+                # Add full traceback as element text
                 if hasattr(report, 'longreprtext'):
                     failure.text = self._sanitize_xml_text(report.longreprtext)
                 break
@@ -3618,7 +3694,12 @@ class LightweightPeriodicJUnitXML:
             for phase in ['setup', 'call', 'teardown']:
                 report = test_info.get(phase)
                 if report and report.skipped:
-                    skip = ET.SubElement(testcase, 'skipped', message='skipped')
+                    # Extract skip reason
+                    skip_msg = self._extract_error_message(report)
+                    skip_msg = self._sanitize_xml_text(
+                        skip_msg) if skip_msg else 'skipped'
+
+                    skip = ET.SubElement(testcase, 'skipped', message=skip_msg)
                     if hasattr(report, 'longreprtext'):
                         skip.text = self._sanitize_xml_text(report.longreprtext)
                     break
@@ -3703,18 +3784,25 @@ class LightweightPeriodicJUnitXML:
 
         # Add failure/error/skip information
         if report.failed:
+            # Extract meaningful error message
+            error_msg = self._extract_error_message(report)
+            error_msg = self._sanitize_xml_text(error_msg)
+
             if report.when == 'setup':
-                failure = ET.SubElement(testcase,
-                                        'error',
-                                        message='setup failure')
+                failure = ET.SubElement(testcase, 'error', message=error_msg)
             else:
-                failure = ET.SubElement(testcase,
-                                        'failure',
-                                        message='test failure')
+                failure = ET.SubElement(testcase, 'failure', message=error_msg)
+
+            # Add full traceback as element text
             if hasattr(report, 'longreprtext'):
                 failure.text = self._sanitize_xml_text(report.longreprtext)
         elif report.skipped:
-            skip = ET.SubElement(testcase, 'skipped', message='skipped')
+            # Extract skip reason
+            skip_msg = self._extract_error_message(report)
+            skip_msg = self._sanitize_xml_text(
+                skip_msg) if skip_msg else 'skipped'
+
+            skip = ET.SubElement(testcase, 'skipped', message=skip_msg)
             if hasattr(report, 'longreprtext'):
                 skip.text = self._sanitize_xml_text(report.longreprtext)
 
