@@ -21,7 +21,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## MoE Backend Support Matrix
 
-There are multiple MOE backends inside TRT-LLM. Here are the support matrix of the MOE backends.
+There are multiple MOE backends inside TensorRT LLM. Here are the support matrix of the MOE backends.
 
 | Device     | Activation Type | MoE Weights Type | MoE Backend | Use Case       |
 |------------|------------------|------------------|-------------|----------------|
@@ -56,7 +56,7 @@ Note:
 
 If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
 
-### Creating the TRT-LLM Server config
+### Creating the TensorRT LLM Server config
 
 We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings.
 
@@ -98,15 +98,14 @@ attention_dp_config:
 EOF
 ```
 
-### Launch the TRT-LLM Server
+### Launch the TensorRT LLM Server
 
-Below is an example command to launch the TRT-LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
+Below is an example command to launch the TensorRT LLM server with the GPT-OSS model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
 
 ```shell
 trtllm-serve openai/gpt-oss-120b \
     --host 0.0.0.0 \
     --port 8000 \
-    --backend pytorch \
     --max_batch_size 720 \
     --max_num_tokens 16384 \
     --kv_cache_free_gpu_memory_fraction 0.9 \
@@ -134,10 +133,6 @@ These options are used directly on the command line when you start the `trtllm-s
 
 * **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 * **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
-
-#### `--backend pytorch`
-
-* **Description:** Tells TensorRT-LLM to use the **pytorch** backend.
 
 #### `--max_batch_size`
 
@@ -201,7 +196,7 @@ curl -s -o /dev/null -w "Status: %{http_code}\n" "http://localhost:8000/health"
 
 When the `Status: 200` code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.
 
-After the TRT-LLM server is set up and shows Application startup complete, you can send requests to the server.
+After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.
 
 ```shell
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json"  -d '{
@@ -217,7 +212,7 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 }' -w "\n"
 ```
 
-Here is an example response, showing that the TRT-LLM server reasons and answers the questions.
+Here is an example response, showing that the TensorRT LLM server reasons and answers the questions.
 
 TODO: Use Chat Compeletions API / Responses API as the example after the PR is merged.
 
@@ -305,7 +300,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt\_llm/serve/scripts/benchmark\_serving.py>.
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
 
 Run `bench.sh` to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above `bench.sh` script.
 

@@ -310,10 +310,15 @@ def greedy_search_sampling_batch(
     softmax_indices: Optional[torch.IntTensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     next_tokens = torch.argmax(logits, dim=-1)
+    index_to_scatter = next_tokens
     if softmax_indices is not None:
-        logits = logits[softmax_indices.to(logits.device, non_blocking=True)]
-    softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+        logits = logits[softmax_indices]
+        index_to_scatter = next_tokens[softmax_indices]
+    probs = torch.zeros_like(logits)
+    probs.scatter_(dim=-1,
+                   index=index_to_scatter.unsqueeze(-1),
+                   src=torch.ones_like(logits))
+    return next_tokens, probs
 
 
 def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
@@ -1127,6 +1132,7 @@ class TorchSampler(Sampler):
 
         return new_draft_tokens_host
 
+    @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
             self, request: LlmRequest, new_tokens: list[list[list[int]]],
             new_tokens_tensor: torch.Tensor) -> int:
@@ -1134,13 +1140,30 @@ class TorchSampler(Sampler):
         #        filtering of vocab_size logits, out of vocab_size in
         #        total. The 'sample' below should generally be avoided
         #        by retaining the draft_probs during drafting (TRTLLM-7772).
-        sampling_strategy = _request_strategy(request, vocab_size=2**31)
+        draft_sampling_strategy = (
+            "greedy", None
+        ) if request.py_draft_use_greedy_sampling else _request_strategy(
+            request, vocab_size=2**31)
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(sampling_strategy,
+        _, draft_probs = sample(draft_sampling_strategy,
                                 request.py_draft_logits,
                                 generator=generator)
-        draft_probs = draft_probs.squeeze(0)
         target_probs = request.py_target_probs
+        d2t = getattr(request, "d2t", None)
+        if d2t is not None:
+            vocab_d = draft_probs.shape[-1]
+            vocab_t = target_probs.shape[-1]
+            assert d2t.numel(
+            ) == vocab_d, f"d2t size mismatch: {d2t.numel()} != {vocab_d}"
+            assert d2t.device == draft_probs.device, f"d2t device mismatch: {d2t.device} != {draft_probs.device}"
+            aligned_draft_probs = torch.zeros(
+                (*draft_probs.shape[:-1], vocab_t),
+                device=draft_probs.device,
+                dtype=draft_probs.dtype)
+            source_indices = torch.arange(vocab_d, device=draft_probs.device)
+            target_indices = (source_indices + d2t) % vocab_t
+            aligned_draft_probs[..., target_indices] = draft_probs
+            draft_probs = aligned_draft_probs
         rejected_indices = get_rejected_indices(draft_probs, target_probs,
                                                 generator,
                                                 request.py_draft_tokens)
@@ -1181,7 +1204,8 @@ class TorchSampler(Sampler):
             new_tokens: list[list[list[int]]],
             new_tokens_tensor: torch.Tensor,
             resource_manager: Optional[ResourceManager] = None) -> int:
-        if request.py_draft_logits is None:
+        if _request_strategy(request, vocab_size=2**
+                             31) == GREEDY or request.py_draft_logits is None:
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:
                 num_accepted = self._process_draft_tokens_tree(
@@ -1247,6 +1271,12 @@ class TorchSampler(Sampler):
             model_outputs: dict[str, torch.Tensor],
             num_context_logits_prefix_sum: list[int],
             resource_manager: Optional[ResourceManager] = None) -> SampleState:
+        # NB: The sampler is either called directly by PyExecutor, for the target model,
+        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
+        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
+        #     latter case, there is always only 1 token per request because draft
+        #     tokens are sampled one-by-one.
+
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
         log_probs_host = self.log_probs_host(scheduled_requests)
@@ -1396,8 +1426,6 @@ class TorchSampler(Sampler):
             requests, pin_memory=True, vocab_size=logits_cuda.size(1))
         generator_cuda = self.get_generator(cuda_device)
 
-        # FIXME: This check should/could be performed in ModelDrafter.prepare_draft_tokens
-        #
         # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
         #     breaking _process_draft_tokens_rejection_sampling.
         needs_d2t = "d2t" in model_outputs
@@ -1523,15 +1551,12 @@ class TorchSampler(Sampler):
             (batch_req_indices, batch_next_tokens_cuda_int,
              batch_softmax_cuda), = batched_results
 
-        # FIXME: This should be done in ModelDrafter.prepare_draft_tokens, but for performance
-        #        parity py_draft_tokens might need to be replaced / backed by a torch.Tensor, so
-        #        that d2t can be applied in a batched manner similar to the code below.
+        # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
+        #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
+        #     is the target vocab, whereas the output logits correspond to the draft
+        #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
+        #     they currently need to be handled within TorchSampler.
         if needs_d2t:
-            # NB: The sampler is either called directly by PyExecutor, for the target model,
-            #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
-            #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-            #     latter case, only there is always only 1 token per request because draft
-            #     tokens are sampled one-by-one.
             self._apply_d2t(batch_next_tokens_cuda_int, model_outputs)
 
         return _BatchedSamplingResult(
@@ -1982,7 +2007,6 @@ class TRTLLMSampler(Sampler):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None
     ) -> SampleStateTRTLLM:
-
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1

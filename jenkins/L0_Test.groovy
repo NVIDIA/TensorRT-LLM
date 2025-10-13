@@ -97,7 +97,7 @@ def BUILD_CONFIGS = [
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
+BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
 
 SLURM_CORES_REQUEST = "1"
@@ -967,16 +967,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
-    // TODO: remove this after GH200 driver upgrade
-    def hostnameMatch = ""
-    if (type == "gh200") {
-        hostnameMatch = """
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "lego-cg1-qct-070.ipp3a2.colossus"
-                                - "lego-cg1-qct-079.ipp3a2.colossus\""""
-    }
 
     def podConfig = [
         cloud: targetCould,
@@ -997,7 +987,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
-                                - "core"${hostnameMatch}
+                                - "core"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
