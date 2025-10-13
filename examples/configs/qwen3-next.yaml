@@ -1,7 +1,7 @@
 max_batch_size: 16
 max_num_tokens: 4096
 tensor_parallel_size: 4
-expert_parallel_size: 4
+moe_expert_parallel_size: 4
 trust_remote_code: true
 enable_attention_dp: false
 cuda_graph_config:
