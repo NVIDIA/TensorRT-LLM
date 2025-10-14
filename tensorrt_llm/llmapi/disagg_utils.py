@@ -71,8 +71,8 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
-    max_retries: int = 1
     otlp_config: Optional[OtlpConfig] = None
+    max_retries: int = 1
     perf_metrics_max_requests: int = 0
 
 
