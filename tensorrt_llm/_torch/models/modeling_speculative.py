@@ -65,6 +65,7 @@ class Eagle3Attention(Attention):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
         )
+        self.is_eagle3 = True
 
 
 class Eagle3DecoderLayer(DecoderLayer):

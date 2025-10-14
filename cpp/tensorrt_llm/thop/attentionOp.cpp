@@ -387,6 +387,7 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+            enqueue_params.output_tensor_numel = output.numel();
 
             if (op.isMLAEnabled())
             {
@@ -621,17 +622,20 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
-    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha);
+    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
+        || op->mFP8FmhaForEagle3;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
 
     op->mAttentionChunkSize = attention_chunk_size;
 
-    TORCH_CHECK(spec_decoding_bool_params.size() == 3,
-        "Expecting 3 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, and is_spec_dec_tree.");
+    TORCH_CHECK(spec_decoding_bool_params.size() == 4,
+        "Expecting 4 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, is_spec_dec_tree, and "
+        "fp8_fmha_for_eagle3.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
+    op->mFP8FmhaForEagle3 = spec_decoding_bool_params[3];      // fp8_fmha_for_eagle3
 
     if (is_mla_enable)
     {

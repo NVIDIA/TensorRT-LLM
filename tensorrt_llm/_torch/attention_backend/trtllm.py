@@ -190,6 +190,7 @@ class TrtllmAttentionWrapper:
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
+        fp8_fmha_for_eagle3: bool = False,
         **kwargs,
     ):
         """
@@ -229,6 +230,7 @@ class TrtllmAttentionWrapper:
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
+            fp8_fmha_for_eagle3 (bool): Whether to use FP8 FMHA for Eagle3 + FP8 target model + BF16/FP16 draft model.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -278,6 +280,7 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
         self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
+        self.fp8_fmha_for_eagle3 = fp8_fmha_for_eagle3
         self.kwargs.update(kwargs)
 
     def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
@@ -417,7 +420,7 @@ class TrtllmAttentionWrapper:
         ]
         spec_decoding_bool_params = [
             self.is_spec_decoding_enabled, self.use_spec_decoding,
-            self.is_spec_dec_tree
+            self.is_spec_dec_tree, self.fp8_fmha_for_eagle3
         ]
         spec_decoding_tensor_params = [
             self.spec_decoding_generation_lengths,
@@ -1288,16 +1291,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
+            fp8_fmha_for_eagle3=fp8_fmha_for_eagle3,
         )
         out_dtype = None
         if out_scale is not None:
             if use_nvfp4_output:
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
-            # elif fp8_fmha_for_eagle3:
-            elif self.has_fp8_kv_cache and not self.has_fp8_qdq and out_scale is not None:
-                # Force to use FP8 FMHA for (eagle3 + FP8 target model + BF16/FP16 draft model) in draft layers
-                out_dtype = torch.float8_e4m3fn
             elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
                   or self.has_fp8_rowwise
                   or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache

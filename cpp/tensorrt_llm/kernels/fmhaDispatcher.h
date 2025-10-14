@@ -40,6 +40,12 @@ public:
     // Check if any fmha kernel meets the requirements.
     bool isSupported();
 
+    // Whether to use trtllm-gen kernels.
+    bool useTllmGen() const
+    {
+        return mUseTllmGen;
+    }
+
     // Does FMHA need a separate Q and Kv input ?
     bool isSeparateQAndKvInput() const
     {

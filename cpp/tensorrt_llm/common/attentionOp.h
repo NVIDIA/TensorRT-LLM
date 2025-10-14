@@ -137,6 +137,9 @@ public:
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
 
+        // optional for mFP8FmhaForEagle3
+        int64_t output_tensor_numel = 0;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -190,6 +193,7 @@ public:
             ss << "softmaxStatsPtr: " << this->softmax_stats << std::endl;
             ss << "k_ptr: " << this->k_ptr << std::endl;
             ss << "v_ptr: " << this->v_ptr << std::endl;
+            ss << "output_tensor_numel: " << this->output_tensor_numel << std::endl;
             return ss.str();
         }
     };
@@ -422,6 +426,7 @@ public:
     bool mIsSpecDecodingEnabled = false;
     bool mUseSpecDecoding = false;
     bool mIsSpecDecTree = true;
+    bool mFP8FmhaForEagle3 = false;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;

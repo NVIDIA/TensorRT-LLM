@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <cstdint>
+#include <torch/extension.h>
 #include <type_traits>
 
 using namespace tensorrt_llm::kernels;
@@ -1831,8 +1832,28 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
         }
 
-        // Run the fmha kernel.
-        mFmhaDispatcher->run(fmhaParams);
+        if (mFP8FmhaForEagle3 && !mFmhaDispatcher->useTllmGen() && !mFP8AttenOutput)
+        {
+            auto origin_attn_output_dtype = std::is_same_v<T, half> ? torch::kFloat16
+                : std::is_same_v<T, __nv_bfloat16>                  ? torch::kBFloat16
+                                                                    : torch::kFloat32;
+            torch::Tensor fp8_attn_output = torch::empty(
+                {params.output_tensor_numel}, torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+            auto* origin_attn_output_ptr = fmhaParams.outputPtr;
+            torch::Tensor origin_attn_tensor
+                = torch::from_blob(origin_attn_output_ptr, {params.output_tensor_numel}, origin_attn_output_dtype);
+            fmhaParams.outputPtr = fp8_attn_output.data_ptr();
+            // Run the fmha kernel.
+            mFmhaDispatcher->run(fmhaParams);
+            // Convert the fp8 output to the original dtype.
+            auto temp_tensor = fp8_attn_output.to(origin_attn_output_dtype);
+            origin_attn_tensor.copy_(temp_tensor);
+        }
+        else
+        {
+            // Run the fmha kernel.
+            mFmhaDispatcher->run(fmhaParams);
+        }
         sync_check_cuda_error(stream);
 
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
@@ -2652,6 +2673,16 @@ int AttentionOp::initialize() noexcept
         {
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
+        }
+        if (mFP8FmhaForEagle3)
+        {
+            // use FP8 FMHA for Eagle3 with FP8 target model and BF16/FP16 draft model
+            FmhaDispatcher tempFmhaDispatcher(fmhaParams);
+            // use FP8 output for non-TllmGen, because FP8 TllmGen supports BF16/FP16 output
+            if (!tempFmhaDispatcher.useTllmGen())
+            {
+                fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
+            }
         }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
