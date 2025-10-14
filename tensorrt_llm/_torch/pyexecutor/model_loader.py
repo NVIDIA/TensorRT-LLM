@@ -269,7 +269,8 @@ class ModelLoader:
                     f"No load support for load format: {load_format}")
 
             for module in model.modules():
-                if hasattr(module, 'post_load_weights'):
+                if hasattr(module, 'post_load_weights') and not getattr(
+                        module, '_weights_removed', False):
                     module.post_load_weights()
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):

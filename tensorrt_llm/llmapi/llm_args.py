@@ -422,6 +422,36 @@ class DecodingBaseConfig(StrictBaseModel):
     max_concurrency: Optional[int] = None
 
     load_format: Optional[str] = None
+    # PyTorch only.
+    # Rolling average window size (N) for acceptance length across completed requests.
+    # If not set or set to 0, the feature is disabled.
+    acceptance_window: Optional[int] = None
+    # PyTorch only.
+    # Threshold for average acceptance length; speculation will be disabled
+    # permanently once the rolling average over the last N completed requests
+    # (N = acceptance_window) drops below this value.
+    acceptance_length_threshold: Optional[float] = None
+
+    # Validate acceptance controls at field level so they run on model creation
+    @field_validator('acceptance_window')
+    @classmethod
+    def _validate_acceptance_window(cls, v: Optional[int]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_window must be >= 0 (0 disables), got {v}")
+        return v
+
+    @field_validator('acceptance_length_threshold')
+    @classmethod
+    def _validate_acceptance_length_threshold(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_length_threshold must be >= 0, got {v}")
+        return v
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)

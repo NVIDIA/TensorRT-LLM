@@ -544,10 +544,9 @@ class Attention(nn.Module):
                 t.reshape(*orig_shape, -1) for t in torch.chunk(
                     q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
             ]
-            ### TODO: avoid the redundant split and concat
-            qkv = torch.concat([q, k, v], dim=-1)
+        else:
+            q, k, v = qkv, None, None
 
-        q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
