@@ -102,6 +102,8 @@ class CompletionOutput:
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
+        additional_context_outputs (Dict[str, torch.Tensor], optional): The additional context outputs. Defaults to None.
+        additional_generation_outputs (Dict[str, torch.Tensor], optional): The additional generation outputs. Defaults to None.
         disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
         request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
@@ -122,6 +124,8 @@ class CompletionOutput:
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
+    additional_context_outputs: Optional[Dict[str, torch.Tensor]] = None
+    additional_generation_outputs: Optional[Dict[str, torch.Tensor]] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
     request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
 
@@ -386,6 +390,14 @@ class GenerationResultBase:
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
+
+        if getattr(response_tensors, 'additional_context_outputs',
+                   None) is not None:
+            output.additional_context_outputs = response_tensors.additional_context_outputs
+
+        if getattr(response_tensors, 'additional_generation_outputs',
+                   None) is not None:
+            output.additional_generation_outputs = response_tensors.additional_generation_outputs
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
         # be marked as cancelled.

@@ -32,8 +32,9 @@ from ..builder import EngineConfig
 from ..layers import MropeParams
 from ..logger import logger
 from ..mapping import Mapping
-from .generation import (LogitsProcessor, LoraManager, SamplingConfig,
-                         StoppingCriteria)
+from .generation import LogitsProcessor, LoraManager
+from .generation import ModelConfig as ModelConfigPython
+from .generation import SamplingConfig, StoppingCriteria
 from .model_runner import ModelRunnerMixin, _engine_config_to_model_config
 
 _bindings_dtype_to_torch_dtype_dict = {
@@ -277,7 +278,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         engine_config = EngineConfig.from_json_file(f"{engine_dir}/config.json")
         if model_config.use_lora_plugin and rank == 0:
-            lora_manager = LoraManager()
+            mapping = _world_config_to_mapping(world_config)
+            lora_manager = LoraManager(
+                mapping=mapping,
+                model_config=ModelConfigPython.from_model_config_cpp(
+                    model_config))
             if lora_dir is None:
                 config_lora_dir = engine_config.build_config.lora_config.lora_dir
                 if len(config_lora_dir) > 0:
@@ -292,7 +297,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 # For Executor, only rank 0 can enqueue requests, and should hold all lora weights
                 lora_manager.load_from_ckpt(lora_dir,
                                             model_config=runtime_model_config,
-                                            runtime_mapping=None,
                                             ckpt_source=lora_ckpt_source)
             else:
                 raise RuntimeError(

@@ -266,7 +266,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in “benchmark\_serving.py” script. To do this first creating a wrapper [bench.sh](http://bench.sh) script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh
@@ -306,7 +306,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see. [https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt\_llm/serve/scripts/benchmark\_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
 
 Run bench.sh to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above bench.sh script.
 
