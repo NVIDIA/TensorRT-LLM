@@ -286,42 +286,13 @@ def serve(model: str, host: str, port: int, log_level: str,
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.max_batch_size,
-              help="Maximum number of requests that the engine can schedule.")
-@click.option(
-    "--max_num_tokens",
-    type=int,
-    default=16384,  # set higher default max_num_tokens for multimodal encoder
-    help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help="Flag for HF transformers.")
-@click.option(
-    "--extra_encoder_options",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
-)
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
               help="Path to metadata server config file")
+@common_llm_options
 def serve_encoder(model: str, host: str, port: int, log_level: str,
-                  max_batch_size: int, max_num_tokens: int,
-                  gpus_per_node: Optional[int], trust_remote_code: bool,
-                  extra_encoder_options: Optional[str],
-                  metadata_server_config_file: Optional[str]):
+                  metadata_server_config_file: Optional[str], **params):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -329,18 +300,20 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     logger.set_level(log_level)
 
     # TODO: expose more argument progressivly
-    llm_args, _ = get_llm_args(model=model,
-                               max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               gpus_per_node=gpus_per_node,
-                               trust_remote_code=trust_remote_code)
+    llm_args, _ = get_llm_args(
+        model=model,
+        max_batch_size=params.get("max_batch_size"),
+        max_num_tokens=params.get("max_num_tokens"),
+        gpus_per_node=params.get("gpus_per_node"),
+        trust_remote_code=params.get("trust_remote_code"))
 
-    encoder_args_extra_dict = {}
-    if extra_encoder_options is not None:
-        with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f)
+    extra_llm_api_options_dict = {}
+    extra_llm_api_options = params.get("extra_llm_api_options")
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            extra_llm_api_options_dict = yaml.safe_load(f)
     encoder_args = update_llm_args_with_extra_dict(llm_args,
-                                                   encoder_args_extra_dict)
+                                                   extra_llm_api_options_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
