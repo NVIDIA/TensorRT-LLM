@@ -2341,10 +2341,9 @@ class PyTorchModelEngine(ModelEngine):
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
         return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                       peft_cache_manager, attn_metadata, 
+                                       peft_cache_manager, attn_metadata,
                                        spec_metadata, new_tensors_device,
-                                       cache_indirection_buffer,
-                                       maybe_graph)
+                                       cache_indirection_buffer, maybe_graph)
 
     @nvtx_range("PyTorchModelEngine.forward")
     @torch.inference_mode()
