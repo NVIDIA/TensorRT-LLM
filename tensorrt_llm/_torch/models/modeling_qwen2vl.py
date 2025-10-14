@@ -322,9 +322,8 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
             # reduce img resolution
             img_max_dim = img_max_dim >> 1
 
-            image = self.get_dummy_image(
-                max_width=img_max_dim, max_height=img_max_dim
-            )  #w, h is sqrt of min_pixels value (3136)
+            image = self.get_dummy_image(max_width=img_max_dim,
+                                         max_height=img_max_dim)
 
             test_mm_prompt = default_multimodal_input_loader(
                 tokenizer=self.tokenizer,
@@ -342,7 +341,7 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
         # on how many tokens we need to complete the input_seq_len, the output of
         # default_multimodal_input_loader may give more tokens then the input_seq_len and this
         # can lead to errors.
-        # That is why we try to clipped the variable text_token_left to a lower threshold
+        # That is why we try to clip the variable text_token_left to a lower threshold
         # but close enough to the actual input_seq_len
         text_generation_perc_threshold = 0.95
         text_token_left = int((input_seq_len - len_prompt_tokens_ids) *

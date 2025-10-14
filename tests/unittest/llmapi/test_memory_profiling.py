@@ -52,7 +52,6 @@ def test_profile_kvcache():
         "postprocess_tokenizer_dir": VLM_MODEL,
         "reasoning_parser": None,
         "fail_fast_on_attention_window_too_large": False,
-        "enable_chunked_prefill": True,
         "cuda_graph_config": cuda_graph_config,
     }
 
