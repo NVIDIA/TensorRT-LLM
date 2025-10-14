@@ -328,10 +328,9 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         max_lora_rank=8,
         max_loras=2,
         max_cpu_loras=2)
-    llm = LLM(
-        model=f"{llm_models_root()}/llama-models/llama-7b-hf",
-        lora_config=lora_config,
-        **llm_kwargs)
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              **llm_kwargs)
     try:
         prompts = [
             "美国的首都在哪里? \n答案:",
@@ -568,7 +567,8 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
 
 
 @skip_gpu_memory_less_than_80gb
-def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
+@test_lora_with_and_without_cuda_graph
+def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
     skip_fp8_pre_ada(use_fp8=True)
     model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
     lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
@@ -581,12 +581,9 @@ def test_llama_3_1_8b_fp8_with_bf16_lora() -> None:
                              max_cpu_loras=2)
     lora_req = LoRARequest("lora-chinese", 0, lora_dir)
 
-    llm = LLM(
-        model_dir,
-        lora_config=lora_config,
-        # Disable CUDA graph
-        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-        cuda_graph_config=None)
+    llm = LLM(model_dir,
+              lora_config=lora_config,
+              cuda_graph_config=cuda_graph_config)
 
     try:
         output = llm.generate(prompt,

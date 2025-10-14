@@ -18,8 +18,8 @@ from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
                                                  compare_grouped_gemm_params)
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.lora_helper import LoraConfig
 
 _RU_LORA_ADAPTER_PROMPTS = [
     "Назови главную площадь в центре Москвы.",

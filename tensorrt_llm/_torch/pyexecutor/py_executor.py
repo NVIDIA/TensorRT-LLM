@@ -23,8 +23,8 @@ except ImportError:
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_disabled, nvtx_range, trace_func, nvtx_pytorch_emit)
-from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+                                 mpi_disabled, nvtx_pytorch_emit, nvtx_range,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
