@@ -1,10 +1,50 @@
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+import typing
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Type
 
 import click
 from click_option_group import OptionGroup, optgroup
+from pydantic import BaseModel
 
-from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+from tensorrt_llm.llmapi.llm_args import BaseLlmArgs, KvCacheConfig
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+
+def option_from_field(
+    field_name: str,
+    option_names: Optional[List[str]] = None,
+    model_class: Type[BaseModel] = BaseLlmArgs,
+) -> Callable:
+    """Create a CLI option decorator from a field in a Pydantic model.
+
+    Args:
+        field_name: Name of the field in the pydantic model
+        option_name: CLI option name (default: --{field_name})
+        model_class: Pydantic model class containing the field
+
+    Returns:
+        A decorator function that adds the option
+    """
+    if option_names is None:
+        option_names = [f"--{field_name}"]
+
+    field_info = model_class.model_fields[field_name]
+
+    field_type = field_info.annotation
+    # Handle Optional types
+    if typing.get_origin(field_type) is typing.Union:
+        args = typing.get_args(field_type)
+        # Get the non-None type
+        field_type = next((arg for arg in args if arg is not type(None)),
+                          args[0])
+
+    elif field_type not in (int, float, str, bool):
+        raise ValueError(f"Unsupported field type: {field_type}")
+
+    return optgroup.option(*option_names,
+                           type=field_type,
+                           is_flag=field_type is bool,
+                           default=field_info.default,
+                           help=field_info.description)
 
 
 class ChoiceWithAlias(click.Choice):
@@ -37,114 +77,56 @@ def common_llm_options(f: Callable) -> Callable:
     # Model and backend configuration
     f = optgroup.group("Model Configuration",
                        help="Model, tokenizer, and backend settings.")(f)
-    f = optgroup.option(
-        "--tokenizer",
-        type=str,
-        default=None,
-        help="Path | Name of the tokenizer. "
-        "Specify this value only if using TensorRT engine as model.")(f)
+    f = option_from_field("tokenizer")(f)
     f = optgroup.option(
         "--backend",
         type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
                              {"trt": "tensorrt"}),
         default="pytorch",
-        help="The backend to use. Default is pytorch backend.")(f)
-    f = optgroup.option(
-        "--trust_remote_code",
-        is_flag=True,
-        default=False,
-        help="Flag for HF transformers to trust remote code.")(f)
+        help=BaseLlmArgs.model_fields["backend"].description)(f)
+    f = option_from_field("trust_remote_code")(f)
     f = optgroup.option(
         "--extra_llm_api_options",
         type=str,
         default=None,
         help=
-        "Path to a YAML file that overwrites the LLM API configuration for serving the model."
+        "Path to a YAML file with LLM API configuration options for serving the model."
     )(f)
 
     # Parallelism configuration
     f = optgroup.group("Parallelism Configuration",
                        help="Multi-GPU and distributed execution settings.",
                        cls=OptionGroup)(f)
-    f = optgroup.option("--tp_size",
-                        "--tp",
-                        "tensor_parallel_size",
-                        type=int,
-                        default=1,
-                        help="Tensor parallelism size.")(f)
-    f = optgroup.option("--pp_size",
-                        "--pp",
-                        "pipeline_parallel_size",
-                        type=int,
-                        default=1,
-                        help="Pipeline parallelism size.")(f)
-    f = optgroup.option("--ep_size",
-                        "--ep",
-                        "moe_expert_parallel_size",
-                        type=int,
-                        default=None,
-                        help="Expert parallelism size for MoE models.")(f)
-    f = optgroup.option(
-        "--cluster_size",
-        "moe_cluster_parallel_size",
-        type=int,
-        default=None,
-        help="Expert cluster parallelism size for MoE models.")(f)
-    f = optgroup.option(
-        "--gpus_per_node",
-        type=int,
-        default=None,
-        help=
-        "Number of GPUs per node. Default to None, and it will be detected automatically."
-    )(f)
+    f = option_from_field("tensor_parallel_size",
+                          option_names=["--tp_size", "--tp"])(f)
+    f = option_from_field("pipeline_parallel_size",
+                          option_names=["--pp_size", "--pp"])(f)
+    f = option_from_field("moe_expert_parallel_size",
+                          option_names=["--ep_size", "--ep"])(f)
+    f = option_from_field("moe_cluster_parallel_size",
+                          option_names=["--cluster_size"])(f)
 
     # Build and runtime limits
     f = optgroup.group(
         "Build and Runtime Limits",
         help="Maximum batch size, sequence length, and token limits.",
         cls=OptionGroup)(f)
-    f = optgroup.option(
-        "--max_batch_size",
-        type=int,
-        default=BaseLlmArgs.model_fields["max_batch_size"].default,
-        help="Maximum number of requests that the engine can schedule.")(f)
-    f = optgroup.option(
-        "--max_num_tokens",
-        type=int,
-        default=BaseLlmArgs.model_fields["max_num_tokens"].default,
-        help=
-        "Maximum number of batched input tokens after padding is removed in each batch."
-    )(f)
-    f = optgroup.option(
-        "--max_seq_len",
-        type=int,
-        default=BaseLlmArgs.model_fields["max_seq_len"].default,
-        help="Maximum total length of one request, including prompt and outputs. "
-        "If unspecified, the value is deduced from the model config.")(f)
-    f = optgroup.option(
-        "--max_beam_width",
-        type=int,
-        default=BaseLlmArgs.model_fields["max_beam_width"].default,
-        help="Maximum number of beams for beam search decoding.")(f)
-    f = optgroup.option(
-        "--max_input_len",
-        type=int,
-        default=BaseLlmArgs.model_fields["max_input_len"].default,
-        help="Maximum input sequence length.")(f)
+    f = option_from_field("max_batch_size")(f)
+    f = option_from_field("max_num_tokens")(f)
+    f = option_from_field("max_seq_len")(f)
+    f = option_from_field("max_beam_width")(f)
+    f = option_from_field("max_input_len")(f)
 
     # KV cache configuration
     f = optgroup.group("KV Cache Configuration",
                        help="KV cache memory and reuse settings.",
                        cls=OptionGroup)(f)
-    f = optgroup.option(
-        "--kv_cache_free_gpu_memory_fraction",
-        "--kv_cache_free_gpu_mem_fraction",
-        "kv_cache_free_gpu_memory_fraction",
-        type=float,
-        default=0.9,
-        help=
-        "Free GPU memory fraction reserved for KV Cache, after allocating model weights and buffers."
-    )(f)
+    f = option_from_field("free_gpu_memory_fraction",
+                          option_names=[
+                              "--kv_cache_free_gpu_memory_fraction",
+                              "--kv_cache_free_gpu_mem_fraction"
+                          ],
+                          model_class=KvCacheConfig)(f)
     f = optgroup.option("--disable_kv_cache_reuse",
                         is_flag=True,
                         default=False,
@@ -154,33 +136,18 @@ def common_llm_options(f: Callable) -> Callable:
     f = optgroup.group("Postprocessing Options",
                        help="Output processing and formatting settings.",
                        cls=OptionGroup)(f)
-    f = optgroup.option(
-        "--num_postprocess_workers",
-        type=int,
-        default=0,
-        help="[Experimental] Number of workers to postprocess raw responses.")(
-            f)
+    f = option_from_field("num_postprocess_workers")(f)
     f = optgroup.option(
         "--reasoning_parser",
         type=click.Choice(ReasoningParserFactory.parsers.keys()),
         default=None,
-        help="[Experimental] Specify the parser for reasoning models.")(f)
+        help=BaseLlmArgs.model_fields["reasoning_parser"].description)(f)
 
     # Advanced options
     f = optgroup.group("Advanced Options",
                        help="Advanced configuration and debugging settings.",
                        cls=OptionGroup)(f)
-    f = optgroup.option(
-        "--fail_fast_on_attention_window_too_large",
-        is_flag=True,
-        default=False,
-        help=
-        "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
-    )(f)
-    f = optgroup.option(
-        "--skip_tokenizer_init",
-        is_flag=True,
-        default=False,
-        help="Skip tokenizer initialization when loading the model.")(f)
+    f = option_from_field("fail_fast_on_attention_window_too_large")(f)
+    f = option_from_field("skip_tokenizer_init")(f)
 
     return f
