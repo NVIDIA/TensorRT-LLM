@@ -297,7 +297,7 @@ def setup_llm(args, **kwargs):
             args.n = args.max_beam_width
         assert best_of <= args.max_beam_width, f"beam width: {best_of}, should be less or equal to max_beam_width: {args.max_beam_width}"
 
-    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
+    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be greater than or equal to n: {args.n}"
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
