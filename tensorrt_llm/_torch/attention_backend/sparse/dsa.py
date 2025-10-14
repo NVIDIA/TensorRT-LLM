@@ -575,6 +575,9 @@ class Indexer(nn.Module):
                     )
                     for chunk_specs in chunk_groups
                 ]
+            else:
+                # Single chunk - use non-chunked fallback path
+                metadata.indexer_prefill_chunks = None
 
             # TODO: Still compute global cu_seqlen bounds for fallback/debugging.
             # Remove this when indexer chunked prefill is fully tested.
@@ -782,10 +785,8 @@ class Indexer(nn.Module):
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
                 for chunk in metadata.indexer_prefill_chunks:
-                    # Gather K from cache for this chunk
+                    # Gather K from cache for this chunk (dual to _update_k_cache)
                     chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(metadata, chunk)
-
-                    # Compute logits for this chunk
                     logits = fp8_mqa_logits(
                         q_fp8[chunk.token_start:chunk.token_end, ...],
                         (chunk_k_fp8, chunk_k_scale),
@@ -793,13 +794,10 @@ class Indexer(nn.Module):
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                     )
-
-                    # Select top-k indices
                     topk_indices = logits.topk(min(self.index_topk, logits.shape[-1]),
                                                dim=-1)[1]
                     topk_indices -= chunk.cu_seqlen_ks[:, None]
 
-                    # Apply masks
                     mask_lo = topk_indices >= 0
                     mask_hi = topk_indices - (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks)[:, None] < 0
                     mask = mask_lo & mask_hi
@@ -808,12 +806,11 @@ class Indexer(nn.Module):
                     topk_indices = topk_indices + chunk.ctx_kv_offsets
                     topk_indices = topk_indices.masked_fill(~mask, -1)
 
-                    # Store in buffer
                     topk_indices_buffer[
                         chunk.token_start:chunk.token_end, :topk_indices.shape[-1]
                     ] = topk_indices.to(dtype=torch.int32)
             else:
-                # Fallback: non-chunked prefill (TODO: remove this once chunked prefill is fully tested)
+                # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
                 cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
