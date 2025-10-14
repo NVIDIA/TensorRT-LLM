@@ -60,6 +60,8 @@ public:
     // Returns -1 if it doesn't have NUMA ID.
     int getCurrentGpuMemoryNumaId();
 
+    std::string getNoCurrentGpuMemoryNumaIdReason();
+
     // Returns the number of GPUs associated with the given NUMA node ID.
     int getGpuCountUnderNuma(int numaId);
 
