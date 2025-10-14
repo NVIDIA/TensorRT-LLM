@@ -23,7 +23,7 @@ def test_custom_values():
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "attn_backend": "flashinfer",
+                "backend": "flashinfer",
             },
             "resize_kv_cache": {
                 "stage": "cache_init",
@@ -43,8 +43,8 @@ def test_custom_values():
     assert args.transforms["detect_sharding"]["simple_shard_only"]
     assert args.attn_page_size == 128
     assert args.max_seq_len == 2048
-    # attn_backend should be overridden if it was 'TRTLLM'
-    assert args.transforms["insert_cached_attention"]["attn_backend"] == "flashinfer"
+    # backend should be overridden if it was 'TRTLLM'
+    assert args.transforms["insert_cached_attention"]["backend"] == "flashinfer"
 
 
 def test_free_mem_ratio_validation():
@@ -94,7 +94,7 @@ def test_config_params():
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "attn_backend": "flashinfer",
+                "backend": "flashinfer",
             },
             "resize_kv_cache": {
                 "stage": "cache_init",
@@ -222,19 +222,17 @@ def test_parallel_config_validation(parallel_field, invalid_value):
 
 
 @pytest.mark.parametrize(
-    "attn_backend,expected_attn_page_size",
+    "backend,expected_attn_page_size",
     [
         ("flashinfer", 64),  # Default attn_page_size
         ("triton", 1024),  # Should equal max_seq_len
     ],
 )
-def test_attention_backend_page_size_logic(attn_backend, expected_attn_page_size):
+def test_attention_backend_page_size_logic(backend, expected_attn_page_size):
     """Test attn_page_size logic for different attention backends."""
     args = LlmArgs(
         model="test-model",
         max_seq_len=1024,
-        transforms={
-            "insert_cached_attention": {"stage": "cache_init", "attn_backend": attn_backend}
-        },
+        transforms={"insert_cached_attention": {"stage": "cache_init", "backend": backend}},
     )
     assert args.attn_page_size == expected_attn_page_size

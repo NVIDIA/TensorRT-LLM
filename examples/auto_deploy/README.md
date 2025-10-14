@@ -222,9 +222,9 @@ args:
     detect_sharding:
       support_partial_config: true
     insert_cached_attention:
-      attn_backend: triton
+      backend: triton
     compile_model:
-      compile_backend: torch-compile
+      backend: torch-compile
 
 prompt:
   batch_size: 8
@@ -240,11 +240,10 @@ Create an additional override file (e.g., `production.yaml`):
 # production.yaml
 args:
   world_size: 8
-  compile_backend: torch-opt
   max_batch_size: 32
-
-benchmark:
-  enabled: false
+  transforms:
+    compile_model:
+      backend: torch-opt
 ```
 
 Then use these configurations:

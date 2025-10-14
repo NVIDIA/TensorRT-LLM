@@ -64,16 +64,13 @@ class UpdateInOutNodes(BaseTransform):
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
-    attn_backend: Optional[str] = Field(default=None, description="The attention backend to use.")
+    backend: Optional[str] = Field(default=None, description="The attention backend to use.")
 
 
 @TransformRegistry.register("insert_cached_attention")
 class InsertCachedAttention(BaseTransform):
     """
-    A transform to insert cached attention into the graph module.
-
-    If attn_backend is not provided in transform config, will find from shared config.
-    """
+    A transform to insert cached attention into the graph module."""
 
     config: InsertCachedAttentionConfig
 
@@ -83,7 +80,7 @@ class InsertCachedAttention(BaseTransform):
 
     @property
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
-        return AttentionRegistry.get(self.config.attn_backend)
+        return AttentionRegistry.get(self.config.backend)
 
     def _process_get_metadata(
         self, gm: GraphModule, m_args: List[str], const_args: List[Constant]

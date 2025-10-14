@@ -57,7 +57,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                     "free_mem_ratio": 0.7
                 },
                 "compile_model": {
-                    "compile_backend":
+                    "backend":
                     "torch-opt",
                     "cuda_graph_batch_sizes":
                     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
@@ -112,7 +112,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
                     "free_mem_ratio": 0.7
                 },
                 "compile_model": {
-                    "compile_backend": "torch-opt",
+                    "backend": "torch-opt",
                     "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                 },
             },

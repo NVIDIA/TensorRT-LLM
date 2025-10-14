@@ -13,8 +13,8 @@ from build_and_run_ad import ExperimentConfig, main
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "flashinfer"},
-                    "compile_model": {"compile_backend": "torch-opt"},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-opt"},
                 },
             },
         ),
@@ -22,7 +22,7 @@ from build_and_run_ad import ExperimentConfig, main
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
                 },
                 "mode": "transformers",
             },

@@ -1413,7 +1413,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             autodeploy_config = {
                 'transforms': {
                     'compile_model': {
-                        'compile_backend': self._config.ad_compile_backend
+                        'backend': self._config.ad_compile_backend
                     },
                     'resize_kv_cache': {
                         'free_mem_ratio': self._config.free_mem_ratio

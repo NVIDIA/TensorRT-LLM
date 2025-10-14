@@ -15,10 +15,10 @@ llm = LLM(
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
     transforms={
-        "insert_cached_attention": {"attn_backend": "flashinfer"},  # or "triton"
-        "insert_cached_mla_attention": {"attn_backend": "MultiHeadLatentAttention"},
+        "insert_cached_attention": {"backend": "flashinfer"},  # or "triton"
+        "insert_cached_mla_attention": {"backend": "MultiHeadLatentAttention"},
         "resize_kv_cache": {"free_mem_ratio": 0.8},
-        "compile_model": {"compile_backend": "torch-compile"},
+        "compile_model": {"backend": "torch-compile"},
         "detect_sharding": {"simple_shard_only": False},
 
     },

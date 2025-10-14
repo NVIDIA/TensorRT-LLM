@@ -56,13 +56,13 @@ world_size: 1
 transforms:
   insert_cached_attention:
     # attention backend
-    attn_backend: flashinfer
+    backend: flashinfer
   resize_kv_cache:
     # fraction of free memory to use for kv-caches
     free_mem_ratio: 0.8
   compile_model:
     # compilation backend
-    compile_backend: torch-opt
+    backend: torch-opt
     # CUDA Graph optimization
     cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
 ```

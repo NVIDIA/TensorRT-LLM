@@ -166,13 +166,13 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     # TODO: discuss what to do with this once we fully transition to the new inference optimizer
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
-        if self.transforms.get("insert_cached_attention", {}).get("attn_backend") in [
+        if self.transforms.get("insert_cached_attention", {}).get("backend") in [
             "triton",
             "torch",
         ]:
             self.attn_page_size = self.max_seq_len
         # NOTE: (hg) For transformers mode. This is ugly.
-        if self.transforms.get("transformers_replace_cached_attn", {}).get("attn_backend") in [
+        if self.transforms.get("transformers_replace_cached_attn", {}).get("backend") in [
             "triton",
             "torch",
         ]:

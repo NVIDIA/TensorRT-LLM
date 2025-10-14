@@ -137,16 +137,16 @@ transforms:
     stage: cache_init
   insert_cached_attention:
     stage: cache_init
-    attn_backend: flashinfer
+    backend: flashinfer
   insert_cached_mla_attention:
     stage: cache_init
-    attn_backend: MultiHeadLatentAttention
+    backend: MultiHeadLatentAttention
   insert_cached_ssm_attention:
     stage: cache_init
-    attn_backend: triton_ssm
+    backend: triton_ssm
   insert_cached_causal_conv:
     stage: cache_init
-    attn_backend: cuda_causal_conv
+    backend: cuda_causal_conv
   initialize_cache:
     stage: cache_init
     run_per_gm: false
@@ -161,4 +161,4 @@ transforms:
     stage: compile
     run_per_gm: false
     cuda_graph_batch_sizes: null
-    compile_backend: torch-compile
+    backend: torch-compile

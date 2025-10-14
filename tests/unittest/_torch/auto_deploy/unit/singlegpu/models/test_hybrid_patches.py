@@ -34,8 +34,8 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
         "model_factory": "AutoModelForCausalLM",
         "max_seq_len": 512,
         "transforms": {
-            "insert_cached_attention": {"attn_backend": "flashinfer"},
-            "compile_model": {"compile_backend": "torch-simple"},
+            "insert_cached_attention": {"backend": "flashinfer"},
+            "compile_model": {"backend": "torch-simple"},
         },
     }
 

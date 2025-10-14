@@ -47,8 +47,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "resize_kv_cache": {"free_mem_ratio": 0.0001},
-                    "insert_cached_attention": {"attn_backend": "flashinfer"},
-                    "compile_model": {"compile_backend": "torch-opt"},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-opt"},
                 },
             },
         ),
@@ -56,7 +56,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
                 },
                 "mode": "transformers",
             },
@@ -65,8 +65,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "triton"},
-                    "compile_model": {"compile_backend": "torch-simple"},
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
                 },
             },
         ),
@@ -74,7 +74,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "triton"},
+                    "transformers_replace_cached_attn": {"backend": "triton"},
                 },
                 "mode": "transformers",
             },
@@ -83,8 +83,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "triton"},
-                    "compile_model": {"compile_backend": "torch-simple"},
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
                 },
             },
         ),
@@ -92,7 +92,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "triton"},
+                    "transformers_replace_cached_attn": {"backend": "triton"},
                 },
                 "mode": "transformers",
             },
@@ -101,8 +101,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "microsoft/Phi-3-mini-4k-instruct",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "triton"},
-                    "compile_model": {"compile_backend": "torch-simple"},
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
                 },
             },
         ),
@@ -110,8 +110,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "microsoft/Phi-3-mini-4k-instruct",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "torch"},
-                    "compile_model": {"compile_backend": "torch-simple"},
+                    "insert_cached_attention": {"backend": "torch"},
+                    "compile_model": {"backend": "torch-simple"},
                 },
             },
         ),
@@ -119,8 +119,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "flashinfer"},
-                    "compile_model": {"compile_backend": "torch-opt"},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-opt"},
                 },
             },
         ),
@@ -128,7 +128,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
                 },
                 "mode": "transformers",
             },
@@ -137,8 +137,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "deepseek-ai/DeepSeek-V3",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "triton"},
-                    "compile_model": {"compile_backend": "torch-simple"},
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-simple"},
                 },
             },
         ),
@@ -146,8 +146,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "Qwen/Qwen2.5-3B-Instruct",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "triton"},
-                    "compile_model": {"compile_backend": "torch-compile"},
+                    "insert_cached_attention": {"backend": "triton"},
+                    "compile_model": {"backend": "torch-compile"},
                 },
             },
         ),
@@ -155,7 +155,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "Qwen/Qwen2.5-3B-Instruct",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "triton"},
+                    "transformers_replace_cached_attn": {"backend": "triton"},
                 },
                 "mode": "transformers",
             },
@@ -164,8 +164,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "flashinfer"},
-                    "compile_model": {"compile_backend": "torch-cudagraph"},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-cudagraph"},
                 },
             },
         ),
@@ -173,7 +173,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
             {
                 "transforms": {
-                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
                 },
                 "mode": "transformers",
             },
@@ -182,8 +182,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "nvidia/NVIDIA-Nemotron-Nano-12B-v2",
             {
                 "transforms": {
-                    "insert_cached_attention": {"attn_backend": "flashinfer"},
-                    "compile_model": {"compile_backend": "torch-simple"},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "compile_model": {"backend": "torch-simple"},
                 },
             },
         ),
