@@ -5,13 +5,14 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
                                  TrtllmAttentionMetadata)
+from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
 from ..attention_backend.interface import (AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
@@ -1632,6 +1633,7 @@ class MLA(nn.Module):
 
         return output
 
+    @nvtx_range("forward_sparse_mla_kvcache_bf16")
     def forward_sparse_mla_kvcache_bf16(
         self,
         q: torch.Tensor,
@@ -1651,29 +1653,23 @@ class MLA(nn.Module):
         2. Load full kv cache from paged memory (with k rope applied)
         3. Call FlashMLA sparse attention kernel for sparse prefill/decode
         """
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata), \
-            "DSA requires TrtllmAttentionMetadata for now"
+        assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), \
+            "DSA requires DSAtrtllmAttentionMetadata"
         # Step 1: Append current tokens to paged cache and apply RoPE to q
         # This writes latent_cache to paged KV and modifies q in-place
         trtllm_attention = self.mqa
-        trtllm_attention.mla_rope_append_paged_kv_assign_q(
-            q, latent_cache, attn_metadata, is_generation=is_generation)
+        with nvtx_range_debug(f"mla_rope_append_paged_kv_assign_q_is_generation={is_generation}"):
+            trtllm_attention.mla_rope_append_paged_kv_assign_q(
+                q, latent_cache, attn_metadata, is_generation=is_generation)
 
         # Step 2: Load full latent cache from paged memory
-        full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
-            attn_metadata, q.dtype, is_generation=is_generation)
-
+        with nvtx_range_debug(f"load_paged_kv_cache_for_mla_is_generation={is_generation}"):
+            full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
+                attn_metadata, q.dtype, is_generation=is_generation)
         full_latent_cache = torch.cat([full_compressed_kv, full_k_pe], dim=-1)
-
         num_tokens = q.shape[0]
-
-        # TODO: this is the local topk indices, we need to convert it to global topk indices
-        # Global indices related to the gen part cache; or prefill part cache
-        # Not for the entire batch global indices (batch-wide)
-
         q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
         q_nope_out = torch.empty(
             [num_tokens, self.num_heads, (self.kv_lora_rank)],
             dtype=q.dtype,

@@ -174,8 +174,8 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     def from_dict(cls, data: dict):
         # dispatch to the correct sparse attention config
         config_classes = {
-            "Rocket": RocketSparseAttentionConfig,
-            "DSA": DSASparseAttentionConfig,
+            "rocket": RocketSparseAttentionConfig,
+            "dsa": DSASparseAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -1234,6 +1234,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
+    DSASparseAttentionConfig,
 ]
 
 
@@ -2880,11 +2881,12 @@ def update_llm_args_with_extra_dict(
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
         "attention_dp_config": AttentionDpConfig,
+        "sparse_attention_config": SparseAttentionBaseConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
-            if field_name in ["speculative_config", "build_config"]:
+            if field_name in ["speculative_config", "build_config", "sparse_attention_config"]:
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:

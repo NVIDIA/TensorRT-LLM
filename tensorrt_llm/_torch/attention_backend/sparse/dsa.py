@@ -516,6 +516,13 @@ class Indexer(nn.Module):
                                    dtype=torch.bool,
                                    device=topk_indices.device)
             mask = mask_lo & mask_hi
+            # Convert local indices to global indices relative to the KV cache
+            kv_offsets = torch.repeat_interleave(
+                metadata.ctx_kv_indptr[:num_contexts],
+                seq_lens,
+                dim=0
+            )  # [num_ctx_tokens]
+            topk_indices = topk_indices + kv_offsets.unsqueeze(1)
             topk_indices = topk_indices.masked_fill(~mask, -1)
             topk_indices_buffer[:num_ctx_tokens, :topk_indices.
                                 shape[-1]] = topk_indices.to(dtype=torch.int32)
@@ -577,7 +584,17 @@ class Indexer(nn.Module):
             # ensure we don't set indices for the top k
             # that is out of range(masked already)
             # this will happen if context length is shorter than K
-            topk_indices_decode[topk_indices_decode > index_end_pos] = -1
+            mask_decode = topk_indices_decode <= index_end_pos
+
+            # Convert local indices to global indices relative to the KV cache
+            gen_seq_lens_cuda = metadata.seq_lens_cuda[num_contexts:]
+            kv_offsets = torch.repeat_interleave(
+                metadata.gen_kv_indptr[:num_generations],
+                gen_seq_lens_cuda,
+                dim=0
+            )  # [num_gen_tokens]
+            topk_indices_decode = topk_indices_decode + kv_offsets.unsqueeze(1)
+            topk_indices_decode = topk_indices_decode.masked_fill(~mask_decode, -1)
 
             # Store in buffer
             topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
