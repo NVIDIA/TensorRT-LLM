@@ -2064,6 +2064,10 @@ class PyExecutor:
                             (request, None))
                     else:
                         requests_to_terminate.append(request)
+
+                # Finalize any remaining logits transfers for all requests in chunked mode
+                if request.py_use_chunked_generation_logits and request.py_return_generation_logits:
+                    request.py_result.transfer_remaining_device_logits()
             else:
                 new_active_requests.append(request)
 
