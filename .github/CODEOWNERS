@@ -159,6 +159,33 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
 
+## OSS Compliance & Legal - License/Attribution Protection
+## IMPORTANT: Changes to any files below may impact legal compliance, attributions, and third-party licenses.
+## These files require review from the OSS compliance team before merging to ensure proper attribution
+## and license compliance when adding, removing, or changing versions of dependencies.
+### License Files
+/LICENSE @NVIDIA/trt-llm-oss-compliance
+/jenkins/license_cpp.json @NVIDIA/trt-llm-oss-compliance
+
+### Python Dependency Management
+/setup.py @NVIDIA/trt-llm-oss-compliance
+/pyproject.toml @NVIDIA/trt-llm-oss-compliance
+/requirements.txt @NVIDIA/trt-llm-oss-compliance
+/requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
+
+### C++ Build & Dependency Management
+/cpp/CMakeLists.txt @NVIDIA/trt-llm-oss-compliance
+/cpp/conanfile.py @NVIDIA/trt-llm-oss-compliance
+/cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
+
+### Third-Party Dependencies
+## Any changes to versions, additions, or removals of third-party libraries
+/3rdparty/** @NVIDIA/trt-llm-oss-compliance
+
+### Docker & Installation Scripts
+## These scripts install and pin dependency versions
+/docker/common/** @NVIDIA/trt-llm-oss-compliance
+
 # The following rule should only be uncommented on release branches (e.g., release/0.19).
 # The rule below requires that any PR to release/**/* branches must be approved by at least one member
 # of the NVIDIA/trt-llm-release-branch-approval team, regardless of who else approves the PR.
