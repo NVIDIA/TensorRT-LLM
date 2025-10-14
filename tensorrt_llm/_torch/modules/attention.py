@@ -202,14 +202,15 @@ class Attention(nn.Module):
         # tensor parallel
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
+        cp_size = config.mapping.cp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size * config.mapping.cp_size,
+            world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
-            cp_size=config.mapping.cp_size,
+            cp_size=cp_size,
             cp_config=config.mapping.cp_config,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
@@ -1008,20 +1009,17 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
-    def _attn_forward(self, attn_instance: AttentionBackend, q: torch.Tensor,
+    def _attn_forward(self, attn_backend: AttentionBackend, q: torch.Tensor,
                       k: torch.Tensor, v: torch.Tensor,
                       position_ids: torch.Tensor,
                       attn_metadata: AttentionMetadata, **kwargs):
-        # if self.mapping.has_cp_helix():
         if self.mapping.cp_size > 1:
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
-            softmax_stats = torch.empty(q.shape[0],
-                                        self.num_heads_tp,
-                                        2,
+            softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
                                         device=q.device,
                                         dtype=torch.float32)
-            partial_o = attn_instance.forward(
+            partial_o = attn_backend.forward(
                 q,
                 k,
                 v,
@@ -1052,8 +1050,7 @@ class MLA(nn.Module):
             return torch.ops.trtllm.helix_post_process(gathered_o,
                                                        gathered_stats, 1.0)
         else:
-            attn_output = attn_instance.forward(q, k, v, attn_metadata,
-                                                **kwargs)
+            attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
@@ -1081,6 +1078,7 @@ class MLA(nn.Module):
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
             all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
+            latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
 
         Returns:
             torch.Tensor: The output tensor.
@@ -1598,7 +1596,6 @@ class MLA(nn.Module):
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
-        # if self.mapping.has_cp_helix():
         if self.mapping.cp_size > 1:
             # note: for allowing testing Helix parallelism, we ensure that the output
             # is compatible with o_proj even in the context phase,
