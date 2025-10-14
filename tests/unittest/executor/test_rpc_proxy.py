@@ -55,6 +55,7 @@ class TestRpcProxy:
 
         return proxy
 
+    @pytest.mark.skip(reason="https://nvbugs/5579234")
     @pytest.mark.parametrize("num_reqs", [1, 10])
     def test_tp1(self, num_reqs):
         tokenizer = TransformersTokenizer.from_pretrained(model_path)

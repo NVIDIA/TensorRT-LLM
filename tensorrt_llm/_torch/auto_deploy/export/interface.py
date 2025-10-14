@@ -35,6 +35,15 @@ class ExportPatchConfig(BaseModel):
     )
 
 
+class DisabledExportPatchConfig(ExportPatchConfig):
+    """Standard configuration for an export patch that is disabled by default."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable this patch.",
+    )
+
+
 class BaseExportPatch(ABC):
     """Base class for all export patches.
 
@@ -128,6 +137,17 @@ class BaseExportPatch(ABC):
     def _revert_patch(self):
         """Revert the patch using stored original values."""
         pass
+
+
+class DisabledBaseExportPatch(BaseExportPatch):
+    """A base class for export patches that are disabled by default."""
+
+    config: DisabledExportPatchConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[ExportPatchConfig]:
+        """Get the configuration class for the patch."""
+        return DisabledExportPatchConfig
 
 
 class ContextManagerPatch(BaseExportPatch):

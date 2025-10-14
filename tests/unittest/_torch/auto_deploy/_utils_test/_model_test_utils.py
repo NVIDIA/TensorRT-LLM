@@ -435,15 +435,33 @@ _SMALL_MODEL_CONFIGS = {
         "llm_models_subdir": "Qwen2.5-3B-Instruct",
         "model_kwargs": {
             "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
         },
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
         "llm_models_subdir": "Mistral-Small-3.1-24B-Instruct-2503",
-        "model_factory": "Mistral3VLM",
+        "model_factory": "AutoModelForImageTextToText",
         "compile_backend": "torch-simple",
         "model_kwargs": {
-            "text_config": {"num_hidden_layers": 2},
-            "vision_config": {"num_hidden_layers": 2},
+            "text_config": {
+                "num_hidden_layers": 2,
+                "head_dim": 64,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+            },
+            "vision_config": {
+                "num_hidden_layers": 1,
+                "hidden_size": 64,
+                "head_dim": 32,
+                "image_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+            },
         },
     },
     "ibm-ai-platform/Bamba-9B-v2": {
@@ -478,6 +496,12 @@ _SMALL_MODEL_CONFIGS = {
             "num_hidden_layers": 9,
             "num_key_value_heads": 2,
             "ssm_state_size": 32,
+        },
+    },
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+        "llm_models_subdir": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "model_kwargs": {
+            "num_hidden_layers": 2,
         },
     },
 }
