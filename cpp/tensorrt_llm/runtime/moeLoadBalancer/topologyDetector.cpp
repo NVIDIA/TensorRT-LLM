@@ -427,6 +427,29 @@ int TopologyDetector::getCurrentGpuMemoryNumaId()
     return -1;
 }
 
+std::string TopologyDetector::getNoCurrentGpuMemoryNumaIdReason()
+{
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
+    std::string reason = "Current GPU=" + std::to_string(currentDevice) + ", mGpuMemoryToNumaMap={";
+    for (auto it = mGpuMemoryToNumaMap.begin(); it != mGpuMemoryToNumaMap.end(); ++it)
+    {
+        reason += "GPU[" + std::to_string(it->first) + "] memory NUMA Node=" + std::to_string(it->second) + ", ";
+    }
+    reason += "}";
+    auto itGpuToNuma = mGpuMemoryToNumaMap.find(currentDevice);
+    if (itGpuToNuma != mGpuMemoryToNumaMap.end())
+    {
+        reason += ", FOUND GPU[" + std::to_string(itGpuToNuma->first)
+            + "] memory NUMA Node=" + std::to_string(itGpuToNuma->second) + ", ";
+    }
+    else
+    {
+        reason += ", NOT FOUND GPU[" + std::to_string(currentDevice) + "] memory NUMA Node";
+    }
+    return reason;
+}
+
 int TopologyDetector::getGpuCountUnderNuma(int numaId)
 {
     auto it = mNumaToGpuMap.find(numaId);

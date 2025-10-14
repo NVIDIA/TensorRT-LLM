@@ -182,6 +182,11 @@ bool HostAccessibleDeviceAllocator::isSupported()
     return true;
 }
 
+std::string HostAccessibleDeviceAllocator::getUnSupportedReason()
+{
+    return TopologyDetector::getInstance().getNoCurrentGpuMemoryNumaIdReason();
+}
+
 void HostAccessibleDeviceAllocator::init()
 {
     TLLM_CHECK(mIsInited == false);
