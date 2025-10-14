@@ -108,22 +108,25 @@ def apply_waives_ut(waives_file, items: list[pytest.Item], config):
     # Corrections don't make sense for the waives file as it specifies global negative
     # filters that may or may not be applicable to the current platform (i.e., the test names
     # being waived may not be generated on the current platform).
-    parse_test_list_lines_bak = test_list_parser.parse_test_list_lines
-    test_list_parser.parse_test_list_lines = partial(
-        test_list_parser.parse_test_list_lines, convert_unittest=False)
-    ret = test_list_parser.parse_and_validate_test_list(
-        waives_file,
-        config,
-        items,
-        check_for_corrections=False,
-    )
+    try:
+        parse_test_list_lines_bak = test_list_parser.parse_test_list_lines
+        test_list_parser.parse_test_list_lines = partial(
+            test_list_parser.parse_test_list_lines, convert_unittest=False)
+        ret = test_list_parser.parse_and_validate_test_list(
+            waives_file,
+            config,
+            items,
+            check_for_corrections=False,
+        )
+    finally:
+        test_list_parser.parse_test_list_lines = parse_test_list_lines_bak
     if not ret:
         return
     _, test_name_to_marker_dict = ret
 
     filtered_dict = {}
     for waiver in test_name_to_marker_dict.keys():
-        if not "unittest/" in waiver:
+        if "unittest/" not in waiver:
             continue
         elif "unittest/unittest/" in waiver:
             filtered_dict[waiver.replace(
@@ -137,7 +140,7 @@ def apply_waives_ut(waives_file, items: list[pytest.Item], config):
     # 2. remove parameterization part in square brackets and try again (function level)
     # 3. remove the last part after '::' and try again, until no '::' left (file level)
     # Note: directory level match is not supported.
-    def match_waiver(id: str) -> bool:
+    def match_waiver(id: str):
         if id in filtered_dict:
             return filtered_dict[id]
         if id.endswith("]"):
@@ -160,7 +163,6 @@ def apply_waives_ut(waives_file, items: list[pytest.Item], config):
                 mark_func = getattr(pytest.mark, marker.lower())
                 mark = mark_func(reason=reason)
                 item.add_marker(mark)
-    test_list_parser.parse_test_list_lines = parse_test_list_lines_bak
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)

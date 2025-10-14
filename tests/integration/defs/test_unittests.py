@@ -135,6 +135,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         command += ['--collect-only']
 
     if waives_file:
+        waives_file = os.path.abspath(waives_file)
         command += [f"--waives-file={waives_file}"]
 
     command += arg_list
