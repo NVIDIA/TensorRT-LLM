@@ -318,6 +318,7 @@ class Attention(nn.Module):
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
         self.support_nvfp4_output = self.attn.support_nvfp4_output()
+        self.is_eagle3 = False
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -404,6 +405,10 @@ class Attention(nn.Module):
             if mrope_position_deltas is not None:
                 mrope_config["mrope_position_deltas"] = mrope_position_deltas
 
+        # Be forced to use FP8 FMHA for BF16/FP16 model with FP8 KV cache (e.g. eagle3 + FP8 target model + BF16/FP16 draft model)
+        fp8_fmha_for_eagle3 = self.is_eagle3 and not self.has_quant_scale and self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+        ) and attn_metadata.num_contexts != 0
+
         attn_output = self.attn.forward(
             q,
             k,
@@ -420,7 +425,8 @@ class Attention(nn.Module):
             enable_attn_nvfp4_output=enable_attn_nvfp4_output,
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
-            attention_sinks=attention_sinks)
+            attention_sinks=attention_sinks,
+            fp8_fmha_for_eagle3=fp8_fmha_for_eagle3)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
