@@ -461,13 +461,23 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 #define MMAS_N_PER_MASK 2
 
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask, uint32_t rowOffset,
-    uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize)
+    uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize
+    #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+        , int32_t tok0WinBeg, uint32_t seqIter
+    #endif
+    )
 {
     uint32_t const idxInQuad = laneId() % 4;
     uint32_t const idxQuad = laneId() / 4;
     // Packed mask is aligned with 32 bits (2 uint16_t).
     uint32_t const nbPackedMasksPerRow = divUp(qSeqLen, 32u) * 2u;
     uint16_t const* uint16Mask = reinterpret_cast<uint16_t const*>(mask);
+
+    uint32_t begMask = ~uint32_t{0};
+    Range const tileRange = {ctaTile.x * seqIter, ctaTile.x * seqIter + ctaTile.x};
+    Range const maxMaskOutRange = {0, mha::max(0, tok0WinBeg) + (inputTokensPerCta - 1)};
+    bool const ctaNeedBegMask = 
+
 #pragma unroll
     for (uint32_t m = 0; m < acc.rows; m++)
     {
@@ -492,6 +502,7 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                     = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos0 / 16)];
                 reinterpret_cast<uint16_t*>(&packedMask)[1]
                     = uint16Mask[tokenRow * nbPackedMasksPerRow + (maskPos1 / 16)];
+                printf("[applyMaskFromInput] threadIdx.x %d, threadIdx.y %d, threadIdx.z %d, idxInQuad %d, idxQuad %d, nbPackedMasksPerRow %d, tok0WinBeg %d, tokenRow %d, mask_n %d, nbValidCols %d, packedMask %x, maskPos0 %d, maskPos1 %d, seqIter %d\n", threadIdx.x , threadIdx.y , threadIdx.z , idxInQuad , idxQuad, nbPackedMasksPerRow, tok0WinBeg, tokenRow, mask_n, nbValidCols, packedMask, maskPos0, maskPos1, seqIter);
 #pragma unroll
                 for (uint32_t nj = 0; nj < MMAS_N_PER_MASK; nj++)
                 {
@@ -1457,16 +1468,21 @@ CUBIN_EXPORT __global__
 
     uint32_t const nbVHeads = nbKHeads;
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
-    uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
-    uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
+    uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen; // 8 * q_seq_len
+    uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads; // 8 + 1 + 1
 
-    uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
+    uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads; // nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize)
     uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp; // inside one request
     uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
     uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
     uint32_t const nbValidHeadTokens = idxHeadTokenInGrp > totalNbHeadTokensInGrp
         ? 0u
         : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
+    if (threadIdx.x % 32 == 0){
+        printf("[mha.cu] kernel_mha_impl gridDim.x %d, gridDim.y %d, gridDim.z %d, blockIdx.x %d, blockIdx.y %d, blockIdx.z %d, threadIdx.x %d, threadIdx.y %d, threadIdx.z %d, warpTile.y %d, variableQSeqLen %d, \
+        actualQSeqLen %d reqSeqOffset %d nbVHeads %d nbQHeads %d nbQHeadTokens %d nbQKVHeads %d nbTokenBlocksPerGrp %d idxHeadGrp %d idxHeadTokenInGrp %d nbValidHeadTokens %d\n",
+        gridDim.x, gridDim.y, gridDim.z, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z, warpTile.y, variableQSeqLen, actualQSeqLen, reqSeqOffset, nbVHeads, nbQHeads, nbQHeadTokens, nbQKVHeads, nbTokenBlocksPerGrp, idxHeadGrp, idxHeadTokenInGrp, nbValidHeadTokens);
+    }
     // Shift the mask ptr by batch_idx.
     mask += reqSeqOffset * divUp(qSeqLen, 32u);
 #else
@@ -1606,8 +1622,17 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
-#if SLIDING_WINDOW
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1 + idxHeadTokenInGrp; // ctaTokOffset;
+    int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
+    uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
+    if (threadIdx.x == 0) {
+        printf("[mha.cu] cacheSeqLen %d actualQSeqLen %d idxHeadTokenInGrp %d nbTotalSkipTokens %d tok0WinBeg %d tok0SeqLen %d int32_t(tok0SeqLen) %d int32_t(slidingWinSize) %d slidingWinSize %d\n", cacheSeqLen, actualQSeqLen, idxHeadTokenInGrp, nbTotalSkipTokens, tok0WinBeg, tok0SeqLen, int32_t(tok0SeqLen), int32_t(slidingWinSize), slidingWinSize);
+    }
+#elif SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+    // if SPEC_DEC && SLIDING_WINDOW && IS_SPEC_DEC_TREE, it should not do sliding
+    assert(!SPEC_DEC || !rtIsReallySliding);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
 #else
     constexpr bool rtIsReallySliding = false;
@@ -1621,7 +1646,9 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
-#if SPEC_DEC
+#if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
+    uint32_t const nbSeqItersWithoutMask = nbSkipLeadingTiles;
+#elif SPEC_DEC
     uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
@@ -1908,7 +1935,11 @@ CUBIN_EXPORT __global__
             {
                 uint32_t const nbValidCols = (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
                 applyMaskFromInput(
-                    warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize);
+                    warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+    , tok0WinBeg, seqIter
+#endif
+                    );
             }
 #else
             bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
@@ -2757,6 +2788,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
 #if SPEC_DEC
     const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
+    printf("[mha.cu] nbSubSeqPerSeq %d, nbKHeads * nbTokenBlocksPerGrp %d, batchSize %d\n", nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize);
     dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
 #else
     dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
