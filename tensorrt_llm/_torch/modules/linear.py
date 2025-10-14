@@ -20,6 +20,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
@@ -714,6 +716,24 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         fused_scale = torch.cat([left_scale, right_scale], dim=0)
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
+
+    def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
+        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm):
+            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
+                                                        module.weight_scale)
+            transfromed_scale = transform_sf_into_required_layout(
+                weight_scale,
+                mn=weight.shape[0],
+                k=weight.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
+            module.weight = nn.Parameter(weight, requires_grad=False)
+            module.weight_scale = nn.Parameter(
+                transfromed_scale,
+                requires_grad=False,
+            )
 
 
 class NVFP4LinearMethod(LinearMethodBase):

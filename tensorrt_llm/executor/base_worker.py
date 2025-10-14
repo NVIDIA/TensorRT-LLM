@@ -205,7 +205,10 @@ class BaseWorker(GenerationExecutor):
                 # point in the TRT flow is currently not supported (it's at the CPP
                 # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
                 # optimization is not available in TRT-python flow.
-                self._lora_manager = LoraManager(cpp_peft_cache_manager=None)
+                self._lora_manager = LoraManager(
+                    mapping=engine_config.pretrained_config.mapping,
+                    model_config=self._runtime_model_config,
+                    cpp_peft_cache_manager=None)
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
@@ -216,8 +219,7 @@ class BaseWorker(GenerationExecutor):
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
                 ResourceManagerType.PEFT_CACHE_MANAGER)
-            self._lora_manager = LoraManager(
-                cpp_peft_cache_manager=peft_cache_manager.impl)
+            self._lora_manager = peft_cache_manager.get_lora_manager()
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
@@ -302,7 +304,6 @@ class BaseWorker(GenerationExecutor):
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
-            runtime_mapping=None,
             uids=[adapter_id],
             ckpt_source=lora_request.ckpt_source)
         return adapter_id in newly_loaded_uids
