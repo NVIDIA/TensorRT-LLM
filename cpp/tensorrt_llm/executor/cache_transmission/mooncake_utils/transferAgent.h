@@ -102,8 +102,8 @@ private:
     static std::string encodeInternal(std::vector<uint8_t> const& data, std::string const& chars);
     static std::vector<uint8_t> decodeInternal(std::string const& encoded, std::string const& chars);
 
-    static inline bool is_base64(unsigned char c, std::string const& chars);
-    static inline bool is_whitespace(unsigned char c);
+    static inline bool isBase64(uint8_t c, std::string const& chars);
+    static inline bool isWhitespace(uint8_t c);
 };
 
 class MooncakeTransferAgent final : public BaseTransferAgent

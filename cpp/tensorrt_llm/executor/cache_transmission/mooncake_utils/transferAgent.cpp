@@ -104,26 +104,26 @@ std::string MooncakeBase64Helper::decodeToString(std::string const& encoded)
 std::string MooncakeBase64Helper::encodeInternal(std::vector<uint8_t> const& data, std::string const& chars)
 {
     std::string encoded;
-    int i = 0;
-    int j = 0;
-    unsigned char char_array_3[3];
-    unsigned char char_array_4[4];
-    size_t data_len = data.size();
+    size_t i = 0;
+    size_t j = 0;
+    std::array<uint8_t, 3> charArray3{};
+    std::array<uint8_t, 4> charArray4{};
+    size_t dataLen = data.size();
     uint8_t const* bytes = data.data();
 
-    while (data_len--)
+    while (dataLen--)
     {
-        char_array_3[i++] = *(bytes++);
+        charArray3[i++] = *(bytes++);
         if (i == 3)
         {
-            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-            char_array_4[3] = char_array_3[2] & 0x3f;
+            charArray4[0] = (charArray3[0] & 0xfc) >> 2;
+            charArray4[1] = ((charArray3[0] & 0x03) << 4) + ((charArray3[1] & 0xf0) >> 4);
+            charArray4[2] = ((charArray3[1] & 0x0f) << 2) + ((charArray3[2] & 0xc0) >> 6);
+            charArray4[3] = charArray3[2] & 0x3f;
 
             for (i = 0; i < 4; i++)
             {
-                encoded += chars[char_array_4[i]];
+                encoded += chars[charArray4[i]];
             }
             i = 0;
         }
@@ -133,17 +133,17 @@ std::string MooncakeBase64Helper::encodeInternal(std::vector<uint8_t> const& dat
     {
         for (j = i; j < 3; j++)
         {
-            char_array_3[j] = '\0';
+            charArray3[j] = '\0';
         }
 
-        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-        char_array_4[3] = char_array_3[2] & 0x3f;
+        charArray4[0] = (charArray3[0] & 0xfc) >> 2;
+        charArray4[1] = ((charArray3[0] & 0x03) << 4) + ((charArray3[1] & 0xf0) >> 4);
+        charArray4[2] = ((charArray3[1] & 0x0f) << 2) + ((charArray3[2] & 0xc0) >> 6);
+        charArray4[3] = charArray3[2] & 0x3f;
 
         for (j = 0; j < i + 1; j++)
         {
-            encoded += chars[char_array_4[j]];
+            encoded += chars[charArray4[j]];
         }
 
         while (i++ < 3)
@@ -157,42 +157,43 @@ std::string MooncakeBase64Helper::encodeInternal(std::vector<uint8_t> const& dat
 
 std::vector<uint8_t> MooncakeBase64Helper::decodeInternal(std::string const& encoded, std::string const& chars)
 {
-    size_t encoded_len = encoded.size();
-    int i = 0;
-    int j = 0;
-    int in_ = 0;
-    unsigned char char_array_4[4], char_array_3[3];
+    size_t encodedLen = encoded.size();
+    size_t i = 0;
+    size_t j = 0;
+    size_t in_ = 0;
+    std::array<uint8_t, 3> charArray3{};
+    std::array<uint8_t, 4> charArray4{};
     std::vector<uint8_t> decoded;
 
-    std::string clean_encoded;
+    std::string cleanEncoded;
     for (char c : encoded)
     {
-        if (!is_whitespace(c))
+        if (!isWhitespace(c))
         {
-            clean_encoded += c;
+            cleanEncoded += c;
         }
     }
 
-    encoded_len = clean_encoded.size();
+    encodedLen = cleanEncoded.size();
 
-    while (encoded_len-- && clean_encoded[in_] != '=' && is_base64(clean_encoded[in_], chars))
+    while (encodedLen-- && cleanEncoded[in_] != '=' && isBase64(cleanEncoded[in_], chars))
     {
-        char_array_4[i++] = clean_encoded[in_];
+        charArray4[i++] = cleanEncoded[in_];
         in_++;
         if (i == 4)
         {
             for (i = 0; i < 4; i++)
             {
-                char_array_4[i] = chars.find(char_array_4[i]);
+                charArray4[i] = chars.find(charArray4[i]);
             }
 
-            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+            charArray3[0] = (charArray4[0] << 2) + ((charArray4[1] & 0x30) >> 4);
+            charArray3[1] = ((charArray4[1] & 0xf) << 4) + ((charArray4[2] & 0x3c) >> 2);
+            charArray3[2] = ((charArray4[2] & 0x3) << 6) + charArray4[3];
 
             for (i = 0; i < 3; i++)
             {
-                decoded.push_back(char_array_3[i]);
+                decoded.push_back(charArray3[i]);
             }
             i = 0;
         }
@@ -202,33 +203,33 @@ std::vector<uint8_t> MooncakeBase64Helper::decodeInternal(std::string const& enc
     {
         for (j = i; j < 4; j++)
         {
-            char_array_4[j] = 0;
+            charArray4[j] = 0;
         }
 
         for (j = 0; j < 4; j++)
         {
-            char_array_4[j] = chars.find(char_array_4[j]);
+            charArray4[j] = chars.find(charArray4[j]);
         }
 
-        char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-        char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-        char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+        charArray3[0] = (charArray4[0] << 2) + ((charArray4[1] & 0x30) >> 4);
+        charArray3[1] = ((charArray4[1] & 0xf) << 4) + ((charArray4[2] & 0x3c) >> 2);
+        charArray3[2] = ((charArray4[2] & 0x3) << 6) + charArray4[3];
 
         for (j = 0; j < i - 1; j++)
         {
-            decoded.push_back(char_array_3[j]);
+            decoded.push_back(charArray3[j]);
         }
     }
 
     return decoded;
 }
 
-bool MooncakeBase64Helper::is_base64(unsigned char c, std::string const& chars)
+bool MooncakeBase64Helper::isBase64(uint8_t c, std::string const& chars)
 {
     return (isalnum(c) || (c == chars[62]) || (c == chars[63]));
 }
 
-bool MooncakeBase64Helper::is_whitespace(unsigned char c)
+bool MooncakeBase64Helper::isWhitespace(uint8_t c)
 {
     return (c == ' ' || c == '\n' || c == '\r' || c == '\t');
 }
@@ -306,13 +307,13 @@ void MooncakeTransferAgent::registerMemory(RegisterDescs const& descs)
             continue;
         }
 
-        int err = registerLocalMemory(mEngine, (void*) desc.getAddr(), desc.getLen(), "*", 1);
+        int err = registerLocalMemory(mEngine, reinterpret_cast<void*>(desc.getAddr()), desc.getLen(), "*", 1);
 
-        TLLM_CHECK_WITH_INFO(
-            err == 0, "registerLocalMemory failed, addr: %p, len: %lu", (void*) desc.getAddr(), desc.getLen());
+        TLLM_CHECK_WITH_INFO(err == 0, "registerLocalMemory failed, addr: %p, len: %lu",
+            reinterpret_cast<void*>(desc.getAddr()), desc.getLen());
 
         auto mooncakeDesc = std::make_shared<MooncakeMemoryDesc>(desc);
-        mMemRegInfo[desc.getAddr()] = mooncakeDesc;
+        mMemRegInfo[desc.getAddr()] = std::move(mooncakeDesc);
     }
 }
 
@@ -326,14 +327,15 @@ void MooncakeTransferAgent::deregisterMemory(RegisterDescs const& descs)
         auto it = mMemRegInfo.find(desc.getAddr());
         if (it != mMemRegInfo.end())
         {
-            auto mooncakeDesc = it->second;
+            auto const& mooncakeDesc = it->second;
             mooncakeDesc->releaseRef();
             if (mooncakeDesc->getRefCount())
                 continue;
 
-            int err = unregisterLocalMemory(mEngine, (void*) desc.getAddr());
+            int err = unregisterLocalMemory(mEngine, reinterpret_cast<void*>(desc.getAddr()));
 
-            TLLM_CHECK_WITH_INFO(err == 0, "unregisterLocalMemory failed, addr: %p", (void*) desc.getAddr());
+            TLLM_CHECK_WITH_INFO(
+                err == 0, "unregisterLocalMemory failed, addr: %p", reinterpret_cast<void*>(desc.getAddr()));
 
             mMemRegInfo.erase(desc.getAddr());
         }
@@ -399,7 +401,7 @@ void MooncakeTransferAgent::invalidateRemoteAgent(std::string const& name)
             TLLM_THROW(error);
         }
 
-        auto agentInfo = it->second;
+        auto const& agentInfo = it->second;
         segmentId = agentInfo.segmentId;
     }
 
@@ -409,7 +411,7 @@ void MooncakeTransferAgent::invalidateRemoteAgent(std::string const& name)
     TLLM_CHECK_WITH_INFO(localDescs.size() == remoteDescs.size(), "Number of local and remote memory must match");
 
     size_t requestCount = localDescs.size();
-    transfer_request_t* transferRequests = new transfer_request_t[requestCount];
+    std::vector<transfer_request_t> transferRequests(requestCount);
 
     for (size_t index = 0; index < requestCount; ++index)
     {
@@ -417,7 +419,7 @@ void MooncakeTransferAgent::invalidateRemoteAgent(std::string const& name)
             localDescs[index].getLen() == remoteDescs[index].getLen(), "Length of local and remote memory must match");
 
         transferRequests[index].opcode = (request.getOp() == TransferOp::kREAD) ? OPCODE_READ : OPCODE_WRITE;
-        transferRequests[index].source = (void*) localDescs[index].getAddr();
+        transferRequests[index].source = reinterpret_cast<void*>(localDescs[index].getAddr());
         transferRequests[index].target_offset = remoteDescs[index].getAddr();
         transferRequests[index].length = localDescs[index].getLen();
         transferRequests[index].target_id = segmentId;
@@ -429,14 +431,12 @@ void MooncakeTransferAgent::invalidateRemoteAgent(std::string const& name)
         notify_msg_t notifyMsg;
         notifyMsg.name = const_cast<char*>(mLocalAgentName.c_str());
         notifyMsg.msg = const_cast<char*>(syncMessage.c_str());
-        rc = submitTransferWithNotify(mEngine, batchId, transferRequests, requestCount, notifyMsg);
+        rc = submitTransferWithNotify(mEngine, batchId, transferRequests.data(), requestCount, notifyMsg);
     }
     else
     {
-        rc = submitTransfer(mEngine, batchId, transferRequests, requestCount);
+        rc = submitTransfer(mEngine, batchId, transferRequests.data(), requestCount);
     }
-
-    delete[] transferRequests;
 
     TLLM_CHECK_WITH_INFO(rc == 0, "submitTransfer failed with status: %d", rc);
 
@@ -457,7 +457,7 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
             return;
         }
 
-        auto agentInfo = it->second;
+        auto const& agentInfo = it->second;
         segmentId = agentInfo.segmentId;
     }
 
@@ -492,7 +492,7 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
         }
 
         std::string decoded = MooncakeBase64Helper::decodeToString(notifyMsgs[i].msg);
-        notifs[notifyMsgs[i].name].push_back(decoded);
+        notifs[notifyMsgs[i].name].emplace_back(std::move(decoded));
 
         TLLM_LOG_DEBUG("MooncakeTransferAgent::getNotifiedSyncMessages getNotifsFromEngine: %s, %s", notifyMsgs[i].name,
             notifyMsgs[i].msg);
