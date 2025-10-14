@@ -305,14 +305,20 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (Exception e) {
             def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
             if (isRerunFailed) {
-                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                    error "Isolated tests failed after rerun attempt"
-                }
+                // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
+                echo "Isolated test ${i} (${isolateTestName}) failed after rerun attempt, continuing with remaining tests"
             }
         } finally {
             // Clean up the temporary test file
             sh "rm -f ${singleTestFile}"
+        }
+    }
+
+    // After processing all isolated tests, set stage failure if any test failed
+    if (rerunFailed) {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            error "One or more isolated tests failed after rerun attempts"
         }
     }
 
@@ -1736,6 +1742,9 @@ def generateRerunReport(stageName, llmSrc) {
         return
     }
 
+    // Specify the stage name correctly for all result xml files.
+    sh "cd ${WORKSPACE}/${stageName} && find . -name '*.xml' -exec sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' {} + || true"
+
     // Collect all original and rerun result files
     def allInputFiles = []
 
@@ -1812,9 +1821,6 @@ def generateRerunReport(stageName, llmSrc) {
 
     // Remove isolation results since they are merged into results.xml
     sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml || true"
-
-    // Specify the stage name correctly for merged results.xml
-    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
     echo "Rerun report generation completed for stage: ${stageName}"
 }
