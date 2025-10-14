@@ -1471,7 +1471,7 @@ class BaseLlmArgs(StrictBaseModel):
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
                                            description="KV cache config.")
 
-    enable_chunked_prefill: bool = Field(default=False,
+    enable_chunked_prefill: bool = Field(default=True,
                                          description="Enable chunked prefill.")
 
     guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
