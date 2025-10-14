@@ -2058,13 +2058,16 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
             KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 50)},
                 50)); // Set all blocks to priority 50.
         kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
+        // Reserve new blocks 0,1,2
         kvCacheManager.storeContextBlocks(*llmRequest0);
         for (int i = 0; i < 3; i++)
         {
+            // i == 0 will reserve new block 3 for generated tokens
             kvCacheManager.addToken(0);
             llmRequest0->addNewToken(0, 0);
         }
         kvCacheManager.removeSequence(0, llmRequest0);
+        // Store blocks 0,1,2,3 with tokens [1,1,2,3] [4,5,6,7] [8,9,10,11] [0,0,0] at priority 50.
     }
     {
         auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
@@ -2073,15 +2076,28 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
         llmRequest1->setKvCacheRetentionConfig(KvCacheRetentionConfig(
             {}, KvCacheRetentionConfig::kMaxRetentionPriority, 20ms)); // Set decode blocks to max priority for 20ms.
         kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
+        // Reserve new blocks [4,5,6]
         kvCacheManager.storeContextBlocks(*llmRequest1);
         for (int i = 0; i < 3; i++)
         {
+            // i == 0 will reserve block 7 for generated tokens
             kvCacheManager.addToken(1);
             llmRequest1->addNewToken(0, 0);
         }
         kvCacheManager.removeSequence(1, llmRequest1);
+        // Store blocks 4,5,6,7 with tokens [0,1,2,3] [4,5,6,7] [8,9,10,11] [1,1,1]
+        // Assigned priorities are 4(35) 5(35) 6(35) 7(100). Block 7 retains max priority for 20ms
+        // Free queues at this point are:
+        //  35 : 4,5,6
+        //  50 : 0,1,2,3
+        // 100 : 7
     }
 
+    // Allow block 7's max priority to expire, demoting block from priority 100 to 35.
+    // Note that demoting block 7 priority puts block 7 at the back of the free queue,
+    // Free queues at this point are:
+    //  35 : 7,4,5,6
+    //  50 : 0,1,2,3
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     kvCacheManager.refreshBlocks();
 
@@ -2089,14 +2105,20 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
+    // No unused blocks available. Evict blocks 6,5 and reserve for new request.
     kvCacheManager.removeSequence(2, llmRequest2);
+    // Store blocks [6,5] for reuse.
+    // Free queues at this point are:
+    //  35 : 6,5,7,4
+    //  50 : 0,1,2,3
 
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
+    // Reuse block 4. Evict blocks 7 and 5.
 
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 8);
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
@@ -2289,6 +2311,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto llmRequest0
         = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId0, inputLength0, beamWidth, llmRequest0);
+    // Reserve block 0 with tokens [0,1,2,3]
     kvCacheManager.storeContextBlocks(*llmRequest0);
     GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId0);
 
@@ -2298,6 +2321,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
         llmRequest0->addNewToken(i, beamIdx);
         kvCacheManager.addToken(requestId0);
     }
+    // Reserve blocks 1,2 for generated tokens
 
     // Verify
     auto cacheBlockIds0 = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
@@ -2307,6 +2331,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
     auto middleBlock = blockManager.getBlockById(cacheBlockIds0[1], maxAttentionWindow);
     middleBlock->setPriority(0);
+    // Lower priority of block 1 to zero
 
     // Create another sequence with one block worth of context tokens (no reuse).
     int requestId1 = 1;
@@ -2315,48 +2340,59 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     auto llmRequest1
         = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId1, inputLength1, beamWidth, llmRequest1);
+    // seq1: Reserve block 3 for tokens [100,101,102,103]
     kvCacheManager.storeContextBlocks(*llmRequest1);
     GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId1);
 
     // Verify that all primary blocks are in use
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 
-    // Free first sequence
+    // Free seq0
     kvCacheManager.removeSequence(requestId0, llmRequest0);
+    // Store blocks 0,1,2 for reuse.
+    // Free queues are now:
+    //  0 : 1
+    // 35 : 0,2
 
     // Verify that 3 primary blocks are free.
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 3);
 
-    // Write one generated token to second sequence. This will prompt block 2 to be offloaded.
+    // Write one generated token to seq1. This will cause block 1 to be evicted 
+    // without offloading since priority is lower than minimum required for offloading.
     llmRequest1->addNewToken(104, beamIdx);
     kvCacheManager.addToken(requestId1);
+    // seq1: Reserve block 1 for tokens [104]
 
-    // Verify that block 2 has block 1 as parent and is in secondary memory
-    auto block2 = blockManager.getBlockById(2, maxAttentionWindow);
-    EXPECT_TRUE(block2->getPrevBlock() != nullptr);
-    EXPECT_EQ(block2->getPrevBlock()->getBlockId(), 1);
-    EXPECT_FALSE(block2->isPrimary());
+    // Verify that block 1 was assigned to seq1 and is in primary memory
+    auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({3, 1}));
+    auto block1 = blockManager.getBlockById(1, maxAttentionWindow);
+    EXPECT_TRUE(block1->isPrimary());
 
-    // Fill block
+    // Fill block with token 105,106,107
     for (int i = 101 + tokensPerBlock; i < 100 + 2 * tokensPerBlock; ++i)
     {
         llmRequest1->addNewToken(i, beamIdx);
         kvCacheManager.addToken(requestId1);
     }
 
-    // Verify
-    auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
-    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({3, 4}));
-
-    // Write one generated token to second sequence. This will prompt block 1 to be offloaded,
-    // but it cannot be because priority is lower than minimum required for offloading.
-    // WindowManager::getFreeBlock will instead free and detach block 2 (secondary block).
+    // Write one generated token to second sequence. This will prompt block 2 to be offloaded into block 4.
     llmRequest1->addNewToken(100 + 2 * tokensPerBlock, beamIdx);
     kvCacheManager.addToken(requestId1);
+    // seq1: Reserve block 4 for token [108]
 
-    // Verify that block 2 is free, has no parent and is in secondary memory
-    EXPECT_EQ(block2->getPrevBlock(), nullptr);
+    // Verify
+    cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({3, 1, 4}));
+
+    // Verify that block 2 has no parent (because block 1 was evicted) and is in secondary memory.
+    auto block2 = blockManager.getBlockById(2, maxAttentionWindow);
+    EXPECT_TRUE(block2->getPrevBlock() == nullptr);
     EXPECT_FALSE(block2->isPrimary());
+
+    // Verify that block 4 is in primary memory
+    auto block4 = blockManager.getBlockById(4, maxAttentionWindow);
+    EXPECT_TRUE(block4->isPrimary());
 
     // Cleanup
     kvCacheManager.removeSequence(requestId1, llmRequest1);

@@ -409,9 +409,9 @@ VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
 
 BlockPtr KVCacheBlock::getPrevBlock() const
 {
-    if (mLookupNode != nullptr)
+    if (mLookupNode != nullptr && mLookupNode->getPrevNode() != nullptr)
     {
-        return mLookupNode->getBlock(mWindowSize);
+        return mLookupNode->getPrevNode()->getBlock(mWindowSize);
     }
     return nullptr;
 }
