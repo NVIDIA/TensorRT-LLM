@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/mooncake_utils/transferAgent.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/ipUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -234,61 +235,21 @@ bool MooncakeBase64Helper::isWhitespace(uint8_t c)
     return (c == ' ' || c == '\n' || c == '\r' || c == '\t');
 }
 
-static std::vector<std::string> findLocalIpAddresses()
-{
-    std::vector<std::string> ips;
-    struct ifaddrs *ifaddr, *ifa;
-
-    if (getifaddrs(&ifaddr) == -1)
-    {
-        return ips;
-    }
-
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
-    {
-        if (ifa->ifa_addr == nullptr)
-        {
-            continue;
-        }
-
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            if (strcmp(ifa->ifa_name, "lo") == 0)
-            {
-                continue;
-            }
-
-            // Check if interface is UP and RUNNING
-            if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING))
-            {
-                TLLM_LOG_INFO("Skipping interface %s (not UP or not RUNNING)", ifa->ifa_name);
-                continue;
-            }
-
-            char host[NI_MAXHOST];
-            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST)
-                == 0)
-            {
-                ips.push_back(host);
-            }
-        }
-    }
-
-    freeifaddrs(ifaddr);
-    return ips;
-}
-
 MooncakeTransferAgent::MooncakeTransferAgent(BaseAgentConfig const& config)
 {
     mLocalAgentName = config.mName;
     std::string segmentName = "127.0.0.1";
 
-    auto ips = findLocalIpAddresses();
-    if (!ips.empty())
-        segmentName = ips[0];
-
     if (getenv("TLLM_MOONCAKE_IP_ADDR"))
+    {
         segmentName = std::string(getenv("TLLM_MOONCAKE_IP_ADDR"));
+    }
+    else
+    {
+        auto ip = common::getLocalIp(common::getEnvMooncakeInterface(), mpi::MpiComm::session().getRank());
+        if (!ip.empty())
+            segmentName = ip;
+    }
 
     mEngine = createTransferEngine("P2PHANDSHAKE", segmentName.c_str(), "", 0, true);
 }

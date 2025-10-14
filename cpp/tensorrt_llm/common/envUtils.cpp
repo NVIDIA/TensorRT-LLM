@@ -318,6 +318,23 @@ std::string getEnvNixlInterface()
     return nixlInterface;
 }
 
+std::string getEnvMooncakeInterface()
+{
+    static std::once_flag flag;
+    static std::string mooncakeInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* mooncake_interface = std::getenv("TRTLLM_MOONCAKE_INTERFACE");
+            if (mooncake_interface)
+            {
+                mooncakeInterface = mooncake_interface;
+            }
+        });
+    return mooncakeInterface;
+}
+
 bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");

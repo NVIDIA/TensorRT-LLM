@@ -89,6 +89,8 @@ std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();
 
+std::string getEnvMooncakeInterface();
+
 bool getEnvDisaggLayerwise();
 
 bool getEnvParallelCacheSend();

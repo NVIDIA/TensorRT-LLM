@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,25 +15,9 @@
  * limitations under the License.
  */
 
-#pragma once
+#include <string>
 
-#include "tensorrt_llm/executor/transferAgent.h"
-
-namespace tensorrt_llm::executor::kv_cache
+namespace tensorrt_llm::common
 {
-
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-
-extern "C"
-{
-    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createMooncakeTransferAgent(BaseAgentConfig const* config);
-}
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
-
-} // namespace tensorrt_llm::executor::kv_cache
+std::string getLocalIp(std::string interface, int rank);
+} // namespace tensorrt_llm::common
