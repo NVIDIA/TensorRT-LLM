@@ -161,11 +161,11 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
 ## OSS Compliance & Legal - License/Attribution Protection
 ## IMPORTANT: Changes to any files below may impact legal compliance, attributions, and third-party licenses.
-## These files require review from the OSS compliance team before merging to ensure proper attribution
+## These files require review from the TRTLLM OSS compliance team before merging to ensure proper attribution
 ## and license compliance when adding, removing, or changing versions of dependencies.
 ### License Files
 /LICENSE @NVIDIA/trt-llm-oss-compliance
-/jenkins/license_cpp.json @NVIDIA/trt-llm-oss-compliance
+/jenkins/license_cpp.json @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
 ### Python Dependency Management
 /setup.py @NVIDIA/trt-llm-oss-compliance
@@ -184,7 +184,10 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
 ### Docker & Installation Scripts
 ## These scripts install and pin dependency versions
-/docker/common/** @NVIDIA/trt-llm-oss-compliance
+/docker/common/** @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+
+### CODEOWNERS file itself
+/.github/CODEOWNERS @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
 # The following rule should only be uncommented on release branches (e.g., release/0.19).
 # The rule below requires that any PR to release/**/* branches must be approved by at least one member
