@@ -71,14 +71,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             attn_backend="torch",
             compile_backend="torch-simple",
         ),
-        # disabled due to https://nvbugspro.nvidia.com/bug/5505835
         get_small_model_config_pytest_param(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            pytest_param_kwargs={
-                "marks": pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5505835")
-            },
             attn_backend="flashinfer",
-            compile_backend="torch-simple",
+            compile_backend="torch-opt",
         ),
         get_small_model_config_pytest_param(
             "deepseek-ai/DeepSeek-V3",
@@ -93,7 +89,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         get_small_model_config_pytest_param(
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
             attn_backend="flashinfer",
-            compile_backend="torch-simple",
+            compile_backend="torch-cudagraph",
         ),
         get_small_model_config_pytest_param(
             "nvidia/NVIDIA-Nemotron-Nano-12B-v2",
