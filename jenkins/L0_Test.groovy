@@ -303,7 +303,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated")
+            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
             if (isRerunFailed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated tests failed after rerun attempt"
@@ -1716,11 +1716,20 @@ def generateRerunReport(stageName, llmSrc) {
 
     def rerunBaseDir = "${WORKSPACE}/${stageName}/rerun"
     def regularRerunDir = "${rerunBaseDir}/regular"
-    def isolatedRerunDir = "${rerunBaseDir}/isolated"
 
-    // Check if any rerun directories exist
+    // Check if regular rerun directory exists
     def hasRegularReruns = sh(script: "[ -d '${regularRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
-    def hasIsolatedReruns = sh(script: "[ -d '${isolatedRerunDir}' ] && echo 'true' || echo 'false'", returnStdout: true).trim() == 'true'
+
+    // Find all isolated rerun directories (isolated_0, isolated_1, etc.)
+    def isolatedRerunDirs = []
+    def isolatedDirsOutput = sh(script: "find ${rerunBaseDir} -type d -name 'isolated_*' 2>/dev/null || true", returnStdout: true).trim()
+    if (isolatedDirsOutput) {
+        isolatedRerunDirs = isolatedDirsOutput.split('\n').findAll { it.trim() }
+    }
+    def hasIsolatedReruns = isolatedRerunDirs.size() > 0
+
+    echo "Found regular reruns: ${hasRegularReruns}"
+    echo "Found isolated rerun directories: ${isolatedRerunDirs}"
 
     if (!hasRegularReruns && !hasIsolatedReruns) {
         echo "No rerun results found, skipping rerun report generation"
@@ -1755,12 +1764,15 @@ def generateRerunReport(stageName, llmSrc) {
         }
     }
 
-    // Add isolated rerun results
+    // Add isolated rerun results from all isolated directories
     if (hasIsolatedReruns) {
-        for (times in [1, 2]) {
-            def rerunFile = "${isolatedRerunDir}/rerun_results_${times}.xml"
-            if (fileExists(rerunFile)) {
-                allInputFiles.add(rerunFile)
+        isolatedRerunDirs.each { isolatedDir ->
+            for (times in [1, 2]) {
+                def rerunFile = "${isolatedDir}/rerun_results_${times}.xml"
+                if (fileExists(rerunFile)) {
+                    allInputFiles.add(rerunFile)
+                    echo "Added isolated rerun result: ${rerunFile}"
+                }
             }
         }
     }
@@ -1802,7 +1814,7 @@ def generateRerunReport(stageName, llmSrc) {
     sh "rm -rf ${WORKSPACE}/${stageName}/results_isolated_*.xml || true"
 
     // Specify the stage name correctly for merged results.xml
-    sh "cd cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
     echo "Rerun report generation completed for stage: ${stageName}"
 }
