@@ -2,8 +2,8 @@
 
 from typing import Optional, Tuple, Type
 
+import torch.nn as nn
 from pydantic import Field
-from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -36,22 +36,22 @@ class LoadWeightsToDevice(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return MoveDeviceConfig
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         factory.load_or_random_init(
-            gm,
+            mod,
             device=self.config.adconfig_checkpoint_device or self.config.device,
         )
-        move_to_device(gm, self.config.device)
+        move_to_device(mod, self.config.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
-        return gm, info
+        return mod, info
 
 
 @TransformRegistry.register("move_inputs_to_device")
@@ -64,15 +64,15 @@ class LoadFactoryModelWeights(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return MoveDeviceConfig
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         cm.to(self.config.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
-        return gm, info
+        return mod, info

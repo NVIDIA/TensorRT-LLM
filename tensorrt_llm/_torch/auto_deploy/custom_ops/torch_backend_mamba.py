@@ -113,7 +113,6 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
 
 @torch.library.custom_op("auto_deploy::torch_ssm_prepare_metadata", mutates_args=())
 def _torch_ssm_prepare_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
@@ -127,7 +126,7 @@ def _torch_ssm_prepare_metadata(
     Returns a tuple of (seq_len_sanitized, seq_start, slot_idx_sanitized).
     """
     # Determine number of active sequences and compute seq_start boundaries
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
 
     seq_start = torch.zeros_like(seq_len_sanitized)
@@ -142,10 +141,10 @@ def _torch_ssm_prepare_metadata(
 
 @_torch_ssm_prepare_metadata.register_fake
 def _torch_ssm_prepare_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
     # Use the same sanitization logic to determine sizes in fake mode
-    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len_sanitized = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len_sanitized)
     return (
         torch.empty_like(seq_len_sanitized),
