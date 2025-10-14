@@ -1,4 +1,5 @@
 import contextlib
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -7,6 +8,7 @@ from typing import Dict, List
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -291,9 +293,14 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # We use heuristic to determine the lm_head_tp_size
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
-    lm_head_tp_size_raw = 256 // token_count
-    lm_head_tp_size = nearest_in_buckets(lm_head_tp_size_raw,
-                                         [1, mapping.gpus_per_node])
+    math_bound_token_count = 256
+    max_lm_head_tp_size = 8
+
+    lm_head_tp_size_raw = math_bound_token_count // token_count
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw, [1, max_lm_head_tp_size])))
     assert mapping.tp_size % lm_head_tp_size == 0
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
