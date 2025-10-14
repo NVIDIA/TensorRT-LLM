@@ -78,7 +78,7 @@ RUN if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
         rm rename_pytorch_triton_to_triton.sh; \
     else \
-        bash ./install.sh --rename_pytorch_triton_to_triton && rm rename_pytorch_triton_to_triton.sh
+        bash ./rename_pytorch_triton_to_triton.sh && rm rename_pytorch_triton_to_triton.sh
     fi
 
 
