@@ -16,6 +16,7 @@ try:
 except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
+from .._ray_utils import unwrap_ray_errors
 from .._utils import mpi_disabled, nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
@@ -274,8 +275,8 @@ class GenerationResultBase:
             else:
                 self.queue = ray_queue
                 self.aqueue = None
-
-            ray.get(self.queue.register.remote(id))
+            with unwrap_ray_errors():
+                ray.get(self.queue.register.remote(id))
         else:
             if has_event_loop():
                 self.aqueue = AsyncQueue()
@@ -735,7 +736,8 @@ class GenerationResult(GenerationResultBase):
 
     def _result_step(self, timeout: Optional[float] = None):
         if mpi_disabled():
-            response = ray.get(self.queue.get.remote(self.request_id))
+            with unwrap_ray_errors():
+                response = ray.get(self.queue.get.remote(self.request_id))
             response = self._handle_ray_response(response)
         else:
             response = self.queue.get()
