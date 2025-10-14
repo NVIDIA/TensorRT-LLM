@@ -236,7 +236,7 @@ To set a timeout for specific long-running test cases, follow these steps:
    disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
    ```
 
-## 6. Set ISOLATION for cases individually
+## 6. Set isolated execution for cases individually
 
 Some test cases may experience intermittent failures due to resource conflicts, memory leaks, or state pollution when run together with other tests. The `ISOLATION` marker ensures these cases run in a separate pytest process, avoiding such issues.
 
