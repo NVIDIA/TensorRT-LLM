@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 cd /usr/local/lib/python3.12/dist-packages/
 ls -la | grep pytorch_triton
 mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info
