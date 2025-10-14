@@ -183,6 +183,10 @@ methods:
         annotation: Optional[Literal["rpc", "ray"]]
         default: null
         status: prototype
+      sparse_attention_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:

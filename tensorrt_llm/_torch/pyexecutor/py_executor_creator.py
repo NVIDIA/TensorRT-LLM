@@ -31,7 +31,6 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..utils import _get_allow_chain_drafter
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -224,7 +223,7 @@ def create_py_executor(
             llm_args.peft_cache_config)
 
     assert llm_args.kv_cache_config, "Expect llm_args.kv_cache_config is not None"
-    kv_cache_config = PybindMirror.maybe_to_pybind(llm_args.kv_cache_config)
+    kv_cache_config = llm_args.kv_cache_config
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
@@ -252,7 +251,9 @@ def create_py_executor(
     if max_num_tokens is None:
         max_num_tokens = 8192
 
-    tokens_per_block = llm_args.kv_cache_config.tokens_per_block
+    tokens_per_block = kv_cache_config.tokens_per_block
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        tokens_per_block = max_num_tokens
 
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
@@ -309,6 +310,8 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+    sparse_attention_config = llm_args.sparse_attention_config
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -332,6 +335,7 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
             lora_config=lora_config,
             checkpoint_loader=checkpoint_loader,
         )
@@ -344,13 +348,11 @@ def create_py_executor(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            if _get_allow_chain_drafter():
-                use_chain_drafter = (
-                    guided_decoding_config is None
-                    and draft_spec_config._allow_greedy_draft_tokens
-                    and pytorch_backend_config.attn_backend == "TRTLLM")
-            else:
-                use_chain_drafter = False
+            use_chain_drafter = (
+                guided_decoding_config is None
+                and draft_spec_config._allow_chain_drafter
+                and draft_spec_config._allow_greedy_draft_tokens
+                and pytorch_backend_config.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
@@ -571,6 +573,7 @@ def create_py_executor(
             kv_cache_config=kv_cache_config,
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(

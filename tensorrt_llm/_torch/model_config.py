@@ -121,6 +121,7 @@ class ModelConfig(Generic[TConfig]):
 
     spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     is_generation: bool = True
     max_num_tokens: int = 8192

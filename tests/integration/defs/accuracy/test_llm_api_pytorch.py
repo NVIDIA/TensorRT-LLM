@@ -88,6 +88,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
+    def test_dummy_load_format(self):
+        llm = LLM(self.MODEL_PATH, load_format="dummy")
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
+    @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_bfloat16(self, attn_backend, torch_compile):
@@ -644,6 +651,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
+@pytest.mark.timeout(14400)
 class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
@@ -1895,8 +1903,20 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    def test_dummy_load_format(self):
+        llm = LLM(
+            f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+            load_format="dummy",
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
+        )
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
 
-@pytest.mark.timeout(7200)
+
+@pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-R1"
@@ -2641,6 +2661,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    def test_dummy_load_format(self):
+        llm = LLM(
+            f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+            load_format="dummy",
+        )
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,is_cached",
         [(1, 1, 1, False, True, True, True),
@@ -2758,6 +2788,16 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_dummy_load_format(self):
+        llm = LLM(
+            f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
+            load_format="dummy",
+        )
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
 
     @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])
@@ -3295,6 +3335,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    def test_dummy_load_format(self):
+        llm = LLM(
+            f"{llm_models_root()}/gpt_oss/gpt-oss-20b",
+            load_format="dummy",
+        )
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm, is_integration_test=True)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -3522,6 +3572,37 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3NextThinking(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Thinking"
+    MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 4)],
+                             ids=["tp4ep4"])
+    def test_auto_dtype(self, tp_size, pp_size, ep_size):
+        if get_device_count() != tp_size * pp_size:
+            pytest.skip("Device count mismatch with world size")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=720)
+
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=4096,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
