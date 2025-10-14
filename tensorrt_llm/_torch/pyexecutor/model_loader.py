@@ -160,6 +160,7 @@ class ModelLoader:
                  pytorch_backend_config: PyTorchConfig,
                  mapping: Mapping,
                  spec_config: Optional["DecodingBaseConfig"],
+                 sparse_attention_config: Optional["SparseAttentionConfig"],
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
                  lora_config: Optional[LoraConfig] = None):
@@ -177,6 +178,7 @@ class ModelLoader:
         self.pytorch_backend_config = pytorch_backend_config
         self.mapping = mapping
         self.spec_config = spec_config
+        self.sparse_attention_config = sparse_attention_config
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
@@ -294,6 +296,7 @@ class ModelLoader:
             force_dynamic_quantization=self.pytorch_backend_config.
             force_dynamic_quantization,
             spec_config=self.spec_config,
+            sparse_attention_config=self.sparse_attention_config,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.pytorch_backend_config.moe_max_num_tokens,
