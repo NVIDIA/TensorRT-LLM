@@ -999,7 +999,7 @@ class RocketKVCacheManager(KVCacheManager):
         self.free_blocks.extend(page_list)
 
     def compute_page_count(self, token_count: int, tokens_per_page: int) -> int:
-        return (token_count + tokens_per_page) // tokens_per_page
+        return (token_count + tokens_per_page - 1) // tokens_per_page
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
