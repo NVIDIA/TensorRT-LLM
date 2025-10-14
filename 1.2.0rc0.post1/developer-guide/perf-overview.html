@@ -1,0 +1,1698 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Overview &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/perf-overview';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0.post1';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.2.0rc0.post1" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Overview</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="overview">
+<span id="perf-overview"></span><h1>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h1>
+<p>This document summarizes performance measurements of TensorRT-LLM on a number of GPUs across a set of key models.</p>
+<p>The data in the following tables is provided as a reference point to help users validate observed performance.
+It should <em>not</em> be considered as the peak performance that can be delivered by TensorRT-LLM.</p>
+<p>We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
+Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situaiton.</p>
+<p>For DeepSeek R1 performance, please check out our <a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html"><span class="std std-doc">performance guide</span></a></p>
+<p>For more information on benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> see this NVIDIA <a class="reference external" href="https://developer.nvidia.com/blog/llm-inference-benchmarking-performance-tuning-with-tensorrt-llm/">blog post</a>.</p>
+<section id="throughput-measurements">
+<h2>Throughput Measurements<a class="headerlink" href="#throughput-measurements" title="Link to this heading">#</a></h2>
+<p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
+and shows the throughput scenario under maximum load. The reported metric is <code class="docutils literal notranslate"><span class="pre">Total</span> <span class="pre">Output</span> <span class="pre">Throughput</span> <span class="pre">(tokens/sec)</span></code>.</p>
+<p>The performance numbers below were collected using the steps described in this document.</p>
+<p>Testing was performed on models with weights quantized using <a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/#">ModelOpt</a> and published by NVIDIA on the <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">Model Optimizer HuggingFace Collection</a>.</p>
+<p><em>(NEW for v1.0) RTX 6000 Pro Blackwell Server Edition Benchmarks:</em></p>
+<p>RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network.</p>
+<section id="hardware">
+<h3>Hardware<a class="headerlink" href="#hardware" title="Link to this heading">#</a></h3>
+<p>The following GPU variants were used for testing:</p>
+<ul class="simple">
+<li><p>H100 SXM 80GB (DGX H100)</p></li>
+<li><p>H200 SXM 141GB (DGX H200)</p></li>
+<li><p>B200 180GB (DGX B200)</p></li>
+<li><p>GB200 192GB (GB200 NVL72)</p></li>
+<li><p>RTX 6000 Pro Blackwell Server Edition</p></li>
+</ul>
+<p>Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.</p>
+</section>
+<section id="fp4-models">
+<h3>FP4 Models<a class="headerlink" href="#fp4-models" title="Link to this heading">#</a></h3>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvidia/Llama-3.3-70B-Instruct-FP4
+nvidia/Llama-3.1-405B-Instruct-FP4
+nvidia/Qwen3-235B-A22B-FP4
+nvidia/Qwen3-30B-A3B-FP4
+nvidia/DeepSeek-R1-0528-FP4
+</pre></div>
+</div>
+</section>
+<section id="fp8-models">
+<h3>FP8 Models<a class="headerlink" href="#fp8-models" title="Link to this heading">#</a></h3>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvidia/Llama-3.1-8B-Instruct-FP8
+nvidia/Llama-3.3-70B-Instruct-FP8
+nvidia/Llama-3.1-405B-Instruct-FP8
+nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
+nvidia/Qwen3-235B-A22B-FP8
+</pre></div>
+</div>
+<section id="llama-4-scout">
+<h4>Llama 4 Scout<a class="headerlink" href="#llama-4-scout" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP1 (FP4)</p></th>
+<th class="head"><p>GB200<br/>TP1 (FP4)</p></th>
+<th class="head"><p>H200<br/>TP4 (FP8)</p></th>
+<th class="head"><p>H100<br/>TP4 (FP8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>14,699</p></td>
+<td><p>15,238</p></td>
+<td><p>34,316</p></td>
+<td><p>15,130</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>8,932</p></td>
+<td><p>9,556</p></td>
+<td><p>21,332</p></td>
+<td><p>8,603</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>11,977</p></td>
+<td><p>11,795</p></td>
+<td><p>24,630</p></td>
+<td><p>12,399</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>10,591</p></td>
+<td><p>7,738</p></td>
+<td><p>21,636</p></td>
+<td><p>12,129</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>9,356</p></td>
+<td><p>8,581</p></td>
+<td><p>18,499</p></td>
+<td><p>9,838</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>3,137</p></td>
+<td><p>3,295</p></td>
+<td><p>3,699</p></td>
+<td><p>3,253</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>7,152</p></td>
+<td><p>7,464</p></td>
+<td><p>14,949</p></td>
+<td><p>7,972</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>2,937</p></td>
+<td><p>3,107</p></td>
+<td><p>4,605</p></td>
+<td><p>3,342</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>1,644</p></td>
+<td><p>1,767</p></td>
+<td><p>2,105</p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>RTX 6000 Pro Blackwell Server Edition</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p><strong>4 GPUs</strong><br/>TP2,PP2 (FP4)</p></th>
+<th class="head"><p><strong>8 GPUs</strong><br/>TP4,PP2 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>12,321</p></td>
+<td><p>21,035</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>7,643</p></td>
+<td><p>13,421</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/1000</p></td>
+<td><p>9,476</p></td>
+<td><p>15,781</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/2000</p></td>
+<td><p>8,919</p></td>
+<td><p>16,434</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/128</p></td>
+<td><p>2,615</p></td>
+<td><p>2,941</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/2048</p></td>
+<td><p>6,208</p></td>
+<td><p>10,410</p></td>
+</tr>
+<tr class="row-even"><td><p>5000/500</p></td>
+<td><p>2,662</p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="llama-3-3-70b">
+<h4>Llama 3.3 70B<a class="headerlink" href="#llama-3-3-70b" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP1 (FP4)</p></th>
+<th class="head"><p>GB200<br/>TP1 (FP4)</p></th>
+<th class="head"><p>H200<br/>TP1 (FP8)</p></th>
+<th class="head"><p>H100<br/>TP2 (FP8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>9,922</p></td>
+<td><p>11,309</p></td>
+<td><p>4,336</p></td>
+<td><p>6,651</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>6,831</p></td>
+<td><p>7,849</p></td>
+<td><p>2,872</p></td>
+<td><p>4,199</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>7,762</p></td>
+<td><p>9,028</p></td>
+<td><p>3,666</p></td>
+<td><p>5,222</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>7,007</p></td>
+<td><p>7,326</p></td>
+<td><p>2,909</p></td>
+<td><p>4,205</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>6,271</p></td>
+<td><p>6,513</p></td>
+<td><p>2,994</p></td>
+<td><p>4,146</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>1,339</p></td>
+<td><p>1,450</p></td>
+<td><p>442</p></td>
+<td><p>762</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>4,783</p></td>
+<td><p>5,646</p></td>
+<td><p>2,003</p></td>
+<td><p>3,082</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>1,459</p></td>
+<td><p>1,602</p></td>
+<td><p>566</p></td>
+<td><p>898</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>665</p></td>
+<td><p>755</p></td>
+<td><p>283</p></td>
+<td><p>437</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>RTX 6000 Pro Blackwell Server Edition</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p><strong>1 GPUs</strong><br/>TP1,PP1 (FP4)</p></th>
+<th class="head"><p><strong>2 GPUs</strong><br/>TP1,PP2 (FP4)</p></th>
+<th class="head"><p><strong>4 GPUs</strong><br/>TP1,PP4 (FP4)</p></th>
+<th class="head"><p><strong>8 GPUs</strong><br/>TP1,PP8 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>2,422</p></td>
+<td><p>4,993</p></td>
+<td><p>7,922</p></td>
+<td><p>9,833</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>1,349</p></td>
+<td><p>2,893</p></td>
+<td><p>4,978</p></td>
+<td><p>7,352</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>1,856</p></td>
+<td><p>4,114</p></td>
+<td><p>6,939</p></td>
+<td><p>9,435</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>1,787</p></td>
+<td><p>3,707</p></td>
+<td><p>5,961</p></td>
+<td><p>8,166</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>1,594</p></td>
+<td><p>2,993</p></td>
+<td><p>5,274</p></td>
+<td><p>6,943</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>393</p></td>
+<td><p>813</p></td>
+<td><p>1,511</p></td>
+<td><p>2,495</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>1,074</p></td>
+<td><p>2,336</p></td>
+<td><p>3,870</p></td>
+<td><p>6,078</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>401</p></td>
+<td><p>812</p></td>
+<td><p>1,511</p></td>
+<td><p>2,491</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>142</p></td>
+<td><p>319</p></td>
+<td><p>630</p></td>
+<td><p>1,148</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="qwen3-235b-a22b">
+<h4>Qwen3-235B-A22B<a class="headerlink" href="#qwen3-235b-a22b" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP8 (FP4)</p></th>
+<th class="head"><p>H200<br/>TP8 (FP8)</p></th>
+<th class="head"><p>H100<br/>TP8 (FP8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>66,057</p></td>
+<td><p>42,821</p></td>
+<td><p>19,658</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>39,496</p></td>
+<td><p>26,852</p></td>
+<td><p>12,447</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>57,117</p></td>
+<td><p>28,026</p></td>
+<td><p>18,351</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>42,391</p></td>
+<td><p>23,789</p></td>
+<td><p>14,898</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>34,105</p></td>
+<td><p>22,061</p></td>
+<td><p>15,136</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>7,329</p></td>
+<td><p>3,331</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>26,854</p></td>
+<td><p>16,672</p></td>
+<td><p>9,924</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>8,190</p></td>
+<td><p>3,623</p></td>
+<td><p>3,225</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>4,453</p></td>
+<td><p>1,876</p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>RTX 6000 Pro Blackwell Server Edition</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p><strong>8 GPUs</strong><br/>TP2,PP4 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>12,494</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>7,715</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>11,157</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>10,697</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>10,109</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>3,181</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>6,712</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>3,173</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="qwen3-30b-a3b">
+<h4>Qwen3-30B-A3B<a class="headerlink" href="#qwen3-30b-a3b" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP1 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>37,844</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>24,953</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>27,817</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>25,828</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>22,051</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>6,251</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>17,554</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>6,142</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>2,944</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>RTX 6000 Pro Blackwell Server Edition</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p><strong>1 GPUs</strong><br/>TP1,PP1 (FP4)</p></th>
+<th class="head"><p><strong>2 GPUs</strong><br/>TP2,PP1 (FP4)</p></th>
+<th class="head"><p><strong>4 GPUs</strong><br/>TP4,PP1 (FP4)</p></th>
+<th class="head"><p><strong>8 GPUs</strong><br/>TP8,PP1 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>12,540</p></td>
+<td><p>22,744</p></td>
+<td><p>35,715</p></td>
+<td><p>52,676</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>7,491</p></td>
+<td><p>15,049</p></td>
+<td><p>28,139</p></td>
+<td><p>33,895</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>10,695</p></td>
+<td><p>17,266</p></td>
+<td><p>26,175</p></td>
+<td><p>44,088</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>9,910</p></td>
+<td><p>16,431</p></td>
+<td><p>24,046</p></td>
+<td><p>31,785</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>8,378</p></td>
+<td><p>13,323</p></td>
+<td><p>25,131</p></td>
+<td><p>28,881</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>3,257</p></td>
+<td><p>3,785</p></td>
+<td><p>4,311</p></td>
+<td><p>4,798</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>5,908</p></td>
+<td><p>10,679</p></td>
+<td><p>18,134</p></td>
+<td><p>22,391</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>2,530</p></td>
+<td><p>3,799</p></td>
+<td><p>5,212</p></td>
+<td><p>5,965</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>871</p></td>
+<td><p>1,558</p></td>
+<td><p>2,551</p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="deepseek-r1">
+<h4>DeepSeek R1<a class="headerlink" href="#deepseek-r1" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP8 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>62,599</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>44,046</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/1000</p></td>
+<td><p>37,634</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/2000</p></td>
+<td><p>40,538</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/128</p></td>
+<td><p>5,026</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/2048</p></td>
+<td><p>28,852</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="llama-4-maverick">
+<h4>Llama 4 Maverick<a class="headerlink" href="#llama-4-maverick" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP8 (FP4)</p></th>
+<th class="head"><p>H200<br/>TP8 (FP8)</p></th>
+<th class="head"><p>H100<br/>TP8 (FP8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>112,676</p></td>
+<td><p>40,572</p></td>
+<td><p>10,829</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>68,170</p></td>
+<td><p>24,616</p></td>
+<td><p>6,744</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p></p></td>
+<td><p>37,835</p></td>
+<td><p>10,108</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>79,617</p></td>
+<td><p>31,782</p></td>
+<td><p>9,677</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>63,766</p></td>
+<td><p>34,734</p></td>
+<td><p>9,151</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>18,088</p></td>
+<td><p>7,307</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>52,195</p></td>
+<td><p>20,957</p></td>
+<td><p>6,916</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p></p></td>
+<td><p>8,456</p></td>
+<td><p>3,457</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>12,678</p></td>
+<td><p>4,106</p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>RTX 6000 Pro Blackwell Server Edition</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p><strong>8 GPUs</strong><br/>TP4,PP2 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>19,146</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>12,165</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>17,870</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>15,954</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>12,456</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>4,463</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>10,727</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>4,613</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="llama-3-1-405b">
+<h4>Llama 3.1 405B<a class="headerlink" href="#llama-3-1-405b" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>B200<br/>TP4 (FP4)</p></th>
+<th class="head"><p>GB200<br/>TP4 (FP4)</p></th>
+<th class="head"><p>H200<br/>TP8 (FP8)</p></th>
+<th class="head"><p>H100<br/>TP8 (FP8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>8,020</p></td>
+<td><p>8,151</p></td>
+<td><p>5,348</p></td>
+<td><p>4,340</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>6,345</p></td>
+<td><p>6,608</p></td>
+<td><p>4,741</p></td>
+<td><p>3,116</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>6,244</p></td>
+<td><p>6,540</p></td>
+<td><p>4,724</p></td>
+<td><p>3,994</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>5,209</p></td>
+<td><p>5,389</p></td>
+<td><p>3,330</p></td>
+<td><p>2,919</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>4,933</p></td>
+<td><p>5,135</p></td>
+<td><p>3,722</p></td>
+<td><p>2,895</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>749</p></td>
+<td><p>797</p></td>
+<td><p>456</p></td>
+<td><p>453</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>4,212</p></td>
+<td><p>4,407</p></td>
+<td><p>2,948</p></td>
+<td><p>2,296</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>1,048</p></td>
+<td><p>1,112</p></td>
+<td><p>650</p></td>
+<td><p>610</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>672</p></td>
+<td><p>739</p></td>
+<td><p>505</p></td>
+<td><p>345</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>RTX 6000 Pro Blackwell Server Edition</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p><strong>8 GPUs</strong><br/>TP1,PP8 (FP4)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>2,981</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>2,369</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>1,931</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>579</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>1,442</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="llama-3-1-8b">
+<h4>Llama 3.1 8B<a class="headerlink" href="#llama-3-1-8b" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Sequence Length (ISL/OSL)</p></th>
+<th class="head"><p>H200<br/>TP1 (FP8)</p></th>
+<th class="head"><p>H100<br/>TP1 (FP8)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128/2048</p></td>
+<td><p>26,221</p></td>
+<td><p>22,714</p></td>
+</tr>
+<tr class="row-odd"><td><p>128/4096</p></td>
+<td><p>18,027</p></td>
+<td><p>14,325</p></td>
+</tr>
+<tr class="row-even"><td><p>500/2000</p></td>
+<td><p>20,770</p></td>
+<td><p>17,660</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000/1000</p></td>
+<td><p>17,744</p></td>
+<td><p>15,220</p></td>
+</tr>
+<tr class="row-even"><td><p>1000/2000</p></td>
+<td><p>16,828</p></td>
+<td><p>13,899</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048/128</p></td>
+<td><p>3,538</p></td>
+<td><p>3,450</p></td>
+</tr>
+<tr class="row-even"><td><p>2048/2048</p></td>
+<td><p>12,194</p></td>
+<td><p>9,305</p></td>
+</tr>
+<tr class="row-odd"><td><p>5000/500</p></td>
+<td><p>3,902</p></td>
+<td><p>3,459</p></td>
+</tr>
+<tr class="row-even"><td><p>20000/2000</p></td>
+<td><p>1,804</p></td>
+<td><p>1,351</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+</section>
+<section id="reproducing-benchmarked-results">
+<h2>Reproducing Benchmarked Results<a class="headerlink" href="#reproducing-benchmarked-results" title="Link to this heading">#</a></h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Only the models shown in the table above are supported by this workflow.</p>
+</div>
+<p>The following tables are references for commands that are used as part of the benchmarking process. For a more detailed description of this benchmarking workflow, see the <a class="reference internal" href="perf-benchmarking.html"><span class="std std-doc">benchmarking suite documentation</span></a>.</p>
+<section id="command-overview">
+<h3>Command Overview<a class="headerlink" href="#command-overview" title="Link to this heading">#</a></h3>
+<p>Starting with v0.19, testing was performed using the PyTorch backend - this workflow does not require an engine to be built.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Stage</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Command</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset">Dataset</a></p></td>
+<td><p>Create a synthetic dataset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">--stdout</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span> <span class="pre">&gt;</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#running-the-benchmark">Run</a></p></td>
+<td><p>Run a benchmark with a dataset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">throughput</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span> <span class="pre">--backend</span> <span class="pre">pytorch</span> <span class="pre">--extra_llm_api_options</span> <span class="pre">$llm_options</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="variables">
+<h3>Variables<a class="headerlink" href="#variables" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Name</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$isl</span></code></p></td>
+<td><p>Benchmark input sequence length.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$osl</span></code></p></td>
+<td><p>Benchmark output sequence length.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></td>
+<td><p>Tensor parallel mapping degree to run the benchmark with</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$pp_size</span></code></p></td>
+<td><p>Pipeline parallel mapping degree to run the benchmark with</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$ep_size</span></code></p></td>
+<td><p>Expert parallel mapping degree to run the benchmark with</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_name</span></code></p></td>
+<td><p>HuggingFace model name eg. meta-llama/Llama-2-7b-hf or use the path to a local weights directory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code></p></td>
+<td><p>Location of the dataset file generated by <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$num_requests</span></code></p></td>
+<td><p>The number of requests to generate for dataset generation</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$seq_len</span></code></p></td>
+<td><p>A sequence length of ISL + OSL</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$llm_options</span></code></p></td>
+<td><p>(optional) A yaml file containing additional options for the LLM API</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="preparing-a-dataset">
+<h3>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading">#</a></h3>
+<p>In order to prepare a dataset, you can use the provided <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6632b40/benchmarks/cpp/prepare_dataset.py">script</a>.
+To generate a synthetic dataset, run the following command:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>--stdout<span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$dataset_file</span>
+</pre></div>
+</div>
+<p>The command will generate a text file located at the path specified <code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code> where all requests are of the same
+input/output sequence length combinations. The script works by using the tokenizer to retrieve the vocabulary size and
+randomly sample token IDs from it to create entirely random sequences. In the command above, all requests will be uniform
+because the standard deviations for both input and output sequences are set to 0.</p>
+<p>For each input and output sequence length combination, the table below details the <code class="docutils literal notranslate"><span class="pre">$num_requests</span></code> that were used. For
+shorter input and output lengths, a larger number of messages were used to guarantee that the system hit a steady state
+because requests enter and exit the system at a much faster rate. For longer input/output sequence lengths, requests
+remain in the system longer and therefore require less requests to achieve steady state.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Input Length</p></th>
+<th class="head"><p>Output Length</p></th>
+<th class="head"><p>$seq_len</p></th>
+<th class="head"><p>$num_requests</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>128</p></td>
+<td><p>128</p></td>
+<td><p>256</p></td>
+<td><p>30000</p></td>
+</tr>
+<tr class="row-odd"><td><p>128</p></td>
+<td><p>2048</p></td>
+<td><p>2176</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>128</p></td>
+<td><p>4096</p></td>
+<td><p>4224</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000</p></td>
+<td><p>2000</p></td>
+<td><p>3000</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-even"><td><p>2048</p></td>
+<td><p>128</p></td>
+<td><p>2176</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-odd"><td><p>2048</p></td>
+<td><p>2048</p></td>
+<td><p>4096</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-even"><td><p>5000</p></td>
+<td><p>500</p></td>
+<td><p>5500</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-odd"><td><p>1000</p></td>
+<td><p>1000</p></td>
+<td><p>2000</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>500</p></td>
+<td><p>2000</p></td>
+<td><p>2500</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-odd"><td><p>20000</p></td>
+<td><p>2000</p></td>
+<td><p>22000</p></td>
+<td><p>1000</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="running-the-benchmark">
+<h3>Running the Benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading">#</a></h3>
+<p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand. The benchmarker will
+run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
+a model name (HuggingFace reference or path to a local model), a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>, and a file containing any desired extra options to the LLM APIs (details in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/6632b40/tensorrt_llm/llmapi/llm_args.py">tensorrt_llm/llmapi/llm_args.py:LlmArgs</a>).</p>
+<p>For dense / non-MoE models:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--tp<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--pp<span class="w"> </span><span class="nv">$pp_size</span><span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--extra_llm_api_options<span class="w"> </span><span class="nv">$llm_options</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">llm_options.yml</span></code></p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">batch_sizes</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">384</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4096</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8192</span>
+</pre></div>
+</div>
+<p>For MoE models:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--tp<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--pp<span class="w"> </span><span class="nv">$pp_size</span><span class="w"> </span>--ep<span class="w"> </span><span class="nv">$ep_size</span><span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--extra_llm_api_options<span class="w"> </span><span class="nv">$llm_options</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">llm_options.yml</span></code></p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">batch_sizes</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">384</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4096</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8192</span>
+</pre></div>
+</div>
+<p>In many cases, we also use a higher KV cache percentage by setting <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span></code> in the benchmark command. This allows us to obtain better performance than the default setting of <code class="docutils literal notranslate"><span class="pre">0.90</span></code>. We fall back to <code class="docutils literal notranslate"><span class="pre">0.90</span></code> or lower if out-of-memory errors are encountered.</p>
+<p>The results will be printed to the terminal upon benchmark completion. For example,</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>PERFORMANCE<span class="w"> </span><span class="nv">OVERVIEW</span>
+<span class="o">===========================================================</span>
+Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">                     </span><span class="m">43</span>.2089
+Total<span class="w"> </span>Output<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">             </span><span class="m">5530</span>.7382
+Per<span class="w"> </span>User<span class="w"> </span>Output<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec/user<span class="o">)</span>:<span class="w">     </span><span class="m">2</span>.0563
+Per<span class="w"> </span>GPU<span class="w"> </span>Output<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec/gpu<span class="o">)</span>:<span class="w">       </span><span class="m">5530</span>.7382
+Total<span class="w"> </span>Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">              </span><span class="m">94022</span>.5497
+Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">                               </span><span class="m">115716</span>.9214
+Average<span class="w"> </span>request<span class="w"> </span>latency<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">                     </span><span class="m">75903</span>.4456
+Per<span class="w"> </span>User<span class="w"> </span>Output<span class="w"> </span>Speed<span class="w"> </span><span class="o">[</span><span class="m">1</span>/TPOT<span class="o">]</span><span class="w"> </span><span class="o">(</span>tokens/sec/user<span class="o">)</span>:<span class="w"> </span><span class="m">5</span>.4656
+Average<span class="w"> </span>time-to-first-token<span class="w"> </span><span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">          </span><span class="m">52667</span>.0339
+Average<span class="w"> </span>time-per-output-token<span class="w"> </span><span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">        </span><span class="m">182</span>.9639
+
+--<span class="w"> </span>Per-Request<span class="w"> </span>Time-per-Output-Token<span class="w"> </span><span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>Breakdown<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>
+
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>MINIMUM:<span class="w"> </span><span class="m">32</span>.8005
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>MAXIMUM:<span class="w"> </span><span class="m">208</span>.4667
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>AVERAGE:<span class="w"> </span><span class="m">182</span>.9639
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>P50<span class="w">    </span>:<span class="w"> </span><span class="m">204</span>.0463
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>P90<span class="w">    </span>:<span class="w"> </span><span class="m">206</span>.3863
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>P95<span class="w">    </span>:<span class="w"> </span><span class="m">206</span>.5064
+<span class="o">[</span>TPOT<span class="o">]</span><span class="w"> </span>P99<span class="w">    </span>:<span class="w"> </span><span class="m">206</span>.5821
+
+--<span class="w"> </span>Per-Request<span class="w"> </span>Time-to-First-Token<span class="w"> </span><span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>Breakdown<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>
+
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>MINIMUM:<span class="w"> </span><span class="m">3914</span>.7621
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>MAXIMUM:<span class="w"> </span><span class="m">107501</span>.2487
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>AVERAGE:<span class="w"> </span><span class="m">52667</span>.0339
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>P50<span class="w">    </span>:<span class="w"> </span><span class="m">52269</span>.7072
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>P90<span class="w">    </span>:<span class="w"> </span><span class="m">96583</span>.7187
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>P95<span class="w">    </span>:<span class="w"> </span><span class="m">101978</span>.4566
+<span class="o">[</span>TTFT<span class="o">]</span><span class="w"> </span>P99<span class="w">    </span>:<span class="w"> </span><span class="m">106563</span>.4497
+
+--<span class="w"> </span>Request<span class="w"> </span>Latency<span class="w"> </span>Breakdown<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span><span class="w"> </span>-----------------------
+
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>P50<span class="w">    </span>:<span class="w"> </span><span class="m">78509</span>.2102
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>P90<span class="w">    </span>:<span class="w"> </span><span class="m">110804</span>.0017
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>P95<span class="w">    </span>:<span class="w"> </span><span class="m">111302</span>.9101
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>P99<span class="w">    </span>:<span class="w"> </span><span class="m">111618</span>.2158
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>MINIMUM:<span class="w"> </span><span class="m">24189</span>.0838
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>MAXIMUM:<span class="w"> </span><span class="m">111668</span>.0964
+<span class="o">[</span>Latency<span class="o">]</span><span class="w"> </span>AVERAGE:<span class="w"> </span><span class="m">75903</span>.4456
+</pre></div>
+</div>
+<blockquote>
+<div><p>[!WARNING] In some cases, the benchmarker may not print anything at all. This behavior usually
+means that the benchmark has hit an out of memory issue. Try reducing the KV cache percentage
+using the <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span></code> option to lower the percentage of used memory.</p>
+</div></blockquote>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#throughput-measurements">Throughput Measurements</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hardware">Hardware</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp4-models">FP4 Models</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-models">FP8 Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-4-scout">Llama 4 Scout</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-3-70b">Llama 3.3 70B</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-235b-a22b">Qwen3-235B-A22B</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-30b-a3b">Qwen3-30B-A3B</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-r1">DeepSeek R1</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-4-maverick">Llama 4 Maverick</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-405b">Llama 3.1 405B</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-8b">Llama 3.1 8B</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproducing-benchmarked-results">Reproducing Benchmarked Results</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#command-overview">Command Overview</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#variables">Variables</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preparing-a-dataset">Preparing a Dataset</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-the-benchmark">Running the Benchmark</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on October 13, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/6632b40">6632b40</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

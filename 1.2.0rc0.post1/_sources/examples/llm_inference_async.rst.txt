@@ -1,0 +1,8 @@
+Generate text asynchronously
+============================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/6632b4051ed2c67482fada3ecdd7aed08bbbce9e/examples/llm-api/llm_inference_async.py.
+
+.. literalinclude:: ../../../examples/llm-api/llm_inference_async.py
+    :lines: 4-43
+    :language: python
+    :linenos:
