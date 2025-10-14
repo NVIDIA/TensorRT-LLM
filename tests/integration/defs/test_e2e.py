@@ -3090,9 +3090,9 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
+        cmd.append("Phi4MMForCausalLM")
         # TODO: remove this once kv cache reuse is supported for Phi-4-multimodal
         cmd.append("--disable_kv_cache_reuse")
-        cmd.append("Phi4MMForCausalLM")
     elif model_name == "mistral-small-3.1-24b-instruct":
         # TODO: remove this once kv cache reuse is supported for Mistral
         cmd.append("--disable_kv_cache_reuse")
