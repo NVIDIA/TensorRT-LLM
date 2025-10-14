@@ -97,10 +97,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                       cache_name, capture_graph)
 
         self.indexer_k_cache_block_offsets = get_empty(
-            [
-                self.max_num_sequences,
-                self.kv_cache_manager.max_indexer_k_cache_blocks_per_seq
-            ],
+            [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
             cache_name="indexer_k_cache_block_offsets",
             dtype=torch.int32,
         )
@@ -188,6 +185,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.cu_seqlen_ke = get_empty(
             (self.max_num_tokens, ),
             cache_name="cu_seqlen_ke",
+            dtype=torch.int32,
+        )
+        self.ctx_kv_offsets = get_empty(
+            (self.max_num_tokens, 1),
+            cache_name="ctx_kv_offsets",
+            dtype=torch.int32,
+        )
+        self.gen_kv_offsets = get_empty(
+            (self.max_num_tokens, 1),
+            cache_name="gen_kv_offsets",
             dtype=torch.int32,
         )
 
@@ -335,6 +342,7 @@ class Indexer(nn.Module):
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
+        num_gen_tokens = metadata.num_tokens - num_ctx_tokens
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
         head_dim = metadata.kv_cache_manager.index_head_dim
@@ -348,25 +356,40 @@ class Indexer(nn.Module):
             # Compute attention window bounds for each query token in batched sequences
             # cu_seqlen_ks[i]: start index in global KV for query token i
             # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
-            host_seq_lens = seq_lens[:num_contexts].to(torch.int32)
+            host_seq_lens = seq_lens[:num_contexts]
             host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
                 host_seq_lens, num_contexts, num_ctx_tokens)
             metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
                                                          non_blocking=True)
             metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
                                                          non_blocking=True)
+            # Prepare context kv offsets to support convert the topk indices to global indices
+            host_ctx_kv_offsets = torch.repeat_interleave(
+                metadata.host_ctx_kv_indptr[:num_contexts],
+                host_seq_lens,
+                dim=0).unsqueeze(1)
+            metadata.ctx_kv_offsets[:num_ctx_tokens].copy_(host_ctx_kv_offsets,
+                                                           non_blocking=True)
 
         # Prepare for decode phase if there are generation requests
         if num_generations > 0:
-            # Get context_lens for generation requests (total tokens including history + new token)
-            context_lens = metadata.kv_lens_cuda_runtime[
-                num_contexts:num_contexts + num_generations].to(torch.int32)
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
+            gen_seq_lens = metadata.kv_lens_cuda_runtime[
+                num_contexts:num_contexts + num_generations]
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                context_lens, tokens_per_block, metadata.num_sms)
+                gen_seq_lens, tokens_per_block, metadata.num_sms)
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                      non_blocking=True)
+            # Prepare generation kv offsets to support convert the topk indices to global indices
+            host_gen_seq_lens = seq_lens[num_contexts:num_contexts +
+                                         num_generations]
+            host_gen_kv_offsets = torch.repeat_interleave(
+                metadata.host_gen_kv_indptr[:num_generations],
+                host_gen_seq_lens,
+                dim=0).unsqueeze(1)
+            metadata.gen_kv_offsets[:num_gen_tokens].copy_(host_gen_kv_offsets,
+                                                           non_blocking=True)
 
         # Compute slot_mapping for all requests (both context and generation)
         # This maps each token to its flat cache position for vectorized KV cache updates
@@ -508,10 +531,8 @@ class Indexer(nn.Module):
                                    device=topk_indices.device)
             mask = mask_lo & mask_hi
             # Convert local indices to global indices relative to the KV cache
-            kv_offsets = torch.repeat_interleave(
-                metadata.ctx_kv_indptr[:num_contexts], ctx_seq_lens,
-                dim=0)  # [num_ctx_tokens]
-            topk_indices = topk_indices + kv_offsets.unsqueeze(1)
+            ctx_kv_offsets = metadata.ctx_kv_offsets[:num_ctx_tokens]
+            topk_indices = topk_indices + ctx_kv_offsets
             topk_indices = topk_indices.masked_fill(~mask, -1)
             topk_indices_buffer[:num_ctx_tokens, :topk_indices.
                                 shape[-1]] = topk_indices.to(dtype=torch.int32)
@@ -576,12 +597,8 @@ class Indexer(nn.Module):
             mask_decode = topk_indices_decode <= index_end_pos
 
             # Convert local indices to global indices relative to the KV cache
-            gen_seq_lens_cuda = metadata.seq_lens_cuda[num_contexts:]
-            kv_offsets = torch.repeat_interleave(
-                metadata.gen_kv_indptr[:num_generations],
-                gen_seq_lens_cuda,
-                dim=0)  # [num_gen_tokens]
-            topk_indices_decode = topk_indices_decode + kv_offsets.unsqueeze(1)
+            gen_kv_offsets = metadata.gen_kv_offsets[:num_gen_tokens]
+            topk_indices_decode = topk_indices_decode + gen_kv_offsets
             topk_indices_decode = topk_indices_decode.masked_fill(
                 ~mask_decode, -1)
 
@@ -864,7 +881,6 @@ class DSACacheManager(KVCacheManager):
         )
 
         self.num_blocks = self.blocks_in_primary_pool
-        self.max_indexer_k_cache_blocks_per_seq = self.num_blocks
 
         # Block manager to manage the indexer k cache blocks for each request. Different layers share the
         # same block ids.

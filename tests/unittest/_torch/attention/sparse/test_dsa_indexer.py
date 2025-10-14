@@ -426,13 +426,35 @@ def _create_mock_metadata(request_ids, batch_size, num_contexts,
             self.cu_seqlen_ke = torch.zeros((num_tokens, ),
                                             device='cuda',
                                             dtype=torch.int32)
+            self.ctx_kv_offsets = torch.zeros((num_tokens, 1),
+                                              device='cuda',
+                                              dtype=torch.int32)
+            self.gen_kv_offsets = torch.zeros((num_tokens, 1),
+                                              device='cuda',
+                                              dtype=torch.int32)
             self.host_slot_mapping_fp8 = torch.zeros_like(self.slot_mapping_fp8,
                                                           device='cpu',
                                                           pin_memory=True)
             self.host_slot_mapping_scale = torch.zeros_like(
                 self.slot_mapping_scale, device='cpu', pin_memory=True)
+            self.host_ctx_kv_indptr = torch.zeros((num_contexts + 1, ),
+                                                  device='cpu',
+                                                  pin_memory=True,
+                                                  dtype=torch.int64)
+            self.host_gen_kv_indptr = torch.zeros((num_generations + 1, ),
+                                                  device='cpu',
+                                                  pin_memory=True,
+                                                  dtype=torch.int64)
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
+            torch.cumsum(kv_lens[:num_contexts],
+                         dim=0,
+                         dtype=torch.int64,
+                         out=self.host_ctx_kv_indptr[1:num_contexts + 1])
+            torch.cumsum(kv_lens[num_contexts:num_contexts + num_generations],
+                         dim=0,
+                         dtype=torch.int64,
+                         out=self.host_gen_kv_indptr[1:num_generations + 1])
 
     return MockMetadata()
 
