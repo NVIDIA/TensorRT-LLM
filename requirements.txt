@@ -75,3 +75,4 @@ tiktoken
 blobfile
 openai-harmony==0.0.4
 nvidia-cutlass-dsl==4.2.1; python_version >= "3.10"
+numexpr<2.14.0 # WAR for attempted use of nonexistent numpy.typing
