@@ -2123,8 +2123,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (rerunFailed) {
-                error "Some tests still failed after rerun attempts, please check the test report."
-            }
+            error "Some tests still failed after rerun attempts, please check the test report."
+        }
 
         if (perfMode) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
