@@ -1,29 +1,36 @@
 """Testing build_and_run_ad end2end."""
 
 import pytest
-from _model_test_utils import get_small_model_config, get_transforms_config
+from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
 
 @pytest.mark.parametrize("world_size", [1, 2])
-@pytest.mark.parametrize("mode", ["graph", "transformers"])
 @pytest.mark.parametrize(
-    "modle_hub_id, attn_backend, compile_backend",
+    "model_hub_id, llm_extra_args",
     [
         (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            "flashinfer",
-            "torch-opt",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "flashinfer"},
+                    "compile_model": {"compile_backend": "torch-opt"},
+                },
+            },
+        ),
+        (
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                },
+                "mode": "transformers",
+            },
         ),
     ],
 )
-def test_build_ad(
-    world_size: int, modle_hub_id: str, attn_backend: str, compile_backend: str, mode: str
-):
-    transforms_config = get_transforms_config(mode, attn_backend, compile_backend)
-    experiment_config = get_small_model_config(
-        modle_hub_id, mode=mode, transforms=transforms_config
-    )
+def test_build_ad(world_size: int, model_hub_id: str, llm_extra_args: dict):
+    experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
 
     experiment_config["args"]["world_size"] = world_size
     experiment_config["args"]["runtime"] = "trtllm"  # Default runtime set to trtllm

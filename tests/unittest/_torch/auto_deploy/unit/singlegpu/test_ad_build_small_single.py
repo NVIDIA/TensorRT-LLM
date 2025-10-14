@@ -1,7 +1,7 @@
 """Testing build_and_run_ad end2end."""
 
 import pytest
-from _model_test_utils import get_small_model_config, get_transforms_config
+from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
@@ -39,96 +39,158 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     )
 
 
-@pytest.mark.parametrize("mode", ["graph", "transformers"])
 @pytest.mark.parametrize(
-    "modle_hub_id, transform_args",
+    "model_hub_id, llm_extra_args",
     [
         (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
-                "attn_backend": "flashinfer",
-                "compile_backend": "torch-opt",
-                "free_mem_ratio": 0.0001,
+                "transforms": {
+                    "resize_kv_cache": {"free_mem_ratio": 0.0001},
+                    "insert_cached_attention": {"attn_backend": "flashinfer"},
+                    "compile_model": {"compile_backend": "torch-opt"},
+                },
+            },
+        ),
+        (
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                },
+                "mode": "transformers",
             },
         ),
         (
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
             {
-                "attn_backend": "triton",
-                "compile_backend": "torch-simple",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "triton"},
+                    "compile_model": {"compile_backend": "torch-simple"},
+                },
+            },
+        ),
+        (
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "triton"},
+                },
+                "mode": "transformers",
             },
         ),
         (
             "Qwen/Qwen3-30B-A3B",
             {
-                "attn_backend": "triton",
-                "compile_backend": "torch-simple",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "triton"},
+                    "compile_model": {"compile_backend": "torch-simple"},
+                },
+            },
+        ),
+        (
+            "Qwen/Qwen3-30B-A3B",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "triton"},
+                },
+                "mode": "transformers",
             },
         ),
         (
             "microsoft/Phi-3-mini-4k-instruct",
             {
-                "attn_backend": "triton",
-                "compile_backend": "torch-simple",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "triton"},
+                    "compile_model": {"compile_backend": "torch-simple"},
+                },
             },
         ),
         (
             "microsoft/Phi-3-mini-4k-instruct",
             {
-                "attn_backend": "torch",
-                "compile_backend": "torch-simple",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "torch"},
+                    "compile_model": {"compile_backend": "torch-simple"},
+                },
             },
         ),
         (
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             {
-                "attn_backend": "flashinfer",
-                "compile_backend": "torch-opt",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "flashinfer"},
+                    "compile_model": {"compile_backend": "torch-opt"},
+                },
+            },
+        ),
+        (
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                },
+                "mode": "transformers",
             },
         ),
         (
             "deepseek-ai/DeepSeek-V3",
             {
-                "attn_backend": "triton",
-                "compile_backend": "torch-simple",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "triton"},
+                    "compile_model": {"compile_backend": "torch-simple"},
+                },
             },
         ),
         (
             "Qwen/Qwen2.5-3B-Instruct",
             {
-                "attn_backend": "triton",
-                "compile_backend": "torch-compile",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "triton"},
+                    "compile_model": {"compile_backend": "torch-compile"},
+                },
+            },
+        ),
+        (
+            "Qwen/Qwen2.5-3B-Instruct",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "triton"},
+                },
+                "mode": "transformers",
             },
         ),
         (
             "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
             {
-                "attn_backend": "flashinfer",
-                "compile_backend": "torch-cudagraph",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "flashinfer"},
+                    "compile_model": {"compile_backend": "torch-cudagraph"},
+                },
+            },
+        ),
+        (
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            {
+                "transforms": {
+                    "transformers_replace_cached_attn": {"attn_backend": "flashinfer"},
+                },
+                "mode": "transformers",
             },
         ),
         (
             "nvidia/NVIDIA-Nemotron-Nano-12B-v2",
             {
-                "attn_backend": "flashinfer",
-                "compile_backend": "torch-simple",
+                "transforms": {
+                    "insert_cached_attention": {"attn_backend": "flashinfer"},
+                    "compile_model": {"compile_backend": "torch-simple"},
+                },
             },
         ),
     ],
 )
-def test_build_ad(modle_hub_id: str, transform_args: dict, mode: str):
-    transforms_config = get_transforms_config(mode, **transform_args)
-    experiment_config = get_small_model_config(
-        modle_hub_id, mode=mode, transforms=transforms_config
-    )
-    if (
-        "DeepSeek-V3" in modle_hub_id
-        or "Phi-3-mini-4k-instruct" in modle_hub_id
-        or "NVIDIA-Nemotron-Nano-12B-v2" in modle_hub_id
-        and mode == "transformers"
-    ):
-        pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")
-
+def test_build_ad(model_hub_id: str, llm_extra_args: dict):
+    experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
 

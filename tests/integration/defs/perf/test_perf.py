@@ -1411,8 +1411,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
             # Create _autodeploy specific configuration
             autodeploy_config = {
-                'compile_backend': self._config.ad_compile_backend,
-                'free_mem_ratio': self._config.free_mem_ratio,
+                'transforms': {
+                    'compile_model': {
+                        'compile_backend': self._config.ad_compile_backend
+                    },
+                    'resize_kv_cache': {
+                        'free_mem_ratio': self._config.free_mem_ratio
+                    },
+                },
                 'runtime': self._config.extra_runtime,
                 'skip_loading_weights': self._config.skip_loading_weights
             }

@@ -8,8 +8,6 @@ from torch import nn
 from torch.export import Dim
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionRegistry
-
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     freqs_cis = freqs_cis[None, : x.shape[1], None]  #             --> [1, s,   1, h_d//2, 2]
@@ -445,7 +443,6 @@ _SMALL_MODEL_CONFIGS = {
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
         "llm_models_subdir": "Mistral-Small-3.1-24B-Instruct-2503",
         "model_factory": "AutoModelForImageTextToText",
-        "compile_backend": "torch-simple",
         "model_kwargs": {
             "text_config": {
                 "num_hidden_layers": 2,
@@ -506,39 +503,6 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
 }
-
-
-def get_transforms_config(
-    mode: str, attn_backend: str, compile_backend: str, free_mem_ratio: float = 0.0
-) -> Dict[str, Any]:
-    """Set the transforms configuration for a given mode, attn_backend and compile_backend."""
-    return (
-        {
-            "resize_kv_cache": {
-                "stage": "cache_init",
-                "free_mem_ratio": free_mem_ratio,
-            },
-            "match_attention_layout": {
-                "stage": "pattern_matcher",
-                "attn_layout": AttentionRegistry.get(attn_backend).get_attention_layout(),
-            },
-            "insert_cached_attention": {
-                "stage": "cache_init",
-                "attn_backend": attn_backend,
-            },
-            "compile_model": {
-                "stage": "compile",
-                "compile_backend": compile_backend,
-            },
-        }
-        if mode == "graph"
-        else {
-            "transformers_replace_cached_attn": {
-                "stage": "cache_init",
-                "attn_backend": attn_backend,
-            },
-        }
-    )
 
 
 def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:

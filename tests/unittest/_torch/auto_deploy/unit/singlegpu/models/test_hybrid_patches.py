@@ -6,7 +6,7 @@ import pytest
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device  # noqa
-from _model_test_utils import get_small_model_config, get_transforms_config
+from _model_test_utils import get_small_model_config
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
@@ -33,9 +33,10 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
         "runtime": "demollm",
         "model_factory": "AutoModelForCausalLM",
         "max_seq_len": 512,
-        "transforms": get_transforms_config(
-            mode="graph", attn_backend="flashinfer", compile_backend="torch-simple"
-        ),
+        "transforms": {
+            "insert_cached_attention": {"attn_backend": "flashinfer"},
+            "compile_model": {"compile_backend": "torch-simple"},
+        },
     }
 
     if use_small_config:

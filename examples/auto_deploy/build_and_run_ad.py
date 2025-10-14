@@ -280,7 +280,7 @@ def main(config: Optional[ExperimentConfig] = None):
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
         ad_logger.info("Running benchmark...")
-        keys_from_args = ["compile_backend", "attn_backend", "mla_backend"]
+        keys_from_args = ["compile_backend"]
         fields_to_show = [f"benchmark={config.benchmark}"]
         fields_to_show.extend([f"{k}={getattr(config.args, k)}" for k in keys_from_args])
         results["benchmark_results"] = benchmark(

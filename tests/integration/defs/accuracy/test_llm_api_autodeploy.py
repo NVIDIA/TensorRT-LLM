@@ -52,9 +52,17 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # Set it explicitly here to 8192 which is the default in build_config.
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
-            "compile_backend": "torch-opt",
-            "free_mem_ratio": 0.7,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+            "transforms": {
+                "resize_kv_cache": {
+                    "free_mem_ratio": 0.7
+                },
+                "compile_model": {
+                    "compile_backend":
+                    "torch-opt",
+                    "cuda_graph_batch_sizes":
+                    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                },
+            },
         }
 
     def get_default_sampling_params(self):
@@ -99,9 +107,15 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             # Set explicitly to match default build_config behavior
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
-            "compile_backend": "torch-opt",
-            "free_mem_ratio": 0.7,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "transforms": {
+                "resize_kv_cache": {
+                    "free_mem_ratio": 0.7
+                },
+                "compile_model": {
+                    "compile_backend": "torch-opt",
+                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                },
+            },
         }
 
     def get_default_sampling_params(self):
