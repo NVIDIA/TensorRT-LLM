@@ -20,10 +20,12 @@ from collections import OrderedDict
 from enum import IntEnum
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, List, Literal, Optional, Tuple, Union, get_args, get_origin
+from typing import (Any, List, Literal, Optional, Tuple, Union, get_args,
+                    get_origin)
 
 import tensorrt as trt
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo,
+                      field_validator)
 
 from .._ipc_utils import IpcMemory, can_access_peer
 from .._utils import get_sm_version
@@ -79,7 +81,8 @@ class ContextFMHAType(IntEnum):
     enabled_with_fp32_acc = 2
 
 
-DefaultPluginDtype = Literal["auto", "float16", "float32", "bfloat16", "int32", None]
+DefaultPluginDtype = Literal["auto", "float16", "float32", "bfloat16", "int32",
+                             None]
 
 
 class PluginConfig(BaseModel):
@@ -96,197 +99,200 @@ class PluginConfig(BaseModel):
     """
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
-    dtype: str = Field(
-        default="float16",
-        description="Base dtype for the model and plugins"
-    )
+    dtype: str = Field(default="float16",
+                       description="Base dtype for the model and plugins")
 
     # Plugins
     bert_attention_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        description="The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models."
+        description=
+        "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models."
     )
     gpt_attention_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        description="The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models."
+        description=
+        "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models."
     )
-    gemm_plugin: Optional[Literal["auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4", None]] = Field(
-        default=None,
-        description="The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. "
-                    "Note: it's only affective for non-quantized gemm operations (except FP8)."
-                    "Note: For FP8, it also requires same calibration in checkpoint."
-    )
-    _explicitly_disable_gemm_plugin: bool = PrivateAttr(
-        default=False,
-        description="Internal flag to track if gemm_plugin was explicitly disabled"
-    )
+    gemm_plugin: Optional[Literal[
+        "auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4",
+        None]] = Field(
+            default=None,
+            description=
+            "The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. "
+            "Note: it's only affective for non-quantized gemm operations (except FP8)."
+            "Note: For FP8, it also requires same calibration in checkpoint.")
+    _explicitly_disable_gemm_plugin: bool = PrivateAttr(default=False)
     gemm_swiglu_plugin: Optional[Literal["fp8", None]] = Field(
         default=None,
-        description="The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and "
-                    "one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper."
+        description=
+        "The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and "
+        "one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper."
     )
     fp8_rowwise_gemm_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        description="The quantized GEMM for fp8, which uses per token dynamic scales for "
-                    "activation and per channel static scales for weights."
-                    "Note: It also requires same calibration in checkpoint."
-    )
+        description=
+        "The quantized GEMM for fp8, which uses per token dynamic scales for "
+        "activation and per channel static scales for weights."
+        "Note: It also requires same calibration in checkpoint.")
     qserve_gemm_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        description="The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), "
-                    "which employs 4-bit quantization for weights and 8-bit quantization for activations."
+        description=
+        "The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), "
+        "which employs 4-bit quantization for weights and 8-bit quantization for activations."
     )
     identity_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        description="The identity plugin simply copies inputs to outputs, it's used mostly for debugging purpose."
+        description=
+        "The identity plugin simply copies inputs to outputs, it's used mostly for debugging purpose."
     )
     nccl_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        description="The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes."
+        description=
+        "The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes."
     )
     lora_plugin: Optional[DefaultPluginDtype] = Field(
-        default=None,
-        description="Enable LoRA."
-    )
-    dora_plugin: bool = Field(
-        default=False,
-        description="Enable DoRA."
-    )
-    weight_only_groupwise_quant_matmul_plugin: Optional[DefaultPluginDtype] = Field(
-        default=None,
-        description="Enable weight-only groupwise quantization matmul operators."
-    )
+        default=None, description="Enable LoRA.")
+    dora_plugin: bool = Field(default=False, description="Enable DoRA.")
+    weight_only_groupwise_quant_matmul_plugin: Optional[
+        DefaultPluginDtype] = Field(
+            default=None,
+            description=
+            "Enable weight-only groupwise quantization matmul operators.")
     weight_only_quant_matmul_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        description="Enable weight-only quantization matmul operators."
-    )
+        description="Enable weight-only quantization matmul operators.")
     smooth_quant_plugins: bool = Field(
         default=True,
-        description="Enable a group of plugins to support smooth quantization."
-    )
+        description="Enable a group of plugins to support smooth quantization.")
     smooth_quant_gemm_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        description="Enable plugin that supports smooth quantization gemm kernels."
-    )
+        description=
+        "Enable plugin that supports smooth quantization gemm kernels.")
     layernorm_quantization_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
         description="Enable plugin that supports layernorm quantization kernels."
     )
     rmsnorm_quantization_plugin: Optional[DefaultPluginDtype] = Field(
         default=None,
-        description="Enable plugin that supports rmsnorm quantization kernels."
-    )
+        description="Enable plugin that supports rmsnorm quantization kernels.")
     quantize_per_token_plugin: bool = Field(
         default=False,
-        description="Enable plugin that supports per-token quantization."
-    )
+        description="Enable plugin that supports per-token quantization.")
     quantize_tensor_plugin: bool = Field(
         default=False,
-        description="Enable plugin that supports per-tensor quantization."
-    )
+        description="Enable plugin that supports per-tensor quantization.")
     moe_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        description="Enable some customized kernels to speed up the MoE layer of MoE models."
+        description=
+        "Enable some customized kernels to speed up the MoE layer of MoE models."
     )
     mamba_conv1d_plugin: Optional[DefaultPluginDtype] = Field(
         default="auto",
-        description="Enable customized kernels to speed up conv1d operator for Mamba."
-    )
+        description=
+        "Enable customized kernels to speed up conv1d operator for Mamba.")
     low_latency_gemm_plugin: Optional[Literal["fp8", None]] = Field(
         default=None,
-        description="The GEMM plugin that optimized specially for low latency scenarios."
-    )
+        description=
+        "The GEMM plugin that optimized specially for low latency scenarios.")
     low_latency_gemm_swiglu_plugin: Optional[Literal["fp8", None]] = Field(
         default=None,
-        description="The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios."
+        description=
+        "The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios."
     )
-    gemm_allreduce_plugin: Optional[Literal["float16", "bfloat16", None]] = Field(
-        default=None,
-        description="The GEMM + AllReduce kernel fusion plugin."
-    )
+    gemm_allreduce_plugin: Optional[Literal[
+        "float16", "bfloat16",
+        None]] = Field(default=None,
+                       description="The GEMM + AllReduce kernel fusion plugin.")
 
     # Features
     context_fmha: bool = Field(
         default=True,
-        description="Enable the fused multi-head attention during the context phase, "
-                    "will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel."
+        description=
+        "Enable the fused multi-head attention during the context phase, "
+        "will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel."
     )
     bert_context_fmha_fp32_acc: bool = Field(
         default=False,
-        description="Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. "
-                    "If disabled, FP16 is used, better performance but potentially worse accuracy is expected."
+        description=
+        "Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. "
+        "If disabled, FP16 is used, better performance but potentially worse accuracy is expected."
     )
     paged_kv_cache: Optional[bool] = Field(
         default=None,
-        description="Enable paged KV cache, which helps manage memory for the KV cache more efficiently, "
-                    "and usually leads to an increase in the batch size and an improved efficiency."
+        description=
+        "Enable paged KV cache, which helps manage memory for the KV cache more efficiently, "
+        "and usually leads to an increase in the batch size and an improved efficiency."
     )
     remove_input_padding: bool = Field(
         default=True,
-        description="Pack different tokens together, which reduces both the amount of computations and memory consumption."
+        description=
+        "Pack different tokens together, which reduces both the amount of computations and memory consumption."
     )
     norm_quant_fusion: bool = Field(
         default=False,
-        description="Fuse the LayerNorm and quantization kernels into a single kernel, "
-                    "resulting in improved end-to-end performance."
-    )
+        description=
+        "Fuse the LayerNorm and quantization kernels into a single kernel, "
+        "resulting in improved end-to-end performance.")
     reduce_fusion: bool = Field(
         default=False,
-        description="Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, "
-                    "resulting in improved end-to-end performance."
-    )
+        description=
+        "Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, "
+        "resulting in improved end-to-end performance.")
     user_buffer: bool = Field(
         default=False,
-        description="Eliminate extra copies from the local buffer to the shared buffer "
-                    "in the communication kernel, leading to improved end-to-end performance. "
-                    "This feature must be enabled with `--reduce_fusion enable` and "
-                    "is currently only supported for the FP8 LLAMA model."
-    )
+        description=
+        "Eliminate extra copies from the local buffer to the shared buffer "
+        "in the communication kernel, leading to improved end-to-end performance. "
+        "This feature must be enabled with `--reduce_fusion enable` and "
+        "is currently only supported for the FP8 LLAMA model.")
     tokens_per_block: int = Field(
         default=32,
-        description="Define how many tokens are contained in each paged kv cache block."
-    )
+        description=
+        "Define how many tokens are contained in each paged kv cache block.")
     use_paged_context_fmha: bool = Field(
         default=True,
-        description="Allow advanced features like KV cache reuse and chunked context."
-    )
+        description=
+        "Allow advanced features like KV cache reuse and chunked context.")
     use_fp8_context_fmha: bool = Field(
         default=True,
-        description="When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA"
+        description=
+        "When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA"
     )
     fuse_fp4_quant: bool = Field(
         default=False,
-        description="Whether to fuse FP4 quantization into attention kernel."
-    )
+        description="Whether to fuse FP4 quantization into attention kernel.")
     multiple_profiles: bool = Field(
         default=False,
-        description="Enables multiple TensorRT optimization profiles in the built engines, "
-                    "will benefits the performance especially when GEMM plugin is disabled, "
-                    "because more optimization profiles help TensorRT have more chances to select better kernels. "
-                    "Note: This feature increases engine build time but no other adverse effects are expected."
+        description=
+        "Enables multiple TensorRT optimization profiles in the built engines, "
+        "will benefits the performance especially when GEMM plugin is disabled, "
+        "because more optimization profiles help TensorRT have more chances to select better kernels. "
+        "Note: This feature increases engine build time but no other adverse effects are expected."
     )
     paged_state: bool = Field(
         default=True,
-        description="Enable paged state, which helps manage memory for the RNN state more efficiently."
+        description=
+        "Enable paged state, which helps manage memory for the RNN state more efficiently."
     )
     streamingllm: bool = Field(
         default=False,
-        description="Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts."
+        description=
+        "Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts."
     )
     manage_weights: bool = Field(
         default=False,
-        description="Enable TensorRT LLM managed weights to speed up engine building process."
+        description=
+        "Enable TensorRT LLM managed weights to speed up engine building process."
     )
     use_fused_mlp: bool = Field(
         default=True,
-        description="Enable horizontal fusion in Gated-MLP that combines two Matmul "
-                    "operations into a single one followed by a separate SwiGLU kernel."
-    )
+        description=
+        "Enable horizontal fusion in Gated-MLP that combines two Matmul "
+        "operations into a single one followed by a separate SwiGLU kernel.")
     pp_reduce_scatter: bool = Field(
         default=False,
         description="Enable a pipeline parallelism optimization with "
-                    "ReduceScatter + AllGather targeting large MoE models."
-    )
+        "ReduceScatter + AllGather targeting large MoE models.")
 
     def __getattribute__(self, name: str) -> Any:
         """Override to resolve 'auto' values to dtype field.
@@ -316,7 +322,8 @@ class PluginConfig(BaseModel):
             return True
         elif value == "disable":
             annotation = cls.model_fields[info.field_name].annotation
-            if annotation is bool or (get_origin(annotation) is Union and bool in get_args(annotation)):
+            if annotation is bool or (get_origin(annotation) is Union
+                                      and bool in get_args(annotation)):
                 return False
             return None
         return value
@@ -353,7 +360,8 @@ class PluginConfig(BaseModel):
                 continue
             elif isinstance(field_value, str):
                 setattr(self, field_name, None)
-            elif isinstance(field_value, bool) or field_name == "paged_kv_cache":
+            elif isinstance(field_value,
+                            bool) or field_name == "paged_kv_cache":
                 setattr(self, field_name, False)
 
     def validate(self):
