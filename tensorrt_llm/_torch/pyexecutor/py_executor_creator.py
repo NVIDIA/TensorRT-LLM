@@ -252,6 +252,8 @@ def create_py_executor(
         max_num_tokens = 8192
 
     tokens_per_block = kv_cache_config.tokens_per_block
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        tokens_per_block = max_num_tokens
 
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
@@ -308,6 +310,8 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+    sparse_attention_config = llm_args.sparse_attention_config
+
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -331,6 +335,7 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
             lora_config=lora_config,
             checkpoint_loader=checkpoint_loader,
         )
@@ -568,6 +573,7 @@ def create_py_executor(
             kv_cache_config=kv_cache_config,
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(

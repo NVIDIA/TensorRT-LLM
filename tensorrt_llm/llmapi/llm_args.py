@@ -166,6 +166,63 @@ class CudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
+class BaseSparseAttentionConfig(StrictBaseModel):
+    """
+    Configuration for sparse attention.
+    """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        # dispatch to the correct sparse attention config
+        config_classes = {
+            "rocket": RocketSparseAttentionConfig,
+        }
+
+        algorithm = data.get("algorithm", None)
+        if algorithm is None:
+            raise ValueError(f"Sparse attention algorithm is required")
+
+        config_class = config_classes.get(algorithm.lower())
+        if config_class is None:
+            raise ValueError(f"Invalid algorithm: {algorithm}")
+
+        return config_class(**data)
+
+    def _check_fields(self):
+        pass
+
+    def supports_backend(self, backend: str) -> bool:
+        """
+        Override if the speculation algorithm does not support
+        a subset of the possible backends.
+        """
+        return True
+
+
+class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for rocket sparse attention.
+    """
+    window_size: Optional[int] = Field(
+        default=None, description="The window size for snap KV.")
+    kernel_size: Optional[int] = Field(
+        default=None, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
+    topk: Optional[int] = Field(default=128, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=1266,
+                                         description="Prompt budget")
+    page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
@@ -1133,6 +1190,10 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     AutoDecodingConfig,
 ]]
 
+SparseAttentionConfig: TypeAlias = Union[
+    RocketSparseAttentionConfig,
+]
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -1508,6 +1569,12 @@ class BaseLlmArgs(StrictBaseModel):
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
         default=None,
         description="Cache transceiver config.",
+        status="prototype")
+
+    # Sparse attention config
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None,
+        description="Sparse attention config.",
         status="prototype")
 
     # Speculative decoding parameters
