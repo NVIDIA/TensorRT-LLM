@@ -536,6 +536,18 @@ class AutoTuner:
 
         self.profiling_debug = True
 
+        #
+        # Test mode state for testing all kernels
+        #
+        # Capture mode flag
+        self._capture_mode: bool = False
+        # List of captured contexts
+        self._captured_contexts: List[Dict[str, Any]] = []
+        # List of (runner_idx, tactic) for each context to iterate through
+        self._test_mode_tactics_config: List[Tuple[int, int]] = None
+        # Track which choose_one call we are at during replay of captured contexts
+        self._test_mode_call_idx: int = 0
+
     @classmethod
     def get(cls):
         if cls._instance is None:
@@ -572,6 +584,44 @@ class AutoTuner:
             Although runners[0] with tactic=-1 is always treated as the fallback runner.
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
+
+        # In test mode, return the forced runner and tactic by cycling through contexts
+        if self._test_mode_tactics_config is not None:
+            # Replay the captured choose_one() context one by one
+            call_idx = self._test_mode_call_idx
+            assert call_idx < len(
+                self._test_mode_tactics_config), "call_idx out of range"
+            assert call_idx < len(
+                self._captured_contexts), "call_idx out of range"
+            assert len(self._test_mode_tactics_config) == len(
+                self._captured_contexts)
+            # Check if we have a forced tactic for this call and both custom_op and kwargs match
+            captured_custom_op = self._captured_contexts[call_idx].get(
+                'custom_op')
+            if captured_custom_op != custom_op:
+                raise RuntimeError(
+                    f"Custom op mismatch in kernel testing mode.\n"
+                    f"Expected operation: '{captured_custom_op}'\n"
+                    f"Actual operation: '{custom_op}'\n"
+                    f"Context index: {call_idx}\n"
+                    f"Make sure the forward() call in test mode uses the same operation as captured."
+                )
+            runner_idx, tactic = self._test_mode_tactics_config[call_idx]
+            self._test_mode_call_idx += 1
+            # Reset counter after all contexts have been used
+            if self._test_mode_call_idx >= len(self._test_mode_tactics_config):
+                self._test_mode_call_idx = 0
+            return (runners[runner_idx], tactic)
+
+        # Capture context for testing all underlying kernels
+        if self._capture_mode:
+            self._captured_contexts.append({
+                'custom_op': custom_op,
+                'runners': runners,
+                'tuning_config': tuning_config,
+                'inputs': inputs,
+                'kwargs': kwargs,
+            })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
         # Early return if it's not tuning, use cache found one or fallback one
@@ -957,3 +1007,91 @@ class AutoTuner:
             logger.debug(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic}, min_time={min_time})"
             )
+
+    @contextlib.contextmanager
+    def capture_exec_context(self):
+        """Context manager for explicitly capturing execution context.
+
+        See get_tactics_iterator() for more details.
+        """
+        self._captured_contexts.clear()
+        self._capture_mode = True
+        try:
+            yield
+        finally:
+            self._capture_mode = False
+
+    @contextlib.contextmanager
+    def get_tactics_iterator(self):
+        """Context manager for iterating through all valid (runner, tactic) combinations for testing.
+
+        This allows comprehensive kernel testing by iterating through all available
+        implementations and tactics.
+
+        Yields:
+            Iterator of configuration tuples. Each configuration is a tuple of
+            (runner_idx, tactic) pairs, one for each captured context.
+
+        Example:
+            >>> # First, explicitly capture the execution context
+            >>> with AutoTuner.get().capture_exec_context(), torch.inference_mode():
+            ...     output = custom_op.forward(x)  # May call choose_one multiple times
+            >>> # Then test all tactic combinations
+            >>> with AutoTuner.get().get_tactics_iterator() as iterator:
+            ...     for config in iterator:  # config = ((runner_idx_0, tactic_0), (runner_idx_1, tactic_1), ...)
+            ...         output = custom_op.forward(x)
+            ...         # Compare output against reference
+        """
+
+        if not self._captured_contexts:
+            raise RuntimeError(
+                "No context available for testing.\n"
+                "Use capture_exec_context() to capture the operation context first:\n"
+                "  with AutoTuner.get().capture_exec_context():\n"
+                "      output = operation.forward(...)\n")
+
+        # Collect valid tactics for each context separately
+        context_tactics_lists = []
+
+        for context in self._captured_contexts:
+            context['custom_op']
+            runners = context['runners']
+            tuning_config = context['tuning_config']
+            inputs = context['inputs']
+            kwargs = context.get('kwargs', {})
+
+            # Generate optimization profile for current inputs
+            profiles = self._optimization_profiles(tuning_config, inputs)
+
+            # Use the first profile for testing
+            profile = profiles[0] if profiles else None
+
+            # Collect all valid (runner_idx, tactic) combinations for this context
+            context_tactics = []
+            for runner_idx, runner in enumerate(runners):
+                valid_tactics = runner.get_valid_tactics(
+                    inputs, profile, **kwargs)
+                for tactic in valid_tactics:
+                    context_tactics.append((runner_idx, tactic))
+            context_tactics_lists.append(context_tactics)
+
+        # Generate cartesian product of all context tactics
+        # Each configuration is a tuple of (runner_idx, tactic) for each context
+        all_configurations = list(itertools.product(*context_tactics_lists))
+
+        # Generator function to yield each configuration
+        def tactics_iterator():
+            for config in all_configurations:
+                # Set the test mode with the full tactics configuration
+                self._test_mode_tactics_config = list(config)
+                self._test_mode_call_idx = 0
+                logger.debug(
+                    f"[Autotuner][test_all_kernels]: Testing configuration: {config}"
+                )
+                yield config
+
+        try:
+            yield tactics_iterator()
+        finally:
+            self._test_mode_tactics_config = None
+            self._test_mode_call_idx = 0

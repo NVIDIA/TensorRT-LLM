@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
+#include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -310,12 +311,6 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
     return output;
-}
-
-inline int32_t nextPowerOfTwo(float val)
-{
-    int32_t const intVal = static_cast<int32_t>(std::ceil(val));
-    return intVal <= 1 ? 1 : 1 << static_cast<int32_t>(std::ceil(std::log2(intVal)));
 }
 
 // Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow

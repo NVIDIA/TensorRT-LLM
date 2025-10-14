@@ -528,14 +528,6 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         return constraint_specs_tuple
 
-    @staticmethod
-    def inputs_pre_hook(inputs: List[torch.Tensor]):
-        args = FP8BlockScaleMoEInputs(*inputs)
-        args.hidden_states = args.hidden_states / torch.max(
-            args.hidden_states) * 448
-        # turn dataclass object to list
-        return list(args)
-
     @classmethod
     @lru_cache(maxsize=None)
     def get_tuning_config(cls) -> TuningConfig:
