@@ -39,6 +39,8 @@ if [ "${CONTAINER_IMAGE:-}" == "" ]; then
     fi
 fi
 
+WORKDIR=$(realpath "$(pwd)")
+
 set -x
 srun --mpi=pmix \
     -N "$NODES" \
@@ -46,5 +48,5 @@ srun --mpi=pmix \
     --container-image "$CONTAINER_IMAGE" \
     --container-name "layer_wise_benchmarks" \
     --container-mounts "$CONTAINER_MOUNTS" \
-    --container-workdir "$(realpath $(pwd))" \
+    --container-workdir "$WORKDIR" \
     pip install -e ../..
