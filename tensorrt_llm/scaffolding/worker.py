@@ -217,19 +217,14 @@ class TRTLLMWorker(Worker):
                 await task.request_handle._aresult_step()
                 if task.request_handle._done:
                     break
+
             while not task.request_handle._done:
                 async_task = asyncio.create_task(
                     task.request_handle._aresult_step())
                 if not async_task.done():
                     async_task.cancel()
                     break
-            '''
-            task.output_str = task.request_handle.outputs[0].text
-            task.output_tokens = task.request_handle.outputs[0].token_ids
-            task.cumulative_logprob = task.request_handle.outputs[
-                0].cumulative_logprob
-            task.logprobs = task.request_handle.outputs[0].logprobs
-            '''
+
             if task.request_handle._done:
                 task.end_flag = True
 
