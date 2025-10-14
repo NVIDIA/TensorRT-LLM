@@ -3043,7 +3043,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(8, 1, 8, True, True, True), (8, 1, 8, False, True, True)],
+        [(8, 1, 8, False, True, True), (8, 1, 8, True, True, True)],
         ids=["latency", "throughput_latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler):
@@ -3051,7 +3051,9 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        free_gpu_memory_fraction = 0.6 if attention_dp else 0.3
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction)
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
                 tensor_parallel_size=tp_size,
