@@ -6,8 +6,6 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .utils import get_shared_pool
-
 
 @dataclass
 class BufferBlock:
@@ -115,3 +113,52 @@ _buffer = Buffers()
 def get_memory_buffers():
     global _buffer
     return _buffer
+
+
+_shared_pool = None
+
+
+def set_shared_pool(shared_pool):
+    """Sets the global memory pool for buffer allocation.
+
+    Args:
+        shared_pool: A CUDA memory pool object to use for allocations.
+    """
+    global _shared_pool
+    _shared_pool = shared_pool
+
+
+def get_shared_pool():
+    """Retrieves the current global memory pool.
+
+    Returns:
+        The current memory pool, or None if not set.
+    """
+    return _shared_pool
+
+
+@contextlib.contextmanager
+def with_shared_pool(shared_pool) -> contextlib.AbstractContextManager:
+    """Temporarily sets a preferred memory pool and restores the previous one on exit.
+
+    This context manager allows temporarily switching to a different memory pool
+    for CUDA graph operations, ensuring the original pool is restored even if
+    an exception occurs.
+
+    Args:
+        shared_pool: The memory pool to use within the context.
+
+    Yields:
+        None
+
+    Example:
+        >>> with with_shared_pool(shared_pool):
+        ...     # Allocations within this block use shared_pool
+        ...     tensor = allocate_buffer(...)
+    """
+    old_shared_pool = get_shared_pool()
+    set_shared_pool(shared_pool)
+    try:
+        yield
+    finally:
+        set_shared_pool(old_shared_pool)

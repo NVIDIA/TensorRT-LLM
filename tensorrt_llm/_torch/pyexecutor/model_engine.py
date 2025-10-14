@@ -34,6 +34,7 @@ from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
+from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -48,8 +49,7 @@ from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
-                     set_torch_compiling, with_model_extra_attrs,
-                     with_shared_pool)
+                     set_torch_compiling, with_model_extra_attrs)
 from .config import PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
