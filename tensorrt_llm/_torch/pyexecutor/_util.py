@@ -416,8 +416,7 @@ class KvCacheCreator:
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
         if isinstance(self._profiling_stage_data, dict):
-            self._profiling_stage_data[
-                "max_gpu_total_bytes"] = kv_cache_max_memory
+            self._profiling_stage_data["activation_bytes"] = activation_bytes
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(

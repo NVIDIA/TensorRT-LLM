@@ -62,7 +62,7 @@ def test_profile_kvcache():
     py_executor = create_py_executor(llm_args=torchllm_args,
                                      checkpoint_dir=VLM_MODEL_PATH,
                                      profiling_stage_data=profiling_data)
-    vlm_max_gpu_total_bytes_with_mm_reqs = profiling_data["max_gpu_total_bytes"]
+    vlm_activation_bytes_with_mm_reqs = profiling_data["activation_bytes"]
     py_executor.shutdown()
     torch.cuda.empty_cache()
 
@@ -71,8 +71,8 @@ def test_profile_kvcache():
     py_executor_2 = create_py_executor(llm_args=torchllm_args,
                                        checkpoint_dir=VLM_MODEL_PATH,
                                        profiling_stage_data=profiling_data)
-    vlm_max_gpu_total_bytes_no_mm_reqs = profiling_data["max_gpu_total_bytes"]
+    vlm_activation_bytes_no_mm_reqs = profiling_data["activation_bytes"]
     py_executor_2.shutdown()
     torch.cuda.empty_cache()
 
-    assert vlm_max_gpu_total_bytes_with_mm_reqs < vlm_max_gpu_total_bytes_no_mm_reqs, f"available KVCache for VLMs is expected to be less when profiling with mm reqs, but got {vlm_max_gpu_total_bytes_with_mm_reqs} for mm reqs and {vlm_max_gpu_total_bytes_no_mm_reqs} without mm reqs"
+    assert vlm_activation_bytes_with_mm_reqs > vlm_activation_bytes_no_mm_reqs, f"Activation bytes should be higher with mm reqs, but got {vlm_activation_bytes_with_mm_reqs} for mm reqs and {vlm_activation_bytes_no_mm_reqs} without mm reqs"
