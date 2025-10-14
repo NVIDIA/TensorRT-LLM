@@ -7,7 +7,6 @@ import torch.nn as nn
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -82,6 +81,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer: Optional["Indexer"] = None
 
     def __init__(self, *args, **kwargs):
+        self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
         super().__init__(*args, **kwargs)
 
     def __post_init__(self):
@@ -175,10 +175,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
-
-        # Preparation stage buffers
-        # TODO: move scheduler_metadata_buffer to device
-        self.scheduler_metadata_buffer = None
+        self.scheduler_metadata_buffer = get_empty(
+            (self.num_sms + 1, 2),
+            cache_name="scheduler_metadata_buffer",
+            dtype=torch.int32,
+        )
+        self.cu_seqlen_ks = get_empty(
+            (self.max_num_tokens, ),
+            cache_name="cu_seqlen_ks",
+            dtype=torch.int32,
+        )
+        self.cu_seqlen_ke = get_empty(
+            (self.max_num_tokens, ),
+            cache_name="cu_seqlen_ke",
+            dtype=torch.int32,
+        )
 
     def prepare(self):
         super().prepare()
@@ -323,54 +334,43 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        num_sms = deep_gemm.get_num_sms()
+        num_ctx_tokens = metadata.num_ctx_tokens
+        request_ids = metadata.request_ids
+        seq_lens = metadata.seq_lens
+        head_dim = metadata.kv_cache_manager.index_head_dim
+        tokens_per_block = metadata.kv_cache_manager.indexer_k_cache_tokens_per_block
+        quant_block_size = metadata.kv_cache_manager.quant_block_size
+        cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+        total_tokens = seq_lens.sum().item()
+
+        # Prepare for prefill phase if there are context requests
+        if num_contexts > 0:
+            # Compute attention window bounds for each query token in batched sequences
+            # cu_seqlen_ks[i]: start index in global KV for query token i
+            # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
+            host_seq_lens = seq_lens[:num_contexts].to(torch.int32)
+            host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
+                host_seq_lens, num_contexts, num_ctx_tokens)
+            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
+                                                         non_blocking=True)
+            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
+                                                         non_blocking=True)
 
         # Prepare for decode phase if there are generation requests
         if num_generations > 0:
             # Get context_lens for generation requests (total tokens including history + new token)
-            context_lens = metadata.kv_lens[num_contexts:num_contexts +
-                                            num_generations].to(torch.int32)
+            context_lens = metadata.kv_lens_cuda_runtime[
+                num_contexts:num_contexts + num_generations].to(torch.int32)
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
-            blocksize = metadata.kv_cache_manager.indexer_k_cache_tokens_per_block
-            metadata.scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                context_lens, blocksize, num_sms)
+            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                context_lens, tokens_per_block, metadata.num_sms)
+            metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
+                                                     non_blocking=True)
 
         # Compute slot_mapping for all requests (both context and generation)
         # This maps each token to its flat cache position for vectorized KV cache updates
-        request_ids = metadata.request_ids
-        seq_lens = metadata.seq_lens
-
-        # start_positions: where to start inserting tokens for each request
-        cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
-
-        # Compute the flat slot mapping for all tokens (separate FP8 and scale offsets)
-        Indexer._compute_slot_mapping(request_ids, start_positions, seq_lens,
-                                      metadata)
-
-    @staticmethod
-    def _compute_slot_mapping(request_ids: List[int],
-                              start_positions: torch.Tensor,
-                              num_tokens_per_request: torch.Tensor,
-                              metadata: DSAtrtllmAttentionMetadata) -> None:
-        """
-        Compute flat byte-level slot mappings for indexer k cache updates
-        Computes separate flat indices for FP8 data and scales.
-
-        Args:
-            request_ids: List of request IDs
-            start_positions: Starting position in cache for each request
-            num_tokens_per_request: Number of tokens for each request
-
-        Sets:
-            metadata.slot_mapping_fp8: [total_tokens] - flat byte index for FP8 data start
-            metadata.slot_mapping_scale: [total_tokens] - flat byte index for scale start
-        """
-        total_tokens = num_tokens_per_request.sum().item()
-        head_dim = metadata.kv_cache_manager.index_head_dim
-        tokens_per_block = metadata.kv_cache_manager.indexer_k_cache_tokens_per_block
-        quant_block_size = metadata.kv_cache_manager.quant_block_size
         scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
         block_stride = tokens_per_block * (head_dim + scale_size
                                            )  # Bytes per block
@@ -378,15 +378,13 @@ class Indexer(nn.Module):
 
         token_idx = 0
         for req_idx, req_id in enumerate(request_ids):
-            num_tokens = num_tokens_per_request[req_idx].item()
+            num_tokens = seq_lens[req_idx].item()
             start_pos = start_positions[req_idx].item()
-
             # Compute slots for each token in this request
             for local_token_idx in range(num_tokens):
                 global_pos = start_pos + local_token_idx
                 block_idx_in_seq = global_pos // tokens_per_block
                 pos_in_block = global_pos % tokens_per_block
-
                 # Get physical block ID
                 if block_idx_in_seq < metadata.host_indexer_k_cache_block_offsets.shape[
                         1]:
@@ -401,7 +399,6 @@ class Indexer(nn.Module):
                         scale_flat_idx = block_id * block_stride + scale_base_offset + pos_in_block * scale_size
                         metadata.host_slot_mapping_scale[
                             token_idx] = scale_flat_idx
-
                 token_idx += 1
 
         metadata.slot_mapping_fp8[:total_tokens].copy_(
@@ -489,15 +486,9 @@ class Indexer(nn.Module):
         self._update_k_cache(k_fp8, k_scale, metadata)
 
         if has_prefill:
-            # Compute attention window bounds for each query token in batched sequences
-            # cu_seqlen_ks[i]: start index in global KV for query token i
-            # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
-            seq_lens = metadata.seq_lens_cuda[:num_contexts].to(torch.int32)
-
-            # FIXME: better way to retrieve cu_seqlen_ks and cu_seqlen_ke from kv cache or attn metadata?
-            # TODO: maybe move this to prepare() stage
-            cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
-                seq_lens, num_contexts, num_ctx_tokens)
+            ctx_seq_lens = metadata.seq_lens_cuda[:num_contexts].to(torch.int32)
+            cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
+            cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
             logits = fp8_mqa_logits(
                 q_fp8[:num_ctx_tokens, ...],
@@ -518,10 +509,8 @@ class Indexer(nn.Module):
             mask = mask_lo & mask_hi
             # Convert local indices to global indices relative to the KV cache
             kv_offsets = torch.repeat_interleave(
-                metadata.ctx_kv_indptr[:num_contexts],
-                seq_lens,
-                dim=0
-            )  # [num_ctx_tokens]
+                metadata.ctx_kv_indptr[:num_contexts], ctx_seq_lens,
+                dim=0)  # [num_ctx_tokens]
             topk_indices = topk_indices + kv_offsets.unsqueeze(1)
             topk_indices = topk_indices.masked_fill(~mask, -1)
             topk_indices_buffer[:num_ctx_tokens, :topk_indices.
@@ -547,9 +536,9 @@ class Indexer(nn.Module):
                                      num_gen_tokens, ...]
 
             # Get k cache and call fp8_paged_mqa_logits with prepared decode metadata
+            # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
-                self.layer_idx
-            )  # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
+                self.layer_idx)
             logits_decode = fp8_paged_mqa_logits(
                 q_decode,
                 k_cache,
@@ -591,10 +580,10 @@ class Indexer(nn.Module):
             kv_offsets = torch.repeat_interleave(
                 metadata.gen_kv_indptr[:num_generations],
                 gen_seq_lens_cuda,
-                dim=0
-            )  # [num_gen_tokens]
+                dim=0)  # [num_gen_tokens]
             topk_indices_decode = topk_indices_decode + kv_offsets.unsqueeze(1)
-            topk_indices_decode = topk_indices_decode.masked_fill(~mask_decode, -1)
+            topk_indices_decode = topk_indices_decode.masked_fill(
+                ~mask_decode, -1)
 
             # Store in buffer
             topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +

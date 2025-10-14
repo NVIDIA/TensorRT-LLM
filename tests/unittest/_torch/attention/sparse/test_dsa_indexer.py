@@ -386,6 +386,7 @@ def _create_mock_metadata(request_ids, batch_size, num_contexts,
     class MockMetadata:
 
         def __init__(self):
+            self.num_sms = deep_gemm.get_num_sms()
             self.request_ids = request_ids
             self.num_contexts = num_contexts
             self.num_generations = num_generations
@@ -416,17 +417,20 @@ def _create_mock_metadata(request_ids, batch_size, num_contexts,
             self.slot_mapping_scale = torch.zeros((num_tokens, ),
                                                   device='cuda',
                                                   dtype=torch.int64)
-            self.scheduler_metadata_buffer = None
-            self.host_slot_mapping_fp8 = torch.zeros_like(
-                self.slot_mapping_fp8,
-                device='cpu',
-                pin_memory=True,
-            )
+            self.scheduler_metadata_buffer = torch.zeros((self.num_sms + 1, 2),
+                                                         device='cuda',
+                                                         dtype=torch.int32)
+            self.cu_seqlen_ks = torch.zeros((num_tokens, ),
+                                            device='cuda',
+                                            dtype=torch.int32)
+            self.cu_seqlen_ke = torch.zeros((num_tokens, ),
+                                            device='cuda',
+                                            dtype=torch.int32)
+            self.host_slot_mapping_fp8 = torch.zeros_like(self.slot_mapping_fp8,
+                                                          device='cpu',
+                                                          pin_memory=True)
             self.host_slot_mapping_scale = torch.zeros_like(
-                self.slot_mapping_scale,
-                device='cpu',
-                pin_memory=True,
-            )
+                self.slot_mapping_scale, device='cpu', pin_memory=True)
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
 
