@@ -240,7 +240,7 @@ To set a timeout for specific long-running test cases, follow these steps:
 
 Some test cases may experience intermittent failures due to resource conflicts, memory leaks, or state pollution when run together with other tests. The `ISOLATION` marker ensures these cases run in a separate pytest process, avoiding such issues.
 
-### When to use ISOLATION:
+### When to use the `ISOLATION` marker:
 - Tests that modify global state or environment variables
 - Tests with memory-intensive operations that may affect subsequent tests
 - Tests that experience intermittent failures only when run with other tests
