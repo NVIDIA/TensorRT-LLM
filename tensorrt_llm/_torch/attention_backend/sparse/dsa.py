@@ -31,6 +31,81 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 
+def split_prefill_chunks(
+    seq_lens: torch.Tensor,
+    max_chunk_size: int,
+    start_idx: int = 0,
+) -> List[List[Tuple[int, int, int, int]]]:
+    """
+    Split prefill requests into chunks based on max_chunk_size.
+    Supports two-level chunking:
+    1. Request-boundary chunking: group multiple small requests into one chunk
+    2. Intra-request chunking: split large requests into multiple Q-block chunks
+
+    Args:
+        seq_lens: Sequence lengths for all requests
+        max_chunk_size: Maximum number of tokens per chunk
+        start_idx: Starting index for prefill requests
+
+    Returns:
+        List of chunk groups, where each group is a list of chunk specs.
+        Each chunk spec is (req_idx, token_start_in_req, token_end_in_req, req_cum_start)
+
+        - For multi-request chunks: group contains multiple specs (one per request)
+        - For intra-request chunks: each Q-block is a separate group with single spec
+    """
+    chunk_groups = []
+    num_reqs = len(seq_lens)
+
+    current_req = start_idx
+    # Compute cumulative token positions
+    query_start_loc_cpu = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device='cpu'),
+        seq_lens.cumsum(dim=0).to(torch.int32)
+    ])
+
+    while current_req < num_reqs:
+        seq_len = seq_lens[current_req].item()
+        req_cum_start = query_start_loc_cpu[current_req].item()
+
+        if seq_len <= max_chunk_size:
+            # This request fits in one chunk - try to pack with others
+            current_size = seq_len
+            chunk_specs = [(current_req, 0, seq_len, req_cum_start)]
+            next_req = current_req + 1
+
+            # Try to add more requests to this chunk
+            while next_req < num_reqs:
+                next_seq_len = seq_lens[next_req].item()
+                if next_seq_len > max_chunk_size:
+                    # Next request is large, stop packing
+                    break
+                if current_size + next_seq_len <= max_chunk_size:
+                    next_cum_start = query_start_loc_cpu[next_req].item()
+                    chunk_specs.append((next_req, 0, next_seq_len, next_cum_start))
+                    current_size += next_seq_len
+                    next_req += 1
+                else:
+                    break
+
+            # Add as one multi-request chunk group
+            chunk_groups.append(chunk_specs)
+            current_req = next_req
+        else:
+            # Large request - split into Q-blocks
+            # Each Q-block is a separate chunk group (processed in separate iteration)
+            num_q_blocks = (seq_len + max_chunk_size - 1) // max_chunk_size
+            for q_block_idx in range(num_q_blocks):
+                token_start = q_block_idx * max_chunk_size
+                token_end = min(token_start + max_chunk_size, seq_len)
+                q_block_spec = [(current_req, token_start, token_end, req_cum_start)]
+                chunk_groups.append(q_block_spec)
+
+            current_req += 1
+
+    return chunk_groups
+
+
 def compute_cu_seqlen_kv_bounds_nocache(
     seq_lens: torch.Tensor,
     num_contexts: int,
@@ -76,9 +151,36 @@ def compute_cu_seqlen_kv_bounds_nocache(
     return cu_seqlen_ks, cu_seqlen_ke
 
 
+class IndexerPrefillChunkMetadata:
+    """Metadata for a single prefill chunk in the indexer"""
+    def __init__(
+        self,
+        cu_seqlen_ks: torch.Tensor,      # Attention window start for each token
+        cu_seqlen_ke: torch.Tensor,      # Attention window end for each token
+        token_start: int,                 # Q token start index in batch
+        token_end: int,                   # Q token end index in batch
+        k_token_start: int,               # K token start index in batch
+        k_token_end: int,                 # K token end index in batch
+        ctx_kv_offsets: torch.Tensor,    # Offsets for converting local to global topk indices
+    ):
+        self.cu_seqlen_ks = cu_seqlen_ks
+        self.cu_seqlen_ke = cu_seqlen_ke
+        self.token_start = token_start
+        self.token_end = token_end
+        self.k_token_start = k_token_start
+        self.k_token_end = k_token_end
+        self.ctx_kv_offsets = ctx_kv_offsets
+
+
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
+    # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
+    indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
+    # Max chunk size for two-level chunking:
+    # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
+    # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
+    indexer_max_chunk_size = 32768 # Tunable
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -330,6 +432,104 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
 
     @staticmethod
+    def prepare_one_prefill_chunk(
+        metadata: DSAtrtllmAttentionMetadata,
+        chunk_specs: List[Tuple[int, int, int, int]],
+        seq_lens_cpu: torch.Tensor,
+    ) -> IndexerPrefillChunkMetadata:
+        """
+        Build metadata for one prefill chunk for indexer forward pass.
+        Handles both multi-request chunks and intra-request Q-block chunks.
+
+        Args:
+            metadata: Attention metadata
+            chunk_specs: List of (req_idx, token_start_in_req, token_end_in_req, req_cum_start)
+                        - For multi-request: multiple specs from different requests
+                        - For intra-request: single spec from one request's Q-block
+            seq_lens_cpu: Sequence lengths for all requests
+        """
+        device = metadata.cu_seqlen_ks.device
+
+        if len(chunk_specs) == 1:
+            # Single request or intra-request Q-block
+            req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[0]
+            num_q_tokens = token_end_in_req - token_start_in_req
+
+            # For intra-request chunks: Q block attends to all previous K in the request
+            # Q tokens [token_start_in_req:token_end_in_req] within the request
+            # K tokens [0:token_end_in_req] within the request (causal attention)
+
+            cu_seqlen_ks = torch.zeros(num_q_tokens, dtype=torch.int32, device='cpu')
+            cu_seqlen_ke = torch.arange(
+                token_start_in_req + 1,
+                token_end_in_req + 1,
+                dtype=torch.int32,
+                device='cpu'
+            )
+
+            # Q token range in batch
+            token_start = req_cum_start + token_start_in_req
+            token_end = req_cum_start + token_end_in_req
+
+            # K token range in batch: from request start to Q block end
+            k_token_start = req_cum_start
+            k_token_end = req_cum_start + token_end_in_req
+
+            kv_offset = metadata.host_ctx_kv_indptr[req_idx].item()
+            ctx_kv_offsets = torch.full(
+                (num_q_tokens, 1),
+                kv_offset,
+                dtype=torch.int32,
+                device='cpu'
+            )
+        else:
+            # Multi-request chunk: batch multiple full requests together
+            # Extract sequence lengths for these requests
+            req_seq_lens = []
+            for spec in chunk_specs:
+                req_idx, token_start_in_req, token_end_in_req, _ = spec
+                assert token_start_in_req == 0, "Multi-request chunk must contain full requests"
+                assert token_end_in_req == seq_lens_cpu[req_idx].item(), \
+                    "Multi-request chunk must contain full requests"
+                req_seq_lens.append(token_end_in_req)
+
+            req_seq_lens_tensor = torch.tensor(req_seq_lens, dtype=torch.int32, device='cpu')
+            num_q_tokens = sum(req_seq_lens)
+
+            # Compute causal attention bounds for batched requests
+            cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
+                req_seq_lens_tensor,
+                len(chunk_specs),
+                num_q_tokens
+            )
+
+            # Global Q and K token ranges (same for multi-request chunks)
+            token_start = chunk_specs[0][3]  # req_cum_start of first request
+            token_end = chunk_specs[-1][3] + chunk_specs[-1][2]  # last req start + length
+            k_token_start = token_start
+            k_token_end = token_end
+
+            # KV offsets for each request
+            ctx_kv_offsets_list = []
+            for spec in chunk_specs:
+                req_idx, _, token_end_in_req, _ = spec
+                kv_offset = metadata.host_ctx_kv_indptr[req_idx].item()
+                ctx_kv_offsets_list.append(
+                    torch.full((token_end_in_req,), kv_offset, dtype=torch.int32, device='cpu')
+                )
+            ctx_kv_offsets = torch.cat(ctx_kv_offsets_list).unsqueeze(1)
+
+        return IndexerPrefillChunkMetadata(
+            cu_seqlen_ks=cu_seqlen_ks.to(device, non_blocking=True),
+            cu_seqlen_ke=cu_seqlen_ke.to(device, non_blocking=True),
+            token_start=token_start,
+            token_end=token_end,
+            k_token_start=k_token_start,
+            k_token_end=k_token_end,
+            ctx_kv_offsets=ctx_kv_offsets.to(device, non_blocking=True),
+        )
+
+    @staticmethod
     def prepare(metadata: DSAtrtllmAttentionMetadata):
         """
         Prepare indexer for the forward pass.
@@ -357,6 +557,28 @@ class Indexer(nn.Module):
             # cu_seqlen_ks[i]: start index in global KV for query token i
             # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
             host_seq_lens = seq_lens[:num_contexts]
+
+            # Two-level chunking: request-boundary + intra-request
+            chunk_groups = split_prefill_chunks(
+                host_seq_lens,
+                metadata.indexer_max_chunk_size,
+                start_idx=0,
+            )
+
+            # Enable chunking when num_chunk > 1
+            if len(chunk_groups) > 1:
+                metadata.indexer_prefill_chunks = [
+                    Indexer.prepare_one_prefill_chunk(
+                        metadata,
+                        chunk_specs,
+                        host_seq_lens,
+                    )
+                    for chunk_specs in chunk_groups
+                ]
+
+            # TODO: Still compute global cu_seqlen bounds for fallback/debugging.
+            # Remove this when indexer chunked prefill is fully tested.
+            # Still compute global cu_seqlen bounds for fallback/debugging
             host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_nocache(
                 host_seq_lens, num_contexts, num_ctx_tokens)
             metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
@@ -479,6 +701,54 @@ class Indexer(nn.Module):
             1) + byte_offsets  # [num_tokens, scale_size]
         k_cache_flat[scatter_indices_scale] = k_scale_bytes
 
+    def _gather_k_cache_for_chunk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        chunk: IndexerPrefillChunkMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather K values from indexer cache for a specific chunk.
+
+        Uses pre-computed slot_mapping for efficient vectorized gather.
+        For intra-request Q-blocks, gathers all previous K tokens in the request.
+
+        Args:
+            metadata: Attention metadata
+            chunk: Chunk metadata containing token ranges
+
+        Returns:
+            k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
+            k_scale: Scaling factors, shape [num_k_tokens, 1]
+        """
+        k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
+        k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
+
+        head_dim = self.head_dim
+        scale_size = 4  # float32 = 4 bytes
+
+        # Extract slot mappings for K token range
+        k_token_start = chunk.k_token_start
+        k_token_end = chunk.k_token_end
+        num_k_tokens = k_token_end - k_token_start
+
+        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8[k_token_start:k_token_end]
+        slot_mapping_scale_chunk = metadata.slot_mapping_scale[k_token_start:k_token_end]
+
+        # Vectorized gather using pre-computed slot mappings
+        # Gather FP8 data
+        byte_offsets_fp8 = torch.arange(head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
+        gather_indices_fp8 = slot_mapping_fp8_chunk.unsqueeze(1) + byte_offsets_fp8  # [num_k_tokens, head_dim]
+        k_fp8_bytes = k_cache_flat[gather_indices_fp8]
+        k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(num_k_tokens, head_dim)
+
+        # Gather scale data
+        byte_offsets_scale = torch.arange(scale_size, device=k_cache.device).unsqueeze(0)  # [1, 4]
+        gather_indices_scale = slot_mapping_scale_chunk.unsqueeze(1) + byte_offsets_scale  # [num_k_tokens, 4]
+        k_scale_bytes = k_cache_flat[gather_indices_scale]
+        k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
+
+        return k_fp8, k_scale
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -509,33 +779,63 @@ class Indexer(nn.Module):
         self._update_k_cache(k_fp8, k_scale, metadata)
 
         if has_prefill:
-            ctx_seq_lens = metadata.seq_lens_cuda[:num_contexts].to(torch.int32)
-            cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
-            cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
+            # Use chunked prefill to reduce memory footprint
+            if metadata.indexer_prefill_chunks is not None:
+                for chunk in metadata.indexer_prefill_chunks:
+                    # Gather K from cache for this chunk
+                    chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(metadata, chunk)
 
-            logits = fp8_mqa_logits(
-                q_fp8[:num_ctx_tokens, ...],
-                (k_fp8[:num_ctx_tokens, ...], k_scale[:num_ctx_tokens, ...]),
-                weights[:num_ctx_tokens, ...],
-                cu_seqlen_ks,
-                cu_seqlen_ke,
-            )
-            topk_indices = logits.topk(min(self.index_topk, logits.shape[-1]),
-                                       dim=-1)[1]
-            topk_indices -= cu_seqlen_ks[:, None]
-            mask_lo = topk_indices >= 0
-            mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:, None] < 0
-            mask = torch.full_like(topk_indices,
-                                   False,
-                                   dtype=torch.bool,
-                                   device=topk_indices.device)
-            mask = mask_lo & mask_hi
-            # Convert local indices to global indices relative to the KV cache
-            ctx_kv_offsets = metadata.ctx_kv_offsets[:num_ctx_tokens]
-            topk_indices = topk_indices + ctx_kv_offsets
-            topk_indices = topk_indices.masked_fill(~mask, -1)
-            topk_indices_buffer[:num_ctx_tokens, :topk_indices.
-                                shape[-1]] = topk_indices.to(dtype=torch.int32)
+                    # Compute logits for this chunk
+                    logits = fp8_mqa_logits(
+                        q_fp8[chunk.token_start:chunk.token_end, ...],
+                        (chunk_k_fp8, chunk_k_scale),
+                        weights[chunk.token_start:chunk.token_end, ...],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                    )
+
+                    # Select top-k indices
+                    topk_indices = logits.topk(min(self.index_topk, logits.shape[-1]),
+                                               dim=-1)[1]
+                    topk_indices -= chunk.cu_seqlen_ks[:, None]
+
+                    # Apply masks
+                    mask_lo = topk_indices >= 0
+                    mask_hi = topk_indices - (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks)[:, None] < 0
+                    mask = mask_lo & mask_hi
+
+                    # Convert local indices to global indices relative to the KV cache
+                    topk_indices = topk_indices + chunk.ctx_kv_offsets
+                    topk_indices = topk_indices.masked_fill(~mask, -1)
+
+                    # Store in buffer
+                    topk_indices_buffer[
+                        chunk.token_start:chunk.token_end, :topk_indices.shape[-1]
+                    ] = topk_indices.to(dtype=torch.int32)
+            else:
+                # Fallback: non-chunked prefill (TODO: remove this once chunked prefill is fully tested)
+                cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
+                cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
+
+                logits = fp8_mqa_logits(
+                    q_fp8[:num_ctx_tokens, ...],
+                    (k_fp8[:num_ctx_tokens, ...], k_scale[:num_ctx_tokens, ...]),
+                    weights[:num_ctx_tokens, ...],
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                )
+                topk_indices = logits.topk(min(self.index_topk, logits.shape[-1]),
+                                           dim=-1)[1]
+                topk_indices -= cu_seqlen_ks[:, None]
+                mask_lo = topk_indices >= 0
+                mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:, None] < 0
+                mask = mask_lo & mask_hi
+                # Convert local indices to global indices relative to the KV cache
+                ctx_kv_offsets = metadata.ctx_kv_offsets[:num_ctx_tokens]
+                topk_indices = topk_indices + ctx_kv_offsets
+                topk_indices = topk_indices.masked_fill(~mask, -1)
+                topk_indices_buffer[:num_ctx_tokens, :topk_indices.
+                                    shape[-1]] = topk_indices.to(dtype=torch.int32)
 
         if has_decode:
             max_seq_len = metadata.kv_cache_manager.max_seq_len
