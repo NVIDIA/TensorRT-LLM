@@ -70,7 +70,8 @@ ninja
 etcd3
 blake3
 soundfile
-triton==3.3.1; platform_machine == "x86_64"
+# triton==3.3.1; platform_machine == "x86_64"  # <For CUDA 12.9>
+triton==3.5.0; platform_machine == "x86_64"
 tiktoken
 blobfile
 openai-harmony==0.0.4
