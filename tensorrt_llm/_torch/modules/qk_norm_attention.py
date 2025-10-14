@@ -200,7 +200,8 @@ class QKNormRoPEAttention(Attention):
                               dtype=self.pretrained_config.torch_dtype,
                               has_weights=True,
                               use_gemma=use_gemma_rms_norm)
-        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream()
+        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
+        )
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def apply_qk_norm(self, q, k):
