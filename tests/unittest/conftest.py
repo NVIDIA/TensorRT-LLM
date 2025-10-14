@@ -16,6 +16,7 @@
 import os
 import sys
 import traceback
+from functools import partial
 from typing import Any
 
 import _pytest.outcomes
@@ -23,6 +24,9 @@ import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from integration.defs import test_list_parser
 
 
 def pytest_configure(config):
@@ -87,11 +91,82 @@ def pytest_addoption(parser):
         default=False,
         help="Run Ray-marked tests (by default they are skipped).",
     )
+    parser.addoption(
+        "--waives-file",
+        "-S",
+        action="store",
+        default=None,
+        help=
+        "Specify a file containing a list of waives, one per line. After filtering collected tests, Pytest will "
+        "apply the waive state specified by this file to the set of tests to be run.",
+    )
+
+
+def apply_waives_ut(waives_file, items: list[pytest.Item], config):
+    """Apply waives based on the waive state specified by the given waives_file."""
+
+    # Corrections don't make sense for the waives file as it specifies global negative
+    # filters that may or may not be applicable to the current platform (i.e., the test names
+    # being waived may not be generated on the current platform).
+    parse_test_list_lines_bak = test_list_parser.parse_test_list_lines
+    test_list_parser.parse_test_list_lines = partial(
+        test_list_parser.parse_test_list_lines, convert_unittest=False)
+    ret = test_list_parser.parse_and_validate_test_list(
+        waives_file,
+        config,
+        items,
+        check_for_corrections=False,
+    )
+    if not ret:
+        return
+    _, test_name_to_marker_dict = ret
+
+    filtered_dict = {}
+    for waiver in test_name_to_marker_dict.keys():
+        if not "unittest/" in waiver:
+            continue
+        elif "unittest/unittest/" in waiver:
+            filtered_dict[waiver.replace(
+                "unittest/unittest/",
+                "unittest/")] = test_name_to_marker_dict[waiver]
+        else:
+            filtered_dict[waiver] = test_name_to_marker_dict[waiver]
+
+    # Fuzzy match is supported in the following order:
+    # 1. exact match
+    # 2. remove parameterization part in square brackets and try again (function level)
+    # 3. remove the last part after '::' and try again, until no '::' left (file level)
+    # Note: directory level match is not supported.
+    def match_waiver(id: str) -> bool:
+        if id in filtered_dict:
+            return filtered_dict[id]
+        if id.endswith("]"):
+            id = id.split("[")[0]
+            if id in filtered_dict:
+                return filtered_dict[id]
+        while "::" in id:
+            id = id.rsplit("::", 1)[0]
+            if id in filtered_dict:
+                return filtered_dict[id]
+
+        return None
+
+    # For each item in the list, apply waives if a waive entry exists
+    for item in items:
+        waiver = match_waiver(item.nodeid)
+        if waiver:
+            marker, reason, _ = waiver
+            if marker:
+                mark_func = getattr(pytest.mark, marker.lower())
+                mark = mark_func(reason=reason)
+                item.add_marker(mark)
+    test_list_parser.parse_test_list_lines = parse_test_list_lines_bak
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_collection_modifyitems(session, config, items):
     test_prefix = config.getoption("--test-prefix")
+    waives_file = config.getoption("--waives-file")
 
     yield
 
@@ -102,6 +177,8 @@ def pytest_collection_modifyitems(session, config, items):
         for item in items:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
 
+    if waives_file:
+        apply_waives_ut(waives_file, items, config)
     # Ray tests are disabled by default
     run_ray = config.getoption("--run-ray") or os.environ.get(
         "TLLM_RUN_RAY_TESTS") == "1"

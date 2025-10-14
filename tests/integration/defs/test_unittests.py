@@ -76,6 +76,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     else:
         test_prefix = "unittest"
 
+    waives_file = request.config.getoption("--waives-file")
+
     num_workers = 1
 
     # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on test execution results.
@@ -132,9 +134,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if dry_run:
         command += ['--collect-only']
 
+    if waives_file:
+        command += [f"--waives-file={waives_file}"]
+
     command += arg_list
 
-    print(f"Running unit test:'{command}'")
+    print(f"Running unit test:\"python {' '.join(command)}\"")
 
     def run_command(cmd, num_workers=1):
         try:
