@@ -37,8 +37,8 @@ For an example showing how to set the parameters and how to access the results, 
       additional_model_outputs=["hidden_states", "attentions"]
       ```
     - Pass this list to the `additional_model_outputs` parameter of `SamplingParams`.
-    - After generation, access the results per sequence via `sequence.additional_context_outputs` (for context outputs) and `sequence.
-    additional_generation_outputs` (for generation outputs).
+    - After generation, access the results per sequence via `sequence.additional_context_outputs` (for context outputs)
+    and `sequence.additional_generation_outputs` (for generation outputs).
 - **Default**: `None` (no additional outputs returned)
 
 **Note:** The available output names depend on the model implementation. The model forward function is expected to return a dictionary of model outputs including the `"logits"` and any additional output that should be attached to responses.
