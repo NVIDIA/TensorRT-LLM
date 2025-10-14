@@ -3359,7 +3359,7 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
 
-@pytest.mark.timeout(5400)
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
@@ -3376,6 +3376,8 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
+    pytest.param('Kimi-K2-Instruct',
+                 marks=(skip_pre_hopper, skip_post_blackwell)),
 ])
 def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
                           eval_task):
