@@ -294,7 +294,7 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
     math_bound_token_count = 256
-    max_lm_head_tp_size = 8
+    max_lm_head_tp_size = min(8, mapping.world_size)
 
     lm_head_tp_size_raw = math_bound_token_count // token_count
     lm_head_tp_size = int(
