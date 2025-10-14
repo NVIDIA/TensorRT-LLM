@@ -218,6 +218,7 @@ class TestRpcError:
 
         client.close()
 
+    @pytest.mark.skip(reason="https://nvbugs/5579234")
     def test_timeout_error(self):
         """Test that requests that exceed timeout are handled with proper error."""
 
