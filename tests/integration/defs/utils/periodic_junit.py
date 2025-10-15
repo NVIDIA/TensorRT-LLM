@@ -145,6 +145,85 @@ class PeriodicJUnitXML:
         return text
 
     @staticmethod
+    def _parse_nodeid(nodeid):
+        """
+        Parse nodeid to extract classname and test name.
+
+        The logic follows pytest nodeid format with optional test prefix:
+        - Format: [prefix/]path/to/test.py::ClassName::test_name
+        - Or: [prefix/]path/to/test.py::test_name (no class)
+
+        Rules:
+        - Everything before '.py' is the package (converted to dot notation)
+        - After '.py::', split by '::':
+          - If there are 2+ parts, first part is the class, last part is test name
+          - If there is 1 part, it's just the test name (no class)
+        - Package becomes the classname, or package.class if class exists
+
+        Examples:
+            'RTX/test_e2e.py::test_foo[param]' ->
+                ('RTX.test_e2e', 'test_foo[param]')
+
+            'RTX/accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp4ep2-cuda_graph=True]' ->
+                ('RTX.accuracy.test_llm_api_pytorch.TestLlama4ScoutInstruct', 'test_auto_dtype[tp4ep2-cuda_graph=True]')
+
+            'tests/test_foo.py::test_bar' ->
+                ('tests.test_foo', 'test_bar')
+
+        Args:
+            nodeid: The pytest nodeid string
+
+        Returns:
+            tuple: (classname, test_name)
+        """
+        if not nodeid:
+            return ('', '')
+
+        # Split by '.py' to separate file path from test components
+        if '.py' in nodeid:
+            file_part, test_part = nodeid.split('.py', 1)
+
+            # Convert file path to package notation (replace / and \ with .)
+            package = file_part.replace('/', '.').replace('\\', '.').strip('.')
+
+            # Parse test components after '.py'
+            # Remove leading '::' if present
+            test_part = test_part.lstrip(':')
+
+            if '::' in test_part:
+                # Split by '::' to get class and test name
+                parts = test_part.split('::')
+
+                if len(parts) >= 2:
+                    # Format: ClassName::test_name or ClassName::nested::test_name
+                    # First part is class, last part is test name
+                    class_name = parts[0]
+                    test_name = parts[-1]
+
+                    # Combine package and class
+                    classname = f"{package}.{class_name}"
+                else:
+                    # Only one part after split (shouldn't happen with '::' check, but safety)
+                    classname = package
+                    test_name = parts[0]
+            else:
+                # No '::' found, entire test_part is the test name
+                classname = package
+                test_name = test_part if test_part else nodeid
+        else:
+            # No '.py' in nodeid, use as-is (fallback)
+            # This might happen with special test formats
+            if '::' in nodeid:
+                parts = nodeid.split('::')
+                classname = '.'.join(parts[:-1])
+                test_name = parts[-1]
+            else:
+                classname = nodeid
+                test_name = nodeid
+
+        return (classname, test_name)
+
+    @staticmethod
     def _format_classname(classname):
         """
         Format classname for JUnit XML report.
@@ -354,10 +433,15 @@ class PeriodicJUnitXML:
         if not primary_report:
             return None
 
+        # Parse nodeid to extract package, classname, and test name
+        # Format: [prefix/]path/to/test.py::ClassName::test_name
+        # or: [prefix/]path/to/test.py::test_name
+        classname, test_name = self._parse_nodeid(nodeid)
+
         testcase = ET.Element(
             'testcase',
-            classname=self._format_classname(primary_report.location[0]),
-            name=primary_report.location[2],
+            classname=classname,
+            name=test_name,
             time=f"{test_info['duration']:.3f}",
         )
 
