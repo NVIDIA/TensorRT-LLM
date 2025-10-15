@@ -14,11 +14,13 @@ l0_a10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
+  - unittest/others/test_time_breakdown.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -46,6 +48,9 @@ l0_a10:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_additional_model_outputs.py
+  # executor
+  - unittest/executor/test_rpc.py
 - condition:
     ranges:
       system_gpu_count:

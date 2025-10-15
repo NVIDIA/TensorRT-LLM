@@ -93,7 +93,7 @@ class GQA_Block(nn.Module):
         k = self.k_proj(x).view(b, s, -1, self.head_dim)
         v = self.v_proj(x).view(b, s, -1, self.head_dim)
 
-        y = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(q, k, v, is_causal=True)
+        y = torch.ops.auto_deploy.torch_attention(q, k, v, is_causal=True, layout="bsnd")
         y = y.contiguous().view(b, s, -1)
 
         return self.o_proj(y)

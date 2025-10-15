@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import os
@@ -179,6 +180,20 @@ class ZeroMqQueue:
 
         nvtx_mark("ipc.send", color="blue", category="IPC")
 
+    async def put_async_noblock(self, obj: Any):
+        self.setup_lazily()
+        try:
+            if self.use_hmac_encryption:
+                data = pickle.dumps(obj)  # nosec B301
+                signed_data = self._sign_data(data)
+                await self.socket.send(signed_data, flags=zmq.NOBLOCK)
+            else:
+                await self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+        except Exception as e:
+            logger.error(f"Error sending object: {e}")
+            logger.error(traceback.format_exc())
+            raise e
+
     def get(self) -> Any:
         self.setup_lazily()
         return self._recv_data()
@@ -186,6 +201,9 @@ class ZeroMqQueue:
     async def get_async(self) -> Any:
         self.setup_lazily()
         return await self._recv_data_async()
+
+    async def get_async_noblock(self, timeout: float = 0.5) -> Any:
+        return await asyncio.wait_for(self.get_async(), timeout)
 
     def close(self):
         if self.socket:

@@ -12,15 +12,15 @@ To use Llama 3.3-70B, you must first agree to Meta’s Llama 3 Community License
 
 ## Prerequisites
 
-GPU: NVIDIA Blackwell or Hopper Architecture  
-OS: Linux  
-Drivers: CUDA Driver 575 or Later  
-Docker with NVIDIA Container Toolkit installed  
+GPU: NVIDIA Blackwell or Hopper Architecture
+OS: Linux
+Drivers: CUDA Driver 575 or Later
+Docker with NVIDIA Container Toolkit installed
 Python3 and python3-pip (Optional, for accuracy evaluation only)
 
 ## Models
 
-* FP8 model: [Llama-3.3-70B-Instruct-FP8](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8)  
+* FP8 model: [Llama-3.3-70B-Instruct-FP8](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP8)
 * NVFP4 model: [Llama-3.3-70B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4)
 
 
@@ -43,16 +43,16 @@ nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6 \
 /bin/bash
 ```
 
-Note: 
+Note:
 
-* You can mount additional directories and paths using the \-v \<local\_path\>:\<path\> flag if needed, such as mounting the downloaded weight paths.  
-* The command mounts your user .cache directory to save the downloaded model checkpoints which are saved to \~/.cache/huggingface/hub/ by default. This prevents having to redownload the weights each time you rerun the container. If the \~/.cache directory doesn’t exist please create it using  mkdir \~/.cache  
-* The command also maps port **8000** from the container to your host so you can access the LLM API endpoint from your host  
+* You can mount additional directories and paths using the \-v \<local\_path\>:\<path\> flag if needed, such as mounting the downloaded weight paths.
+* The command mounts your user .cache directory to save the downloaded model checkpoints which are saved to \~/.cache/huggingface/hub/ by default. This prevents having to redownload the weights each time you rerun the container. If the \~/.cache directory doesn’t exist please create it using  mkdir \~/.cache
+* The command also maps port **8000** from the container to your host so you can access the LLM API endpoint from your host
 * See the [https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) for all the available containers. The containers published in the main branch weekly have “rcN” suffix, while the monthly release with QA tests has no “rcN” suffix. Use the rc release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html) 
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
 
-### Creating the TRT-LLM Server config
+### Creating the TensorRT LLM Server config
 
 We create a YAML configuration file /tmp/config.yml for the TensorRT LLM Server and populate it with the following recommended performance settings.
 
@@ -64,20 +64,19 @@ enable_attention_dp: false
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 1024
-kv_cache_config:     
+kv_cache_config:
   dtype: fp8
 EOF
 ```
 
-### Launch the TRT-LLM Server
+### Launch the TensorRT LLM Server
 
-Below is an example command to launch the TRT-LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
+Below is an example command to launch the TensorRT LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
 
 ```shell
 trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
     --host 0.0.0.0 \
     --port 8000 \
-    --backend pytorch \
     --max_batch_size 1024 \
     --max_num_tokens 2048 \
     --max_seq_len 2048 \
@@ -107,10 +106,6 @@ These options are used directly on the command line when you start the `trtllm-s
 
 &emsp;**Recommendation:** If you experience OOM errors, try reducing this value to **0.8** or lower.
 
-#### `--backend pytorch`
-
-&emsp;**Description:** Tells TensorRT LLM to use the **pytorch** backend.
-
 #### `--max_batch_size`
 
 &emsp;**Description:** The maximum number of user requests that can be grouped into a single batch for processing.
@@ -136,7 +131,7 @@ These options provide finer control over performance and are set within a YAML f
 
 &emsp;**Description**: A section for configuring the Key-Value (KV) cache.
 
-&emsp;**Options**: 
+&emsp;**Options**:
 
 &emsp;&emsp;dtype: Sets the data type for the KV cache.
 
@@ -184,7 +179,7 @@ See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.h
 
 ### Basic Test
 
-Start a new terminal on the host to test the TensorRT LLM server you just launched. 
+Start a new terminal on the host to test the TensorRT LLM server you just launched.
 
 You can query the health/readiness of the server using:
 
@@ -194,7 +189,7 @@ curl -s -o /dev/null -w "Status: %{http_code}\n" "http://localhost:8000/health"
 
 When the `Status: 200` code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.
 
-After the TRT-LLM server is set up and shows Application startup complete, you can send requests to the server. 
+After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.
 
 ```shell
 curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -d '{
@@ -205,7 +200,7 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -
 }'
 ```
 
-Here is an example response, showing that the TRT-LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.
+Here is an example response, showing that the TensorRT LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.
 
 ```json
 {"id":"cmpl-bc1393d529ce485c961d9ffee5b25d72","object":"text_completion","created":1753843963,"model":"nvidia/Llama-3.3-70B-Instruct-FP8","choices":[{"index":0,"text":" New York is a state located in the northeastern United States. It is bordered by","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
@@ -213,10 +208,10 @@ Here is an example response, showing that the TRT-LLM server returns “New York
 
 ### Troubleshooting Tips
 
-* If you encounter CUDA out-of-memory errors, try reducing max\_batch\_size or max\_seq\_len  
-* Ensure your model checkpoints are compatible with the expected format  
-* For performance issues, check GPU utilization with nvidia-smi while the server is running  
-* If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed  
+* If you encounter CUDA out-of-memory errors, try reducing max\_batch\_size or max\_seq\_len
+* Ensure your model checkpoints are compatible with the expected format
+* For performance issues, check GPU utilization with nvidia-smi while the server is running
+* If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed
 * For connection issues, make sure port 8000 is not being used by another application
 
 ### Running Evaluations to Verify Accuracy (Optional)
@@ -241,7 +236,7 @@ MODEL_PATH=nvidia/Llama-3.3-70B-Instruct-FP8
 lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs temperature=0.0,add_special_tokens=False --num_fewshot 5 --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=20,tokenized_requests=False --log_samples --output_path trtllm.fp8.gsm8k
 ```
 
-Sample result in Blackwell. 
+Sample result in Blackwell.
 
 ```
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
@@ -271,7 +266,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in “benchmark\_serving.py” script. To do this first creating a wrapper [bench.sh](http://bench.sh) script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh
@@ -311,7 +306,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see. [https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt\_llm/serve/scripts/benchmark\_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
 Run bench.sh to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above bench.sh script.
 
@@ -352,13 +347,41 @@ P99 E2EL (ms):                            [result]
 
 ### Key Metrics
 
-* Median Time to First Token (TTFT)  
-  * The typical time elapsed from when a request is sent until the first output token is generated.  
-* Median Time Per Output Token (TPOT)  
-  * The typical time required to generate each token *after* the first one.   
-* Median Inter-Token Latency (ITL)  
-  * The typical time delay between the completion of one token and the completion of the next.  
-* Median End-to-End Latency (E2EL)  
-  * The typical total time from when a request is submitted until the final token of the response is received.   
-* Total Token Throughput  
-  * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens. 
+#### Time to First Token (TTFT)
+  * The typical time elapsed from when a request is sent until the first output token is generated.
+
+#### Time Per Output Token (TPOT) and Inter-Token Latency (ITL)
+  * TPOT is the typical time required to generate each token *after* the first one.
+  * ITL is the typical time delay between the completion of one token and the completion of the next.
+  * Both TPOT and ITL ignore TTFT.
+
+For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
+
+```math
+\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+```
+
+Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
+
+```math
+\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+```
+
+```math
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+```
+
+#### End-to-End (E2E) Latency
+  * The typical total time from when a request is submitted until the final token of the response is received.
+
+#### Total Token Throughput
+  * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
+```math
+\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+```
+
+#### Tokens Per Second (TPS) or Output Token Throughput
+  * how many output tokens the system generates each second.
+```math
+\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+```

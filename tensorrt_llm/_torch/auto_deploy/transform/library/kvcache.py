@@ -4,6 +4,7 @@ import operator
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
+import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
@@ -156,12 +157,10 @@ class InsertCachedAttention(BaseTransform):
         if cm.info.is_paged:
             assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
-        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
-        m_arg_keys = list(cm.info.named_standard_args.keys())
-        m_const_args = cm.info.const_args_for_prepare_metadata
-
         # insert metadata computation and extract each argument as a node
-        metadata_nodes = self._process_get_metadata(gm, m_arg_keys, m_const_args)
+        metadata_nodes = self._process_get_metadata(
+            gm, cm.info.args_for_prepare_metadata, cm.info.const_args_for_prepare_metadata
+        )
 
         buffer_in_lookup: Dict[str, Node] = {}
 
@@ -225,10 +224,6 @@ class ResizeKVCacheConfig(TransformConfig):
     free_mem_ratio: float = Field(
         description="The fraction of available memory to occupy.", default=0.8
     )
-    args_only: bool = Field(
-        description="Use ``*cm.args`` (default) or use ``**cm.named_args`` for the forward pass.",
-        default=True,
-    )
 
 
 @TransformRegistry.register("resize_kv_cache")
@@ -244,20 +239,13 @@ class ResizeKVCache(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return ResizeKVCacheConfig
 
-    def _run_forward(self, gm: GraphModule, cm: CachedSequenceInterface):
-        """Run a forward pass to get the memory usage."""
-        if self.config.args_only:
-            gm(*cm.args)
-        else:
-            gm(**cm.named_args)
-
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         free_mem_ratio = self.config.free_mem_ratio
 
         def _get_mem_info_in_mb():
@@ -275,7 +263,7 @@ class ResizeKVCache(BaseTransform):
 
         if free_mem_ratio == 0.0:
             self._log_info(f"Skipping cache resize for {free_mem_ratio=}")
-            return gm, TransformInfo(
+            return mod, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
@@ -287,7 +275,7 @@ class ResizeKVCache(BaseTransform):
         free_mem_pre, _ = _get_mem_info_in_mb()
         self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-        self._run_forward(gm, cm)
+        mod(**cm.named_args)
 
         free_mem_post, _ = _get_mem_info_in_mb()
         self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
@@ -323,18 +311,18 @@ class ResizeKVCache(BaseTransform):
             has_valid_shapes=True,
         )
 
-        return gm, info
+        return mod, info
 
 
 @TransformRegistry.register("initialize_cache")
 class InitializeCache(BaseTransform):
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         num_caches = cm.initialize_caches()
         self._log_info(f"Initialized {num_caches} caches for cached attention")
 
@@ -342,4 +330,4 @@ class InitializeCache(BaseTransform):
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
         )
 
-        return gm, info
+        return mod, info

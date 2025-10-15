@@ -166,6 +166,63 @@ class CudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
+class BaseSparseAttentionConfig(StrictBaseModel):
+    """
+    Configuration for sparse attention.
+    """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        # dispatch to the correct sparse attention config
+        config_classes = {
+            "rocket": RocketSparseAttentionConfig,
+        }
+
+        algorithm = data.get("algorithm", None)
+        if algorithm is None:
+            raise ValueError(f"Sparse attention algorithm is required")
+
+        config_class = config_classes.get(algorithm.lower())
+        if config_class is None:
+            raise ValueError(f"Invalid algorithm: {algorithm}")
+
+        return config_class(**data)
+
+    def _check_fields(self):
+        pass
+
+    def supports_backend(self, backend: str) -> bool:
+        """
+        Override if the speculation algorithm does not support
+        a subset of the possible backends.
+        """
+        return True
+
+
+class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for rocket sparse attention.
+    """
+    window_size: Optional[int] = Field(
+        default=None, description="The window size for snap KV.")
+    kernel_size: Optional[int] = Field(
+        default=None, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
+    topk: Optional[int] = Field(default=128, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=1266,
+                                         description="Prompt budget")
+    page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
@@ -365,7 +422,39 @@ class DecodingBaseConfig(StrictBaseModel):
     max_concurrency: Optional[int] = None
 
     load_format: Optional[str] = None
+    # PyTorch only.
+    # Rolling average window size (N) for acceptance length across completed requests.
+    # If not set or set to 0, the feature is disabled.
+    acceptance_window: Optional[int] = None
+    # PyTorch only.
+    # Threshold for average acceptance length; speculation will be disabled
+    # permanently once the rolling average over the last N completed requests
+    # (N = acceptance_window) drops below this value.
+    acceptance_length_threshold: Optional[float] = None
 
+    # Validate acceptance controls at field level so they run on model creation
+    @field_validator('acceptance_window')
+    @classmethod
+    def _validate_acceptance_window(cls, v: Optional[int]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_window must be >= 0 (0 disables), got {v}")
+        return v
+
+    @field_validator('acceptance_length_threshold')
+    @classmethod
+    def _validate_acceptance_length_threshold(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_length_threshold must be >= 0, got {v}")
+        return v
+
+    # If set, drafting is allowed to use chain drafter.
+    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
@@ -380,6 +469,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
+            "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
@@ -560,6 +650,52 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_layers_to_capture is not None:
             return len(self.eagle3_layers_to_capture)
         return 3
+
+
+class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
+    output_directory: str
+    write_interval: int = 20
+    file_prefix: str = "data"
+    eagle3_layers_to_capture: Optional[Set[int]] = None
+
+    max_total_draft_tokens: Optional[int] = Field(default=1, init=False)
+    eagle_choices: Optional[List[List[int]]] = Field(default=None, init=False)
+
+    def model_post_init(self, __context):
+        self._last_hidden_in_save = True
+        if self.eagle3_layers_to_capture is None:
+            self._last_hidden_in_save = False
+        elif -1 not in self.eagle3_layers_to_capture:
+            self._last_hidden_in_save = False
+            self.eagle3_layers_to_capture.add(-1)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "SaveState"
+
+    def validate(self) -> None:
+        if self.output_directory is None or not self.eagle3_layers_to_capture:
+            raise ValueError(
+                "Save directory and layers to capture must be provided")
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).
+        """
+        if self.eagle3_layers_to_capture is None:
+            return 4
+        return len(self.eagle3_layers_to_capture)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -1050,8 +1186,13 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
 ]]
+
+SparseAttentionConfig: TypeAlias = Union[
+    RocketSparseAttentionConfig,
+]
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -1430,6 +1571,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="Cache transceiver config.",
         status="prototype")
 
+    # Sparse attention config
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None,
+        description="Sparse attention config.",
+        status="prototype")
+
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
@@ -1448,7 +1595,7 @@ class BaseLlmArgs(StrictBaseModel):
                                           description="The maximum beam width.")
 
     max_num_tokens: Optional[int] = Field(
-        default=None, description="The maximum number of tokens.")
+        default=8192, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
         default=False,
@@ -1501,6 +1648,13 @@ class BaseLlmArgs(StrictBaseModel):
     return_perf_metrics: bool = Field(default=False,
                                       description="Return perf metrics.",
                                       status="prototype")
+
+    orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
+        default=None,
+        description=
+        "The orchestrator type to use. Defaults to None, which uses MPI.",
+        status="prototype",
+    )
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
@@ -1740,13 +1894,15 @@ class BaseLlmArgs(StrictBaseModel):
 
         if self.max_batch_size is not None:
             if self.max_batch_size > self.build_config.max_batch_size:
-                raise ValueError(
-                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
+                self.max_batch_size = self.build_config.max_batch_size
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] is overridden by build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
         if self.max_num_tokens is not None:
             if self.max_num_tokens > self.build_config.max_num_tokens:
-                raise ValueError(
-                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
+                self.max_num_tokens = self.build_config.max_num_tokens
+                logger.warning(
+                    f"max_num_tokens [{self.max_num_tokens}] is overridden by build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
         if self.max_seq_len is not None:
             if self.max_seq_len != self.build_config.max_seq_len:
@@ -1868,6 +2024,20 @@ class BaseLlmArgs(StrictBaseModel):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.AUTO
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+            elif isinstance(self.speculative_config,
+                            SaveHiddenStatesDecodingConfig):
+                assert self.backend in ['pytorch']
+                logger.warning(
+                    "SaveHiddenStatesDecodingConfig is active, setting max_batch_size to 1, disabling overlap scheduler, and setting cuda_graph_config to None"
+                )
+                self.build_config.max_batch_size = 1
+                self.max_batch_size = 1
+                self.disable_overlap_scheduler = True
+                self.cuda_graph_config = None
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.SAVE_HIDDEN_STATES
+                self.build_config.max_draft_len = 1
+                self.speculative_config.max_draft_len = 1
 
             else:
                 raise ValueError(

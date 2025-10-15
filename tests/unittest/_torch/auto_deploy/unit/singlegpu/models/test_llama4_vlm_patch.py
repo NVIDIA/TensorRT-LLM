@@ -19,7 +19,6 @@ def test_build_run_llama4_vlm():
 
     factory = llm_args.create_factory()
     model = factory.build_model("cuda")
-    factory._set_strict_forward(model)
     processor = factory.init_processor()
 
     img1 = Image.new("RGB", (16, 16), color=(128, 128, 128))
@@ -58,17 +57,17 @@ def test_build_run_llama4_vlm():
     pixel_values = inputs["pixel_values"]
 
     def _run_with_and_without_image(model, use_patch=True):
-        with apply_export_patches(patch_list=["hf_llama4_vision"] if use_patch else []):
+        with apply_export_patches(patch_configs={"hf_llama4_vision": {"enabled": use_patch}}):
             with torch.inference_mode():
                 out_no_images = model(
-                    input_ids,
-                    position_ids,
-                    torch.zeros_like(pixel_values) if use_patch else None,
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    pixel_values=torch.zeros_like(pixel_values) if use_patch else None,
                 )
                 out_with_images = model(
-                    input_ids,
-                    position_ids,
-                    pixel_values,
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    pixel_values=pixel_values,
                 )
             return {"no_images": out_no_images.logits, "with_images": out_with_images.logits}
 
@@ -82,16 +81,20 @@ def test_build_run_llama4_vlm():
     # Export to GM
     gm = torch_export_to_gm(
         model,
-        args=(input_ids, position_ids, pixel_values),
-        patch_list=[
-            "transformers_sdpa_mask",
-            "autocast_noop",
-            "torch_where",
-            "tensor_meta_device",
-            "sdpa_kernel_noop",
-            "sdpa",
-            "hf_llama4_vision",
-        ],
+        kwargs={
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "pixel_values": pixel_values,
+        },
+        patch_configs={
+            "transformers_sdpa_mask": {},
+            "autocast_noop": {},
+            "torch_where": {},
+            "tensor_meta_device": {},
+            "sdpa_kernel_noop": {},
+            "sdpa": {},
+            "hf_llama4_vision": {"enabled": True},
+        },
     )
     move_to_device(gm, model.device)
 

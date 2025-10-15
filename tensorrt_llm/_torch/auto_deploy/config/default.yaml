@@ -6,17 +6,14 @@ transforms:
   ############################################################################################
   build_model:
     stage: factory
+    run_per_gm: false
     device: meta
-    use_strict_forward: true
-    # nothing to clean up
-    run_graph_cleanup: false
     requires_clean_graph: false
   export_to_gm:
     stage: export
     clone_state_dict: false
     strict: false
-    # nothing to clean up
-    run_graph_cleanup: false
+    run_per_gm: false
     requires_clean_graph: false
   cleanup_noop_slice:
     stage: post_export
@@ -33,8 +30,10 @@ transforms:
     stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
+    run_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
+    requires_shape_prop: true
   match_grouped_attention:
     stage: pattern_matcher
   match_attention_layout:
@@ -51,6 +50,8 @@ transforms:
   # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
   # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
   optimize_rope:
+    stage: pattern_matcher
+  quantize_int4_linear_from_config:
     stage: pattern_matcher
   quantize_fp8_linear_from_config:
     stage: pattern_matcher
@@ -87,8 +88,10 @@ transforms:
   ############################################################################################
   load_weights:
     stage: weight_load
+    run_per_gm: false
   move_inputs_to_device:
     stage: weight_load
+    run_per_gm: false
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
@@ -112,13 +115,14 @@ transforms:
     enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  fuse_collectives:
-    stage: post_load_fusion
+  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  # check if we can fuse rmsnorm
   fuse_rmsnorm:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
     stage: post_load_fusion
     backend: flashinfer
+    requires_shape_prop: true
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
@@ -137,13 +141,13 @@ transforms:
     attn_backend: cuda_causal_conv
   initialize_cache:
     stage: cache_init
+    run_per_gm: false
   resize_kv_cache:
     stage: cache_init
+    run_per_gm: false
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
   compile_model:
     stage: compile
-  forward_with_cached_sequence_interface:
-    stage: compile
-    args_only: true
+    run_per_gm: false

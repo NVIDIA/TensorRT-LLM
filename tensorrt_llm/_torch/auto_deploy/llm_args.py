@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
+from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
@@ -116,16 +116,28 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
+    # TODO: see if we can just remove this field and use kv_cache_config.dtype instead?
     kv_cache_dtype: str = Field(
         default="auto",
         description="Data type for KV cache. This is a temporary field until kv_cache_dtype is "
         "supported in AutoDeploy.",
     )
 
+    # NOTE: we do not support copy_on_partial_reuse in AutoDeploy yet
+    # see https://github.com/NVIDIA/TensorRT-LLM/issues/7142
+    kv_cache_config: KvCacheConfig = Field(
+        default_factory=lambda **kwargs: KvCacheConfig(copy_on_partial_reuse=False, **kwargs),
+        description="KV cache config.",
+    )
+
     max_beam_width: int = Field(
         default=1,
         description="The maximum beam width. >1 is not supported by AutoDeploy.",
         frozen=True,
+    )
+
+    enable_chunked_prefill: bool = Field(
+        default=False, description="Enable chunked prefill.", frozen=True
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################

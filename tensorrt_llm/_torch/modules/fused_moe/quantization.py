@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import tensorrt_llm.logger as trtllm_logger
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -271,8 +271,6 @@ class FusedMoEMethodBase(ABC):
             module.w2_bias.data if module.bias else None)
 
         self.load_quant_scales(module, weights)
-        # Re-setup quant scales after loading weights as the tensors may have been modified.
-        self.setup_quant_scales(module)
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -323,7 +321,8 @@ class FusedMoEMethodBase(ABC):
                 module.initial_global_assignments)
 
     def post_load_weights(self, module: torch.nn.Module):
-        pass
+        # Re-setup quant scales after loading weights as the tensors may have been modified.
+        self.setup_quant_scales(module)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: List[Dict]):
         pass
@@ -722,7 +721,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                     if int(name.split(".")[0]) not in expert_ids:
                         continue
                     weight_name = name.replace("weight_scale_inv", "weight")
-                    trtllm_logger.logger.debug(f"Resmoothing {weight_name}")
+                    logger.debug(f"Resmoothing {weight_name}")
                     weight = weights[weight_name][:]
                     scale = weights[name][:]
                     weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
@@ -730,6 +729,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         super().load_weights(module, weights, weight_loading_mode)
 
     def post_load_weights(self, module: torch.nn.Module):
+        super().post_load_weights(module)
         if is_sm_100f():
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 module.quant_scales[0],
@@ -2038,23 +2038,6 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
                                           dst_w2_weight_scale: torch.Tensor):
         return super().load_expert_w2_weight_scale_nvfp4(
             module, w2_weight_scale, dst_w2_weight_scale, 32)
-
-    def load_all_fp4_weight_scales_and_alphas(
-            self, module: torch.nn.Module, weights: Dict,
-            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
-            dst_w2_weight_scale: torch.Tensor, dst_fc31_alpha: torch.Tensor,
-            dst_fc2_alpha: torch.Tensor):
-        super().load_all_fp4_weight_scales_and_alphas(
-            module, weights, load_expert_ids, dst_w3_w1_weight_scale,
-            dst_w2_weight_scale, dst_fc31_alpha, dst_fc2_alpha)
-        # The kernel we use will convert nvfp4 to e4m3 before matmul,
-        # so the range of the scale factor can only be [0,448/6].
-        dst_w3_w1_weight_scale.copy_((dst_w3_w1_weight_scale.to(torch.float32) /
-                                      6.0).to(torch.float8_e4m3fn))
-        dst_w2_weight_scale.copy_((dst_w2_weight_scale.to(torch.float32) /
-                                   6.0).to(torch.float8_e4m3fn))
-        dst_fc31_alpha.copy_(dst_fc31_alpha * 6.0)
-        dst_fc2_alpha.copy_(dst_fc2_alpha * 6.0)
 
 
 def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,

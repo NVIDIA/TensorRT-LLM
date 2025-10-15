@@ -35,8 +35,17 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
-        self.slot_manager = SlotManager(max_num_requests)
-        self.max_total_draft_tokens = config.max_total_draft_tokens
+        # There could be dummy request for padding batch when using CUDA graph.
+        # Reserve one more slot for the dummy request.
+        slot_size = self.max_seq_len + 1
+        self.slot_manager = SlotManager(slot_size)
+        # This class is reused by MTP_EAGLE
+        from ...llmapi.llm_args import EagleDecodingConfig
+
+        if isinstance(config, EagleDecodingConfig):
+            self.max_total_draft_tokens = config.max_total_draft_tokens
+        else:
+            self.max_total_draft_tokens = self.max_draft_len
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
@@ -46,13 +55,15 @@ class Eagle3ResourceManager(BaseResourceManager):
             dtype=self.dtype,
             device='cuda')
         # sequence length, only used for metadata preparation
-        self.seq_lens = {i: 0 for i in range(max_num_requests)}
+        self.seq_lens = {i: 0 for i in range(slot_size)}
         # start indices of each slot
-        self.start_indices = {i: 0 for i in range(max_num_requests)}
+        self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
         self.is_first_draft = True
         self.spec_tree_manager = None
-        if config.eagle_choices is not None:
+
+        if isinstance(config,
+                      EagleDecodingConfig) and config.eagle_choices is not None:
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
                 use_dynamic_tree=config.use_dynamic_tree,
@@ -126,6 +137,10 @@ class Eagle3SpecMetadata(SpecMetadata):
                                           self.num_layers - 4)
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
+            if self.layers_to_capture[0] == -1:
+                self.layers_to_capture = self.layers_to_capture[1:] + [
+                    self.layers_to_capture.pop(0)
+                ]
         self.num_capture_layers = len(self.layers_to_capture)
 
         # Initialize to 0 to avoid reading uninitialized memory during warmup

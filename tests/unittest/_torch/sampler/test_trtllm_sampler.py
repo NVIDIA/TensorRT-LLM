@@ -23,6 +23,7 @@ def create_llm(model_dir):
         enable_chunked_prefill=True,
         cuda_graph_config=CudaGraphConfig(),
         kv_cache_config=trt_kv_cache_config,
+        sampler_type="TRTLLMSampler",
         max_num_tokens=
         128  # Only one request longer than max_num_tokens is required to test chunked prefill
     )

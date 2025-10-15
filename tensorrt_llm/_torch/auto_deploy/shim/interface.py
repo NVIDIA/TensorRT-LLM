@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, List, Optional, Tuple, final
+from typing import Callable, Dict, List, Optional, Tuple, final
 
 import torch
 import torch.nn as nn
@@ -33,11 +33,6 @@ class CachedSequenceInterface:
     def all_future_arg_names(self) -> List[str]:
         """Return all the argument names owned by this interface including uninitialized caches."""
         return list(self.info.named_args.keys()) + list(self._cache_initializers.keys())
-
-    @property
-    def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
-        """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
-        return self.info.dynamic_shapes + ({},) * len(self._caches)
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
