@@ -474,11 +474,11 @@ def create_py_executor(
 
                 connector_worker = connector_worker_task.result()
 
-            forward_pass_callback = connector_worker.register_forward_pass_callback(
+            forward_pass_callable = connector_worker.register_forward_pass_callable(
             )
-            if forward_pass_callback:
-                model_engine.register_forward_pass_callback(
-                    forward_pass_callback)
+            if forward_pass_callable:
+                model_engine.register_forward_pass_callable(
+                    forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)

@@ -60,7 +60,6 @@ from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
-from .kv_cache_connector import KvCacheConnectorWorker
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -471,9 +470,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.cache_indirection_attention = None
 
-    def register_forward_pass_callback(
-            self, callback: KvCacheConnectorWorker.ForwardPassCallback):
-        self.forward_pass_callback = callback
+    def register_forward_pass_callable(self, callable: Callable):
+        self.forward_pass_callable = callable
 
     @property
     def runtime_draft_len(self):
@@ -2314,9 +2312,8 @@ class PyTorchModelEngine(ModelEngine):
                         outputs = self.cuda_graph_runner.replay(
                             batch_size, inputs)
 
-            if self.forward_pass_callback is not None:
-                self.forward_pass_callback.event.record()
-                self.forward_pass_callback.callback()
+            if self.forward_pass_callable is not None:
+                self.forward_pass_callable()
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
