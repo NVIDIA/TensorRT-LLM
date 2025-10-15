@@ -412,16 +412,23 @@ class ModelConfig(Generic[TConfig]):
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
-            pretrained_config = transformers.AutoConfig.from_pretrained(
-                checkpoint_dir,
-                trust_remote_code=trust_remote_code,
-            )
+            # When handling the case where model_format is TLLM_ENGINE
+            # send cyclic requests to the NONE URL.
+            if checkpoint_dir is not None:
+                pretrained_config = transformers.AutoConfig.from_pretrained(
+                    checkpoint_dir,
+                    trust_remote_code=trust_remote_code,
+                )
 
-            # Find the cache path by looking for the config.json file which should be in all
-            # huggingface models
-            model_dir = Path(
-                transformers.utils.hub.cached_file(checkpoint_dir,
-                                                   'config.json')).parent
+                # Find the cache path by looking for the config.json file which should be in all
+                # huggingface models
+                model_dir = Path(
+                    transformers.utils.hub.cached_file(checkpoint_dir,
+                                                       'config.json')).parent
+            else:
+                raise ValueError(
+                    "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
+                )
 
         quant_config = QuantConfig()
         layer_quant_config = None
