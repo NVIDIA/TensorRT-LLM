@@ -2538,3 +2538,48 @@ def ray_cleanup(llm_venv) -> None:
             "ray.scripts.scripts",
             "stop",
         ])
+
+
+@pytest.fixture(autouse=True)
+def cleanup_mpi_processes() -> None:
+    """
+    Cleanup MPI and related processes after each test to prevent hanging tests.
+    This fixture forcefully terminates any leftover MPI processes that may prevent
+    test timeout from working properly.
+    """
+    yield
+
+    # Force cleanup of MPI and executor processes after test completes
+    import subprocess
+    import time
+
+    processes_to_kill = [
+        'mpirun',
+        'mpiexec',
+        'trtllmExecutorWorker',
+        'MPIPoolExecutor',
+        'MPICommExecutor',
+    ]
+
+    for process_name in processes_to_kill:
+        try:
+            # First try graceful termination (SIGTERM)
+            subprocess.call(['pkill', '-f', process_name],
+                            stderr=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            timeout=2)
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+
+    # Give processes a moment to terminate gracefully
+    time.sleep(0.5)
+
+    # Force kill any remaining processes (SIGKILL)
+    for process_name in processes_to_kill:
+        try:
+            subprocess.call(['pkill', '-9', '-f', process_name],
+                            stderr=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            timeout=2)
+        except (subprocess.TimeoutExpired, Exception):
+            pass

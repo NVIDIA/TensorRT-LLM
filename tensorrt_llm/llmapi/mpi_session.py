@@ -155,9 +155,31 @@ class MpiPoolSession(MpiSession):
         ]
         return [future.result() for future in futures]
 
-    def shutdown(self, wait=True):
+    def shutdown(self, wait=True, timeout=30):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=wait)
+            if wait and timeout is not None:
+                # Use a timer to force shutdown if it takes too long
+                shutdown_complete = threading.Event()
+
+                def force_shutdown():
+                    if not shutdown_complete.is_set():
+                        logger.warning(
+                            f"MpiPoolSession shutdown timed out after {timeout}s, forcing shutdown"
+                        )
+                        try:
+                            self.mpi_pool.shutdown(wait=False)
+                        except Exception as e:
+                            logger.error(f"Error during force shutdown: {e}")
+
+                timer = threading.Timer(timeout, force_shutdown)
+                timer.start()
+                try:
+                    self.mpi_pool.shutdown(wait=wait)
+                    shutdown_complete.set()
+                finally:
+                    timer.cancel()
+            else:
+                self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
 
     def abort(self):
@@ -229,12 +251,59 @@ class MpiCommSession(MpiSession):
         futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
-    def shutdown(self, wait=True):
+    def shutdown(self, wait=True, timeout=30):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=wait)
+            if wait and timeout is not None:
+                # Use a timer to force shutdown if it takes too long
+                shutdown_complete = threading.Event()
+
+                def force_shutdown():
+                    if not shutdown_complete.is_set():
+                        logger.warning(
+                            f"MpiCommSession.mpi_pool shutdown timed out after {timeout}s, forcing shutdown"
+                        )
+                        try:
+                            self.mpi_pool.shutdown(wait=False)
+                        except Exception as e:
+                            logger.error(
+                                f"Error during force mpi_pool shutdown: {e}")
+
+                timer = threading.Timer(timeout, force_shutdown)
+                timer.start()
+                try:
+                    self.mpi_pool.shutdown(wait=wait)
+                    shutdown_complete.set()
+                finally:
+                    timer.cancel()
+            else:
+                self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+
         if self.thread_pool is not None:
-            self.thread_pool.shutdown(wait=wait)
+            if wait and timeout is not None:
+                # Also add timeout for thread pool shutdown
+                shutdown_complete_thread = threading.Event()
+
+                def force_shutdown_thread():
+                    if not shutdown_complete_thread.is_set():
+                        logger.warning(
+                            f"MpiCommSession.thread_pool shutdown timed out after {timeout}s, forcing shutdown"
+                        )
+                        try:
+                            self.thread_pool.shutdown(wait=False)
+                        except Exception as e:
+                            logger.error(
+                                f"Error during force thread_pool shutdown: {e}")
+
+                timer_thread = threading.Timer(timeout, force_shutdown_thread)
+                timer_thread.start()
+                try:
+                    self.thread_pool.shutdown(wait=wait)
+                    shutdown_complete_thread.set()
+                finally:
+                    timer_thread.cancel()
+            else:
+                self.thread_pool.shutdown(wait=wait)
             self.thread_pool = None
 
     def abort(self):
@@ -329,11 +398,46 @@ class RemoteMpiCommSessionClient(MpiSession):
     def abort(self):
         self.shutdown()
 
-    def shutdown(self, wait=True):
-        pass
+    def shutdown(self, wait=True, timeout=30):
+        if not self._is_shutdown:
+            self._is_shutdown = True
+            try:
+                # Send None to signal server to shutdown
+                self.queue.put(None)
+                logger.info("RemoteMpiCommSessionClient sent shutdown signal")
+            except Exception as e:
+                logger.error(f"Error sending shutdown signal: {e}")
+            finally:
+                try:
+                    # Close the queue connection
+                    if hasattr(self.queue, 'close'):
+                        self.queue.close()
+                except Exception as e:
+                    logger.error(f"Error closing queue: {e}")
 
     def shutdown_abort(self, grace: float = 60, reason=None):
-        pass
+        if self._is_shutdown:
+            return
+
+        if sys.is_finalizing():
+            # Cannot start thread at interpreter shutdown
+            return self.shutdown(wait=False)
+
+        fut = Future()
+        killer = threading.Thread(group=None,
+                                  target=self._abort_on_timeout,
+                                  name="RemoteMpiSessionTimeoutKiller",
+                                  args=(fut, grace, reason))
+        killer.start()
+        try:
+            self.shutdown()
+            fut.set_result(None)
+        except Exception as e:
+            logger.error(
+                f"Error during RemoteMpiCommSessionClient shutdown: {e}")
+            fut.set_result(None)
+        finally:
+            killer.join(timeout=1.0)  # Don't wait forever for killer thread
 
 
 class RemoteMpiCommSessionServer():

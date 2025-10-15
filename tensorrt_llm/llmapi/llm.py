@@ -742,13 +742,20 @@ class BaseLLM:
         return ModelLoader.load_hf_model_config(self.args.model)
 
     @set_api_status("beta")
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: int = 30) -> None:
+        """
+        Shutdown the LLM instance and cleanup resources.
+
+        Args:
+            timeout: Maximum time in seconds to wait for MPI session shutdown.
+                    Default is 30 seconds. Set to None to wait indefinitely.
+        """
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
 
         if hasattr(self, 'mpi_session') and self.mpi_session is not None:
-            self.mpi_session.shutdown()
+            self.mpi_session.shutdown(timeout=timeout)
             self.mpi_session = None
 
     @staticmethod
