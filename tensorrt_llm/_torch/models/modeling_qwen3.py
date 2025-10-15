@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
@@ -8,6 +8,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -27,8 +28,13 @@ class Qwen3Attention(QKNormRoPEAttention):
         model_config: ModelConfig[Qwen3Config],
         layer_idx: Optional[int] = None,
         fuse_qk_norm_rope: bool = True,
+        attn_output_gate: bool = False,
+        use_gemma_rms_norm: bool = False,
+        disable_deep_gemm: bool = False,
     ):
         config = model_config.pretrained_config
+        self.pretrained_config = config
+        self.attn_output_gate = attn_output_gate
 
         if getattr(config, "rope_scaling", None) is not None:
             if "type" in config.rope_scaling:
@@ -48,22 +54,20 @@ class Qwen3Attention(QKNormRoPEAttention):
                 rope=RopeParams.from_config(config),
             )
 
-        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
-        # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
+            bias=getattr(config, "attention_bias", None),
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=fuse_qk_norm_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
+            dense_bias=getattr(config, "attention_bias", None),
             config=model_config,
+            attn_output_gate=self.attn_output_gate,
+            use_gemma_rms_norm=use_gemma_rms_norm,
             disable_deep_gemm=disable_deep_gemm,
         )
 
@@ -82,18 +86,16 @@ class Qwen3DecoderLayer(DecoderLayer):
             model_config,
             layer_idx=layer_idx,
         )
-
-        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
-        # and https://nvbugspro.nvidia.com/bug/5505402)
-        disable_deep_gemm = True
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             bias=config.mlp_bias if hasattr(config, "mlp_bias") else False,
             dtype=config.torch_dtype,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
             config=model_config,
-            disable_deep_gemm=disable_deep_gemm,
         )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -102,6 +104,8 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
+        self.disable_allreduce = (self.mapping.tp_size == 1
+                                  or self.enable_attention_dp)
 
     def forward(
         self,
@@ -109,7 +113,6 @@ class Qwen3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -125,14 +128,21 @@ class Qwen3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            mrope_config=mrope_config,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_allreduce),
             **kwargs,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_allreduce),
+            cutlass_min_latency_mode=False,
+        )
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -173,7 +183,6 @@ class Qwen3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -194,7 +203,6 @@ class Qwen3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
-                mrope_config=mrope_config,
                 spec_metadata=spec_metadata,
             )
 

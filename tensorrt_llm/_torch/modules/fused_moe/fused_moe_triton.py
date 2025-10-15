@@ -227,10 +227,6 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
-    def get_quant_scales(self, module: torch.nn.Module, slot_start,
-                         slot_end) -> tuple[torch.Tensor, ...]:
-        return tuple()
-
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
@@ -1389,3 +1385,6 @@ class TritonFusedMoE(MoE):
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)

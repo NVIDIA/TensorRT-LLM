@@ -1,26 +1,39 @@
 # Plan for phi4-mm model support.
 # (done) step 1: support legacy inference pipeline for phi4-mm model.
 # (done) step 2: refactor the inference pipeline to use AGGREGATE mode (https://github.com/NVIDIA/TensorRT-LLM/pull/5522).
-# (todo) step 3: optimization
+# (done) step 3: optimization phi4-mm image modality inference.
+# (todo) step 4: misc tasks:
+#   * optimize audio modality.
 #   * use TRTLLM-attention to replace original pytorch attention in vision/audio encoders.
 #   * use data parallel to accelerate inference.
 
 import copy
+import enum
 import importlib
+import math
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from types import MethodType
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torchvision
 import transformers
+from einops import rearrange
 from PIL import Image
+from torchvision.transforms.functional import get_image_size, pad, resize
+from transformers.image_processing_utils import BatchFeature
+from transformers.image_utils import (ImageInput, is_pil_image,
+                                      make_list_of_images, valid_images)
+from transformers.utils import TensorType
 
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -29,10 +42,12 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_utils import register_auto_model
 
 # Special token ids from the original Phi-4-multimodal-instruct implementation
+# Hardcoded in https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L44.
 _IMAGE_SPECIAL_TOKEN_ID = 200010  # '<|endoftext10|>' from HF `modeling_phi4mm.py`
 _AUDIO_SPECIAL_TOKEN_ID = 200011  # '<|endoftext11|>' from HF `modeling_phi4mm.py`
 _PAD_TOKEN_ID = 199999  # '<|endoftext|>' from HF `special_tokens_map.json`
@@ -41,7 +56,12 @@ _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE = [-9999,
 _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE = [float('-inf'), -10000
                                             ]  # from HF `modeling_phi4mm.py`
 
-# Below classes will be loaded from HuggingFace codes, rather than using transformers version,
+# SigLip input config.
+# Hardcoded in https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L195.
+_BASE_RESOLUTION = 448
+_MASK_RESOLUTION = _BASE_RESOLUTION // 14
+
+# Below classes will be loaded from HuggingFace code, rather than using transformers version,
 # since transformers version is not compatible with checkpoints and configs from `microsoft/Phi-4-multimodal-instruct`.
 Phi4MMAudioEmbedding = None
 Phi4MMImageEmbedding = None
@@ -49,6 +69,10 @@ Phi4MMConfig = None
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
+def _is_torch_compile() -> bool:
+    return os.getenv("TLLM_MULTIMODAL_ENCODER_TORCH_COMPILE", "0") == "1"
+
+
 def _is_disagg() -> bool:
     return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
@@ -97,12 +121,426 @@ def _load_phi4mm_classes(local_path):
         sys.path = original_sys_path
 
 
-class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
-                              transformers.generation.GenerationMixin):
+# Below code is optimized for image modality inference, including input_processor and vision encoder forward.
+def vision_encoder_forward(self,
+                           input_ids: torch.LongTensor,
+                           input_embeds: torch.FloatTensor,
+                           image_sizes=None,
+                           **kwargs) -> torch.FloatTensor:
+    """Optimize vision encoder forward.
 
-    # Copy and modify from https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/modeling_phi4mm.py::Phi4MMImageAudioEmbedding
-    # Note: the HF implementation here will cause duplicated encoders on all GPUs for TP>1 scenario.
-    # TODO: use TRTLLM-attention to replace original pytorch Flash_attn_2 in HFPhi4MultimodalEncoder.
+    * Remove many unnecessary if-else conditions and assertions.
+    * Optimize positions/positions_tuple calculation.
+    * Optimize the input parameters for get_img_features.
+
+    Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/modeling_phi4mm.py#L268
+    """
+    if isinstance(image_sizes, torch.Tensor):
+        image_sizes = image_sizes.view(-1, 2)
+    image_attention_mask = kwargs['image_attention_mask']
+    input_shape = input_ids.size()
+    input_ids = input_ids.view(-1, input_shape[-1])
+    positions = torch.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID,
+                              as_tuple=False)
+    positions_tuple = torch.unbind(positions, dim=1)
+    if isinstance(self.img_projection, torch.nn.Sequential):
+        target_device = self.img_projection[0].bias.device
+        target_dtype = self.img_projection[0].bias.dtype
+    else:
+        target_device = self.img_projection.bias.device
+        target_dtype = self.img_projection.bias.dtype
+
+    # Inference with SigLip Vision Encoder.
+    batch_size = input_embeds.shape[0]
+    input_embeds = input_embeds.flatten(0, 1)
+    flatten_img_attn_mask = image_attention_mask.to(torch.bool).flatten(0, 1)
+    img_features = self.get_img_features(input_embeds,
+                                         attention_mask=flatten_img_attn_mask)
+
+    # Reshape and combine global/sub image features.
+    base_resolution = self.crop_size
+    base_feat_height_reduction = self.base_feat_height_reduction
+    base_feat_height = self.base_feat_height_target
+    img_features = img_features.view(batch_size, -1,
+                                     base_feat_height * base_feat_height,
+                                     self.image_dim_out)
+    C = self.image_dim_out
+    H = base_feat_height
+    rh = base_feat_height_reduction
+    _h1 = H // rh
+    _fused_dim = rh * rh * C
+    output_imgs, output_len = [], []
+    for batch_idx in range(batch_size):
+        h, w = image_sizes[batch_idx]
+        h = h // base_resolution
+        w = w // base_resolution
+        B_ = h * w
+
+        # Global image features.
+        global_image_feature = img_features[batch_idx, :1]
+        global_image_feature = global_image_feature.reshape(1, H, H, C)
+        global_image_feature = global_image_feature.reshape(
+            1, _h1, rh, _h1, rh, C)
+        global_image_feature = global_image_feature.permute(0, 1, 3, 2, 4, 5)
+        global_image_feature = global_image_feature.reshape(
+            1, _h1, _h1, rh * rh * C)
+        global_GN = self.sub_GN.repeat(1, _h1, 1, 1)
+        global_image_feature = torch.cat([global_image_feature, global_GN],
+                                         dim=2).reshape(1, -1, _fused_dim)
+
+        # Sub image features.
+        sub_image_feature = img_features[batch_idx, 1:(1 + B_)]
+        sub_image_feature = sub_image_feature.reshape(B_, H, H, C)
+        sub_image_feature = sub_image_feature.reshape(B_, _h1, rh, _h1, rh, C)
+        sub_image_feature = sub_image_feature.permute(0, 1, 3, 2, 4, 5)
+        sub_image_feature = sub_image_feature.reshape(B_, -1, rh * rh * C)
+        sub_image_feature = sub_image_feature.reshape(1, h, w, _h1, _h1, -1)
+        sub_image_feature = sub_image_feature.permute(0, 1, 3, 2, 4, 5)
+        sub_image_feature = sub_image_feature.reshape(1, h * _h1, w * _h1,
+                                                      rh * rh * C)
+
+        # Fetch useful content.
+        downsample_attn_mask = image_attention_mask[batch_idx, 1:B_ + 1, 0::2,
+                                                    0::2]
+        downsample_attn_mask = downsample_attn_mask.reshape(1, h, w, _h1, _h1)
+        downsample_attn_mask = downsample_attn_mask.permute(0, 1, 3, 2, 4)
+        downsample_attn_mask = downsample_attn_mask.reshape(1, h * _h1, w * _h1)
+        useful_height = int(
+            downsample_attn_mask[0, :,
+                                 0].sum())  # Not optimized for D2H memcpy.
+        useful_width = int(
+            downsample_attn_mask[0,
+                                 0, :].sum())  # Not optimized for D2H memcpy.
+        sub_image_feature = sub_image_feature[:, :useful_height, :useful_width]
+        sub_GN = self.sub_GN.repeat(1, useful_height, 1, 1)
+        num_image_tokens = image_attention_mask[
+            batch_idx, :B_ + 1, 0::2, 0::2].sum().to(
+                torch.int32) + (useful_height + 1) + _h1  # Not optimized.
+        sub_image_feature = torch.cat([sub_image_feature, sub_GN],
+                                      dim=2).reshape(1, -1, _fused_dim)
+
+        # Concat global/sub image features.
+        if self.hd_transform_order == 'glb_sub':
+            output_imgs.append(
+                torch.cat(
+                    [global_image_feature, self.glb_GN, sub_image_feature],
+                    dim=1))
+        elif self.hd_transform_order == 'sub_glb':
+            output_imgs.append(
+                torch.cat(
+                    [sub_image_feature, self.glb_GN, global_image_feature],
+                    dim=1))
+        else:
+            raise NotImplementedError(
+                f'hd_transform_order = {self.hd_transform_order}, not implemented'
+            )
+        output_len.append(num_image_tokens)
+
+    # Project image features.
+    img_set_tensor = []
+    for _output_img in output_imgs:
+        img_feature_proj = self.img_projection(
+            _output_img.to(target_device).to(target_dtype))
+        img_set_tensor.append(img_feature_proj)
+
+    # Combine image embeddings with text embeddings.
+    hidden_states = kwargs['wte'](input_ids)
+    merged_img_set_tensor = torch.cat(img_set_tensor, dim=1).squeeze(0)
+    with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+        new_hidden_states = hidden_states.index_put(
+            indices=positions_tuple,
+            values=merged_img_set_tensor,
+            accumulate=False,
+        )  # Not optimized for D2D memcpy.
+    hidden_states = new_hidden_states
+
+    if self.drop is not None:
+        hidden_states = self.drop(hidden_states)
+
+    return hidden_states
+
+
+def siglip_embedding_forward(
+        self, pixel_values: torch.FloatTensor,
+        patch_attention_mask: torch.BoolTensor) -> torch.Tensor:
+    """Optimize SigLip Embedding forward.
+
+    * Optimize by moving the _batch_nb_patches_h_inv and _batch_nb_patches_w_inv outside the loop.
+    * Optimize by removing explicit D2H transfers.
+
+    Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/vision_siglip_navit.py#L571
+    """
+    device = pixel_values.device
+    batch_size = pixel_values.size(0)
+
+    patch_embeds = self.patch_embedding(pixel_values)
+    embeddings = patch_embeds.flatten(2).transpose(1, 2)
+
+    max_im_h, max_im_w = pixel_values.size(2), pixel_values.size(3)
+    max_nb_patches_h, max_nb_patches_w = max_im_h // self.patch_size, max_im_w // self.patch_size
+    boundaries = torch.arange(1 / self.num_patches_per_side,
+                              1.0,
+                              1 / self.num_patches_per_side,
+                              device=device)
+    position_ids = torch.full(
+        size=(
+            batch_size,
+            max_nb_patches_h * max_nb_patches_w,
+        ),
+        fill_value=0,
+        device=device,
+    )
+    _batch_nb_patches_h_inv = 1.0 / patch_attention_mask[:, :, 0].sum(dim=1)
+    _batch_nb_patches_w_inv = 1.0 / patch_attention_mask[:, 0, :].sum(dim=1)
+    for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
+        fractional_coords_h = torch.arange(0,
+                                           1 - 1e-6,
+                                           _batch_nb_patches_h_inv[batch_idx],
+                                           device=device)
+        fractional_coords_w = torch.arange(0,
+                                           1 - 1e-6,
+                                           _batch_nb_patches_w_inv[batch_idx],
+                                           device=device)
+
+        bucket_coords_h = torch.bucketize(
+            fractional_coords_h, boundaries,
+            right=True)  # Not optimized for D2H memcpy.
+        bucket_coords_w = torch.bucketize(
+            fractional_coords_w, boundaries,
+            right=True)  # Not optimized for D2H memcpy.
+
+        pos_ids = (bucket_coords_h[:, None] * self.num_patches_per_side +
+                   bucket_coords_w).flatten()
+        position_ids[batch_idx][p_attn_mask.view(
+            -1)] = pos_ids  # Not optimized for D2H memcpy.
+
+    embeddings = embeddings + self.position_embedding(position_ids)
+    return embeddings
+
+
+def dynamic_preprocess(
+        self,
+        image: ImageInput,
+        min_num: int = 1,
+        max_num: int = 12,
+        image_size: int = 384,
+        mask_size: int = 27,
+        return_image: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimize dynamic preprocess for image modality.
+
+    * Support both PIL.Image.Image and torch.Tensor.
+    * Optimize by removing explicit D2H transfers.
+
+    Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L201
+    """
+    # Get target_width, target_height and target_aspect_ratio.
+    orig_width, orig_height = get_image_size(image)
+    w_crop_num = math.ceil(orig_width / float(image_size))
+    h_crop_num = math.ceil(orig_height / float(image_size))
+    if w_crop_num * h_crop_num > max_num:
+        aspect_ratio = orig_width / orig_height
+        target_ratios = set((i, j) for n in range(min_num, max_num + 1)
+                            for i in range(1, n + 1) for j in range(1, n + 1)
+                            if i * j <= max_num and i * j >= min_num)
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+        target_aspect_ratio = self.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+    else:
+        target_width = image_size * w_crop_num
+        target_height = image_size * h_crop_num
+        target_aspect_ratio = (w_crop_num, h_crop_num)
+
+    # Generate attention mask.
+    ratio_width = target_width / orig_width
+    ratio_height = target_height / orig_height
+    if ratio_width < ratio_height:
+        new_size = (target_width, int(orig_height * ratio_width))
+        padding_width = 0
+        padding_height = target_height - int(orig_height * ratio_width)
+    else:
+        new_size = (int(orig_width * ratio_height), target_height)
+        padding_width = target_width - int(orig_width * ratio_height)
+        padding_height = 0
+    attention_mask = torch.ones((int(mask_size * target_aspect_ratio[1]),
+                                 int(mask_size * target_aspect_ratio[0])))
+    if padding_width >= 14:
+        attention_mask[:, -math.floor(padding_width / 14):] = 0
+    if padding_height >= 14:
+        attention_mask[-math.floor(padding_height / 14):, :] = 0
+    if min(new_size[1], target_height) < 10 or min(new_size[0],
+                                                   target_width) < 10:
+        raise ValueError(
+            f'The aspect ratio is very extreme {new_size} and not supported.')
+
+    if return_image:
+        image = resize(image, [new_size[1], new_size[0]])
+        fill_values = [255, 255, 255] if is_pil_image(image) else 1.0
+        resized_img = pad(image, [0, 0, padding_width, padding_height],
+                          fill=fill_values)
+    else:
+        resized_img = None
+    return resized_img, attention_mask
+
+
+def _reshape_attention_masks(
+        image_attention_masks: List[torch.Tensor],
+        mask_resolution: int) -> Tuple[List[torch.Tensor], List[int]]:
+    """Reshape attention mask and also return the number of image tokens."""
+    mask_shapes = [[mask.size(0), mask.size(1)]
+                   for mask in image_attention_masks]
+    attention_masks_reshape = [
+        rearrange(mask,
+                  '(h rh) (w rw) -> (h w) rh rw',
+                  h=h // mask_resolution,
+                  w=w // mask_resolution,
+                  rh=mask_resolution,
+                  rw=mask_resolution)
+        for mask, (h, w) in zip(image_attention_masks, mask_shapes)
+    ]
+    downsample_attention_masks = []
+    for mask, (h, w) in zip(attention_masks_reshape, mask_shapes):
+        mask = mask[:, 0::2, 0::2]
+        h_stride = h // mask_resolution
+        w_stride = w // mask_resolution
+        h1 = mask_resolution // 2 + mask_resolution % 2
+        mask = mask.reshape(1, h_stride, w_stride, h1, h1)
+        mask = rearrange(mask,
+                         '1 hs ws h1 w1 -> (hs h1) (ws w1)',
+                         h1=h1,
+                         w1=h1,
+                         hs=h_stride,
+                         ws=w_stride)
+        downsample_attention_masks.append(mask)
+    # 256: global image tokens with 16x16 patches.
+    # 1: special token to aggregate information from all image patches.
+    # int(mask.sum().item()): valid image tokens with real contents in sub images.
+    # int(mask[:, 0].sum().item()): number of valid patches in the first column of the mask, to handle the vertical dimension of the image patches.
+    # 16: padding value to ensure there's enough token space during vision encoding.
+    num_img_tokens = [
+        256 + 1 + int(mask.sum().item()) + int(mask[:, 0].sum().item()) + 16
+        for mask in downsample_attention_masks
+    ]
+    return attention_masks_reshape, num_img_tokens
+
+
+def image_preprocess(
+    self,
+    images: ImageInput,
+    return_tensors: Optional[Union[str, TensorType]] = None,
+):
+    """Optimize preprocess for image modality.
+
+    * Support both PIL.Image.Image and torch.Tensor.
+    * Carve out the num_img_tokens calculation.
+
+    Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L161
+    """
+    images = make_list_of_images(images)
+    if not valid_images(images):
+        raise TypeError(
+            "Invalid image type. Must be of type PIL.Image.Image, torch.Tensor."
+        )
+
+    img_processor = [
+        torchvision.transforms.ToTensor()
+        if is_pil_image(images[0]) else lambda x: x,
+        torchvision.transforms.Normalize(
+            (0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5),
+        ),
+    ]
+    base_resolution = _BASE_RESOLUTION
+    if is_pil_image(images[0]):
+        images = [image.convert('RGB') for image in images]
+    mask_resolution = _MASK_RESOLUTION
+    elems, image_attention_masks = [], []
+    for im in images:
+        elem, attention_mask = self.dynamic_preprocess(
+            im,
+            max_num=self.dynamic_hd,
+            image_size=base_resolution,
+            mask_size=mask_resolution,
+            return_image=True)
+        elems.append(elem)
+        image_attention_masks.append(attention_mask)
+
+    img_processor = torchvision.transforms.Compose(img_processor)
+    hd_images = [img_processor(im) for im in elems]
+    global_image = [
+        torch.nn.functional.interpolate(
+            im.unsqueeze(0).float(),
+            size=(base_resolution, base_resolution),
+            mode='bicubic',
+        ).to(im.dtype) for im in hd_images
+    ]
+    shapes = [[im.size(1), im.size(2)] for im in hd_images]
+    global_attention_mask = [
+        torch.ones((1, mask_resolution, mask_resolution)) for _ in hd_images
+    ]
+
+    attention_masks_reshape, num_img_tokens = _reshape_attention_masks(
+        image_attention_masks, mask_resolution)
+    hd_images_reshape = [
+        rearrange(im,
+                  'c (h rh) (w rw) -> (h w) c rh rw',
+                  h=h // base_resolution,
+                  w=w // base_resolution,
+                  rh=base_resolution,
+                  rw=base_resolution) for im, (h, w) in zip(hd_images, shapes)
+    ]
+    hd_images_reshape = [
+        torch.cat([_global_image] + [_im], dim=0)
+        for _global_image, _im in zip(global_image, hd_images_reshape)
+    ]
+    hd_masks_reshape = [
+        torch.cat([_global_mask] + [_mask],
+                  dim=0) for _global_mask, _mask in zip(
+                      global_attention_mask, attention_masks_reshape)
+    ]
+    max_crops = max([img.size(0) for img in hd_images_reshape])
+    image_transformed = [
+        self.pad_to_max_num_crops(im, max_crops) for im in hd_images_reshape
+    ]
+    image_transformed = torch.stack(image_transformed, dim=0)
+    mask_transformed = [
+        self.pad_mask_to_max_num_crops(mask, max_crops)
+        for mask in hd_masks_reshape
+    ]
+    mask_transformed = torch.stack(mask_transformed, dim=0)
+
+    returned_input_image_embeds = image_transformed
+    returned_image_sizes = torch.tensor(shapes, dtype=torch.long)
+    returned_image_attention_mask = mask_transformed
+    returned_num_img_tokens = num_img_tokens
+
+    data = {
+        "input_image_embeds": returned_input_image_embeds,
+        "image_sizes": returned_image_sizes,
+        "image_attention_mask": returned_image_attention_mask,
+        "num_img_tokens": returned_num_img_tokens,
+    }
+
+    return BatchFeature(data=data, tensor_type=return_tensors)
+
+
+# Create a NoOp module to replace head layers in vision encoder.
+class NoOp(torch.nn.Module):
+
+    def forward(self, *args, **kwargs):
+        return None
+
+
+class InputMode(enum.Enum):
+    LANGUAGE = 0
+    VISION = 1
+    SPEECH = 2
+    VISION_SPEECH = 3
+
+
+class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
+
     config_class = Phi4MMConfig
     base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
@@ -111,6 +549,14 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
     _supports_cache_class = True
 
     def __init__(self, config: transformers.PretrainedConfig, **kwargs):
+        # Config for torch.compile
+        if _is_torch_compile():
+            # There some .item() calls in the original code, so we need to capture the scalar outputs
+            # otherwise the graph will be broken.
+            torch._dynamo.config.capture_scalar_outputs = True
+            # Enable cudnn benchmark to get faster kernels and get better performance.
+            torch.backends.cudnn.benchmark = True
+
         super().__init__(config, **kwargs)
         self.padding_idx = config.pad_token_id
 
@@ -126,7 +572,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
             'embedding_cls': config.embd_layer['embedding_cls'],
             **config.embd_layer
         }
-        # The default values are from HuggingFace Phi-4-multimodal-instruct codes.
+        # The default values are from HuggingFace Phi-4-multimodal-instruct code.
         self.image_input_id = embedding_config.get('image_input_id', -1)
         self.audio_input_id = embedding_config.get('audio_input_id', -10000)
         if self.image_input_id == self.audio_input_id:
@@ -136,30 +582,22 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
         self.image_embd_layer_kwargs = embedding_config['image_embd_layer']
         self.image_embed = Phi4MMImageEmbedding(config,
                                                 **self.image_embd_layer_kwargs)
+        # Bind optimized vision encoder forward.
+        self.image_embed.forward = MethodType(vision_encoder_forward,
+                                              self.image_embed)
+        # Bind optimized siglip embedding forward.
+        self.image_embed.img_processor.embeddings.forward = MethodType(
+            siglip_embedding_forward,
+            self.image_embed.img_processor.embeddings,
+        )
+        # Skip head layer in vision encoder to save runtime.
+        self.image_embed.img_processor.head = NoOp()
 
         self.audio_embd_layer_kwargs = embedding_config['audio_embd_layer']
         self.audio_embed = Phi4MMAudioEmbedding(config,
                                                 **self.audio_embd_layer_kwargs)
 
-    def _replace_special_token_ids(self,
-                                   input_ids: torch.Tensor) -> torch.Tensor:
-        # Inplace-replacement for special token ids.
-        torch.where(
-            (input_ids >= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[0])
-            & (input_ids <= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[1]),
-            torch.tensor(_IMAGE_SPECIAL_TOKEN_ID),
-            input_ids,
-            out=input_ids,
-        )
-        torch.where(
-            (input_ids >= _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE[0])
-            & (input_ids <= _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE[1]),
-            torch.tensor(_AUDIO_SPECIAL_TOKEN_ID),
-            input_ids,
-            out=input_ids,
-        )
-        return input_ids
-
+    @nvtx_range("[Encoder][Image] batch_infer_image_embeds")
     def _batch_infer_image_embeds(
             self, batched_input_ids: torch.Tensor,
             multimodal_params: List[MultimodalParams]) -> torch.Tensor:
@@ -213,6 +651,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
             )
         return batched_image_hidden_states
 
+    @nvtx_range("[Encoder][Audio] batch_infer_audio_embeds")
     def _batch_infer_audio_embeds(
             self, batched_input_ids: torch.Tensor,
             multimodal_params: List[MultimodalParams]) -> torch.Tensor:
@@ -264,73 +703,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
             )
         return batched_audio_hidden_states
 
-    def _encoding_per_request(
-            self, multimodal_params: List[MultimodalParams],
-            mm_token_ids: torch.Tensor) -> List[torch.FloatTensor]:
-        # Loop implementation.
-        mm_embeddings = []
-        for i in range(len(multimodal_params)):
-            input_ids = multimodal_params[i].multimodal_data["input_ids"]
-            input_image_embeds = multimodal_params[i].multimodal_data[
-                "input_image_embeds"]
-            input_audio_embeds = multimodal_params[i].multimodal_data[
-                "input_audio_embeds"]
-            image_sizes = multimodal_params[i].multimodal_data["image_sizes"]
-            image_attention_mask = multimodal_params[i].multimodal_data[
-                "image_attention_mask"]
-            audio_embed_sizes = multimodal_params[i].multimodal_data[
-                "audio_embed_sizes"]
-            audio_attention_mask = multimodal_params[i].multimodal_data[
-                "audio_attention_mask"]
-            audio_projection_mode = multimodal_params[i].multimodal_data[
-                "audio_projection_mode"]
-
-            input_shape = input_ids.size()
-            input_ids = input_ids.view(-1, input_shape[-1])
-            input_ids = self._replace_special_token_ids(input_ids)
-            image_position_mask = input_ids == _IMAGE_SPECIAL_TOKEN_ID
-            non_image_position_mask = ~image_position_mask
-
-            image_hidden_states = None
-            if input_image_embeds is not None:
-                image_hidden_states = self.image_embed(
-                    input_ids=input_ids,
-                    input_embeds=input_image_embeds,
-                    image_sizes=image_sizes,
-                    wte=self.embed_tokens,
-                    image_attention_mask=image_attention_mask,
-                )
-            audio_hidden_states = None
-            if input_audio_embeds is not None:
-                audio_hidden_states = self.audio_embed(
-                    input_ids=input_ids,
-                    input_embeds=input_audio_embeds,
-                    audio_embed_sizes=audio_embed_sizes,
-                    audio_attention_mask=audio_attention_mask,
-                    wte=self.embed_tokens,
-                    audio_projection_mode=audio_projection_mode,
-                )
-
-            if input_image_embeds is not None and input_audio_embeds is not None:
-                dtype = image_hidden_states.dtype
-                hidden_states = image_hidden_states * image_position_mask.to(
-                    dtype).unsqueeze(
-                        -1) + audio_hidden_states * non_image_position_mask.to(
-                            dtype).unsqueeze(-1)
-            elif input_image_embeds is not None:
-                hidden_states = image_hidden_states
-            elif input_audio_embeds is not None:
-                hidden_states = audio_hidden_states
-            else:
-                hidden_states = self.embed_tokens(input_ids)
-
-            # Postprocessing to get multimodal-only embeddings.
-            mm_token_mask = torch.isin(input_ids, mm_token_ids)
-            hidden_states = hidden_states[mm_token_mask]
-
-            mm_embeddings.append(hidden_states)
-        return mm_embeddings
-
+    @nvtx_range("[HFPhi4MultimodalEncoder] encoding_batch_request")
     def _encoding_batch_request(
             self, multimodal_params: List[MultimodalParams],
             mm_token_ids: torch.Tensor) -> List[torch.FloatTensor]:
@@ -348,7 +721,6 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
         for i, input_ids in enumerate(input_ids_list):
             batched_input_ids[i, :input_ids.shape[1]] = input_ids
         batched_input_ids = batched_input_ids.view(-1, max_input_ids_len)
-        batched_input_ids = self._replace_special_token_ids(batched_input_ids)
         image_position_mask = batched_input_ids == _IMAGE_SPECIAL_TOKEN_ID
         non_image_position_mask = ~image_position_mask
 
@@ -377,19 +749,14 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
         batched_hidden_states = [batched_hidden_states]
         return batched_hidden_states
 
+    @torch.compile(disable=not _is_torch_compile())
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams],
                 mm_token_ids: torch.Tensor) -> List[torch.FloatTensor]:
-        if os.getenv("PHI4_MM_PER_REQUEST_INFER", "0") == "1":
-            # Reference code path to check correctness of batch inference and further dev.
-            # (TODO) Remove this path after accuracy bench and data parallelism are supported.
-            return self._encoding_per_request(multimodal_params, mm_token_ids)
-        else:
-            # Batch inference as default path.
-            return self._encoding_batch_request(multimodal_params, mm_token_ids)
+        return self._encoding_batch_request(multimodal_params, mm_token_ids)
 
 
-class Phi4MMInputProcessor(InputProcessor):
+class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -414,6 +781,95 @@ class Phi4MMInputProcessor(InputProcessor):
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
+        # Bind the optimized methods to the image processor instance
+        self.processor.image_processor.dynamic_preprocess = MethodType(
+            dynamic_preprocess,
+            self.processor.image_processor,
+        )
+        self.processor.image_processor.preprocess = MethodType(
+            image_preprocess,
+            self.processor.image_processor,
+        )
+
+        self.dtype = model_config.torch_dtype
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        return torch.tensor([_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
+                            dtype=torch.int32,
+                            device=self.device)
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Image.Image,
+        **kwargs,
+    ):
+        images = [image]
+        # Dynamic HD
+        base_resolution = _BASE_RESOLUTION
+        mask_resolution = _MASK_RESOLUTION
+        image_attention_masks = []
+        for im in images:
+            _, attention_mask = self.processor.image_processor.dynamic_preprocess(
+                image=im,
+                max_num=self.processor.image_processor.dynamic_hd,
+                image_size=base_resolution,
+                mask_size=mask_resolution,
+                return_image=False,
+            )
+            image_attention_masks.append(attention_mask)
+        _, num_img_tokens = _reshape_attention_masks(image_attention_masks,
+                                                     mask_resolution)
+        return num_img_tokens[0]
+
+    def _post_process(self, image_inputs: BatchFeature,
+                      audio_inputs: BatchFeature,
+                      text_prompt: str) -> Dict[str, torch.Tensor]:
+        # Combine image/audio/text embeddings.
+        inputs = self.processor._convert_images_audios_text_to_inputs(
+            image_inputs,
+            audio_inputs,
+            [text_prompt],
+        )
+
+        # Set input_mode and audio_projection_mode according to the modality.
+        # Ref: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/modeling_phi4mm.py#L2103
+        if len(image_inputs) > 0 and len(audio_inputs) > 0:
+            input_mode = InputMode.VISION_SPEECH
+            audio_projection_mode = 'vision'
+        elif len(image_inputs) > 0:
+            input_mode = InputMode.VISION
+            audio_projection_mode = 'vision'
+        elif len(audio_inputs) > 0:
+            input_mode = InputMode.SPEECH
+            audio_projection_mode = 'speech'
+        else:
+            input_mode = InputMode.LANGUAGE
+            audio_projection_mode = 'speech'
+        inputs["input_mode"] = torch.tensor([input_mode.value],
+                                            dtype=torch.long)
+        inputs["audio_projection_mode"] = audio_projection_mode
+
+        # Inplace-replacement for special token ids.
+        input_ids = inputs['input_ids']
+        if len(image_inputs) > 0:
+            torch.where(
+                (input_ids >= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[0])
+                & (input_ids <= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[1]),
+                torch.tensor(_IMAGE_SPECIAL_TOKEN_ID),
+                input_ids,
+                out=input_ids,
+            )
+        if len(audio_inputs) > 0:
+            torch.where(
+                (input_ids >= _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE[0])
+                & (input_ids <= _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE[1]),
+                torch.tensor(_AUDIO_SPECIAL_TOKEN_ID),
+                input_ids,
+                out=input_ids,
+            )
+        inputs['input_ids'] = input_ids
+        return inputs
 
     @torch.inference_mode()
     def __call__(
@@ -424,39 +880,34 @@ class Phi4MMInputProcessor(InputProcessor):
         images = mm_data.get("image", None)
         audios = mm_data.get("audio", None)
 
-        if images is not None:
-            if isinstance(images[0], torch.Tensor):
-                # HF Phi4MM can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
-                images = [
-                    Image.fromarray((image.permute(1, 2, 0) * 255).to(
-                        torch.uint8).cpu().numpy()) for image in images
-                ]
+        # Return ahead of time if no multimodal data.
+        if images is None and audios is None:
+            input_ids = self.tokenizer.encode(text_prompt,
+                                              add_special_tokens=False,
+                                              return_tensors="pt")
+            return input_ids[0].to(torch.int32).tolist(), {}
 
-        # Preprocessing for multimodal data.
-        inputs = self.processor(text=[text_prompt],
-                                images=images,
-                                audios=audios,
-                                return_tensors='pt').to(self.device)
+        # Processing for multimodal data.
+        image_inputs = self.processor.image_processor(
+            images, return_tensors='pt') if images is not None else {}
+        audio_inputs = self.processor.audio_processor(
+            audios, return_tensors='pt') if audios is not None else {}
 
-        # Set audio_projection_mode according to the modality.
-        # Ref: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/modeling_phi4mm.py#L2103
-        if images is not None:
-            audio_projection_mode = 'vision'
-        elif audios is not None:
-            audio_projection_mode = 'speech'
-        else:
-            audio_projection_mode = 'speech'
+        # Postprocessing for multimodal data.
+        inputs = self._post_process(image_inputs, audio_inputs, text_prompt)
 
-        # Will package inputs for language model forward in AGGREGATE mode.
+        # Package inputs for language model forward in AGGREGATE mode.
         multimodal_data = {}
         multimodal_data['input_ids'] = inputs['input_ids']
-        multimodal_data['input_image_embeds'] = inputs['input_image_embeds']
+        multimodal_data['input_image_embeds'] = inputs['input_image_embeds'].to(
+            self.dtype)
         multimodal_data['image_sizes'] = inputs['image_sizes']
         multimodal_data['image_attention_mask'] = inputs['image_attention_mask']
         multimodal_data['input_audio_embeds'] = inputs['input_audio_embeds']
         multimodal_data['audio_embed_sizes'] = inputs['audio_embed_sizes']
         multimodal_data['audio_attention_mask'] = inputs['audio_attention_mask']
-        multimodal_data['audio_projection_mode'] = audio_projection_mode
+        multimodal_data['audio_projection_mode'] = inputs[
+            'audio_projection_mode']
         return inputs['input_ids'][0].to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
@@ -493,7 +944,6 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if not _is_disagg():
             _load_phi4mm_classes(config._name_or_path)
 
-            # Setup HFPhi4MultimodalEncoder in AGGREGATE mode.
             self.hf_phi4mm_model = HFPhi4MultimodalEncoder(config).eval()
             self.hf_phi4mm_model.to(config.torch_dtype)
             # Required by HFPhi4MultimodalEncoder.
@@ -507,7 +957,6 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
         self.vocab_size = config.vocab_size
         self.model_dtype = getattr(config, "torch_dtype", torch.float16)
-        logger.info(f"{self.dtype=} {self.model_dtype=}")
         self.post_config()
         self.is_loaded = True
 
@@ -516,6 +965,11 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if not _is_disagg():
             filtered_weights = {}
             for k, v in weights.items():
+                # Skip image_embed head weights since we set it as NoOp.
+                if k.startswith(
+                        "model.embed_tokens_extend.image_embed.img_processor.head."
+                ):
+                    continue
                 if k.startswith("model.embed_tokens."):
                     new_k = k.replace("model.embed_tokens.", "embed_tokens.")
                     filtered_weights[new_k] = v
@@ -557,6 +1011,15 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        # The data with the following keys will be moved to CUDA device,
+        # the rest of them will be kept on CPU.
+        return [
+            "input_ids", "input_image_embeds", "image_attention_mask",
+            "input_audio_embeds", "audio_attention_mask"
+        ]
+
     @torch.inference_mode()
     def forward(
         self,
@@ -579,16 +1042,22 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_disagg():
-                # Forward the multimodal data to HFPhi4MultimodalEncoder in AGGREGATE mode.
-                mm_embedding = self.hf_phi4mm_model(multimodal_params,
-                                                    self.mm_token_ids)
+                encoder_kwargs = {
+                    "mm_token_ids": self.mm_token_ids,
+                }
+                mm_embedding = get_multimodal_embeddings(
+                    encoder_forward_fn=self.hf_phi4mm_model.forward,
+                    multimodal_params=multimodal_params[:num_context_requests],
+                    encoder_kwargs=encoder_kwargs,
+                )
             else:
-                # Directly fetch the multimodal embedding for DISAGG mode.
-                # This path is not functional now. `multimodal_params` will be prepared in PyExecutor.
-                mm_embedding = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "Phi-4-multimodal does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embedding = find_input_mm_embeds(
+                mm_embedding, multimodal_params[:num_context_requests])
+
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,

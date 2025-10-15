@@ -316,7 +316,7 @@ if __name__ == '__main__':
         default=["tensorrt_llm"],
         action="append",
         help=
-        "Specify the name of the TensorRT-LLM model. Can be specified multiple times to use multiple models."
+        "Specify the name of the TensorRT LLM model. Can be specified multiple times to use multiple models."
     )
     parser.add_argument('-c',
                         '--concurrency',

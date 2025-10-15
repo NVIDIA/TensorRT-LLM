@@ -2,17 +2,24 @@
 Tests for basic graph sharding.
 """
 
+from typing import List
+
 import pytest
 import torch
+import torch.nn as nn
 from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import (
+    FullModelExportInfo,
+    ModelFactory,
+    SubModuleExportInfo,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale, pack_int4_in_uint8
 
 
 class DummyFactory(ModelFactory):
@@ -29,6 +36,9 @@ class DummyFactory(ModelFactory):
 
     def get_quant_config(self):
         return self.quant_config
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 @pytest.mark.parametrize(
@@ -183,4 +193,68 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
     # check there's quantization error during transformation
     assert not torch.allclose(model(x), gm_transformed(x))
     # check if we can still export the model as expected
+    torch_export_to_gm(gm_transformed, args=(x,))
+
+
+def _per_block_amax(W: torch.Tensor, block: int = 128) -> torch.Tensor:
+    N, K = W.shape
+    return W.abs().view(N, K // block, block).amax(dim=-1).to(torch.float32)
+
+
+def test_int4awq_transform_graph_and_load_hook():
+    """INT4 AWQ transform with FP model's state_dict rewritten via hook to packed+scales."""
+    device = "cuda"
+    torch.manual_seed(0)
+    quant_config = {"quant_algo": "W4A16_AWQ"}
+    BLOCK = 128
+    QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_int4_linear
+
+    # FP model (K divisible by 128, out_dims even)
+    model = MLP(256, 128, 256).to(torch.float16).to(device)
+    x = torch.randn(3, 256, dtype=torch.float16, device=device)
+
+    def int4awq_state_dict_hook(module: nn.Module, state_dict: dict, prefix: str, local_meta: dict):
+        for name, m in module.named_modules():
+            if not isinstance(m, nn.Linear):
+                continue
+            key_w = f"{prefix}{name}.weight"
+            if key_w not in state_dict:
+                continue
+            W = state_dict[key_w].detach().to(torch.float32).to(device)  # (N, K) fp
+            N, K = W.shape
+            assert N % 2 == 0 and K % BLOCK == 0
+            amax = _per_block_amax(W, BLOCK)  # (N, K//128)
+            weights_scaling_factor = (amax / 7.0).to(torch.float32)
+            W_packed = pack_int4_in_uint8(W, weights_scaling_factor)  # (N//2, K) uint8
+            state_dict[key_w] = W_packed.to(torch.uint8)
+            state_dict[f"{prefix}{name}.pre_quant_scale"] = torch.ones(
+                K, dtype=torch.float32, device=W.device
+            )
+            state_dict[f"{prefix}{name}.weight_scale"] = weights_scaling_factor
+
+    model._register_state_dict_hook(int4awq_state_dict_hook)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {"quantize_int4_linear_from_config": {"stage": "pattern_matcher"}},
+    )(None, gm).to(device)
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        lambda gm_: any(is_op(n, QUANT_OP) for n in gm_.graph.nodes),
+        lambda num_p_og: num_p_og // 2,  # stored params halved by packing
+        0.5,  # atol
+        0.5,  # rtol
+        True,  # test_load_hook
+        False,  # strict_loading
+        None,  # dynamic_shapes
+        None,  # check_num_matches
+        False,  # skip_output_assert
+        quant_config,
+    )
+
+    # Still exportable
     torch_export_to_gm(gm_transformed, args=(x,))

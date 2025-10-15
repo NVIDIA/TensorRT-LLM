@@ -54,6 +54,25 @@ def _load_hook_remove(
     state_dict.pop(key, None)
 
 
+def _update_view_nodes(node: Node) -> None:
+    """
+    After sharding weights of the linear node, using column split
+    in attention module (Q, K, V),
+    the output Y = X @ W^T is [batch, seq, num_heads // TP_size, head_dim]
+    Some models hardcode the shape of the output to be [batch, seq, num_heads, head_dim]
+    instead of implicit [batch, seq, -1, head_dim].
+    Detect such cases and update the shape of the view node accordingly.
+    """
+    view_nodes = [n for n in node.users if is_op(n, torch.ops.aten.view)]
+    for view_node in view_nodes:
+        view_shape = view_node.args[1]
+        if len(view_shape) == 4 and view_shape[2] != -1:
+            args = list(view_node.args)
+            args[1] = [view_shape[0], view_shape[1], -1, view_shape[3]]
+            view_node.args = tuple(args)
+            ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
+
+
 def _insert_sharded_matmul(
     gm: GraphModule,
     node: Node,
@@ -157,14 +176,15 @@ def _insert_sharded_matmul(
             world_size=world_size,
         )
 
-    # no comm node needed for single device
+    # column shard with no gather: the output is sharded
     if not add_dist:
+        _update_view_nodes(node)
         return
 
     # figure out the right dist op
     dist_lookup = {
-        0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
+        0: (torch.ops.auto_deploy.torch_dist_all_gather.default, -1),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -558,7 +578,7 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Add all_gather node after BMM to collect results
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather,
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
@@ -646,10 +666,81 @@ def _insert_sharded_moe(
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
         dist_node = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,)
+            torch.ops.auto_deploy.torch_dist_all_reduce.default, args=(node,)
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
+
+
+def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:
+    """Return tensor_node[lo:hi, ...] via aten.slice along dim 0."""
+    with gm.graph.inserting_after(tensor_node):
+        # aten.slice.Tensor(self, dim, start, end, step)
+        return gm.graph.call_function(
+            torch.ops.aten.slice.Tensor,
+            args=(tensor_node, 0, lo, hi, 1),
+        )
+
+
+def _split_range_last_remainder(n: int, world_size: int, rank: int):
+    """[lo, hi) split along dim0; last rank gets remainder."""
+    base = n // world_size
+    lo = base * rank
+    hi = n if rank == world_size - 1 else base * (rank + 1)
+    return lo, hi
+
+
+def _insert_sharded_mxfp4_mlp_ep(
+    gm: GraphModule,
+    node: Node,
+    rank: int,
+    world_size: int,
+):
+    """
+    Transform a call to auto_deploy::triton_mxfp4_moe into:
+      - sharded expert parameters along dim 0 (this rank's slice),
+      - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
+      - followed by torch_dist_all_reduce.
+
+    Expects the original op signature:
+      (hidden_states,
+       router_weight, router_bias, top_k,
+       gate_up_blocks, gate_up_bias, gate_up_scales,
+       alpha, limit,
+       down_blocks, down_bias, down_scales)
+    """
+
+    IDX_GATE_UP_BLOCKS = 4
+    IDX_GATE_UP_BIAS = 5
+    IDX_GATE_UP_SCALES = 6
+    IDX_DOWN_BLOCKS = 9
+    IDX_DOWN_BIAS = 10
+    IDX_DOWN_SCALES = 11
+
+    gate_up_blocks_node = node.args[IDX_GATE_UP_BLOCKS]
+    num_experts = int(gate_up_blocks_node.meta["val"].shape[0])
+
+    local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
+
+    # Prepare new args with slices for this rank
+    args = list(node.args)
+    args[IDX_GATE_UP_BLOCKS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BLOCKS], local_lo, local_hi)
+    args[IDX_GATE_UP_BIAS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BIAS], local_lo, local_hi)
+    args[IDX_GATE_UP_SCALES] = _slice_expert_dim(gm, args[IDX_GATE_UP_SCALES], local_lo, local_hi)
+    args[IDX_DOWN_BLOCKS] = _slice_expert_dim(gm, args[IDX_DOWN_BLOCKS], local_lo, local_hi)
+    args[IDX_DOWN_BIAS] = _slice_expert_dim(gm, args[IDX_DOWN_BIAS], local_lo, local_hi)
+    args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
+
+    args_ep = tuple(args) + (int(world_size), int(rank))
+    node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
+    node.args = args_ep
+
+    # Add a dist all-reduce after the op (sum partial results across EP ranks)
+    with gm.graph.inserting_after(node):
+        red = gm.graph.call_function(torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,))
+        node.replace_all_uses_with(red)
+        # keep dataflow: red(input=node)
+        red.replace_input_with(red, node)
 
 
 class EPShardingInfo(ShardingTransformInfo):
@@ -676,6 +767,20 @@ class EPShardingInfo(ShardingTransformInfo):
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
         _insert_sharded_moe(gm, node, self.rank, self.world_size, [])
+
+
+class MXFP4EPShardingInfo(EPShardingInfo):
+    """GPT-OSS style MXFP4-specific EP sharding behavior."""
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        """Validate the transformation configuration."""
+        if not is_op(node, torch.ops.auto_deploy.triton_mxfp4_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_mxfp4_mlp_ep(gm, node, self.rank, self.world_size)
 
 
 class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
@@ -714,6 +819,7 @@ EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
 
 
@@ -737,6 +843,7 @@ class ShardingConfig(BaseModel):
     predefined_config: Optional[Dict[str, Any]] = None
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = False
+    support_partial_config: bool = False
     sharding_dims: List[str] = Field(default_factory=list)
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
@@ -781,7 +888,7 @@ class ShardingConfig(BaseModel):
         tp_plan = self.predefined_config["tp_plan"]
 
         values = set(tp_plan.values())
-        allowed_values = {
+        supported_modes = {
             "colwise",  # row split and no collective
             "rowwise",  # column split and all-reduce
             "gather",  # simple shard (row + all_gather)
@@ -793,7 +900,7 @@ class ShardingConfig(BaseModel):
             # "local_packed_rowwise",
             # "local",
         }
-        if not values.issubset(allowed_values):
+        if not self.support_partial_config and not values.issubset(supported_modes):
             ad_logger.warning("Sharding config contains invalid values. Skipping.")
             # invalidate the config
             self.predefined_config = {}

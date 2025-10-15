@@ -44,7 +44,7 @@ WEIGHT_STREAMING_DISABLED_VAL = "1.0"
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Build TensorRT-LLM models.')
+    parser = argparse.ArgumentParser(description='Build TensorRT LLM models.')
     parser.add_argument('-m',
                         '--model',
                         type=str,

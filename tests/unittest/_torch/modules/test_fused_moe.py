@@ -30,12 +30,10 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
-                                                   CutlassFusedMoE,
-                                                   DefaultMoeRoutingMethod,
-                                                   RenormalizeMoeRoutingMethod,
-                                                   TritonFusedMoE, VanillaMoE,
-                                                   create_moe, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe import (
+    BaseMoeRoutingMethod, CutlassFusedMoE, TRTLLMGenFusedMoE,
+    DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod, TritonFusedMoE,
+    create_moe, WideEPMoE)
 # isort: on
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
@@ -76,8 +74,10 @@ def test_fused_moe(moe_backend,
     if bias and moe_backend not in ["TRITON"]:
         pytest.skip("Bias not supported.")
 
-    mapping = Mapping()
+    mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
+
+    torch.cuda.set_device(mapping.rank)
 
     with torch.device(f'cuda:{mapping.rank}'):
         SEQ_LEN = 8
@@ -165,18 +165,19 @@ def test_fused_moe(moe_backend,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize("moe_cls", [CutlassFusedMoE, VanillaMoE])
+@pytest.mark.parametrize("moe_cls", ["CUTLASS", "VANILLA"])
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 def test_fused_moe_multi_gpu(moe_cls, ep_size):
     world_size = 4
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
             test_fused_moe,
-            *zip(*[(moe_cls, torch.bfloat16, 512, DefaultMoeRoutingMethod,
-                    Mapping(world_size=world_size,
-                            tp_size=world_size,
-                            moe_ep_size=ep_size,
-                            moe_tp_size=world_size // ep_size))] * world_size),
+            *zip(
+                *[(moe_cls, torch.bfloat16, 512, DefaultMoeRoutingMethod, False,
+                   Mapping(world_size=world_size,
+                           tp_size=world_size,
+                           moe_ep_size=ep_size,
+                           moe_tp_size=world_size // ep_size))] * world_size),
         )
         for r in results:
             assert r is None
@@ -234,7 +235,8 @@ def test_fused_moe_alltoall(alltoall_method_type):
                 dtype=dtype,
                 reduce_results=True,
                 model_config=ModelConfig(mapping=mapping,
-                                         max_num_tokens=MAX_NUM_TOKENS),
+                                         max_num_tokens=MAX_NUM_TOKENS,
+                                         moe_max_num_tokens=MAX_NUM_TOKENS),
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
@@ -273,6 +275,10 @@ def test_fused_moe_alltoall(alltoall_method_type):
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False)
 
+            if alltoall_method_type == AlltoallMethodType.MNNVL and output.ndim == 3:
+                output = output.sum(dim=1)
+            print(f"output: {output.shape}")
+            print(f"ref_output: {ref_output.shape}")
             # Evaluate outputs
             torch.testing.assert_close(output,
                                        ref_output,
@@ -634,6 +640,162 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5565565")
+@skip_pre_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize(
+    "alltoall_method_type",
+    [AlltoallMethodType.MNNVL, AlltoallMethodType.NotEnabled],
+    ids=lambda s: s.name)
+def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
+    """Test WideEPMoE with FP8 block-wise quantization using DeepGemmFusedMoE as reference."""
+
+    world_size = 4
+    dtype = torch.bfloat16
+    # Reduce model size to avoid MPI int32 overflow
+    HIDDEN_SIZE = 768
+    INTERMEDIATE_SIZE = 512
+    NUM_EXPERTS = 16
+    TOP_K = 2
+    MAX_NUM_TOKENS = 256
+
+    # The MPI can not support FP8, so create weights on each rank
+    def per_rank_test_fused_moe_alltoall_fp8_blockwise(job_id):
+        routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
+        mapping = Mapping(world_size=world_size,
+                          rank=mpi_rank(),
+                          tp_size=world_size,
+                          moe_ep_size=world_size,
+                          moe_tp_size=1,
+                          enable_attention_dp=True)
+        torch.cuda.set_device(mapping.rank)
+        # Use same seed for all ranks to ensure consistency
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        # Generate test data locally on each rank
+        x_list = []
+        m = MAX_NUM_TOKENS
+        while m >= 1:
+            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype, device="cuda")
+            set_tensor_value_2(x, m, HIDDEN_SIZE)
+            x_list.append(x)
+            m //= 2
+
+        # Generate weights locally on each rank (same weights due to same seed)
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            w1_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") / HIDDEN_SIZE
+            w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                    dtype=dtype,
+                                    device="cuda")
+            w3_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") / HIDDEN_SIZE
+
+            set_tensor_value_3(w1_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+            set_tensor_value_4(w2_weight, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+            set_tensor_value_3(w3_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+
+            # FP8 block-wise quantization
+            w1_weight_fp8, w1_weight_scale = per_block_cast_to_fp8_e8m0(
+                w1_weight)
+            w1_weight_fp8 = w1_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+            w2_weight_fp8, w2_weight_scale = per_block_cast_to_fp8_e8m0(
+                w2_weight)
+            w2_weight_fp8 = w2_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+            w3_weight_fp8, w3_weight_scale = per_block_cast_to_fp8_e8m0(
+                w3_weight)
+            w3_weight_fp8 = w3_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight_fp8
+            weights[f"{expert_id}.w2.weight"] = w2_weight_fp8
+            weights[f"{expert_id}.w3.weight"] = w3_weight_fp8
+            weights[f"{expert_id}.w1.weight_scale_inv"] = w1_weight_scale
+            weights[f"{expert_id}.w2.weight_scale_inv"] = w2_weight_scale
+            weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
+            weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale
+
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+
+        # Test WideEPMoE with alltoall method
+        with mock.patch.object(WideEPMoE,
+                               "select_alltoall_method_type",
+                               return_value=alltoall_method_type):
+            alltoall_model = WideEPMoE(
+                num_experts=NUM_EXPERTS,
+                routing_method=routing_method,
+                hidden_size=HIDDEN_SIZE,
+                intermediate_size=INTERMEDIATE_SIZE,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ModelConfig(mapping=mapping,
+                                         max_num_tokens=MAX_NUM_TOKENS,
+                                         quant_config=quant_config),
+            )
+        alltoall_model.to("cuda")
+        alltoall_model.load_weights([weights])
+        alltoall_model.post_load_weights()
+
+        # Use DeepGemmFusedMoE as reference
+        ref_model = DeepGemmFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ModelConfig(mapping=mapping,
+                                     max_num_tokens=MAX_NUM_TOKENS,
+                                     quant_config=quant_config),
+        )
+        ref_model.to("cuda")
+        ref_model.load_weights([weights])
+        ref_model.post_load_weights()
+
+        # Evaluate the outputs on variant sequence lengths
+        m = MAX_NUM_TOKENS
+        i = 0
+        while m >= 1:
+            x = x_list[i]
+            i += 1
+            router_logits = torch.randn((m, NUM_EXPERTS),
+                                        dtype=dtype,
+                                        device="cuda")
+            all_rank_num_tokens = [m] * mapping.world_size
+            with torch.inference_mode():
+                output = alltoall_model.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False)
+                ref_output = ref_model.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False)
+
+            # Evaluate outputs with relaxed tolerance for FP8
+            # If WideEPMoE output has TOP_K dimension, reduce it to match DeepGemmFusedMoE
+            if output.dim() == 3 and output.shape[1] == TOP_K:
+                output = output.sum(dim=1)
+            torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+            m //= 2
+
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(per_rank_test_fused_moe_alltoall_fp8_blockwise,
+                               range(world_size))
+        for r in results:
+            assert r is None
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
@@ -725,6 +887,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
+    fused_moe.post_load_weights()
 
     def swiglu_fused_moe(x):
         x, gate = x.chunk(2, dim=-1)
@@ -1261,6 +1424,131 @@ def test_fused_moe_nvfp4(dtype):
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
+@skip_pre_blackwell
+def test_fused_moe_w4a8_nvfp4_fp8():
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f'cuda:{mapping.rank}'):
+        SCALING_VECTOR_SIZE = 32
+
+        SEQ_LEN = 4
+        HIDDEN_SIZE = 512
+        INTERMEDIATE_SIZE = 512
+        NUM_EXPERTS = 4
+        TOP_K = 2
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
+        x_sf_global = 448 / x.abs().max().float()
+        router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
+                                    dtype=dtype,
+                                    device="cuda")
+
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                    dtype=torch.float32,
+                                    device="cpu")
+            w1_sf_global = (448) / w1_weight.abs().max().float()
+
+            w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                    dtype=torch.float32,
+                                    device="cpu")
+            w2_sf_global = (448) / w2_weight.abs().max().float()
+
+            w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                    dtype=torch.float32,
+                                    device="cpu")
+            w3_sf_global = (448) / w3_weight.abs().max().float()
+
+            w3_w1_global = min(
+                w1_sf_global,
+                w3_sf_global)  # w3 global and w1 global must be the same
+
+            w1_weight_nvfp4, w1_sf_block, _ = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+                w1_weight * w3_w1_global, SCALING_VECTOR_SIZE, 1, False)
+            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w1_sf_block.view(INTERMEDIATE_SIZE, -1))
+
+            w2_weight_nvfp4, w2_sf_block, _ = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+                w2_weight * w2_sf_global, SCALING_VECTOR_SIZE, 1, False)
+            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w2_sf_block.view(HIDDEN_SIZE, -1))
+
+            w3_weight_nvfp4, w3_sf_block, _ = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+                w3_weight * w3_w1_global, SCALING_VECTOR_SIZE, 1, False)
+            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w3_sf_block.view(INTERMEDIATE_SIZE, -1))
+
+            w1_weight_nvfp4 = w1_weight_nvfp4.cuda()
+            w1_sf_block_unswizzled = w1_sf_block_unswizzled.cuda()
+            w2_weight_nvfp4 = w2_weight_nvfp4.cuda()
+            w2_sf_block_unswizzled = w2_sf_block_unswizzled.cuda()
+            w3_weight_nvfp4 = w3_weight_nvfp4.cuda()
+            w3_sf_block_unswizzled = w3_sf_block_unswizzled.cuda()
+
+            w1_input_scale = x_sf_global.cuda()
+            w2_input_scale = x_sf_global.cuda()
+            w3_input_scale = x_sf_global.cuda()
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4
+            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4
+            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4
+            weights[
+                f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
+                    torch.float8_e4m3fn).cuda()
+            weights[
+                f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
+                    torch.float8_e4m3fn).cuda()
+            weights[
+                f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
+                    torch.float8_e4m3fn).cuda()
+            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
+            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
+            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
+            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global
+            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
+            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
+
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_NVFP4_FP8)
+        fused_moe = TRTLLMGenFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=False,
+            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe.load_weights([weights])
+        fused_moe.cuda()
+
+        # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
+        ref_fused_moe = RefGatedMLPFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            model_config=ModelConfig(quant_config=quant_config))
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        AutoTuner.get().clear_cache()
+        with torch.inference_mode(), autotune():
+            fused_moe.forward(x, router_logits)
+
+        with torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+        # compare
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, ref_output, rtol=1e-1, atol=0.5)
+
+
 @skip_neither_ada_nor_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -1527,7 +1815,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 @skip_pre_blackwell
 @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
+def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
     SEQ_LEN = 128
@@ -2100,7 +2388,8 @@ class RefGatedMLPFusedMoE(nn.Module):
                     f"{expert}.w3.input_scale"]
                 down_proj_weights[0]['input_scale'] = weights[
                     f"{expert}.w2.input_scale"]
-            elif self.quant_config and self.quant_config.quant_algo == QuantAlgo.NVFP4:
+            elif self.quant_config and self.quant_config.quant_algo in (
+                    QuantAlgo.NVFP4, QuantAlgo.W4A8_NVFP4_FP8):
                 gate_up_proj_weights[0]['weight_scale'] = weights[
                     f"{expert}.w1.weight_scale"]
                 gate_up_proj_weights[1]['weight_scale'] = weights[

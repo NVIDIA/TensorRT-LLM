@@ -68,7 +68,7 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-# Add TensorRT-LLM Gen export interface and CUDA support
+# Add TensorRT LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
@@ -138,9 +138,9 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 if(TRTLLM_VERSION_RESULT EQUAL 0)
-  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
+  message(STATUS "TensorRT LLM version: ${TRTLLM_VERSION}")
 else()
-  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
+  message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
 configure_file(
@@ -248,6 +248,7 @@ endif()
 include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${3RDPARTY_DIR}/cutlass/include
@@ -510,7 +511,6 @@ print(os.path.dirname(torch.__file__),end='');"
       endif()
     endif()
   endif()
-
 else()
   if(NOT WIN32)
     if(NOT USE_CXX11_ABI)
@@ -558,6 +558,7 @@ if(ENABLE_UCX)
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
                  NO_DEFAULT_PATH)
   endif()
+  find_package(NIXL)
 endif()
 if(ENABLE_UCX)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=1")

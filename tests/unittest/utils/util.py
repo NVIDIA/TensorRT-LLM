@@ -19,7 +19,8 @@ except ImportError:
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm._utils import (mpi_disabled, torch_dtype_to_trt,
+                                 trt_dtype_to_torch)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -74,6 +75,11 @@ def getCUDAVersion():
         print(f"Error getting CUDA version: {e}")
 
 
+def isSM100Family():
+    sm = getSMVersion()
+    return sm == 100 or sm == 103
+
+
 skip_pre_ada = pytest.mark.skipif(
     getSMVersion() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -84,7 +90,7 @@ skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100,
+    getSMVersion() == 100 or getSMVersion() == 103,
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
@@ -127,9 +133,8 @@ def skip_fp8_pre_ada(use_fp8):
 
 
 def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
-    if getSMVersion() == 100 and (head_size not in [32, 64, 128]
-                                  and context_fmha_type
-                                  != ContextFMHAType.disabled):
+    if (isSM100Family()) and (head_size not in [32, 64, 128] and
+                              context_fmha_type != ContextFMHAType.disabled):
         pytest.skip(
             "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
         )
@@ -181,14 +186,14 @@ def skip_gpu_memory_less_than(required_memory: int):
     )
 
 
-skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1024 * 1024 *
-                                                            1024)
+skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
+                                                            1000)
 
 
 def modelopt_installed():
@@ -442,3 +447,7 @@ def check_accuracy(a, b, atol, rtol, percent):
     if not (mismatch_percent < 1 - percent):
         raise Exception("Mismatch percentage is %f for rtol %f" %
                         (mismatch_percent, rtol))
+
+
+skip_ray = pytest.mark.skipif(
+    mpi_disabled(), reason="This test is skipped for Ray orchestrator.")

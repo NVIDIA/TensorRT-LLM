@@ -121,6 +121,7 @@ class ModelConfig(Generic[TConfig]):
 
     spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     is_generation: bool = True
     max_num_tokens: int = 8192
@@ -133,6 +134,8 @@ class ModelConfig(Generic[TConfig]):
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
+    # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
+    use_low_precision_moe_combine: bool = False
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
@@ -523,15 +526,23 @@ class ModelConfig(Generic[TConfig]):
 
         # For kv cache size calculation: set size_per_head
         head_dim_names = ["head_size", "head_dim"]
+        head_size = None
         for head_dim_name in head_dim_names:
-            if head_dim_name in self.pretrained_config:
-                head_size = getattr(self.pretrained_config, head_dim_name)
-                break
-        else:
-            logger.warning(
-                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
+            if hasattr(self.pretrained_config, head_dim_name):
+                value = getattr(self.pretrained_config, head_dim_name)
+                if value is not None:
+                    head_size = value
+                    break
+
+        if head_size is None:
+            assert hidden_size % num_heads == 0, (
+                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
             )
-            head_size = hidden_size // num_heads
+            calculated_head_size = hidden_size // num_heads
+            logger.warning(
+                f"head_size/head_dim is not set or None, using default value {calculated_head_size}"
+            )
+            head_size = calculated_head_size
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size

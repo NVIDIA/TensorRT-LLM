@@ -39,8 +39,8 @@ public:
 
         if (offset + size > mBuffer->getSize())
         {
-            throw std::out_of_range(std::string("slice ") + std::to_string(offset + size) + " exceeds buffer size "
-                + std::to_string(mBuffer->getSize()));
+            throw std::out_of_range(std::string("offset ") + std::to_string(offset) + std::string(" + size ")
+                + std::to_string(size) + " exceeds buffer size " + std::to_string(mBuffer->getSize()));
         }
     }
 

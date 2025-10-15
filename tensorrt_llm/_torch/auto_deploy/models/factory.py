@@ -3,14 +3,18 @@
 import copy
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Type, final
 
 import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
+from torch.export import Dim
+from torch.fx import GraphModule
 
-from ..custom_ops.attention_interface import CacheConfig, DynamicShapeCallback
+from ..custom_ops.attention_interface import CacheConfig
 from ..utils.logger import ad_logger
+
+DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 
 
 class ShardingConfigSource(Enum):
@@ -18,6 +22,73 @@ class ShardingConfigSource(Enum):
 
     HUGGINGFACE = "huggingface"
     UNKNOWN = "unknown"
+
+
+class SubModuleExportInfo:
+    """Information+configuration for exporting a submodule from a factory model."""
+
+    def __init__(self, submodule_name: str):
+        self.submodule_name = submodule_name
+        self._dynamic_shape_lookup: Optional[Dict[str, DynamicShape]] = None
+
+    @property
+    @final
+    def dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
+        """Return the lookup for the dynamic shapes of keyword arguments.
+
+        This property is lazy-initialized and will be computed on the first access. This is useful
+        for two reasons:
+            1. dynamic shape object are not picklable, so we need to compute them on the first
+               access in the respective subprocess.
+            2. On the other hand, we do not want to initialize the symbolic integers defining the
+               dynamic shapes more than once to ensure that the **same** symbolic integers is used
+               for semantically identical shape information (e.g. there is only one dynamic batch
+               size). This property is used during export process to compare the dynamic shapes of
+               multiple inputs.
+        """
+        if self._dynamic_shape_lookup is None:
+            self._dynamic_shape_lookup = self._init_dynamic_shape_lookup()
+        return self._dynamic_shape_lookup
+
+    @abstractmethod
+    def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
+        """Initialize the lookup for the dynamic shapes of keyword arguments."""
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    @abstractmethod
+    def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Post-process the subgraph module.
+
+        Args:
+            sub_mod: The submodule from which the graph was captured+exported.
+            sub_gm: The graph module that was exported.
+
+        This method can be useful if there are certain properties of the the original submodule
+        that we may want to preserve in the exported graph module.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
+
+class FullModelExportInfo(SubModuleExportInfo):
+    """An export configuration for the full model.
+
+    This is the most "trivial" export configuration as it is simply the instructions to export the
+    full model with the standard forward function signature of ``input_ids, position_ids``.
+    """
+
+    def __init__(self):
+        super().__init__("")
+
+    def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
+        batch_size_dyn = Dim.DYNAMIC
+        seq_len_dyn = Dim.DYNAMIC
+        return {
+            "input_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+            "position_ids": {0: batch_size_dyn, 1: seq_len_dyn},
+        }
+
+    def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        pass
 
 
 class ModelFactory(ABC):
@@ -173,6 +244,8 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            load_factoy_model: If True, will load weights for the factory model in addition to main
+                gm. This is useful for the transformers model.
 
         NOTE: we always call ``self._to_maybe_random(model, device)`` as a preprocessing step
         to ensure the model parameters already exist on the right device and have the desired dtype
@@ -204,6 +277,7 @@ class ModelFactory(ABC):
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
             self._load_checkpoint(model, device)
+        ad_logger.info("Loading and initializing weights. Done.")
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
@@ -245,22 +319,19 @@ class ModelFactory(ABC):
         """
         return {}
 
-    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
-        """Return a dictionary of extra model inputs that behave like optional forward arguments.
+    @abstractmethod
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        """Specify and return a dictionary of export configurations for the model.
+
+        Args:
+            model: The model to get the export configurations for.
 
         Returns:
-            A dictionary of extra inputs for the model where the key corresponds to the argument
-            name and the value corresponds to a tuple of (none_input, dynamic_shape_callback):
-                - `none_input`: The none input value of the extra input indicating the tensor
-                   value corresponding to the equivalent of the None input. `None` is not supported
-                   as we require the input to be a tensor. Hence, this none_input acts as a
-                   placeholder for the None input. We assume that the "optional" behavior of these
-                   arguments can be represented via a placeholder tensor and and an appropriate
-                   check within the forward function using ``torch.cond``.
-                - `dynamic_shape_callback`: A function that returns the dynamic shape of the extra
-                  input. Simply set to `None` if the extra input is not dynamic.
+            A list of export configurations for the model.
+
+        Each export config describes which submodules of the factory model should be exported and
+        contains relevant configuration+information for the export process.
         """
-        return {}
 
 
 class ModelFactoryRegistry:

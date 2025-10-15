@@ -239,6 +239,12 @@ def filtered_nodes(
         for node in nodes:
             if target(node):
                 yield node
+    elif isinstance(target, Iterable) and all(isinstance(t, Callable) for t in target):
+        for node in nodes:
+            for t in target:
+                if t(node):
+                    yield node
+                    break
     else:
         # Handle the case where target or ops contains operations
         operations = ops if ops is not None else target
@@ -321,9 +327,10 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     for node in gm.graph.nodes:
         if input_id_node is None and node.op == "placeholder":
             input_id_node = node
-        output_node = node
+        if node.op == "output":
+            output_node = node
     assert input_id_node, "Could not find input node"
-    assert output_node.op == "output", "Could not find output node"
+    assert output_node, "Could not find output node"
 
     # start list of boundary nodes
     boundary_nodes = [input_id_node]

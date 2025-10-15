@@ -3,8 +3,9 @@
 import os
 import re
 import types
+from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -14,6 +15,8 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
 from PIL import Image
 from torch._prims_common import DeviceLikeType
+from torch.export import Dim
+from torch.fx import GraphModule
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -22,6 +25,7 @@ from transformers import (
     AutoTokenizer,
     PretrainedConfig,
 )
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from transformers.utils import (
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
@@ -29,11 +33,18 @@ from transformers.utils import (
     WEIGHTS_NAME,
 )
 
-from ..custom_ops.attention_interface import CacheConfig, Dim, DynamicShapeCallback
+from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
-from .factory import ModelFactory, ModelFactoryRegistry, ShardingConfigSource
-from .quant_config_reader import QuantConfigReader, QuantConfigReaderRegistry
+from .factory import (
+    DynamicShape,
+    FullModelExportInfo,
+    ModelFactory,
+    ModelFactoryRegistry,
+    ShardingConfigSource,
+    SubModuleExportInfo,
+)
+from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
 
 
 @contextmanager
@@ -64,8 +75,16 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
         modeling.load_state_dict = original_load_state_dict
 
 
+# TODO (lucaslie): continue working on the base class
+class AutoModelFactory(ModelFactory):
+    @property
+    @abstractmethod
+    def automodel_cls(self) -> Type[_BaseAutoModelClass]:
+        """Get the AutoModel class for calling from_pretrained and from_config."""
+
+
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
-class AutoModelForCausalLMFactory(ModelFactory):
+class AutoModelForCausalLMFactory(AutoModelFactory):
     _tokenizer_defaults = {
         "legacy": False,
         "padding_side": "left",
@@ -106,25 +125,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self._checkpoint_conversion_mapping: Optional[Dict[str, str]] = None
 
     @property
-    def autoconfig_from_pretrained(self):
-        return AutoConfig.from_pretrained
+    def automodel_cls(self) -> Type[_BaseAutoModelClass]:
+        return AutoModelForCausalLM
 
-    # TODO (@lucaslie): Do we ever want to switch to from_pretrained?
-    @property
-    def automodel_from_config(self):
-        return AutoModelForCausalLM.from_config
-
-    @staticmethod
-    def _simple_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
-        """A simple forward pass for the model to functionalize the args.
-
-        This follows the standard function signature as expected by factory.py. We do _not_ use the
-        model.forward method directly to create the patch. Instead we use the type of the model to
-        get the forward method to keep the patch composable with other forward patches.
-        """
-        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
-
-    def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
+    def _recursive_update_config(
+        self, config: PretrainedConfig, update_dict: Dict[str, Any]
+    ) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         """
         Deep-merge a PretrainedConfig object with values from update_dict.
 
@@ -133,11 +139,15 @@ class AutoModelForCausalLMFactory(ModelFactory):
             update_dict: Dictionary with values to update in the config
 
         Returns:
-            The updated PretrainedConfig object
+            A tuple of (updated_config, nested_unused_kwargs) where nested_unused_kwargs captures
+            any keys from update_dict that could not be applied to config, preserving nesting.
         """
+        nested_unused_kwargs: Dict[str, Any] = {}
+
         for key, value_new in update_dict.items():
             # Check if the key exists in config
             if not hasattr(config, key):
+                nested_unused_kwargs[key] = value_new
                 continue
 
             target_value = getattr(config, key)
@@ -145,25 +155,42 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # Handle nested PretrainedConfig objects...
             if isinstance(value_new, dict) and isinstance(target_value, PretrainedConfig):
                 # Recursively update nested configs
-                updated_value = self._recursive_update_config(target_value, value_new)
+                updated_value, child_unused = self._recursive_update_config(target_value, value_new)
                 setattr(config, key, updated_value)
+                if child_unused:
+                    nested_unused_kwargs[key] = child_unused
             else:
                 # Direct update for simple values
                 setattr(config, key, value_new)
 
-        return config
+        return config, nested_unused_kwargs
 
-    def _build_model(self, device: DeviceLikeType) -> nn.Module:
-        """Build the model on the desired device."""
-
+    def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
-        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
-        model_config = self._recursive_update_config(model_config, self.model_kwargs)
+        model_config, unused_kwargs = AutoConfig.from_pretrained(
+            self.model, return_unused_kwargs=True, trust_remote_code=True
+        )
+        model_config, nested_unused_kwargs = self._recursive_update_config(
+            model_config, self.model_kwargs
+        )
+        # merge nested unused kwargs into HF's unused kwargs (preserve nesting)
+        merged_unused = deep_merge_dicts(unused_kwargs, nested_unused_kwargs)
+        return model_config, merged_unused
+
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
+        """Build the model on the desired device."""
+        model_config, unused_kwargs = self._get_model_config()
 
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = self.automodel_from_config(model_config, trust_remote_code=True)
+            model = self.automodel_cls.from_config(
+                model_config,
+                **{
+                    "trust_remote_code": True,
+                    **unused_kwargs,
+                },
+            )
         if device == "meta":
             # post-init --> this must be called explicitly for HF models the way we initialize them
             # since this "gets lost" with the init_empty_weights context manager.
@@ -176,10 +203,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
-        # patch forward method
-        model.forward = types.MethodType(self._simple_forward, model)
-
         model.eval()
+
+        if self._quant_config_reader is not None:
+            model = self._quant_config_reader.post_process_model(model, model_config)
 
         return model
 
@@ -221,6 +248,41 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if self.tokenizer is None:
             return None
         return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+
+    def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
+        """Automatically build the model from_pretrained and load the weights.
+
+        Args:
+            device: The device to build the model on.
+
+        Returns:
+            The built model.
+
+        If we skip weight loading, we will fall back to the build_model+load_or_random_init methods.
+        NOTE that there is NO sharding when skip_loading_weights is True.
+        """
+        # only this way can we skip downloading/loading weights
+        if self.skip_loading_weights or "cuda" not in str(device):
+            ad_logger.info("Falling back to build_model+load_or_random_init methods.")
+            model = self.build_model("meta")
+            self.load_or_random_init(model, device)
+            return model
+
+        # full joint loading of weights and model
+        self.prefetch_checkpoint(force=True)  # ensuring weights are downloaded
+        model_config, unused_kwargs = self._get_model_config()
+        model = self.automodel_cls.from_pretrained(
+            self.model,
+            config=model_config,
+            **{
+                "trust_remote_code": True,
+                "tp_plan": "auto",
+                **unused_kwargs,
+                "torch_dtype": "auto",  # takes precedence over unused_kwargs!
+            },
+        )
+        model.eval()
+        return model
 
     @staticmethod
     def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:
@@ -362,13 +424,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config_reader is not None:
             return
-        # TODO: specified by user or auto-detect
-        reader_cls = QuantConfigReaderRegistry.get("modelopt")
-        result = reader_cls.from_file(fetched_dir)
+        result = autodetect_quant_config_reader(fetched_dir)
         if result is None:
             return
         reader, extra_model_kwargs = result
-
         if reader is not None:
             self._quant_config_reader = reader
             self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)
@@ -390,6 +449,9 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
                 if new_key != key:
                     state_dict[new_key] = state_dict.pop(key)
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 class _StateDictParamNameConverter:
@@ -431,10 +493,81 @@ class _StateDictParamNameConverter:
                     state_dict[new_key] = state_dict.pop(key)
 
 
+class TextModelExportInfo(SubModuleExportInfo):
+    """An export configuration for the text model portion of a VLM."""
+
+    def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        """Post-process the subgraph module and make sure the embedding remains available."""
+        # make sure get_input_embeddings function is available in the graph module
+        embed_tokens = sub_mod.get_input_embeddings()
+        sub_gm.get_input_embeddings = types.MethodType(
+            sub_mod.get_input_embeddings.__func__, sub_gm
+        )
+
+        # retrieve+replicate expected submodule hierarchy for where the embedding module is located
+        for embed_name, subsubmod in sub_mod.named_modules():
+            if subsubmod is embed_tokens:
+                break
+        else:
+            raise RuntimeError(
+                "Could not find embedding module in model. Expected embedding module to be a "
+                "submodule of the text submodule."
+            )
+        sub_gm.set_submodule(embed_name, embed_tokens)
+
+        # add a dummy node to the graph for making the embedding module impure --> impure nodes
+        # won't be deleted from the graph during cleanup and this way we ensure that the embedding
+        # module is not deleted from the GraphModule either.
+        # TODO (lucaslie): is there a better way to make the embedding module "sticky"?
+        n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
+        sub_gm.graph.call_function(
+            torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
+        )
+
+    def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
+        batch_size_dynamic = Dim.DYNAMIC
+        seq_len_dynamic = Dim.DYNAMIC
+        return {
+            "input_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            "inputs_embeds": {0: batch_size_dynamic, 1: seq_len_dynamic},
+            "position_ids": {0: batch_size_dynamic, 1: seq_len_dynamic},
+        }
+
+    @classmethod
+    def from_autoinferred(cls, model: nn.Module) -> "TextModelExportInfo":
+        """Create an export configuration from the model by auto-inferring the text submodule.
+
+        model:
+            The full model (AutoModelForImageTextToText)
+
+        Returns:
+            An export configuration for the text submodule with the right submodule key.
+
+        The text submodule is being auto-discovered by looking at the first submodule that contains
+        the ``text_config`` instead of the full config object.
+        """
+        # retrieve expected text_config class
+        text_config_cls = type(model.config.text_config)
+
+        # heuristic to identify the text submodule
+        submodule_key = None
+        for name, submodule in model.named_modules():
+            if isinstance(getattr(submodule, "config", None), text_config_cls):
+                submodule_key = name
+                break
+
+        if submodule_key is None:
+            raise ValueError(
+                "Could not find text submodule in model. Expected text submodule to have a config "
+                f"object of type {text_config_cls}."
+            )
+
+        return cls(submodule_key)
+
+
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     _model_defaults = {
-        "use_cache": False,
         "text_config": {
             "use_cache": False,
         },
@@ -454,8 +587,8 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
-    def automodel_from_config(self):
-        return AutoModelForImageTextToText.from_config
+    def automodel_cls(self) -> Type[_BaseAutoModelClass]:
+        return AutoModelForImageTextToText
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
@@ -470,28 +603,11 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return None
         return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
-    @staticmethod
-    def _simple_forward(
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-    ):
-        """A simple forward pass for the model to functionalize the args.
-
-        This follows the standard function signature as expected by factory.py. We do _not_ use the
-        model.forward method directly to create the patch. Instead we use the type of the model to
-        get the forward method to keep the patch composable with other forward patches.
-        """
-        return type(model).forward(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
-        )
-
-    def get_example_inputs(self) -> Dict[str, torch.Tensor]:
-        """Return a dictionary of example inputs for the model."""
+    # NOTE: for now we only export text_model - hence using the default example_inputs is
+    # sufficient. Leaving the logic below for future reference as a special function called
+    # `get_example_inputs_with_images`. It's also used in unit tests at the moment.
+    def get_example_inputs_with_images(self) -> Dict[str, torch.Tensor]:
+        """Return a dictionary of example inputs for the model with images."""
 
         def _prep_seq(text, img1, img2):
             return [
@@ -521,7 +637,7 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             ),
         ]
 
-        processor = AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        processor = self.init_processor()
         inputs = processor.apply_chat_template(
             batch_messages,
             add_generation_prompt=True,
@@ -542,30 +658,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         #    values still need to be returned by `get_example_inputs`.
         return {**inputs}
 
-    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
-        """Return a dictionary of extra inputs for the model.
-
-        Returns:
-            A dictionary of extra inputs for the model where the key corresponds to the argument
-            name and the value corresponds to a tuple of (example_input, dynamic_shape_callback).
-            The dynamic shape callback is a function that returns the dynamic shape of the extra
-            input. Simply set to `None` if the extra input is not dynamic.
-        """
-
-        def _get_dynamic_shape():
-            return {
-                # TODO (lucaslie): how to set default values for dynamic shapes?
-                0: Dim("img_batch_size", max=10),
-                2: Dim("img_height", min=32, max=2048),
-                3: Dim("img_width", min=32, max=2048),
-            }
-
-        none_pixel_values = torch.zeros(0, 3, 336, 336)
-        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
-
     @property
     def _example_image_dims(self) -> Tuple[int, int]:
         # Some specializations (children) of this class may override this if their models have
         # assumptions on the image dimensions. For example, they may have a lower bound due to
         # the patch size they use.
-        return (16, 16)
+        return (64, 64)
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [TextModelExportInfo.from_autoinferred(model)]

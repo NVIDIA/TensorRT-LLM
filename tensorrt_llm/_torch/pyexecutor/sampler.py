@@ -1,21 +1,23 @@
+import dataclasses
+import enum
+import sys
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from functools import cached_property
-from typing import List, Literal, Optional, TypeAlias
+from itertools import repeat
+from typing import Any, List, Literal, Optional, TypeVar, cast
 
-import numpy as np
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
-from tensorrt_llm._torch.pyexecutor.sampler_utils import (
-    BEAM_0, SINGLE_BEAM_WIDTH, handle_stop_single_beam)
-from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
+from tensorrt_llm._utils import mpi_disabled, nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
-                                            FinishReason, KvCacheConfig)
+                                            FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
     DecoderInputBuffers, add_new_tokens_to_requests, make_decoding_batch_input)
@@ -23,11 +25,20 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
                                                     DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.sampling_params import SamplingParams
 
+from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .resource_manager import ResourceManager, ResourceManagerType
 from .scheduler import ScheduledRequests
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 
 @dataclass(kw_only=True)
@@ -60,12 +71,19 @@ class Sampler(ABC):
         return None
 
     @abstractmethod
-    def sample_async(self, scheduled_requests: ScheduledRequests, model_outputs,
-                     num_context_logits_prefix_sum: list[int]) -> SampleState:
+    def sample_async(
+            self,
+            scheduled_requests: ScheduledRequests,
+            model_outputs,
+            num_context_logits_prefix_sum: list[int],
+            resource_manager: Optional[ResourceManager] = None) -> SampleState:
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, state: SampleState) -> None:
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         raise NotImplementedError
 
     @staticmethod
@@ -78,6 +96,10 @@ class Sampler(ABC):
     def is_generation_model(self) -> bool:
         raise NotImplementedError
 
+    def should_provide_draft_probs(self, request: LlmRequest) -> bool:
+        """Check if sampler wants to receive draft token probabilities."""
+        return True  # conservative default
+
 
 class EarlyStopSampler(Sampler):
     """
@@ -85,12 +107,21 @@ class EarlyStopSampler(Sampler):
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
-    def sample_async(self, scheduled_requests: ScheduledRequests, model_outputs,
-                     num_context_logits_prefix_sum: list[int]) -> SampleState:
+    @override
+    def sample_async(
+            self,
+            scheduled_requests: ScheduledRequests,
+            model_outputs,
+            num_context_logits_prefix_sum: list[int],
+            resource_manager: Optional[ResourceManager] = None) -> SampleState:
         host = SampleStateTensors(new_tokens=torch.empty(0))
         return SampleState(scheduled_requests=scheduled_requests, host=host)
 
-    def update_requests(self, state: SampleState) -> None:
+    @override
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -99,6 +130,7 @@ class EarlyStopSampler(Sampler):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
 
+    @override
     def is_generation_model(self) -> bool:
         return False
 
@@ -123,16 +155,25 @@ class EarlyStopWithMMResult(Sampler):
     Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
     """
 
+    @override
     def sample_async(
-            self, scheduled_requests: ScheduledRequests, model_outputs,
-            num_context_logits_prefix_sum: list[int]
+        self,
+        scheduled_requests: ScheduledRequests,
+        model_outputs,
+        num_context_logits_prefix_sum: list[int],
+        resource_manager: Optional[ResourceManager] = None
     ) -> SampleStateWithMMResult:
         # from model_outputs to MultimodalResult
         data = MultimodalResult(mm_embeddings=model_outputs['mm_embeddings'])
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
                                        data=data)
 
-    def update_requests(self, state: SampleStateWithMMResult) -> None:
+    @override
+    def update_requests(
+            self,
+            state: SampleStateWithMMResult,
+            resource_manager: Optional[ResourceManager] = None) -> None:
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateWithMMResult)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -149,64 +190,111 @@ class EarlyStopWithMMResult(Sampler):
 
             request.py_result.append_mm_embeddings(mm_embedding)
 
+    @override
     def is_generation_model(self) -> bool:
         return False
 
 
-def top_k_sampling_batch(logits,
-                         top_k=50,
-                         generator: Optional[torch.Generator] = None):
+def top_k_sampling_batch(
+    logits,
+    *,
+    top_k: int,
+    temperature: float,
+    generator: Optional[torch.Generator] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # NB: To be replaced by a more efficient implementation.
+    return top_k_top_p_sampling_batch(
+        logits,
+        top_k=top_k,
+        temperature=temperature,
+        generator=generator,
+        top_p=1,
+    )
+
+
+def top_p_sampling_batch(
+    logits: torch.Tensor,
+    *,
+    top_p: float,
+    temperature: float,
+    generator: Optional[torch.Generator] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # NB: To be replaced by a more efficient implementation.
+    return top_k_top_p_sampling_batch(
+        logits,
+        top_p=top_p,
+        top_k=logits.size(1),
+        temperature=temperature,
+        generator=generator,
+    )
+
+
+def temperature_sampling_batch(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    generator: Optional[torch.Generator] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # NB: To be replaced by a more efficient implementation.
+    return top_k_top_p_sampling_batch(
+        logits,
+        top_p=1,
+        top_k=logits.size(1),
+        temperature=temperature,
+        generator=generator,
+    )
+
+
+def top_k_top_p_sampling_batch(
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    top_p: float,
+    temperature: float,
+    generator: Optional[torch.Generator] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     logits_dim = logits.dim()
-    if logits_dim == 1:
-        logits = logits.unsqueeze(0)
-    # logits should be 2D ：[batch_size, vocab_size]
+    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
+    assert temperature > 0, "non-greedy sampling requires valid temperature"
+    logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
 
-    # get first top_k logits of each sample and their indices
-    if top_k > 0:
-        values, indices = torch.topk(logits, top_k, dim=-1)
+    assert top_k > 1, "non-greedy sampling requires valid top_k"
+    need_top_k = top_k < vocab_size
+    assert top_p > 0, "non-greedy sampling requires valid top_p"
+    need_top_p = top_p < 1
+
+    # top-K: mask out logits not belonging to the top-K for each sample
+    if need_top_k:
+        values, _ = torch.topk(logits, top_k, dim=-1)
         min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
         # set the logits who is less than first top_k logits to -inf
         logits = torch.where(logits < min_values,
                              torch.full_like(logits, float('-inf')), logits)
 
-    # compute probability distribution
-    softmax = torch.softmax(logits, dim=-1)
+    # top-p: mask out logits outside the nucleus
+    if need_top_p:
+        sorted_logits, sorted_indices = torch.sort(logits,
+                                                   descending=True,
+                                                   dim=-1)
 
-    # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(softmax, num_samples=1,
-                                    generator=generator).squeeze(-1)
-    return next_tokens, softmax
+        # compute cumulative probability distribution of each sample
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
+                                        dim=-1)
 
+        # get the location of top_p
+        # NB: Currently selecting the smallest index with cumulative_probs > top_p.
+        #     Thus, top_p -> 0 resembles greedy; agreement requires torch.sort(..., stable=True).
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[:,
+                                 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = 0
 
-def top_p_sampling_batch(logits: torch.Tensor,
-                         top_p: float = 0.9,
-                         temperature: float = 1.0,
-                         generator: Optional[torch.Generator] = None):
-    logits_dim = logits.dim()
-    if logits_dim == 1:
-        logits = logits.unsqueeze(0)
-    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
-
-    if temperature != 0:
-        logits = logits / max(temperature, 1e-5)
-
-    # sort the logits of each sample in descending order
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-
-    # compute  cumulative probability distribution of each sample
-    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
-                                    dim=-1)
-    # get the location of top_p
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-    sorted_indices_to_remove[:, 0] = 0
-
-    # set the logits to -inf whose is outside top_p
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        1, sorted_indices, sorted_indices_to_remove)
-    logits = logits.masked_fill(indices_to_remove, float('-inf'))
+        # set the logits to -inf for token indices outside top_p
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, float('-inf'))
 
     # compute probability distribution
     softmax = torch.softmax(logits, dim=-1)
@@ -217,65 +305,44 @@ def top_p_sampling_batch(logits: torch.Tensor,
     return next_tokens, softmax
 
 
-def top_k_top_p_sampling_batch(logits: torch.Tensor,
-                               top_k: int,
-                               top_p: float,
-                               temperature: float = 1.0,
-                               generator: Optional[torch.Generator] = None):
-    logits_dim = logits.dim()
-    if logits_dim == 1:
-        logits = logits.unsqueeze(0)
-    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
-    if temperature != 0:
-        logits = logits / max(temperature, 1e-5)
-    batch_size, vocab_size = logits.size()
-    # get first top_k logits of each sample and their indices
-    if top_k > 0:
-        values, indices = torch.topk(logits, top_k, dim=-1)
-        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
-
-        # set the logits who is less than first top_k logits to -inf
-        logits = torch.where(logits < min_values,
-                             torch.full_like(logits, float('-inf')), logits)
-
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-
-    # compute  cumulative probability distribution of each sample
-    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
-                                    dim=-1)
-
-    # get the location of top_p
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-    sorted_indices_to_remove[:, 0] = 0
-
-    # set the logits to -inf whose is outside top_p
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        1, sorted_indices, sorted_indices_to_remove)
-    logits = logits.masked_fill(indices_to_remove, float('-inf'))
-
-    # compute probability distribution
-    softmax = torch.softmax(logits, dim=-1)
-
-    # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(softmax, num_samples=1,
-                                    generator=generator).squeeze(-1)
-    return next_tokens, softmax
-
-
-def greedy_search_sampling_batch(logits):
+def greedy_search_sampling_batch(
+    logits,
+    *,
+    softmax_indices: Optional[torch.IntTensor] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     next_tokens = torch.argmax(logits, dim=-1)
-    softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+    index_to_scatter = next_tokens
+    if softmax_indices is not None:
+        logits = logits[softmax_indices]
+        index_to_scatter = next_tokens[softmax_indices]
+    probs = torch.zeros_like(logits)
+    probs.scatter_(dim=-1,
+                   index=index_to_scatter.unsqueeze(-1),
+                   src=torch.ones_like(logits))
+    return next_tokens, probs
 
 
 def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
-                         generator: torch.Generator, draft_tokens: list[int]):
-
-    p = draft_probs[torch.arange(len(draft_tokens)), draft_tokens]
-    q = target_probs[:-1]
-    q = q[torch.arange(len(draft_tokens)), draft_tokens]
-    accept_probs = torch.minimum(torch.ones(()), q / p)
+                         generator: torch.Generator,
+                         draft_tokens: list[int]) -> torch.Tensor:
+    # NB: ModelDrafter._pad_to_max_draft_tokens pads draft_tokens, but
+    #     not draft_probs. Relying on shape of draft_probs here.
+    num_draft_tokens = draft_probs.size(0)
+    draft_tokens = draft_tokens[:num_draft_tokens]
+    # NB: torch.arange is needed to enable "advanced indexing",
+    #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
+    token_idx = torch.arange(num_draft_tokens,
+                             dtype=torch.int32,
+                             device=generator.device)
+    draft_tokens_cuda = torch.tensor(draft_tokens,
+                                     dtype=torch.int32,
+                                     pin_memory=True).to(
+                                         device=generator.device,
+                                         non_blocking=True)
+    p = draft_probs[token_idx, draft_tokens_cuda]
+    q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
+    accept_probs = torch.minimum(
+        torch.ones((), device=generator.device, dtype=q.dtype), q / p)
     # Use deterministic random generation for multi-GPU consistency
     rejected_indices = (torch.rand(accept_probs.shape,
                                    generator=generator,
@@ -297,60 +364,160 @@ def sample_rejected(draft_probs: torch.Tensor, target_probs: torch.Tensor,
     return new_token
 
 
-TopK = tuple[Literal["top_k"], int]
+TemperatureOnly = tuple[Literal["temperature"], float]
+TopK = tuple[Literal["top_k"], int, float]
 TopP = tuple[Literal["top_p"], float, float]
 TopKTopP = tuple[Literal["top_k_top_p"], int, float, float]
 Greedy = tuple[Literal["greedy"], None]
 GREEDY: Greedy = ("greedy", None)
-Strategy = TopK | TopP | Greedy
+Strategy = TopK | TopP | Greedy | TopKTopP | TemperatureOnly
+
+T = TypeVar('T')
 
 
-def request_strategy(request: LlmRequest) -> Strategy:
-    if request.sampling_config.top_k is not None and len(
-            request.sampling_config.top_k
-    ) > 0 and request.sampling_config.top_p is not None and len(
-            request.sampling_config.top_p) > 0:
-        return ("top_k_top_p", request.sampling_config.top_k[0],
-                request.sampling_config.top_p[0],
-                request.sampling_config.temperature[0])
-    if request.sampling_config.top_p is not None and len(
-            request.sampling_config.top_p) > 0:
-        return ("top_p", request.sampling_config.top_p[0],
-                request.sampling_config.temperature[0])
-    elif request.sampling_config.top_k is not None and len(
-            request.sampling_config.top_k) > 0:
-        return ("top_k", request.sampling_config.top_k[0])
-    else:
-        return ("greedy", None)
+# Due to tensorrt_llm::runtime::SamplingConfig using vectors, params
+# in LlmRequest.sampling_params are either None or single-element lists.
+# This helper method simplifies code using such params.
+def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
+    if p is None:
+        return None
+    t, = p
+    return t
 
 
-def sampling_strategies(requests: Iterable[LlmRequest]) -> list[Strategy]:
-    return [request_strategy(req) for req in requests]
+@dataclass(frozen=True, kw_only=True)
+class TorchSamplerSamplingParams:
+    """Subset of tensorrt_llm::runtime::SamplingConfig handled by TorchSampler."""
+    temperature: Optional[float]
+    top_p: Optional[float]
+    top_k: Optional[int]
 
 
-def sample(strategy: Strategy,
-           logits: torch.Tensor,
-           generator: Optional[torch.Generator] = None):
+def _request_get_sampling_params(
+        request: LlmRequest) -> TorchSamplerSamplingParams:
+    sampling_config = request.sampling_config
+    temperature = _unwrap_singleton(
+        cast(Optional[List[float]], sampling_config.temperature))
+    top_p = _unwrap_singleton(cast(Optional[List[float]],
+                                   sampling_config.top_p))
+    top_k = _unwrap_singleton(cast(Optional[List[int]], sampling_config.top_k))
+
+    return TorchSamplerSamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
+
+
+def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
+    # The semantics are specified in the doc-string of SamplingParams
+
+    params = _request_get_sampling_params(request)
+    temperature = params.temperature
+    top_p = params.top_p
+    top_k = params.top_k
+
+    if SamplingParams.params_imply_greedy_decoding(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+    ):
+        return GREEDY
+
+    # --- resolving default values
+    # NB: not greedy, hence temperature != 0 if specified
+    temperature = temperature or 1.0
+
+    # NB: not greedy, hence top_p != 0 if specified
+    top_p = top_p or 1.0
+    # NB: not greedy, hence top_k != 1 if specified
+    #     (0 and vocab_size are equivalent)
+    top_k = top_k or vocab_size
+
+    assert top_k > 1, "non-greedy sampling requires valid top_k"
+    need_top_k = top_k < vocab_size
+    assert top_p > 0, "non-greedy sampling requires valid top_p"
+    need_top_p = top_p < 1
+
+    if need_top_p:
+        if need_top_k:
+            return ("top_k_top_p", top_k, top_p, temperature)
+        return ("top_p", top_p, temperature)
+    if need_top_k:
+        return ("top_k", top_k, temperature)
+    return ("temperature", temperature)
+
+
+def _group_requests_by_sampling_strategy(
+        requests: Iterable[LlmRequest],
+        *,
+        pin_memory: bool = False,
+        vocab_size: int) -> dict[Strategy, torch.Tensor]:
+    # NB: Client code relies on request indices in returned torch.Tensor being sorted.
+    strategy_dict: dict[Strategy, list[int]] = defaultdict(list)
+    for req_index, req in enumerate(requests):
+        strategy_dict[_request_strategy(
+            req, vocab_size=vocab_size)].append(req_index)
+    return {
+        strategy: torch.tensor(indices,
+                               pin_memory=pin_memory,
+                               dtype=torch.int32)
+        for strategy, indices in strategy_dict.items()
+    }
+
+
+def sample(
+    strategy: Strategy,
+    logits: torch.Tensor,
+    generator: Optional[torch.Generator] = None,
+    *,
+    softmax_indices: Optional[torch.IntTensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    filter_softmax = True
     match strategy:
-        case ("top_k", top_k):
-            return top_k_sampling_batch(logits, top_k, generator)
+        case ("top_k", top_k, temperature):
+            tokens, softmax = top_k_sampling_batch(logits,
+                                                   top_k=top_k,
+                                                   temperature=temperature,
+                                                   generator=generator)
         case ("top_p", top_p, temperature):
-            return top_p_sampling_batch(logits, top_p, temperature, generator)
+            tokens, softmax = top_p_sampling_batch(
+                logits,
+                top_p=top_p,
+                generator=generator,
+                temperature=temperature,
+            )
         case ("top_k_top_p", top_k, top_p, temperature):
-            return top_k_top_p_sampling_batch(logits, top_k, top_p, temperature,
-                                              generator)
+            tokens, softmax = top_k_top_p_sampling_batch(
+                logits,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                generator=generator,
+            )
+        case ("temperature", temperature):
+            tokens, softmax = temperature_sampling_batch(
+                logits,
+                temperature=temperature,
+                generator=generator,
+            )
         case ("greedy", None):
-            return greedy_search_sampling_batch(logits)
+            tokens, softmax = greedy_search_sampling_batch(
+                logits, softmax_indices=softmax_indices)
+            filter_softmax = False
+    if filter_softmax and softmax_indices is not None:
+        softmax = softmax[softmax_indices.to(softmax.device, non_blocking=True)]
+    return tokens, softmax
 
 
 def add_token(request: LlmRequest,
-              new_tokens: torch.Tensor,
+              new_tokens: list[list[list[int]]],
               *,
               beam: int,
               step: int = 0) -> int:
     seq_slot = request.py_seq_slot
     assert seq_slot is not None
-    new_token = int(new_tokens[step, seq_slot, beam])
+    new_token = new_tokens[step][seq_slot][beam]
     request.add_new_token(new_token, beam)
     return new_token
 
@@ -359,54 +526,336 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
     return torch.empty(shape, dtype=torch.int, device=device)
 
 
-class TorchStore:
-
-    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
-                 max_beam_width: int):
-        self.max_draft_len = max_draft_len
-        self.max_num_sequences = max_num_sequences
-        self.max_beam_width = max_beam_width
-        self.max_tokens = max_draft_len + 1
-        assert max_beam_width == SINGLE_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
-        self.new_tokens = int_tensor(
-            (self.max_tokens, max_num_sequences, max_beam_width))
-        """Shape: See cpp DecoderState.getAllNewTokens()"""
-        self.finish_reasons = int_tensor(self.new_tokens.shape)
-
-        # Helper tensors for finish_reasons:
-        self._finish_reasons_nonzero_static_buffer = torch.empty(
-            (self.max_tokens * max_num_sequences, 2),
-            device='cuda',
-            dtype=torch.int64)
-        """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer), see `def _write_reason`"""
-        self._reason_tensors = {
-            reason:
-            torch.tensor(reason.value,
-                         dtype=self.finish_reasons.dtype,
-                         device="cuda")
-            for reason in [
-                FinishReason.NOT_FINISHED, FinishReason.END_ID,
-                FinishReason.STOP_WORDS, FinishReason.LENGTH,
-                FinishReason.TIMED_OUT, FinishReason.CANCELLED
-            ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
-        }
+@dataclass(kw_only=True, frozen=True)
+class _BatchedSamplingResult:
+    # Original request indices for all requests (permuted due to batching by strategy):
+    batch_req_indices: torch.Tensor
+    # Next tokens for all requests:
+    batch_next_tokens_cuda_int: torch.Tensor
+    # Probs for all requests which need them:
+    batch_softmax_cuda: torch.Tensor
+    # (request, batch_softmax indices), for requests having py_draft_logits / requesting py_target_probs:
+    py_draft_logits_indices: list[tuple[LlmRequest,
+                                        torch.Tensor]] = dataclasses.field(
+                                            default_factory=list)
 
 
-@dataclass(kw_only=True)
-class SampleStateTensorsHostTorch(SampleStateTensors):
-    finish_reasons: torch.Tensor
+# Inspired by https://github.com/pytorch/pytorch/issues/80577; note also the
+# suggestion to consider torch.nested.
+def torch_multi_arange(ends: torch.Tensor,
+                       *,
+                       starts: Optional[torch.Tensor] = None,
+                       steps: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Efficiently compute torch.cat([torch.arange(b, e, d) for b, e, d in zip(starts, ends, steps)]).
+
+    Starts, ends, steps need to share dtype and shape. Invalid ranges like range(1, 2, -1) are
+    silently discarded. 'steps' defaults to 1 and 'starts' defaults to 0.
+    """
+    if steps is not None:
+        assert ends.dtype == steps.dtype
+        assert ends.shape == steps.shape
+    if starts is not None:
+        assert ends.dtype == starts.dtype
+        assert ends.shape == starts.shape
+
+    # This algorithm combines torch.repeat_interleaved() and torch.cumsum() to
+    # construct the result.
+    #
+    # 1. Given N ranges (characterized by starts, ends, steps), construct a sequence
+    #    of 2N numbers, in which the non-overlapping pairs of consecutive numbers
+    #    correspond to the ranges. For a given range, the pair (a, b) is chosen such
+    #    that upon torch.cumsum() application 'a' turns the last element of the
+    #    preceding range into the start element for the current range and 'b' is
+    #    simply the step size for the current range.
+    #
+    repeats = ends  # number of elements in each range
+    if starts is not None:
+        repeats = repeats.clone()
+        repeats -= starts
+    if steps is not None:
+        repeats = repeats.div(steps, rounding_mode="trunc")
+    repeats = repeats.clip(0)  # ignore invalid ranges
+    range_ends = repeats - 1  # last element in each range
+    if steps is not None:
+        range_ends *= steps
+    if starts is not None:
+        range_ends += starts
+    prev_range_ends = range_ends.roll(
+        1)  # last element in preceding range (or 0)
+    prev_range_ends[0] = 0
+    ones = torch.tensor(1, dtype=ends.dtype, pin_memory=True).to(
+        device=ends.device, non_blocking=True).broadcast_to(ends.shape)
+    if steps is None:
+        steps = ones
+    jumps = -prev_range_ends  # delta from one range to the next
+    if starts is not None:
+        jumps += starts
+    seq = torch.cat((jumps.unsqueeze(-1), steps.unsqueeze(-1)), dim=1).view(-1)
+    #
+    # 2. Construct output via torch.repeat_interleave() and torch.cumsum()
+    seq_repeats = torch.cat((ones.unsqueeze(-1), (repeats - 1).unsqueeze(-1)),
+                            dim=1).view(-1)
+    seq = seq.repeat_interleave(seq_repeats)
+    seq = seq.cumsum(0)
+    return seq
 
 
-@dataclass(kw_only=True)
-class SampleStateTorch(SampleState):
-    host: SampleStateTensorsHostTorch
+# Helper class for _PackedStepIndexer and _UnpackedStepIndexer, facilitating the
+# selection of memory locations of tokens associated with given sets of requests.
+class _StepIndexTranslator(ABC):
+
+    def __init__(
+        self,
+        *,
+        num_steps: torch.Tensor,
+        req_offsets: Optional[torch.Tensor] = None,
+        max_steps: Optional[int] = None,
+        index_dtype: Optional[torch.dtype] = None,
+    ):
+        """Build the index.
+
+        Arguments:
+            index_dtype: torch.dtype to use for indices (defaults to torch.int32).
+            num_steps (index_dtype): Number of steps/tokens for each request
+            req_offsets (index_dtype): Index offset at which the data for each request starts.
+                                       If not provided, it is computed using calculate_request_offsets(),
+                                       which assumes dense packing.
+            max_steps (int): The largest value allowed to occur in num_steps.
+                             If not provided, it is computed from num_steps.
+        """
+        if req_offsets is None:
+            req_offsets, _ = self.calculate_request_offsets(num_steps)
+        if max_steps is None:
+            max_steps = cast(int, num_steps.max().item())
+        self._index_map, self._index_mask = self._build_index(
+            req_offsets=req_offsets,
+            num_steps=num_steps,
+            max_steps=max_steps,
+            index_dtype=(index_dtype or torch.int32),
+        )
+
+    @staticmethod
+    def calculate_request_offsets(
+            req_num_steps: torch.Tensor,
+            pin_memory: bool = False) -> tuple[torch.Tensor, int]:
+        if req_num_steps.numel():
+            req_offsets = torch.cumsum(req_num_steps, 0)
+            sum_steps = int(req_offsets[-1].item())
+            req_offsets_rolled = torch.empty_like(req_offsets,
+                                                  pin_memory=pin_memory)
+            req_offsets_rolled[1:] = req_offsets[:-1]
+            req_offsets_rolled[0] = 0
+            req_offsets = req_offsets_rolled
+        else:
+            req_offsets = torch.empty_like(req_num_steps, pin_memory=pin_memory)
+            sum_steps = 0
+        return req_offsets, sum_steps
+
+    def _build_index(
+            self, req_offsets: torch.Tensor, num_steps: torch.Tensor,
+            max_steps: int,
+            index_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        steps_dim = torch.arange(max_steps,
+                                 device=num_steps.device,
+                                 dtype=index_dtype)
+        valid_mask = steps_dim.unsqueeze(0) < num_steps.unsqueeze(-1)
+        indices = self._compute_index_map(index_dtype=index_dtype,
+                                          steps_dim=steps_dim,
+                                          req_offsets=req_offsets)
+        # NB: steps_dim and req_offsets may have been overwritten by this point.
+        return indices, valid_mask
+
+    @abstractmethod
+    def _compute_index_map(self, index_dtype: torch.dtype,
+                           steps_dim: torch.Tensor,
+                           req_offsets: torch.Tensor) -> torch.Tensor:
+        """Compute full tensor index map.
+
+        Should return a tensor of shape (len(num_steps), max_steps) containing the linear
+        token index (index_dtype) corresponding to a given request and decoding step.
+        Each row corresponds to a request (same ordering as 'req_offsets' and 'num_steps'),
+        and the columns correspond to decoding steps 0, ..., num_steps[i]. Entries corresponding
+        to decoding steps which are invalid for the given request are masked elsewhere within
+        _StepIndexTranslator.
+
+        This method is allowed to repurpose/overwrite 'steps_dim' and 'req_offsets'.
+
+        Arguments:
+            num_steps (index_dtype): Number of steps/tokens for each request
+            req_offsets (index_dtype): Index offset at which the data for each request starts.
+            steps_dim (index_dtype): arange(max_steps)
+            index_dtype: torch.dtype to use for indices
+        """
+
+    def __getitem__(self, req_indices: Any) -> torch.Tensor:
+        """Gather indices for a given set of requests.
+
+        Arguments:
+            req_indices: Any 1d torch-compatible indexing expression to select requests, corresponds
+                         to the linear indices of the entries in 'num_steps' and 'req_offsets' (cf. __init__).
+        Returns:
+            Array of linear indices (index_dtype) selecting the tokens/steps associated
+            with the requests identified by req_indices, in the same order as
+            req_indices.
+        """
+        indices = self._index_map[req_indices].view(-1)
+        mask = self._index_mask[req_indices].view(-1)
+        # NB: Return value has dynamic shape (depends on mask nnz), which
+        #     implies stream sync if CUDA is used.
+        return indices[mask]
+
+
+# Helper class for _PackedStepIndexer and _UnpackedStepIndexer, facilitating the
+# selection of memory locations of tokens associated with given sets of requests,
+# for memory layouts that can be parametrized via request offsets and step stride.
+class _StridedStepIndexTranslator(_StepIndexTranslator):
+
+    def __init__(
+        self,
+        *,
+        num_steps: torch.Tensor,
+        req_offsets: Optional[torch.Tensor] = None,
+        max_steps: Optional[int] = None,
+        index_dtype: Optional[torch.dtype] = None,
+        step_stride: Optional[int] = None,
+    ):
+        """Build the index.
+
+        Allows to specify a custom stride for steps dimension.
+
+        Arguments:
+            index_dtype: torch.dtype to use for indices (defaults to torch.int32).
+            num_steps (index_dtype): Number of steps/tokens for each request
+            req_offsets (index_dtype): Index offset at which the data for each request starts.
+                                       If not provided, it is computed using calculate_request_offsets(),
+                                       assuming dense packing of tokens (grouped by request). Overriding
+                                       this also allows for "request major" indexing into rectangular
+                                       tensors.
+            max_steps (int): The largest value allowed to occur in num_steps.
+                             If not provided, it is computed from 'num_steps'.
+            step_stride: Additional stride to multiply 'steps_dim' with (defaults to 1). Allows,
+                         e.g., "step major" indexing into rectangular tensors.
+        """
+        self._step_stride = step_stride
+        super().__init__(num_steps=num_steps,
+                         req_offsets=req_offsets,
+                         max_steps=max_steps,
+                         index_dtype=index_dtype)
+
+    @override
+    def _compute_index_map(self, index_dtype: torch.dtype,
+                           steps_dim: torch.Tensor,
+                           req_offsets: torch.Tensor) -> torch.Tensor:
+        if self._step_stride is not None:
+            steps_dim *= self._step_stride  # in-place OK
+        return req_offsets.unsqueeze(-1) + steps_dim.unsqueeze(0)
+
+
+# In sample_async(), each request contains a different number of output positions
+# (a.k.a. 'steps') and 'logits_cuda' (and other tensors derived from it) packs those
+# tokens into a single contiguous array, with the 'step' axis being the rapidly
+# changing one.
+#
+# The class below builds an index to simplify selecting the linear indices of the
+# tokens associated with a given set of requests.
+#
+# NB: Consider switching to torch.nested (cf. https://github.com/pytorch/pytorch/issues/80577)
+class _PackedStepIndexer(_StridedStepIndexTranslator):
+
+    def __init__(
+        self,
+        *,
+        num_steps: torch.Tensor,
+        req_offsets: Optional[torch.Tensor] = None,
+        max_steps: Optional[int] = None,
+        index_dtype: Optional[torch.dtype] = None,
+    ):
+        """Build the index.
+
+        Arguments:
+            index_dtype: torch.dtype to use for indices (defaults to torch.int32).
+            num_steps (index_dtype): Number of steps/tokens for each request
+            req_offsets (index_dtype): Index offset at which the data for each request starts.
+                                       If not provided, it is computed using calculate_request_offsets().
+            max_steps (int): The largest value allowed to occur in num_steps.
+                             If not provided, it is computed from 'num_steps'.
+        """
+        super().__init__(num_steps=num_steps,
+                         req_offsets=req_offsets,
+                         max_steps=max_steps,
+                         index_dtype=index_dtype)
+
+
+# After gathering results with _PackedStepIndexer in TorchSampler._sample_batched_by_strategy,
+# they need to be scattered into result buffers in TorchSampler._unbatch_sampling_results.
+# This helper class provides the translation from linear packed request + step/token indices
+# to unpacked / rectangular-tensor (but still linearized) request + step/token indices.
+#
+# NB: Consider switching to torch.nested (cf. https://github.com/pytorch/pytorch/issues/80577)
+class _UnpackedStepIndexer(_StridedStepIndexTranslator):
+
+    class DimOrder(enum.Enum):
+        SLOT_MAJOR = enum.auto()
+        STEP_MAJOR = enum.auto()
+
+    def __init__(
+        self,
+        *,
+        seq_slots: torch.Tensor,
+        num_steps: torch.Tensor,
+        dim_order: DimOrder = DimOrder.SLOT_MAJOR,
+        steps_dim_size: int,
+        slots_dim_size: Optional[int] = None,
+        index_dtype: Optional[torch.dtype] = None,
+    ):
+        """Build the index.
+
+        Arguments:
+            index_dtype: torch.dtype to use for indices (defaults to torch.int32).
+            seq_slots (index_dtype): Request indices in unpacked tensor, enumerated in packed tensor
+                                     request order.
+            num_steps (index_dtype): Number of steps/tokens for each request
+            dim_order: Memory layout of indexed tensor.
+            steps_dim_size (int): The extent of the step dimension in the unpacked tensor.
+            slots_dim_size (int): The extent of the slot dimension in the unpacked tensor.
+                                  Required if dim_order is DimOrder.STEP_MAJOR.
+        """
+        if dim_order is self.DimOrder.SLOT_MAJOR:
+            super().__init__(
+                num_steps=num_steps,
+                req_offsets=(steps_dim_size * seq_slots),
+                max_steps=steps_dim_size,
+                index_dtype=index_dtype,
+            )
+        elif dim_order is self.DimOrder.STEP_MAJOR:
+            if slots_dim_size is None:
+                raise ValueError("slots_dim_size required for step-major order")
+            super().__init__(
+                num_steps=num_steps,
+                req_offsets=seq_slots,  # no need for stride here
+                max_steps=steps_dim_size,
+                index_dtype=index_dtype,
+                step_stride=slots_dim_size,
+            )
+        else:
+            raise ValueError(f"Invalid dim_order: {dim_order}")
 
 
 class TorchSampler(Sampler):
-    SampleState = SampleStateTorch
+    BEAM = 0
+    MAX_BEAM_WIDTH = BEAM + 1
 
+    @override
     def is_generation_model(self) -> bool:
         return True
+
+    @dataclass(frozen=True, kw_only=True)
+    class Store:
+        new_tokens: torch.Tensor
+        """Shape: See cpp DecoderState.getAllNewTokens()"""
+
+    def create_store(self) -> Store:
+        return self.Store(new_tokens=int_tensor(self.NEW_TOKENS_SHAPE))
 
     @dataclass(frozen=True, kw_only=True)
     class Args:
@@ -414,21 +863,21 @@ class TorchSampler(Sampler):
         max_draft_len: int
         max_num_sequences: int
         max_beam_width: int
-        enable_mixed_sampler: bool
+        max_total_draft_tokens: int
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
-        self.enable_mixed_sampler = args.enable_mixed_sampler
+        self.max_tokens = args.max_draft_len + 1
+        assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
+        self.max_num_sequences = args.max_num_sequences
 
+        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences,
+                                 self.MAX_BEAM_WIDTH)
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
-            self.store = TorchStore(max_draft_len=args.max_draft_len,
-                                    max_num_sequences=args.max_num_sequences,
-                                    max_beam_width=args.max_beam_width)
-        self.max_num_sequences = args.max_num_sequences
-        self.max_tokens = self.store.max_tokens
+            self.store = self.create_store()
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
@@ -447,42 +896,85 @@ class TorchSampler(Sampler):
             # Fallback to a default seed if not set
             self._generator = torch.Generator(device=device)
             self._generator.manual_seed(self._global_seed)
+        assert self._generator.device == device
         return self._generator
 
-    def handle_logprobs(self, request: LlmRequest, state: SampleStateTorch, *,
+    def get_spec_tree_manager(
+            self,
+            resource_manager: ResourceManager) -> Optional[SpecTreeManager]:
+        if resource_manager is None:
+            return None
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is None or not hasattr(spec_resource_manager,
+                                                        "spec_tree_manager"):
+            return None
+        return spec_resource_manager.spec_tree_manager
+
+    def _meet_max_token_stop_criteria(self, request: LlmRequest):
+        num_tokens = request.get_num_tokens(self.BEAM)
+        return (num_tokens - request.py_orig_prompt_len
+                >= request.py_max_new_tokens) or (num_tokens
+                                                  >= self.max_seq_len)
+
+    @staticmethod
+    def _meet_stop_token_criteria(request: LlmRequest):
+        if request.py_stop_words_list:
+            assert isinstance(
+                request.py_stop_words_list,
+                list), "request.py_stop_words_list should be a list"
+            stop_words_list, prefix_sum = request.py_stop_words_list
+            tokens = request.get_tokens(0)
+            offset = 0
+            for i, offset_end in enumerate(prefix_sum):
+                if i > 0:
+                    offset = prefix_sum[i - 1]
+                stop_word = stop_words_list[offset:offset_end]
+                if len(stop_word) > len(tokens):
+                    continue
+                if tokens[-len(stop_word):] == stop_word:
+                    return True
+        return False
+
+    def _handle_stop_criteria(self, request: LlmRequest,
+                              new_token: int) -> bool:
+        """Handle stop criteria and set appropriate finish reasons and state.
+        Returns True if generation should stop."""
+        if new_token == request.py_end_id:
+            request.finish_by(FinishReason.END_ID, self.BEAM)
+            return True
+
+        if self._meet_max_token_stop_criteria(request):
+            request.finish_by(FinishReason.LENGTH, self.BEAM)
+            return True
+
+        if self._meet_stop_token_criteria(request):
+            request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
+            return True
+
+        return False
+
+    def handle_logprobs(self, request: LlmRequest, state: SampleState, *,
                         beam: int, count: int):
         current_slice = slice(0, count), request.py_seq_slot, beam
         if request.py_return_log_probs:
-            assert state.host.log_probs is not None
-            log_probs = state.host.log_probs[request.py_seq_slot][beam][:count]
-            current_tokens = state.host.new_tokens[current_slice]
+            topk_log_probs_vals = request.py_topk_logprobs_vals[:count]
+            topk_log_probs_indices = request.py_topk_logprobs_indices[:count]
 
             token_log_probs = [{
-                int(token): Logprob(logprob=logprob, rank=1)
-            } for token, logprob in zip(current_tokens, log_probs.tolist())]
+                token: Logprob(logprob=logprob, rank=rank + 1)
+                for rank, (token, logprob) in enumerate(
+                    zip(topk_token.tolist(), topk_logprob.tolist()))
+            }
+                               for topk_token, topk_logprob in zip(
+                                   topk_log_probs_indices, topk_log_probs_vals)]
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
-    FinishReasons: TypeAlias = list[list[int]]
-    """`(num_seq_slots, num_steps)`"""
-
-    @classmethod
-    def finish_if_reason(cls, request: LlmRequest,
-                         finish_reasons: FinishReasons, *, step: int) -> bool:
-        reason = FinishReason(finish_reasons[request.py_seq_slot][step])
-        valid_reasons = {
-            FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS
-        }
-        if reason in valid_reasons:
-            request.finish_by(reason, BEAM_0)
-            return True
-        return False
-
-    def _process_draft_tokens_greedy(self, request: LlmRequest, *,
-                                     new_tokens: torch.Tensor,
-                                     finish_reasons: FinishReasons) -> int:
-        new_token = add_token(request, new_tokens, beam=BEAM_0)
-        stop = self.finish_if_reason(request, finish_reasons, step=0)
+    def _process_draft_tokens_greedy(self, request: LlmRequest,
+                                     new_tokens: torch.Tensor) -> int:
+        new_token = add_token(request, new_tokens, beam=self.BEAM)
+        stop = self._handle_stop_criteria(request, new_token)
         if stop or get_draft_token_length(request) == 0:
             return 0
         num_accepted = 0
@@ -495,27 +987,189 @@ class TorchSampler(Sampler):
             num_accepted += 1
             new_token = add_token(request,
                                   new_tokens,
-                                  beam=BEAM_0,
+                                  beam=self.BEAM,
                                   step=num_accepted)
-            if self.finish_if_reason(request, finish_reasons,
-                                     step=num_accepted):
+            if self._handle_stop_criteria(request, new_token):
                 break
         return num_accepted
 
+    def _process_draft_tokens_tree(self, request: LlmRequest,
+                                   new_tokens: torch.Tensor,
+                                   spec_tree_manager: SpecTreeManager) -> int:
+        """Tree verification for draft token tree based speculative decoding. This function will only be called for the target model.
+        Verification logic:
+            Find the longest prefix match. Since each node in the tree has a related path,
+            we can find the longest match by comparing all the paths.
+        Args:
+            request: LlmRequest. The request with draft tokens.
+            new_tokens: torch.Tensor. [max_draft_len + 1, max_num_sequences, MAX_BEAM_WIDTH], host buffer. The tokens generated by the target model
+                        The relationship between [max_draft_len + 1] and the draft token tree:
+                        If the current node is accepted, what is the NEXT token_id that the target model will generate?
+                        For example, new_tokens[0, req_idx, 1] indicates the NEXT token_id sampled from the root node in the draft token tree if it is accepted.
+                        We know that the root node in the draft token tree is always accepted. Therefore, new_tokens[0, req_idx, 1] indicates the token_id following the root node,
+                        corresponding to the first layer in the draft token tree (the root node is the 0th layer).
+                        Similarly, new_tokens[1, req_idx, 1] represents the NEXT token_id if the first token in the first layer of the draft tokens tree is accepted.
+            spec_tree_manager: SpecTreeManager. which contains the tree structure and other meta information of the tree.
+        """
+        # handle the drafter model request
+        # For the drafter model, we do not execute the tree verification logic,
+        # but only add the draft tokens of the previous layer.
+        if get_draft_token_length(request) == 0:
+            cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
+
+            # TODO: For the last layer of the dynamic tree, we need to resampling all the draft tokens.
+            cur_layer_num_nodes = sum(
+                spec_tree_manager.get_top_k_list(cur_draft_layer_idx))
+            for i in range(cur_layer_num_nodes):
+                new_token = add_token(request, new_tokens, beam=0, step=i)
+            return 0
+        else:
+            # handle the target model request
+            # For the target model, we will do the tree verification logic.
+            seq_slot = request.py_seq_slot
+            assert seq_slot is not None
+            eagle_paths = spec_tree_manager.get_eagle_paths(seq_slot)
+
+            all_draft_tokens = request.py_draft_tokens  # [max_total_draft_tokens]
+            all_target_tokens = new_tokens[:, seq_slot, :].squeeze(
+                -1)  # [max_total_draft_tokens]
+            assert all_target_tokens.shape[
+                0] == spec_tree_manager.max_total_draft_tokens + 1
+
+            longest_accepted_len = 0
+            longest_match_path_idx = -1
+
+            for path_idx, path in enumerate(eagle_paths):
+                path_exclude_root = path[
+                    1:] - 1  # [max_draft_len], '[1:]' since the new_tokens does not contain the root node.
+                # '-1' is the index shift after exclude the root node.
+                draft_tokens_indices = path_exclude_root[path_exclude_root >=
+                                                         0]  # [max_draft_len]
+                target_tokens_indices = path[path >= 0]  # [max_draft_len + 1]
+
+                assert len(
+                    draft_tokens_indices) == len(target_tokens_indices) - 1
+
+                cur_draft_tokens = all_draft_tokens[draft_tokens_indices]
+                cur_target_tokens = all_target_tokens[target_tokens_indices]
+
+                cur_accepted_len = torch.cumprod(
+                    (cur_draft_tokens == cur_target_tokens[:-1]).int(),
+                    dim=-1).sum()
+
+                # Accepted one more token from the target model.
+                cur_accepted_len += 1
+
+                if cur_accepted_len > longest_accepted_len:
+                    longest_accepted_len = cur_accepted_len
+                    longest_match_path_idx = path_idx
+
+            if longest_accepted_len == 0:
+                # No draft tokens are accepted.
+                # Take the top-1 token of the first layer as the next new token.
+                new_token = add_token(request, new_tokens, beam=0, step=0)
+                return 0
+            else:
+                # Take the longest accepted path as the next new token.
+                num_accepted_draft_tokens = 0
+                for idx in eagle_paths[
+                        longest_match_path_idx][:longest_accepted_len]:
+                    new_token = add_token(request, new_tokens, beam=0, step=idx)
+                    num_accepted_draft_tokens += 1
+                    if self._handle_stop_criteria(request, new_token):
+                        break
+
+                return num_accepted_draft_tokens - 1
+
+    def _tree_sampling_batch(self, requests: list[LlmRequest],
+                             max_num_sequences: int, seq_slots: torch.Tensor,
+                             model_outputs: dict[str, torch.Tensor],
+                             spec_tree_manager: SpecTreeManager):
+
+        if spec_tree_manager.use_dynamic_tree and draft_layer_id == spec_tree_manager.max_draft_len - 1:
+            # TODO: Re-sample the draft tokens for the last layer.
+            raise NotImplementedError(
+                "Dynamic tree is not fully supported yet.")
+
+        raw_logits = model_outputs["logits"]
+        num_requests = len(requests)
+        assert raw_logits.shape[0] % num_requests == 0
+        num_logits_per_request = raw_logits.shape[0] // num_requests
+        request_index = torch.arange(num_requests)
+
+        draft_layer_id = spec_tree_manager.cur_draft_layer_idx
+        # 1) Get the topK list for the specific draft layer.
+        top_k_list = spec_tree_manager.get_top_k_list(draft_layer_id)
+        assert len(top_k_list) == num_logits_per_request
+
+        # Considering that the beam_width of spec-dec can only be 1, we ignore this dimension here.
+        new_draft_tokens_cuda = torch.empty(
+            (max_num_sequences, spec_tree_manager.max_total_draft_tokens + 1),
+            dtype=torch.int64,
+            device=raw_logits.device)
+
+        top_k_list_cumsum = torch.cumsum(top_k_list, dim=0)
+        # Different nodes have different topK value.
+        for i, top_k_list_i in enumerate(top_k_list):
+            # 2) Extract the logits needed for this layer.
+            logits = raw_logits[request_index * num_logits_per_request + i, :]
+            assert logits.shape[0] == len(requests)
+            # 3) Sample the logits according to the topK value.
+            indices = torch.topk(logits, k=top_k_list_i, dim=-1).indices
+            # 4) Write to the temporary output tensor.
+            new_draft_tokens_cuda[
+                seq_slots, top_k_list_cumsum[i] -
+                top_k_list_i:top_k_list_cumsum[i]] = indices[request_index]
+
+        # 5) Append eagle3 d2t.
+        self._apply_d2t(new_draft_tokens_cuda, model_outputs)
+
+        # 6) Copy back to the output tensor.
+        int_new_draft_tokens = new_draft_tokens_cuda.transpose(0, 1).to(
+            torch.int, non_blocking=True).unsqueeze(dim=-1)
+
+        new_draft_tokens_host = int_new_draft_tokens.to("cpu",
+                                                        non_blocking=True)
+
+        return new_draft_tokens_host
+
+    @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
-            self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
-        """We cannot use finish_if_reason in _process_draft_tokens_rejection_sampling because it *writes to new_tokens*,
-        rendering the finish reason calculation in sample_async stale (incorrect) for this batch"""
-        sampling_strategy = request_strategy(request)
+            self, request: LlmRequest, new_tokens: list[list[list[int]]],
+            new_tokens_tensor: torch.Tensor) -> int:
+        # FIXME: Passing a dummy vocab_size could result in unnecessary
+        #        filtering of vocab_size logits, out of vocab_size in
+        #        total. The 'sample' below should generally be avoided
+        #        by retaining the draft_probs during drafting (TRTLLM-7772).
+        draft_sampling_strategy = (
+            "greedy", None
+        ) if request.py_draft_use_greedy_sampling else _request_strategy(
+            request, vocab_size=2**31)
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(sampling_strategy,
-                                request.py_draft_logits[0],
+        _, draft_probs = sample(draft_sampling_strategy,
+                                request.py_draft_logits,
                                 generator=generator)
         target_probs = request.py_target_probs
+        d2t = getattr(request, "d2t", None)
+        if d2t is not None:
+            vocab_d = draft_probs.shape[-1]
+            vocab_t = target_probs.shape[-1]
+            assert d2t.numel(
+            ) == vocab_d, f"d2t size mismatch: {d2t.numel()} != {vocab_d}"
+            assert d2t.device == draft_probs.device, f"d2t device mismatch: {d2t.device} != {draft_probs.device}"
+            aligned_draft_probs = torch.zeros(
+                (*draft_probs.shape[:-1], vocab_t),
+                device=draft_probs.device,
+                dtype=draft_probs.dtype)
+            source_indices = torch.arange(vocab_d, device=draft_probs.device)
+            target_indices = (source_indices + d2t) % vocab_t
+            aligned_draft_probs[..., target_indices] = draft_probs
+            draft_probs = aligned_draft_probs
         rejected_indices = get_rejected_indices(draft_probs, target_probs,
                                                 generator,
                                                 request.py_draft_tokens)
         sample_last = True
+        stop = False
         if rejected_indices.numel() == 0:
             num_initially_accepted = get_draft_token_length(request)
             sample_last = False
@@ -524,451 +1178,635 @@ class TorchSampler(Sampler):
         num_accepted = num_initially_accepted
         for i in range(num_accepted):
             new_token = request.py_draft_tokens[i]
-            new_tokens[i, request.seq_slot, BEAM_0] = new_token
-            request.add_new_token(new_token, BEAM_0)
-            if handle_stop_single_beam(request,
-                                       new_token,
-                                       max_seq_len=self.max_seq_len):
+            new_tokens_tensor[i, request.seq_slot, self.BEAM] = new_token
+            request.add_new_token(new_token, self.BEAM)
+            stop = self._handle_stop_criteria(request, new_token)
+            if stop:
                 num_accepted = i + 1
                 return num_accepted
         if sample_last:
             new_token = sample_rejected(draft_probs, target_probs, generator,
                                         num_accepted)
-            new_tokens[num_accepted, request.seq_slot, BEAM_0] = new_token
-            request.add_new_token(new_token, BEAM_0)
-            handle_stop_single_beam(request,
-                                    new_token,
-                                    max_seq_len=self.max_seq_len)
+            new_tokens_tensor[num_accepted, request.seq_slot,
+                              self.BEAM] = new_token
+            request.add_new_token(new_token, self.BEAM)
         else:
             new_token = add_token(request,
                                   new_tokens,
-                                  beam=BEAM_0,
+                                  beam=self.BEAM,
                                   step=num_accepted)
-            handle_stop_single_beam(request,
-                                    new_token,
-                                    max_seq_len=self.max_seq_len)
+        stop = self._handle_stop_criteria(request, new_token)
 
         return num_accepted
 
-    def update_requests(self, state: SampleStateTorch) -> None:
-        assert isinstance(state, SampleStateTorch)
+    def process_draft_tokens(
+            self,
+            request: LlmRequest,
+            new_tokens: list[list[list[int]]],
+            new_tokens_tensor: torch.Tensor,
+            resource_manager: Optional[ResourceManager] = None) -> int:
+        if _request_strategy(request, vocab_size=2**
+                             31) == GREEDY or request.py_draft_logits is None:
+            spec_tree_manager = self.get_spec_tree_manager(resource_manager)
+            if spec_tree_manager is not None:
+                num_accepted = self._process_draft_tokens_tree(
+                    request,
+                    new_tokens=new_tokens,
+                    spec_tree_manager=spec_tree_manager)
+            else:
+                num_accepted = self._process_draft_tokens_greedy(
+                    request, new_tokens=new_tokens)
+            return num_accepted
+        else:
+            return self._process_draft_tokens_rejection_sampling(
+                request, new_tokens, new_tokens_tensor)
+
+    @override
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
+        assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens
-        finish_reasons = state.host.finish_reasons[:, :, BEAM_0].T.tolist()
+
+        new_tokens = state.host.new_tokens.tolist()
 
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-            add_token(req, new_tokens, beam=BEAM_0)
-            self.finish_if_reason(req, finish_reasons, step=0)
-            self.handle_logprobs(req, state, beam=BEAM_0, count=1)
+            new_token = add_token(req, new_tokens, beam=self.BEAM)
+            self._handle_stop_criteria(req, new_token)
+            self.handle_logprobs(req, state, beam=self.BEAM, count=1)
             req.py_decoding_iter += 1
 
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             processed = 1
-            if req.py_draft_logits is None:
-                num_accepted = self._process_draft_tokens_greedy(
-                    req, new_tokens=new_tokens, finish_reasons=finish_reasons)
-            else:
-                num_accepted = self._process_draft_tokens_rejection_sampling(
-                    req, new_tokens)
+            num_accepted = self.process_draft_tokens(req, new_tokens,
+                                                     state.host.new_tokens,
+                                                     resource_manager)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
+            else:
+                req.py_num_accepted_draft_tokens = 0
+                req.py_rewind_len = 0
             processed += num_accepted
-            self.handle_logprobs(req, state, beam=BEAM_0, count=processed)
+            self.handle_logprobs(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
 
-    def log_probs_host(self, scheduled_requests: ScheduledRequests):
+    def log_probs_host(
+            self,
+            scheduled_requests: ScheduledRequests) -> Optional[torch.Tensor]:
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
-        if any(req.py_return_log_probs
-               for req in scheduled_requests.all_requests()):
-            return torch.empty(
-                (self.max_num_sequences, SINGLE_BEAM_WIDTH, self.max_tokens),
-                device="cpu",
-                pin_memory=True)
-        return None
+        return any(req.py_return_log_probs
+                   for req in scheduled_requests.all_requests())
 
+    @override
+    @torch.inference_mode()
     def sample_async(
-            self, scheduled_requests: ScheduledRequests,
+            self,
+            scheduled_requests: ScheduledRequests,
             model_outputs: dict[str, torch.Tensor],
-            num_context_logits_prefix_sum: list[int]) -> SampleStateTorch:
+            num_context_logits_prefix_sum: list[int],
+            resource_manager: Optional[ResourceManager] = None) -> SampleState:
+        # NB: The sampler is either called directly by PyExecutor, for the target model,
+        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
+        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
+        #     latter case, there is always only 1 token per request because draft
+        #     tokens are sampled one-by-one.
+
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
-        finish_reasons = self.store.finish_reasons
         log_probs_host = self.log_probs_host(scheduled_requests)
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in requests],
             dtype=torch.int64,  # for index_fill_
             pin_memory=True)
-        seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
-        self._process_requests(scheduled_requests,
-                               model_outputs,
-                               new_tokens,
-                               num_context_logits_prefix_sum,
-                               seq_slots=seq_slots,
-                               seq_slots_host=seq_slots_host,
-                               log_probs_host=log_probs_host)
-        self._write_finish_reasons(requests,
-                                   finish_reasons=finish_reasons,
-                                   seq_slots=seq_slots,
-                                   new_tokens=new_tokens)
+        new_tokens_host = self._process_requests(
+            scheduled_requests,
+            model_outputs,
+            new_tokens,
+            num_context_logits_prefix_sum,
+            seq_slots=seq_slots_host,
+            log_probs_host=log_probs_host,
+            resource_manager=resource_manager)
 
-        new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
-        finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
-        return SampleStateTorch(
-            scheduled_requests=scheduled_requests,
-            device=SampleStateTensors(new_tokens=new_tokens),
-            host=SampleStateTensorsHostTorch(
-                new_tokens=new_tokens_host,
-                log_probs=log_probs_host,
-                finish_reasons=finish_reasons_host,
-            ),
-            sampler_event=sampler_event,
-        )
+        return SampleState(scheduled_requests=scheduled_requests,
+                           device=SampleStateTensors(new_tokens=new_tokens),
+                           host=SampleStateTensors(new_tokens=new_tokens_host),
+                           sampler_event=sampler_event)
 
     @staticmethod
-    def append_eagle3(tokens: torch.Tensor, model_outputs):
+    def _apply_d2t(tokens: torch.Tensor, model_outputs) -> None:
+        """Applies draft-to-target token translation table.
+
+        Modifies tokens in-place.
+        """
         if "d2t" in model_outputs:
             d2t = model_outputs["d2t"][tokens]
             tokens += d2t
 
     @staticmethod
     def _apply_embedding_bias(
-            logits: torch.Tensor,
-            requests: list[LlmRequest],
-            steps_per_request: list[int] = None) -> torch.Tensor:
+        logits: torch.Tensor,
+        requests: list[LlmRequest],
+        request_steps: torch.Tensor,
+    ) -> None:
         """Apply embedding bias (aka logit bias) to logits.
-        If steps_per_request is None, assumes 1 step per request (non-batched path).
+
+        Arguments:
+          request_steps: Number of steps/tokens for each request.
+
+        Modifies logits in-place.
         """
-        # Collect biases and their associated data
-        bias_list = []
-        bias_data = []  # Either indices (fast path) or steps (batched path)
+        # NB: Unfortunately, Torch provides no combination of torch.index_select (similar to
+        #     torch.Tensor.gather -- allows one-to-many mapping) and addition, analogous to how
+        #     torch.Tensor.scatter_add_ (and it's variant torch.Tensor.index_add_ -- allows
+        #     many-to-one mapping) combine addition with torch.Tensor.scatter_.
+        #
+        #     Notwithstanding the previous point, there are two options:
+        #         (i)  materialize a permuted bias tensor with repeated consecutive rows via
+        #              torch.repeat_interleave and then use torch.Tensor.index_add_ (poor write
+        #              locality / risk of false sharing)
+        #        (ii)  materialize the correctly ordered bias tensor via torch.index_select and then
+        #              perform a masked addition (poor read locality for request batches randomly
+        #              mixing uniform and heterogeneous bias tensors, i.e., mixing slices with high
+        #              and low reuse).
+        #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
 
-        for i, req in enumerate(requests):
-            bias = req._py_embedding_bias_1d
-            if bias is not None:
-                bias_list.append(bias)
-                bias_data.append(i if steps_per_request is
-                                 None else steps_per_request[i])
+        # Track which logits require logit bias application
+        logits_bias_mask = torch.zeros((logits.size(0), ),
+                                       dtype=torch.bool,
+                                       pin_memory=True)
 
-        if not bias_list:
-            return logits
+        _next_bias_index = 0
 
-        bias_tensor = torch.stack(bias_list).to(logits.device,
-                                                non_blocking=True)
-        logits = logits.clone()
+        def provision_bias_index() -> int:
+            nonlocal _next_bias_index
+            bias_index = _next_bias_index
+            _next_bias_index += 1
+            return bias_index
 
-        if steps_per_request is None:
-            # Fast path: direct indexing
-            indices = torch.tensor(bias_data, device=logits.device)
-            logits[indices] += bias_tensor
+        # Indices of unique bias tensors
+        #
+        # NB: hash(torch.Tensor) is equivalent to id(torch.Tensor), and does not
+        #     depend on tensor contents, cf. https://github.com/pytorch/pytorch/issues/2569
+        bias_to_index: dict[torch.Tensor,
+                            int] = defaultdict(provision_bias_index)
+
+        # Source indices for bias application
+        bias_gather_indices: list[int] = []
+
+        # Collect bias information
+        req_bias = None
+        for i, (req, steps) in enumerate(zip(requests, request_steps)):
+            steps = int(steps.item())
+            req_bias = req._py_embedding_bias_1d
+            if req_bias is not None:
+                logits_bias_mask[i:(i + steps)] = True
+                req_bias_index = bias_to_index[req_bias]
+                bias_gather_indices.extend(repeat(req_bias_index, steps))
+
+        if not bias_to_index:
+            return
+        assert req_bias is not None  # otherwise bias_to_index is empty
+
+        bias_gather_indices_cuda = torch.tensor(bias_gather_indices,
+                                                pin_memory=True,
+                                                dtype=torch.int32).to(
+                                                    logits.device,
+                                                    non_blocking=True)
+        logits_bias_mask_cuda = logits_bias_mask.to(logits.device,
+                                                    non_blocking=True)
+        biases_tensor = torch.empty((len(bias_to_index), *req_bias.shape),
+                                    pin_memory=True)
+        biases_tensor = torch.stack(
+            tuple(bias_to_index.keys()),
+            out=biases_tensor,
+        )
+        biases_tensor_cuda = biases_tensor.to(logits.device, non_blocking=True)
+
+        biases_tensor_cuda = torch.index_select(biases_tensor_cuda, 0,
+                                                bias_gather_indices_cuda)
+        # NB: Avoiding logits[bias_scatter_indices] += biases_tensor (and torch.Tensor.scatter_add_), because it
+        #     is unclear if this allows for repeated indices, cf.
+        #         https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.index_put_.html#torch-tensor-index-put
+        #     and thus introduces read-after-write dependencies (including possible false
+        #     sharing).
+        logits[logits_bias_mask_cuda] += biases_tensor_cuda
+
+    def _sample_batched_by_strategy(
+        self,
+        logits_cuda: torch.Tensor,
+        requests: list[LlmRequest],
+        model_outputs: dict[str, torch.Tensor],
+        *,
+        cuda_device: torch.device,
+        log_probs_host: bool = False,
+        req_num_steps: torch.Tensor,
+        req_offsets: torch.Tensor,
+        steps_dim_size: int,
+        token_dtype: torch.dtype,
+    ) -> _BatchedSamplingResult:
+        if log_probs_host:
+            assert logits_cuda.dim() == 2, "logits should be 2D"
+            logprobs = F.log_softmax(logits_cuda.to("cuda",
+                                                    dtype=torch.float32),
+                                     dim=-1)
+            topk_vals, topk_indices = torch.topk(logprobs,
+                                                 k=max(req.py_num_logprobs
+                                                       for req in requests),
+                                                 dim=-1)
+
+        requests_by_strategy = _group_requests_by_sampling_strategy(
+            requests, pin_memory=True, vocab_size=logits_cuda.size(1))
+        generator_cuda = self.get_generator(cuda_device)
+
+        # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
+        #     breaking _process_draft_tokens_rejection_sampling.
+        needs_d2t = "d2t" in model_outputs
+        if needs_d2t and (len(requests_by_strategy) > 1 or
+                          (requests_by_strategy
+                           and next(iter(requests_by_strategy)) != GREEDY)):
+            raise ValueError("d2t does not yet support non-greedy sampling")
+
+        # Indexer for accessing tokens in 'logits_cuda', corresponding to the
+        # requests in 'requests'.
+        logits_cuda_indexer = _PackedStepIndexer(
+            num_steps=req_num_steps,
+            max_steps=steps_dim_size,
+            req_offsets=req_offsets,
+        )
+
+        batched_results: list[tuple[torch.Tensor, torch.Tensor,
+                                    torch.Tensor]] = []
+        py_draft_logits_indices: list[tuple[LlmRequest, torch.Tensor]] = [
+        ]  # see _BatchedSamplingResult for details
+        softmax_index_offset = 0
+        for strategy, group_req_indices in requests_by_strategy.items():
+            # group_req_indices: Indices of 'requests' entries having the same sampling
+            # strategy, ordered ascending.
+
+            # Indices of 'group_req_indices' entries corresponding to requests
+            # with draft logits.
+            speculation_group_indices = [
+                grp_idx
+                for grp_idx, glob_req_idx in enumerate(group_req_indices)
+                if requests[glob_req_idx].py_draft_logits is not None
+            ]
+            # To skip softmax computation where it is not needed, track
+            #   softmax_req_indices: Indices of 'requests' entries requesting probs
+            #   softmax_grp_indices: Indices of 'speculation_group_indices' entries requesting probs
+            #   speculation_softmax_indices: Indices of 'softmax_grp_indices' entries corresponding
+            #                                to requests with draft logits.
+            if log_probs_host:
+                softmax_req_indices = group_req_indices
+                softmax_grp_indices = torch.arange(len(group_req_indices),
+                                                   dtype=torch.int32)
+                speculation_softmax_indices = torch.tensor(
+                    speculation_group_indices, dtype=torch.int32)
+                for req_id in group_req_indices:
+                    req = requests[req_id]
+                    req.py_topk_logprobs_vals = topk_vals[
+                        logits_cuda_indexer[req_id], :req.py_num_logprobs].to(
+                            device="cpu", non_blocking=True)
+                    req.py_topk_logprobs_indices = topk_indices[
+                        logits_cuda_indexer[req_id], :req.py_num_logprobs].to(
+                            device="cpu", non_blocking=True)
+            else:
+                speculation_group_indices_tensor = torch.tensor(
+                    speculation_group_indices, dtype=torch.int32)
+                softmax_req_indices = group_req_indices[
+                    speculation_group_indices_tensor]
+                softmax_grp_indices = speculation_group_indices_tensor
+                speculation_softmax_indices = torch.arange(
+                    len(speculation_group_indices), dtype=torch.int32)
+
+            group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
+            # NB: Assuming that group_req_indices are sorted
+            group_req_1st_index, group_req_last_index = group_req_indices[
+                0], group_req_indices[-1]
+            if group_req_last_index - group_req_1st_index + 1 == len(
+                    group_req_indices):
+                # Avoid data movement if indices are contiguous
+                group_logits_cuda = logits_cuda[
+                    req_offsets[group_req_1st_index]:(
+                        req_offsets[group_req_last_index] +
+                        req_num_steps[group_req_last_index])]
+            else:
+                group_logits_cuda_indices_cuda = group_logits_cuda_indices.to(
+                    device=logits_cuda.device, non_blocking=True)
+                group_logits_cuda = logits_cuda[group_logits_cuda_indices_cuda]
+
+            # Indexer for accessing tokens in 'group_logits_cuda' (and 'group_next_tokens_cuda')
+            # corresponding to the requests in 'group_req_indices'.
+            group_logits_cuda_indexer = _PackedStepIndexer(
+                num_steps=req_num_steps[group_req_indices],
+                max_steps=steps_dim_size)
+            softmax_group_indices_cuda = group_logits_cuda_indexer[
+                softmax_grp_indices].to(device=logits_cuda.device,
+                                        non_blocking=True)
+
+            # Indexer for accessing tokens in 'group_softmax_cuda' corresponding to the
+            # requests in 'softmax_req_indices'.
+            if softmax_req_indices is not group_req_indices:
+                group_softmax_cuda_indexer = _PackedStepIndexer(
+                    num_steps=req_num_steps[softmax_req_indices],
+                    max_steps=steps_dim_size)
+            else:
+                group_softmax_cuda_indexer = group_logits_cuda_indexer
+
+            py_draft_logits_indices += [(
+                requests[request_idx],
+                softmax_index_offset + group_softmax_cuda_indexer[softmax_idx],
+            ) for softmax_idx, request_idx in zip(
+                speculation_softmax_indices,
+                softmax_req_indices[speculation_softmax_indices],
+            )]
+
+            group_next_tokens_cuda, group_softmax_cuda = sample(
+                strategy,
+                group_logits_cuda,
+                generator_cuda,
+                softmax_indices=cast(torch.IntTensor,
+                                     softmax_group_indices_cuda),
+            )
+            group_next_tokens_cuda_int = group_next_tokens_cuda.to(
+                dtype=token_dtype, non_blocking=True)
+            batched_results.append(
+                (group_req_indices, group_next_tokens_cuda_int,
+                 group_softmax_cuda))
+            softmax_index_offset += group_softmax_cuda.size(0)
+        # Batched sampling results, see _BatchedSamplingResult for details.
+        if len(batched_results) > 1:
+            batch_req_indices = torch.cat([res[0] for res in batched_results])
+            batch_next_tokens_cuda_int = torch.cat(
+                [res[1] for res in batched_results])
+            batch_softmax_cuda = torch.cat([res[2] for res in batched_results])
         else:
-            # Batched path: expand biases and use boolean mask
-            expanded_biases = torch.repeat_interleave(bias_tensor,
-                                                      torch.tensor(
-                                                          bias_data,
-                                                          device=logits.device),
-                                                      dim=0)
+            (batch_req_indices, batch_next_tokens_cuda_int,
+             batch_softmax_cuda), = batched_results
 
-            mask = torch.zeros(sum(steps_per_request),
-                               dtype=torch.bool,
-                               device=logits.device)
-            offset = 0
-            for i, req in enumerate(requests):
-                steps = steps_per_request[i]
-                if req._py_embedding_bias_1d is not None:
-                    mask[offset:offset + steps] = True
-                offset += steps
+        # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
+        #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
+        #     is the target vocab, whereas the output logits correspond to the draft
+        #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
+        #     they currently need to be handled within TorchSampler.
+        if needs_d2t:
+            self._apply_d2t(batch_next_tokens_cuda_int, model_outputs)
 
-            logits[mask] += expanded_biases
+        return _BatchedSamplingResult(
+            batch_req_indices=batch_req_indices,
+            batch_next_tokens_cuda_int=batch_next_tokens_cuda_int,
+            batch_softmax_cuda=batch_softmax_cuda,
+            py_draft_logits_indices=py_draft_logits_indices,
+        )
 
+    def _unbatch_sampling_results(
+        self,
+        batched_sampling_result: _BatchedSamplingResult,
+        *,
+        new_tokens_cuda: torch.Tensor,
+        req_num_steps: torch.Tensor,
+        seq_slots: torch.Tensor,
+        log_probs_host: bool = False,
+    ) -> torch.Tensor:
+        beam = self.BEAM
+        assert beam == 0, "beam_width != 1 not supported"
+
+        batch_req_indices = batched_sampling_result.batch_req_indices
+        batch_next_tokens_cuda_int = batched_sampling_result.batch_next_tokens_cuda_int
+        batch_softmax_cuda = batched_sampling_result.batch_softmax_cuda
+        py_draft_logits_indices = batched_sampling_result.py_draft_logits_indices
+
+        def _dims_canonically_ordered(t: torch.Tensor) -> bool:
+            return len(t.dim_order(
+                ambiguity_check=[torch.contiguous_format])) == t.ndim
+
+        # Assert destination tensor dimensions are canonically ordered ("row"-major); this
+        # matters for element ordering in the .view(...).scatter_(...) calls below.
+        assert _dims_canonically_ordered(new_tokens_cuda)
+
+        # Construct index mapping from slice indices of computed tensors
+        # (packed request_idx and step dimensions) to linearized indices
+        # in (steps, seq_slot).
+        batch_destination_cuda_indexer = _UnpackedStepIndexer(
+            seq_slots=seq_slots[batch_req_indices],
+            num_steps=req_num_steps[batch_req_indices],
+            steps_dim_size=new_tokens_cuda.size(0),
+            slots_dim_size=new_tokens_cuda.size(1),
+            dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
+            index_dtype=torch.int64,  # enforced by Tensor.scatter_
+        )
+
+        # Batch update output tensors
+        batch_dest_indices_1d_cuda = batch_destination_cuda_indexer[:].to(
+            new_tokens_cuda.device, non_blocking=True)
+        new_tokens_cuda.view(-1,
+                             *new_tokens_cuda.shape[2:])[:, beam, ...].scatter_(
+                                 0, batch_dest_indices_1d_cuda,
+                                 batch_next_tokens_cuda_int)
+        new_tokens_host = new_tokens_cuda.to("cpu", non_blocking=True)
+        # For requests with LlmRequest.py_draft_logits, return py_target_probs
+        for request, batch_softmax_index_cuda in py_draft_logits_indices:
+            request.py_target_probs = batch_softmax_cuda[
+                batch_softmax_index_cuda].clone()
+
+        return new_tokens_host
+
+    @staticmethod
+    @torch.inference_mode()
+    def _apply_min_length_penalty(logits: torch.Tensor,
+                                  requests: list[LlmRequest],
+                                  num_steps: list[int]) -> torch.Tensor:
+        """Inplace apply min_length_penalty to logits.
+
+            Args:
+                logits: The logits to apply min length penalty to
+                requests: The requests to apply min length penalty to
+                num_steps: The number of steps per request
+
+            Returns:
+                The logits with min length penalty applied
+        """
+        if any(r.py_min_length and r.max_beam_num_tokens < r.py_min_length[0]
+               for r in requests):
+            current_offset = 0
+            for index, r in enumerate(requests):
+                if r.py_min_length:
+                    for step in range(num_steps[index]):
+                        if r.max_beam_num_tokens + step < r.py_min_length[0]:
+                            logits[current_offset + step,
+                                   r.py_end_id] = float('-inf')
+                        else:
+                            #early exit
+                            break
+                current_offset += num_steps[index]
         return logits
 
     @staticmethod
-    def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
-        max_stop_word_len = 0
-        for req in requests:
-            _, cumsum = req.py_stop_words_list
-            if -1 in cumsum:
-                cumsum = cumsum[:cumsum.index(-1)]
-            request_max_stop_word_len = np.max(np.diff(cumsum, prepend=0),
-                                               initial=0)
-            max_stop_word_len = max(max_stop_word_len,
-                                    request_max_stop_word_len)
-        return max_stop_word_len
-
-    @staticmethod
-    def _requests_with_stop_words(
-            requests: list[LlmRequest]) -> list[LlmRequest]:
-        return [
-            r for r in requests if (r.py_stop_words_list is not None
-                                    and len(r.py_stop_words_list[0]) > 0)
-        ]
-
-    def _write_reason(self, finish_reasons: torch.Tensor, reason: FinishReason,
-                      *, where: torch.Tensor, seq_slots: torch.Tensor) -> None:
-        """Avoid GPU<->CPU syncs via:
-        ### `nonzero_static` [REF-A], see: https://ianbarber.blog/2024/12/18/nonzero_static-in-pytorch/.
-        - `nonzero` syncs (frontend needs result size).
-        - `nonzero_static` pads with dummy entries (`fill_value`), written into a prealloc buffer (max_num_sequences, 2).
-        - Need to drop padding, but `buffer[buffer!=fill_value]`, `buffer[:count_nonzero]`, `buffer[:sum]` all sync.
-
-        ### Hack:
-        1. Use `fill_value=0`, so padding is `[..., [0,0], [0,0]]`.
-        2. Write blindly to `finish_reasons` [REF-B]. Only `[seq_slot[0],0]` might have wrong values written to it, because of the padding entries.
-        3. Save `[seq_slot[0],0]` in `before_write` [REF-C], restore if `where[0][0]` is `False` [REF-D].
-        """
-        assert seq_slots.is_cuda and where.is_cuda
-        assert seq_slots.shape[0] == where.shape[1]
-        first_slot = seq_slots[0].unsqueeze(0)
-        before_write = finish_reasons[0][:].index_select(
-            0, first_slot).squeeze()  # REF-C
-        reason_tensor = self.store._reason_tensors[reason]
-        buffer = self.store._finish_reasons_nonzero_static_buffer
-        size = buffer.shape[0]
-        torch.nonzero_static(where, size=size, fill_value=0,
-                             out=buffer)  # REF-A
-        r, c = buffer[:, 0], buffer[:, 1]
-        finish_reasons[r, seq_slots[c], BEAM_0] = reason_tensor  # REF-B
-
-        correct = torch.where(~where[0, 0], before_write, reason_tensor).view(1)
-        assert correct.is_cuda
-        finish_reasons[0, first_slot, BEAM_0] = correct  # REF-D
-
-    def _write_finish_reasons(self, requests: list[LlmRequest], *,
-                              finish_reasons: torch.Tensor,
-                              seq_slots: torch.Tensor,
-                              new_tokens: torch.Tensor) -> None:
-        """later _write_reason overwrites earlier, in reverse precedence order"""
-        tokens = new_tokens[:, seq_slots, BEAM_0]
-        # we need to fill with NOT_FINISHED so we can differentiate between previous requests that had the same seq slot
-        finish_reasons.index_fill_(1, seq_slots,
-                                   FinishReason.NOT_FINISHED.value)
-
-        if with_stop_words := self._requests_with_stop_words(requests):
-            stop_seq_slots = torch.tensor(
-                [r.py_seq_slot for r in with_stop_words],
-                pin_memory=True).to("cuda", non_blocking=True)
-            stop_tokens = new_tokens[:, stop_seq_slots, BEAM_0]
-            self._write_reason(
-                finish_reasons,
-                FinishReason.STOP_WORDS,
-                where=self._are_stop_words(with_stop_words, stop_tokens),
-                seq_slots=stop_seq_slots,
-            )
-
-        self._write_reason(
-            finish_reasons,
-            FinishReason.LENGTH,
-            where=self._are_max_length(requests),
-            seq_slots=seq_slots,
-        )
-
-        self._write_reason(
-            finish_reasons,
-            FinishReason.END_ID,
-            where=self._are_end_id(requests, tokens),
-            seq_slots=seq_slots,
-        )
-
-    def _are_end_id(self, requests: list[LlmRequest],
-                    tokens: torch.Tensor) -> torch.Tensor:
-        end_ids_tensor = torch.tensor(
-            [([req.py_end_id if req.py_end_id is not None else -1] *
-              self.max_tokens) for req in requests],
-            pin_memory=True,
-            dtype=tokens.dtype).T.to(device="cuda", non_blocking=True)
-        return tokens == end_ids_tensor
-
-    def _are_max_length(self, requests: list[LlmRequest]) -> torch.Tensor:
-        lengths_tensor = torch.tensor([[
-            ((req.get_num_tokens(BEAM_0) + num_tokens) - req.py_orig_prompt_len)
-            for num_tokens in range(1, self.max_tokens + 1)
-        ] for req in requests])
-        max_lengths_tensor = torch.tensor([
-            ([min(req.py_max_new_tokens, self.max_seq_len)] * self.max_tokens)
-            for req in requests
-        ])
-        return (lengths_tensor
-                >= max_lengths_tensor).T.pin_memory().to(device="cuda",
-                                                         non_blocking=True)
-
-    _PAD_ID = -1
-    """Pad with negative, doesn't matter what"""
-
-    @cached_property
-    def _pad_steps_mask(self):
-        square = torch.ones(self.max_tokens, self.max_tokens, dtype=torch.bool)
-        pad_id = torch.tensor(self._PAD_ID)
-        mask = torch.where(square.tril(), torch.tensor(1), pad_id)
-        mask.pin_memory()
-        return mask.to("cuda", non_blocking=True)
-
-    def _padded_old_tokens(self,
-                           requests: list[LlmRequest],
-                           new_tokens: torch.Tensor,
-                           pad_id: int = _PAD_ID) -> torch.Tensor:
-        # TODO: make sure only the lookback tokens are pulled into the list
-        longest = self._longest_stop_word_len(requests)
-        assert longest > 0, f"{longest=}, longest stop word length should be greater than 0, as this code path is only reached with requests with stop words"
-        lookback = longest - 1
-        old_tokens = []
-        for request in requests:
-            old = request.get_tokens(BEAM_0)[-lookback:] if lookback > 0 else []
-            padded = [pad_id] * max(0, lookback - len(old)) + old
-            old_tokens.append([padded] * self.max_tokens)
-        old_tokens_tensor = torch.tensor(old_tokens,
-                                         pin_memory=True).to("cuda",
-                                                             non_blocking=True)
-        assert old_tokens_tensor.shape == (
-            len(requests), self.max_tokens, lookback
-        ), f"{old_tokens_tensor.shape} != ({len(requests)=}, {self.max_tokens=}, {lookback=})"
-        new_tokens = new_tokens.T.unsqueeze(1) * self._pad_steps_mask
-        ret = torch.cat((old_tokens_tensor, new_tokens), dim=-1)
-        assert ret.shape == (
-            len(requests), self.max_tokens, lookback + self.max_tokens
-        ), f"{ret.shape} != ({len(requests)=}, {self.max_tokens=}, {lookback + self.max_tokens=})"
-        return ret
-
-    def _are_stop_words(self, requests: list[LlmRequest],
-                        tokens: torch.Tensor) -> torch.Tensor:
-        per_step = torch.zeros((self.max_tokens, len(requests)),
-                               dtype=torch.bool,
-                               pin_memory=True).to("cuda", non_blocking=True)
-
-        padded_tokens = self._padded_old_tokens(requests, tokens)
-
-        def request_stop_words(request: LlmRequest, new_tokens: torch.Tensor):
-            swl, ends = request.py_stop_words_list
-            if -1 in ends:
-                ends = ends[:ends.index(-1)]
-            lens = np.diff(ends, prepend=0)
-            lens_device = torch.tensor(list(lens),
-                                       pin_memory=True).to("cuda",
-                                                           non_blocking=True)
-            max_len = np.max(lens)
-
-            words = torch.zeros(len(lens),
-                                max_len,
-                                dtype=torch.int32,
-                                pin_memory=True)
-            for step, (start, l) in enumerate(zip([0] + ends, lens)):
-                words[step, :l] = torch.tensor(swl[start:start + l],
-                                               dtype=torch.int32)
-            words_device = words.to("cuda", non_blocking=True)
-
-            for step, step_seq in enumerate(new_tokens):
-                for word, L in zip(words_device, lens_device):
-                    truncated_seq = step_seq[step_seq >= 0][-L:]
-                    if torch.equal(truncated_seq, word[-L:]):
-                        # We don't care about subsequent steps because we already found a stop word match
-                        return step
-            return None
-
-        for request_idx, request in enumerate(requests):
-            step = request_stop_words(request, padded_tokens[request_idx])
-            if step is not None:
-                per_step[step][request_idx] = True
-        return per_step
-
-    def _process_requests(self,
-                          scheduled_requests: ScheduledRequests,
-                          model_outputs: dict[str, torch.Tensor],
-                          new_tokens: torch.Tensor,
-                          num_context_logits_prefix_sum: list[int],
-                          *,
-                          seq_slots: torch.Tensor,
-                          seq_slots_host: torch.Tensor,
-                          log_probs_host: torch.Tensor | None = None):
-
-        # raw_logits should contain only the logits from the gen requests.
-        # If return context logits is requested, fetch only the logits from gen requests.
+    def _select_generated_logits(
+        scheduled_requests: ScheduledRequests,
+        raw_logits_cuda: torch.Tensor,
+        *,
+        req_num_generation_steps: torch.Tensor,
+        num_context_logits_prefix_sum: list[int],
+        generation_requests_total_steps: int,
+    ) -> torch.Tensor:
+        # raw_logits should contain only the generated logits.
+        # If return context logits is requested, select only the generated logits.
+        #
+        # NB: Context request logits always precede generation request logits, also
+        #     requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
         if any(r.py_return_context_logits
                for r in scheduled_requests.context_requests):
-            gen_logits_indices = []
-            total_context_logits = num_context_logits_prefix_sum[-1]
-            for i in range(len(scheduled_requests.context_requests)):
-                gen_logits_indices.append(num_context_logits_prefix_sum[i + 1] -
-                                          1)
-            gen_logits_indices.extend(
-                range(
-                    total_context_logits, total_context_logits +
-                    len(scheduled_requests.generation_requests)))
-            raw_logits = model_outputs["logits"][gen_logits_indices]
-        else:
-            raw_logits = model_outputs["logits"]
+            assert len(num_context_logits_prefix_sum) == len(
+                scheduled_requests.context_requests) + 1
+            req_num_generation_steps_cuda = req_num_generation_steps.to(
+                raw_logits_cuda.device, non_blocking=True)
+            context_req_offsets_cuda = torch.tensor(
+                num_context_logits_prefix_sum,
+                dtype=torch.int32,
+                pin_memory=True).to(device=raw_logits_cuda.device,
+                                    non_blocking=True)
+
+            # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
+            # only end-offsets of the token storage locations matter.
+            next_context_req_offsets_cuda = context_req_offsets_cuda.roll(
+                -1)  # trailing '0' is overwritten below
+            # Since logits for generation requests are densely packed, cover them all by a single
+            # fictituous entry in 'context_req_offsets_cuda'.
+            if scheduled_requests.generation_requests:
+                req_num_steps_fictitious_cuda = req_num_generation_steps_cuda[:(
+                    len(scheduled_requests.context_requests) + 1)].clone()
+                req_num_steps_fictitious_cuda[
+                    -1] = generation_requests_total_steps
+                next_context_req_offsets_cuda[-1] = (
+                    next_context_req_offsets_cuda[-2] +
+                    req_num_steps_fictitious_cuda[-1])
+            else:
+                req_num_steps_fictitious_cuda = req_num_generation_steps_cuda[:len(
+                    scheduled_requests.context_requests)]
+                next_context_req_offsets_cuda = next_context_req_offsets_cuda[:
+                                                                              -1]
+
+            # Now, the generated tokens for context request i are at indices
+            #    range(next_context_req_offsets_cuda[i] - req_num_steps_fictitious_cuda[i], next_context_req_offsets_cuda[i])
+            # And if generation requests are present, those tensors each include a trailing entry selecting
+            # all tokens/logits generated by all generation requests.
+            indices_to_keep_cuda = torch_multi_arange(
+                starts=(next_context_req_offsets_cuda -
+                        req_num_steps_fictitious_cuda),
+                ends=next_context_req_offsets_cuda,
+            )
+
+            raw_logits_cuda = raw_logits_cuda[indices_to_keep_cuda]
+        return raw_logits_cuda
+
+    @nvtx_range("_process_requests")
+    def _process_requests(
+            self,
+            scheduled_requests: ScheduledRequests,
+            model_outputs: dict[str, torch.Tensor],
+            new_tokens_cuda: torch.Tensor,
+            num_context_logits_prefix_sum: list[int],
+            *,
+            seq_slots: torch.Tensor,
+            log_probs_host: torch.Tensor | None = None,
+            resource_manager: Optional[ResourceManager] = None) -> torch.Tensor:
+        seq_slots = seq_slots.to(dtype=torch.int32)  # int32 suffices here
+        spec_tree_manager = self.get_spec_tree_manager(resource_manager)
+
+        raw_logits_cuda = model_outputs["logits"]
 
         requests = scheduled_requests.all_requests()
-        num_steps = [1 + get_draft_token_length(req) for req in requests]
-        sum_steps = sum(num_steps)
-        no_draft_tokens = len(requests) == sum_steps
-        fast_path = not self.enable_mixed_sampler and no_draft_tokens and log_probs_host is None
+        cuda_device = raw_logits_cuda.device
+        req_num_steps_list = [
+            1 + get_draft_token_length(req) for req in requests
+        ]
+        req_num_steps = torch.tensor(req_num_steps_list,
+                                     dtype=torch.int32,
+                                     pin_memory=True)
+        # NB: These offsets consider generated tokens _only_ (draft and target, but not context)
+        #     and are thus only correct after _select_generated_logits() below.
+        req_offsets, sum_steps = _PackedStepIndexer.calculate_request_offsets(
+            req_num_steps, pin_memory=True)
 
-        if fast_path:
-            logits = raw_logits[:len(requests)]
-            logits = self._apply_embedding_bias(logits, requests)
-            next_tokens = torch.argmax(logits, dim=-1)
-            self.append_eagle3(next_tokens, model_outputs)
-            int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
-            next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH)
-            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
-            return
+        raw_logits_cuda = self._select_generated_logits(
+            scheduled_requests,
+            raw_logits_cuda,
+            req_num_generation_steps=req_num_steps,
+            num_context_logits_prefix_sum=num_context_logits_prefix_sum,
+            generation_requests_total_steps=(
+                # NB: requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
+                sum_steps - cast(
+                    int, req_offsets[len(
+                        scheduled_requests.context_requests)].item())
+                if scheduled_requests.generation_requests else 0),
+        )
 
-        strategies = sampling_strategies(requests)
-        batched_next_tokens, batched_softmax = None, None
-        batched_strategy: Strategy | None = GREEDY
-        if self.enable_mixed_sampler:
-            assert "d2t" not in model_outputs, "eagle3 does not yet support non-greedy sampling"
-            if len(set(strategies)) == 1:
-                batched_strategy = strategies[0]
-            else:
-                batched_strategy = None
-        generator = self.get_generator(raw_logits.device)
-        if batched_strategy is not None:
-            logits = raw_logits[:sum_steps]
-            # Collect steps per request for batched strategy
-            steps_per_request = [
-                1 + get_draft_token_length(req) for req in requests
-            ]
-            logits = self._apply_embedding_bias(logits, requests,
-                                                steps_per_request)
-            batched_next_tokens, batched_softmax = sample(
-                batched_strategy, logits, generator)
-            self.append_eagle3(batched_next_tokens, model_outputs)
+        # Handle embedding bias
+        logits_cuda = raw_logits_cuda[:sum_steps]
+        self._apply_embedding_bias(logits_cuda, requests, req_num_steps)
 
-        offset = 0
-        for i, (strategy, slot, steps, request) in enumerate(
-                zip(strategies, seq_slots_host, num_steps, requests)):
-            input_slice = slice(offset, offset + steps)
-            logits = raw_logits[input_slice]
+        logits_cuda = self._apply_min_length_penalty(logits_cuda, requests,
+                                                     req_num_steps_list)
 
-            req = requests[i]
+        # Fast path for drafter model's tree sampling.
+        if spec_tree_manager is not None and logits_cuda.size(0) == len(
+                scheduled_requests.all_requests()):
+            new_tokens_host = self._tree_sampling_batch(
+                requests,
+                self.max_num_sequences,
+                seq_slots,
+                model_outputs,
+                spec_tree_manager,
+            )
+            return new_tokens_host
 
-            if batched_next_tokens is None:
-                logits = self._apply_embedding_bias(logits, [req])
-                next_tokens, softmax = sample(strategy, logits, generator)
-            else:
-                # Batched processing already applied bias, just use the results
-                next_tokens = batched_next_tokens[input_slice]
-                softmax = batched_softmax[input_slice]
-            current_slice = slice(0, steps), slot, BEAM_0
-            new_tokens[current_slice] = next_tokens
-            if request.py_draft_logits is not None:
-                request.py_target_probs = softmax.clone()
-            if log_probs_host is not None:
-                assert BEAM_0 == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
-                token_probs = torch.gather(
-                    softmax, dim=1, index=next_tokens.unsqueeze(1)).squeeze(-1)
-                log_probs = torch.log(token_probs)
-                log_probs_host[slot, BEAM_0, :steps].copy_(log_probs,
-                                                           non_blocking=True)
-            offset += steps
+        # Perform sampling in batches
+        batched_sampling_result = self._sample_batched_by_strategy(
+            logits_cuda,
+            requests,
+            model_outputs,
+            cuda_device=cuda_device,
+            log_probs_host=log_probs_host,
+            req_offsets=req_offsets,
+            steps_dim_size=new_tokens_cuda.size(0),
+            req_num_steps=req_num_steps,
+            token_dtype=new_tokens_cuda.dtype,
+        )
+
+        # Fill results into output buffers
+        new_tokens_host = self._unbatch_sampling_results(
+            batched_sampling_result,
+            new_tokens_cuda=new_tokens_cuda,
+            log_probs_host=log_probs_host,
+            req_num_steps=req_num_steps,
+            seq_slots=seq_slots,
+        )
+
+        # NB: update_requests syncs w/ device computation and async D2H copies
+        return new_tokens_host
+
+    @override
+    def should_provide_draft_probs(self, request: LlmRequest) -> bool:
+        params = _request_get_sampling_params(request)
+        temperature = params.temperature
+        top_p = params.top_p
+        top_k = params.top_k
+
+        # Do not request draft probs when sampling is greedy.
+        return not SamplingParams.params_imply_greedy_decoding(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
 
 
 class Algorithms:
@@ -1001,6 +1839,7 @@ class TRTLLMSampler(Sampler):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
     SampleState = SampleStateTRTLLM
 
+    @override
     def is_generation_model(self) -> bool:
         return True
 
@@ -1041,8 +1880,16 @@ class TRTLLMSampler(Sampler):
             2 if self.is_trt_overlap else 1)
         self.micro_batch_idx = 0
 
-        self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
-                                            mapping.tp_size, mapping.pp_size)
+        if mpi_disabled():
+            self.world_config = WorldConfig(mapping.tp_size,
+                                            mapping.pp_size,
+                                            mapping.cp_size,
+                                            rank=mapping.rank,
+                                            gpus_per_node=mapping.gpus_per_node)
+        else:
+            self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
+                                                mapping.tp_size,
+                                                mapping.pp_size)
         self.model_config = ModelConfig(vocab_size, num_hidden_layers,
                                         num_hidden_layers, 0, num_heads,
                                         hidden_size, self.model_datatype)
@@ -1153,10 +2000,14 @@ class TRTLLMSampler(Sampler):
 
     @torch.inference_mode()
     @nvtx_range("sample_async")
+    @override
     def sample_async(
-            self, scheduled_requests: ScheduledRequests, model_outputs,
-            num_context_logits_prefix_sum: list[int]) -> SampleStateTRTLLM:
-
+        self,
+        scheduled_requests: ScheduledRequests,
+        model_outputs,
+        num_context_logits_prefix_sum: list[int],
+        resource_manager: Optional[ResourceManager] = None
+    ) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1
@@ -1244,7 +2095,11 @@ class TRTLLMSampler(Sampler):
                                  finalize_events=finalize_events)
 
     @torch.inference_mode()
-    def update_requests(self, state: SampleStateTRTLLM):
+    @override
+    def update_requests(self,
+                        state: SampleStateTRTLLM,
+                        resource_manager: Optional[ResourceManager] = None):
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
         if state.scheduled_requests.batch_size == 0:
             return

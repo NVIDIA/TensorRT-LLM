@@ -181,6 +181,7 @@ class TrtllmAttentionWrapper:
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
         is_spec_dec_tree: bool = False,
@@ -189,6 +190,10 @@ class TrtllmAttentionWrapper:
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
+        sparse_kv_indices: Optional[torch.Tensor] = None,
+        sparse_kv_offsets: Optional[torch.Tensor] = None,
+        sparse_attn_indices: Optional[torch.Tensor] = None,
+        sparse_attn_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -225,8 +230,13 @@ class TrtllmAttentionWrapper:
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
+            sparse_kv_indices (torch.Tensor): The sparse indices for the KV cache, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
+            sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
+            sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
+            sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -262,8 +272,12 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.block_ids_per_seq = block_ids_per_seq
         self.softmax_stats_tensor = softmax_stats_tensor
+        self.helix_position_offsets = helix_position_offsets
         self.attention_sinks = attention_sinks
-
+        self.sparse_kv_indices = sparse_kv_indices
+        self.sparse_kv_offsets = sparse_kv_offsets
+        self.sparse_attn_indices = sparse_attn_indices
+        self.sparse_attn_offsets = sparse_attn_offsets
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -420,6 +434,13 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
+        mla_tensor_params = [self.helix_position_offsets]
+        sparse_attention_params = [
+            self.sparse_kv_indices,
+            self.sparse_kv_offsets,
+            self.sparse_attn_indices,
+            self.sparse_attn_offsets,
+        ]
 
         thop.attention(
             q,
@@ -482,10 +503,12 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            mla_tensor_params,
             self.attention_chunk_size,
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
+            sparse_attention_params,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -613,6 +636,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
+        capture_graph = torch.cuda.is_current_stream_capturing()
+
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
                       cache_name: str) -> torch.Tensor:
             """
@@ -630,36 +655,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 tensor_shape: The required shape.
                 dtype: The required dtype.
                 cache_name: The key for the specific list of buffers to search in.
-
             Returns:
                 An existing compatible buffer or a newly created one.
             """
-            if buffers is not None:
-                # Safely get the list of candidates. Defaults to an empty list if key is missing.
-                candidate_buffers = buffers.get(cache_name, [])
-                numel_like = math.prod(tensor_shape)
+            if buffers is None:
+                return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
 
-                for buffer in candidate_buffers:
-                    numel_buffer = buffer.numel()
-
-                    # buffer just needs to be large enough.
-                    if numel_buffer >= numel_like:
-                        return buffer[0:numel_like].view(
-                            tensor_shape)  # Found a fit, return immediately.
-
-            # If we get here, no suitable buffer was found in the cache. Create a new one.
-            new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-            if buffers is not None:
-                buffers.setdefault(cache_name, []).append(new_buffer)
-            return new_buffer
+            return buffers.get_buffer(tensor_shape, dtype, cache_name,
+                                      capture_graph)
 
         def get_empty_like(like_tensor: torch.Tensor,
                            cache_name: str) -> torch.Tensor:
-            return get_empty(
-                like_tensor.shape,
-                cache_name=cache_name,
-                dtype=like_tensor.dtype,
-            )
+            return get_empty(like_tensor.shape,
+                             cache_name=cache_name,
+                             dtype=like_tensor.dtype)
 
         self.prompt_lens_cuda = get_empty(
             (self.max_num_sequences, ),
@@ -671,10 +680,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
-        self.kv_lens_cuda = get_empty_like(
-            self.prompt_lens_cuda,
-            cache_name="kv_lens_cuda",
-        )
+        self.kv_lens_cuda = get_empty_like(self.prompt_lens_cuda,
+                                           cache_name="kv_lens_cuda")
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
@@ -848,8 +855,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
             self.request_ids).pin_memory()
         num_blocks = block_ids_per_seq.shape[1]
+        self.kv_block_ids_per_seq.fill_(0)
         self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
             block_ids_per_seq, non_blocking=True)
+        self.block_ids_per_seq.fill_(0)
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
@@ -1214,6 +1223,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
@@ -1247,6 +1257,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
             )
+
+        sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
+        if self.sparse_attention_config is not None:
+            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                q, k, metadata)
+            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                q, k, metadata)
+
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1284,6 +1302,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q_pe=q_pe,
             mrope_config=mrope_config,
             softmax_stats_tensor=softmax_stats_tensor,
+            helix_position_offsets=helix_position_offsets,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
@@ -1294,6 +1313,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
+            sparse_kv_indices=sparse_kv_indices,
+            sparse_kv_offsets=sparse_kv_offsets,
+            sparse_attn_indices=sparse_attn_indices,
+            sparse_attn_offsets=sparse_attn_offsets,
         )
         out_dtype = None
         if out_scale is not None:
@@ -1507,3 +1530,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_heads,
             self.mla_params.v_head_dim,
         )
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse attn indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse kv indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError

@@ -1,7 +1,3 @@
-# I want to create accuracy tests for disaggregated serving.
-# I need to to this by creating a new class that mimics LLM class. Instead of implementing the
-# actual methods it will send OAI requests to the disaggregated serving endpoint.
-# Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
 import itertools
@@ -234,11 +230,17 @@ def launch_disaggregated_llm(
                          streaming: bool):
             kwargs = {}
             if sampling_params is not None:
-                kwargs.update(max_tokens=sampling_params.max_tokens,
-                              temperature=sampling_params.temperature,
-                              top_p=sampling_params.top_p,
-                              stop=sampling_params.stop,
-                              seed=sampling_params.seed)
+                kwargs.update(
+                    max_tokens=sampling_params.max_tokens,
+                    # NB: 'LLM' (cf. SamplingParams) and OpenAI API
+                    #     defaults differ (top_p=0 vs. top_p=1).
+                    # FIXME: Because 'LLM' does not permit expressly setting
+                    #     top_p=0, diverting to temperature=0.
+                    temperature=(sampling_params.temperature
+                                 if sampling_params.top_p is not None else 0),
+                    top_p=sampling_params.top_p,
+                    stop=sampling_params.stop,
+                    seed=sampling_params.seed)
                 if (guided_decoding_params :=
                         sampling_params.guided_decoding) is not None:
                     extra_body = {}
@@ -359,12 +361,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-    def test_auto_dtype(self, disable_overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {
-            "disable_overlap_scheduler": disable_overlap_scheduler
+    @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
+    @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
+    def test_auto_dtype(self, disable_overlap_scheduler, ctx_enable_block_reuse,
+                        gen_enable_block_reuse):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "enable_block_reuse": ctx_enable_block_reuse
+            }
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config = {
+            "disable_overlap_scheduler": disable_overlap_scheduler,
+            "kv_cache_config": {
+                "enable_block_reuse": gen_enable_block_reuse
+            },
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -436,6 +452,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(reason="https://nvbugs/5556020")
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
@@ -697,9 +714,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(8)
+    @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}

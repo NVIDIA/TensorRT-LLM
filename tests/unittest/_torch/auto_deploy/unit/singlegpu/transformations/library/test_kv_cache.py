@@ -1,14 +1,19 @@
-from typing import Optional
+from typing import List, Optional
 
 import pytest
 import torch
+import torch.nn as nn
 from _graph_test_helpers import SequenceEmbeddingInfo
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import (
+    FullModelExportInfo,
+    ModelFactory,
+    SubModuleExportInfo,
+)
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 
@@ -31,6 +36,9 @@ class DummyFactory(ModelFactory):
 
     def get_cache_config(self):
         return self.cache_config
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
@@ -74,8 +82,18 @@ class GQAWithSdpa(GQA):
         v = v.view(b, s, self.num_kv_heads, self.head_dim)
 
         # Use grouped SDPA in bsnd layout
-        attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(
-            q, k, v, None, 0.0, True, None
+        attn_output = torch.ops.auto_deploy.torch_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=None,
+            logit_cap=None,
+            layout="bsnd",
         )
 
         # SDPA output is already in [b, s, n, h_d] format
@@ -153,6 +171,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
         {
             "build_model": {
                 "stage": "factory",
+                "run_per_gm": False,
                 "device": "cuda",
                 "run_graph_cleanup": False,
                 "requires_clean_graph": False,
@@ -160,6 +179,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             "export_to_gm": {
                 "stage": "export",
                 "strict": False,
+                "run_per_gm": False,
                 "clone_state_dict": True,
                 "run_graph_cleanup": False,
                 "requires_clean_graph": False,
@@ -179,7 +199,8 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     gm = optimizer(cm)
 
     gm.to("cuda")
-    cm.initialize_caches()
+    num_caches = cm.initialize_caches()
+    print(f"num_caches: {num_caches}")
 
     # Helper function to call the model with proper sequence nesting
     def _call_and_unnest(x, input_pos):
@@ -187,7 +208,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
         cm.info.nest_sequences(x, input_pos=input_pos)
 
         # Use the cm.args as is - it already contains the correct position_ids
-        y = gm(*cm.args)
+        y = gm(**cm.named_args)
 
         # Unnest the output sequences
         return torch.stack(cm.info.unnest_sequences(y))
@@ -216,5 +237,5 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model
-    exported_gm = torch_export_to_gm(gm, args=cm.args)
+    exported_gm = torch_export_to_gm(gm, args=(), kwargs=cm.named_args)
     assert exported_gm is not None

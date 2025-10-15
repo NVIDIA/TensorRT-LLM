@@ -89,9 +89,6 @@ class ADEngine(ModelEngine):
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
         max_beam_width = ad_config.max_beam_width
-        ad_logger.info(
-            f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
-        )
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
@@ -108,10 +105,6 @@ class ADEngine(ModelEngine):
         )
 
         factory = ad_config.create_factory()
-
-        # pass in extra arguments defined by the model factory
-        for name, (none_input, dynamic_shape_callback) in factory.get_extra_inputs().items():
-            seq_info.add_extra_arg(name, none_input, dynamic_shape_callback)
 
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
@@ -142,6 +135,9 @@ class ADEngine(ModelEngine):
         self.pytorch_backend_config.attention_dp_time_out_iters = 50
         self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
         self.pytorch_backend_config.batch_wait_timeout_ms = 0
+        self.pytorch_backend_config.batch_wait_timeout_iters = 0
+        self.pytorch_backend_config.batch_wait_max_tokens_ratio = 0.0
+        self.pytorch_backend_config.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
@@ -158,7 +154,7 @@ class ADEngine(ModelEngine):
         self.model = get_inference_model(self.cache_seq_interface)
 
         # start fresh with fixed seed
-        torch.manual_seed(1234)
+        torch.manual_seed(42)
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
@@ -182,6 +178,7 @@ class ADEngine(ModelEngine):
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
+        slot_idx: List[int] = []
         flat_gather_idx: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
@@ -190,8 +187,15 @@ class ADEngine(ModelEngine):
         # look at context requests first
         for request in context_requests:
             # store input ids and pos of first token in sequence
-            input_ids.append(request.get_tokens(0))
-            input_pos.append(request.context_current_position)
+            # NOTE: begin_compute > 0 indicates block reuse
+            # NOTE: end_compute will be used in the future for chunked prefill
+            all_prompt_tokens = request.get_tokens(0)
+            begin_compute = request.context_current_position
+            end_compute = begin_compute + request.context_chunk_size
+            prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+
+            input_ids.append(prompt_tokens)
+            input_pos.append(begin_compute)
 
             request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
@@ -199,6 +203,9 @@ class ADEngine(ModelEngine):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
+
+            # store seq slot idx
+            slot_idx.append(request.seq_slot)
 
             # store extra arguments
             if request.py_multimodal_data is not None:
@@ -219,6 +226,10 @@ class ADEngine(ModelEngine):
 
             request.py_batch_idx = request.seq_slot
 
+            # store seq slot idx
+            # TODO: double-check if this is correct for the overlap scheduler
+            slot_idx.append(request.seq_slot)
+
             # return all logits
             last_logit_only.append(False)
 
@@ -231,6 +242,7 @@ class ADEngine(ModelEngine):
             input_ids,
             input_pos=input_pos,
             page_assignments=page_assignments,
+            slot_idx=slot_idx,
             **extra_args,
         )
         # scatter the new tokens into the input_ids tensor if provided
@@ -246,7 +258,7 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
+        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)
@@ -306,9 +318,38 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     max_draft_len = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
     )
+    max_total_draft_tokens = 0
+    if ad_config.speculative_config is None:
+        max_total_draft_tokens = 0
+    elif hasattr(ad_config.speculative_config, "max_total_draft_tokens"):
+        max_total_draft_tokens = ad_config.speculative_config.max_total_draft_tokens
+    else:
+        max_total_draft_tokens = max_draft_len
 
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
+
+    # check kvcache config for partial block reuse
+    # TODO: copy_on_partial_reuse is not supported yet, see
+    # https://github.com/NVIDIA/TensorRT-LLM/issues/7142 for more details.
+    enable_block_reuse = ad_config.kv_cache_config.enable_block_reuse
+    enable_partial_reuse = ad_config.kv_cache_config.enable_partial_reuse
+    copy_on_partial_reuse = ad_config.kv_cache_config.copy_on_partial_reuse
+    if enable_block_reuse and enable_partial_reuse and copy_on_partial_reuse:
+        raise RuntimeError(
+            f"partial block reuse with {copy_on_partial_reuse=} set to True is NOT supported"
+            " in AutoDeploy. Please set it to False via the kv_cache_config.copy_on_partial_reuse "
+            "field in tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs."
+        )
+
+    # TODO: detect whether SSM layer is present in the model and raise an error or disable block
+    # reuse with a warning --> see https://github.com/NVIDIA/TensorRT-LLM/issues/7142. For now, we
+    # just emit a general warning.
+    if enable_block_reuse:
+        ad_logger.warning(
+            f"{enable_block_reuse=} is enabled. Note that this is not supported for SSM layers and"
+            " may lead to incorrect results if the model contains SSM layers."
+        )
 
     # resource managers
     kv_cache_manager = _CacheManagerWithFakePool(
@@ -337,16 +378,12 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    # TODO (lucaslie, fridah-nv): some models require enable_mixed_sampler=True to have good outputs, see
-    # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
-    # We should expose mixed_sample to our build_and_run_ad script so we can configure this
-    # correctly for models as needed.
     sampler_args = TorchSampler.Args(
         max_seq_len=ad_config.max_seq_len,
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=ad_config.max_beam_width,
-        enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
 
