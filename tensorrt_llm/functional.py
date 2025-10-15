@@ -26,6 +26,8 @@ import torch
 import tensorrt as trt
 # isort: on
 
+import flashinfer.comm as flashinfer_comm
+
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (QuantModeWrapper, bf16_array, bool_array,
@@ -3976,6 +3978,39 @@ class MoEAllReduceParams(AllReduceParams):
                     and self.shared_expert_output is not None)
         else:
             return (self.expanded_idx_to_permuted_idx is not None)
+
+
+class FlashInferAllReduceParams(AllReduceParams):
+
+    def __init__(self,
+                 strategy: Optional[
+                     flashinfer_comm.AllReduceStrategyType] = flashinfer_comm.
+                 AllReduceStrategyType.TWOSHOT,
+                 fusion_op: Optional[
+                     flashinfer_comm.AllReduceFusionOp] = flashinfer_comm.
+                 AllReduceFusionOp.NONE,
+                 config_mode: Optional[
+                     flashinfer_comm.AllReduceStrategyConfig] = flashinfer_comm.
+                 AllReduceStrategyConfig.USE_MEMCPY,
+                 bias: Optional[Tensor] = None,
+                 residual: Optional[Tensor] = None,
+                 norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
+                 norm_pre_residual_weight: Optional[Tensor] = None,
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True):
+        super().__init__(
+            bias=bias,
+            residual=residual,
+            norm_weight=norm_weight,
+            scale=scale,
+            norm_pre_residual_weight=norm_pre_residual_weight,
+            eps=eps,
+            enable_allreduce=enable_allreduce,
+        )
+        self.strategy = strategy
+        self.fusion_op = fusion_op
+        self.config_mode = config_mode
 
 
 def create_allreduce_plugin(

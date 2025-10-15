@@ -1823,8 +1823,9 @@ class Linear(nn.Module):
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
+        use_flashinfer_allreduce: bool = True,
     ):
-        from ..distributed import AllReduce
+        from ..distributed import AllReduce, FlashInferVLLMAllReduce
 
         super().__init__()
         self.has_bias = bias
@@ -1866,6 +1867,18 @@ class Linear(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=allreduce_strategy,
                                     dtype=self.dtype) if reduce_output else None
+
+        self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        self.flashinfer_vllm = self.use_flashinfer_allreduce and os.getenv(
+            "_USE_FLASHINFER_VLLM_ALLREDUCE", "0") == "1"
+        self.flashinfer_token_threshold = int(
+            os.getenv("_FLASHINFER_TOKEN_THRESHOLD", "256"))
+
+        if self.flashinfer_vllm:
+            self.flash_infer_all_reduce = FlashInferVLLMAllReduce(
+                mapping=self.mapping,
+                dtype=self.dtype) if reduce_output else None
+
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
@@ -2000,10 +2013,18 @@ class Linear(nn.Module):
                     bias, all_reduce_params)
                 bias = None if fuse_bias else bias
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
-                output = self.all_reduce(
-                    output,
-                    all_reduce_params=all_reduce_params,
-                )
+
+                if self.flashinfer_vllm and output.size(
+                        0) <= self.flashinfer_token_threshold:
+                    output = self.flash_infer_all_reduce(
+                        output,
+                        all_reduce_params=None,
+                    )
+                else:
+                    output = self.all_reduce(
+                        output,
+                        all_reduce_params=all_reduce_params,
+                    )
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:

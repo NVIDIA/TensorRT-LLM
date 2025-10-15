@@ -715,7 +715,6 @@ class LlamaDecoderLayer(DecoderLayer):
                 scale = self.mlp.gate_up_proj.input_scale
             else:
                 scale = None
-
             all_reduce_output = self.all_reduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
