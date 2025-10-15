@@ -27,9 +27,18 @@ from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16
+    from fast_hadamard_transform import hadamard_transform
+    hidden_size = x.size(-1)
+    assert (
+        hidden_size & (hidden_size - 1)
+    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    return hadamard_transform(x, scale=hidden_size**-0.5)
 
 def split_prefill_chunks(
     seq_lens: torch.Tensor,
@@ -180,7 +189,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
-    indexer_max_chunk_size = 32768 # Tunable
+    indexer_max_chunk_size = 128000 # Tunable
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -386,7 +395,8 @@ class Indexer(nn.Module):
                  skip_create_weights_in_init: bool,
                  sparse_attention_config: "SparseAttentionConfig",
                  dtype: Optional[torch.dtype],
-                 layer_idx: int = 0):
+                 layer_idx: int = 0,
+                 aux_stream: Optional[torch.cuda.Stream] = None):
         super().__init__()
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
@@ -430,6 +440,8 @@ class Indexer(nn.Module):
 
         self.softmax_scale = self.head_dim**-0.5
         self.scale_fmt = "ue8m0"
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -912,12 +924,17 @@ class Indexer(nn.Module):
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
         quant_block_size = metadata.kv_cache_manager.quant_block_size
-        q = self.wq_b(qr)
+
+        q, k = maybe_execute_in_parallel(
+            lambda: self.wq_b(qr),
+            lambda: self.wk(hidden_states),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-
-        k = self.wk(hidden_states)
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -928,6 +945,13 @@ class Indexer(nn.Module):
         # Remove head dimension (size 1) for MQA k
         k = torch.cat([k_pe[:, 0, :], k_nope], dim=-1)
 
+        q, k = maybe_execute_in_parallel(
+            lambda: rotate_activation(q),
+            lambda: rotate_activation(k),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
         q_fp8, q_scale = fp8_utils.per_token_quant_and_transform(
@@ -962,6 +986,7 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
             attention_chunk_size: Optional[int] = None,
             sparse_attention_config: Optional["SparseAttentionConfig"] = None,
             dtype: Optional[torch.dtype] = None,
+            aux_stream: Optional[torch.cuda.Stream] = None,
             **kwargs):
         TrtllmAttention.__init__(
             self,
@@ -981,7 +1006,7 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
 
         self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
                                skip_create_weights_in_init,
-                               sparse_attention_config, dtype, layer_idx)
+                               sparse_attention_config, dtype, layer_idx, aux_stream)
 
     def sparse_attn_predict(
         self,
