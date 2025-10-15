@@ -2358,8 +2358,10 @@ def checkStageName(stageNames) {
 }
 
 def ensureStageResultNotUploaded(stageName) {
+    echo "GlobalState.uploadResultStageNames: ${GlobalState.uploadResultStageNames}"
     if(!GlobalState.uploadResultStageNames.contains(stageName)) {
         GlobalState.uploadResultStageNames.add(stageName)
+        echo "GlobalState.uploadResultStageNames: ${GlobalState.uploadResultStageNames}"
     } else {
         stage('Upload Test Results') {
             catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
@@ -3017,11 +3019,15 @@ def launchTestJobs(pipeline, testFilter)
                     }
                 } else if (values instanceof List) {
                     trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                        values[1]()
+                        try {
+                            values[1]()
+                        } catch (Exception e) {
+                            GlobalState.uploadResultStageNames.remove(key)
+                            throw e
+                        }
                     })
                 } else {
                     values()
-                    GlobalState.uploadResultStageNames.remove(key)
                 }
             }, [sleepTimeInSecs: 120])
         }
