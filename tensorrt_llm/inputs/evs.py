@@ -1,18 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch
 
 
 def compute_retained_tokens_count(video_size: torch.LongTensor,
-                                  spatial_merge_size: int, q: float) -> int:
+                                  spatial_merge_size: int,
+                                  pruning_ratio: float) -> int:
     """
     Compute the number of retained tokens for a given video.
     Method ensures that we retain all the tokens from the first frame
@@ -21,14 +15,18 @@ def compute_retained_tokens_count(video_size: torch.LongTensor,
     Args:
         video_size: The size of the video in the format of (T, H, W).
         spatial_merge_size: The size of the spatial merge.
-        q: The pruning rate.
+        pruning_ratio: The pruning ratio.
 
     Returns:
         The number of retained tokens.
     """
+    # Note about why map(int,..) exists here.
+    # In vLLM a rounding issue was observed when input was Tensor versus when input was tuple of integers.
+    # Tuple of ints input came from Preprocessing stage, while in actual forward() it was a Tensor.
+    # To make sure number of output tokens stays the case - an explicit cast was added.
     T, H, W = map(int, video_size)
     min_num_tokens = (H // spatial_merge_size) * (W // spatial_merge_size)
-    evs_num_tokens = int(T * min_num_tokens * (1 - q))
+    evs_num_tokens = int(T * min_num_tokens * (1 - pruning_ratio))
     return max(min_num_tokens, evs_num_tokens)
 
 
@@ -36,7 +34,7 @@ def compute_retention_mask(
     video_embeds: torch.Tensor,
     video_size: torch.LongTensor,
     spatial_merge_size: int,
-    q: float,
+    pruning_ratio: float,
     flatten_output: bool = True,
 ) -> torch.Tensor:
     """
@@ -49,7 +47,7 @@ def compute_retention_mask(
         video_size (`torch.LongTensor` of shape `(3)`):
             The temporal, height and width of video.
         spatial_merge_size: Size reduction for rows & cols dimensions.
-        q: (`float`): Pruning rate factor [0,1)
+        pruning_ratio: (`float`): Pruning ratio factor [0,1)
         flatten_output: (`bool`): Whether to flatten the output mask.
 
     Returns:
@@ -83,7 +81,8 @@ def compute_retention_mask(
                           descending=True,
                           stable=True)
     retain_num_tokens = compute_retained_tokens_count(video_size,
-                                                      spatial_merge_size, q)
+                                                      spatial_merge_size,
+                                                      pruning_ratio)
     topk_indices = order[:retain_num_tokens]
 
     retention_mask = torch.zeros_like(dissimilarity_flat, dtype=torch.bool)
