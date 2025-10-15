@@ -472,7 +472,7 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
             notifyMsgs[i].msg);
     }
 
-    free(notifyMsgs);
+    freeNotifsMsgBuf(notifyMsgs, size);
     return notifs;
 }
 
