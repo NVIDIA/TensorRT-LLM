@@ -155,6 +155,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml"
          ),
+        "deepseek_v3_lite_bf16_empty_batch":
+        (3,
+         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -1280,14 +1284,19 @@ def run_disaggregated_benchmark(example_dir,
                                 benchmark_model_root,
                                 shared_gpt_path,
                                 env=None,
-                                cwd=None):
+                                cwd=None,
+                                num_ranks=2,
+                                random_input_len=16,
+                                random_output_len=64,
+                                num_prompts=100,
+                                max_concurrency=32,
+                                skip_warmup=False):
     """Run disaggregated test with given configuration."""
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
-    num_rank = 2
     workers_cmd = [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_rank), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
 
@@ -1339,15 +1348,15 @@ def run_disaggregated_benchmark(example_dir,
                 '--dataset-path',
                 shared_gpt_path,
                 '--random-input-len',
-                '256',
+                str(random_input_len),
                 '--random-output-len',
-                '64',
+                str(random_output_len),
                 '--random-prefix-len',
                 '0',
                 '--num-prompts',
-                '320',
+                str(num_prompts),
                 '--max-concurrency',
-                '32',
+                str(max_concurrency),
                 '--host',
                 'localhost',
                 '--port',
@@ -1358,7 +1367,8 @@ def run_disaggregated_benchmark(example_dir,
                 'e2el,ttft',
             ]
             # warm up
-            check_call(benchmark_cmd, env=env)
+            if not skip_warmup:
+                check_call(benchmark_cmd, env=env)
             output = check_output(benchmark_cmd, env=env)
             e2el_pattern = r"Median E2EL \(ms\):\s*(\d+\.?\d*)"
             ttft_pattern = r"Median TTFT \(ms\):\s*(\d+\.?\d*)"
@@ -1468,3 +1478,43 @@ def test_disaggregated_benchmark_on_diff_backends(
 
     assert ucx_e2el > 0 and nixl_e2el > 0 and nixl_e2el < 1.05 * ucx_e2el
     assert ucx_ttft > 0 and nixl_ttft > 0 and nixl_ttft < 1.05 * ucx_ttft
+
+
+@pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
+        disaggregated_example_root, llm_venv, benchmark_model_root,
+        benchmark_root, shared_gpt_path):
+
+    src_dst_dict = {
+        benchmark_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    test_desc = "deepseek_v3_lite_bf16_empty_batch"
+    num_ranks, config_file = get_test_config(test_desc,
+                                             disaggregated_example_root,
+                                             os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        benchmark_model_root,
+        shared_gpt_path,
+        env=env,
+        cwd=llm_venv.get_working_directory(),
+        num_ranks=num_ranks,
+        num_prompts=10,
+        max_concurrency=10,
+        random_input_len=384,
+        random_output_len=1536,
+        skip_warmup=True)
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+    assert e2el > 0 and ttft > 0
