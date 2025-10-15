@@ -83,6 +83,9 @@ install_python_rockylinux() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    PYTHON_URL="https://urm.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
+  fi
   dnf makecache --refresh
   dnf install \
     epel-release \
