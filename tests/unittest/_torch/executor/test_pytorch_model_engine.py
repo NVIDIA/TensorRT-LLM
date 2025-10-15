@@ -1,14 +1,12 @@
 import unittest
 from dataclasses import dataclass
-from unittest.mock import patch
+from unittest.mock import Mock
 
 import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
-    KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
@@ -80,16 +78,6 @@ class DummyModelEngine(PyTorchModelEngine):
 
     def _load_model(self, mode_path: str, **kwargs) -> torch.nn.Module:
         return DummyModel(self.dtype)
-
-
-class DummyForwardPassCallback(KvCacheConnectorWorker.ForwardPassCallback):
-
-    def __init__(self):
-        event = torch.cuda.Event()
-        super().__init__(event)
-
-    def callback(self):
-        return "DummyForwardPassCallback called."
 
 
 def _create_request(num_tokens, req_id: int):
@@ -335,54 +323,56 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
 
-    def test_forward_pass_callback_on_cuda_graph_on(self):
+    def test_forward_pass_callable_on_cuda_graph_on(self):
         config = PyTorchConfig(use_cuda_graph=True,
                                cuda_graph_padding_enabled=True)
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
-        callback = DummyForwardPassCallback()
-        with patch.object(callback, "callback") as patched_callback:
-            model_engine.register_forward_pass_callback(callback)
-            resource_manager = ResourceManager(
-                {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
-            prompt_len = 32
-            requests = [_create_request(prompt_len, 0)]
+        mock_callable = Mock()
+        model_engine.register_forward_pass_callable(mock_callable)
 
-            batch = ScheduledRequests()
-            batch.context_requests = requests
-            batch.generation_requests = []
-            kv_cache_manager.prepare_resources(batch)
-            model_engine.forward(batch, resource_manager)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
-            patched_callback.assert_called_once()
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
 
-    def test_forward_pass_callback_on_cuda_graph_off(self):
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        mock_callable.assert_called_once()
+
+    def test_forward_pass_callable_on_cuda_graph_off(self):
         config = PyTorchConfig(use_cuda_graph=False)
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
-        callback = DummyForwardPassCallback()
-        with patch.object(callback, "callback") as patched_callback:
-            model_engine.register_forward_pass_callback(callback)
-            resource_manager = ResourceManager(
-                {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
-            prompt_len = 32
-            requests = [_create_request(prompt_len, 0)]
+        mock_callable = Mock()
+        model_engine.register_forward_pass_callable(mock_callable)
 
-            batch = ScheduledRequests()
-            batch.context_requests = requests
-            batch.generation_requests = []
-            kv_cache_manager.prepare_resources(batch)
-            model_engine.forward(batch, resource_manager)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
-            patched_callback.assert_called_once()
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
 
-    def test_foward_pass_callback_off(self):
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        mock_callable.assert_called_once()
+
+    def test_foward_pass_callable_off(self):
         config = PyTorchConfig(use_cuda_graph=False)
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
-        self.assertTrue(model_engine.forward_pass_callback is None,
+        self.assertTrue(model_engine.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
-        # Assert we can run `forward` without a forward_pass_callback
+        # Assert we can run `forward` without a forward_pass_callback without error
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 

@@ -281,7 +281,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
     ):
-        self.forward_pass_callback = None
+        self.forward_pass_callable = None
         self.ub_buffers = None
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
