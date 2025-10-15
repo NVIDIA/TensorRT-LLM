@@ -2886,7 +2886,10 @@ def update_llm_args_with_extra_dict(
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
-            if field_name in ["speculative_config", "build_config", "sparse_attention_config"]:
+            if field_name in [
+                    "speculative_config", "build_config",
+                    "sparse_attention_config"
+            ]:
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:

@@ -5,17 +5,18 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
+                                 nvtx_range_debug)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
                                  TrtllmAttentionMetadata)
-from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
 from ..attention_backend.interface import (AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
+from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -1659,12 +1660,15 @@ class MLA(nn.Module):
         # Step 1: Append current tokens to paged cache and apply RoPE to q
         # This writes latent_cache to paged KV and modifies q in-place
         trtllm_attention = self.mqa
-        with nvtx_range_debug(f"mla_rope_append_paged_kv_assign_q_is_generation={is_generation}"):
+        with nvtx_range_debug(
+                f"mla_rope_append_paged_kv_assign_q_is_generation={is_generation}"
+        ):
             trtllm_attention.mla_rope_append_paged_kv_assign_q(
                 q, latent_cache, attn_metadata, is_generation=is_generation)
 
         # Step 2: Load full latent cache from paged memory
-        with nvtx_range_debug(f"load_paged_kv_cache_for_mla_is_generation={is_generation}"):
+        with nvtx_range_debug(
+                f"load_paged_kv_cache_for_mla_is_generation={is_generation}"):
             full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
                 attn_metadata, q.dtype, is_generation=is_generation)
         full_latent_cache = torch.cat([full_compressed_kv, full_k_pe], dim=-1)

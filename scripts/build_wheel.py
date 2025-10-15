@@ -611,8 +611,10 @@ def main(*,
         build_deep_gemm = "OFF"
         build_flash_mla = "OFF"
     else:
-        targets.extend(
-            ["th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils", "flash_mla"])
+        targets.extend([
+            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
+            "flash_mla"
+        ])
         build_pyt = "ON"
         build_deep_ep = "ON"
         build_deep_gemm = "ON"

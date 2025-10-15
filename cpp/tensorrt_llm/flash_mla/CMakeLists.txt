@@ -8,7 +8,8 @@ endif()
 # =============
 
 # Use FlashMLA submodule
-set(FLASH_MLA_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/flash-mla)
+set(FLASH_MLA_SOURCE_DIR
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/flash-mla)
 get_filename_component(FLASH_MLA_SOURCE_DIR ${FLASH_MLA_SOURCE_DIR} ABSOLUTE)
 
 if(NOT EXISTS ${FLASH_MLA_SOURCE_DIR})
@@ -82,8 +83,7 @@ foreach(SOURCE_FILE ${FLASH_MLA_ALL_FILES})
     string(REPLACE "flash_mla.cuda" "tensorrt_llm.flash_mla_cpp_tllm" _content
                    "${_content}")
     # Replace absolute imports with relative imports for internal modules
-    string(REPLACE "from flash_mla." "from ." _content
-                   "${_content}")
+    string(REPLACE "from flash_mla." "from ." _content "${_content}")
 
     # Add adaptation header
     string(
@@ -115,9 +115,9 @@ endforeach()
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
 
-# Define source files matching FlashMLA's setup.py
-# Note: pybind.cpp has runtime checks (arch.is_sm90()), but still references all kernel symbols
-# We compile all sources to avoid undefined symbols at module load time
+# Define source files matching FlashMLA's setup.py Note: pybind.cpp has runtime
+# checks (arch.is_sm90()), but still references all kernel symbols We compile
+# all sources to avoid undefined symbols at module load time
 set(FLASH_MLA_SOURCES
     ${FLASH_MLA_SOURCE_DIR}/csrc/pybind.cpp
     ${FLASH_MLA_SOURCE_DIR}/csrc/smxx/get_mla_metadata.cu
@@ -125,23 +125,27 @@ set(FLASH_MLA_SOURCES
 
 # Add SM90 sources (always include if CUDA >= 12.3)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
-  list(APPEND FLASH_MLA_SOURCES
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/dense/splitkv_mla.cu
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/splitkv_mla.cu
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu)
+  list(
+    APPEND
+    FLASH_MLA_SOURCES
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/dense/splitkv_mla.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/splitkv_mla.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu)
 endif()
 
 # Add SM100 sources (always include if CUDA >= 12.9)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
-  list(APPEND FLASH_MLA_SOURCES
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/decode/sparse_fp8/splitkv_mla.cu
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
-       ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu)
+  list(
+    APPEND
+    FLASH_MLA_SOURCES
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/decode/sparse_fp8/splitkv_mla.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
+    ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu)
 endif()
 
-# Disable LTO before creating target (matching DeepEP's approach)
-# Let CMake generate fatbinData for CUDA separable compilation
+# Disable LTO before creating target (matching DeepEP's approach) Let CMake
+# generate fatbinData for CUDA separable compilation
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 pybind11_add_module(flash_mla_cpp_tllm ${FLASH_MLA_SOURCES})
@@ -159,8 +163,8 @@ set_target_properties(
              INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
 
-# Set CUDA architectures
-# Compile kernels for all CUDA-version-supported architectures since pybind.cpp references them
+# Set CUDA architectures Compile kernels for all CUDA-version-supported
+# architectures since pybind.cpp references them
 set(FLASH_MLA_BUILD_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
   list(APPEND FLASH_MLA_BUILD_ARCHS "90")
@@ -173,36 +177,37 @@ set_cuda_architectures(flash_mla_cpp_tllm ${FLASH_MLA_BUILD_ARCHS})
 # Compiler options matching FlashMLA setup.py
 target_compile_options(
   flash_mla_cpp_tllm
-  PRIVATE ${TORCH_CXX_FLAGS}
-          $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
-          $<$<COMPILE_LANGUAGE:CXX>:-O3>
-          $<$<COMPILE_LANGUAGE:CXX>:-fPIC>
-          $<$<COMPILE_LANGUAGE:CXX>:-DNDEBUG>
-          $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
-          $<$<COMPILE_LANGUAGE:CXX>:-fno-lto>
-          $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-          $<$<COMPILE_LANGUAGE:CUDA>:-std=c++17>
-          $<$<COMPILE_LANGUAGE:CUDA>:-DNDEBUG>
-          $<$<COMPILE_LANGUAGE:CUDA>:-D_USE_MATH_DEFINES>
-          $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-declarations>
-          $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__>
-          $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_CONVERSIONS__>
-          $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF2_OPERATORS__>
-          $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_BFLOAT16_CONVERSIONS__>
-          $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-          $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-          $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-          $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v,--register-usage-level=10>)
+  PRIVATE
+    ${TORCH_CXX_FLAGS}
+    $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>
+    $<$<COMPILE_LANGUAGE:CXX>:-fPIC>
+    $<$<COMPILE_LANGUAGE:CXX>:-DNDEBUG>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-lto>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:CUDA>:-DNDEBUG>
+    $<$<COMPILE_LANGUAGE:CUDA>:-D_USE_MATH_DEFINES>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-declarations>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_CONVERSIONS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF2_OPERATORS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_BFLOAT16_CONVERSIONS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+    $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v,--register-usage-level=10>)
 
 # Extension name definition
 target_compile_definitions(flash_mla_cpp_tllm
                            PRIVATE TORCH_EXTENSION_NAME=flash_mla_cpp_tllm)
 
-
 # Include directories matching FlashMLA setup.py
 target_include_directories(
   flash_mla_cpp_tllm
-  PRIVATE ${CUDA_INCLUDE_DIRS} ${FLASH_MLA_SOURCE_DIR}/csrc
+  PRIVATE ${CUDA_INCLUDE_DIRS}
+          ${FLASH_MLA_SOURCE_DIR}/csrc
           ${FLASH_MLA_SOURCE_DIR}/csrc/sm90
           ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/include
           ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/tools/util/include)
@@ -220,4 +225,3 @@ target_link_directories(
 # Set targets
 # ===========
 add_dependencies(flash_mla flash_mla_cpp_tllm)
-
