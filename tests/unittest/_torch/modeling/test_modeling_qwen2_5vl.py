@@ -6,7 +6,7 @@ from typing import List
 
 import pytest
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from parameterized import parameterized
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLConfig
 from transformers import \
@@ -19,7 +19,6 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs import (create_input_processor,
@@ -480,11 +479,8 @@ class TestQwen2_5_VL(unittest.TestCase):
                 target_keywords=["mrope_config.mrope_position_deltas"])
             gen_multimodal_params_list.append(multimodal_param)
 
-        graph_runner = None
-        if scenario.use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            mock_engine.use_mrope = True
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(
+            1, True) if scenario.use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata,
                         multimodal_params):
