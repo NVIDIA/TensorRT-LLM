@@ -1893,6 +1893,12 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
 def get_gpu_device_list():
     "get device list"
     with tempfile.TemporaryDirectory() as temp_dirname:
