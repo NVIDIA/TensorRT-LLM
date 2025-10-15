@@ -41,12 +41,14 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(
-    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, BlockKey const& lastBlockKey, int32_t indexFromEnd)
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP)
 {
     constexpr SizeType32 beam{0};
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0)
+    // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
+    // distributed among CP ranks. So, we transfer all blocks from send side.
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP)
     {
         auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
         return blockRange;
