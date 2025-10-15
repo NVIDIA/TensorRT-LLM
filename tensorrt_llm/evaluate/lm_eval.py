@@ -69,6 +69,12 @@ class LmEvalWrapper(TemplateLM):
         """
         Method to apply a chat template to a list of chat history between user and model.
         """
+        chat_template_kwargs = {
+            "continue_final_message": not add_generation_prompt,
+        }
+        if self.enable_thinking:
+            chat_template_kwargs["thinking"] = True
+
         return self.llm.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
@@ -332,6 +338,7 @@ class LmEvalEvaluator(Evaluator):
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
+        self.enable_thinking = enable_thinking
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -545,6 +552,10 @@ class GPQADiamond(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--enable_thinking",
+                  is_flag=True,
+                  default=False,
+                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
@@ -595,6 +606,10 @@ class GPQAMain(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--enable_thinking",
+                  is_flag=True,
+                  default=False,
+                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
@@ -645,6 +660,10 @@ class GPQAExtended(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="System prompt.")
+    @click.option("--enable_thinking",
+                  is_flag=True,
+                  default=False,
+                  help="Enable thinking mode for reasoning models (e.g., DeepSeek-V3.2).")
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
