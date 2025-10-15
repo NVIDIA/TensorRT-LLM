@@ -357,7 +357,7 @@ class MTPForCausalLM(nn.Module):
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
-            case "deepseekv3":
+            case "deepseek_v3":
                 from .modeling_deepseekv3 import DeepseekV3MTP
                 mtp_layer = DeepseekV3MTP
             case _:
