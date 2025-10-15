@@ -2101,17 +2101,17 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help=
-        "Enable periodic JUnit XML reporter. This reporter uses incremental append strategy "
-        "for ultra-fast periodic saves, ideal for very large test suites. Saves progress periodically "
-        "to prevent data loss on interruption. Requires --output-dir to be set.",
+        "Enable periodic JUnit XML reporter. This reporter leverages pytest's built-in junitxml "
+        "for reliable test result handling. Saves progress periodically to prevent data loss on "
+        "interruption. Requires --output-dir to be set.",
     )
     parser.addoption(
         "--periodic-interval",
         action="store",
         type=int,
-        default=1800,
+        default=18000,
         help=
-        "Time interval in seconds between periodic saves (default: 1800s = 30min). "
+        "Time interval in seconds between periodic saves (default: 18000s = 5 hours). "
         "Only used with --periodic-junit.",
     )
     parser.addoption(
@@ -2121,7 +2121,7 @@ def pytest_addoption(parser):
         default=10,
         help=
         "Number of completed tests before triggering a periodic save (default: 10). "
-        "Only used with --lightweight-periodic-junit.",
+        "Only used with --periodic-junit.",
     )
 
 

@@ -15,29 +15,35 @@
 """
 Periodic JUnit XML Reporter for pytest.
 
-This module provides a lightweight periodic JUnit XML reporter that uses incremental
-append strategy for ultra-fast periodic saves, ideal for very large test suites.
+This module provides a lightweight periodic JUnit XML reporter that leverages
+pytest's built-in junitxml plugin for simplified test result handling.
 """
 
-import datetime
 import os
 import platform
 import signal
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from typing import Optional
+
+try:
+    from _pytest.config import Config
+    from _pytest.junitxml import LogXML
+    from _pytest.reports import TestReport
+except ImportError:
+    # Fallback for different pytest versions
+    Config = None  # type: ignore
+    TestReport = None  # type: ignore
+    LogXML = None  # type: ignore
 
 
 class PeriodicJUnitXML:
     """
-    Periodic JUnit XML reporter using incremental append.
+    Periodic JUnit XML reporter using pytest's built-in junitxml.
 
-    This version is efficient by appending test results incrementally
-    instead of rewriting the entire file each time. Best for very large test suites.
-
-    Trade-offs:
-    + Extremely fast saves (constant time)
-    + Minimal memory usage
-    - More complex XML handling
-    - Final cleanup needed to consolidate statistics
+    This version leverages pytest's LogXML plugin to avoid manual XML construction
+    and test report parsing. Much simpler and more maintainable than the previous version.
 
     Usage:
         Add to conftest.py:
@@ -48,34 +54,18 @@ class PeriodicJUnitXML:
             reporter = PeriodicJUnitXML(
                 xmlpath='results/junit_report.xml',
                 interval=18000,    # Save every 5 hours
-                batch_size=10,    # Or save every 10 tests
-                use_fsync=False   # Disable fsync for better performance (default)
+                batch_size=10,     # Or save every 10 tests
             )
             reporter.pytest_configure(config)
             config.pluginmanager.register(reporter, 'periodic_junit')
-
-        Performance Note:
-            - use_fsync=False (default): Fast, relies on OS buffer. Risk: data loss on crash
-            - use_fsync=True: Slow (10-100x), guarantees disk write. Use for critical data
     """
-
-    # Compile regex pattern once at class level for better performance
-    import re
-    _ANSI_ESCAPE_PATTERN = re.compile(
-        r'\x1b'  # ESC character
-        r'(?:'  # Start non-capturing group
-        r'\[[0-?]*[ -/]*[@-~]'  # CSI sequences: ESC [ ... letter
-        r'|].*?(?:\x07|\x1b\\)'  # OSC sequences: ESC ] ... BEL/ESC\
-        r'|[()][AB012]'  # Character set selection
-        r')')
 
     def __init__(
             self,
             xmlpath: str,
-            interval: int = 1800,
+            interval: int = 18000,  # Default 5 hours
             batch_size: int = 10,
-            logger=None,  # Optional logger (print_info, print_warning functions)
-            use_fsync: bool = False,  # Whether to use fsync for data safety
+            logger=None,  # Optional logger (info, warning functions)
     ):
         """
         Initialize periodic reporter.
@@ -85,21 +75,18 @@ class PeriodicJUnitXML:
             interval: Time interval in seconds between saves (default: 1800 = 30 min)
             batch_size: Number of tests before triggering a save (default: 10)
             logger: Optional dictionary with 'info' and 'warning' functions for logging
-            use_fsync: Whether to use os.fsync() to force disk writes (default: False for performance)
-                      Set to True for maximum data safety at cost of performance
         """
         self.xmlpath = os.path.abspath(xmlpath)
         self.time_interval = interval
         self.batch_size = batch_size
         self.logger = logger or {}
-        self.use_fsync = use_fsync
 
         self.completed_tests = 0
         self.last_save_time = time.time()
         self.suite_start_time = time.time()
 
-        # Initialize statistics and tracking structures
-        self.__init_stats()
+        self.logxml: Optional[LogXML] = None
+        self.old_output_file = None
 
     def _log_info(self, message):
         """Log info message."""
@@ -115,534 +102,158 @@ class PeriodicJUnitXML:
         else:
             print(f"WARNING: {message}")
 
-    @classmethod
-    def _sanitize_xml_text(cls, text):
-        """
-        Sanitize text for XML by removing illegal characters.
+    def pytest_configure(self, config: Config):
+        """Configure and initialize the LogXML plugin."""
+        # Ensure required attributes exist on config
+        if not hasattr(config, 'option'):
+            config.option = type('Namespace', (), {})()
+        if not hasattr(config.option, 'xmlpath'):
+            config.option.xmlpath = self.xmlpath
+        if not hasattr(config.option, 'junit_logging'):
+            config.option.junit_logging = 'out-err'
 
-        XML 1.0 only allows:
-        - #x9 (TAB)
-        - #xA (LF)
-        - #xD (CR)
-        - #x20-#xD7FF
-        - #xE000-#xFFFD
-        - #x10000-#x10FFFF
-
-        This removes:
-        - ANSI escape sequences (terminal colors)
-        - Other control characters
-        """
-        if not text:
-            return text
-
-        # Remove ANSI escape sequences using pre-compiled pattern
-        text = cls._ANSI_ESCAPE_PATTERN.sub('', text)
-
-        # Remove other control characters except allowed ones
-        # Keep: tab(0x09), newline(0x0A), carriage return(0x0D)
-        # Optimized: Use list comprehension and join for better performance
-        result = []
-        for c in text:
-            codepoint = ord(c)
-            if (codepoint == 0x09 or codepoint == 0x0A or codepoint == 0x0D
-                    or (0x20 <= codepoint <= 0xD7FF)
-                    or (0xE000 <= codepoint <= 0xFFFD)
-                    or (0x10000 <= codepoint <= 0x10FFFF)):
-                result.append(c)
-
-        return ''.join(result)
-
-    @staticmethod
-    def _parse_nodeid(nodeid):
-        """
-        Parse nodeid to extract classname and test name.
-
-        The logic follows pytest nodeid format with optional test prefix:
-        - Format: [prefix/]path/to/test.py::ClassName::test_name
-        - Or: [prefix/]path/to/test.py::test_name (no class)
-
-        Rules:
-        - Everything before '.py' is the package (converted to dot notation)
-        - After '.py::', split by '::':
-          - If there are 2+ parts, first part is the class, last part is test name
-          - If there is 1 part, it's just the test name (no class)
-        - Package becomes the classname, or package.class if class exists
-
-        Examples:
-            'RTX/test_e2e.py::test_foo[param]' ->
-                ('RTX.test_e2e', 'test_foo[param]')
-
-            'RTX/accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp4ep2-cuda_graph=True]' ->
-                ('RTX.accuracy.test_llm_api_pytorch.TestLlama4ScoutInstruct', 'test_auto_dtype[tp4ep2-cuda_graph=True]')
-
-            'tests/test_foo.py::test_bar' ->
-                ('tests.test_foo', 'test_bar')
-
-        Args:
-            nodeid: The pytest nodeid string
-
-        Returns:
-            tuple: (classname, test_name)
-        """
-        if not nodeid:
-            return ('', '')
-
-        # Split by '.py' to separate file path from test components
-        if '.py' in nodeid:
-            file_part, test_part = nodeid.split('.py', 1)
-
-            # Convert file path to package notation (replace / and \ with .)
-            package = file_part.replace('/', '.').replace('\\', '.').strip('.')
-
-            # Parse test components after '.py'
-            # Remove leading '::' if present
-            test_part = test_part.lstrip(':')
-
-            if '::' in test_part:
-                # Split by '::' to get class and test name
-                parts = test_part.split('::')
-
-                if len(parts) >= 2:
-                    # Format: ClassName::test_name or ClassName::nested::test_name
-                    # First part is class, last part is test name
-                    class_name = parts[0]
-                    test_name = parts[-1]
-
-                    # Combine package and class
-                    classname = f"{package}.{class_name}"
-                else:
-                    # Only one part after split (shouldn't happen with '::' check, but safety)
-                    classname = package
-                    test_name = parts[0]
-            else:
-                # No '::' found, entire test_part is the test name
-                classname = package
-                test_name = test_part if test_part else nodeid
-        else:
-            # No '.py' in nodeid, use as-is (fallback)
-            # This might happen with special test formats
-            if '::' in nodeid:
-                parts = nodeid.split('::')
-                classname = '.'.join(parts[:-1])
-                test_name = parts[-1]
-            else:
-                classname = nodeid
-                test_name = nodeid
-
-        return (classname, test_name)
-
-    @staticmethod
-    def _format_classname(classname):
-        """
-        Format classname for JUnit XML report.
-
-        Removes .py extension and converts path separators to dots
-        to create a proper package/class hierarchy.
-
-        Examples:
-            'tests/integration/test_foo.py' -> 'tests.integration.test_foo'
-            'H100.examples.test_eagle' -> 'H100.examples.test_eagle'
-            'path/to/test_bar.py::TestClass' -> 'path.to.test_bar.TestClass'
-        """
-        if not classname:
-            return classname
-
-        # Remove .py extension
-        if classname.endswith('.py'):
-            classname = classname[:-3]
-
-        # Replace path separators with dots
-        classname = classname.replace('/', '.').replace('\\', '.')
-
-        # Remove leading/trailing dots
-        classname = classname.strip('.')
-
-        return classname
-
-    @staticmethod
-    def _extract_error_message(report):
-        """
-        Extract a concise error message from a test report.
-
-        This extracts the most relevant error information for the 'message' attribute
-        of error/failure elements in JUnit XML.
-
-        Returns a string suitable for the message attribute.
-        """
-        # Try to get exception info first
-        if hasattr(report, 'longrepr') and report.longrepr:
-            try:
-                # For ExceptionInfo objects
-                if hasattr(report.longrepr, 'reprcrash'):
-                    crash = report.longrepr.reprcrash
-                    if crash:
-                        # Get the crash message (usually "file:line: ExceptionType: message")
-                        return str(crash.message) if hasattr(
-                            crash, 'message') else str(crash)
-
-                # For string representations
-                longrepr_str = str(report.longrepr)
-
-                # Try to extract the last line which usually contains the key error
-                lines = longrepr_str.strip().split('\n')
-
-                # Look for exception type and message (usually in the last few lines)
-                for line in reversed(lines[-10:]):  # Check last 10 lines
-                    line = line.strip()
-                    # Common patterns: "ExceptionType: message" or "E   AssertionError: ..."
-                    if line and (': ' in line or line.startswith('E ')):
-                        # Remove leading 'E ' from pytest output
-                        if line.startswith('E '):
-                            line = line[2:].strip()
-
-                        # Limit length to avoid too long messages
-                        if len(line) > 200:
-                            line = line[:197] + '...'
-
-                        return line
-
-                # Fallback: use first non-empty line
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('_'):
-                        if len(line) > 200:
-                            line = line[:197] + '...'
-                        return line
-
-            except Exception:
-                pass
-
-        # Fallback to longreprtext if available
-        if hasattr(report, 'longreprtext') and report.longreprtext:
-            lines = report.longreprtext.strip().split('\n')
-            for line in reversed(lines[-5:]):
-                line = line.strip()
-                if line:
-                    if len(line) > 200:
-                        line = line[:197] + '...'
-                    return line
-
-        # Last resort: generic message
-        if report.failed:
-            return f"{report.when} failed"
-        elif report.skipped:
-            return "skipped"
-        else:
-            return "test issue"
-
-    def __init_stats(self):
-        """Initialize test statistics tracking."""
-        # Statistics tracking
-        self.stats = {
-            'tests': 0,
-            'errors': 0,
-            'failures': 0,
-            'skipped': 0,
-            'passed': 0,
-            'time': 0.0,
-        }
-
-        # Pending test cases buffer
-        self.pending_cases = []
-
-        # Store test reports by nodeid to accumulate across phases (setup, call, teardown)
-        self.test_reports = {}
-
-        # File handle for incremental writes
-        self.xml_file = None
-        self.header_written = False
-
-    def pytest_configure(self, config):
-        """Configure and initialize output file."""
-        os.makedirs(os.path.dirname(self.xmlpath), exist_ok=True)
-
-        # Open file for incremental writing
-        self.xml_file = open(self.xmlpath, 'w', encoding='utf-8')
-
-        # Write XML header and opening tags
-        self.xml_file.write('<?xml version="1.0" encoding="utf-8"?>\n')
-        self.xml_file.write('<testsuites>\n')
-        self.xml_file.write('  <testsuite name="pytest">\n')
-        self.xml_file.flush()
-        self.header_written = True
+        # Initialize the LogXML plugin (pytest's built-in junitxml reporter)
+        self.logxml = LogXML(
+            self.xmlpath,
+            None,  # prefix
+            'pytest',  # suite_name
+            'out-err',  # logging - capture stdout and stderr only
+        )
+        self.logxml.config = config
+        self.logxml.stats = dict.fromkeys(
+            ['error', 'passed', 'failure', 'skipped'], 0)
+        self.logxml.node_reporters = {}  # type: ignore
+        self.logxml.node_reporters_ordered = []  # type: ignore
+        self.logxml.global_properties = []
 
         # Register signal handlers for graceful shutdown
         self._register_signal_handlers()
 
         self._log_info(f"PeriodicJUnitXML: Initialized at {self.xmlpath}")
 
-    def pytest_runtest_logreport(self, report):
-        """Collect test results and save periodically."""
-        nodeid = report.nodeid
+    def pytest_runtest_logreport(self, report: TestReport):
+        """Handle test reports and trigger periodic saving."""
+        if self.logxml is not None:
+            # Delegate to pytest's built-in LogXML to handle all the complex parsing
+            self.logxml.pytest_runtest_logreport(report)
 
-        # Accumulate reports for all phases (setup, call, teardown)
-        if nodeid not in self.test_reports:
-            self.test_reports[nodeid] = {
-                'setup': None,
-                'call': None,
-                'teardown': None,
-                'duration': 0.0,
-                'outcome': 'passed',
-            }
+            # Only increment counter and check for save on teardown phase
+            if report.when == "teardown":
+                self.completed_tests += 1
+                current_time = time.time()
 
-        # Store the report for this phase
-        self.test_reports[nodeid][report.when] = report
-        self.test_reports[nodeid]['duration'] += getattr(
-            report, 'duration', 0.0)
+                # Check if we need to save based on time interval
+                if current_time - self.last_save_time >= self.time_interval:
+                    tests_to_process = 0
+                    if self.completed_tests >= self.batch_size:
+                        self._log_info(
+                            f"Completed {self.completed_tests} cases during the last "
+                            f"{current_time - self.last_save_time:.0f} seconds")
+                        tests_to_process = self.completed_tests
+                        self.completed_tests = 0  # Reset counter
+                        self.last_save_time = current_time
 
-        # Update outcome (failed takes precedence over skipped)
-        if report.failed:
-            self.test_reports[nodeid]['outcome'] = 'failed'
-        elif report.skipped and self.test_reports[nodeid]['outcome'] != 'failed':
-            self.test_reports[nodeid]['outcome'] = 'skipped'
-
-        # Only process on teardown phase (when test is fully complete)
-        if report.when != 'teardown':
-            return
-
-        # Extract test case information from all accumulated reports
-        test_case = self._create_testcase_xml_from_reports(
-            nodeid, self.test_reports[nodeid])
-        self.pending_cases.append(test_case)
-
-        # Update statistics
-        self.stats['tests'] += 1
-        self.stats['time'] += self.test_reports[nodeid]['duration']
-
-        outcome = self.test_reports[nodeid]['outcome']
-        if outcome == 'failed':
-            self.stats['failures'] += 1
-        elif outcome == 'skipped':
-            self.stats['skipped'] += 1
-        else:
-            self.stats['passed'] += 1
-
-        # Clean up stored reports for this test
-        del self.test_reports[nodeid]
-
-        self.completed_tests += 1
-        current_time = time.time()
-
-        # Check if we should flush pending cases
-        if (self.completed_tests >= self.batch_size
-                or current_time - self.last_save_time >= self.time_interval):
-            self._flush_pending_cases()
-            self.completed_tests = 0
-            self.last_save_time = current_time
-
-    def _create_testcase_xml_from_reports(self, nodeid, test_info):
-        """Create XML string for a single test case from accumulated reports."""
-        import xml.etree.ElementTree as ET
-
-        # Get the primary report (prefer call, then teardown, then setup)
-        primary_report = (test_info.get('call') or test_info.get('teardown')
-                          or test_info.get('setup'))
-
-        if not primary_report:
-            return None
-
-        # Parse nodeid to extract package, classname, and test name
-        # Format: [prefix/]path/to/test.py::ClassName::test_name
-        # or: [prefix/]path/to/test.py::test_name
-        classname, test_name = self._parse_nodeid(nodeid)
-
-        testcase = ET.Element(
-            'testcase',
-            classname=classname,
-            name=test_name,
-            time=f"{test_info['duration']:.3f}",
-        )
-
-        # Add file and line attributes if available
-        if hasattr(primary_report, 'location') and len(
-                primary_report.location) > 1:
-            testcase.set('file', primary_report.location[0])
-            if primary_report.location[1] is not None:
-                testcase.set('line', str(primary_report.location[1]))
-
-        # Add failure/error/skip information
-        outcome = test_info['outcome']
-        failed_report = None
-
-        # Check each phase for failures
-        for phase in ['setup', 'call', 'teardown']:
-            report = test_info.get(phase)
-            if report and report.failed:
-                failed_report = report
-
-                # Extract meaningful error message
-                error_msg = self._extract_error_message(report)
-                error_msg = self._sanitize_xml_text(error_msg)
-
-                if phase == 'setup':
-                    failure = ET.SubElement(testcase,
-                                            'error',
-                                            message=error_msg)
-                else:
-                    failure = ET.SubElement(testcase,
-                                            'failure',
-                                            message=error_msg)
-
-                # Add full traceback as element text
-                if hasattr(report, 'longreprtext'):
-                    failure.text = self._sanitize_xml_text(report.longreprtext)
-                break
-
-        # Check for skipped
-        if not failed_report and outcome == 'skipped':
-            for phase in ['setup', 'call', 'teardown']:
-                report = test_info.get(phase)
-                if report and report.skipped:
-                    # Extract skip reason
-                    skip_msg = self._extract_error_message(report)
-                    skip_msg = self._sanitize_xml_text(
-                        skip_msg) if skip_msg else 'skipped'
-
-                    skip = ET.SubElement(testcase, 'skipped', message=skip_msg)
-                    if hasattr(report, 'longreprtext'):
-                        skip.text = self._sanitize_xml_text(report.longreprtext)
-                    break
-
-        # Collect captured output from ALL phases (setup, call, teardown)
-        # This is the key part for --junit_logging functionality
-        stdout_content = []
-        stderr_content = []
-
-        for phase in ['setup', 'call', 'teardown']:
-            report = test_info.get(phase)
-            if not report:
-                continue
-
-            # Method 1: Check for sections attribute (pytest's captured output)
-            if hasattr(report, 'sections') and report.sections:
-                for section_name, section_content in report.sections:
-                    if section_content:
-                        if 'stdout' in section_name.lower(
-                        ) or 'Captured stdout' in section_name:
-                            stdout_content.append(
-                                f'--- {phase} {section_name} ---\n{section_content}'
-                            )
-                        elif 'stderr' in section_name.lower(
-                        ) or 'Captured stderr' in section_name:
-                            stderr_content.append(
-                                f'--- {phase} {section_name} ---\n{section_content}'
-                            )
-                        elif 'log' in section_name.lower(
-                        ) or 'Captured log' in section_name:
-                            # Logs typically go to stdout
-                            stdout_content.append(
-                                f'--- {phase} {section_name} ---\n{section_content}'
-                            )
-
-            # Method 2: Fallback to direct capture attributes
-            if hasattr(report, 'capstdout') and report.capstdout:
-                stdout_content.append(
-                    f'--- {phase} stdout ---\n{report.capstdout}')
-            if hasattr(report, 'capstderr') and report.capstderr:
-                stderr_content.append(
-                    f'--- {phase} stderr ---\n{report.capstderr}')
-            if hasattr(report, 'caplog') and report.caplog:
-                stdout_content.append(
-                    f'--- {phase} Captured Log ---\n{report.caplog}')
-
-        # Add system-out element if we have stdout content
-        if stdout_content:
-            system_out = ET.SubElement(testcase, 'system-out')
-            # Sanitize the combined stdout to remove ANSI codes and invalid XML chars
-            system_out.text = self._sanitize_xml_text(
-                '\n\n'.join(stdout_content))
-
-        # Add system-err element if we have stderr content
-        if stderr_content:
-            system_err = ET.SubElement(testcase, 'system-err')
-            # Sanitize the combined stderr to remove ANSI codes and invalid XML chars
-            system_err.text = self._sanitize_xml_text(
-                '\n\n'.join(stderr_content))
-
-        return ET.tostring(testcase, encoding='unicode')
-
-    def _flush_pending_cases(self):
-        """Write pending test cases to file."""
-        if not self.pending_cases or not self.xml_file:
-            return
-
-        try:
-            for case_xml in self.pending_cases:
-                # Indent for pretty printing
-                lines = case_xml.split('\n')
-                for line in lines:
-                    if line.strip():
-                        self.xml_file.write(f'    {line}\n')
-
-            # Always flush to OS buffer (fast operation)
-            self.xml_file.flush()
-
-            # Optionally force write to disk (slow but safer)
-            # fsync can be 100-1000x slower than flush, so it's disabled by default
-            if self.use_fsync:
-                os.fsync(self.xml_file.fileno())
-
-            self._log_info(
-                f"Flushed {len(self.pending_cases)} test cases to report")
-            self.pending_cases.clear()
-
-        except Exception as e:
-            self._log_warning(f"Failed to flush test cases: {e}")
+                    if tests_to_process > 0:
+                        try:
+                            self._generate_report()
+                        except Exception as e:
+                            self._log_warning(
+                                f"Error generating periodic report: {e}")
 
     def pytest_sessionfinish(self):
-        """Finalize report with closing tags and statistics."""
+        """Generate final report at session end."""
         try:
-            # Flush any remaining test cases
-            self._flush_pending_cases()
-
-            if self.xml_file:
-                # Write closing tags
-                self.xml_file.write('  </testsuite>\n')
-                self.xml_file.write('</testsuites>\n')
-                self.xml_file.close()
-                self.xml_file = None
-
-                # Update testsuite attributes using post-processing
-                self._update_suite_attributes()
-
-                self._log_info(f"\nPeriodicJUnitXML: Session finished")
-                self._log_info(f"  Tests: {self.stats['tests']}")
-                self._log_info(f"  Failures: {self.stats['failures']}")
-                self._log_info(f"  Errors: {self.stats['errors']}")
-                self._log_info(f"  Skipped: {self.stats['skipped']}")
-                self._log_info(f"  Total time: {self.stats['time']:.3f}s")
-
+            self._generate_report(is_final=True)
         except Exception as e:
-            self._log_warning(f"Error finalizing report: {e}")
+            self._log_warning(f"Error generating final report: {e}")
 
-    def _update_suite_attributes(self):
-        """Update testsuite element with final statistics."""
-        import xml.etree.ElementTree as ET
+    def _generate_report(self, is_final=False):
+        """
+        Generate XML report with executed tests.
+
+        Args:
+            is_final: If True, write to the main output file. Otherwise, create timestamped file.
+        """
+        if self.logxml is None or not self.logxml.node_reporters_ordered:
+            return
 
         try:
-            # Parse the file we just wrote
-            tree = ET.parse(self.xmlpath)
-            root = tree.getroot()
-            suite = root.find('testsuite')
+            # Choose output file path
+            if is_final:
+                output_file = self.xmlpath
+            else:
+                # Create filename with timestamp for intermediate reports
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dirname = os.path.dirname(self.xmlpath)
+                basename = os.path.basename(self.xmlpath)
+                name, ext = os.path.splitext(basename)
+                output_file = os.path.join(dirname,
+                                           f"{name}_periodic_{timestamp}{ext}")
 
-            if suite is not None:
-                # Update attributes
-                suite.set('tests', str(self.stats['tests']))
-                suite.set('failures', str(self.stats['failures']))
-                suite.set('errors', str(self.stats['errors']))
-                suite.set('skipped', str(self.stats['skipped']))
-                suite.set('time', f"{self.stats['time']:.3f}")
-                suite.set(
-                    'timestamp',
-                    datetime.datetime.fromtimestamp(
-                        self.suite_start_time).strftime("%Y-%m-%dT%H:%M:%S"))
-                suite.set('hostname', platform.node())
+            # Create directory if needed
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-                # Write back
-                tree.write(self.xmlpath, encoding='utf-8', xml_declaration=True)
+            # Write to temporary file first for atomic operation
+            temp_file = output_file + '.tmp'
+            with open(temp_file, "w", encoding="utf-8") as logfile:
+                suite_stop_time = time.time()
+                suite_time_delta = suite_stop_time - self.suite_start_time
+
+                stats = self.logxml.stats
+                numtests = sum(stats.values()) - getattr(
+                    self.logxml, 'cnt_double_fail_tests', 0)
+
+                # Build XML structure
+                logfile.write('<?xml version="1.0" encoding="utf-8"?>')
+                suite_node = ET.Element(
+                    "testsuite",
+                    name="pytest",
+                    errors=str(stats["error"]),
+                    failures=str(stats["failure"]),
+                    skipped=str(stats["skipped"]),
+                    tests=str(numtests),
+                    time=f"{suite_time_delta:.3f}",
+                    timestamp=datetime.fromtimestamp(
+                        self.suite_start_time).strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                    hostname=platform.node(),
+                )
+
+                # Add all test cases using pytest's node reporters
+                for node_reporter in self.logxml.node_reporters_ordered:
+                    suite_node.append(node_reporter.to_xml())
+
+                testsuites = ET.Element("testsuites")
+                testsuites.append(suite_node)
+                logfile.write(ET.tostring(testsuites, encoding="unicode"))
+
+            # Atomic rename to final location
+            os.replace(temp_file, output_file)
+
+            # Remove old periodic XML report to save disk space
+            if self.old_output_file and os.path.exists(self.old_output_file):
+                try:
+                    self._log_info(
+                        f"Removing old report {self.old_output_file}, latest is {output_file}"
+                    )
+                    os.remove(self.old_output_file)
+                except Exception as e:
+                    self._log_warning(f"Failed to remove old report: {e}")
+
+            # Update old output file reference
+            self.old_output_file = output_file
+
+            self._log_info(
+                f"Generated report with {numtests} tests: {output_file}")
 
         except Exception as e:
-            self._log_warning(f"Failed to update suite attributes: {e}")
+            self._log_warning(f"Error in report generation: {e}")
+            # Clean up temporary file if it exists
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+            raise
 
     def _register_signal_handlers(self):
         """Register signal handlers for graceful shutdown on interruption."""
@@ -655,28 +266,16 @@ class PeriodicJUnitXML:
             )
 
             try:
-                # Flush any pending test cases
-                if self.pending_cases:
+                # Save current progress with all completed tests
+                if self.logxml and self.logxml.node_reporters_ordered:
                     self._log_info(
-                        f"Flushing {len(self.pending_cases)} pending test cases..."
+                        f"Saving {len(self.logxml.node_reporters_ordered)} test results..."
                     )
-                    self._flush_pending_cases()
-
-                # Close the file properly
-                if self.xml_file:
-                    self.xml_file.write('  </testsuite>\n')
-                    self.xml_file.write('</testsuites>\n')
-                    self.xml_file.close()
-                    self.xml_file = None
-
-                    # Update statistics
-                    self._update_suite_attributes()
-
+                    self._generate_report(is_final=True)
                     self._log_info(
-                        f"✅ Successfully saved {self.stats['tests']} test results to {self.xmlpath}"
-                    )
+                        f"✅ Successfully saved test results to {self.xmlpath}")
                 else:
-                    self._log_warning("XML file already closed")
+                    self._log_warning("No test results to save")
 
             except Exception as e:
                 self._log_warning(
