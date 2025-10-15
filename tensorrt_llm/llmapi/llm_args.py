@@ -2116,7 +2116,6 @@ class BaseLlmArgs(StrictBaseModel):
         moe_cluster_size = pretrained_config.mapping.moe_cluster_size
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
-        pretrained_config.mapping.world_size
         gpus_per_node = pretrained_config.mapping.gpus_per_node
         # load parallel_config
         if self.parallel_config.tp_size != 1 and self.parallel_config.tp_size != tp_size:
