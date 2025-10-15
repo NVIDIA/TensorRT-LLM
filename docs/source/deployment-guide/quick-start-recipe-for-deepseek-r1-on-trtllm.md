@@ -58,7 +58,7 @@ Note:
 * The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
 * See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html) 
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
 
 ### Creating the TensorRT LLM Server config
 
@@ -226,7 +226,7 @@ Refer to the wide EP [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main
 
 ### Basic Test
 
-Start a new terminal on the host to test the TensorRT LLM server you just launched. 
+Start a new terminal on the host to test the TensorRT LLM server you just launched.
 
 You can query the health/readiness of the server using:
 
@@ -354,7 +354,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
 Run `bench.sh` to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above `bench.sh` script.
 
@@ -395,13 +395,13 @@ P99 E2EL (ms):                            [result]
 
 ### Key Metrics
 
-* Median Time to First Token (TTFT)
+* Time to First Token (TTFT)
   * The typical time elapsed from when a request is sent until the first output token is generated.
-* Median Time Per Output Token (TPOT)
+* Time Per Output Token (TPOT)
   * The typical time required to generate each token *after* the first one.
-* Median Inter-Token Latency (ITL)
+* Inter-Token Latency (ITL)
   * The typical time delay between the completion of one token and the completion of the next.
-* Median End-to-End Latency (E2EL)
+* End-to-End Latency (E2EL)
   * The typical total time from when a request is submitted until the final token of the response is received.
 * Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.

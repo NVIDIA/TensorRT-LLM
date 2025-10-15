@@ -299,7 +299,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
 Run bench.sh to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above bench.sh script.
 
@@ -340,13 +340,13 @@ P99 E2EL (ms):                            [result]
 
 ### Key Metrics
 
-* Median Time to First Token (TTFT)
+* Time to First Token (TTFT)
   * The typical time elapsed from when a request is sent until the first output token is generated.
-* Median Time Per Output Token (TPOT)
+* Time Per Output Token (TPOT)
   * The typical time required to generate each token *after* the first one.
-* Median Inter-Token Latency (ITL)
+* Inter-Token Latency (ITL)
   * The typical time delay between the completion of one token and the completion of the next.
-* Median End-to-End Latency (E2EL)
+* End-to-End Latency (E2EL)
   * The typical total time from when a request is submitted until the final token of the response is received.
 * Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
