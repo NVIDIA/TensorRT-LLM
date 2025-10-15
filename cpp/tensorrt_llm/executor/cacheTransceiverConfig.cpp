@@ -24,7 +24,7 @@ namespace tensorrt_llm::executor
 CacheTransceiverConfig::CacheTransceiverConfig(
     std::optional<BackendType> backendType, std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs)
     : mBackendType(backendType)
-    : mMaxTokensInBuffer(maxNumTokens)
+    , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
 {
 }
