@@ -5,12 +5,19 @@ import threading
 from subprocess import PIPE, Popen
 from typing import Literal
 
+cur_dir = os.path.dirname(os.path.abspath(__file__))
+
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
                                              split_mpi_env)
+
+# isort: off
+sys.path.append(os.path.join(cur_dir, '..'))
+from utils.util import skip_single_gpu
+# isort: on
 
 
 def task0():
@@ -110,9 +117,12 @@ def test_split_mpi_env():
     session.submit_sync(task1)
 
 
-def test_llmapi_launch_subsequent_tests():
+@skip_single_gpu
+@pytest.mark.parametrize(
+    "task_script", ["_run_mpi_comm_task.py", "_run_multi_mpi_comm_tasks.py"])
+def test_llmapi_launch_multiple_tasks(task_script: str):
     """
-    Test that the trtllm-llmapi-launch can run subsequent LLM API tests.
+    Test that the trtllm-llmapi-launch can run multiple tasks.
     """
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     test_file = os.path.join(cur_dir, "_run_multi_llm_tasks.py")

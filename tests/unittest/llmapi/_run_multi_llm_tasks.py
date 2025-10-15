@@ -1,14 +1,16 @@
 import os
+import sys
+
+cur_dir = os.path.dirname(os.path.abspath(__file__))
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.utils import print_colored
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-import sys
-
-sys.path.append(cur_dir + "/..")
+# isort: off
+sys.path.append(os.path.join(cur_dir, '..'))
 from utils.llm_data import llm_models_root
+# isort: on
 
 model_path = llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"
 
