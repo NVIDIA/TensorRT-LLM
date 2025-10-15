@@ -132,6 +132,14 @@ class TransformInfo(BaseModel):
         "tensors in the graph and it preserves the has_valid_shapes flag of the last transform.",
     )
 
+    @classmethod
+    def from_last_info(cls, info: "TransformInfo") -> "TransformInfo":
+        """Create a new TransformInfo from the last transform info."""
+        return cls(
+            is_clean=info.is_clean,
+            has_valid_shapes=info.has_valid_shapes,
+        )
+
     # overload += operator to concatenate TransformInfo objects
     def __iadd__(self, other: "TransformInfo") -> "TransformInfo":
         # since TransformInfo is frozen, instead, we return a new TransformInfo object
@@ -140,6 +148,24 @@ class TransformInfo(BaseModel):
             num_matches=self.num_matches + other.num_matches,
             is_clean=self.is_clean & other.is_clean,
             has_valid_shapes=self.has_valid_shapes & other.has_valid_shapes,
+        )
+
+    def __or__(self, other: "TransformInfo") -> "TransformInfo":
+        """Merge two TransformInfo objects."""
+        return TransformInfo(
+            skipped=self.skipped and other.skipped,  # we only count skipped if both were skipped
+            num_matches=self.num_matches + other.num_matches,
+            is_clean=self.is_clean or other.is_clean,
+            has_valid_shapes=self.has_valid_shapes or other.has_valid_shapes,
+        )
+
+    def __and__(self, other: "TransformInfo") -> "TransformInfo":
+        """Merge two TransformInfo objects."""
+        return TransformInfo(
+            skipped=self.skipped and other.skipped,  # we only count skipped if both were skipped
+            num_matches=self.num_matches + other.num_matches,
+            is_clean=self.is_clean and other.is_clean,
+            has_valid_shapes=self.has_valid_shapes and other.has_valid_shapes,
         )
 
 
