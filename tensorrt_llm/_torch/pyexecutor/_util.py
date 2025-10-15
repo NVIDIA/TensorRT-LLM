@@ -61,17 +61,25 @@ def get_kv_cache_manager_cls(model_config: ModelConfig):
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
-    def __init__(self, *, model_engine: PyTorchModelEngine,
-                 draft_model_engine: Optional[PyTorchModelEngine],
-                 mapping: Mapping, net_max_seq_len: int,
-                 kv_connector_manager: Optional[KvCacheConnectorManager],
-                 max_num_tokens: int, max_beam_width: int,
-                 tokens_per_block: int, max_seq_len: int, max_batch_size: int,
-                 kv_cache_config: KvCacheConfig,
-                 pytorch_backend_config: PyTorchConfig,
-                 speculative_config: SpeculativeConfig,
-                 sparse_attention_config: SparseAttentionConfig,
-                 profiling_stage_data: Optional[dict]):
+    def __init__(
+        self,
+        *,
+        model_engine: PyTorchModelEngine,
+        draft_model_engine: Optional[PyTorchModelEngine],
+        mapping: Mapping,
+        net_max_seq_len: int,
+        kv_connector_manager: Optional[KvCacheConnectorManager],
+        max_num_tokens: int,
+        max_beam_width: int,
+        tokens_per_block: int,
+        max_seq_len: int,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        pytorch_backend_config: PyTorchConfig,
+        speculative_config: SpeculativeConfig,
+        sparse_attention_config: SparseAttentionConfig,
+        profiling_stage_data: Optional[dict],
+    ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
         self._mapping = mapping
