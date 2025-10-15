@@ -58,7 +58,7 @@ protected:
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            std::nullopt, dataType, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, cacheType,
+            std::nullopt, dataType, sinkTokenLength, stream, kvMaxNumTokens, enableBlockReuse, onboardBlocks, cacheType,
             std::nullopt, nullptr, true);
 
         mCacheManager->allocatePools(false);
@@ -108,9 +108,7 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
         size_t recvbufferCount = tensorrt_llm::common::getEnvRequestKVCacheConcurrent()
             ? tensorrt_llm::common::getEnvKVCacheRecvBufferCount()
             : 1;
-        size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
-            ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
-            : 1;
+        size_t sendBufferCount = tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum();
         size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
         std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{
             {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
@@ -152,9 +150,7 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
         size_t recvbufferCount = tensorrt_llm::common::getEnvRequestKVCacheConcurrent()
             ? tensorrt_llm::common::getEnvKVCacheRecvBufferCount()
             : 1;
-        size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
-            ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
-            : 1;
+        size_t sendBufferCount = tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum();
         size_t cacheSizeBytesPerToken = kvCacheSizePerToken(4, 2, 64, CacheType::kSELF);
         tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
             tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
@@ -260,7 +256,7 @@ TEST_F(CacheTransBufferTest, TestBufferIndexAssignment1)
         SizeType32 tokensPerBlock = 8;
         std::optional<size_t> maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
         setenv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT", "1", 1);
-        setenv("TRTLLM_PARALLEL_CACHE_SEND", "1", 1);
+        setenv("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM", "2", 1);
         SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
@@ -346,8 +342,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndNoneTransSize)
         auto bufferManager = tensorrt_llm::runtime::BufferManager{std::make_shared<CudaStream>()};
         auto targetNum = 2;
         auto targetSize = 1024;
+        std::vector<size_t> targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum, targetNum);
         EXPECT_EQ(onlyUseDynamicBuffer, true);
@@ -393,8 +390,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferManager = tensorrt_llm::runtime::BufferManager{std::make_shared<CudaStream>()};
         auto targetNum = 2;
         auto targetSize = 1024;
+        std::vector<size_t> targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum, targetNum);
         EXPECT_EQ(onlyUseDynamicBuffer, false);
@@ -407,8 +405,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferId4 = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId4.has_value());
         EXPECT_EQ(bufferId4.value(), 0);
+        targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers2, bufferCoverTargetNum2, onlyUseDynamicBuffer2]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId4, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId4, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers2.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum2, targetNum / 2);
         EXPECT_EQ(onlyUseDynamicBuffer2, false);
@@ -418,8 +417,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferId5 = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId5.has_value());
         EXPECT_EQ(bufferId5.value(), 0);
+        targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers3, bufferCoverTargetNum3, onlyUseDynamicBuffer3]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId5, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId5, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers3.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum3, targetNum);
         EXPECT_EQ(onlyUseDynamicBuffer3, false);

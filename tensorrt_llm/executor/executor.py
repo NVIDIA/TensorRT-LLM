@@ -7,8 +7,8 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
-                    Union)
+from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+                    Optional, Union)
 
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -103,6 +103,9 @@ class GenerationExecutor(ABC):
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
 
+    def use_ray_queue(self) -> bool:
+        return False
+
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
         pass
@@ -124,6 +127,8 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt_id: Optional[int] = None,
+        arrival_time: Optional[float] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -147,7 +152,9 @@ class GenerationExecutor(ABC):
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             multimodal_params=multimodal_params,
-            scheduling_params=scheduling_params)
+            scheduling_params=scheduling_params,
+            cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -249,21 +256,29 @@ class GenerationExecutor(ABC):
         """
         if error is not None:
             # For details please refer to the comment of `GenerationResult.error`
-            if isinstance(error, Exception):
+
+            if isinstance(error, RequestError):
+                # A per-request error, can be captured and ignored
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+            elif isinstance(error, str):
+                # A per-request error, can be captured and ignored
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+                    print_colored(str(traceback.extract_stack()) + "\n", "red")
+                error = RequestError(error)
+            else:
                 # Serious error from background thread or process
+                if not isinstance(error, BaseException):
+                    error = RuntimeError(repr(error))
                 if enable_llm_debug():
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
                 self.shutdown()
-                raise error
-            elif isinstance(error, str):
-                if enable_llm_debug():
-                    print_colored(f"Got per-request error: {repr(error)}\n",
-                                  "red")
-                    print_colored(str(traceback.extract_stack()) + "\n", "red")
-                # A per-request error, can be captured and ignored
-                raise RequestError(error)
+            raise error
 
         # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
         # more than one error.
@@ -344,6 +359,23 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     @staticmethod
+    def _create_ray_executor(
+            worker_kwargs: Dict,
+            model_world_size: int,
+            postproc_worker_config: PostprocWorkerConfig,
+            is_llm_executor: bool,
+            tp_size: int,
+            kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+        from .ray_executor import RayExecutor
+
+        return RayExecutor(worker_kwargs,
+                           model_world_size=model_world_size,
+                           postproc_worker_config=postproc_worker_config,
+                           is_llm_executor=is_llm_executor,
+                           tp_size=tp_size,
+                           kv_connector_config=kv_connector_config)
+
+    @staticmethod
     def create(
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -359,7 +391,8 @@ class GenerationExecutor(ABC):
         kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
-        llm_args: Optional[TorchLlmArgs] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
+        **args,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -394,13 +427,40 @@ class GenerationExecutor(ABC):
         if lora_config:
             worker_kwargs["lora_config"] = lora_config
 
+        orchestrator_type = None if not isinstance(
+            llm_args, TorchLlmArgs) else llm_args.orchestrator_type
+        if orchestrator_type == "ray":
+            return GenerationExecutor._create_ray_executor(
+                worker_kwargs,
+                model_world_size,
+                postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                tp_size=args.get("tp_size", 1),
+                kv_connector_config=kv_connector_config)
+        elif orchestrator_type is not None:
+            raise ValueError(
+                f"Unsupported orchestrator_type: {orchestrator_type}")
+
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)
         # The case where the Python main process utilizes mpi4py to spawn MPI workers
         spawn_workers = need_spawn_mpi_workers(model_world_size)
+        orchestrator_is_rpc = llm_args and llm_args.orchestrator_type == "rpc"
+
         if spawn_workers or (mpirun_launch and reuse_mpi_comm):
             if reuse_mpi_comm:
                 assert mpi_session is not None, "reuse_mpi_comm requires an external MPI session"
+
+            if orchestrator_is_rpc:
+                from .rpc_proxy import GenerationExecutorRpcProxy
+                return GenerationExecutorRpcProxy(
+                    worker_kwargs,
+                    model_world_size=model_world_size,
+                    mpi_session=mpi_session,
+                    postproc_worker_config=postproc_worker_config,
+                    is_llm_executor=is_llm_executor,
+                    kv_connector_config=kv_connector_config)
+
             return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
@@ -417,6 +477,16 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
+            if orchestrator_is_rpc:
+                from .rpc_proxy import GenerationExecutorRpcProxy
+                return GenerationExecutorRpcProxy(
+                    worker_kwargs,
+                    model_world_size=model_world_size,
+                    mpi_session=mpi_session,
+                    postproc_worker_config=postproc_worker_config,
+                    is_llm_executor=is_llm_executor,
+                    kv_connector_config=kv_connector_config)
+
             return GenerationExecutorWorker(
                 **worker_kwargs,
                 is_llm_executor=is_llm_executor,
@@ -427,6 +497,16 @@ class GenerationExecutor(ABC):
         # While this requires uses to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
+            if orchestrator_is_rpc:
+                from .rpc_proxy import GenerationExecutorRpcProxy
+                return GenerationExecutorRpcProxy(
+                    worker_kwargs,
+                    model_world_size=model_world_size,
+                    mpi_session=mpi_session,
+                    postproc_worker_config=postproc_worker_config,
+                    is_llm_executor=is_llm_executor,
+                    kv_connector_config=kv_connector_config)
+
             return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
@@ -439,6 +519,7 @@ class GenerationExecutor(ABC):
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
             mpi_session = ProcessPoolExecutorSession(n_workers=1,
                                                      mp_context=ctx)
+            # TODO: add rpc worker here
             return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,

@@ -926,8 +926,9 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently only add one tactic here.
-        return [0]
+        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
+        input, _, _ = inputs
+        return [0, 1] if input.shape[0] <= 128 else [0]
 
     def forward(
         self,
@@ -941,9 +942,9 @@ class fp8SwapABGemmRunner(TunableRunner):
             device=input.device,
             dtype=self.output_dtype,
         )
-        # TODO: add swap_ab=tactic == 0 to detemrmine the swap_ab value
-        # Treat the default tactic=-1 as swap_ab=False
-        deep_gemm.fp8_gemm_nt(
+
+        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
+        forward_func(
             (a, a_sf),
             (weight, weight_scale),
             output,

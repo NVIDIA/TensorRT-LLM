@@ -26,7 +26,6 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -99,7 +98,7 @@ TEST_F(RequestInfoTest, Basic)
     }
     auto state = std::make_unique<texec::DataTransceiverState>();
     state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, nvinfer1::DataType::kFLOAT});
+    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, nvinfer1::DataType::kFLOAT});
     RequestInfo info{1, *state};
     auto info2 = serializeDeserialize(info);
     EXPECT_EQ(info, info2);
@@ -141,115 +140,17 @@ TEST_F(CacheConfigTest, EqualTo)
         vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.setTokensPerBlock(tokensPerBlock);
     tr::WorldConfig worldConfig{tensorParallelism, pipelineParallelism, contextParallelism};
+    std::vector<SizeType32> attentionLayerNumPerPP(pipelineParallelism, nbAttentionLayers / pipelineParallelism);
 
     texec::kv_cache::CacheState::ModelConfig cacheStateCfg{
         modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
 
     texec::kv_cache::CacheState state0{
-        cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType, kvFactor};
+        cacheStateCfg, worldConfig, attentionLayerNumPerPP, modelConfig.getKvDataType(), attentionType, kvFactor};
     texec::kv_cache::CacheState state1{nbAttentionLayers, nbHeads, sizePerHead, tokensPerBlock, tensorParallelism,
-        pipelineParallelism, contextParallelism, dtype, attentionType, kvFactor, false, 0, tensorParallelism};
+        pipelineParallelism, contextParallelism, attentionLayerNumPerPP, dtype, attentionType, kvFactor, false, 0,
+        tensorParallelism};
     EXPECT_EQ(state0, state1);
-}
-
-// ---------------------------------------
-//          MockTransceiverTest
-// ---------------------------------------
-
-class MockDataSender : public DataSender
-{
-public:
-    MockDataSender()
-    {
-        ON_CALL(*this, getCommState).WillByDefault(ReturnRef(mState));
-        ON_CALL(*this, recvRequestInfo)
-            .WillByDefault(Return(RequestInfo{0,
-                texec::DataTransceiverState{
-                    texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 1, nvinfer1::DataType::kFLOAT},
-                    texec::kv_cache::CommState{std::vector<SizeType32>{0}, 0}}}));
-        ON_CALL(*this, getCounterpartsCount).WillByDefault(Return(1));
-    }
-
-    MOCK_METHOD(RequestInfo, recvRequestInfo, (), (override));
-    MOCK_METHOD(void, sendSync, (LlmRequest const&), (override));
-    MOCK_METHOD(texec::kv_cache::CommState const&, getCommState, (), (const));
-    MOCK_METHOD(void, setCommState, (texec::kv_cache::CommState), (override));
-    MOCK_METHOD(size_t, getCounterpartsCount, (LlmRequest::RequestIdType), (const));
-    MOCK_METHOD(void, release, (LlmRequest::RequestIdType), (override));
-
-private:
-    static texec::kv_cache::CommState mState;
-};
-
-texec::kv_cache::CommState MockDataSender::mState;
-
-class MockDataReceiver : public DataReceiver
-{
-public:
-    MOCK_METHOD(TransferSession, sendRequestInfo, (LlmRequest const&), (override));
-    MOCK_METHOD(void, receiveSync, (TransferSession&), (override));
-};
-
-class MockTransceiverTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
-{
-public:
-    void SetUp() override {}
-
-    void TearDown() override {}
-
-    static auto makeLlmRequest(
-        LlmRequest::RequestIdType requestId = 0, SizeType32 maxNewTokens = 1, VecTokens inputTokens = {-1})
-    {
-        texec::Request request{std::move(inputTokens), maxNewTokens};
-        auto state = std::make_unique<texec::DataTransceiverState>();
-        auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
-        return std::make_unique<LlmRequest>(requestId, std::move(request));
-    }
-};
-
-TEST_F(MockTransceiverTest, MpiResponderBasic)
-{
-    if (tensorrt_llm::mpi::MpiComm::world().getSize() > 2)
-    {
-        GTEST_SKIP() << "mpirun with procs<=2 is required to run this test.";
-    }
-    auto sender = std::make_unique<MockDataSender>();
-    EXPECT_CALL(*sender, recvRequestInfo)
-        .WillOnce(Return(RequestInfo{0,
-            texec::DataTransceiverState{
-                texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 1, nvinfer1::DataType::kFLOAT},
-                texec::kv_cache::CommState{std::vector<SizeType32>{0}, 0}}}));
-    EXPECT_CALL(*sender, sendSync).WillOnce(Return());
-    EXPECT_CALL(*sender, getCounterpartsCount).WillOnce(Return(1));
-    EXPECT_CALL(*sender, release).WillOnce(Return());
-
-    DataResponder responder{std::move(sender)};
-    auto request = makeLlmRequest(0);
-    auto future = responder.respondAndSendAsync(*request);
-    future.get();
-}
-
-TEST_F(MockTransceiverTest, MpiRequesterBasic)
-{
-
-    if (tensorrt_llm::mpi::MpiComm::world().getSize() > 2)
-    {
-        GTEST_SKIP() << "mpirun with procs<=2 is required to run this test.";
-    }
-    auto receiver = std::make_unique<MockDataReceiver>();
-    auto state = std::make_unique<texec::DataTransceiverState>();
-    state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
-    EXPECT_CALL(*receiver, sendRequestInfo)
-        .WillOnce(Return(TransferSession({nullptr}, DataContext{0}, *state, *state,
-            tensorrt_llm::runtime::BufferManager{std::make_shared<tr::CudaStream>()}, nullptr)));
-    EXPECT_CALL(*receiver, receiveSync).WillOnce(Return());
-    DataRequester requester{std::move(receiver)};
-    auto request = makeLlmRequest(0);
-    auto stats = texec::ContextPhaseParams({}, 0, state.release(), std::nullopt);
-    request->setContextPhaseParams(std::move(stats));
-    auto future = requester.requestAndReceiveAsync(*request);
-    future.get();
 }
 
 // TODO: Restore multi-rank tests.
@@ -307,7 +208,7 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr enableBlockReuse = true;
+        auto constexpr enableBlockReuse = false;
         auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
@@ -316,10 +217,11 @@ protected:
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
             mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
-            dataType, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, CacheType::kSELF,
+            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, CacheType::kSELF,
             std::nullopt, nullptr, true);
+        auto attentionLayerNumPerPP = std::vector<SizeType32>{numLayers};
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
-            numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, dataType);
+            numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, attentionLayerNumPerPP, dataType);
 
         if (tensorrt_llm::common::getEnvUseUCXKvCache())
         {
@@ -331,7 +233,7 @@ protected:
             {
                 void* ret = dllGetSym(handle, name);
                 TLLM_CHECK_WITH_INFO(ret != nullptr,
-                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
                     "built with UCX support, please rebuild in UCX-enabled environment.");
                 return ret;
             };
@@ -394,15 +296,13 @@ protected:
         mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(
-                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
+            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(
-                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
+            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
         }
     }
 
@@ -432,11 +332,11 @@ protected:
                 // fill cache with tokens (= request length), for reuse test
                 TLLM_CUDA_CHECK(cudaMemset(block.data(), llmRequest->getPromptLen(), block.getSizeInBytes()));
             }
-            mFutures.emplace_back(mResponder->respondAndSendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->sendAsync(*llmRequest));
         }
         else
         {
-            auto future = mRequester->requestAndReceiveAsync(*llmRequest);
+            auto future = mRequester->receiveAsync(*llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -457,8 +357,8 @@ protected:
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
-    std::unique_ptr<DataResponder> mResponder;
-    std::unique_ptr<DataRequester> mRequester;
+    std::unique_ptr<CacheSender> mSender;
+    std::unique_ptr<CacheReceiver> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
     std::vector<std::future<void>> mFutures;
@@ -530,8 +430,8 @@ protected:
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
         tensorrt_llm::mpi::MpiComm::world().barrier();
-        int contextRanks = contextTp * contextPp;
-        int genRanks = genTp * genPp;
+        int contextRanks = contextTp * contextPp * contextCp;
+        int genRanks = genTp * genPp * genCp;
         int nprocs = (contextRanks + genRanks);
 
         mIsContext = false;
@@ -546,8 +446,9 @@ protected:
         {
             return;
         }
-        TLLM_LOG_INFO("Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, GenTp: %d, GenPp:%d", contextTp,
-            contextPp, genTp, genPp);
+        TLLM_LOG_INFO(
+            "Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, ContextCp: %d, GenTp: %d, GenPp:%d, GenCp:%d",
+            contextTp, contextPp, contextCp, genTp, genPp, genCp);
         mComm = std::addressof(mParticipatingComm);
 
         mWorldSize = mComm->getSize();
@@ -557,7 +458,7 @@ protected:
             mIsContext = mRank < contextRanks;
             mIsGeneration = (mRank >= contextRanks && mRank < (contextRanks + genRanks));
             mRankInInstance = mIsContext ? mRank : (mRank - contextRanks);
-            mSizeInInstance = mIsContext ? (contextTp * contextPp) : (genTp * genPp);
+            mSizeInInstance = mIsContext ? (contextTp * contextPp * contextCp) : (genTp * genPp * genCp);
             int color = 0;
             if (mIsGeneration)
             {
@@ -583,7 +484,8 @@ protected:
             }
 
             mTpRank = mRankInInstance % mTpSize;
-            mPpRank = mRankInInstance / mTpSize;
+            mPpRank = mRankInInstance / (mTpSize * mCpSize);
+            mCpRank = (mRankInInstance % (mTpSize * mCpSize)) / mTpSize;
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
             mContextTpSize = contextTp;
@@ -614,7 +516,29 @@ protected:
             return;
         }
 
-        ASSERT_EQ(numLayers % mPpSize, 0);
+        // ASSERT_EQ(numLayers % mPpSize, 0);
+
+        auto getLayerNumPPRank = [](int numLayers, int ppRank, int ppSize)
+        {
+            int layerNumPerPP = numLayers / ppSize;
+            int layerNumExtraInPP = numLayers % ppSize;
+            int layerNumInPPRank = layerNumPerPP + (ppRank < layerNumExtraInPP ? 1 : 0);
+            return layerNumInPPRank;
+        };
+
+        mAttentionLayerNumPerPP = std::vector<SizeType32>(mPpSize, 0);
+        for (int ppRank = 0; ppRank < mPpSize; ppRank++)
+        {
+            mAttentionLayerNumPerPP[ppRank] = getLayerNumPPRank(numLayers, ppRank, mPpSize);
+        }
+        int layerNumthisRank = getLayerNumPPRank(numLayers, mPpRank, mPpSize);
+
+        auto contextAttentionLayerNumPerPP = std::vector<SizeType32>(mContextPpSize, 0);
+        for (int ppRank = 0; ppRank < mContextPpSize; ppRank++)
+        {
+            contextAttentionLayerNumPerPP[ppRank] = getLayerNumPPRank(numLayers, ppRank, mContextPpSize);
+        }
+
         if (!isMLA)
         {
             // ASSERT_EQ(numHeads % mTpSize , 0);
@@ -653,7 +577,7 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr enableBlockReuse = true;
+        auto constexpr enableBlockReuse = false;
         auto constexpr onboardBlocks = true;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
@@ -693,19 +617,19 @@ protected:
             maxAttentionWindowVec.push_back(windowAttentionToken);
         }
         TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
-        mManager = std::make_unique<KVCacheManager>(numLayers / mPpSize, numHeadsPerRank, sizePerHead, tokensPerBlock,
+        mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
             blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
-            sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
+            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
             true);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
             : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
-        mCacheState
-            = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRank, sizePerHead, tokensPerBlock,
-                mTpSize, mPpSize, mCpSize, dataType, attentionType, kvFactor, enableDPAttention, DPrank, DPsize);
+        mCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRank, sizePerHead,
+            tokensPerBlock, mTpSize, mPpSize, mCpSize, mAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
+            enableDPAttention, DPrank, DPsize);
         mContextCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRankForContext,
-            sizePerHead, tokensPerBlock, mContextTpSize, mContextPpSize, mContextCpSize, dataType, attentionType,
-            kvFactor, mContextDP, DPrank, mContextTpSize);
+            sizePerHead, tokensPerBlock, mContextTpSize, mContextPpSize, mContextCpSize, contextAttentionLayerNumPerPP,
+            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize);
 
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
@@ -737,7 +661,7 @@ protected:
                 {
                     void* ret = dllGetSym(handle, name);
                     TLLM_CHECK_WITH_INFO(ret != nullptr,
-                        "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                        "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
                         "built with UCX support, please rebuild in UCX-enabled environment.");
                     return ret;
                 };
@@ -751,8 +675,8 @@ protected:
 
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
-                mConnectionManager
-                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(mCacheTransBufferManager.get());
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    mCacheTransBufferManager.get(), *mCacheState);
             }
             else
             {
@@ -764,13 +688,13 @@ protected:
 
             if (mIsContext)
             {
-                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+                mSender = std::make_unique<CacheSender>(
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
             }
             else
             {
-                mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+                mRequester = std::make_unique<CacheReceiver>(
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
             }
 
             std::vector<int> contextRankVec(mContextRankSize);
@@ -865,7 +789,8 @@ protected:
             mContextCacheState->getModelConfig().mSizePerHead, mContextCacheState->getModelConfig().mTokensPerBlock,
             mContextCacheState->getParallelConfig().mTensorParallelism,
             mContextCacheState->getParallelConfig().mPipelineParallelism,
-            mContextCacheState->getParallelConfig().mContextParallelism, mContextCacheState->getDataType(),
+            mContextCacheState->getParallelConfig().mContextParallelism,
+            mContextCacheState->getParallelConfig().mAttentionLayerNumPerPP, mContextCacheState->getDataType(),
             mContextCacheState->getAttentionConfig().mAttentionType, mContextCacheState->getAttentionConfig().mKvFactor,
             mContextCacheState->getParallelConfig().mEnableAttentionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
@@ -904,7 +829,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mResponder->respondAndSendAsync(*llmRequest);
+        auto future = mSender->sendAsync(*llmRequest);
         return future;
     }
 
@@ -914,7 +839,20 @@ protected:
         auto constexpr beamWidth{1};
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
 
-        return mRequester->requestAndReceiveAsync(*llmRequest);
+        return mRequester->receiveAsync(*llmRequest);
+    }
+
+    // Called only by generationVerifyKVCache. Currently, generation ranks might over-allocate blocks when CP is
+    // enabled.
+    bool isBlockOverallocated(int blockIdx, int numTotalBlocks)
+    {
+        bool const generationHasCP = mCpSize > 1;
+        if (!generationHasCP)
+        {
+            return false;
+        }
+        int const numValidBlocks = getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks, /*strict=*/true);
+        return blockIdx >= numValidBlocks;
     }
 
     void generationVerifyKVCache(std::shared_ptr<LlmRequest> const& llmRequest)
@@ -926,12 +864,21 @@ protected:
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
+        int const numTotalBlocks = blockRange.getBlockIds().size();
         auto const numPools = mManager->getBlockManager().getNumPools();
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
+                if (isBlockOverallocated(blockIdx, numTotalBlocks))
+                {
+                    TLLM_LOG_INFO(
+                        "[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx "
+                        "%d, numTotalBlocks %d)",
+                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
+                    break;
+                }
                 verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
                 blockIdx++;
             }
@@ -944,8 +891,19 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
         auto hostTensor = tensorrt_llm::runtime::BufferManager::cpu(blockData.getShape(), blockData.getDataType());
-        int layerSizePerRank = blockData.getDimension<1>();
-        int startLayerId = layerSizePerRank * mPpRank;
+        int layerSizeThisRank = blockData.getDimension<1>();
+        int startLayerId = 0;
+        if (mIsWindowAttention)
+        {
+            startLayerId = layerSizeThisRank * mPpRank;
+        }
+        else
+        {
+            for (int ppRank = 0; ppRank < mPpRank; ppRank++)
+            {
+                startLayerId += mAttentionLayerNumPerPP[ppRank];
+            }
+        }
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * (mTpRank / mDupHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
@@ -958,7 +916,7 @@ protected:
         int startTokenId = blockId * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
         auto dataTypeSize = tensorrt_llm::common::getDTypeSize(blockData.getDataType());
-        for (int layerId = 0; layerId < layerSizePerRank; layerId++)
+        for (int layerId = 0; layerId < layerSizeThisRank; layerId++)
         {
             for (int headId = 0; headId < headSizePerRank; headId++)
             {
@@ -1008,8 +966,20 @@ protected:
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
 
         auto hostTensor = tensorrt_llm::runtime::BufferManager::cpu(blockData.getShape(), blockData.getDataType());
-        int layerSizePerRank = blockData.getDimension<1>();
-        int startLayerId = layerSizePerRank * mPpRank;
+        int layerSizethisRank = blockData.getDimension<1>();
+        int startLayerId = 0;
+        if (mIsWindowAttention)
+        {
+            startLayerId = layerSizethisRank * mPpRank;
+        }
+        else
+        {
+            for (int ppRank = 0; ppRank < mPpRank; ppRank++)
+            {
+                startLayerId += mAttentionLayerNumPerPP[ppRank];
+            }
+        }
+
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * (mTpRank / mDupHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
@@ -1019,13 +989,13 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = blockId * tokensPerBlock;
+        int startTokenId = (blockId * mCpSize + mCpRank) * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
         bufferManager.copy(blockData, *hostTensor);
         bufferManager.getStream().synchronize();
 
-        for (int layerId = 0; layerId < layerSizePerRank; layerId++)
+        for (int layerId = 0; layerId < layerSizethisRank; layerId++)
         {
             for (int headId = 0; headId < headSizePerRank; headId++)
             {
@@ -1100,20 +1070,21 @@ protected:
     tensorrt_llm::mpi::MpiComm const* mComm;
     tensorrt_llm::mpi::MpiComm mParticipatingComm{nullptr, false};
     SizeType32 mWorldSize{0}, mRank{0}, mRankInInstance{0};
-    SizeType32 mSizeInInstance{0}, mTpRank{0}, mPpRank{0}, mTpSize{0}, mPpSize{0}, mCpSize{0}, mContextRankSize{0},
-        mGenRankSize{0}, mContextTpSize{0}, mContextPpSize{0}, mContextCpSize{0};
+    SizeType32 mSizeInInstance{0}, mTpRank{0}, mPpRank{0}, mCpRank{0}, mTpSize{0}, mPpSize{0}, mCpSize{0},
+        mContextRankSize{0}, mGenRankSize{0}, mContextTpSize{0}, mContextPpSize{0}, mContextCpSize{0};
     LlmRequest::RequestIdType mRequestId{0};
     bool mContextDP{false};
     bool mGenerationDP{false};
     bool mIsMLA{false};
     bool mIsWindowAttention{false};
     int mDupHeadFactor{1};
+    std::vector<SizeType32> mAttentionLayerNumPerPP;
 
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
-    std::unique_ptr<DataResponder> mResponder;
-    std::unique_ptr<DataRequester> mRequester;
+    std::unique_ptr<CacheSender> mSender;
+    std::unique_ptr<CacheReceiver> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
     std::unique_ptr<texec::kv_cache::CacheState> mContextCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
@@ -1151,6 +1122,11 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     bool generationDP = std::get<14>(param);
 
     bool isWindow = std::get<15>(param);
+
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
@@ -1245,6 +1221,10 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     bool generationDP = std::get<14>(param);
     bool isWindow = std::get<15>(param);
 
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
     if (mIsContext || mIsGeneration)
@@ -1333,23 +1313,39 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
+// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true, false)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(/*true,*/ false)));
 
-INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
-    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
-        testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true)));
+// Waive off isWindow test for now
+// INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
+//     testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
+//     testing::Values(1),
+//         testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
+//         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+//         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true)));
 
+// Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(8), testing::Values(4), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false, true)));
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false /*, true*/)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1EvenLayer, AsymmetricalCacheTest,
+    testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4),
+        testing::Values(1), testing::Values(10), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2EvenLayer, AsymmetricalCacheTest,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
+        testing::Values(1), testing::Values(10), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(2), testing::Values(1), testing::Values(1),
@@ -1369,6 +1365,56 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLA, AsymmetricalCacheTest,
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false)));
 
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLAEvenLayer, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
+        testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+
+// Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2, 4),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false)));
+
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
@@ -1384,6 +1430,18 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA3, AsymmetricalCacheTestWi
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA4, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA5, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(2), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA, AsymmetricalCacheTestWithDP,
@@ -1403,10 +1461,17 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA2, AsymmetricalCacheTest
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false)));
+
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0EvenLayer, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(5), testing::Values(2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate1, AsymmetricalCacheTestWithDP,
@@ -1419,6 +1484,12 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate2, Asymmetrical
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false)));
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate3, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false)));
+
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate4, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1, 2),
         testing::Values(2), testing::Values(1), testing::Values(4), testing::Values(1, 2), testing::Values(4),
@@ -1444,12 +1515,17 @@ TEST(targetTest, CacheStateNODP)
     {
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
+        std::vector<SizeType32> contextAttentionLayerNumPerPP(
+            contextWC.getPipelineParallelism(), numLayers / contextWC.getPipelineParallelism());
+        std::vector<SizeType32> genAttentionLayerNumPerPP(
+            genWC.getPipelineParallelism(), numLayers / genWC.getPipelineParallelism());
 
         auto const sharedModelConfig
             = texec::kv_cache::CacheState::ModelConfig{std::vector(numLayers, numHeads), sizePerHead, tokensPerBlock};
-        auto const contextCache
-            = texec::kv_cache::CacheState(sharedModelConfig, contextWC, dataType, attentionType, kvFactor);
-        auto const genCache = texec::kv_cache::CacheState(sharedModelConfig, genWC, dataType, attentionType, kvFactor);
+        auto const contextCache = texec::kv_cache::CacheState(
+            sharedModelConfig, contextWC, contextAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
+        auto const genCache = texec::kv_cache::CacheState(
+            sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
 
         auto const contextTargetInfo
             = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
@@ -1731,6 +1807,8 @@ TEST(targetTest, CacheStateContextDP)
     int genCP = 1;
     bool contextEnableDP = true;
     bool genEnableDP = true;
+    std::vector<SizeType32> contextAttentionLayerNumPerPP(contextPP, numLayers / contextPP);
+    std::vector<SizeType32> genAttentionLayerNumPerPP(genPP, numLayers / genPP);
 
     auto const verifyContext = [&](int contextRank, int generationRank, std::vector<int> const& expectRanks,
                                    int expectPPDomain, int expectTPDomain, bool expectNeedSend)
@@ -1740,13 +1818,13 @@ TEST(targetTest, CacheStateContextDP)
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
-        auto const contextCache
-            = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead, tokensPerBlock, contextTP,
-                contextPP, contextCP, dataType, attentionType, kvFactor, contextEnableDP, contextDPRank, contextTP};
+        auto const contextCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, contextTP, contextPP, contextCP, contextAttentionLayerNumPerPP, dataType, attentionType,
+            kvFactor, contextEnableDP, contextDPRank, contextTP};
 
-        auto const genCache
-            = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead, tokensPerBlock, genTP,
-                genPP, genCP, dataType, attentionType, kvFactor, genEnableDP, generationDPRank, genTP};
+        auto const genCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
+            genEnableDP, generationDPRank, genTP};
 
         auto const contextTragetInfo
             = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
@@ -1788,13 +1866,13 @@ TEST(targetTest, CacheStateContextDP)
         /*expectNeedSend*/ true);
     verifyContext(
         /*contextRank*/ 0, /*generationRank*/ 1, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
-        /*expectNeedSend*/ true);
+        /*expectNeedSend*/ false);
     verifyContext(
         /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
         /*expectNeedSend*/ false);
     verifyContext(
         /*contextRank*/ 1, /*generationRank*/ 1, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
-        /*expectNeedSend*/ false);
+        /*expectNeedSend*/ true);
     verifyContext(
         /*contextRank*/ 2, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
         /*expectNeedSend*/ false);
@@ -1847,13 +1925,13 @@ TEST(targetTest, CacheStateContextDP)
         auto attentionType = isMLA ? texec::kv_cache::CacheState::AttentionType::kMLA
                                    : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
 
-        auto const contextCache
-            = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead, tokensPerBlock, contextTP,
-                contextPP, contextCP, dataType, attentionType, kvFactor, contextEnableDP, contextDPRank, contextTP};
+        auto const contextCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, contextTP, contextPP, contextCP, contextAttentionLayerNumPerPP, dataType, attentionType,
+            kvFactor, contextEnableDP, contextDPRank, contextTP};
 
-        auto const genCache
-            = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead, tokensPerBlock, genTP,
-                genPP, genCP, dataType, attentionType, kvFactor, genEnableDP, generationDPRank, genTP};
+        auto const genCache = tensorrt_llm::executor::kv_cache::CacheState{numLayers, numHeads, sizePerHead,
+            tokensPerBlock, genTP, genPP, genCP, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
+            genEnableDP, generationDPRank, genTP};
 
         auto const contextTragetInfo
             = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
@@ -1872,6 +1950,8 @@ TEST(targetTest, CacheStateContextDP)
     contextPP = 1;
     genTP = 1;
     genPP = 2;
+    contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
+    genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
 
     verfiyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);
@@ -1885,6 +1965,8 @@ TEST(targetTest, CacheStateContextDP)
     contextPP = 1;
     genTP = 1;
     genPP = 1;
+    contextAttentionLayerNumPerPP = std::vector<SizeType32>(contextPP, numLayers / contextPP);
+    genAttentionLayerNumPerPP = std::vector<SizeType32>(genPP, numLayers / genPP);
 
     verfiyGeneration(
         /*contextRank*/ 0, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1);

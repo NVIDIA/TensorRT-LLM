@@ -5,8 +5,9 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import logger
+from tensorrt_llm._utils import get_sm_version, local_mpi_size
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...distributed import AllReduce, allgather, reducescatter
@@ -16,9 +17,11 @@ from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
+from .ops import MoEOp, MoEOpSelector
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
-                           NVFP4CutlassFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           FP8QDQFusedMoEMethod, FusedMoEQuantScalesW4A8,
+                           MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
@@ -29,7 +32,7 @@ class AlltoallMethodType(IntEnum):
     NotEnabled = 0
     # MNNVL
     MNNVL = 1
-    # DeepEP intranode or internode: no CUDA Graphs support, IBGDA is required by internode
+    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
     DeepEP = 2
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 3
@@ -82,18 +85,23 @@ class WideEPMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            layer_idx=layer_idx,
         )
 
         assert self.use_dp, "Attention DP should be used with WideEP."
         assert self.parallel_size > 1, "WideEP should only be enabled with parallel_size > 1"
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.layer_idx = layer_idx
+
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
 
         moe_load_balancer = get_moe_load_balancer()
         self.layer_load_balancer = None
         self.repeat_idx = 0
         self.repeat_count = 1
+
+        self.use_cuda_graph = model_config.use_cuda_graph
 
         moe_load_balancer_config = model_config.moe_load_balancer
         init_expert_size_per_partition = moe_load_balancer_config.num_local_slots if moe_load_balancer_config else self.num_experts // self.ep_size
@@ -185,13 +193,9 @@ class WideEPMoE(MoE):
         self.use_postquant_alltoall = False
         self.use_low_precision_combine = False
         if self.enable_alltoall:
-            qm = self.quant_config.quant_mode
             self.use_postquant_alltoall = (os.environ.get(
-                "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
-                                           == "1") and qm.has_nvfp4()
-            self.use_low_precision_combine = (os.environ.get(
-                "TRTLLM_MOE_USE_LOW_PRECISION_COMBINE", "0")
-                                              == "1") and qm.has_nvfp4()
+                "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1")
+            self.use_low_precision_combine = model_config.use_low_precision_moe_combine
 
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
@@ -210,6 +214,9 @@ class WideEPMoE(MoE):
                         str(
                             min(model_config.max_num_tokens,
                                 self.moe_max_num_tokens))))
+                # Set nvshmem queue pair depth larger than the number of on-flight WRs (ref: https://github.com/deepseek-ai/DeepEP/issues/427)
+                os.environ['NVSHMEM_QP_DEPTH'] = str(
+                    2 * (self.deep_ep_max_num_tokens + 1))
                 self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(
                     model_config.mapping)
                 self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens,
@@ -219,6 +226,8 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -226,6 +235,9 @@ class WideEPMoE(MoE):
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+
+        # MoE op will be lazily initialized when first accessed (see moe_op_impl property)
+        self._moe_op_impl = None
 
     def _check_configs(self):
         assert self._weights_created
@@ -248,6 +260,25 @@ class WideEPMoE(MoE):
     def select_alltoall_method_type(mapping: Mapping, top_k: int,
                                     dtype: torch.dtype,
                                     use_cuda_graph: bool) -> AlltoallMethodType:
+
+        # Check if DeepEP is feasible for the given number of ranks
+        # DeepEP supports two modes:
+        # 1. Intranode: Single node with 2, 4, or 8 ranks
+        # 2. Internode: 2, 4, 8, or 16 nodes with 8 ranks per node
+        def is_deepep_feasible(num_ranks: int) -> bool:
+            NUM_INTRANODE_SUPPORTED_RANKS = {2, 4, 8}
+            REQUIRED_LOCAL_MPI_SIZE = 8
+            NUM_INTERNODE_SUPPORTED_RDMA_RANKS = {2, 4, 8, 16}
+            mpi_size = local_mpi_size()
+            # Intranode cases
+            if num_ranks == mpi_size and num_ranks in NUM_INTRANODE_SUPPORTED_RANKS:
+                return True
+            # Internode cases
+            if mpi_size != REQUIRED_LOCAL_MPI_SIZE:
+                return False
+            num_rdma_nodes = num_ranks // mpi_size
+            return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
+
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             return AlltoallMethodType[all2all_method_type]
@@ -269,12 +300,10 @@ class WideEPMoE(MoE):
 
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
-                if use_cuda_graph:
-                    # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
-                    return AlltoallMethodType.DeepEPLowLatency
-                else:
-                    # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
+                # Choose DeepEP if feasible
+                if is_deepep_feasible(mapping.moe_ep_size):
                     return AlltoallMethodType.DeepEP
+                return AlltoallMethodType.DeepEPLowLatency
 
         return AlltoallMethodType.NotEnabled
 
@@ -310,13 +339,45 @@ class WideEPMoE(MoE):
 
         return self.enable_alltoall
 
+    def deep_ep_low_latency_dispatch_modify_output_to_adapt_fused_moe(
+        self, x: torch.Tensor, x_sf: Optional[torch.Tensor],
+        recv_expert_count: torch.Tensor, final_scales_dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor,
+               torch.Tensor]:
+        # x shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
+        # recv_expert_count shape: [#local experts]
+
+        # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
+        # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
+        mask = torch.arange(x.shape[1],
+                            dtype=torch.int32, device=x.device).expand(
+                                x.shape[0],
+                                x.shape[1]) < recv_expert_count.unsqueeze(1)
+        token_selected_slots = torch.where(
+            mask,
+            torch.arange(x.shape[0] * self.mapping.moe_ep_rank,
+                         x.shape[0] * (self.mapping.moe_ep_rank + 1),
+                         dtype=torch.int32,
+                         device=x.device).unsqueeze(1), self.num_slots)
+        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        if x_sf is not None:
+            x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1], x_sf.shape[2])
+        # Cheat the fused_moe API with fake top_k=1
+        token_selected_slots = token_selected_slots.view(x.shape[0], 1)
+        token_final_scales = torch.ones_like(token_selected_slots,
+                                             dtype=final_scales_dtype)
+        return x, x_sf, token_selected_slots, token_final_scales
+
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                if get_sm_version() == 100:
+                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+                else:
+                    return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -338,6 +399,19 @@ class WideEPMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
+
+    @property
+    def moe_op_impl(self) -> MoEOp:
+        """
+        Lazily initialize and return the MoE op.
+
+        The op is selected based on hardware capabilities and quantization
+        configuration, which are only available after weights are created.
+        """
+        if self._moe_op_impl is None:
+            assert self._weights_created, "Weights must be created before accessing moe_op"
+            self._moe_op_impl = MoEOpSelector.select_op(self)
+        return self._moe_op_impl
 
     def dummy_allreduce(self):
         """
@@ -367,6 +441,18 @@ class WideEPMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
         return outputs
 
+    def is_post_quant_all2all_supported(self):
+        if not self.use_postquant_alltoall:
+            return False
+        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            return True
+        elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
+            return self.has_nvfp4
+        elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+            return self.has_fp8_qdq or self.has_nvfp4 or self.has_w4afp8
+        else:
+            return False
+
     def forward_chunk(
             self,
             x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -374,10 +460,10 @@ class WideEPMoE(MoE):
             use_all_to_all: bool,
             output_dtype: Optional[torch.dtype] = None,
             all_rank_num_tokens: Optional[List[int]] = None,
-            all_rank_max_num_tokens: Optional[int] = None,
             use_dp_padding: Optional[bool] = None,
             repeating_info: Tuple = (True, True),
     ) -> torch.Tensor:
+        all_rank_max_num_tokens = max(all_rank_num_tokens)
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
             output_dtype = output_dtype
@@ -389,8 +475,9 @@ class WideEPMoE(MoE):
         if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
 
-        use_deepseek_fp8_block_scale = False
-        use_w4_group_scaling = False
+        if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.MNNVL:
+            pass
+
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -442,7 +529,8 @@ class WideEPMoE(MoE):
         use_allgather = not use_all_to_all
 
         # If alltoall is disabled, we need also disable use_postquant_alltoall
-        use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
+        use_postquant_alltoall = use_all_to_all and self.is_post_quant_all2all_supported(
+        )
 
         # Prepare additional information for profiling in case padding is applied when using alltoall.
         # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -482,7 +570,7 @@ class WideEPMoE(MoE):
                 if not use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                         self.deep_ep_buffer.dispatch(x, token_selected_slots, token_final_scales, self.num_slots,
-                        self.expert_size_per_partition * self.mapping.moe_ep_rank)
+                        self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
                     padded, x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                         x, None, recv_topk_idx, token_final_scales)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
@@ -492,28 +580,8 @@ class WideEPMoE(MoE):
                     assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
                     x, recv_expert_count, deep_ep_handle = \
                         self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                    # x shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
-                    # recv_expert_count shape: [#local experts]
-
-                    # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
-                    # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
-                    mask = torch.arange(
-                        x.shape[1], dtype=torch.int32, device=x.device).expand(
-                            x.shape[0],
-                            x.shape[1]) < recv_expert_count.unsqueeze(1)
-                    token_selected_slots = torch.where(
-                        mask,
-                        torch.arange(
-                            x.shape[0] * self.mapping.moe_ep_rank,
-                            x.shape[0] * (self.mapping.moe_ep_rank + 1),
-                            dtype=torch.int32,
-                            device=x.device).unsqueeze(1), self.num_slots)
-                    x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
-                    # Cheat the fused_moe API with fake top_k=1
-                    token_selected_slots = token_selected_slots.view(
-                        x.shape[0], 1)
-                    token_final_scales = torch.ones_like(
-                        token_selected_slots, dtype=token_final_scales.dtype)
+                    x, _, token_selected_slots, token_final_scales = self.deep_ep_low_latency_dispatch_modify_output_to_adapt_fused_moe(
+                        x, None, recv_expert_count, token_final_scales.dtype)
 
         x_sf = None
         x_row = x.shape[0]
@@ -544,9 +612,8 @@ class WideEPMoE(MoE):
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
-                use_deepseek_fp8_block_scale = True
+                pass
             elif self.has_w4afp8:
-                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
             else:
                 raise ValueError(
@@ -569,12 +636,8 @@ class WideEPMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
 
-        ep_size = self.ep_size
-        ep_rank = self.ep_rank
         w3_w1_weight = self.w3_w1_weight
         w2_weight = self.w2_weight
-        cluster_size = self.cluster_size
-        cluster_rank = self.cluster_rank
         quant_scales = self.quant_scales
 
         if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -587,6 +650,7 @@ class WideEPMoE(MoE):
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 pass
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
+                assert self.has_nvfp4, "DeepEP postquant alltoall should have nvfp4"
                 if x_sf is not None:
                     # Adapter between `x_sf` and DeepEP
                     # TODO: remove the adapter by adding dtype support to DeepEP
@@ -594,53 +658,61 @@ class WideEPMoE(MoE):
                     x_sf = x_sf.view(torch.float32)
                 (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
                     self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots, token_final_scales, self.num_slots,
-                    self.expert_size_per_partition * self.mapping.moe_ep_rank)
+                    self.expert_size_per_partition * self.mapping.moe_ep_rank, all_rank_max_num_tokens, self.ep_size, self.use_cuda_graph)
                 padded, x, x_sf, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                     x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                token_num = x_row
-                hidden_size = x_col
-                assert x_sf is not None and self.has_nvfp4
-                assert hidden_size % 32 == 0
-                assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
-                assert x_sf.shape[0] == token_num and x_sf.shape[
-                    1] == hidden_size // 16
-                assert x.shape[0] == token_num and x.shape[1] == hidden_size // 2
-
+                assert self.has_any_quant, "DeepEPLowLatency postquant alltoall should have quantization"
+                assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
                 deep_ep_topk_idx = token_selected_slots
                 deep_ep_topk_weights = token_final_scales
+                if self.has_fp8_qdq:
+                    assert x.dtype == torch.float8_e4m3fn and x_sf is None, "x should be torch.float8_e4m3fn and x_sf should be None in fp8 postquant alltoall"
+                    x = x.view(torch.bfloat16)
+                    x, recv_expert_count, deep_ep_handle = \
+                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                    x = x.view(torch.float8_e4m3fn)
+                elif self.has_nvfp4:
+                    token_num = x_row
+                    hidden_size = x_col
+                    assert x.dtype == torch.uint8 and x_sf is not None and x_sf.dtype == torch.uint8
+                    assert hidden_size % 32 == 0, "HiddenSize should be divisible by 32 in nvfp4 postquant alltoall"
+                    assert x_sf.shape[0] == token_num and x_sf.shape[
+                        1] == hidden_size // 16
+                    assert x.shape[0] == token_num and x.shape[
+                        1] == hidden_size // 2
 
-                assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
-                x, x_sf, recv_expert_count, deep_ep_handle = \
-                    self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
-                assert x.dim() == 3 and x_sf.dim() == 3
-                assert x.shape[2] == hidden_size // 2 and x_sf.shape[
-                    2] == hidden_size // 16
-
-                mask = torch.arange(
-                    x.shape[1], dtype=torch.int32, device=x.device).expand(
-                        x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
-                token_selected_slots = torch.where(
-                    mask,
-                    torch.arange(x.shape[0] * self.mapping.moe_ep_rank,
-                                 x.shape[0] * (self.mapping.moe_ep_rank + 1),
-                                 dtype=torch.int32,
-                                 device=x.device).unsqueeze(1), self.num_slots)
-                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
-                x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
-                                    x_sf.shape[2])
-                token_selected_slots = token_selected_slots.view(x.shape[0], 1)
-                token_final_scales = torch.ones_like(
-                    token_selected_slots, dtype=token_final_scales.dtype)
+                    x, x_sf, recv_expert_count, deep_ep_handle = \
+                        self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                    assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
+                    assert x.dim() == 3 and x_sf.dim() == 3
+                    assert x.shape[2] == hidden_size // 2 and x_sf.shape[
+                        2] == hidden_size // 16
+                elif self.has_w4afp8:
+                    assert isinstance(quant_scales, FusedMoEQuantScalesW4A8)
+                    pre_quant_scales = quant_scales.pre_quant_scale_1
+                    assert pre_quant_scales.shape == (
+                        1, x.shape[1]) and pre_quant_scales.dtype == x.dtype
+                    x = (x * pre_quant_scales).to(torch.float8_e4m3fn).view(
+                        torch.bfloat16)
+                    x, recv_expert_count, deep_ep_handle = \
+                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                    x = x.view(torch.float8_e4m3fn)
+                else:
+                    raise ValueError(
+                        f"unsupported quantization mode in postquant alltoall: {self.quant_config.quant_mode}"
+                    )
+                x, x_sf, token_selected_slots, token_final_scales = self.deep_ep_low_latency_dispatch_modify_output_to_adapt_fused_moe(
+                    x, x_sf, recv_expert_count, token_final_scales.dtype)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        final_hidden_states = torch.ops.trtllm.fused_moe(
+        final_hidden_states = self.moe_op_impl.run_moe(
+            self,
             x,
             token_selected_slots,
             token_final_scales,
@@ -650,19 +722,11 @@ class WideEPMoE(MoE):
             None,  # w2_bias
             output_dtype,
             quant_scales=quant_scales,
+            use_all_to_all=use_all_to_all,
             input_sf=x_sf,
             swizzled_input_sf=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=use_all_to_all,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
             min_latency_mode=False,
-            tune_max_num_tokens=self.tune_max_num_tokens,
+            use_fused_finalize=self.use_fused_finalize,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
         )
@@ -691,11 +755,16 @@ class WideEPMoE(MoE):
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
                 if self.use_low_precision_combine:
-                    global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
-                        final_hidden_states, recv_expert_count)
-                    final_hidden_states = self.deep_ep_buffer.low_latency_combine_fp4(
-                        final_hidden_states, global_scales, deep_ep_topk_idx,
-                        deep_ep_topk_weights, deep_ep_handle)
+                    assert self.has_nvfp4 or self.has_w4afp8 or self.has_fp8_qdq, "Low precision combine only supports nvfp4, w4afp8 and fp8 qdq"
+                    precision = "fp8"
+                    global_scales = None
+                    if self.has_nvfp4:
+                        precision = "nvfp4"
+                        global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
+                            final_hidden_states, recv_expert_count)
+                    final_hidden_states = self.deep_ep_buffer.low_latency_combine_low_precision(
+                        precision, final_hidden_states, global_scales,
+                        deep_ep_topk_idx, deep_ep_topk_weights, deep_ep_handle)
                 else:
                     final_hidden_states = self.deep_ep_buffer.low_latency_combine(
                         final_hidden_states, deep_ep_topk_idx,
@@ -710,29 +779,32 @@ class WideEPMoE(MoE):
 
         return final_hidden_states
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert all_rank_num_tokens is not None
         assert use_dp_padding is not None
 
-        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
-        num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
-        use_all_to_all = self.can_use_alltoall(all_rank_num_tokens,
-                                               all_rank_max_num_tokens)
+        all_rank_max_num_tokens = max(all_rank_num_tokens)
 
         if use_dp_padding:
             all_rank_num_tokens_padded = [all_rank_max_num_tokens
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
+
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
+        num_chunks = self.calculate_num_chunks(all_rank_num_tokens_padded)
+        use_all_to_all = self.can_use_alltoall(all_rank_num_tokens_padded,
+                                               all_rank_max_num_tokens)
         if num_chunks == 1:
             is_first_call = self.repeat_idx == 0
             is_last_call = self.repeat_idx == self.repeat_count - 1
@@ -742,7 +814,6 @@ class WideEPMoE(MoE):
                 use_all_to_all,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                all_rank_max_num_tokens=all_rank_max_num_tokens,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call))
             outputs = self.reducescatter_or_allreduce(
@@ -801,8 +872,6 @@ class WideEPMoE(MoE):
                                 use_all_to_all,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk],
-                                all_rank_max_num_tokens=
-                                all_rank_max_num_tokens_list[idx_chunk],
                                 use_dp_padding=use_dp_padding,
                                 repeating_info=(is_first_call, is_last_call))
                         if idx_chunk > 0:
@@ -819,8 +888,6 @@ class WideEPMoE(MoE):
                             use_all_to_all,
                             all_rank_num_tokens=all_rank_num_tokens_list[
                                 idx_chunk],
-                            all_rank_max_num_tokens=all_rank_max_num_tokens_list[
-                                idx_chunk],
                             use_dp_padding=use_dp_padding,
                             repeating_info=(is_first_call, is_last_call))
                         with torch.cuda.stream(self.aux_stream):
@@ -836,8 +903,6 @@ class WideEPMoE(MoE):
                         router_logits,
                         use_all_to_all,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk],
-                        all_rank_max_num_tokens=all_rank_max_num_tokens_list[
-                            idx_chunk],
                         repeating_info=(is_first_call, is_last_call))
 
                 outputs_list.append(outputs)
@@ -1008,3 +1073,6 @@ class WideEPMoE(MoE):
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)

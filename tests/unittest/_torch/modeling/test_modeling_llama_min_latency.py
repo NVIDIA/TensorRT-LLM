@@ -266,10 +266,12 @@ class TestLlama4MinLatency(unittest.TestCase):
         attention_backend = "TRTLLM"
         metadata_cls = get_attention_backend(attention_backend).Metadata
 
-        if transformers.__version__ >= "4.55.0":
+        if transformers.__version__ >= "4.55.0" \
+            and transformers.__version__ < "4.56.1":
             self.skipTest(
-                "The transformers 4.55.0 has accuracy issues while 4.33.1 works fine. "
-                "https://nvbugspro.nvidia.com/bug/5441729")
+                "The transformers between 4.55.0 and 4.56.1 have accuracy "
+                "issues for Llama4. See: "
+                "https://github.com/huggingface/transformers/pull/40609")
 
         torch.random.manual_seed(0)
         config_dict = deepcopy(LLAMA_4_MAVERICK_TWO_LAYER_CONFIG)
@@ -420,14 +422,16 @@ class TestLlama4MinLatency(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1, lambda inputs: llama.forward(**inputs),
+                key = (1, 0, False)
+                graph_runner.capture(key,
+                                     lambda inputs: llama.forward(**inputs),
                                      inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if scenario.use_cuda_graph:

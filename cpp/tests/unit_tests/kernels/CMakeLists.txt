@@ -26,6 +26,9 @@ add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(mixtureOfExpertsTest
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+
   add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
   remove_compile_definition(mixtureOfExpertsInternalTest
                             USING_OSS_CUTLASS_MOE_GEMM)
@@ -37,6 +40,7 @@ add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
+add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
@@ -87,3 +91,4 @@ add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
+add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)

@@ -70,11 +70,6 @@ def test_case_name(request):
 
 
 @pytest.fixture(scope="session")
-def output_dir(request):
-    return request.config._trt_config["output_dir"]
-
-
-@pytest.fixture(scope="session")
 def llm_backend_root():
     llm_root = os.environ.get("LLM_ROOT", find_repo_root())
     backend_root = os.path.join(llm_root, "triton_backend")
@@ -655,10 +650,10 @@ def install_root_requirements(llm_backend_root):
 
 @pytest.fixture(scope="session")
 def output_dir(request):
-    if USE_TURTLE:
-        return request.config._trt_config["output_dir"]
-    else:
-        return request.config.getoption("--output-dir")
+    output = request.config.getoption("--output-dir")
+    if output:
+        os.makedirs(str(output), exist_ok=True)
+    return output
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):

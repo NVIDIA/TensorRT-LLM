@@ -19,6 +19,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
+#include <nanobind/stl/chrono.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -37,7 +38,9 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
+#include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
@@ -75,7 +78,7 @@ tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& con
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
-    m.doc() = "TensorRT-LLM Python bindings for C++ runtime";
+    m.doc() = "TensorRT LLM Python bindings for C++ runtime";
     m.attr("binding_type") = "nanobind";
     nb::set_leak_warnings(false);
 
@@ -123,13 +126,16 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     // Create submodule for executor bindings.
     auto mExecutor = m.def_submodule("executor", "Executor bindings");
     auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+    auto mInternalProcessGroup = mInternal.def_submodule("process_group", "PyTorch ProcessGroup internal bindings");
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
+    auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
+    tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
     tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
@@ -471,7 +477,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("DISAGG_CONTEXT_COMPLETE", tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
-        .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
+        .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS)
+        .value("DISAGG_TRANS_ERROR", tb::LlmRequestState::kDISAGG_TRANS_ERROR);
 
     nb::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, nb::rv_policy::reference)
@@ -480,6 +487,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("pinned", &tr::MemoryCounters::getPinned)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
+    tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
@@ -507,4 +515,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, nb::rv_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
+
+    m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
 }
