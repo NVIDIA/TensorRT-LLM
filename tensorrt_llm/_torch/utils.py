@@ -292,14 +292,13 @@ def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
     # We use heuristic to determine the lm_head_tp_size
     # Since token_count=256 will hit the boundary of math-bound problem
     # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
     math_bound_token_count = 256
-    max_lm_head_tp_size = min(8, mapping.world_size)
-
     lm_head_tp_size_raw = math_bound_token_count // token_count
     lm_head_tp_size = int(
         os.getenv(
             'LM_HEAD_TP_SIZE',
-            nearest_in_buckets(lm_head_tp_size_raw, [1, max_lm_head_tp_size])))
+            nearest_in_buckets(lm_head_tp_size_raw, [1, mapping.world_size])))
     assert mapping.tp_size % lm_head_tp_size == 0
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
