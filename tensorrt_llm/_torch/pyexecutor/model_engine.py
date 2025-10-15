@@ -137,6 +137,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
@@ -164,6 +165,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_config.max_draft_len = 0
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
+        self.sparse_attention_config = sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
 
@@ -175,6 +177,7 @@ class PyTorchModelEngine(ModelEngine):
                 pytorch_backend_config=pytorch_backend_config,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
+                sparse_attention_config=self.sparse_attention_config,
                 max_num_tokens=max_num_tokens,
                 max_seq_len=max_seq_len,
                 lora_config=lora_config,
@@ -261,7 +264,8 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
 
         self.attn_backend = get_attention_backend(
-            pytorch_backend_config.attn_backend)
+            pytorch_backend_config.attn_backend,
+            sparse_attn_config=sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -794,7 +798,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
-                cache_indirection=cache_indirection)
+                cache_indirection=cache_indirection,
+                sparse_attention_config=self.sparse_attention_config)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -811,7 +816,8 @@ class PyTorchModelEngine(ModelEngine):
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            cache_indirection=cache_indirection)
+            cache_indirection=cache_indirection,
+            sparse_attention_config=self.sparse_attention_config)
 
         return self.attn_metadata
 
