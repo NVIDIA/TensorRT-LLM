@@ -1054,6 +1054,45 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
                 }
             vision_weights = process_weights(weights, "visual",
                                              weight_name_mapping)
+            if get_sm_version < 100:
+                tp_rank = self.model_config.mapping.tp_rank
+                tp_size = self.model_config.mapping.tp_size
+                num_vision_heads = self.mm_encoder.config.num_heads
+
+                # Need to shard the weights to support tp
+                def shard_qkv(tensor, is_weight=True):
+                    hidden_dim = tensor.shape[0] // 3
+                    head_dim = hidden_dim // num_vision_heads
+                    heads_per_tp = num_vision_heads // tp_size
+                    start, end = tp_rank * heads_per_tp, (tp_rank +
+                                                          1) * heads_per_tp
+
+                    if is_weight:
+                        tensor = tensor.reshape(3, num_vision_heads, head_dim,
+                                                hidden_dim)
+                        sliced = tensor[:, start:end].reshape(3, -1, hidden_dim)
+                    else:
+                        tensor = tensor.reshape(3, num_vision_heads, head_dim)
+                        sliced = tensor[:, start:end].reshape(3, -1)
+
+                    return torch.cat([sliced[0], sliced[1], sliced[2]], dim=0)
+
+                for key in vision_weights.keys():
+                    if "attn.qkv_proj" in key:
+                        if "weight" in key:
+                            # qkv_proj.weight shape: [3 * hidden_dim, hidden_dim]
+                            vision_weights[key] = shard_qkv(vision_weights[key],
+                                                            is_weight=True)
+                        elif "bias" in key:
+                            # qkv_proj.bias shape: [3 * hidden_dim]
+                            vision_weights[key] = shard_qkv(vision_weights[key],
+                                                            is_weight=False)
+
+                    if "attn.o_proj.weight" in key:
+                        # o_proj.weight shape: [hidden_dim, hidden_dim]
+                        vision_weights[key] = torch.chunk(vision_weights[key],
+                                                          tp_size,
+                                                          dim=1)[tp_rank]
             self.mm_encoder.load_state_dict(vision_weights, strict=True)
 
         self.llm.load_weights(weights, weight_mapper)
