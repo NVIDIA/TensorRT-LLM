@@ -133,13 +133,6 @@ class ModelLoader:
             assert self.llm_args.build_config
             self.build_config = self.llm_args.build_config
 
-            self.auto_parallel_config = self.llm_args.auto_parallel_config.model_copy(
-                update={
-                    "world_size":
-                    self.llm_args.parallel_config.world_size if self.llm_args.
-                    parallel_config.auto_parallel else 1
-                })
-
         self._gather_build_steps()
 
     def _gather_build_steps(self):
@@ -540,11 +533,7 @@ class ModelLoader:
         # avoid the original build_config is modified, avoid the side effect
         copied_build_config = copy.deepcopy(self.build_config)
 
-        copied_build_config.update(
-            auto_parallel_config=self.auto_parallel_config)
         copied_build_config.update_kv_cache_type(self._model_info.architecture)
-        if self.auto_parallel_config.enabled:
-            self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
 
         self._engine = build(self.model, copied_build_config)
@@ -727,9 +716,9 @@ class CachedModelLoader:
     def build_cache_enabled(self) -> bool:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
-        return (self.llm_args.enable_build_cache or _enable_build_cache) and (
-            self.llm_args.model_format is _ModelFormatKind.HF
-        ) and not self.llm_args.parallel_config.auto_parallel
+        return (self.llm_args.enable_build_cache
+                or _enable_build_cache) and (self.llm_args.model_format
+                                             is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
         ''' Get the cache stage for engine building. '''
@@ -745,8 +734,6 @@ class CachedModelLoader:
         parallel_config = self.llm_args.parallel_config
 
         force_rebuild = False
-        if parallel_config.auto_parallel:
-            force_rebuild = True
         if self.llm_args.model_format is not _ModelFormatKind.HF:
             force_rebuild = True
 

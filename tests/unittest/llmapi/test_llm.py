@@ -456,21 +456,12 @@ def test_llm_generate_async():
 
 def _test_llm_generate_async(model_name=default_model_name,
                              tp_size: int = 1,
-                             use_auto_parallel: bool = False,
                              tokenizer=None):
-    if "Mixtral" in model_name and use_auto_parallel:
-        pytest.skip("Auto parallel is not supported for Mixtral models")
-
-    tp_size = tp_size if not use_auto_parallel else 1
-    world_size = tp_size if use_auto_parallel else None
-
     llm = LLM(
         model=get_model_path(model_name),
         tokenizer=tokenizer,
         kv_cache_config=global_kvcache_config,
         tensor_parallel_size=tp_size,
-        auto_parallel=use_auto_parallel,
-        auto_parallel_world_size=world_size,
         fast_build=True,
     )
 
