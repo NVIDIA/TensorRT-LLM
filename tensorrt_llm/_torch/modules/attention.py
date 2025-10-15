@@ -128,6 +128,7 @@ class Attention(nn.Module):
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
         attn_output_gate: Optional[bool] = None,
+        use_custom_cublas_mm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -236,7 +237,7 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -254,11 +255,13 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
-        )
+            use_custom_cublas_mm=use_custom_cublas_mm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
-        attn_cls = get_attention_backend(self.attn_backend)
+        attn_cls = get_attention_backend(
+            self.attn_backend,
+            sparse_attn_config=config.sparse_attention_config)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -276,6 +279,9 @@ class Attention(nn.Module):
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
+        if config.sparse_attention_config is not None:
+            logger.warning("disable rope_fusion for sparse attention.")
+            rope_fusion = False
         self.rope_fusion = rope_fusion
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning(
@@ -313,6 +319,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -537,10 +544,9 @@ class Attention(nn.Module):
                 t.reshape(*orig_shape, -1) for t in torch.chunk(
                     q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
             ]
-            ### TODO: avoid the redundant split and concat
-            qkv = torch.concat([q, k, v], dim=-1)
+        else:
+            q, k, v = qkv, None, None
 
-        q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -854,6 +860,7 @@ class MLA(nn.Module):
             v_head_dim=self.v_head_dim,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.mqa = create_attention(
@@ -873,6 +880,7 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_attention_config=config.sparse_attention_config,
         )
 
         self.aux_stream = aux_stream

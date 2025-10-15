@@ -10,3 +10,4 @@ Model Recipes
    quick-start-recipe-for-llama3.3-70b-on-trtllm.md
    quick-start-recipe-for-llama4-scout-on-trtllm.md
    quick-start-recipe-for-gpt-oss-on-trtllm.md
+   quick-start-recipe-for-qwen3-next-on-trtllm.md

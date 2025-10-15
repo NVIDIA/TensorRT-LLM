@@ -106,10 +106,6 @@ class ADEngine(ModelEngine):
 
         factory = ad_config.create_factory()
 
-        # pass in extra arguments defined by the model factory
-        for name, (none_input, dynamic_shape_callback) in factory.get_extra_inputs().items():
-            seq_info.add_extra_arg(name, none_input, dynamic_shape_callback)
-
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
@@ -262,7 +258,7 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        logits: torch.Tensor = self.model(self.cache_seq_interface)[0]
+        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)

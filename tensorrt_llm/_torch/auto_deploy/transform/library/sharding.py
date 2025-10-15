@@ -292,7 +292,7 @@ def detect_sharding_from_factory_config(
     num_simple_shards = 0
     num_row_col_shards = 0
 
-    for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
+    for lin_node in filtered_nodes(gm.graph.nodes, [is_linear_op, is_fake_quantized_linear_op]):
         # use node's weight name to get the module name
         module_name = lin_node.args[1].target
 
@@ -368,7 +368,7 @@ def detect_sharding_from_factory_config(
                             )
                             num_row_col_shards += 1
                         else:
-                            ad_logger.warning("Invalid sharding config. Skipping.")
+                            ad_logger.warning(f"Unsupported sharding action {config}. Skipping.")
                     else:
                         # TODO: local refers to hybrid EP+TP parallelism. Not supported yet.
                         ad_logger.warning("Local EP+TP sharding is not supported yet. Skipping.")
@@ -387,7 +387,19 @@ def detect_sharding_from_factory_config(
                     )
                     num_simple_shards += 1
                 else:
-                    ad_logger.warning("Invalid sharding config. Skipping.")
+                    ad_logger.warning(
+                        f"Unsupported sharding action {config}. Fallback to simple shard"
+                    )
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            lin_node,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                        )
+                    )
                 # after successful match, break the loop
                 break
 
@@ -479,8 +491,7 @@ def detect_column_row_shard(
     # acceptable attention nodes between sharded GEMMs
     shardable_attention_nodes = {
         torch.ops.auto_deploy.torch_attention_sdpa,
-        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
-        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention,
     }
 
     # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an

@@ -137,6 +137,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
@@ -164,6 +165,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_config.max_draft_len = 0
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
+        self.sparse_attention_config = sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
 
@@ -175,6 +177,7 @@ class PyTorchModelEngine(ModelEngine):
                 pytorch_backend_config=pytorch_backend_config,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
+                sparse_attention_config=self.sparse_attention_config,
                 max_num_tokens=max_num_tokens,
                 max_seq_len=max_seq_len,
                 lora_config=lora_config,
@@ -261,7 +264,8 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
 
         self.attn_backend = get_attention_backend(
-            pytorch_backend_config.attn_backend)
+            pytorch_backend_config.attn_backend,
+            sparse_attn_config=sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -695,19 +699,25 @@ class PyTorchModelEngine(ModelEngine):
         cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                         reverse=True)
         # Create CUDA graphs for different draft lengths
-        draft_lengths = [self.max_draft_len]
-        # For non-draft model, we also capture the CUDA graph instance for draft length 0,
-        # so that when we disable spec decode at runtime, we can still run the captured graph.
-        # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-        if (not self.is_draft_model and self.max_draft_len > 0
-                and not self.spec_config.spec_dec_mode.use_one_engine()
-                # Assume that speculation is always on if the user didn't give us a max_concurrency
-                # value. This will save on memory.
-                and self.spec_config.max_concurrency is not None):
-            draft_lengths.append(0)
-        if self.is_spec_decode and self.is_draft_model and spec_resource_manager is not None and isinstance(
-                spec_resource_manager, Eagle3ResourceManager):
-            draft_lengths.append(self.original_max_draft_len)
+        draft_lengths = []
+        if self.is_draft_model:
+            if self.model_is_wrapped and self.is_spec_decode and spec_resource_manager is not None and isinstance(
+                    spec_resource_manager, Eagle3ResourceManager):
+                # The CDL path uses draft_len > 0 for the number of iterations in the drafting loop.
+                draft_lengths.append(self.original_max_draft_len)
+            else:
+                draft_lengths.append(self.max_draft_len)
+        else:
+            # For non-draft model, we also capture the CUDA graph instance for draft length 0,
+            # so that when we disable spec decode at runtime, we can still run the captured graph.
+            # Note that for one engine mode, we are not able to turn off spec decode at runtime.
+            if (self.max_draft_len > 0
+                    and not self.spec_config.spec_dec_mode.use_one_engine()
+                    # Assume that speculation is always on if the user didn't give us a max_concurrency
+                    # value. This will save on memory.
+                    and self.spec_config.max_concurrency is not None):
+                draft_lengths.append(0)
+            draft_lengths = [self.max_draft_len]
 
         for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
@@ -723,6 +733,7 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
                     )
+
                     self.enable_spec_decode = draft_len > 0 or self.is_draft_model
 
                     def _update_draft_inference_state(is_first_draft: bool,
@@ -787,7 +798,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
-                cache_indirection=cache_indirection)
+                cache_indirection=cache_indirection,
+                sparse_attention_config=self.sparse_attention_config)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -804,7 +816,8 @@ class PyTorchModelEngine(ModelEngine):
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            cache_indirection=cache_indirection)
+            cache_indirection=cache_indirection,
+            sparse_attention_config=self.sparse_attention_config)
 
         return self.attn_metadata
 
@@ -2257,21 +2270,34 @@ class PyTorchModelEngine(ModelEngine):
         inputs = self._preprocess_inputs(inputs)
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
-        if self.without_logits:
-            outputs = self.model_forward(**inputs)
-            return outputs
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        logits = self.model_forward(
+        outputs = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
-        if gather_ids is not None:
-            return {'logits': logits[gather_ids]}
+
+        if self.without_logits:
+            return outputs
+
+        if isinstance(outputs, dict):
+            # If the model returns a dict, get the logits from it. All other keys are kept.
+            logits = outputs.get('logits', None)
+            # If the logits are not found, no further processing is needed.
+            if logits is None:
+                return outputs
         else:
-            return {'logits': logits}
+            # If the model returns a single tensor, assume it is the logits and wrap it in a dict.
+            logits = outputs
+            outputs = {'logits': logits}
+
+        # If we have special gather_ids, gather the logits
+        if gather_ids is not None:
+            outputs['logits'] = logits[gather_ids]
+
+        return outputs
 
     @nvtx_range("_forward_step_mm_encoder_only")
     def _forward_step_mm_encoder_only(

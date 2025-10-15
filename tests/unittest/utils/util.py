@@ -19,7 +19,8 @@ except ImportError:
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm._utils import (mpi_disabled, torch_dtype_to_trt,
+                                 trt_dtype_to_torch)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -446,3 +447,7 @@ def check_accuracy(a, b, atol, rtol, percent):
     if not (mismatch_percent < 1 - percent):
         raise Exception("Mismatch percentage is %f for rtol %f" %
                         (mismatch_percent, rtol))
+
+
+skip_ray = pytest.mark.skipif(
+    mpi_disabled(), reason="This test is skipped for Ray orchestrator.")

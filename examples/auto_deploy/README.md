@@ -262,18 +262,18 @@ Then use these configurations:
 # Using single YAML config
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml
+  --yaml-extra my_config.yaml
 
 # Using multiple YAML configs (deep merged in order, later files have higher priority)
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml production.yaml
+  --yaml-extra my_config.yaml production.yaml
 
 # Targeting nested AutoDeployConfig with separate YAML
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml \
-  --args.yaml-configs autodeploy_overrides.yaml
+  --yaml-extra my_config.yaml \
+  --args.yaml-extra autodeploy_overrides.yaml
 ```
 
 #### Configuration Precedence and Deep Merging
@@ -281,7 +281,8 @@ python build_and_run_ad.py \
 The configuration system follows a strict precedence order where higher priority sources override lower priority ones:
 
 1. **CLI Arguments** (highest priority) - Direct command line arguments
-1. **YAML Configs** - Files specified via `--yaml-configs` and `--args.yaml-configs`
+1. **YAML Extra Configs** - Files specified via `--yaml-extra` and `--args.yaml-extra`
+1. **YAML Default Config** - (**do not change**) Files specified via `--yaml-default` and `--args.yaml-default`
 1. **Default Settings** (lowest priority) - Built-in defaults from the config classes
 
 **Deep Merging**: Unlike simple overwriting, deep merging intelligently combines nested dictionaries recursively. For example:
@@ -307,18 +308,18 @@ args:
 **Nested Config Behavior**: When using nested configurations, outer YAML configs become init settings for inner objects, giving them higher precedence:
 
 ```bash
-# The outer yaml-configs affects the entire ExperimentConfig
-# The inner args.yaml-configs affects only the AutoDeployConfig
+# The outer yaml-extra affects the entire ExperimentConfig
+# The inner args.yaml-extra affects only the AutoDeployConfig
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs experiment_config.yaml \
-  --args.yaml-configs autodeploy_config.yaml \
+  --yaml-extra experiment_config.yaml \
+  --args.yaml-extra autodeploy_config.yaml \
   --args.world-size=8  # CLI override beats both YAML configs
 ```
 
 #### Built-in Default Configuration
 
-Both [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the [`_get_config_dict()`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) function and defines default transform configurations for graph optimization stages.
+Both [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified via the [`yaml_default`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) field and defines default transform configurations for graph optimization stages.
 
 The built-in defaults are automatically merged with your configurations at the lowest priority level, ensuring that your custom settings always override the defaults. You can inspect the current default configuration to understand the baseline transform pipeline:
 
@@ -331,6 +332,8 @@ python build_and_run_ad.py \
   --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
   --args.transforms.export-to-gm.strict=true
 ```
+
+As indicated before, this can be overwritten via the `yaml_default` (`--yaml-default`) field but note that this will overwrite the entire Inference Optimizer pipeline.
 
 </details>
 

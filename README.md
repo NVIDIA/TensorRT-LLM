@@ -18,6 +18,10 @@ TensorRT LLM
 <div align="left">
 
 ## Tech Blogs
+
+* [10/13] Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md)
+
 * [09/26] Inference Time Compute Implementation in TensorRT LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md)
 

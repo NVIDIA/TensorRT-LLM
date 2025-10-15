@@ -192,6 +192,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Input QKV buffers.
     void const* qPtr;

@@ -6,8 +6,6 @@ from torch import nn
 from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
@@ -167,6 +165,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
+            disable_deep_gemm=True,
         )
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
@@ -389,9 +388,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
-        super().load_weights(weights, weight_mapper)
-
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

@@ -143,6 +143,7 @@ def remove_weights(
     for mod in iter_modules(module, ignore_modules):
         mod._parameters.clear()
         mod._buffers.clear()
+        mod._weights_removed = True
 
 
 def skip_forward(
@@ -379,6 +380,8 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
+                                             False),
             )
 
             if self.has_custom_lm_head:

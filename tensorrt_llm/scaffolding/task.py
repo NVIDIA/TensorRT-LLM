@@ -1,10 +1,11 @@
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.result import GenerationResult, TokenLogprobs
 
 
 @dataclass
@@ -64,6 +65,7 @@ class GenerationTask(Task):
     # result field
     # link to TRTLLM's GenerationResult, for async update in streaming mode
     _result: Optional[GenerationResult] = None
+    customized_result_fields: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def result(self) -> GenerationResult:
@@ -96,7 +98,7 @@ class GenerationTask(Task):
             0].cumulative_logprob if self._result else None
 
     @property
-    def logprobs(self) -> Optional[List[float]]:
+    def logprobs(self) -> Optional[TokenLogprobs]:
         return self._result.outputs[0].logprobs if self._result else None
 
     @property
@@ -113,6 +115,32 @@ class GenerationTask(Task):
 
     def create_scaffolding_output(self) -> GenerationResult:
         return self._result
+
+
+@dataclass
+class StreamGenerationTask(GenerationTask):
+    # input field
+    # if the flag is set to True, the worker will cancel the generation work
+    cancel_flag: Optional[bool] = field(default=False)
+    # the task will be returned to the controller with at least new streaming_step tokens
+    # if the streaming_step is set to 0,
+    # the task will be returned to the controller immediately with
+    # new tokens that have already been generated.
+    streaming_step: Optional[int] = field(default=1)
+
+    #result field
+    # worker set this field and identify the same task by this field
+    request_handle: Any = field(default=None)
+    # worker set this field to True when the generation is finished
+    end_flag: bool = field(default=False)
+
+    @staticmethod
+    def create_from_generation_task(task: GenerationTask,
+                                    streaming_step) -> "StreamGenerationTask":
+        stream_task = StreamGenerationTask()
+        stream_task.__dict__ = copy.deepcopy(task.__dict__)
+        stream_task.streaming_step = streaming_step
+        return stream_task
 
 
 @dataclass
