@@ -8,7 +8,6 @@ from typing import Dict, List
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
