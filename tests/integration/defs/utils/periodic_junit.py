@@ -47,12 +47,27 @@ class PeriodicJUnitXML:
 
             reporter = PeriodicJUnitXML(
                 xmlpath='results/junit_report.xml',
-                interval=1800,  # Save every 30 minutes
-                batch_size=10   # Or save every 10 tests
+                interval=18000,    # Save every 5 hours
+                batch_size=10,    # Or save every 10 tests
+                use_fsync=False   # Disable fsync for better performance (default)
             )
             reporter.pytest_configure(config)
             config.pluginmanager.register(reporter, 'periodic_junit')
+
+        Performance Note:
+            - use_fsync=False (default): Fast, relies on OS buffer. Risk: data loss on crash
+            - use_fsync=True: Slow (10-100x), guarantees disk write. Use for critical data
     """
+
+    # Compile regex pattern once at class level for better performance
+    import re
+    _ANSI_ESCAPE_PATTERN = re.compile(
+        r'\x1b'  # ESC character
+        r'(?:'  # Start non-capturing group
+        r'\[[0-?]*[ -/]*[@-~]'  # CSI sequences: ESC [ ... letter
+        r'|].*?(?:\x07|\x1b\\)'  # OSC sequences: ESC ] ... BEL/ESC\
+        r'|[()][AB012]'  # Character set selection
+        r')')
 
     def __init__(
             self,
@@ -60,6 +75,7 @@ class PeriodicJUnitXML:
             interval: int = 1800,
             batch_size: int = 10,
             logger=None,  # Optional logger (print_info, print_warning functions)
+            use_fsync: bool = False,  # Whether to use fsync for data safety
     ):
         """
         Initialize periodic reporter.
@@ -69,11 +85,14 @@ class PeriodicJUnitXML:
             interval: Time interval in seconds between saves (default: 1800 = 30 min)
             batch_size: Number of tests before triggering a save (default: 10)
             logger: Optional dictionary with 'info' and 'warning' functions for logging
+            use_fsync: Whether to use os.fsync() to force disk writes (default: False for performance)
+                      Set to True for maximum data safety at cost of performance
         """
         self.xmlpath = os.path.abspath(xmlpath)
         self.time_interval = interval
         self.batch_size = batch_size
         self.logger = logger or {}
+        self.use_fsync = use_fsync
 
         self.completed_tests = 0
         self.last_save_time = time.time()
@@ -96,8 +115,8 @@ class PeriodicJUnitXML:
         else:
             print(f"WARNING: {message}")
 
-    @staticmethod
-    def _sanitize_xml_text(text):
+    @classmethod
+    def _sanitize_xml_text(cls, text):
         """
         Sanitize text for XML by removing illegal characters.
 
@@ -116,33 +135,22 @@ class PeriodicJUnitXML:
         if not text:
             return text
 
-        import re
-
-        # Remove ANSI escape sequences (e.g., \x1b[31m for colors)
-        # Pattern: ESC [ ... m (most common)
-        # Also handles: ESC ] ... BEL/ESC\ (less common)
-        ansi_escape_pattern = re.compile(
-            r'\x1b'  # ESC character
-            r'(?:'  # Start non-capturing group
-            r'\[[0-?]*[ -/]*[@-~]'  # CSI sequences: ESC [ ... letter
-            r'|].*?(?:\x07|\x1b\\)'  # OSC sequences: ESC ] ... BEL/ESC\
-            r'|[()][AB012]'  # Character set selection
-            r')')
-        text = ansi_escape_pattern.sub('', text)
+        # Remove ANSI escape sequences using pre-compiled pattern
+        text = cls._ANSI_ESCAPE_PATTERN.sub('', text)
 
         # Remove other control characters except allowed ones
         # Keep: tab(0x09), newline(0x0A), carriage return(0x0D)
-        def is_valid_xml_char(c):
+        # Optimized: Use list comprehension and join for better performance
+        result = []
+        for c in text:
             codepoint = ord(c)
-            return (codepoint == 0x09 or codepoint == 0x0A or codepoint == 0x0D
+            if (codepoint == 0x09 or codepoint == 0x0A or codepoint == 0x0D
                     or (0x20 <= codepoint <= 0xD7FF)
                     or (0xE000 <= codepoint <= 0xFFFD)
-                    or (0x10000 <= codepoint <= 0x10FFFF))
+                    or (0x10000 <= codepoint <= 0x10FFFF)):
+                result.append(c)
 
-        # Filter out invalid characters
-        text = ''.join(c if is_valid_xml_char(c) else '' for c in text)
-
-        return text
+        return ''.join(result)
 
     @staticmethod
     def _parse_nodeid(nodeid):
@@ -566,8 +574,13 @@ class PeriodicJUnitXML:
                     if line.strip():
                         self.xml_file.write(f'    {line}\n')
 
+            # Always flush to OS buffer (fast operation)
             self.xml_file.flush()
-            os.fsync(self.xml_file.fileno())  # Force write to disk
+
+            # Optionally force write to disk (slow but safer)
+            # fsync can be 100-1000x slower than flush, so it's disabled by default
+            if self.use_fsync:
+                os.fsync(self.xml_file.fileno())
 
             self._log_info(
                 f"Flushed {len(self.pending_cases)} test cases to report")
