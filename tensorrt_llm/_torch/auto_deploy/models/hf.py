@@ -115,9 +115,17 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # a mapping of the parameter names exists and hold that information in this attribute.
         self._checkpoint_conversion_mapping: Optional[Dict[str, str]] = None
 
+        # This is needed for guided decoding in the pyexecutor.
+        model_config, _ = self._get_model_config()
+        self._vocab_size_padded = getattr(model_config, "vocab_size", None)
+
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
         return AutoModelForCausalLM
+
+    @property
+    def vocab_size_padded(self) -> Optional[int]:
+        return self._vocab_size_padded
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
