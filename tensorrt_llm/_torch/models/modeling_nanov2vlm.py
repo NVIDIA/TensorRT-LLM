@@ -14,7 +14,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
-                       compute_retention_mask, register_input_processor)
+                       compute_retained_tokens_count, compute_retention_mask,
+                       register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -26,6 +27,8 @@ from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
 VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
+IMAGE_START_TOKEN_ID = 131073
+IMAGE_END_TOKEN_ID = 131074
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
@@ -53,6 +56,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         self.downsample_ratio = config.downsample_ratio
         self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
         self.ps_version = config.ps_version  # Pixel shuffle version.
+        self.video_pruning_ratio = VIDEO_PRUNING_RATIO
 
         # Construct the vision projection.
         self.vit_hidden_size = config.vit_hidden_size
@@ -123,11 +127,12 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         return vit_embeds
 
     def apply_evs(
-            self, mm_embedding: List[torch.Tensor],
-            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        self, mm_embedding: List[torch.Tensor],
+        multimodal_params: List[MultimodalParams]
+    ) -> Tuple[List[torch.Tensor], Optional[List[List[int]]]]:
         """Apply EVS to the multimodal embedding."""
-        if VIDEO_PRUNING_RATIO <= 0:
-            return mm_embedding
+        if self.video_pruning_ratio <= 0:
+            return mm_embedding, None
 
         modality_types = [
             multimodal_param.multimodal_data['modality_type']
@@ -138,30 +143,48 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             for multimodal_param in multimodal_params
         ]
         mm_embedding_evs = []
+        num_tokens_in_videos = []
         # Iterate over batch.
         for modality_type, mm_embed, video_sizes in zip(modality_types,
                                                         mm_embedding,
                                                         video_size_list):
             if modality_type == "video":
                 # Iterate over each video in the batch.
-                start_idx, mm_embed_list = 0, []
+                start_idx, mm_embed_list, num_tokens_per_video = 0, [], []
                 for video_size in video_sizes:
-                    partial_mm_embed = mm_embed[start_idx:start_idx +
-                                                video_size[0]]
-                    retention_mask = compute_retention_mask(
-                        video_embeds=partial_mm_embed,
-                        video_size=video_size,
+                    t, p, ih, iw = video_size
+                    partial_mm_embed = mm_embed[start_idx:start_idx + t * p]
+                    # -> [num_frames * num_patches_per_frame, h*w, hidden_size]
+
+                    # Need to expose temporal dimension for EVS.
+                    _, wh, hidden_size = partial_mm_embed.shape
+                    reshaped_partial_mm_embed = partial_mm_embed.reshape(
+                        t, p, wh, hidden_size).reshape(t, p * wh, hidden_size)
+
+                    # -> [num_frames, num_patches_per_frame*h*w, hidden_size]
+                    original_retention_mask = compute_retention_mask(
+                        video_embeds=reshaped_partial_mm_embed,
+                        video_size=(t, p * ih, iw),
                         spatial_merge_size=self.spatial_merge_size,
-                        q=VIDEO_PRUNING_RATIO,
+                        pruning_ratio=self.video_pruning_ratio,
                         flatten_output=False,
                     ).flatten(start_dim=1)
-                    start_idx += video_size[0]
+                    # -> [num_frames, num_patches_per_frame*h*w]
+                    num_tokens_per_frame = original_retention_mask.sum(dim=1)
+                    retention_mask = original_retention_mask.reshape(
+                        t, p, wh).reshape(t * p, wh)
+                    # -> [num_frames * num_patches_per_frame, h*w]
+                    start_idx += t * p
                     partial_mm_embed = partial_mm_embed[retention_mask]
                     mm_embed_list.append(partial_mm_embed)
+                    num_tokens_per_video.append(num_tokens_per_frame)
                 mm_embedding_evs.append(torch.cat(mm_embed_list, dim=0))
+                num_tokens_in_videos.append(
+                    torch.cat(num_tokens_per_video, dim=0))
             else:
                 mm_embedding_evs.append(mm_embed)
-        return mm_embedding_evs
+        return mm_embedding_evs, num_tokens_in_videos if len(
+            num_tokens_in_videos) > 0 else None
 
     def forward(self, multimodal_params: List[MultimodalParams]):
         mm_embedding = []
@@ -184,13 +207,14 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
                                    batched_num_patches,
                                    dim=0)
 
-        mm_embedding = self.apply_evs(mm_embedding, multimodal_params)
+        mm_embedding, num_tokens_in_videos = self.apply_evs(
+            mm_embedding, multimodal_params)
 
         mm_embedding = [
             m.reshape(-1, self.llm_hidden_size) for m in mm_embedding
         ]
         # -> list of [num_patches*num_image_token, hidden_size]
-        return mm_embedding
+        return mm_embedding, num_tokens_in_videos
 
 
 class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
@@ -207,9 +231,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         self.image_size = model_config.force_image_size
         self.patch_size = model_config.patch_size
         self.downsample_ratio = model_config.downsample_ratio
+        self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
         self.img_context_token_id = model_config.img_context_token_id
         self.num_image_token = int((self.image_size // self.patch_size)**2 *
                                    (self.downsample_ratio**2))
+        self.video_pruning_ratio = VIDEO_PRUNING_RATIO
 
         self.device = 'cpu'
 
@@ -233,8 +259,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         " Return multimodal special token ids for NanoV2VL. "
-        # TODO: Hardcoded for now, need extract from model config later.
-        return torch.tensor([131073, 131074])
+        return torch.tensor([IMAGE_START_TOKEN_ID, IMAGE_END_TOKEN_ID])
 
     def get_mm_token_ids(self):
         return torch.tensor([self.img_context_token_id], dtype=torch.int32)
@@ -305,6 +330,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         if self.processor.use_thumbnail and blocks != 1:
             blocks += 1
         num_image_tokens = self.num_image_token * blocks
+        # Add special tokens.
+        num_image_tokens += len(self.get_mm_special_token_ids())
         return num_image_tokens
 
     def get_num_tokens_per_video(
@@ -316,44 +343,30 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     ):
         # Use VIDEO_PRUNING_RATIO if not explicitly provided
         if video_pruning_ratio is None:
-            video_pruning_ratio = VIDEO_PRUNING_RATIO
+            video_pruning_ratio = self.video_pruning_ratio
 
         num_frames = len(video)
-
         if video_pruning_ratio > 0:
             num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
                                                                  **kwargs)
-            num_tokens_per_frame_list = [num_tokens_per_frame] * num_frames
-
-            # Total patches across all frames
-            total_num_tokens_base = sum(num_tokens_per_frame_list)
-
-            # Calculate total desired tokens after pruning
-            desired_num_tokens = int(total_num_tokens_base *
-                                     (1.0 - video_pruning_ratio))
-
-            # Calculate tokens for each frame except the last
-            existing_num_tokens = 0
-            for i in range(num_frames - 1):
-                feature_size = num_tokens_per_frame_list[i]
-                feature_size = int(feature_size * (1.0 - video_pruning_ratio))
-                existing_num_tokens += feature_size
-
-            # Last frame gets the remaining tokens
-            last_frame_tokens = desired_num_tokens - existing_num_tokens
-            num_total_tokens = existing_num_tokens + last_frame_tokens
-
-            # Add start and end tokens for each frame
-            num_total_tokens += num_frames * 2
+            num_image_tokens_per_frame = num_tokens_per_frame - len(
+                self.get_mm_special_token_ids())
+            blocks = num_image_tokens_per_frame // self.num_image_token
+            video_size = (num_frames, blocks * self.image_size, self.image_size)
+            num_total_tokens = compute_retained_tokens_count(
+                video_size=video_size,
+                spatial_merge_size=self.spatial_merge_size,
+                pruning_ratio=video_pruning_ratio,
+            )
+            # Add special tokens for each frame.
+            num_total_tokens += num_frames * len(
+                self.get_mm_special_token_ids())
         else:
             # No pruning - sum tokens for all frames
             num_total_tokens = sum(
                 self.get_num_tokens_per_image(
                     image=frame, video_pruning_ratio=None, **kwargs)
                 for frame in video)
-            # Add start and end tokens for each frame
-            num_total_tokens += num_frames * 2
-
         return num_total_tokens
 
     @torch.inference_mode()
@@ -409,32 +422,40 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             processed_query = ""
             for video_index, video in enumerate(videos):
                 # Processing for multimodal data.
+                num_frames = len(video)
                 processed_images = self.processor(images=video,
                                                   return_tensors='pt').to(
                                                       self.device)
                 t, _, h, w = processed_images['pixel_values'].shape
                 num_patches_list.append(processed_images['num_patches'])
                 pixel_values_list.append(processed_images['pixel_values'])
-                video_size_list.append([t, h, w])
+                video_size_list.append([num_frames, t // num_frames, h, w])
 
                 # Processing the text prompt.
                 processed_query += parts[video_index]
-                total_num_patches = sum(processed_images['num_patches'])
-                desired_num_tokens = int(self.num_image_token *
-                                         total_num_patches *
-                                         (1.0 - VIDEO_PRUNING_RATIO))
-                existing_num_tokens = 0
-                for num_patches in processed_images['num_patches'][:-1]:
-                    feature_size = num_patches * self.num_image_token
-                    feature_size = int(feature_size *
-                                       (1.0 - VIDEO_PRUNING_RATIO))
-                    existing_num_tokens += feature_size
-                    image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
-                    processed_query += image_repl
-                # Special handling for the last patch of image tokens.
-                image_repl = self.img_start_token + self.img_context_token * (
-                    desired_num_tokens -
-                    existing_num_tokens) + self.img_end_token
+                if self.video_pruning_ratio > 0:
+                    desired_num_tokens = compute_retained_tokens_count(
+                        video_size=(num_frames, t // num_frames * h, w),
+                        spatial_merge_size=self.spatial_merge_size,
+                        pruning_ratio=self.video_pruning_ratio,
+                    )
+                    # It is dummy tokens and will be adjusted in VisionEncoder after applied EVS.
+                    # We need to know the length of the full input ids ahead, to make Mamba-mixer work.
+                    num_tokens_per_frame = [desired_num_tokens
+                                            ] + [0] * (num_frames - 1)
+                else:
+                    num_tokens_per_frame = [
+                        num_patches * self.num_image_token
+                        for num_patches in processed_images['num_patches']
+                    ]
+
+                # Prepare video prompts.
+                # TODO: add metadata like FPS and frame_index when such metadata is available.
+                image_repl = "This is a video:\n"
+                for idx, num_tokens in enumerate(num_tokens_per_frame):
+                    image_repl += f"Frame {idx + 1}: "
+                    image_repl += self.img_start_token + self.img_context_token * num_tokens + self.img_end_token
+                    image_repl += "\n"
                 processed_query += image_repl
             processed_query += parts[num_videos]
             processed_images['num_patches'] = torch.tensor(
@@ -499,6 +520,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.vocab_size = llm_model_config.pretrained_config.vocab_size
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self.img_context_token_id = config.img_context_token_id
+        self.video_context_token_id = config.video_context_token_id
         self.post_config()
         self.is_loaded = True
 
@@ -523,6 +545,49 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
+    def update_input_ids(self, input_ids, num_tokens_in_videos):
+        """Update input_ids in videos if EVS is applied.
+
+        Note: it is not compatible with chunked_prefill for now.
+        """
+        image_start_token_id = IMAGE_START_TOKEN_ID
+        image_end_token_id = IMAGE_END_TOKEN_ID
+
+        # Find the positions of start and end image tokens in input_ids
+        image_start_token_mask = (input_ids == image_start_token_id)
+        image_start_token_indices = torch.nonzero(image_start_token_mask,
+                                                  as_tuple=False).flatten()
+        image_end_token_mask = (input_ids == image_end_token_id)
+        image_end_token_indices = torch.nonzero(image_end_token_mask,
+                                                as_tuple=False).flatten()
+
+        num_tokens_in_videos = torch.cat(num_tokens_in_videos, dim=0)
+        results_ids = input_ids.clone()
+        src_idx = 0
+        target_idx1, target_idx2 = 0, 0
+        for start_idx, end_idx, num_tokens in zip(
+                image_start_token_indices.tolist(),
+                image_end_token_indices.tolist(),
+                num_tokens_in_videos.tolist()):
+            if num_tokens == 0:
+                continue
+            target_idx1 = target_idx2
+            target_idx2 = target_idx1 + start_idx - src_idx
+            results_ids[target_idx1:target_idx2] = input_ids[src_idx:start_idx]
+
+            mm_tokens = torch.tensor([image_start_token_id] +
+                                     [self.img_context_token_id] * num_tokens +
+                                     [image_end_token_id],
+                                     dtype=input_ids.dtype,
+                                     device=input_ids.device)
+            target_idx1 = target_idx2
+            target_idx2 = target_idx2 + num_tokens + 2
+            results_ids[target_idx1:target_idx2] = mm_tokens
+
+            src_idx = end_idx + 1
+        results_ids[src_idx:] = input_ids[src_idx:]
+        return results_ids
+
     @torch.inference_mode()
     def forward(
         self,
@@ -545,7 +610,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_disagg():
-                mm_embedding = get_multimodal_embeddings(
+                mm_embedding, num_tokens_in_videos = get_multimodal_embeddings(
                     encoder_forward_fn=self.vision_encoder.forward,
                     multimodal_params=multimodal_params[:num_context_requests])
             else:
@@ -553,6 +618,11 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     "Nano-V2-VLM does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
+            # Adjust input_ids in videos if EVS is applied.
+            if num_tokens_in_videos is not None:
+                input_ids = self.update_input_ids(input_ids,
+                                                  num_tokens_in_videos)
+
             mm_embedding = find_input_mm_embeds(
                 mm_embedding, multimodal_params[:num_context_requests])
         input_ids, input_embeds = fuse_input_embeds(
