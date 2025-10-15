@@ -18,7 +18,7 @@ cd examples/ray_orchestrator
 pip install -r requirements.txt
 ```
 
-Run a simple `TP=2` example with a Hugging Face model:
+To run a simple `TP=2` example with a Hugging Face model:
 
 ```shell
 python llm_inference_distributed_ray.py
@@ -33,11 +33,11 @@ This example is the same as in `/examples/llm-api`, with the only change being `
 - Multi-node inference (refer to [multi-node README](./multi_nodes/README.md))
 - Disaggregated serving (refer to [disagg README](./disaggregated/README.md))
 
-**Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.**
+*Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.*
 
 ### Upcoming
 - Performance optimization
-- Integration with RLHF frameworks, such as [NVIDIA Nemo-RL](https://github.com/NVIDIA-NeMo/RL) and [Verl](https://github.com/volcengine/verl).
+- Integration with RLHF frameworks, such as [Verl](https://github.com/volcengine/verl) and [NVIDIA Nemo-RL](https://github.com/NVIDIA-NeMo/RL).
 
 ## Architecture
 This feature introduces new classes such as [RayExecutor](/tensorrt_llm/executor/ray_executor.py) and [RayGPUWorker](/tensorrt_llm/executor/ray_gpu_worker.py) for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on [torch.distributed](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) without MPI. We welcome contributions to improve and extend this support.
