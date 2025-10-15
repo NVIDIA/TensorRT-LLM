@@ -108,3 +108,51 @@ def task1():
 def test_split_mpi_env():
     session = MpiPoolSession(n_workers=4)
     session.submit_sync(task1)
+
+
+def test_llmapi_launch_subsequent_tests():
+    """
+    Test that the trtllm-llmapi-launch can run subsequent LLM API tests.
+    """
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    test_file = os.path.join(cur_dir, "_run_multi_llm_tasks.py")
+    assert os.path.exists(test_file), f"Test file {test_file} does not exist"
+    command = [
+        "mpirun", "-n", "2", "--allow-run-as-root", "trtllm-llmapi-launch",
+        "python3", test_file
+    ]
+    print(' '.join(command))
+
+    with Popen(command,
+               env=os.environ,
+               stdout=PIPE,
+               stderr=PIPE,
+               bufsize=1,
+               start_new_session=True,
+               universal_newlines=True,
+               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
+        # Function to read from a stream and write to output
+        def read_stream(stream, output_stream):
+            for line in stream:
+                output_stream.write(line)
+                output_stream.flush()
+
+        # Create threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=read_stream,
+                                         args=(process.stdout, sys.stdout))
+        stderr_thread = threading.Thread(target=read_stream,
+                                         args=(process.stderr, sys.stderr))
+
+        # Start both threads
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
+        return_code = process.wait()
+
+        # Wait for both threads to finish reading
+        stdout_thread.join()
+        stderr_thread.join()
+
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
