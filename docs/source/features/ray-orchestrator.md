@@ -27,7 +27,7 @@ This example is the same as in `/examples/llm-api`, with the only change being `
 ## Features
 Currently available:
 - Generate text asynchronously (refer to [llm_inference_async_ray.py](/examples/ray_orchestrator/llm_inference_async_ray.py))
-- Multi-node inference (refer to [multi-node README](/examples/ray_orchestrator/README.md))
+- Multi-node inference (refer to [multi-node README](/examples/ray_orchestrator/multi_nodes/README.md))
 - Disaggregated serving (refer to [disagg README](/examples/ray_orchestrator/disaggregated/README.md))
 
 *Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.*
