@@ -95,7 +95,6 @@ class KvCacheConnectorWorker(ABC):
     def _clear_connector_meta(self):
         self._metadata = None
 
-    @abstractmethod
     def register_forward_pass_callable(self) -> Callable:
         """
         This callable will be called at the end of the forward pass.
