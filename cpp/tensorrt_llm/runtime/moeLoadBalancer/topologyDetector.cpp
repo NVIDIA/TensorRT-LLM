@@ -90,6 +90,8 @@ void TopologyDetector::detectCpuTopology()
     mCpuArchitecture = "unknown";
 #endif
 
+    mDebugStringStream << "CPU Architecture: " << mCpuArchitecture << "\n";
+
     // Detect NUMA topology on Linux systems using libnuma
 #ifdef __linux__
     if (numa_available() == -1)
@@ -106,13 +108,17 @@ void TopologyDetector::detectCpuTopology()
         // Failed to get max node, fall back to default behavior
         TLLM_LOG_WARNING("Failed to get max NUMA node. Falling back to default CPU topology detection.");
         mNumaToCpuCountMap[0] = std::thread::hardware_concurrency();
+        mDebugStringStream << "Failed to get max NUMA node. Falling back to default CPU topology detection.\n";
         return;
     }
+
+    mDebugStringStream << "Max NUMA node: " << maxNode << "\n";
 
     mNumaToCpuCountMap.clear(); // Clear before re-populating
     std::map<int, int> tempNumaToCpuCountMap;
     for (int i = 0; i <= maxNode; ++i)
     {
+        mDebugStringStream << "Querying NUMA node " << i << "\n";
         struct bitmask* cpus = numa_allocate_cpumask();
         if (!cpus)
         {
@@ -129,6 +135,7 @@ void TopologyDetector::detectCpuTopology()
                 if (numa_bitmask_isbitset(cpus, cpu_idx))
                 {
                     cpuCount++;
+                    mDebugStringStream << "CPU " << cpu_idx << " is on NUMA node " << i << "\n";
                 }
             }
             if (cpuCount > 0)
