@@ -2674,16 +2674,6 @@ int AttentionOp::initialize() noexcept
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
         }
-        if (mFP8FmhaForEagle3)
-        {
-            // use FP8 FMHA for Eagle3 with FP8 target model and BF16/FP16 draft model
-            FmhaDispatcher tempFmhaDispatcher(fmhaParams);
-            // use FP8 output for non-TllmGen, because FP8 TllmGen supports BF16/FP16 output
-            if (!tempFmhaDispatcher.useTllmGen())
-            {
-                fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
-            }
-        }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
@@ -2733,6 +2723,16 @@ int AttentionOp::initialize() noexcept
         fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
+        if (mFP8FmhaForEagle3)
+        {
+            // use FP8 FMHA for Eagle3 with FP8 target model and BF16/FP16 draft model
+            FmhaDispatcher tempFmhaDispatcher(fmhaParams);
+            // use FP8 output for non-TllmGen, because FP8 TllmGen supports BF16/FP16 output
+            if (!tempFmhaDispatcher.useTllmGen())
+            {
+                fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
+            }
+        }
 
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
