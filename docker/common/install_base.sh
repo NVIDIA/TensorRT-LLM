@@ -115,7 +115,11 @@ install_python_rockylinux() {
 }
 
 install_pyp_rockylinux() {
-  bash -c "pip3 install 'urllib3<2.0' pytest"
+  EXTRA_INDEX_URL=""
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    EXTRA_INDEX_URL="--extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple"
+  fi
+  bash -c "pip3 install ${EXTRA_INDEX_URL} 'urllib3<2.0' pytest"
 }
 
 install_gcctoolset_rockylinux() {

@@ -64,7 +64,7 @@ RUN TRT_VER=${TRT_VER} \
     CUBLAS_VER=${CUBLAS_VER} \
     bash ./install.sh --tensorrt && rm install_tensorrt.sh
 
-RUN bash ./install.sh --polygraphy && rm install_polygraphy.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR}bash ./install.sh --polygraphy && rm install_polygraphy.sh
 
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && rm install_mpi4py.sh
 
