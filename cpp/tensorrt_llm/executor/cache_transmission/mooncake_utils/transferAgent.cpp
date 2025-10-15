@@ -59,7 +59,20 @@ void MooncakeTransferStatus::wait() const
         transfer_status_t status;
         int rc = getTransferStatus(mEngine, mBatchId, index, &status);
         if (rc || status.status == STATUS_FAILED)
+        {
             has_failed = true;
+            if (rc)
+            {
+                TLLM_LOG_ERROR(
+                    "Failed to get transfer status for batch %lu, task %zu: error code %d (batch_id=%lu, task_id=%zu)",
+                    mBatchId, index, rc, mBatchId, index);
+            }
+            else
+            {
+                TLLM_LOG_ERROR("Transfer failed for batch %lu, task %zu: status %d (batch_id=%lu, task_id=%zu)",
+                    mBatchId, index, status.status, mBatchId, index);
+            }
+        }
         else if (status.status == STATUS_PENDING || status.status == STATUS_WAITING)
             return false;
     }
@@ -71,7 +84,7 @@ void MooncakeTransferStatus::wait() const
         freeBatchID(mEngine, mBatchId);
         // mBatchId = INVALID_BATCH;
     }
-    // Currently, we cannot distinguish between failed and completed
+    // Currently, we cannot distinguish between failed and completed from return value.
     return true;
 }
 
