@@ -1595,7 +1595,7 @@ class BaseLlmArgs(StrictBaseModel):
                                           description="The maximum beam width.")
 
     max_num_tokens: Optional[int] = Field(
-        default=None, description="The maximum number of tokens.")
+        default=8192, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
         default=False,
@@ -1894,13 +1894,15 @@ class BaseLlmArgs(StrictBaseModel):
 
         if self.max_batch_size is not None:
             if self.max_batch_size > self.build_config.max_batch_size:
-                raise ValueError(
-                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
+                self.max_batch_size = self.build_config.max_batch_size
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] is overridden by build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
         if self.max_num_tokens is not None:
             if self.max_num_tokens > self.build_config.max_num_tokens:
-                raise ValueError(
-                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
+                self.max_num_tokens = self.build_config.max_num_tokens
+                logger.warning(
+                    f"max_num_tokens [{self.max_num_tokens}] is overridden by build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
         if self.max_seq_len is not None:
             if self.max_seq_len != self.build_config.max_seq_len:
