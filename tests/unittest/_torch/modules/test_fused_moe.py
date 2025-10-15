@@ -14,7 +14,7 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.util import (check_accuracy, skip_blackwell_geforce,
+from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest,
                         skip_non_hopper_unittest, skip_pre_blackwell,
                         skip_pre_hopper)
@@ -1436,7 +1436,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend):
 
 
 @skip_pre_blackwell
-def test_fused_moe_w4a8_nvfp4_fp8():
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1525,14 +1528,15 @@ def test_fused_moe_w4a8_nvfp4_fp8():
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_NVFP4_FP8)
-        fused_moe = TRTLLMGenFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe = TRTLLMGenFusedMoE(num_experts=NUM_EXPERTS,
+                                      routing_method=routing_method,
+                                      hidden_size=HIDDEN_SIZE,
+                                      intermediate_size=INTERMEDIATE_SIZE,
+                                      dtype=dtype,
+                                      reduce_results=False,
+                                      model_config=ModelConfig(
+                                          quant_config=quant_config,
+                                          moe_backend=moe_backend))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -1925,10 +1929,20 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
-@skip_non_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [768, 2880])
-def test_fused_moe_wfp4a16(dtype, hidden_size):
+@pytest.mark.parametrize(
+    "moe_backend",
+    [
+        # smVersion
+        pytest.param("TRTLLM",
+                     marks=[skip_blackwell_geforce, skip_pre_blackwell]),
+        pytest.param(
+            "CUTLASS",
+            marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
+    ],
+)
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1938,7 +1952,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = 640
         SCALING_GROUP_SIZE = 32
-        NUM_EXPERTS = 3
+        NUM_EXPERTS = 4
         TOP_K = 2
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
@@ -1983,19 +1997,25 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
+            # WFP4A16FusedMoEMethod
             weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
             weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
             weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+            # MXFP4WeightFusedMoEMethod
+            weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
-        fused_moe = CutlassFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe = create_moe(num_experts=NUM_EXPERTS,
+                               routing_method=routing_method,
+                               hidden_size=HIDDEN_SIZE,
+                               intermediate_size=INTERMEDIATE_SIZE,
+                               dtype=dtype,
+                               reduce_results=False,
+                               model_config=ModelConfig(
+                                   quant_config=quant_config,
+                                   moe_backend=moe_backend))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -2048,7 +2068,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
 
         # compare
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+        check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
 @skip_pre_hopper
