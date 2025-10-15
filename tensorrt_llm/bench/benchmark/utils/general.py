@@ -47,13 +47,6 @@ def get_settings_from_engine(
     engine_world_map = config["pretrained_config"]["mapping"]
     engine_build_cfg = config["build_config"]
 
-    world_config = {
-        "pp_size": engine_world_map["pp_size"],
-        "tp_size": engine_world_map["tp_size"],
-        "world_size": engine_world_map["world_size"],
-        "gpus_per_node": engine_world_map["gpus_per_node"],
-    }
-
     executor_settings = {
         "max_batch_size": engine_build_cfg["max_batch_size"],
         "max_num_tokens": engine_build_cfg["max_num_tokens"],
@@ -63,7 +56,7 @@ def get_settings_from_engine(
         "sw_version": config["version"],
         "engine_dir": str(engine_path.absolute()),
         "settings_config": executor_settings,
-        "world_config": world_config,
+        "engine_world_map": engine_world_map,
     })
 
     runtime_config["performance_options"] = {}
@@ -103,12 +96,12 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
 
-    world_config = {
+    engine_world_map = {
         "pp_size": params.get("pp"),
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
-        "ep_size": params.get("ep"),
-        "cluster_size": params.get("cluster_size"),
+        "moe_ep_size": params.get("ep"),
+        "moe_cluster_size": params.get("cluster_size"),
     }
 
     if params.get("max_batch_size") and params.get("max_num_tokens"):
@@ -183,7 +176,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "max_num_tokens": int(max_num_tokens),
             "chunking": enable_chunked_prefill,
         },
-        "world_config": world_config,
+        "engine_world_map": engine_world_map,
         "backend": backend,
         "decoding_config": {},
         "performance_options": {
