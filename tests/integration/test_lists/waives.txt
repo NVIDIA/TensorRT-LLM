@@ -121,13 +121,10 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-rec
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-scienceqa-Llama-3.2-11B-Vision-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False] SKIP (https://nvbugs/5222697)
-examples/test_gpt.py::test_llm_gpt2_santacoder_1node_4gpus[parallel_build-enable_fmha-enable_gemm_plugin-enable_attention_plugin] SKIP (https://nvbugs/5219531)
 examples/test_eagle.py::test_llama_eagle_1gpu[llama-v2-7b-hf-eagle1] SKIP (https://nvbugs/5219535)
 examples/test_eagle.py::test_llama_eagle_1gpu[llama-3.2-1b-eagle1] SKIP (https://nvbugs/5219535)
 examples/test_eagle.py::test_llama_eagle_1gpu[llama-3.1-8b-eagle1] SKIP (https://nvbugs/5219535)
-examples/test_eagle.py::test_mistral_eagle_1gpu[mistral-7b-v0.1-eagle1] SKIP (https://nvbugs/5219535)
 examples/test_eagle.py::test_llama_eagle_1gpu[llama-3.1-8b-eagle2] SKIP (https://nvbugs/5219535)
-examples/test_eagle.py::test_mistral_eagle_1gpu[mistral-7b-v0.1-eagle2] SKIP (https://nvbugs/5219535)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16] SKIP (https://nvbugspro.nvidia.com/bug/5226339)
 perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20] SKIP # https://nvbugspro.nvidia.com/bug/5207477
 perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20] SKIP
@@ -294,8 +291,6 @@ unittest/_torch/multi_gpu_modeling/test_llama3.py::test_llama_3_3 SKIP (https://
 examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] SKIP (https://nvbugs/5546507)
-examples/test_eagle.py::test_mistral_nemo_eagle_1gpu[Mistral-Nemo-12b-Base-eagle1] SKIP (https://nvbugs/5546507)
-examples/test_eagle.py::test_mistral_nemo_eagle_1gpu[Mistral-Nemo-12b-Base-eagle2] SKIP (https://nvbugs/5546507)
 examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs1] SKIP (https://nvbugs/5546507)
 examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2] SKIP (https://nvbugs/5546507)
 examples/test_ngram.py::test_llm_ngram_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs1] SKIP (https://nvbugs/5546507)
