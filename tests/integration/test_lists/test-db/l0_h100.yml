@@ -45,6 +45,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=False]
@@ -62,9 +63,12 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=False-fp8kv=False-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=False-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=True-eagle3_one_model=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[enable_chunked_prefill=False-eagle3_one_model=True]
@@ -277,7 +281,8 @@ l0_h100:
   - examples/test_mistral.py::test_mistral_with_bf16_lora_torch[mistral-7b-v0.1]
   - examples/test_phi.py::test_phi_4_mini_instruct_with_bf16_lora_torch[Phi-4-mini-instruct]
   - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch[llama-3.2-1b-instruct]
-  - examples/test_nemotron_nas.py::test_nemotron_nano_8b_lora_torch[Llama-3.1-Nemotron-Nano-8B-v1]
+ # https://nvbugs/5563469: Disable Nemotron-Nano-8B-v1 test due to non-deterministic failures, revisit as part of TRTLLM-7885
+ # - examples/test_nemotron_nas.py::test_nemotron_nano_8b_lora_torch[Llama-3.1-Nemotron-Nano-8B-v1]
 - condition:
     ranges:
       system_gpu_count:
