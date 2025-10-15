@@ -3268,19 +3268,19 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
                 ["atmosphere", "serene", "majestic", "clear", "sky", "trees"],
             ],
         },
-        "Phi-4-multimodal-instruct": {
+        "phi4-multimodal-instruct": {
             "image": [
                 ["depicts", "landscape", "mountain", "half", "dome"],
                 ["atmosphere", "serene", "sense", "scene", "majestic"],
             ],
         },
-        "Phi-4-multimodal-instruct-fp4": {
+        "phi4-multimodal-instruct-fp4": {
             "image": [
                 ["depicts", "landscape", "mountain", "half", "dome"],
                 ["atmosphere", "serene", "sense", "scene", "majestic"],
             ],
         },
-        "Phi-4-multimodal-instruct-fp8": {
+        "phi4-multimodal-instruct-fp8": {
             "image": [
                 ["depicts", "landscape", "mountain", "half", "dome"],
                 ["atmosphere", "serene", "sense", "scene", "majestic"],
@@ -3312,7 +3312,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         cmd.append("--kv_cache_fraction=0.5")
         cmd.append("--max_seq_len=1024")
 
-    elif model_name.startswith("Phi-4-multimodal-instruct"):
+    elif model_name.startswith("phi4-multimodal-instruct"):
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
