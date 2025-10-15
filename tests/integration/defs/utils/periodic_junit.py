@@ -40,10 +40,17 @@ except ImportError:
 
 class PeriodicJUnitXML:
     """
-    Periodic JUnit XML reporter using pytest's built-in junitxml.
+    Periodic JUnit XML reporter using lightweight collection and batch processing.
 
-    This version leverages pytest's LogXML plugin to avoid manual XML construction
-    and test report parsing. Much simpler and more maintainable than the previous version.
+    This reporter uses a two-phase approach for maximum performance:
+    1. Collection phase (during test execution): Quickly collect TestReport objects
+    2. Processing phase (when generating reports): Batch process through pytest's LogXML
+
+    This approach provides:
+    - Fast test execution (minimal overhead during test runs)
+    - Standard JUnit XML output (using pytest's LogXML for compatibility)
+    - Periodic saves to prevent data loss
+    - Graceful shutdown on interruption (SIGINT/SIGTERM)
 
     Usage:
         Add to conftest.py:
@@ -70,9 +77,12 @@ class PeriodicJUnitXML:
         """
         Initialize periodic reporter.
 
+        Uses lightweight collection mode: test reports are collected quickly during execution
+        and processed in batch only when generating reports (much faster).
+
         Args:
             xmlpath: Path to the output XML file
-            interval: Time interval in seconds between saves (default: 1800 = 30 min)
+            interval: Time interval in seconds between saves (default: 18000 = 5 hours)
             batch_size: Number of tests before triggering a save (default: 10)
             logger: Optional dictionary with 'info' and 'warning' functions for logging
         """
@@ -85,8 +95,13 @@ class PeriodicJUnitXML:
         self.last_save_time = time.time()
         self.suite_start_time = time.time()
 
+        # Store raw reports for batch processing
+        self.pending_reports = [
+        ]  # Collected reports, processed only when generating XML
+
+        # LogXML will be created only when generating reports
         self.logxml: Optional[LogXML] = None
-        self.old_output_file = None
+        self.config = None
 
     def _log_info(self, message):
         """Log info message."""
@@ -103,7 +118,10 @@ class PeriodicJUnitXML:
             print(f"WARNING: {message}")
 
     def pytest_configure(self, config: Config):
-        """Configure and initialize the LogXML plugin."""
+        """Configure and initialize the reporter."""
+        # Store config for later use
+        self.config = config
+
         # Ensure required attributes exist on config
         if not hasattr(config, 'option'):
             config.option = type('Namespace', (), {})()
@@ -112,6 +130,17 @@ class PeriodicJUnitXML:
         if not hasattr(config.option, 'junit_logging'):
             config.option.junit_logging = 'out-err'
 
+        # Register signal handlers for graceful shutdown
+        self._register_signal_handlers()
+
+        self._log_info(f"PeriodicJUnitXML: Initialized at {self.xmlpath} "
+                       "(lightweight mode - fast collection, batch processing)")
+
+    def _init_logxml(self):
+        """Initialize or re-initialize the LogXML plugin."""
+        if self.config is None:
+            return
+
         # Initialize the LogXML plugin (pytest's built-in junitxml reporter)
         self.logxml = LogXML(
             self.xmlpath,
@@ -119,46 +148,40 @@ class PeriodicJUnitXML:
             'pytest',  # suite_name
             'out-err',  # logging - capture stdout and stderr only
         )
-        self.logxml.config = config
+        self.logxml.config = self.config
         self.logxml.stats = dict.fromkeys(
             ['error', 'passed', 'failure', 'skipped'], 0)
         self.logxml.node_reporters = {}  # type: ignore
         self.logxml.node_reporters_ordered = []  # type: ignore
         self.logxml.global_properties = []
 
-        # Register signal handlers for graceful shutdown
-        self._register_signal_handlers()
-
-        self._log_info(f"PeriodicJUnitXML: Initialized at {self.xmlpath}")
-
     def pytest_runtest_logreport(self, report: TestReport):
         """Handle test reports and trigger periodic saving."""
-        if self.logxml is not None:
-            # Delegate to pytest's built-in LogXML to handle all the complex parsing
-            self.logxml.pytest_runtest_logreport(report)
+        # Collect the report for later batch processing (fast)
+        self.pending_reports.append(report)
 
-            # Only increment counter and check for save on teardown phase
-            if report.when == "teardown":
-                self.completed_tests += 1
-                current_time = time.time()
+        # Only increment counter and check for save on teardown phase
+        if report.when == "teardown":
+            self.completed_tests += 1
+            current_time = time.time()
 
-                # Check if we need to save based on time interval
-                if current_time - self.last_save_time >= self.time_interval:
-                    tests_to_process = 0
-                    if self.completed_tests >= self.batch_size:
-                        self._log_info(
-                            f"Completed {self.completed_tests} cases during the last "
-                            f"{current_time - self.last_save_time:.0f} seconds")
-                        tests_to_process = self.completed_tests
-                        self.completed_tests = 0  # Reset counter
-                        self.last_save_time = current_time
+            # Check if we need to save based on time interval
+            if current_time - self.last_save_time >= self.time_interval:
+                tests_to_process = 0
+                if self.completed_tests >= self.batch_size:
+                    self._log_info(
+                        f"Completed {self.completed_tests} cases during the last "
+                        f"{current_time - self.last_save_time:.0f} seconds")
+                    tests_to_process = self.completed_tests
+                    self.completed_tests = 0  # Reset counter
+                    self.last_save_time = current_time
 
-                    if tests_to_process > 0:
-                        try:
-                            self._generate_report()
-                        except Exception as e:
-                            self._log_warning(
-                                f"Error generating periodic report: {e}")
+                if tests_to_process > 0:
+                    try:
+                        self._generate_report()
+                    except Exception as e:
+                        self._log_warning(
+                            f"Error generating periodic report: {e}")
 
     def pytest_sessionfinish(self):
         """Generate final report at session end."""
@@ -167,28 +190,52 @@ class PeriodicJUnitXML:
         except Exception as e:
             self._log_warning(f"Error generating final report: {e}")
 
+    def _process_pending_reports(self):
+        """Process all pending reports through LogXML (lightweight mode only)."""
+        if not self.pending_reports:
+            return
+
+        report_count = len(self.pending_reports)
+        self._log_info(
+            f"Processing {report_count} pending reports through LogXML...")
+
+        # Initialize LogXML if not already done
+        if self.logxml is None:
+            self._init_logxml()
+
+        # Process all collected reports
+        start_time = time.time()
+        for report in self.pending_reports:
+            if self.logxml:
+                self.logxml.pytest_runtest_logreport(report)
+
+        # Clear processed reports
+        self.pending_reports.clear()
+
+        elapsed = (time.time() - start_time) * 1000
+        self._log_info(
+            f"Processed {report_count} reports in {elapsed:.1f}ms ({elapsed/report_count:.2f}ms per report)"
+        )
+
     def _generate_report(self, is_final=False):
         """
         Generate XML report with executed tests.
 
+        Always writes to the same output file (self.xmlpath) for simplicity.
+
         Args:
-            is_final: If True, write to the main output file. Otherwise, create timestamped file.
+            is_final: Kept for compatibility but not used (always writes to same file)
         """
+        # Process pending reports (batch processing for performance)
+        if self.pending_reports:
+            self._process_pending_reports()
+
         if self.logxml is None or not self.logxml.node_reporters_ordered:
             return
 
         try:
-            # Choose output file path
-            if is_final:
-                output_file = self.xmlpath
-            else:
-                # Create filename with timestamp for intermediate reports
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dirname = os.path.dirname(self.xmlpath)
-                basename = os.path.basename(self.xmlpath)
-                name, ext = os.path.splitext(basename)
-                output_file = os.path.join(dirname,
-                                           f"{name}_periodic_{timestamp}{ext}")
+            # Always use the same output file
+            output_file = self.xmlpath
 
             # Create directory if needed
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -229,21 +276,9 @@ class PeriodicJUnitXML:
             # Atomic rename to final location
             os.replace(temp_file, output_file)
 
-            # Remove old periodic XML report to save disk space
-            if self.old_output_file and os.path.exists(self.old_output_file):
-                try:
-                    self._log_info(
-                        f"Removing old report {self.old_output_file}, latest is {output_file}"
-                    )
-                    os.remove(self.old_output_file)
-                except Exception as e:
-                    self._log_warning(f"Failed to remove old report: {e}")
-
-            # Update old output file reference
-            self.old_output_file = output_file
-
             self._log_info(
-                f"Generated report with {numtests} tests: {output_file}")
+                f"{'Final report' if is_final else 'Periodic report'} generated with {numtests} tests: {output_file}"
+            )
 
         except Exception as e:
             self._log_warning(f"Error in report generation: {e}")
