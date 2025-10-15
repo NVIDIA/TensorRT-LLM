@@ -1005,8 +1005,6 @@ public:
     //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
-
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
@@ -1585,8 +1583,6 @@ public:
     //! the placeholder block). It should be called after every context chunk is processed.
     //! \return true iff at least one async block transfer was actually issued.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
