@@ -222,7 +222,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
 
-class DSASparseAttentionConfig(SparseAttentionBaseConfig):
+class DSASparseAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for DeepSeek Sparse Attention.
     """
