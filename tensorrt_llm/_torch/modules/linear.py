@@ -1027,15 +1027,12 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                        tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
-                # The kernel we use will convert nvfp4 to e4m3 before matmul,
-                # so the range of the scale factor can only be [0,448/6].
-                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
                 weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
                 if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
+                    weight_scale_2 = w["weight_scale_2"][...]
                 else:
-                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
+                    assert weight_scale_2 == w["weight_scale_2"][...], (
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
                     )
 
