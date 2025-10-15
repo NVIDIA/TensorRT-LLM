@@ -29,6 +29,7 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.commands.common_llm_options import common_llm_options
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -44,30 +45,6 @@ from tensorrt_llm.sampling_params import SamplingParams
                     resolve_path=True),
     default=None,
     help="Path to a serialized TRT-LLM engine.",
-)
-@optgroup.option(
-    "--extra_llm_api_options",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
-@optgroup.option(
-    "--backend",
-    type=click.Choice(ALL_SUPPORTED_BACKENDS),
-    default="pytorch",
-    help="The backend to use for benchmark. Default is pytorch backend.")
-@optgroup.option(
-    "--kv_cache_free_gpu_mem_fraction",
-    type=float,
-    default=.90,
-    help="The percentage of memory to use for KV Cache after model load.",
-)
-@optgroup.option(
-    "--max_seq_len",
-    type=int,
-    default=None,
-    help="Maximum sequence length.",
 )
 @optgroup.group(
     "Engine Input Configuration",
@@ -108,24 +85,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=int,
     default=2,
     help="Number of requests warm up benchmark.",
-)
-@optgroup.option(
-    "--tp",
-    type=int,
-    default=1,
-    help="tensor parallelism size",
-)
-@optgroup.option(
-    "--pp",
-    type=int,
-    default=1,
-    help="pipeline parallelism size",
-)
-@optgroup.option(
-    "--ep",
-    type=int,
-    default=None,
-    help="expert parallelism size",
 )
 @optgroup.group("Request Load Control Options",
                 cls=MutuallyExclusiveOptionGroup,
@@ -185,6 +144,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Path where iteration logging is written to.",
 )
+@common_llm_options
 @click.pass_obj
 def latency_command(
     bench_env: BenchmarkEnvironment,
@@ -285,6 +245,7 @@ def latency_command(
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
+    # TODO: unify LlmArgs parsing via Pydantic
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = options.backend

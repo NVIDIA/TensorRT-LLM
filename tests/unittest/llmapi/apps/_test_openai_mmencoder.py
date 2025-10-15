@@ -52,22 +52,22 @@ def model_name():
 @pytest.fixture(scope="module",
                 params=[True, False],
                 ids=["extra_options", "no_extra_options"])
-def extra_encoder_options(request):
+def extra_llm_api_options(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def temp_extra_encoder_options_file(request):
+def temp_extra_llm_api_options_file(request):
     temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_encoder_options.yaml")
+    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
-        extra_encoder_options_dict = {
+        extra_llm_api_options_dict = {
             "max_batch_size": 8,
             "max_num_tokens": 16384
         }
 
         with open(temp_file_path, 'w') as f:
-            yaml.dump(extra_encoder_options_dict, f)
+            yaml.dump(extra_llm_api_options_dict, f)
 
         yield temp_file_path
     finally:
@@ -76,13 +76,13 @@ def temp_extra_encoder_options_file(request):
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, extra_encoder_options: bool,
-           temp_extra_encoder_options_file: str):
+def server(model_name: str, extra_llm_api_options: bool,
+           temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     args = ["--max_batch_size", "8"]
-    if extra_encoder_options:
+    if extra_llm_api_options:
         args.extend(
-            ["--extra_encoder_options", temp_extra_encoder_options_file])
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
 
     with RemoteMMEncoderServer(model_path, args) as remote_server:
         yield remote_server

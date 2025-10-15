@@ -1221,8 +1221,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     free_gpu_memory_fraction: Optional[float] = Field(
         default=None,
         description=
-        "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
-    )
+        "The fraction of GPU memory fraction that should be allocated for the KV cache, after allocating model weights "
+        "and buffers. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory "
+        "corresponding to the minimum will be used.")
     host_cache_size: Optional[int] = Field(
         default=None,
         description=
@@ -1443,7 +1444,8 @@ class BaseLlmArgs(StrictBaseModel):
     tokenizer: Optional[Union[
         str, Path, TokenizerBase, PreTrainedTokenizerBase]] = Field(
             description=
-            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub.",
+            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub. "
+            "Specify this value only if using a TensorRT engine as the model.",
             default=None)
 
     tokenizer_mode: Literal['auto', 'slow'] = Field(
@@ -1480,7 +1482,8 @@ class BaseLlmArgs(StrictBaseModel):
 
     gpus_per_node: Optional[int] = Field(
         default=None,
-        description="The number of GPUs per node.",
+        description=
+        "The number of GPUs per node. If not provided, it will be detected automatically.",
         status="beta",
         validate_default=True)
 
@@ -1581,21 +1584,27 @@ class BaseLlmArgs(StrictBaseModel):
     speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
 
-    max_batch_size: Optional[int] = Field(default=None,
-                                          description="The maximum batch size.")
+    max_batch_size: Optional[int] = Field(
+        default=None,
+        description=
+        "The maximum number of requests that can be scheduled in one batch.")
 
     # generation constraints
     max_input_len: Optional[int] = Field(
         default=None, description="The maximum input length.")
 
     max_seq_len: Optional[int] = Field(
-        default=None, description="The maximum sequence length.")
+        default=None,
+        description=
+        "The maximum total length of one request, including prompt and outputs. "
+        "If unspecified, the value is deduced from the model config.")
 
-    max_beam_width: Optional[int] = Field(default=None,
-                                          description="The maximum beam width.")
+    max_beam_width: Optional[int] = Field(
+        default=None,
+        description="The maximum number of beams for beam search decoding.")
 
     max_num_tokens: Optional[int] = Field(
-        default=None, description="The maximum number of tokens.")
+        default=None, description="The maximum number of tokens in each batch.")
 
     gather_generation_logits: bool = Field(
         default=False,

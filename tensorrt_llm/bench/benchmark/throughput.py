@@ -28,6 +28,7 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.commands.common_llm_options import common_llm_options
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -46,11 +47,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option(
-    "--backend",
-    type=click.Choice(ALL_SUPPORTED_BACKENDS),
-    default="pytorch",
-    help="The backend to use for benchmark. Default is pytorch backend.")
-@optgroup.option(
     "--custom_module_dirs",
     type=click.Path(exists=True,
                     readable=True,
@@ -60,13 +56,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     multiple=True,
     help="Paths to custom module directories to import.",
 )
-@optgroup.option(
-    "--extra_llm_api_options",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
                                  readable=True,
@@ -75,32 +64,10 @@ from tensorrt_llm.sampling_params import SamplingParams
                  default=None,
                  help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
-    "--max_batch_size",
-    type=int,
-    help="Maximum runtime batch size to run the engine with.",
-)
-@optgroup.option(
-    "--max_num_tokens",
-    type=int,
-    help="Maximum runtime tokens that an engine can accept.",
-)
-@optgroup.option(
-    "--max_seq_len",
-    type=int,
-    default=None,
-    help="Maximum sequence length.",
-)
-@optgroup.option(
     "--beam_width",
     type=int,
     default=1,
     help="Number of search beams.",
-)
-@optgroup.option(
-    "--kv_cache_free_gpu_mem_fraction",
-    type=float,
-    default=.90,
-    help="The percentage of memory to use for KV Cache after model load.",
 )
 @optgroup.group(
     "Engine Input Configuration",
@@ -115,16 +82,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     required=False,
     help="Pass in a dataset file for parsing instead of stdin.",
-)
-# For text models, tokenizer initialization is not needed when loading the model since the dataset is already tokenized.
-# For this reason, we skip tokenizer initialization by default.
-# However, for VLM models, tokenizer initialization is needed inside the model since the dataset contains texts and
-# raw media data. We cannot skip tokenizer initialization in this case.
-@optgroup.option(
-    "--no_skip_tokenizer_init",
-    is_flag=True,
-    default=False,
-    help="Do not skip tokenizer initialization when loading the model.",
 )
 @optgroup.option(
     "--eos_id",
@@ -153,14 +110,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Device to load the multimodal data on.",
 )
 @optgroup.option(
-    "--max_input_len",
-    type=int,
-    default=4096,
-    help=
-    "Maximum input sequence length to use for multimodal models. This is used only when --modality "
-    "is specified since the actual number of vision tokens is unknown before the model is run.",
-)
-@optgroup.option(
     "--num_requests",
     type=int,
     default=0,
@@ -185,34 +134,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     type=click.IntRange(min=1),
     help="Target (average) sequence length for tuning heuristics.",
-)
-@optgroup.group(
-    "World Configuration",
-    help="Options for configuring the backend multi-GPU world.",
-)
-@optgroup.option(
-    "--tp",
-    type=int,
-    default=1,
-    help="tensor parallelism size",
-)
-@optgroup.option(
-    "--pp",
-    type=int,
-    default=1,
-    help="pipeline parallelism size",
-)
-@optgroup.option(
-    "--ep",
-    type=int,
-    default=None,
-    help="expert parallelism size",
-)
-@optgroup.option(
-    "--cluster_size",
-    type=int,
-    default=None,
-    help="expert cluster parallelism size",
 )
 @optgroup.group("Request Load Control Options",
                 cls=MutuallyExclusiveOptionGroup,
@@ -286,6 +207,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
 )
+@common_llm_options
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -296,7 +218,11 @@ def throughput_command(
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")
-    no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
+    # For text models, tokenizer initialization is not needed when loading the model since the dataset is already
+    # tokenized. For this reason, we skip tokenizer initialization by default.
+    # However, for VLM models, tokenizer initialization is needed inside the model since the dataset contains texts and
+    # raw media data. We cannot skip tokenizer initialization in this case, hence we expose the option to the user.
+    skip_tokenizer_init: bool = params.get("skip_tokenizer_init", True)
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
@@ -396,6 +322,7 @@ def throughput_command(
     # Dynamic runtime features.
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
 
+    # TODO: unify LlmArgs parsing via Pydantic
     # LlmArgs
     exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
     exec_settings["iteration_log"] = options.iteration_log
@@ -407,7 +334,7 @@ def throughput_command(
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
-        kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
+        kwargs['skip_tokenizer_init'] = skip_tokenizer_init
         kwargs['backend'] = options.backend
 
         llm = get_llm(runtime_config, kwargs)
