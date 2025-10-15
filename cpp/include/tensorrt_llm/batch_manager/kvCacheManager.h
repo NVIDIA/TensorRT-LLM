@@ -302,8 +302,6 @@ public:
 
     [[nodiscard]] bool isFull() const;
 
-    [[nodiscard]] bool isShared() const;
-
     [[nodiscard]] bool isLeaf() const;
 
     void setPriority(executor::RetentionPriority priority);
@@ -1006,8 +1004,6 @@ public:
     void addSequence(
         GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock);
 
-    void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
@@ -1023,9 +1019,6 @@ public:
     void unpinBlocksById(KVCacheBlock::IdType blockId);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
-    void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
-        SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
 
     // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
@@ -1257,9 +1250,6 @@ public:
 
     //! \brief Update cache offsets for blocks initiated from sequence
     void updateSequenceCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-
-    //! \brief Update cache offsets for block at index
-    void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
 
     //! \brief Add/detach block(s) to/from the sequence if needed
     //! \details When we need a new block, we add it. For sliding window

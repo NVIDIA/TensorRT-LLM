@@ -317,12 +317,6 @@ bool KVCacheBlock::hasRefs() const
     return mRefCount > 0;
 }
 
-bool KVCacheBlock::isShared() const
-{
-    // block is considered shared if ready for reuse
-    return mRefCount > 1 || mPrevBlock != nullptr;
-}
-
 bool KVCacheBlock::hasSchedulingRefs() const
 {
     return mSchedulingRefCount > 0;
@@ -1019,12 +1013,6 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
     }
 }
 
-void BlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
-    SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const
-{
-    mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
-}
-
 void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock, SizeType32 windowSize,
     executor::KvCacheTransferMode mode, std::string const& directory)
 {
@@ -1457,11 +1445,6 @@ void WindowBlockManager::addBlockToAllBeams(BlockPtr& block, GenerationRequest& 
     {
         addBlockToBeam(block, sequence, beamIdx);
     }
-}
-
-void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowSize)
-{
-    mWindowBlockManagers.at(windowSize).allocateBlock(sequence, false);
 }
 
 void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAmongBeams)
@@ -2140,23 +2123,6 @@ void WindowBlockManager::updateLastCacheBlockOffsets(GenerationRequest& sequence
         auto const blockId = beamCacheBlock.back();
         auto const blockIdx = static_cast<SizeType32>(beamCacheBlock.size() - 1);
         setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
-    }
-}
-
-void BlockManager::updateCacheBlockOffsetsAtIdx(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
-{
-    auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
-    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
-    auto const beamWidth = sequence.getBeamWidth();
-
-    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
-    auto const& offsetsShape = cacheBlocksTensor.getShape();
-
-    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto const& beamCacheBlock = cacheBlocks[beamIdx];
-        auto const blockId = beamCacheBlock.at(blockIdx);
-        mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
     }
 }
 
