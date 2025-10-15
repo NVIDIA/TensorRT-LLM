@@ -464,9 +464,10 @@ void initConfigBindings(nb::module_& m)
             });
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>,
-            std::optional < int >> (), nb::arg("backend") = std::nullopt,
-            nb::arg("max_tokens_in_buffer") = std::nullopt, nb::arg("kv_transfer_timeout_ms") = std::nullopt)
+        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
+                 std::optional<int>>(),
+            nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
+            nb::arg("kv_transfer_timeout_ms") = std::nullopt)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
