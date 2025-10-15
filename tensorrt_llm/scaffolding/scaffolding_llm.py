@@ -175,13 +175,19 @@ class ScaffoldingLlm:
         result = ScaffoldingResult(self.streaming_event)
 
         async def put_request():
-            request = ScaffoldingRequest(
-                prompt=prompt,
-                kwargs={},
-                result=result,
-                controller=self.prototype_controller.clone())
-
-            await self.task_queue.put(request)
+            try:
+                request = ScaffoldingRequest(
+                    prompt=prompt,
+                    kwargs={},
+                    result=result,
+                    controller=self.prototype_controller.clone())
+            except Exception as e:
+                self.task_queue.put(None)
+                print(
+                    f"Error: build ScaffoldingRequest failed: {e} \n {traceback.format_exc()}"
+                )
+            else:
+                await self.task_queue.put(request)
 
         asyncio.run_coroutine_threadsafe(put_request(), self.loop)
 
@@ -208,7 +214,7 @@ class ScaffoldingLlm:
 
     def shutdown(self, shutdown_workers=False):
 
-        def shutdown_workers():
+        def shutdown_workers_func():
             for worker in self.workers.values():
                 worker.shutdown()
 
@@ -228,4 +234,4 @@ class ScaffoldingLlm:
             self.shutdown_event.set()
 
         if shutdown_workers:
-            shutdown_workers()
+            shutdown_workers_func()

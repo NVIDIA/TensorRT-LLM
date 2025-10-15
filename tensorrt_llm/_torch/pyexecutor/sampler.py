@@ -17,7 +17,7 @@ from tensorrt_llm._utils import mpi_disabled, nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
-                                            FinishReason, KvCacheConfig)
+                                            FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
     DecoderInputBuffers, add_new_tokens_to_requests, make_decoding_batch_input)
@@ -25,6 +25,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
                                                     DecoderState,
                                                     GptDecoderBatched)
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -310,10 +311,15 @@ def greedy_search_sampling_batch(
     softmax_indices: Optional[torch.IntTensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     next_tokens = torch.argmax(logits, dim=-1)
+    index_to_scatter = next_tokens
     if softmax_indices is not None:
-        logits = logits[softmax_indices.to(logits.device, non_blocking=True)]
-    softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+        logits = logits[softmax_indices]
+        index_to_scatter = next_tokens[softmax_indices]
+    probs = torch.zeros_like(logits)
+    probs.scatter_(dim=-1,
+                   index=index_to_scatter.unsqueeze(-1),
+                   src=torch.ones_like(logits))
+    return next_tokens, probs
 
 
 def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
@@ -1127,6 +1133,7 @@ class TorchSampler(Sampler):
 
         return new_draft_tokens_host
 
+    @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
             self, request: LlmRequest, new_tokens: list[list[list[int]]],
             new_tokens_tensor: torch.Tensor) -> int:
@@ -1134,13 +1141,30 @@ class TorchSampler(Sampler):
         #        filtering of vocab_size logits, out of vocab_size in
         #        total. The 'sample' below should generally be avoided
         #        by retaining the draft_probs during drafting (TRTLLM-7772).
-        sampling_strategy = _request_strategy(request, vocab_size=2**31)
+        draft_sampling_strategy = (
+            "greedy", None
+        ) if request.py_draft_use_greedy_sampling else _request_strategy(
+            request, vocab_size=2**31)
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(sampling_strategy,
+        _, draft_probs = sample(draft_sampling_strategy,
                                 request.py_draft_logits,
                                 generator=generator)
-        draft_probs = draft_probs.squeeze(0)
         target_probs = request.py_target_probs
+        d2t = getattr(request, "d2t", None)
+        if d2t is not None:
+            vocab_d = draft_probs.shape[-1]
+            vocab_t = target_probs.shape[-1]
+            assert d2t.numel(
+            ) == vocab_d, f"d2t size mismatch: {d2t.numel()} != {vocab_d}"
+            assert d2t.device == draft_probs.device, f"d2t device mismatch: {d2t.device} != {draft_probs.device}"
+            aligned_draft_probs = torch.zeros(
+                (*draft_probs.shape[:-1], vocab_t),
+                device=draft_probs.device,
+                dtype=draft_probs.dtype)
+            source_indices = torch.arange(vocab_d, device=draft_probs.device)
+            target_indices = (source_indices + d2t) % vocab_t
+            aligned_draft_probs[..., target_indices] = draft_probs
+            draft_probs = aligned_draft_probs
         rejected_indices = get_rejected_indices(draft_probs, target_probs,
                                                 generator,
                                                 request.py_draft_tokens)
@@ -1181,7 +1205,8 @@ class TorchSampler(Sampler):
             new_tokens: list[list[list[int]]],
             new_tokens_tensor: torch.Tensor,
             resource_manager: Optional[ResourceManager] = None) -> int:
-        if request.py_draft_logits is None:
+        if _request_strategy(request, vocab_size=2**
+                             31) == GREEDY or request.py_draft_logits is None:
             spec_tree_manager = self.get_spec_tree_manager(resource_manager)
             if spec_tree_manager is not None:
                 num_accepted = self._process_draft_tokens_tree(

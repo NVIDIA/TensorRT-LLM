@@ -291,8 +291,9 @@ public:
         mSelfState.setCommState(std::move(commState));
     }
 
-    [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const
+    [[nodiscard]] size_t getCounterpartsCount(LlmRequest::RequestIdType requestId)
     {
+        std::unique_lock<std::mutex> lock(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
         return it->second.getConnections().size();
@@ -400,10 +401,14 @@ public:
 
     void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
     {
-        auto it = mRequestToSession.find(requestId);
-        TLLM_CHECK(it != mRequestToSession.end());
-        auto& session = it->second;
-        auto const& connections = session.getConnections();
+        TransferSession* session = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mMtxForMap);
+            auto it = mRequestToSession.find(requestId);
+            TLLM_CHECK(it != mRequestToSession.end());
+            session = std::addressof(it->second);
+        }
+        auto const& connections = session->getConnections();
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);

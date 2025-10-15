@@ -225,6 +225,7 @@ class TestLlama(unittest.TestCase):
 
             llama = LlamaForCausalLM(model_config).to(dtype).to(device)
             llama.load_weights(hf_llama.state_dict())
+            llama.post_load_weights()
 
         num_blocks = 1
         tokens_per_block = 128

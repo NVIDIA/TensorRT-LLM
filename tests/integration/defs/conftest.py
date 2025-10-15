@@ -15,6 +15,7 @@
 # -*- coding: utf-8 -*-
 
 import datetime
+import gc
 import os
 import platform
 import re
@@ -2524,6 +2525,7 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        gc.collect()
 
 
 @pytest.fixture(autouse=True)
