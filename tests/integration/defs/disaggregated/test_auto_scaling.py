@@ -191,6 +191,7 @@ def request_completion(model_name, prompt, port=TEST_PORT):
                                      temperature=0.0)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
@@ -214,6 +215,7 @@ async def test_service_discovery(model_name, disagg_server_config,
         terminate(ctx_worker1, gen_worker1, disagg_server)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize(
     "router", ["round_robin"], indirect=True
 )  # use only round_robin to reduce the test time, this router type doesn't matter for this test
@@ -261,6 +263,7 @@ async def test_minimal_instances(model_name, disagg_server_config,
         terminate(*processes)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
@@ -274,8 +277,14 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
-        ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
-        gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
+        ctx_worker1 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     TEST_PORT + 100,
+                                     device=0)
+        gen_worker1 = run_gen_worker(model_name,
+                                     worker_config,
+                                     TEST_PORT + 200,
+                                     device=1)
         disagg_server = run_disagg_server(disagg_server_config, TEST_PORT)
         await wait_for_disagg_server_ready(TEST_PORT)
         verify_cluster_info(True, 1, 1)
@@ -293,7 +302,10 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         test_prompt = "The capital of France is"
 
         # add gen2, the request should succeed
-        gen_worker2 = run_gen_worker(model_name, worker_config, TEST_PORT + 201)
+        gen_worker2 = run_gen_worker(model_name,
+                                     worker_config,
+                                     TEST_PORT + 201,
+                                     device=2)
         await wait_for_worker_ready(TEST_PORT + 201)
         await asyncio.sleep(INACTIVE_TIMEOUT)
         verify_cluster_info(True, 1, 1)
@@ -311,7 +323,10 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
             request_completion(model_name, test_prompt, port=TEST_PORT)
 
         # add ctx2, the request should succeed
-        ctx_worker2 = run_ctx_worker(model_name, worker_config, TEST_PORT + 101)
+        ctx_worker2 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     TEST_PORT + 101,
+                                     device=3)
         await wait_for_worker_ready(TEST_PORT + 101)
         verify_cluster_info(True, 1, 1)
 
@@ -339,6 +354,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                   disagg_server)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ["round_robin"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(300)
