@@ -1640,7 +1640,8 @@ class BaseLlmArgs(StrictBaseModel):
     otlp_traces_endpoint: Optional[str] = Field(
         default=None,
         description="Target URL to which OpenTelemetry traces will be sent.",
-        alias="otlp_traces_endpoint")
+        alias="otlp_traces_endpoint",
+        status="prototype")
 
     backend: Optional[str] = Field(
         default=None,

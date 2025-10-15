@@ -579,7 +579,13 @@ class GenerationResultBase:
         self,
         output: CompletionOutput,
         req_perf_metrics_dict: Optional[dict[str, float]] = None,
-    ):
+    ) -> None:
+        """Perform distributed tracing for the generation request.
+
+        Args:
+            output (CompletionOutput): The output of the generation result.
+            req_perf_metrics_dict (Optional[dict[str, float]]): Request performance metrics. Defaults to None.
+        """
         if not tracing.global_otlp_tracer():
             return
 

@@ -187,6 +187,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
         default: null
         status: prototype
+      otlp_traces_endpoint:
+        annotation: Optional[str]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -215,6 +219,10 @@ methods:
       cache_salt:
         annotation: Optional[str]
         default: null
+      trace_headers:
+        annotation: Optional[Mapping[str, str]]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:
