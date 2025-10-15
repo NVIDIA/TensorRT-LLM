@@ -608,8 +608,6 @@ public:
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams);
 
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
-
     [[nodiscard]] std::optional<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
@@ -1009,8 +1007,6 @@ public:
         GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);

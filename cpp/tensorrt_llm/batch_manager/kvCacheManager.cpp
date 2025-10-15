@@ -1567,57 +1567,6 @@ std::pair<SizeType32, std::optional<KVCacheBlock::IdType>> WindowBlockManager::s
     return {numBlocksStoredForReuse, lastStoredId};
 }
 
-void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
-{
-    mWindowBlockManagers.at(windowSize).replaceSharedBlock(sequence, blockIdx);
-}
-
-void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx)
-{
-    auto const requestId = sequence.getRequestId();
-    auto const beamWidth = sequence.getBeamWidth();
-    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-
-    if (!allocatedBlocks.at((blockIdx + 1) * beamWidth - 1)->isShared())
-    {
-        return;
-    }
-    BlockKey blockKey = allocatedBlocks.at(blockIdx * beamWidth)->getBlockKey();
-    bool isFull = allocatedBlocks.at(blockIdx * beamWidth)->isFull();
-
-    // Free shared block
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = allocatedBlocks.at(blockIdx * beamWidth + beamIdx);
-        block->decRefCount();
-        if (!block->hasRefs())
-        {
-            mEvictionPolicy->releaseBlock(block);
-        }
-    }
-
-    // Allocate new blocks
-    TLLM_CHECK_WITH_INFO(hasFreeBlocks(beamWidth), "Can't allocate new blocks. No free blocks left.");
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = getFreeBlock(sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt,
-            sequence.getTransferMode(), sequence.getDirectory());
-        block->incRefCount();
-        if (sequence.getCacheBlockIds(mWindowSize).at(beamIdx).size() == 0)
-        {
-            block->setPrevBlockInSeq(nullptr);
-        }
-        else
-        {
-            block->setPrevBlockInSeq(mAllBlocksById.at(sequence.getCacheBlockIds(mWindowSize)[beamIdx].back()));
-        }
-        block->setBlockKey(blockKey, isFull);
-        block->setHash();
-        sequence.changeCacheBlock(mWindowSize, beamIdx, blockIdx, block->getBlockId());
-        allocatedBlocks.at(blockIdx * beamWidth + beamIdx) = block;
-    }
-}
-
 void BlockManager::releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize)
 {
     mWindowBlockManagers.at(windowSize).releaseLastBlock(sequence);
