@@ -341,3 +341,4 @@ accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized 
 test_e2e.py::test_openai_chat_harmony SKIP (https://nvbugs/5575829)
 unittest/bindings/test_executor_bindings.py::test_request_perf_metrics_draft SKIP (https://nvbugs/5565590)
 accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_plugin SKIP (https://nvbugs/5354887)
+cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] SKIP (https://nvbugs/5582133)
