@@ -218,9 +218,16 @@ void TopologyDetector::detectGpuTopology()
         }
         int hasMemoryNumaConfig = 0;
         TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&hasMemoryNumaConfig, cudaDevAttrNumaConfig, deviceId));
+        mDebugStringStream << "[Init] GPU[" << deviceId << "] hasMemoryNumaConfig=" << hasMemoryNumaConfig << ", ";
         if (hasMemoryNumaConfig == cudaDeviceNumaConfigNumaNode)
         {
             TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&numaMemoryNode, cudaDevAttrNumaId, deviceId));
+            mDebugStringStream << "numaMemoryNode=" << numaMemoryNode << "\n";
+        }
+        else
+        {
+            mDebugStringStream << "numaMemoryNode=-1"
+                               << "\n";
         }
 #endif
 
@@ -431,7 +438,9 @@ std::string TopologyDetector::getNoCurrentGpuMemoryNumaIdReason()
 {
     int currentDevice = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
-    std::string reason = "Current GPU=" + std::to_string(currentDevice) + ", mGpuMemoryToNumaMap={";
+    std::string reason;
+    reason += mDebugStringStream.str();
+    reason += "Current GPU=" + std::to_string(currentDevice) + ", mGpuMemoryToNumaMap={";
     for (auto it = mGpuMemoryToNumaMap.begin(); it != mGpuMemoryToNumaMap.end(); ++it)
     {
         reason += "GPU[" + std::to_string(it->first) + "] memory NUMA Node=" + std::to_string(it->second) + ", ";

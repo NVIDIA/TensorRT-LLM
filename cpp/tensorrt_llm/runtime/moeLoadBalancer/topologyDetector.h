@@ -18,6 +18,7 @@
 
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 #ifdef __linux__
@@ -106,6 +107,8 @@ private:
     // Precomputed CPU affinity masks
     std::map<int, struct bitmask*> mGpuStrictCpuMasks; // GPU ID -> Strict CPU mask
 #endif
+
+    std::stringstream mDebugStringStream;
 };
 
 } // namespace tensorrt_llm::runtime
