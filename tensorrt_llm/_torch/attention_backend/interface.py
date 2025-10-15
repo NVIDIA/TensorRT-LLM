@@ -344,6 +344,11 @@ class AttentionMetadata:
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
 
+    def update_for_spec_dec(self) -> None:
+        """
+        Hook to be called during forward when using spec-dec one-model mode.
+        """
+
 
 class PositionalEmbedder(Protocol):
     """
