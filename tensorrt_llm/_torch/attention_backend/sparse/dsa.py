@@ -194,12 +194,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
-    # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
-    indexer_max_chunk_size = 128000  # Tunable
+    # 2. Intra-request: Split large requests into chunks if seq_len > max_chunk_size
+    indexer_max_chunk_size: int
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
         super().__init__(*args, **kwargs)
+        if self.sparse_attention_config.indexer_max_chunk_size is not None:
+            self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
+        else:
+            self.indexer_max_chunk_size = 32768 # Default to 32K tokens for the indexer
 
     def __post_init__(self):
         super().__post_init__()

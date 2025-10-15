@@ -186,6 +186,8 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         if config_class is None:
             raise ValueError(f"Invalid algorithm: {algorithm}")
 
+        # Remove 'algorithm' before passing to subclass constructor
+        data = {k: v for k, v in data.items() if k != 'algorithm'}
         return config_class(**data)
 
     def _check_fields(self):
@@ -228,11 +230,13 @@ class DSASparseAttentionConfig(BaseSparseAttentionConfig):
     """
     algorithm: ClassVar[str] = "dsa"
     index_n_heads: Optional[int] = Field(
-        default=64, description="The number of heads for the indexer.")
+        default=None, description="The number of heads for the indexer.")
     index_head_dim: Optional[int] = Field(
-        default=128, description="The dimension of the indexer heads.")
-    index_topk: Optional[int] = Field(default=2048,
-                                      description="The topk for the indexer.")
+        default=None, description="The dimension of the indexer heads.")
+    index_topk: Optional[int] = Field(
+        default=None, description="The topk for the indexer.")
+    indexer_max_chunk_size: Optional[int] = Field(
+        default=None, description="The maximum chunk size for the indexer.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -2881,7 +2885,7 @@ def update_llm_args_with_extra_dict(
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
         "attention_dp_config": AttentionDpConfig,
-        "sparse_attention_config": SparseAttentionBaseConfig,
+        "sparse_attention_config": BaseSparseAttentionConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
