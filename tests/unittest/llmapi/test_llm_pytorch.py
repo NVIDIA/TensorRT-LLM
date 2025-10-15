@@ -546,7 +546,7 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
         print("Creating dummy LoRAs...")
 
         model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     torch_dtype=torch.bfloat16,
+                                                     dtype=torch.bfloat16,
                                                      device_map="auto")
         hf_modules = ["q_proj", "k_proj", "v_proj"]
         peft_lora_config = PeftLoraConfig(r=8,
@@ -599,7 +599,7 @@ def test_gemma3_1b_instruct_multi_lora() -> None:
         print("Creating dummy LoRAs...")
 
         model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     torch_dtype=torch.bfloat16,
+                                                     dtype=torch.bfloat16,
                                                      device_map="auto")
         hf_modules = ["q_proj", "k_proj", "v_proj"]
         peft_lora_config = PeftLoraConfig(r=8,

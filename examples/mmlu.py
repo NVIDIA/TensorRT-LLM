@@ -447,7 +447,7 @@ def main():
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=DTYPE_STR_MAPPING[args.hf_data_type],
+            dtype=DTYPE_STR_MAPPING[args.hf_data_type],
             device_map="auto" if args.hf_device_map_auto else None,
         )
         if not args.hf_device_map_auto:
