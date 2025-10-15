@@ -301,6 +301,13 @@ class PeriodicJUnitXML:
             )
 
             try:
+                # Process any pending reports first
+                if self.pending_reports:
+                    self._log_info(
+                        f"Processing {len(self.pending_reports)} pending test reports before exit..."
+                    )
+                    self._process_pending_reports()
+
                 # Save current progress with all completed tests
                 if self.logxml and self.logxml.node_reporters_ordered:
                     self._log_info(
