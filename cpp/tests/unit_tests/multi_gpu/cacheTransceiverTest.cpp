@@ -1133,7 +1133,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
 
     bool isWindow = std::get<15>(param);
 
-    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache() && tensorrt_llm::common::getEnvUseMooncakeKvCache())
+    if (genCp > 1 && (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache()))
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
@@ -1231,7 +1231,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     bool generationDP = std::get<14>(param);
     bool isWindow = std::get<15>(param);
 
-    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache() && tensorrt_llm::common::getEnvUseMooncakeKvCache())
+    if (genCp > 1 && (tensorrt_llm::common::getEnvUseNixlKvCache() || tensorrt_llm::common::getEnvUseMooncakeKvCache()))
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
