@@ -44,7 +44,7 @@ def get_settings_from_engine(
     with open(config_path, "r") as config_json:
         config = json.load(config_json)
 
-    engine_world_map = config["pretrained_config"]["mapping"]
+    mapping = config["pretrained_config"]["mapping"]
     engine_build_cfg = config["build_config"]
 
     executor_settings = {
@@ -56,7 +56,7 @@ def get_settings_from_engine(
         "sw_version": config["version"],
         "engine_dir": str(engine_path.absolute()),
         "settings_config": executor_settings,
-        "engine_world_map": engine_world_map,
+        "mapping": mapping,
     })
 
     runtime_config["performance_options"] = {}
@@ -96,7 +96,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
 
-    engine_world_map = {
+    mapping = {
         "pp_size": params.get("pp"),
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
@@ -176,7 +176,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "max_num_tokens": int(max_num_tokens),
             "chunking": enable_chunked_prefill,
         },
-        "engine_world_map": engine_world_map,
+        "mapping": mapping,
         "backend": backend,
         "decoding_config": {},
         "performance_options": {

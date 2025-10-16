@@ -28,7 +28,9 @@ class RuntimeConfig(BaseModel):
     engine_dir: Optional[Path] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
-    engine_world_map: Dict[str, Any]
+    # TODO: this is a dict corresponding to the Mapping class, the type should be
+    # changed to Mapping after the Mapping class is migrated to a Pydantic model.
+    mapping: Dict[str, Any]
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
     backend: Literal["pytorch", "_autodeploy", None] = None
@@ -46,15 +48,15 @@ class RuntimeConfig(BaseModel):
             "skip_tokenizer_init":
             True,
             "pipeline_parallel_size":
-            self.engine_world_map["pp_size"],
+            self.mapping["pp_size"],
             "tensor_parallel_size":
-            self.engine_world_map["tp_size"],
+            self.mapping["tp_size"],
             "gpus_per_node":
-            self.engine_world_map["gpus_per_node"],
+            self.mapping["gpus_per_node"],
             "moe_expert_parallel_size":
-            self.engine_world_map["moe_ep_size"],
+            self.mapping["moe_ep_size"],
             "moe_cluster_parallel_size":
-            self.engine_world_map["moe_cluster_size"],
+            self.mapping["moe_cluster_size"],
             "trust_remote_code":
             True,
             "enable_chunked_prefill":
