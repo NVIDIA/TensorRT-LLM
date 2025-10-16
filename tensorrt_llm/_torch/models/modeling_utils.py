@@ -86,10 +86,7 @@ class MetaInitMode(TorchDispatchMode):
         if func in self.init_ops:
             if kwargs is None:
                 kwargs = {}
-            # respect caller-provided device
-            has_device = ('device' in kwargs and kwargs['device'] is not None)
-            if not has_device:
-                kwargs['device'] = torch.device('meta')
+            kwargs['device'] = torch.device('meta')
             return func(*args, **kwargs)
         elif func not in self.random_init_ops and self._has_meta_tensor(
                 args, kwargs):

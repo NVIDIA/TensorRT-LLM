@@ -14,6 +14,7 @@ from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor, ceil_div
 from .interface import MoE, MoEWeightLoadingMode
+from .moe_prefetch_manager import MoEPrefetchProxy
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
                            W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
@@ -71,6 +72,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -86,6 +88,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
+            moe_prefetch_proxy=moe_prefetch_proxy,
         )
 
         sm_version = get_sm_version()
@@ -356,6 +359,15 @@ class TRTLLMGenFusedMoE(MoE):
         router_logits_arg = router_logits if not post_quant_comm else None
         routing_bias_arg = routing_bias if not post_quant_comm else None
 
+        w3_w1_weight = self.w3_w1_weight
+        w2_weight = self.w2_weight
+
+        if self.use_prefetch:
+            torch.cuda.current_stream().wait_stream(
+                self.prefetch_proxy.prefetch_stream)
+            w3_w1_weight = self.prefetch_proxy.w3_w1_dst_buffer
+            w2_weight = self.prefetch_proxy.w2_dst_buffer
+
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
         if self.has_deepseek_fp8_block_scales:
@@ -367,9 +379,9 @@ class TRTLLMGenFusedMoE(MoE):
                 routing_bias_arg,
                 x_val,
                 x_scale,
-                self.w3_w1_weight,
+                w3_w1_weight,
                 self.w3_w1_weight_scaling_factor,
-                self.w2_weight,
+                w2_weight,
                 self.w2_weight_scaling_factor,
                 self.num_slots,
                 top_k,
@@ -405,9 +417,9 @@ class TRTLLMGenFusedMoE(MoE):
                 routing_bias_arg,
                 hidden_states_fp4,
                 hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
-                self.w3_w1_weight,
+                w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
-                self.w2_weight,
+                w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
@@ -435,24 +447,23 @@ class TRTLLMGenFusedMoE(MoE):
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
             if not post_quant_comm:
-                pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+                pad_size = w3_w1_weight.shape[-1] * 2 - x.shape[-1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
             else:
                 x = x
 
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
+            intermediate_size_per_partition_padded = w3_w1_weight.shape[-2] // 2
             final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 router_logits_arg,
                 routing_bias_arg,
                 x,
-                self.w3_w1_weight,
+                w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
-                self.w2_weight,
+                w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
                 self.num_slots,
@@ -483,9 +494,9 @@ class TRTLLMGenFusedMoE(MoE):
                 router_logits_arg,
                 routing_bias_arg,
                 hidden_states_fp8,
-                self.w3_w1_weight,
+                w3_w1_weight,
                 self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
-                self.w2_weight,
+                w2_weight,
                 self.w2_weight_scale.view(torch.float8_e4m3fn),
                 self.fc31_scale_c.data,
                 self.fc31_alpha.data,
@@ -512,27 +523,26 @@ class TRTLLMGenFusedMoE(MoE):
             else:
                 final_hidden_states = outputs[0]
         elif self.has_w4a8_mxfp4_fp8:
-            pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+            pad_size = w3_w1_weight.shape[-1] * 2 - x.shape[-1]
             if not post_quant_comm:
                 x = torch.nn.functional.pad(x, (0, pad_size))
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_gate_dequant[0])
             else:
                 x = x
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
+            intermediate_size_per_partition_padded = w3_w1_weight.shape[-2] // 2
 
             final_hidden_states = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 router_logits_arg,
                 routing_bias_arg,
                 x,
-                self.w3_w1_weight,
+                w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
-                self.w2_weight,
+                w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
                 self.fc31_input_dequant,  # output1_scales_scalar
@@ -562,21 +572,20 @@ class TRTLLMGenFusedMoE(MoE):
             else:
                 mxfp8_x, sf = x, x_sf
 
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
+            intermediate_size_per_partition_padded = w3_w1_weight.shape[-2] // 2
 
             final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 router_logits_arg,
                 routing_bias_arg,
                 mxfp8_x,
                 sf,
-                self.w3_w1_weight,
+                w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
-                self.w2_weight,
+                w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
                 self.num_slots,
@@ -598,6 +607,10 @@ class TRTLLMGenFusedMoE(MoE):
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
             )
+
+        if self.use_prefetch:
+            self.prefetch_proxy.start_next_layer_prefetching(
+                torch.cuda.current_stream())
 
         # Combine results if using alltoall
         if self.enable_alltoall and alltoall_info is not None:
