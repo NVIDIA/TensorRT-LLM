@@ -1,9 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# Configuration
-slurm_file="disaggr_torch.slurm"
-
 # SLURM Configuration
 partition="<partition>"
 account="<account>"
@@ -29,6 +26,7 @@ streaming=true             # Enable streaming mode
 cache_max_tokens=4608     # Cache transceiver max tokens
 seq_offset=203  # Offset added to sequence lengths
 # Dataset file for benchmarking
+# Set it to empty to use random dataset
 dataset_file="<dataset_file>"
 
 # Environment Configuration
@@ -46,8 +44,18 @@ build_wheel=false
 # Workspace Configuration
 work_dir=$(pwd) # path to the work directory containing the scripts
 
+# Path to
+log_dir=$work_dir
+
+# Configuration
+slurm_file=$work_dir/"disaggr_torch.slurm"
+
 # Profiling Configuration
 nsys_on=false  # Set to true to enable profiling
+
+# Time Breakdown Configuration
+enable_time_breakdown=true  # Set to true to enable request time breakdown
+perf_metrics_max_requests=20000  # Maximum number of requests to store perf metrics for
 
 ##############################################################
 
@@ -120,7 +128,8 @@ run_single() {
         "${gen_eplb_num_slots}" "${mtp_size}" "${gen_concurrency_list}" \
         "${gpus_per_node}" "${use_nv_sa_benchmark}" "${isl}" "${osl}" "${multi_round}" "${benchmark_ratio}" \
         "${streaming}" "${cache_max_tokens}" "${dataset_file}" "${container_mount}" "${container_image}" \
-        "${model_path}" "${trtllm_repo}" "${build_wheel}" "${work_dir}" "${nsys_on}" "${seq_offset}" "${numa_bind}" "${benchmark_mode}"
+        "${model_path}" "${trtllm_repo}" "${build_wheel}" "${work_dir}" "${nsys_on}" "${seq_offset}" "${numa_bind}" "${benchmark_mode}" "${log_dir}" \
+        "${enable_time_breakdown}" "${perf_metrics_max_requests}"
     set +x
 }
 

@@ -21,7 +21,9 @@ def gen_config_file(work_dir: str,
                     gen_gpu_memory_fraction: float,
                     eplb_num_slots: int,
                     mtp_size: int = 0,
-                    cache_transceiver_max_num_tokens: int = 4608) -> None:
+                    cache_transceiver_max_num_tokens: int = 4608,
+                    enable_time_breakdown: bool = False,
+                    perf_metrics_max_requests: int = 1000) -> None:
     """
     Generate configuration YAML file for disaggregated inference.
 
@@ -74,6 +76,10 @@ def gen_config_file(work_dir: str,
         },
     }
 
+    if enable_time_breakdown:
+        ctx_config['return_perf_metrics'] = True
+        ctx_config['perf_metrics_max_requests'] = perf_metrics_max_requests
+
     gen_cuda_graph_batch_sizes = [
         1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 2048, gen_batch_size
     ]
@@ -119,6 +125,10 @@ def gen_config_file(work_dir: str,
         'stream_interval': 20,
         'num_postprocess_workers': 4,
     }
+
+    if enable_time_breakdown:
+        gen_config['return_perf_metrics'] = True
+        gen_config['perf_metrics_max_requests'] = perf_metrics_max_requests
 
     if gen_tp_size == 8 and not gen_enable_attention_dp:
         gen_config['allreduce_strategy'] = "MNNVL"
@@ -234,6 +244,14 @@ if __name__ == "__main__":
                         type=int,
                         default=8448,
                         help="Max number of tokens for cache transceiver")
+    parser.add_argument("--enable_time_breakdown",
+                        action='store_true',
+                        help="Enable request time breakdown")
+    parser.add_argument(
+        "--perf_metrics_max_requests",
+        type=int,
+        default=1000,
+        help="Maximum number of requests to store perf metrics for")
 
     args = parser.parse_args()
 
@@ -245,4 +263,5 @@ if __name__ == "__main__":
                     args.gen_max_num_tokens, args.gen_max_seq_len,
                     args.gen_enable_attention_dp, args.gen_gpu_memory_fraction,
                     args.eplb_num_slots, args.mtp_size,
-                    args.cache_transceiver_max_num_tokens)
+                    args.cache_transceiver_max_num_tokens,
+                    args.enable_time_breakdown, args.perf_metrics_max_requests)
