@@ -514,6 +514,10 @@ def create_input_processor_with_hash(
                 vocab_size=vocab_size,
                 mm_token_ids=mm_ids,
                 mm_special_token_ids=mm_special_token_ids,
+                kwargs={
+                    "mm_data": mm_data,
+                    "text_prompt": inputs["prompt"],
+                }
             )
             # Store special token offsets if available
             if len(start_special_token_positions

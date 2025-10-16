@@ -642,7 +642,8 @@ def find_mm_token_positions(
     num_mm_tokens: List[int],
     vocab_size: Optional[int] = None,
     mm_token_ids: Optional[torch.Tensor] = None,
-    mm_special_token_ids: Optional[torch.Tensor] = None
+    mm_special_token_ids: Optional[torch.Tensor] = None,
+    kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[int], List[int]]:
     """Get starting positions of contiguous multimodal token chunks using known lengths.
 
@@ -707,9 +708,15 @@ def find_mm_token_positions(
 
     # Get positions of all multimodal tokens
     mm_positions = torch.where(mm_mask)[0].tolist()
+    try:
+        images = kwargs["mm_data"]['image']
+        image_sizes = [image.shape for image in images]
+    except Exception as e:
+        image_sizes = None
+
     assert len(mm_positions) == sum(
         num_mm_tokens
-    ), f"Number of multimodal tokens does not match sum of all lengths"
+    ), f"Number of multimodal tokens does not match sum of all lengths: {len(mm_positions)=}, {sum(num_mm_tokens)=}, {kwargs=} PIL {image_sizes=}"
 
     # Use num_mm_tokens to find the starting position of each chunk
     start_positions = []

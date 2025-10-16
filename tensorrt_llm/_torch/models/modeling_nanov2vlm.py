@@ -284,18 +284,18 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
         def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width,
                                        height, image_size):
-            best_factor = float('-inf')
+            best_ratio_diff = float("inf")
             best_ratio = (1, 1)
             area = width * height
             for ratio in target_ratios:
                 target_aspect_ratio = ratio[0] / ratio[1]
-                factor_based_on_area_n_ratio = min(
-                    (ratio[0] * ratio[1] * image_size * image_size) / area,
-                    0.6) * min(target_aspect_ratio / aspect_ratio,
-                               aspect_ratio / target_aspect_ratio)
-                if factor_based_on_area_n_ratio > best_factor:
-                    best_factor = factor_based_on_area_n_ratio
+                ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+                if ratio_diff < best_ratio_diff:
+                    best_ratio_diff = ratio_diff
                     best_ratio = ratio
+                elif ratio_diff == best_ratio_diff:
+                    if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                        best_ratio = ratio
             return best_ratio
 
         def _calculate_targets(
