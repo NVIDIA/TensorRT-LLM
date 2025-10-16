@@ -2184,11 +2184,12 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None
         }, gather_ids if is_spec_decode else None
 
-    def _get_lora_params_from_requests(self,
-                                       scheduled_requests: ScheduledRequests,
-                                       attn_metadata: AttentionMetadata,
-                                       peft_cache_manager: PeftCacheManager,
-                                       maybe_graph: bool = False):
+    def _get_lora_params_from_requests(
+            self,
+            scheduled_requests: ScheduledRequests,
+            attn_metadata: AttentionMetadata,
+            peft_cache_manager: Optional[PeftCacheManager] = None,
+            maybe_graph: bool = False):
         '''
         Get LoRA parameters from scheduled requests.
 
