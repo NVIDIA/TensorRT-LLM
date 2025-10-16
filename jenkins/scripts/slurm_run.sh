@@ -29,12 +29,12 @@ set_value_in_command() {
     echo "$result"
 }
 
-# save job ID in $jobWorkspace/id.txt for later job to retrieve
-echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
-
 resultsPath=$jobWorkspace/results
 mkdir -p $resultsPath
 if [ $SLURM_LOCALID -eq 0 ]; then
+    # save job ID in $jobWorkspace/slurm_job_id.txt for later job to retrieve
+    echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
+
     wget -nv $llmTarfile
     tar -zxf $tarName
     which python3
@@ -66,19 +66,10 @@ cd $llmSrcNode/tests/integration/defs
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
+if [ $SLURM_LOCALID -eq 0 ]; then
+    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+fi
 pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
-
-# generate .coveragerc in workspace and add file path to pytest command
-cat << EOF > $jobWorkspace/.coveragerc
-[run]
-branch = True
-data_file = $jobWorkspace/.coverage.$stageName
-[paths]
-source =
-    $llmSrcNode/tensorrt_llm/
-    $trtllmWhlPath/tensorrt_llm/
-EOF
-pytestCommand=$(set_value_in_command "coverageConfigFile" "$jobWorkspace/.coveragerc" "$pytestCommand")
 
 containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
 containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
@@ -93,17 +84,19 @@ echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
 
-# echo "Running: $testCase"
 echo "Full Command: $pytestCommand"
 
-# For single node testing
-# Unset Env variables that set by Slurm srun
-# This will disable MPI when run pytest
-# (Disabled since we plan to use sbatch for trtllm slurm jobs)
+# For single-node test runs, clear all environment variables related to Slurm and MPI.
+# This prevents test processes (e.g., pytest) from incorrectly initializing MPI
+# when running under a single-node srun environment.
+# TODO: check if we can take advantage of --export=None arg when execute srun instead
+# of unset them in the script
  if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
-     for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
-         unset "$v"
-     done
+    for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+        if [ "$v" != "SLURM_PROCID" ]; then
+            unset "$v"
+        fi
+    done
  fi
 
 # Turn off "exit on error" so the following lines always run
@@ -111,6 +104,7 @@ set +e
 trap - ERR
 
 eval $pytestCommand
+echo "Rank${SLURM_PROCID} Pytest finished execution"
 
 if [ "$perfMode" = "true" ]; then
     if [[ "$stageName" == *PyTorch* ]]; then
@@ -119,11 +113,11 @@ if [ "$perfMode" = "true" ]; then
         basePerfFilename="base_perf.csv"
     fi
     basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
-    echo "Check perf result"
+    echo "Check Perf Result"
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
         $stageName/perf_script_test_results.csv \
         $basePerfPath
-    echo "Check perf report"
+    echo "Check Perf Result"
     python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
         --output_path $stageName/report.pdf \
         --files $stageName/perf_script_test_results.csv \
