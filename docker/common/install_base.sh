@@ -122,6 +122,7 @@ install_pyp_rockylinux() {
       PIP_INDEX_URL ="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
   fi
   bash -c "pip3 install 'urllib3<2.0' pytest"
+  PIP_INDEX_URL=""
 }
 
 install_gcctoolset_rockylinux() {
