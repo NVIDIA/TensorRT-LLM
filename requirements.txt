@@ -25,7 +25,7 @@ sentencepiece>=0.1.99
 tensorrt~=10.13.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.8.0a0.
 # torch>=2.7.1,<=2.8.0a0  # <For CUDA 12.9>
-torch>=2.8.0a0,<=2.8.0
+torch>=2.9.0a0,<=2.9.0
 torchvision
 nvidia-modelopt[torch]~=0.33.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.27.7
