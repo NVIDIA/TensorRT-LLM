@@ -1,6 +1,6 @@
 import unittest
 from dataclasses import dataclass
-from unittest.mock import Mock, MagicMock
+from unittest.mock import MagicMock, Mock
 
 import torch
 
@@ -36,6 +36,12 @@ class Config:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
+
+
+class DummyKvCacheConnectorWorker(KvCacheConnectorWorker):
+
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+        pass
 
 
 class DummyModel(torch.nn.Module):
@@ -368,6 +374,25 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         mock_callable.assert_called_once()
 
     def test_foward_pass_callable_off(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        self.assertTrue(model_engine.forward_pass_callable is None,
+                        "forward_pass_callback should be None by default")
+
+        # Assert we can run `forward` without a forward_pass_callback without error
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+    def test_foward_pass_callable_backward_compat(self):
         config = PyTorchConfig(use_cuda_graph=False)
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
         self.assertTrue(model_engine.forward_pass_callable is None,
