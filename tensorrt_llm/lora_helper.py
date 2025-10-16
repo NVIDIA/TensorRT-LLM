@@ -46,6 +46,7 @@ def get_default_trtllm_modules_to_hf_modules():
         "attn_q": "q_proj",
         "attn_k": "k_proj",
         "attn_v": "v_proj",
+        "attn_qkv": "qkv_proj",
         "attn_dense": "o_proj",
         "mlp_h_to_4h": "gate_proj",
         "mlp_4h_to_h": "down_proj",

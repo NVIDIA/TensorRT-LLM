@@ -18,6 +18,7 @@ import sys
 import traceback
 from typing import Any
 
+import _pytest.outcomes
 import pytest
 import torch
 import tqdm
@@ -65,8 +66,9 @@ def pytest_pyfunc_call(pyfuncitem) -> Any:
         return (yield)
     # NB: _pytest.outcomes.OutcomeException subclasses BaseException
     except BaseException as e:
-        print(f"TEST RAISED ERROR: {e}")
-        traceback.print_exception(e)
+        if not isinstance(e, _pytest.outcomes.Skipped):
+            print(f"TEST RAISED ERROR: {e}")
+            traceback.print_exception(e)
         raise
 
 

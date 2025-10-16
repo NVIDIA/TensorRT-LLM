@@ -15,6 +15,7 @@
 # -*- coding: utf-8 -*-
 
 import datetime
+import gc
 import os
 import platform
 import re
@@ -2086,6 +2087,14 @@ def pytest_addoption(parser):
         action="append",
         default=[],
     )
+    parser.addoption(
+        "--test-model-suites",
+        action="store",
+        default=None,
+        help=
+        "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
+        "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2132,6 +2141,7 @@ def pytest_collection_modifyitems(session, config, items):
     waives_file = config.getoption("--waives-file")
     test_prefix = config.getoption("--test-prefix")
     perf_test = config.getoption("--perf")
+    test_model_suites = config.getoption("--test-model-suites")
 
     if perf_test:
         global ALL_PYTEST_ITEMS
@@ -2162,6 +2172,10 @@ def pytest_collection_modifyitems(session, config, items):
     if regexp is not None:
         deselect_by_regex(regexp, items, test_prefix, config)
 
+    if test_model_suites:
+        deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                      config)
+
     if waives_file:
         apply_waives(waives_file, items, config)
 
@@ -2181,6 +2195,55 @@ def pytest_configure(config):
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
+
+
+def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                  config):
+    """Filter tests based on the test model suites specified.
+    If a test matches any of the test model suite names, it is considered selected.
+
+    Args:
+        test_model_suites: String containing test model suite names separated by semicolons
+        items: List of pytest items to filter
+        test_prefix: Test prefix if any
+        config: Pytest config object
+    """
+    if not test_model_suites:
+        return
+
+    # Split by semicolon or space and strip whitespace
+    suite_names = [
+        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
+        if suite.strip()
+    ]
+
+    if not suite_names:
+        return
+
+    selected = []
+    deselected = []
+
+    for item in items:
+        # Get the test name without prefix for comparison
+        test_name = item.nodeid
+        if test_prefix and test_name.startswith(f"{test_prefix}/"):
+            test_name = test_name[len(f"{test_prefix}/"):]
+
+        # Check if any suite name matches the test name
+        found = False
+        for suite_name in suite_names:
+            if suite_name in test_name or test_name.endswith(suite_name):
+                found = True
+                break
+
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):
@@ -2462,6 +2525,7 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        gc.collect()
 
 
 @pytest.fixture(autouse=True)

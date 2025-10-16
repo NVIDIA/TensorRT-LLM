@@ -76,7 +76,7 @@ methods:
         default: null
       max_num_tokens:
         annotation: Optional[int]
-        default: null
+        default: 8192
       # Misc
       load_format:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]

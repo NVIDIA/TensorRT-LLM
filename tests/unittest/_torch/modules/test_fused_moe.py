@@ -640,7 +640,7 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5550283")
+@pytest.mark.skip(reason="https://nvbugs/5565565")
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -742,6 +742,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
+        alltoall_model.post_load_weights()
 
         # Use DeepGemmFusedMoE as reference
         ref_model = DeepGemmFusedMoE(
@@ -757,6 +758,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         )
         ref_model.to("cuda")
         ref_model.load_weights([weights])
+        ref_model.post_load_weights()
 
         # Evaluate the outputs on variant sequence lengths
         m = MAX_NUM_TOKENS
@@ -773,13 +775,11 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs with relaxed tolerance for FP8
@@ -1612,15 +1612,14 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                                       dtype=torch.int8).cuda()
 
             # The pre-quant scale to be multiplied with the input activation.
-            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
+            # Use random pre-quant scales [0.95, 1.05] instead of fixed 1.0 to ensure the kernel handles
+            # non-uniform pre-quant scaling factors correctly
+            w1_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w2_pre_quant_scale = torch.rand(
+                INTERMEDIATE_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w3_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
 
             # The weight scale to dequantize int4 weights (by multiplication).
             w1_scale = torch.randn(

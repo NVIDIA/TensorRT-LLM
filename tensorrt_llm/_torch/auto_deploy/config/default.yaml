@@ -6,16 +6,14 @@ transforms:
   ############################################################################################
   build_model:
     stage: factory
+    run_per_gm: false
     device: meta
-    # nothing to clean up
-    run_graph_cleanup: false
     requires_clean_graph: false
   export_to_gm:
     stage: export
     clone_state_dict: false
     strict: false
-    # nothing to clean up
-    run_graph_cleanup: false
+    run_per_gm: false
     requires_clean_graph: false
   cleanup_noop_slice:
     stage: post_export
@@ -35,6 +33,7 @@ transforms:
     run_shape_prop: true
   match_eager_attention:
     stage: pattern_matcher
+    requires_shape_prop: true
   match_grouped_attention:
     stage: pattern_matcher
   match_attention_layout:
@@ -87,8 +86,10 @@ transforms:
   ############################################################################################
   load_weights:
     stage: weight_load
+    run_per_gm: false
   move_inputs_to_device:
     stage: weight_load
+    run_per_gm: false
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
@@ -138,10 +139,13 @@ transforms:
     attn_backend: cuda_causal_conv
   initialize_cache:
     stage: cache_init
+    run_per_gm: false
   resize_kv_cache:
     stage: cache_init
+    run_per_gm: false
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################
   compile_model:
     stage: compile
+    run_per_gm: false

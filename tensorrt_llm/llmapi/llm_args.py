@@ -166,6 +166,63 @@ class CudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
+class BaseSparseAttentionConfig(StrictBaseModel):
+    """
+    Configuration for sparse attention.
+    """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        # dispatch to the correct sparse attention config
+        config_classes = {
+            "rocket": RocketSparseAttentionConfig,
+        }
+
+        algorithm = data.get("algorithm", None)
+        if algorithm is None:
+            raise ValueError(f"Sparse attention algorithm is required")
+
+        config_class = config_classes.get(algorithm.lower())
+        if config_class is None:
+            raise ValueError(f"Invalid algorithm: {algorithm}")
+
+        return config_class(**data)
+
+    def _check_fields(self):
+        pass
+
+    def supports_backend(self, backend: str) -> bool:
+        """
+        Override if the speculation algorithm does not support
+        a subset of the possible backends.
+        """
+        return True
+
+
+class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for rocket sparse attention.
+    """
+    window_size: Optional[int] = Field(
+        default=None, description="The window size for snap KV.")
+    kernel_size: Optional[int] = Field(
+        default=None, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
+    topk: Optional[int] = Field(default=128, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=1266,
+                                         description="Prompt budget")
+    page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
@@ -365,7 +422,39 @@ class DecodingBaseConfig(StrictBaseModel):
     max_concurrency: Optional[int] = None
 
     load_format: Optional[str] = None
+    # PyTorch only.
+    # Rolling average window size (N) for acceptance length across completed requests.
+    # If not set or set to 0, the feature is disabled.
+    acceptance_window: Optional[int] = None
+    # PyTorch only.
+    # Threshold for average acceptance length; speculation will be disabled
+    # permanently once the rolling average over the last N completed requests
+    # (N = acceptance_window) drops below this value.
+    acceptance_length_threshold: Optional[float] = None
 
+    # Validate acceptance controls at field level so they run on model creation
+    @field_validator('acceptance_window')
+    @classmethod
+    def _validate_acceptance_window(cls, v: Optional[int]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_window must be >= 0 (0 disables), got {v}")
+        return v
+
+    @field_validator('acceptance_length_threshold')
+    @classmethod
+    def _validate_acceptance_length_threshold(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_length_threshold must be >= 0, got {v}")
+        return v
+
+    # If set, drafting is allowed to use chain drafter.
+    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
 
@@ -1101,6 +1190,10 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     AutoDecodingConfig,
 ]]
 
+SparseAttentionConfig: TypeAlias = Union[
+    RocketSparseAttentionConfig,
+]
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -1478,6 +1571,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="Cache transceiver config.",
         status="prototype")
 
+    # Sparse attention config
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None,
+        description="Sparse attention config.",
+        status="prototype")
+
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
@@ -1496,7 +1595,7 @@ class BaseLlmArgs(StrictBaseModel):
                                           description="The maximum beam width.")
 
     max_num_tokens: Optional[int] = Field(
-        default=None, description="The maximum number of tokens.")
+        default=8192, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
         default=False,
@@ -1795,13 +1894,15 @@ class BaseLlmArgs(StrictBaseModel):
 
         if self.max_batch_size is not None:
             if self.max_batch_size > self.build_config.max_batch_size:
-                raise ValueError(
-                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
+                self.max_batch_size = self.build_config.max_batch_size
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] is overridden by build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
         if self.max_num_tokens is not None:
             if self.max_num_tokens > self.build_config.max_num_tokens:
-                raise ValueError(
-                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
+                self.max_num_tokens = self.build_config.max_num_tokens
+                logger.warning(
+                    f"max_num_tokens [{self.max_num_tokens}] is overridden by build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
         if self.max_seq_len is not None:
             if self.max_seq_len != self.build_config.max_seq_len:
