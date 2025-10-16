@@ -117,9 +117,8 @@ def submit_job(config):
         ctx_config_path,
         str(gen_num),
         gen_config_path,
-        str(config['worker_config']['eplb_num_slots']),
         str(config['worker_config']['mtp_size']),
-        config['worker_config']['concurrency_list'],
+        config['benchmark']['concurrency_list'],
 
         # Sequence and benchmark parameters
         str(config['sequence']['input_length']),

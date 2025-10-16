@@ -14,6 +14,7 @@ benchmark:
   multi_round: 8  # Number of benchmark rounds
   benchmark_ratio: 0.8  # Benchmark ratio
   streaming: true  # Enable streaming mode
+  concurrency_list: "16"
 
 # Hardware Configuration
 hardware:
@@ -41,7 +42,6 @@ profiling:
   nsys_on: false  # Set to true to enable profiling
 
 worker_config:
-  concurrency_list: "16"
   eplb_num_slots: 0  # Number of slots for EPLB
   mtp_size: 0  # MTP size
   gen:
