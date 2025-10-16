@@ -2518,7 +2518,13 @@ class TorchLlmArgs(BaseLlmArgs):
                                    status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
-        description="The checkpoint loader to use for this LLM instance.",
+        description=
+        "The checkpoint loader to use for this LLM instance. You may use a custom checkpoint loader by subclassing "
+        "`BaseCheckpointLoader` and providing an instance of the subclass here to load weights from a custom "
+        "checkpoint format.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         json_schema_extra={
             "type":
             "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
@@ -2528,7 +2534,12 @@ class TorchLlmArgs(BaseLlmArgs):
 
     checkpoint_format: Optional[str] = Field(
         default=None,
-        description="The format of the provided checkpoint.",
+        description=
+        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         status="prototype",
     )
 
