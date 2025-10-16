@@ -666,6 +666,7 @@ class MLA(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
+        enable_unit_test: bool = False,
     ):
         """
         Initialize the MLA module.
@@ -688,6 +689,7 @@ class MLA(nn.Module):
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
+            enable_unit_test (bool): Whether to enable unit test.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -708,6 +710,7 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
+        self.enable_unit_test = enable_unit_test
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -753,7 +756,11 @@ class MLA(nn.Module):
         self.num_heads_tp = self.num_heads // tp_size
         self.num_heads_tp_cp = self.num_heads_tp // cp_size
 
-        rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
+        if self.enable_unit_test:
+            rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps",
+                                   1e-6)
+        else:
+            rms_norm_eps = config.pretrained_config.rms_norm_eps
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -825,7 +832,6 @@ class MLA(nn.Module):
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_generation only
-        # TODO: loading weights needs to be aware of cp as well and split v_b_proj accordingly
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
@@ -863,7 +869,7 @@ class MLA(nn.Module):
         mscale_all_dim = pos_embd_params.rope.mscale_all_dim
         scaling_factor = pos_embd_params.rope.scale
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-        self.q_scaling = 1.0 / (mscale * mscale)
+        q_scaling = 1.0 / (mscale * mscale)
 
         self.mha = create_attention(
             config.attn_backend,
@@ -873,7 +879,7 @@ class MLA(nn.Module):
             num_kv_heads=self.num_heads_tp,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            q_scaling=self.q_scaling,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -893,7 +899,7 @@ class MLA(nn.Module):
             num_kv_heads=1,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            q_scaling=self.q_scaling,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -1008,10 +1014,10 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
-    def _attn_forward(self, attn_backend: AttentionBackend, q: torch.Tensor,
-                      k: torch.Tensor, v: torch.Tensor,
-                      position_ids: torch.Tensor,
-                      attn_metadata: AttentionMetadata, **kwargs):
+    def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
+                          k: torch.Tensor, v: torch.Tensor,
+                          position_ids: torch.Tensor,
+                          attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.cp_size > 1:
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
@@ -1054,11 +1060,11 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
-        # note: for testing Helix parallelism, we ensure that the output is
-        # large enough for the context phase, but we then cut it again in
-        # `forward_context`
         hidden_size = self.o_proj.in_features
-        if num_contexts > 0:
+        if self.enable_unit_test and num_contexts > 0:
+            # note: for testing Helix parallelism, we ensure that the output is
+            # large enough for the context phase, but we then cut it again in
+            # `forward_context`
             hidden_size *= self.mapping.cp_size
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
@@ -1147,14 +1153,8 @@ class MLA(nn.Module):
             q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            # TODO for CP Helix: any rank except the last one / the one generating
-            # the output token should use the latent cache of the "next" logical rank
-            # (first token for each sequence in the KV cache of next rank)
-            # this generally doesn't influence the results much, but it could
-            # for now, we solve it by allowing to pass a custom latent cache for generation
-            latent_cache_gen = latent_cache[
-                num_ctx_tokens:,
-                ...] if latent_cache_gen is None else latent_cache_gen
+            if latent_cache_gen is None:
+                latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -1528,7 +1528,7 @@ class MLA(nn.Module):
             self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
-        attn_out_latent = self._attn_forward(
+        attn_out_latent = self._attn_forward_gen(
             self.mqa,
             fused_q,
             None,
@@ -1571,6 +1571,7 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+
         return output
 
     def forward(
@@ -1595,12 +1596,14 @@ class MLA(nn.Module):
                               attn_metadata,
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
-        if self.mapping.cp_size > 1:
-            # note: for allowing testing Helix parallelism, we ensure that the output
-            # is compatible with o_proj even in the context phase,
+
+        if self.enable_unit_test and self.mapping.cp_size > 1:
+            # note: for allowing testing Helix parallelism, we ensure that
+            # the output is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
+
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output
