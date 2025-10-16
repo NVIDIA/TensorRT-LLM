@@ -1204,13 +1204,12 @@ class PyExecutor:
 
                 self._kv_connector_terminate_requests()
 
-                if self.enable_iter_perf_stats:
+                if self.enable_iter_perf_stats and sample_state is not None:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
-                        BatchState(sample_state=SampleState(
-                            scheduled_requests=scheduled_batch),
+                        BatchState(sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 

@@ -37,10 +37,10 @@ class TestStrategySelection:
         if params.top_p == 0:
             pytest.skip("top_p = 0 disallowed by tensorrt_llm::executor::SamplingConfig")
 
+    # If this xpasses, update _check_params and doc-string of SamplingParams.
+    @pytest.mark.xfail(reason="top_p = 0 disallowed by tensorrt_llm::executor::SamplingConfig")
     def test_top_p_0_disallowed(self):
-        # If this xpasses, update _check_params and doc-string of SamplingParams.
         params = SamplingParams(top_p=0)
-        pytest.xfail("top_p = 0 disallowed by tensorrt_llm::executor::SamplingConfig")
         params._get_sampling_config()
 
     def _build_mock_llm_request(self, params: SamplingParams) -> LlmRequest:
