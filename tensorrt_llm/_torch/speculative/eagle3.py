@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from tensorrt_llm.mapping import Mapping
@@ -18,6 +20,149 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
+
+
+@triton.jit
+def top_p_sample_from_cdf_kernel(
+        cdf_ptr,
+        idx_ptr,
+        out_ptr,
+        B,
+        V,
+        stride_cdf_row,
+        stride_idx_row,
+        top_p,  # 0-d fp32 tensor — load inside
+        seed,
+        offset  # 0-d int32 / int64 tensors — load inside
+):
+    row = tl.program_id(0)
+    if row >= B:
+        return
+
+    # Load runtime scalars
+    tp = tl.load(top_p)
+    sd = tl.load(seed)
+    off = tl.load(offset)
+
+    # Make a size-1 block to keep pointer/value ranks consistent
+    rv = tl.arange(0, 1)
+
+    # Base pointers for this row (as blocks)
+    base_cdf = cdf_ptr + (row *
+                          stride_cdf_row) + rv * 0  # rv*0 preserves block type
+    base_idx = idx_ptr + (row * stride_idx_row) + rv * 0
+
+    # ---------- Binary search 1: find K with CDF[K] >= tp ----------
+    lo = tl.zeros((1, ), dtype=tl.int32)
+    hi = tl.full((1, ), V - 1, dtype=tl.int32)
+    for _ in tl.static_range(0, 32):
+        active = lo < hi
+        mid = (lo + hi) // 2
+        v = tl.load(base_cdf + mid)
+        ge = v >= tp
+        hi = tl.where(active & ge, mid, hi)
+        lo = tl.where(active & (~ge), mid + 1, lo)
+    K = lo
+    mass = tl.load(base_cdf + K)
+
+    # ---------- RNG & target draw ----------
+    u01 = tl.rand(sd, off + row)
+    u = u01 * mass
+
+    # ---------- Binary search 2: find j with CDF[j] >= u ----------
+    lo = tl.zeros((1, ), dtype=tl.int32)
+    hi = tl.full((1, ), V - 1, dtype=tl.int32)
+    for _ in tl.static_range(0, 32):
+        active = lo < hi
+        mid = (lo + hi) // 2
+        v = tl.load(base_cdf + mid)
+        ge = v >= u
+        hi = tl.where(active & ge, mid, hi)
+        lo = tl.where(active & (~ge), mid + 1, lo)
+    j = lo
+
+    # Map back to token id (block load) → store
+    tok = tl.load(base_idx + j, mask=tl.full((1, ), True, tl.int1))
+
+    # Store as a block to a block pointer derived from out_ptr
+    out_row_ptr = out_ptr + row + rv * 0
+    tl.store(out_row_ptr, tok)
+
+
+def triton_top_p_sample(
+    probs: torch.Tensor,
+    top_p: float,
+    *,
+    seed: int | torch.Tensor = 12345,
+    offset: int | torch.Tensor = 0,
+    sorted_inputs: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out: torch.Tensor | None = None,
+):
+    """
+    Graph-safe top-p (nucleus) sampling using Triton and stateless RNG.
+
+    Args:
+        probs: [B, V] float32 tensor of probabilities (not logits). Does not need to be sorted.
+        top_p: scalar float in (0, 1].
+        seed: int or 0-d CUDA tensor (int32). Keep constant across capture; advance 'offset' between replays.
+        offset: int or 0-d CUDA tensor (int64). Increase by B (or any unique stride) per replay to decorrelate.
+        sorted_inputs: Optional (probs_sorted, idx_sorted) both [B, V]; if provided, skips internal sort.
+        out: Optional preallocated [B] int32 tensor for results.
+
+    Returns:
+        next_token_ids: int32 tensor [B]
+
+    Notes:
+      - If you plan to put this inside a CUDA graph, JIT-compile and autotune
+        *before* capture (do a warm-up call), and reuse the same storage for all inputs.
+      - Internally we sort descending and build an inclusive CDF, both graph-friendly.
+      - RNG is stateless (Philox) and capture-safe; update 'offset' between replays.
+    """
+    assert probs.is_cuda and probs.dtype == torch.float32 and probs.dim() == 2
+    B, V = probs.shape
+    device = probs.device
+
+    if sorted_inputs is None:
+        # Sort descending and compute inclusive CDF on GPU — graph-friendly
+        vals, idx = torch.sort(probs, dim=-1, descending=True)
+    else:
+        vals, idx = sorted_inputs
+        assert vals.shape == probs.shape and idx.shape == probs.shape
+        assert vals.device == probs.device and idx.device == probs.device
+
+    cdf = torch.cumsum(vals, dim=-1)
+
+    # Clamp numerical drift so top_p=1.0 always hits last index
+    cdf = torch.minimum(cdf, torch.ones((), device=device, dtype=vals.dtype))
+
+    # Prepare outputs and scalars
+    if out is None:
+        out = torch.empty((B, ), device=device, dtype=torch.int32)
+
+    if not torch.is_tensor(seed):
+        seed = torch.tensor(seed, device=device, dtype=torch.int32)
+    if not torch.is_tensor(offset):
+        offset = torch.tensor(offset, device=device, dtype=torch.int64)
+
+    # Launch kernel: one program per row
+    grid = (B, )
+    top_p_f32 = torch.tensor(float(top_p), device=device, dtype=torch.float32)
+
+    top_p_sample_from_cdf_kernel[grid](
+        cdf,
+        idx,
+        out,
+        B,
+        V,
+        cdf.stride(0),
+        idx.stride(0),
+        top_p_f32,
+        seed,
+        offset,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -468,7 +613,12 @@ class Eagle3OneModelWorker(nn.Module):
                                          device=logits.device)
 
         # Do greedy sampling for the input logits
-        target_tokens = torch.argmax(logits, dim=-1)
+        # target_tokens = torch.argmax(logits, dim=-1)
+        target_probs = torch.softmax(logits, dim=-1)
+        target_tokens = triton_top_p_sample(target_probs,
+                                            top_p=1.0,
+                                            seed=42,
+                                            offset=0)
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
