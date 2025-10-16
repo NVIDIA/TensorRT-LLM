@@ -5,7 +5,7 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
