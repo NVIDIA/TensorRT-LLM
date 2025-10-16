@@ -1349,7 +1349,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         group_size = module.quant_config.group_size
         if in_features % group_size != 0:
             raise ValueError(
-                f"in_features ({self.in_features}) must be divisible by group_size ({group_size}) "
+                f"in_features ({in_features}) must be divisible by group_size ({group_size}) "
                 f"for INT4 per-group quantization scale dimensions.")
 
         module.weight_scale = Parameter(torch.empty(
