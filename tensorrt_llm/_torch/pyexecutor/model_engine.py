@@ -18,6 +18,8 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
+from tensorrt_llm.inputs.registry import (create_input_processor,
+                                          create_input_processor_with_hash)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -172,7 +174,9 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-
+        self.input_processor = create_input_processor(model_path, None)
+        self.input_processor_with_hash = create_input_processor_with_hash(
+            self.input_processor)
         if model is None:
             loader = ModelLoader(
                 pytorch_backend_config=pytorch_backend_config,
