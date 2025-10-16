@@ -1,8 +1,6 @@
 import argparse
 import time
 
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          SchedulerConfig)
 from tensorrt_llm.scaffolding import (NativeGenerationController,
                                       ScaffoldingLlm, TRTLLMWorker)
 from tensorrt_llm.scaffolding.contrib.DeepConf import (
@@ -151,14 +149,11 @@ def main():
         "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
     ]
 
-    scheduler_config = SchedulerConfig(
-        capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION)
     llm_worker = TRTLLMWorker.init_with_new_llm(
         args.model_dir,
         backend="pytorch",
         max_batch_size=32,
         max_num_tokens=kwargs.get("max_tokens"),
-        scheduler_config=scheduler_config,
     )
     print(f"init llm worker done")
 
