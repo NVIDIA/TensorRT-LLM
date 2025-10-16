@@ -1,6 +1,6 @@
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
 from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
@@ -36,6 +36,19 @@ def _check_for_default_value_only(
     if value != cls.model_fields[field_name].get_default(call_default_factory=True):
         raise ValueError(msg)
     return value
+
+
+_TRANSFORMS_SHORTCUT_LOOKUP = {
+    "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
+    "free_mem_ratio": ("resize_kv_cache.free_mem_ratio",),
+    "compile_backend": ("compile_model.backend",),
+    "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
+}
+
+
+def _shortcut_description(description: str, shortcut: str) -> str:
+    long_names_str = ", ".join([f"transforms.{k}" for k in _TRANSFORMS_SHORTCUT_LOOKUP[shortcut]])
+    return f"{description} Alias for: {long_names_str}."
 
 
 class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
@@ -134,7 +147,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         default=False, description="Enable chunked prefill.", frozen=True
     )
 
-    ### INFERENCE OPTIMIZER CONFIG #############################################################
+    ### INFERENCE OPTIMIZER CONFIG #################################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
@@ -142,10 +155,36 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "or transformers-only cached attention optimization.",
     )
 
-    transforms: Dict[str, Any] = Field(
+    transforms: Dict[str, Dict[str, Any]] = Field(
         default_factory=dict,
         description="A dictionary of transform configurations. The key is the transform name and "
         "the value is the transform configuration.",
+    )
+
+    ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
+    attn_backend: str = Field(
+        default="flashinfer",
+        description=_shortcut_description("Attention backend to use.", "attn_backend"),
+    )
+    free_mem_ratio: float = Field(
+        default=0.0,
+        description=_shortcut_description(
+            "The fraction of available memory to allocate for cache.", "free_mem_ratio"
+        ),
+    )
+    compile_backend: str = Field(
+        default="torch-compile",
+        description=_shortcut_description(
+            "The backend to use for compiling the model.", "compile_backend"
+        ),
+    )
+    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description=_shortcut_description(
+            "List of batch sizes for CUDA graph creation. If not provided, a heuristic will"
+            " be used to determine the batch sizes.",
+            "cuda_graph_batch_sizes",
+        ),
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
@@ -189,6 +228,27 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             )
 
         return value
+
+    @model_validator(mode="after")
+    def update_transforms_with_shortcuts(self) -> Dict[str, Any]:
+        """Synchronize the transforms config with the values from the defined shortcuts.
+
+        NOTE: shortcut values always take precedence over the values in the transforms config.
+        """
+        for shortcut_key, transforms_keys in _TRANSFORMS_SHORTCUT_LOOKUP.items():
+            for transform_key in transforms_keys:
+                t_key, config_key = transform_key.split(".")
+                if t_key not in self.transforms:
+                    continue
+
+                # first update the transforms config with the shortcut value
+                if shortcut_key in self.model_fields_set:
+                    self.transforms[t_key][config_key] = getattr(self, shortcut_key)
+                # then update the shortcut field with the value from the transforms config to make
+                # sure both fields are in sync
+                setattr(self, shortcut_key, self.transforms[t_key][config_key])
+
+        return self
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
