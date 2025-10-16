@@ -707,13 +707,14 @@ std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,Lo
     return results;
 }
 
-// TODO: I don't think this needs partial reuse anymore. Also, create == true may be only useful option
 //! \brief Get lookup nodes for prompt given by llmRequest.
 //! \details Nodes are created if necessary. Returned nodes should be used to store blocks in search tree. For lookup of reusable blocks, please use lookupBlocks instead.
-LookupResults KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool create)
+LookupResults KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock)
 {
-    TLLM_CHECK_WITH_INFO(!(enablePartialReuse && create), "enablePartialReuse and create are mutually exclusive flags");
     auto blockKeys = getBlockKeys(llmRequest, inputLength, allowPartiallyFilledBlock);
+
+    auto constexpr enablePartialReuse = false;
+    auto constexpr create = true;
 
     LookupResults results;
     auto searchRoot = mRoot;
@@ -1200,7 +1201,7 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
 {
     // Lookup prompt nodes once for all window block managers
     auto constexpr beamIdx = 0;
-    auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, false, false, true);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, -1, false);
     for (auto const& [windowSize, _] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
@@ -1949,10 +1950,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         TLLM_LOG_DEBUG("BlockManager::releaseBlocks - prompt = " + mLookup->printPrompt(llmRequest.value()));
         // Looking for an exact match, but the last block can be partially filled.
         auto constexpr allowPartiallyFilledBlock = true;
-        auto constexpr enablePartialMatch = false;
-        // Inserting, create node if not found
-        auto constexpr createNodeIfNotFound = true;
-        auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, allowPartiallyFilledBlock, enablePartialMatch, createNodeIfNotFound);
+        auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, allowPartiallyFilledBlock);
         TLLM_LOG_DEBUG("BlockManager::releaseBlocks - nodes = " + streamPrint(matchedPromptNodes));
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
@@ -1996,7 +1994,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     }
 
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, false, false, true);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, false);
     TLLM_LOG_DEBUG("BlockManager::storeNewBlock - nodes = " + streamPrint(matchedPromptNodes));
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {

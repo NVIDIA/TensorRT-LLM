@@ -298,11 +298,10 @@ public:
 
     //! \brief Find matching nodes for a given prompt prefix
     //! \param allowPartiallyFilledBlock Allow last block in prompt to have less than tokensPerBlock tokens.
-    //! \param enablePartialReuse Allow matching tokens to be copied from block that does not match entire prompt.
-    [[nodiscard]] LookupResults lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool createNodes);
+    [[nodiscard]] LookupResults lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock);
 
     //! \brief Find matching blocks for a given prompt prefix for all window sizes.
-    //! return map of matching blocks vs window size. Matching blocks is a vector of varying size.
+    //! \details return map of matching blocks vs window size. Matching blocks is a vector of varying size.
     std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> lookupBlocks(
             std::map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
             LlmRequest const& llmRequest, SizeType32 inputLength, 
