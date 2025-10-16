@@ -20,47 +20,21 @@ import subprocess as sp
 
 _GPU_DEVICE_PRODUCT_NAME_MAPPING = {"A100-PCIE-80GB": "A100 80GB PCIe"}
 
-# Mapping of PCI device IDs to device subtypes
-# This allows distinguishing between different variants of the same GPU family
-_PCI_DEVICE_ID_TO_SUBTYPE = {
-    # H100 variants
-    0x2330: "H100_SXM",
-    0x2331: "H100_PCIe",
-    0x2339: "H100_NVL",
-    # A100 variants
-    0x20B0: "A100_SXM4_40GB",
-    0x20B1: "A100_PCIe_40GB",
-    0x20B2: "A100_SXM4_80GB",
-    0x20B3: "A100_PCIe_80GB",
-    0x20B5: "A100_SXM4_80GB",
-    0x20F0: "A100X",
-    0x20F1: "A100_PCIe_80GB",
-    0x20F3: "A100_PCIe_40GB",
-    0x20F5: "A100_SXM4_80GB",
-    # L40S variants
-    0x26B1: "L40S",
-    0x26B2: "L40",
-    0x26B5: "L40S",
-    # Add more mappings as needed for other GPU families
-}
 
-
-def get_device_subtype(pci_device_id: int, device_product_name: str) -> str:
+def get_device_subtype(device_product_name: str) -> str:
     """
-    Get device subtype based on PCI device ID and product name.
+    Get device subtype based on device product name.
+
+    Simply converts the cleaned device product name to a consistent format
+    by replacing spaces and hyphens with underscores.
 
     Args:
-        pci_device_id: PCI device ID from NVML
-        device_product_name: Cleaned device product name
+        device_product_name: Cleaned device product name from NVML
 
     Returns:
-        Device subtype string, or cleaned product name if no specific subtype found
+        Device subtype string with consistent formatting
     """
-    # First try to get subtype from PCI device ID mapping
-    if pci_device_id in _PCI_DEVICE_ID_TO_SUBTYPE:
-        return _PCI_DEVICE_ID_TO_SUBTYPE[pci_device_id]
-
-    # Fallback to using cleaned product name
+    # Convert device name to consistent subtype format (replace spaces and hyphens with underscores)
     return device_product_name.replace(" ", "_").replace("-", "_")
 
 

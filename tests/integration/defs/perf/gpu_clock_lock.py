@@ -506,9 +506,8 @@ class GPUClockLock:
                 "device_product_name"] = clean_device_product_name(
                     self._gpu_properties["device_product_name"])
 
-            # Add device subtype based on PCI device ID and cleaned product name
+            # Add device subtype based on cleaned product name
             self._gpu_properties["device_subtype"] = get_device_subtype(
-                self._gpu_properties["pci_device_id"],
                 self._gpu_properties["device_product_name"])
 
             if "jetson" in self._gpu_properties[
