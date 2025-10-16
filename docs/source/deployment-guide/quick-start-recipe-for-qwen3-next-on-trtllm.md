@@ -1,8 +1,8 @@
-# Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell & Hopper Hardware
+# Quick Start Recipe for Qwen3 Next on TensorRT-LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
-This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support will be rolled out in future updates.
+This is a functional quick start guide for running the Qwen3-Next model on TensorRT-LLM. This guide provides a working setup with recommended defaults. Additional performance optimizations and support will be rolled out in future updates.
 
 ## Prerequisites
 
@@ -29,9 +29,9 @@ make -C docker release_build IMAGE_TAG=qwen3-next-local
 make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LOCAL_USER=1
 ```
 
-### Creating the TensorRT LLM Server config
+### Creating the TensorRT-LLM Server config
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT LLM Server with the following content:
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server with the following content:
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
@@ -52,9 +52,9 @@ EOF
 ```
 
 
-### Launch the TensorRT LLM Server
+### Launch the TensorRT-LLM Server
 
-Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.
+Use the command below launch the TensorRT0LLM server with the Qwen3-Next model from within the container.
 
 ```shell
 trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
@@ -103,7 +103,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--trust_remote_code`
 
-* **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 
 #### Extra LLM API Options (YAML Configuration)
@@ -141,7 +141,7 @@ See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/ref
 
 ### Basic Test
 
-Start a new terminal on the host to test the TensorRT LLM server you just launched.
+Start a new terminal on the host to test the TensorRT-LLM server you just launched.
 
 You can query the health/readiness of the server using:
 
