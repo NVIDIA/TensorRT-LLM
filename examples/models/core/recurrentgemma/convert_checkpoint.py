@@ -155,7 +155,7 @@ class HfParser:
         hf_model = AutoModelForCausalLM.from_pretrained(
             checkpoint_path,
             device_map="auto",
-            torch_dtype="auto",
+            dtype="auto",
         )
         model_params = dict(hf_model.named_parameters())
         return model_params

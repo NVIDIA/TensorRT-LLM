@@ -265,7 +265,7 @@ class FalconForCausalLM(DecoderModelForCausalLM):
             weights = load_weights_from_hf_by_shard(hf_model_dir, config)
         else:
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-                hf_model_dir, torch_dtype='auto')
+                hf_model_dir, dtype='auto')
             weights = load_weights_from_hf_model(hf_model, config)
 
         model = cls(config)
