@@ -1,8 +1,11 @@
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 
 @dataclass
@@ -80,9 +83,23 @@ class Buffers:
 
         # No suitable buffer was found, so allocate a new one.
         # The new buffer is created with uint8 to represent raw bytes.
-        new_buffer_tensor = torch.zeros((required_memory_size, ),
-                                        device='cuda',
-                                        dtype=torch.uint8)
+        new_buffer_tensor = None
+        try:
+            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
+                new_buffer_tensor = torch.zeros((required_memory_size, ),
+                                                device='cuda',
+                                                dtype=torch.uint8)
+        except Exception as ex:
+            # Need to check if this is an OOM exception
+            logger.debug(
+                f"Exception happened to create tensor from given memory pool: {str(ex)}"
+            )
+            # if exception happens during allocating memory from shared pool, retry
+            # to allocate from default pool
+            new_buffer_tensor = torch.zeros((required_memory_size, ),
+                                            device='cuda',
+                                            dtype=torch.uint8)
+
         new_block = BufferBlock(buffer=new_buffer_tensor,
                                 is_reserved=reserve_buffer)
 
@@ -97,3 +114,52 @@ _buffer = Buffers()
 def get_memory_buffers():
     global _buffer
     return _buffer
+
+
+_shared_pool = None
+
+
+def set_shared_pool(shared_pool):
+    """Sets the global memory pool for buffer allocation.
+
+    Args:
+        shared_pool: A CUDA memory pool object to use for allocations.
+    """
+    global _shared_pool
+    _shared_pool = shared_pool
+
+
+def get_shared_pool():
+    """Retrieves the current global memory pool.
+
+    Returns:
+        The current memory pool, or None if not set.
+    """
+    return _shared_pool
+
+
+@contextlib.contextmanager
+def with_shared_pool(shared_pool) -> contextlib.AbstractContextManager:
+    """Temporarily sets a preferred memory pool and restores the previous one on exit.
+
+    This context manager allows temporarily switching to a different memory pool
+    for CUDA graph operations, ensuring the original pool is restored even if
+    an exception occurs.
+
+    Args:
+        shared_pool: The memory pool to use within the context.
+
+    Yields:
+        None
+
+    Example:
+        >>> with with_shared_pool(shared_pool):
+        ...     # Allocations within this block use shared_pool
+        ...     tensor = allocate_buffer(...)
+    """
+    old_shared_pool = get_shared_pool()
+    set_shared_pool(shared_pool)
+    try:
+        yield
+    finally:
+        set_shared_pool(old_shared_pool)

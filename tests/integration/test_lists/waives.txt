@@ -331,8 +331,6 @@ full:L40S/accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_fp8_prequantiz
 full:L40S/accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8 SKIP (https://nvbugs/5542862)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2] SKIP (https://nvbugs/5543035)
 unittest/_torch/multi_gpu_modeling/test_llama3.py::test_llama_3_3 SKIP (https://nvbugs/5536131)
-cpp/test_multi_gpu.py::test_cache_transceiver[2proc-mpi_kvcache-90] SKIP (https://nvbugs/5546202)
-cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mpi_kvcache-90] SKIP (https://nvbugs/5546202)
 examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] SKIP (https://nvbugs/5546507)

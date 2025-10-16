@@ -199,6 +199,9 @@ methods:
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
         default: null
+      cache_salt:
+        annotation: Union[str, Sequence[str], NoneType]
+        default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
