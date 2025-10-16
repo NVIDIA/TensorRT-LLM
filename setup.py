@@ -244,7 +244,7 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
-    license_files=["ATTRIBUTIONS-CPP.md"],
+    license_files=["LICENSE", "ATTRIBUTIONS-CPP.md", "ATTRIBUTIONS-Python.md"],
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',
