@@ -7,11 +7,32 @@ from diffusers import DiffusionPipeline
 
 from tensorrt_llm._torch.auto_deploy.compile import CompileBackendRegistry
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library.fusion import fuse_gemms
-from tensorrt_llm._torch.auto_deploy.transformations.library.quantization import quantize
+from tensorrt_llm._torch.auto_deploy.transformations._graph import load_buffers_and_params
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 
 torch._dynamo.config.cache_size_limit = 100
+
+
+# TODO: Reuse the cache context from the original model
+class TransformerWrapper(torch.nn.Module):
+    def __init__(self, compiled_model, config):
+        super().__init__()
+        self.model = compiled_model
+        self.config = config
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def cache_context(self, *args, **kwargs):
+        # Return a no-op context manager since the compiled model
+        # doesn't support this feature
+        from contextlib import contextmanager
+
+        @contextmanager
+        def noop_context():
+            yield
+
+        return noop_context()
 
 
 def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> None:
@@ -115,6 +136,12 @@ def main():
         action="store_true",
         help="Whether to skip image generation",
     )
+    parser.add_argument(
+        "--max_batch_size",
+        type=int,
+        default=1,
+        help="The max batch size to use for the model",
+    )
     args = parser.parse_args()
     DiffusionPipeline._execution_device = property(execution_device_getter, execution_device_setter)
     pipe = DiffusionPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16)
@@ -137,18 +164,17 @@ def main():
     gm = torch_export_to_gm(model, args=(), kwargs=flux_kwargs, clone=True)
 
     if args.restore_from:
+        # Load quantized weights from the restored model into the exported graph module
         quant_state_dict = model.state_dict()
-        quantize(gm, {}).to("cuda")
-        gm.load_state_dict(quant_state_dict, strict=False)
-
-    fuse_gemms(gm)
+        load_buffers_and_params(
+            gm, quant_state_dict, strict_missing=False, strict_unexpected=False, clone=False
+        )
 
     compiler_cls = CompileBackendRegistry.get("torch-opt")
-    gm = compiler_cls(gm, args=(), kwargs=flux_kwargs).compile()
+    gm = compiler_cls(gm, args=(), max_batch_size=args.max_batch_size, kwargs=flux_kwargs).compile()
 
     del model
-    fx_model = gm
-    fx_model.config = flux_config
+    fx_model = TransformerWrapper(gm, flux_config)
     pipe.transformer = fx_model
     if not args.skip_image_generation:
         ad_logger.info("Generating image with the exported auto-deploy model")
