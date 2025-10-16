@@ -2152,6 +2152,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
     def test_nvfp4_multi_gpus_corner_case(self):
         """
         This test is used to test the corner case of the NVFP4 model.
