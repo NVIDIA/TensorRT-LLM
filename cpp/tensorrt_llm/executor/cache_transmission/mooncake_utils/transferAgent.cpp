@@ -53,6 +53,11 @@ void MooncakeTransferStatus::wait() const
 
 [[nodiscard]] bool MooncakeTransferStatus::isCompleted() const
 {
+    if (mBatchFreed)
+    {
+        return true;
+    }
+
     bool has_failed = false;
     for (size_t index = 0; index < mRequestCount; ++index)
     {
@@ -64,17 +69,18 @@ void MooncakeTransferStatus::wait() const
             if (rc)
             {
                 TLLM_LOG_ERROR(
-                    "Failed to get transfer status for batch %lu, task %zu: error code %d (batch_id=%lu, task_id=%zu)",
-                    mBatchId, index, rc, mBatchId, index);
+                    "Failed to get transfer status for batch %lu, task %zu: error code %d", mBatchId, index, rc);
             }
             else
             {
-                TLLM_LOG_ERROR("Transfer failed for batch %lu, task %zu: status %d (batch_id=%lu, task_id=%zu)",
-                    mBatchId, index, status.status, mBatchId, index);
+                TLLM_LOG_ERROR("Transfer failed for batch %lu, task %zu: status %d", mBatchId, index, status.status);
             }
         }
         else if (status.status == STATUS_PENDING || status.status == STATUS_WAITING)
+        {
+            TLLM_LOG_DEBUG("Transfer is pending for batch %lu, task %zu", mBatchId, index);
             return false;
+        }
     }
     if (!has_failed)
     {
@@ -82,9 +88,11 @@ void MooncakeTransferStatus::wait() const
         // than the batch size. So, free the batch id here to workaround the issue
         // where the same batchId could be used to post multiple transfer.
         freeBatchID(mEngine, mBatchId);
-        // mBatchId = INVALID_BATCH;
+        mBatchFreed = true;
+        TLLM_LOG_DEBUG("Batch ID %lu freed, future calls will return true directly", mBatchId);
     }
     // Currently, we cannot distinguish between failed and completed from return value.
+    TLLM_LOG_DEBUG("Transfer is completed for batch %lu", mBatchId);
     return true;
 }
 

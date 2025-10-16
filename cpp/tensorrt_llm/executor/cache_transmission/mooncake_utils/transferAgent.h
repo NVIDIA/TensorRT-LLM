@@ -41,6 +41,7 @@ private:
     transfer_engine_t mEngine;
     uint64_t mBatchId;
     size_t mRequestCount;
+    mutable bool mBatchFreed = false;
 };
 
 class MooncakeMemoryDesc
