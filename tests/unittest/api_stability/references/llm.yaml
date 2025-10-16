@@ -183,6 +183,10 @@ methods:
         annotation: Optional[Literal["rpc", "ray"]]
         default: null
         status: prototype
+      sparse_attention_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -194,6 +198,9 @@ methods:
         default: null
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
+        default: null
+      cache_salt:
+        annotation: Union[str, Sequence[str], NoneType]
         default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:

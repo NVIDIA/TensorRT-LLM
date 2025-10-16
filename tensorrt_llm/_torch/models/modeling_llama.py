@@ -561,13 +561,13 @@ class Llama4DecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
-                if self.next_attn is not None and (self.is_nvfp4
-                                                   or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
-                        self.next_attn.qkv_proj, 'input_scale') else None
-                else:
-                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                if not (self.next_attn is not None and (self.is_nvfp4
+                                                   or self.is_fp8_quant)) \
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
+                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                else:
+                    scale = self.next_attn.qkv_proj.input_scale
 
                 # TODO: MIN_LATENCY_MODE is hardcoded to False
                 if cutlass_min_latency_mode:
@@ -771,13 +771,14 @@ class LlamaDecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
-                if self.next_attn is not None and (self.is_nvfp4
-                                                   or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
-                        self.next_attn.qkv_proj, 'input_scale') else None
-                else:
-                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+                if not (self.next_attn is not None and (self.is_nvfp4
+                                                   or self.is_fp8_quant)) \
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
+                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                else:
+                    scale = self.next_attn.qkv_proj.input_scale
 
                 all_reduce_output = self.all_reduce(
                     hidden_states,
@@ -979,9 +980,7 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def load_weights(self, weights: Dict):
-        super().load_weights(weights)
-
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1320,6 +1319,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             if had_mm_encoder:
                 self.mm_encoder = saved_mm_encoder
 
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

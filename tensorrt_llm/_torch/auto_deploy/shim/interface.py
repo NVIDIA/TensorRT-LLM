@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-from ..custom_ops.attention_interface import DynamicShape, GetCacheCallable, SequenceInfo
+from ..custom_ops.attention_interface import GetCacheCallable, SequenceInfo
 
 
 @final
@@ -33,18 +33,6 @@ class CachedSequenceInterface:
     def all_future_arg_names(self) -> List[str]:
         """Return all the argument names owned by this interface including uninitialized caches."""
         return list(self.info.named_args.keys()) + list(self._cache_initializers.keys())
-
-    @property
-    def dynamic_shapes(self) -> Tuple[DynamicShape, ...]:
-        """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
-        return tuple(self.named_dynamic_shapes.values())
-
-    @property
-    def named_dynamic_shapes(self) -> Dict[str, DynamicShape]:
-        """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
-        named_dynamic_shapes = self.info.named_dynamic_shapes
-        named_dynamic_shapes.update({k: {} for k in self._caches})
-        return named_dynamic_shapes
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
