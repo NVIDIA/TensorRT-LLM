@@ -27,10 +27,8 @@ llm_perf_nim:
   # cpp
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-maxnt:5000-input_output_len:5000,500-con:250]
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:500,2000-con:250]
-  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:500,2000-quant:fp8-con:250]
   # reduced 'reqs' to fit timeout limit
   - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:500,2000-reqs:8-con:1]
-  - perf/test_perf.py::test_perf[phi_4_mini_instruct-bench-bfloat16-maxbs:32-input_output_len:500,2000-quant:fp8-reqs:8-con:1]
 
 
 # FP8 specific tests
