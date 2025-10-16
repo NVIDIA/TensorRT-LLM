@@ -23,12 +23,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 16Gi
+                        cpu: '8'
+                        memory: 32Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '2'
-                        memory: 16Gi
+                        cpu: '8'
+                        memory: 32Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                 qosClass: Guaranteed
@@ -47,7 +47,7 @@ def generate()
         sh "apt update"
         sh "apt install -y python3-dev git curl"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
-        sh "git config --global user.email \"tensorrt_llm@nvidia.com\""
+        sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
         sh "git config --global user.name \"TensorRT LLM\""
         trtllm_utils.checkoutSource(LLM_REPO, params.llmBranch, env.WORKSPACE, false, false)
         sh "python3 --version"
@@ -66,6 +66,9 @@ def generate()
             withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
                 def authedUrl = LLM_REPO.replaceFirst('https://', "https://${GIT_USER}:${GIT_PASS}@")
                 sh "git remote set-url origin ${authedUrl}"
+                sh "git fetch origin ${params.llmBranch}"
+                sh "git status"
+                sh "git rebase origin/${params.llmBranch}"
                 sh "git push origin HEAD:${params.llmBranch}"
             }
         }
