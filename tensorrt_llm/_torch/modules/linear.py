@@ -1448,7 +1448,8 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
         copy_weight(module.weight, fused_weight)
 
-        weight_scales = self.load_weight_scales(weights)
+        weight_scales = self.load_weight_scales(weights, module.tp_size,
+                                                module.tp_rank, module.tp_mode)
 
         # Create concatenated weight scale tensor
         cat_weight_scale = torch.cat(weight_scales, dim=0).T.contiguous()
