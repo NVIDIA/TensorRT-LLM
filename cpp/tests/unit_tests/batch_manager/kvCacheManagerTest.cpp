@@ -3131,6 +3131,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
         std::nullopt, true, onboardBlocks, CacheType::kSELF, std::nullopt,
         std::make_unique<tlk::KVCacheEventManager>(1024));
     kvCacheManager.allocatePools(false);
+    // Free queues:
+    // 35 : 7,6,5,4,3,2,1,0
 
     auto events = getEvents(kvCacheManager);
     EXPECT_EQ(events.size(), 1);
@@ -3144,7 +3146,11 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     llmRequest0->setLoraTaskId(42);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    // Reserve blocks 0,1,2 for prefilled tokens [0,1,2,3] [4,5,6,7] [8,9]
+    // Free queues
+    // 35 : 7,6,5,4,3
     kvCacheManager.storeContextBlocks(*llmRequest0);
+    // Store full blocks 0,1 with tokens [0,1,2,3] [4,5,6,7] 
 
     events = getEvents(kvCacheManager);
 
@@ -3157,6 +3163,10 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     kvCacheManager.addToken(0);
     llmRequest0->addNewToken(0, 0);
     kvCacheManager.removeSequence(0, llmRequest0);
+    // Store block 2 with tokens [8,9]
+    // Release blocks 0,1,2
+    // Free queues:
+    // 35 : 0,1,2,7,6,5,4,3
 
     auto newEvents = getEvents(kvCacheManager);
     EXPECT_EQ(newEvents.size(), 1);
@@ -3173,8 +3183,17 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto llmRequest1 = std::make_shared<LlmRequest>(1, 0, inputTokens1, samplingConfig, true);
     llmRequest1->setLoraTaskId(42);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
+    // Reuse blocks 0,1 for tokens [0,1,2,3] [4,5,6,7]
+    // Add new block 3 for prefill token [8]
+    // Free queues:
+    // 35 : 2,7,6,5,4
     kvCacheManager.storeContextBlocks(*llmRequest1);
+    // Blocks 0,1 already stored
     kvCacheManager.removeSequence(1, llmRequest1);
+    // No new blocks stored. 0,1 already stored, 3 contains no reusable state.
+    // Release blocks 0,1,3
+    // Free queues:
+    // 35 : 0,1,3,2,7,6,5,4
 
     events = getEvents(kvCacheManager);
 
@@ -3183,10 +3202,21 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     auto llmRequest2 = std::make_shared<LlmRequest>(2, 0, inputTokens2, samplingConfig, true);
     kvCacheManager.addSequence(2, inputTokens2->size(), beamWidth, llmRequest2);
+    // No reuse possible. Reserve blocks 4,5,6,7 for prefill tokens [1,1,2,3] [4,5,6,7] [8,9,10,11] [12]
+    // Free queues:
+    // 35 : 0,1,3,2
 
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     auto llmRequest3 = std::make_shared<LlmRequest>(3, 0, inputTokens3, samplingConfig, true);
     kvCacheManager.addSequence(3, inputTokens3->size(), beamWidth, llmRequest3);
+    // No reuse possible. Reserve blocks [0,1,3,2] for prefill tokens [2,1,2,3] [3,4,5,6] [7,8,9,10] [11,12]
+    // Some blocks will be offloaded:
+    // 2 -> 8 (8 reserved for seq3, 2 now in secondary)
+    // 3 -> Not offloaded, contains no reusable state
+    // 1 -> 9 (9 reserved for seq3, 1 now in secondary)
+    // 0 -> 2 (2 reserved for seq3, 0 now in secondary and 2 evicted)
+    // Reserved for seq3 = [2,9,3,8]
+    // No free blocks
 
     events = getEvents(kvCacheManager);
     size_t firstSwapped = std::get<tle::KVCacheUpdatedData>(events.front().data).blockHash;
@@ -3205,7 +3235,15 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
         ::testing::ElementsAreArray({firstSwapped}));
 
     kvCacheManager.removeSequence(2, llmRequest2);
+    // Store blocks 4,5,6,7
+    // Release blocks 4,5,6,7
+    // Free queues:
+    // 35 : 4,5,6,7
     kvCacheManager.removeSequence(3, llmRequest3);
+    // Store blocks 2,9,3,8
+    // Release blocks 2,9,3,8
+    // Free queues:
+    // 35 : 2,9,3,8,4,5,6,7
 
     events = getEvents(kvCacheManager);
     EXPECT_EQ(events.size(), 2);
@@ -3221,18 +3259,27 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto llmRequest4 = std::make_shared<LlmRequest>(4, 0, inputTokens4, samplingConfig, true);
     llmRequest4->setLoraTaskId(42);
     kvCacheManager.addSequence(4, inputTokens4->size(), beamWidth, llmRequest4);
+    // Reuse block 0 with tokens [0,1,2,3]
+    // This will cause block 0 to be onboarded
+    // Allocate new blocks 7,6 for prefill tokens [1,1,1,1] [0]
+    // This will cause blocks 7,6 to be offloaded
+    // Block 3 will be evicted since it contains no reusable state
+    // Total tally: Onboard 1 block, offload 2 blocks, removbe 1 block.
 
     events = getEvents(kvCacheManager);
 
-    // Offload 1 block, onboard 1 block, remove 1 secondary block. The second new block allocated was never stored,
-    // so it doesn't create a removed event
+    // As argued above:
+    // block 0 was onboarded
+    // blocks 6,7 were offloaded
+    // block 3 was removed
+    // In total, expect 4 events.
     auto onboardedBlocks = 0;
     auto offloadedBlocks = 0;
     auto removedBlocks = 0;
 
-    EXPECT_EQ(events.size(), 3);
+    EXPECT_EQ(events.size(), 4);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
     {
         if (std::holds_alternative<tle::KVCacheUpdatedData>(events.front().data))
         {
@@ -3249,7 +3296,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     }
 
     EXPECT_EQ(onboardedBlocks, 1);
-    EXPECT_EQ(offloadedBlocks, 1);
+    EXPECT_EQ(offloadedBlocks, 2);
     EXPECT_EQ(removedBlocks, 1);
 
     kvCacheManager.storeContextBlocks(*llmRequest4);

@@ -156,9 +156,14 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
-std::string printBlockKey(BlockKey const& blockKey)
+} // namespace
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-    std::stringstream out;
+//! \brief Print blockKey to output stream. Intended for debugging.
+std::ostream& operator<<(std::ostream& out, BlockKey const& blockKey) {
+    // Note: << operator requires friend declaration if it will print any protected or private members.
+    // BlockKey is a struct, not a class, hence it has only public members.
     bool firstIteration = true;
     for (auto uniqueToken : blockKey.uniqueTokens)
     {
@@ -181,12 +186,11 @@ std::string printBlockKey(BlockKey const& blockKey)
 	}
     }
     out << "]";
-    return out.str();
+    return out;
 }
 
-std::string printBlockKeys(std::vector<BlockKey> const& blockKeys)
-{
-    std::stringstream out;
+//! \brief Print vector of BlockKey to output stream. Intended for debugging.
+std::ostream& operator<<(std::ostream& out, std::vector<BlockKey> const& blockKeys) {
     bool firstIteration = true;
     for (auto const& blockKey : blockKeys)
     {
@@ -198,15 +202,11 @@ std::string printBlockKeys(std::vector<BlockKey> const& blockKeys)
 	{
             out << ", ";
 	}
-        out << printBlockKey(blockKey);
+        out << blockKey;
     }
-    return out.str();
+    return out;
 }
 
-} // namespace
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
-{
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
     // Hashing algorithm adapted from StackOverflow:
@@ -344,6 +344,12 @@ bool KVCacheBlock::isShared() const
 bool KVCacheBlock::hasSchedulingRefs() const
 {
     return mSchedulingRefCount > 0;
+}
+
+void KVCacheBlock::clearBlockKey()
+{
+    mBlockKey = BlockKey();
+    mIsFull = false;
 }
 
 void KVCacheBlock::setBlockKey(BlockKey const& blockKey, bool isFull)
@@ -486,9 +492,7 @@ std::string KVCachePromptLookup::printPrompt(LlmRequest const& llmRequest)
     return out.str();
 }
 
-std::string KVCachePromptLookup::printNode(LookupResult const& match)
-{
-    std::stringstream out;
+std::ostream& operator<<(std::ostream& out, LookupResult const& match) {
     bool firstIteration = true;
     for (auto const& nodeInfo : match)
     {
@@ -503,19 +507,18 @@ std::string KVCachePromptLookup::printNode(LookupResult const& match)
 	}
 	if (matchedNode != nullptr)
 	{
-            out << printBlockKey(matchedNode->getBlockKey());
+            out << matchedNode->getBlockKey();
 	}
 	else
 	{
             out << "nil";
 	}
     }
-    return out.str();
+    return out;
 }
 
-std::string KVCachePromptLookup::printNodes(LookupResults const& matches)
+std::ostream& operator<<(std::ostream& out, LookupResults const& matches)
 {
-    std::stringstream out;
     bool firstIteration = true;
     for (auto const& match : matches)
     {
@@ -527,29 +530,27 @@ std::string KVCachePromptLookup::printNodes(LookupResults const& matches)
 	{
             out << ", ";
 	}
-        out << "[" << printNode(match) << "]";
+        out << "[" << match << "]";
     }
-    return out.str();
+    return out;
 }
 
-std::string KVCachePromptLookup::printMatchedBlock(std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr> const& match)
+std::ostream& operator<<(std::ostream& out, std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr> const& match)
 {
-    std::stringstream out;
     [[maybe_unused]] auto const [partialMatch,nuMatched,matchedNode,matchedBlock] = match;
     if (matchedNode != nullptr)
     {
-        out << printBlockKey(matchedNode->getBlockKey());
+        out << matchedNode->getBlockKey();
     }
     else
     {
         out << "nil";
     }
-    return out.str();
+    return out;
 }
 
-std::string KVCachePromptLookup::printMatchedBlocks(std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matches)
+std::ostream& operator<<(std::ostream& out, std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matches)
 {
-    std::stringstream out;
     bool firstIteration = true;
     for (auto const& match : matches)
     {
@@ -561,19 +562,18 @@ std::string KVCachePromptLookup::printMatchedBlocks(std::vector<std::tuple<bool,
 	{
             out << ", ";
 	}
-        out << "[" << printMatchedBlock(match) << "]";
+        out << "[" << match << "]";
     }
-    return out.str();
+    return out;
 }
 
-std::string KVCachePromptLookup::printMatchedBlocks(std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> const& matches)
+std::ostream& operator<<(std::ostream& out, std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> const& matches)
 {
-    std::stringstream out;
     for (auto [windowSize,singleWindowMatches] : matches)
     {
-        out << "windowSize=" << windowSize << " :: " << printMatchedBlocks(singleWindowMatches) << std::endl;
+        out << "windowSize=" << windowSize << " :: " << singleWindowMatches << std::endl;
     }
-    return out.str();
+    return out;
 }
 
 std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const
@@ -592,10 +592,9 @@ std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(LlmRequest const& llmReq
     return blockKeys;
 }
 
-// TODO:
-// Rewrite so this function returns a vector of matching blocks for each window size.
-// This is the only way to get correct results since the next node depends on which of the current nodes have available blocks, which is a local decision for each window size.
-
+//! \brief Return map of vector of matching blocks for a given prompt (provided by llmRequest).
+//! \details Map key is windowSize. Vector matches blocks from start of sequence until no more matches can be found.
+// TODO: Current return logic is tailored for full attention. Return logic for SWA should be different.
 std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> KVCachePromptLookup::lookupBlocks(
         std::map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
         LlmRequest const& llmRequest, SizeType32 inputLength, 
@@ -709,6 +708,8 @@ std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,Lo
 }
 
 // TODO: I don't think this needs partial reuse anymore. Also, create == true may be only useful option
+//! \brief Get lookup nodes for prompt given by llmRequest.
+//! \details Nodes are created if necessary. Returned nodes should be used to store blocks in search tree. For lookup of reusable blocks, please use lookupBlocks instead.
 LookupResults KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse, bool create)
 {
     TLLM_CHECK_WITH_INFO(!(enablePartialReuse && create), "enablePartialReuse and create are mutually exclusive flags");
@@ -1159,6 +1160,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         mAllBlocksById, {blocksInPrimaryPool, blocksInSecondaryPool}, secondaryOffloadMinPriority);
     if (mEventManager)
     {
+	TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueCreatedEvent(blocksInPrimaryPool=%d, blocksInSecondaryPool=%d) ",__FILE__,__LINE__,blocksInPrimaryPool,blocksInSecondaryPool);
         mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool}, mWindowSize);
     }
 }
@@ -1325,13 +1327,13 @@ BlockPtr WindowBlockManager::getFreeBlock(
 {
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel);
+    // remove block from free queue and set priority
+    mEvictionPolicy->claimBlock(block, priority, durationMs);
     if (block->getUniqueTokens().empty())
     {
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
-    // remove block from free queue and set priority
-    mEvictionPolicy->claimBlock(block, priority, durationMs);
     // Offloading is an option only when these conditions are met:
     // 1. Block contains state (evidenced by presence of tokens)
     // 2. Eviction policy indicated block can be offloaded
@@ -1340,23 +1342,34 @@ BlockPtr WindowBlockManager::getFreeBlock(
     if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
         && mOnboardBlocks)
     {
-        // Offload block in primary memory before repurposing
+        // Offload block to primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
+        // Remove block from secondary free queue
+        mEvictionPolicy->claimBlock(offloadBlock);
         mTransferManager->offload(block, offloadBlock, mPools);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 
         if (mEventManager && blockInRadixTree(block))
         {
+	    TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueUpdatedEvent(block=%d) Primary->Secondary",__FILE__,__LINE__,block->getBlockId());
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
                 mWindowSize);
         }
-        mEvictionPolicy->releaseBlock(block); // append offload block to mFreeSecondaryBlocks queue
+
+        // append offload block to mFreeSecondaryBlocks queue
+        mEvictionPolicy->releaseBlock(block);
         block = offloadBlock;
+    }
+    if (mEventManager && blockInRadixTree(block))
+    {
+	TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueRemovedEvent(block=%d)",__FILE__,__LINE__,block->getBlockId());
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
     // Detach block from search structure
     block->setLookupNode(nullptr, nullptr);
+    block->clearBlockKey();
 
     return block;
 }
@@ -1405,6 +1418,7 @@ void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock)
 
         if (mEventManager)
         {
+	    TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueUpdatedEvent(block=%d) Secondary->Primary",__FILE__,__LINE__,offloadBlock->getBlockId());
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
                 mWindowSize);
@@ -1433,6 +1447,7 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
 
         if (mEventManager && blockInRadixTree(block))
         {
+	    TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueUpdatedEvent(block=%d) Primary->Secondary",__FILE__,__LINE__,block->getBlockId());
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
                 mWindowSize);
@@ -1473,7 +1488,7 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 {
-    return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
+    return !block->getUniqueTokens().empty() && block->getLookupNode() != nullptr;
 }
 
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(
@@ -1499,6 +1514,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
             if (perBlockRetentions[bi].retentionPriority.has_value()
                 && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
             {
+	        TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueUpdatedEvent(block=%d) Priority changed from %d to %d",__FILE__,__LINE__,matchingBlock->getBlockId(),matchingBlock->getPriority(),*perBlockRetentions[bi].retentionPriority);
                 mEventManager->enqueueUpdatedEvent(
                     tle::KVCacheUpdatedData(matchingBlock->getHash())
                         .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority),
@@ -1611,7 +1627,7 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
 
     // Find matching blocks that can be reused
     auto matchedBlocks = mLookup->lookupBlocks(mWindowBlockManagers, llmRequest, inputLength - 1, true, mEnablePartialReuse);
-    TLLM_LOG_DEBUG("BlockManager::addSequence - blocks = " + mLookup->printMatchedBlocks(matchedBlocks));
+    TLLM_LOG_DEBUG("BlockManager::addSequence - blocks = " + streamPrint(matchedBlocks));
     // Find kv cache blocks to reuse for each window manager
     mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedBlocks[windowSize]);
 }
@@ -1800,6 +1816,7 @@ void WindowBlockManager::storeBlocks(
     }
     if (mEventManager)
     {
+	TLLM_LOG_DEBUG("%s;%d - mEventManager->enqueueStoredEvent(storedBlocks=%d)",__FILE__,__LINE__,storedBlocks);
         mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
     }
 }
@@ -1936,7 +1953,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         // Inserting, create node if not found
         auto constexpr createNodeIfNotFound = true;
         auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, allowPartiallyFilledBlock, enablePartialMatch, createNodeIfNotFound);
-        TLLM_LOG_DEBUG("BlockManager::releaseBlocks - nodes = " + mLookup->printNodes(matchedPromptNodes));
+        TLLM_LOG_DEBUG("BlockManager::releaseBlocks - nodes = " + streamPrint(matchedPromptNodes));
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
@@ -1980,7 +1997,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 
     // Lookup prompt nodes once for all window block managers
     auto matchedPromptNodes = mLookup->lookup(llmRequest.value(), -1, false, false, true);
-    TLLM_LOG_DEBUG("BlockManager::storeNewBlock - nodes = " + mLookup->printNodes(matchedPromptNodes));
+    TLLM_LOG_DEBUG("BlockManager::storeNewBlock - nodes = " + streamPrint(matchedPromptNodes));
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);

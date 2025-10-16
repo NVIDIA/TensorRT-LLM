@@ -267,6 +267,20 @@ private:
     std::unordered_map<SizeType32, BlockPtr> mBlocks;
 };
 
+// Print methods used for debugging.
+std::ostream& operator<<(std::ostream& out, LookupResult const& match);
+std::ostream& operator<<(std::ostream& out, LookupResults const& matches);
+std::ostream& operator<<(std::ostream& out, std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr> const& match);
+std::ostream& operator<<(std::ostream& out, std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matches);
+std::ostream& operator<<(std::ostream& out, std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> const& matches);
+
+template<typename T> std::string streamPrint(T v)
+{
+    std::stringstream out;
+    out << v;
+    return out.str();
+}
+
 class KVCachePromptLookup
 {
 public:
@@ -294,13 +308,7 @@ public:
             LlmRequest const& llmRequest, SizeType32 inputLength, 
             bool allowPartiallyFilledBlock, bool enablePartialReuse);
 
-    // Debugging functions
-    //
-    std::string printNode(LookupResult const& match);
-    std::string printNodes(LookupResults const& matches);
-    std::string printMatchedBlock(std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr> const& match);
-    std::string printMatchedBlocks(std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>> const& matches);
-    std::string printMatchedBlocks(std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> const& matches);
+    // Print methods used for debugging.
     std::string printPrompt(LlmRequest const& llmRequest);
 
 private:
@@ -347,6 +355,7 @@ public:
     // This info is duplicated in KVCacheBlock and KVCachePromptLookupNode
     // because it is needed by the former when KVCacheBlock might not be stored
     // in lookup structure and therefore cannot get this value from there
+    void clearBlockKey();
     void setBlockKey(BlockKey const& blockKey, bool isFull);
     BlockKey getBlockKey() const;
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;

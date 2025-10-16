@@ -134,7 +134,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 
     auto priority = block->getPriority();
     auto priorityIdx = getPriorityIdx(priority);
-    TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::releaseBlock :: blockId=%d, priority=%d, priorityIdx=%d",__FILE__,__LINE__,id,priority,priorityIdx);
+    TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::releaseBlock :: blockId=%d, cacheLevel=%d, priority=%d, priorityIdx=%d",__FILE__,__LINE__,id,cacheLevel,priority,priorityIdx);
     auto& q = mFreeQueues[cacheLevel][priorityIdx];
     if (toFront)
     {
@@ -146,6 +146,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     }
 
     mNumFreeBlocksPerLevel[cacheLevel]++;
+    TLLM_LOG_DEBUG("Increased mNumFreeBlocksPerLevel[%d] from %d to %d",cacheLevel,mNumFreeBlocksPerLevel[cacheLevel]-1,mNumFreeBlocksPerLevel[cacheLevel]);
 
     if (block->getDurationMs().has_value()
         && block->getPriority() != executor::KvCacheRetentionConfig::kDefaultRetentionPriority)
@@ -171,12 +172,15 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
 {
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
+    auto priorityIdx = getPriorityIdx(getPriorityIdx(block->getPriority()));
+    TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::claimBlock :: blockId=%d, cacheLevel=%d, priority=%d, priorityIdx=%d",__FILE__,__LINE__,id,cacheLevel,priority,priorityIdx);
 
     // Detach block from free queue
     if (mFreeBlockIterators[id] != std::nullopt)
     {
-        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+        mFreeQueues[cacheLevel][priorityIdx].erase(*mFreeBlockIterators[id]);
         mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+        TLLM_LOG_DEBUG("Decreased mNumFreeBlocksPerLevel[%d] from %d to %d",cacheLevel,mNumFreeBlocksPerLevel[cacheLevel]+1,mNumFreeBlocksPerLevel[cacheLevel]);
     }
 
     mFreeBlockIterators[id] = std::nullopt;
