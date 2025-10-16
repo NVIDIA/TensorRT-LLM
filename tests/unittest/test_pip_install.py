@@ -63,7 +63,8 @@ def test_pip_install():
 
     download_wheel(args)
     print("##########  Install tensorrt_llm package  ##########")
-    subprocess.check_call("pip3 install tensorrt_llm-*.whl", shell=True)
+    subprocess.check_call("pip3 install --force-reinstall tensorrt_llm-*.whl",
+                          shell=True)
     print("##########  Test import tensorrt_llm  ##########")
     subprocess.check_call(
         'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
