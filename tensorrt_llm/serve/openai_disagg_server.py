@@ -1,25 +1,27 @@
 #!/usr/bin/env python
 import asyncio
 import copy
+import itertools
 import os
 import signal
 import traceback
+from collections import deque
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import List, Optional, Type, Union
+from typing import Callable, Optional, Type, Union
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.status import HTTP_429_TOO_MANY_REQUESTS
+from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
+from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig,
-                                              RouterConfig)
+                                              get_ctx_gen_server_urls)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
@@ -28,6 +30,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 DisaggregatedParams,
                                                 ErrorResponse)
+from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+                                                get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -37,35 +41,57 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds.
 class OpenAIDisaggServer:
 
     def __init__(self,
-                 ctx_servers: List[str],
-                 gen_servers: List[str],
+                 config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 max_retries: int = 3,
-                 ctx_router_config: Optional[RouterConfig] = None,
-                 gen_router_config: Optional[RouterConfig] = None,
-                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
-                 metadata_server_cfg: Optional[MetadataServerConfig] = None):
-
-        self.ctx_servers = ctx_servers
-        self.gen_servers = gen_servers
+                 metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                 metrics_interval_secs: int = 0):
+        self.ctx_servers, self.gen_servers = get_ctx_gen_server_urls(config.server_configs)
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ctx_router_config, ctx_servers, metadata_server_cfg, self.metadata_server)
-        self.gen_router = create_router(gen_router_config, gen_servers, metadata_server_cfg, self.metadata_server)
-        self.conditional_disagg_config = conditional_disagg_config
+        self.ctx_router = create_router(
+            config.ctx_router_config, self.ctx_servers, metadata_server_cfg, self.metadata_server)
+        self.gen_router = create_router(
+            config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
+        self.conditional_disagg_config = config.conditional_disagg_config
 
-        if max_retries < 0:
-            raise ValueError(f"Max retries {max_retries} must be greater than or equal to 0")
-        self.max_retries = max_retries
+        self.perf_metrics_max_requests = config.perf_metrics_max_requests
+        if self.perf_metrics_max_requests > 0:
+            # record corresponding keys of context and generation servers for perf metrics
+            # (ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_time)
+            self.perf_metrics_keys = deque(maxlen=self.perf_metrics_max_requests)
+            self.perf_metrics_keys_lock = asyncio.Lock()
+            # server_url -> {ctx_request_id: perf_metrics}
+            self.server_perf_metrics: dict[str, dict[int, dict]] = {}
+
+        else:
+            self.perf_metrics_keys = None
+            self.perf_metrics_keys_lock = None
+            self.server_perf_metrics = None
+
+        if config.max_retries < 0:
+            raise ValueError(f"Max retries {config.max_retries} must be greater than or equal to 0")
+        self.max_retries = config.max_retries
+        # Metrics counters and synchronization
+        self._metrics = {
+            "ctx_total_requests": 0,
+            "ctx_completed_requests": 0,
+            "gen_total_requests": 0,
+            "gen_completed_requests": 0,
+        }
+        self._metrics_lock = asyncio.Lock()
+        self._metrics_task = None
+        self.metrics_interval_secs = metrics_interval_secs
+
         logger.info(f"Server max retries: {self.max_retries}")
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
 
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(self.ctx_servers) == 0:
             raise ValueError("At least one context server must be provided")
 
-        if self.conditional_disagg_config is not None and not isinstance(self.gen_router, KvCacheAwareRouter):
+        if self.conditional_disagg_config is not None and \
+                not isinstance(self.gen_router, KvCacheAwareRouter):
             raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
 
         # Session will be initialized in lifespan
@@ -81,10 +107,17 @@ class OpenAIDisaggServer:
             logger.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
 
+            if self.perf_metrics_max_requests > 0:
+                await self.set_steady_clock_offsets(self.session)
+
             if self.metadata_server:
                 logger.info("Starting server monitoring via metadata service")
                 await self.ctx_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
                 await self.gen_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
+
+            # Start periodic metrics logging
+            if self.metrics_interval_secs > 0:
+                self._metrics_task = asyncio.create_task(self._log_metrics_periodically(self.metrics_interval_secs))
 
             yield
 
@@ -93,15 +126,48 @@ class OpenAIDisaggServer:
                 await self.ctx_router.stop_server_monitoring()
                 await self.gen_router.stop_server_monitoring()
 
+            # Stop periodic metrics logging
+            if self._metrics_task is not None:
+                self._metrics_task.cancel()
+                try:
+                    await self._metrics_task
+                except asyncio.CancelledError:
+                    pass
+
             await self.session.close()  # Ensure session cleanup
 
         self.app = FastAPI(lifespan=lifespan)
+
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
+
+    async def _increment_metric(self, key: str, amount: int = 1):
+        if self.metrics_interval_secs > 0:
+            async with self._metrics_lock:
+                self._metrics[key] += amount
+
+    async def _get_metrics_snapshot(self):
+        async with self._metrics_lock:
+            return dict(self._metrics)
+
+    async def _log_metrics_periodically(self, interval_seconds: int):
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                snapshot = await self._get_metrics_snapshot()
+                logger.info(
+                    (
+                        f"[Statistics] total_context_requests={snapshot['ctx_total_requests']}, completed_context_requests={snapshot['ctx_completed_requests']}, "
+                        f"total_generation_requests={snapshot['gen_total_requests']}, completed_generation_requests={snapshot['gen_completed_requests']}"
+                    )
+                )
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     def create_error_response(
@@ -112,6 +178,7 @@ class OpenAIDisaggServer:
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/perf_metrics", self.perf_metrics, methods=["GET"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -126,33 +193,65 @@ class OpenAIDisaggServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
-    async def merge_streaming_responses(self, ctx_response,
-                                        gen_server: str,
-                                        gen_req: Union[CompletionRequest, ChatCompletionRequest]):
+    async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int, raw_request: Request):
+        async with self.perf_metrics_keys_lock:
+            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id, raw_request.state.server_arrival_time, raw_request.state.server_first_token_time))
+
+    async def perf_metrics(self) -> JSONResponse:
+        if self.perf_metrics_keys is None:
+            return JSONResponse(content=[])
+
+        perf_metrics = {}
+        exc = None
         try:
+            for server in self.ctx_servers + self.gen_servers:
+                async with self.session.get(f"{server}/perf_metrics") as response:
+                    server_perf_metrics = await response.json()
+                    perf_metrics[server] = server_perf_metrics
+        except Exception as e:
+            # Keep the exception to raise it after saving perf metrics
+            exc = e
 
-            if ctx_response is not None and len(ctx_response.choices) != 1:
-                raise ValueError("Context server did not return a single choice. This is not expected")
+        return_metrics = []
+        async with self.perf_metrics_keys_lock:
+            for server in perf_metrics:
+                server_metrics = self.server_perf_metrics.setdefault(server, {})
+                for request_perf_metrics in perf_metrics[server]:
+                    ctx_request_id = request_perf_metrics.get("ctx_request_id", None)
+                    if ctx_request_id is None:
+                        continue
+                    server_metrics[ctx_request_id] = request_perf_metrics
 
-            #If request finished after first token not due to length, return right away and skip gen
-            if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
-                yield f"data: [DONE]\n\n".encode('utf-8')
-            else:
-                # Then yield the generation responses
-                if isinstance(gen_req, CompletionRequest):
-                    gen_response = await self.send_completion_request(gen_server, gen_req)
-                elif isinstance(gen_req, ChatCompletionRequest):
-                    gen_response = await self.send_chat_request(gen_server, gen_req)
-                else:
-                    raise TypeError("Invalid request type: {type(gen_req).__name__}")
+                if len(server_metrics) > self.perf_metrics_max_requests:
+                    # Remove oldest requests and keep at most perf_metrics_max_requests
+                    num_remove = len(server_metrics) - self.perf_metrics_max_requests
+                    removed_keys = list(itertools.islice(server_metrics.keys(), num_remove))
+                    for ctx_request_id in removed_keys:
+                        server_metrics.pop(ctx_request_id)
+            if exc is not None:
+                raise exc
 
-                async for chunk in gen_response.body_iterator:
-                    yield chunk
+            remain_keys = []
+            for ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_time in self.perf_metrics_keys:
+                gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
+                if gen_perf_metrics is None:
+                    # generation not finished
+                    remain_keys.append((ctx_server, gen_server, ctx_request_id, server_arrival_time, server_first_token_time))
+                    continue
+                ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
+                return_metrics.append({
+                    "ctx_server": ctx_server,
+                    "gen_server": gen_server,
+                    "disagg_server_arrival_time": server_arrival_time,
+                    "disagg_server_first_token_time": server_first_token_time,
+                    "ctx_perf_metrics": ctx_perf_metrics,
+                    "gen_perf_metrics": gen_perf_metrics})
+            self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
 
-        finally:
-            await self.gen_router.finish_request(gen_req)
+        return JSONResponse(content=return_metrics)
 
-    async def openai_completion(self, req: CompletionRequest) -> Response:
+
+    async def openai_completion(self, req: CompletionRequest, raw_request: Request) -> Response:
         try:
             if not isinstance(req.prompt, str):
                 # Check if it's a list and contains integers
@@ -161,15 +260,15 @@ class OpenAIDisaggServer:
                 elif not isinstance(req.prompt, list) or not all(isinstance(x, int) for x in req.prompt):
                     raise ValueError("Disaggregated server currently only supports single string prompt or list of integers in request")
 
-            return await self._send_disagg_request(req)
+            return await self._send_disagg_request(req, raw_request)
 
         except Exception as e:
             await self._handle_exception(e)
 
-    async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
+    async def openai_chat_completion(self, req: ChatCompletionRequest, raw_request: Request) -> Response:
 
         try:
-            return await self._send_disagg_request(req)
+            return await self._send_disagg_request(req, raw_request)
         except Exception as e:
             await self._handle_exception(e)
 
@@ -190,6 +289,7 @@ class OpenAIDisaggServer:
         ctx_req.stream_options = None
 
         logger.debug("Sending request to ctx server: %s", ctx_server)
+        await self._increment_metric("ctx_total_requests")
         try:
             if isinstance(ctx_req, ChatCompletionRequest):
                 ctx_response = await self.send_chat_request(ctx_server, ctx_req)
@@ -198,18 +298,56 @@ class OpenAIDisaggServer:
                 ctx_response = await self.send_completion_request(ctx_server, ctx_req)
         finally:
             await self.ctx_router.finish_request(ctx_req)
+            await self._increment_metric("ctx_completed_requests")
 
         choices = ctx_response.choices
         if len(choices) > 1:
             raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
         if choices[0].disaggregated_params is None:
             raise ValueError("Context server did not return disaggregated params")
+        if choices[0].disaggregated_params.ctx_request_id is None:
+            raise ValueError("Invalid disaggregated params in context phase response.")
 
         return ctx_response
 
-    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
+    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest], raw_request: Request):
+        ctx_server = None
         gen_server = None
+        ctx_request_id = None
         need_ctx = False
+
+        async def _merge_streaming_responses(ctx_response,
+                                            gen_req: Union[CompletionRequest, ChatCompletionRequest]):
+            try:
+                if ctx_response is not None and len(ctx_response.choices) != 1:
+                    raise ValueError("Context server did not return a single choice. This is not expected")
+
+                #If request finished after first token not due to length, return right away and skip gen
+                if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
+                    yield "data: [DONE]\n\n".encode('utf-8')
+                else:
+                    # Then yield the generation responses
+                    await self._increment_metric("gen_total_requests")
+                    if isinstance(gen_req, CompletionRequest):
+                        gen_response = await self.send_completion_request(gen_server, gen_req)
+                    elif isinstance(gen_req, ChatCompletionRequest):
+                        gen_response = await self.send_chat_request(gen_server, gen_req)
+                    else:
+                        raise TypeError("Invalid request type: {type(gen_req).__name__}")
+
+                    first_response = await anext(gen_response.body_iterator)
+                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                    yield first_response
+                    async for chunk in gen_response.body_iterator:
+                        yield chunk
+                    await self._increment_metric("gen_completed_requests")
+                    if need_ctx and self.perf_metrics_keys is not None:
+                        asyncio.create_task(self._add_perf_metrics_keys(
+                            ctx_server, gen_server, ctx_request_id, raw_request))
+
+
+            finally:
+                await self.gen_router.finish_request(gen_req)
         try:
             # Determine if need context server
             condition = self.conditional_disagg_config
@@ -247,6 +385,7 @@ class OpenAIDisaggServer:
                 # Append disaggregates parameters to generation request
                 req.disaggregated_params = ctx_response.choices[0].disaggregated_params
                 req.disaggregated_params.request_type = "generation_only"
+                ctx_request_id = req.disaggregated_params.ctx_request_id
 
                 # Replace the string prompt with prompt_tokens_ids
                 if isinstance(req, CompletionRequest):
@@ -270,11 +409,17 @@ class OpenAIDisaggServer:
                         del ctx_response.choices[0].disaggregated_params
                         return ctx_response
                     else:
+                        await self._increment_metric("gen_total_requests")
                         if isinstance(req, CompletionRequest):
                             gen_response = await self.send_completion_request(gen_server, req)
                         else:
                             assert isinstance(req, ChatCompletionRequest)
                             gen_response = await self.send_chat_request(gen_server, req)
+                        await self._increment_metric("gen_completed_requests")
+                        if need_ctx and self.perf_metrics_keys is not None:
+                            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                            asyncio.create_task(self._add_perf_metrics_keys(
+                                ctx_server, gen_server, ctx_request_id, raw_request))
                         return gen_response
                 finally:
                     if gen_server is not None:
@@ -283,7 +428,7 @@ class OpenAIDisaggServer:
             else:
                 # Return a streaming response that combines both context and generation responses
                 return StreamingResponse(
-                    self.merge_streaming_responses(ctx_response, gen_server, req),
+                    _merge_streaming_responses(ctx_response, req),
                     media_type="text/event-stream"
                 )
         except:
@@ -328,7 +473,7 @@ class OpenAIDisaggServer:
                            request: Union[CompletionRequest, ChatCompletionRequest],
                            endpoint: str,
                            response_type: Type[Union[CompletionResponse, ChatCompletionResponse]],
-                           create_generator: callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
+                           create_generator: Callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
         for attempt in range(self.max_retries + 1):
             try:
                 if request.stream:
@@ -347,7 +492,7 @@ class OpenAIDisaggServer:
                         return response_type(**response_dict)
             except (aiohttp.ClientError, OSError) as e:
                 if attempt == self.max_retries:
-                    raise HTTPException(status_code=HTTP_429_TOO_MANY_REQUESTS, detail=f"Too many requests") from e
+                    raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error") from e
                 logger.error(f"Client error: {e} - retry {attempt} of {self.max_retries}")
                 # TODO : add a configurable retry interval
                 await asyncio.sleep(1)
@@ -361,6 +506,39 @@ class OpenAIDisaggServer:
 
     async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
         return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
+
+    async def set_steady_clock_offsets(self, session: aiohttp.ClientSession):
+        STEADY_CLOCK_OFFSET_ENDPOINT = "/steady_clock_offset"
+        async def query_steady_clock_offset(server_url: str) -> tuple[Optional[float], Optional[float]]:
+            try:
+                originate_ts = get_steady_clock_now_in_seconds()
+                async with session.get(server_url + STEADY_CLOCK_OFFSET_ENDPOINT) as response:
+                    destination_ts = get_steady_clock_now_in_seconds()
+                    if response.status == 200:
+                        response_content = await response.json()
+                        # Compute the steady clock timestamp difference using the NTP clock synchronization algorithm. https://en.wikipedia.org/wiki/Network_Time_Protocol#Clock_synchronization_algorithm
+                        receive_ts = response_content['receive_ts']
+                        transmit_ts = response_content['transmit_ts']
+                        delay = (destination_ts - originate_ts) - (transmit_ts - receive_ts)
+                        offset = ((receive_ts - originate_ts) + (transmit_ts - destination_ts)) / 2
+                        return delay, offset
+                    else:
+                        return None, None
+            except Exception:
+                return None, None
+        async def set_steady_clock_offset(server_url: str, offset: float) -> None:
+            payload = {"offset": offset}
+            async with session.post(server_url + STEADY_CLOCK_OFFSET_ENDPOINT, json=payload) as response:
+                if response.status != 200:
+                    logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
+        for server_url in self.ctx_servers + self.gen_servers:
+            delay, offset = await query_steady_clock_offset(server_url)
+            if delay is None or offset is None:
+                logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
+                continue
+            logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second')
+            # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
+            await set_steady_clock_offset(server_url, -offset)
 
     @classmethod
     async def check_server_ready(cls, session: aiohttp.ClientSession, server_url: str) -> bool:

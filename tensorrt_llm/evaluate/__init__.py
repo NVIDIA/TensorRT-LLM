@@ -15,10 +15,10 @@
 
 from .cnn_dailymail import CnnDailymail
 from .json_mode_eval import JsonModeEval
-from .lm_eval import GSM8K, GPQADiamond, GPQAExtended, GPQAMain
+from .lm_eval import GSM8K, MMMU, GPQADiamond, GPQAExtended, GPQAMain
 from .mmlu import MMLU
 
 __all__ = [
     "CnnDailymail", "MMLU", "GSM8K", "GPQADiamond", "GPQAMain", "GPQAExtended",
-    "JsonModeEval"
+    "JsonModeEval", "MMMU"
 ]

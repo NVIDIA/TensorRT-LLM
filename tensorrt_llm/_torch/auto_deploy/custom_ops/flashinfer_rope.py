@@ -38,7 +38,7 @@ def apply_rope_with_input_pos_flashinfer(
     k_shape = k.shape
     head_dim = cos_sin_cache.shape[-1]
 
-    position_ids = position_ids.view(-1).to(q.device)
+    position_ids = position_ids.view(-1).to(q.device).int()  # flashinfer requires int
     num_nnz = position_ids.shape[0]
 
     q_flat = q.view(num_nnz, -1)

@@ -10,7 +10,7 @@ from ..._utils import get_sm_version
 def _register_fake():
 
     @torch.library.register_fake("trtllm::allreduce")
-    def _(
+    def allreduce(
         input,
         residual,
         norm_weight,
@@ -55,6 +55,25 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    @torch.library.register_fake("trtllm::allreduce_pg")
+    def _(
+        input,
+        residual,
+        norm_weight,
+        scale,
+        bias,
+        workspace,
+        group,
+        rank,
+        pg,
+        strategy,
+        op,
+        eps,
+        trigger_completion_at_end,
+    ):
+        return allreduce(input, residual, norm_weight, scale, bias, workspace,
+                         group, strategy, op, eps, trigger_completion_at_end)
+
     #MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
     def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
@@ -76,12 +95,16 @@ def _register_fake():
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
-    def _(input, sizes, group):
+    def allgather(input, sizes, group):
         if sizes is None:
             output_shape = (len(group) * input.shape[0], *input.shape[1:])
         else:
             output_shape = (sum(sizes), *input.shape[1:])
         return input.new_empty(output_shape)
+
+    @torch.library.register_fake("trtllm::allgather_pg")
+    def _(input, sizes, group, process_group):
+        return allgather(input, sizes, group)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
     def _(
@@ -92,6 +115,21 @@ def _register_fake():
         bias,
         out_dtype,
         userbuffers_id=False,
+    ):
+        shape = [i for i in mat_a.shape]
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(shape, dtype=out_dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::cuda_scaled_mm")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        userbuffers_id: bool = False,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -161,10 +199,6 @@ def _register_fake():
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
 
-    @torch.library.register_fake("trtllm::logits_bitmask")
-    def _(logits: List[torch.Tensor], bitmask: List[torch.Tensor]):
-        pass
-
     @torch.library.register_fake("trtllm::fp4_quantize")
     def _(
         input: torch.Tensor,
@@ -179,71 +213,31 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
-    @torch.library.register_fake("trtllm::moe_comm_prepare_indices")
-    def _(
-        gathered_target_rank_ids: torch.Tensor,
-        real_rank_token_count_cum_sum: Optional[torch.Tensor],
-        max_token_count_per_rank: int,
-        expert_count: int,
-        top_k: int,
-        ep_rank: int,
-        ep_size: int,
-    ):
-        max_send_ranks_per_token = max(ep_size, top_k)
-        local_gather_indices_shape = (max_token_count_per_rank * ep_size, )
-        rank_count_cum_sum_shape = (ep_size, )
-        send_rank_local_indices_shape = (max_token_count_per_rank *
-                                         max_send_ranks_per_token, )
-        recv_rank_local_indices_shape = (max_token_count_per_rank * ep_size, )
-        backward_recv_rank_local_indices_shape = (max_token_count_per_rank *
-                                                  max_send_ranks_per_token, )
-
-        local_gather_indices = gathered_target_rank_ids.new_empty(
-            local_gather_indices_shape, dtype=torch.int32)
-        send_rank_count_cum_sum = gathered_target_rank_ids.new_empty(
-            rank_count_cum_sum_shape, dtype=torch.int32)
-        send_rank_local_indices = gathered_target_rank_ids.new_empty(
-            send_rank_local_indices_shape, dtype=torch.int32)
-        recv_rank_count_cum_sum = gathered_target_rank_ids.new_empty(
-            rank_count_cum_sum_shape, dtype=torch.int32)
-        recv_rank_local_indices = gathered_target_rank_ids.new_empty(
-            recv_rank_local_indices_shape, dtype=torch.int32)
-        backward_recv_rank_local_indices = gathered_target_rank_ids.new_empty(
-            backward_recv_rank_local_indices_shape, dtype=torch.int32)
-
-        return (local_gather_indices, send_rank_count_cum_sum,
-                send_rank_local_indices, recv_rank_count_cum_sum,
-                recv_rank_local_indices, backward_recv_rank_local_indices)
-
-    @torch.library.register_fake("trtllm::moe_local_gather")
-    def _(
-        recv_rank_cum_sum: torch.Tensor,
-        local_gather_indices: torch.Tensor,
-        gathered_expert_ids: torch.Tensor,
-        gathered_scales: Optional[torch.Tensor],
-        local_expert_ids: torch.Tensor,
-        local_scales: Optional[torch.Tensor],
-        max_token_count_per_rank: int,
-        expert_count: int,
-        top_k: int,
-        ep_rank: int,
-        ep_size: int,
-    ):
-        pass
+    @torch.library.register_fake("trtllm::calculate_nvfp4_global_scale")
+    def _(input: torch.Tensor, tokens_per_batch: Optional[torch.Tensor]):
+        return input.new_empty((input.shape[:-1], 1), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::moe_comm")
     def _(
-        input: torch.Tensor,
+        inputs: List[torch.Tensor],
         send_rank_cum_sum: torch.Tensor,
         send_indices: torch.Tensor,
-        output: torch.Tensor,
         recv_rank_cum_sum: torch.Tensor,
         recv_indices: torch.Tensor,
         all_workspaces: torch.Tensor,
+        output_allocation_count: int,
         ep_rank: int,
         ep_size: int,
+        need_zero_output: Optional[List[bool]],
     ):
-        pass
+        outputs = []
+        for input_tensor in inputs:
+            output_tensor = torch.empty(
+                (output_allocation_count, input_tensor.shape[1]),
+                dtype=input_tensor.dtype,
+                device=input_tensor.device)
+            outputs.append(output_tensor)
+        return outputs
 
     @torch.library.register_fake("trtllm::get_moe_commworkspace_size_per_rank")
     def _(ep_size: int):
@@ -286,6 +280,12 @@ def _register_fake():
     def _(single_layer_load_balancer_ptr: int,
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
+
+    @torch.library.register_fake("trtllm::memset_expert_ids")
+    def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
+          max_token_count_per_rank: int, top_k: int, slot_count: int,
+          ep_size: int):
+        pass
 
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
@@ -463,6 +463,7 @@ def _register_fake():
         expert_first_token_offset_tensor: torch.Tensor,
         num_rows: torch.SymInt,
         hidden_size: torch.SymInt,
+        unpadded_hidden_size: torch.SymInt,
         experts_per_token: int,
         num_experts_per_node: int,
         tp_size: int,
@@ -471,12 +472,12 @@ def _register_fake():
         ep_rank: int,
     ):
         num_rows_val = int(num_rows)
-        hidden_size_val = int(hidden_size)
-        return gemm2_output.new_empty((num_rows_val, hidden_size_val),
+        unpadded_hidden_size_val = int(unpadded_hidden_size)
+        return gemm2_output.new_empty((num_rows_val, unpadded_hidden_size_val),
                                       dtype=gemm2_output.dtype)
 
     @torch.library.register_fake("trtllm::allgather_list")
-    def _(input_list, sizes, group):
+    def allgather_list(input_list, sizes, group):
         assert len(input_list) > 0
 
         def create_output_tensor(i):
@@ -489,8 +490,12 @@ def _register_fake():
 
         return [create_output_tensor(i) for i in input_list]
 
+    @torch.library.register_fake("trtllm::allgather_list_pg")
+    def _(input_list, sizes, group, process_group):
+        return allgather_list(input_list, sizes, group)
+
     @torch.library.register_fake("trtllm::reducescatter")
-    def _(input, sizes, group):
+    def reducescatter(input, sizes, group):
         import tensorrt_llm
         local_rank = tensorrt_llm.mpi_rank()
 
@@ -500,6 +505,10 @@ def _register_fake():
         else:
             shape[0] = sizes[local_rank]
         return input.new_empty(shape)
+
+    @torch.library.register_fake("trtllm::reducescatter_pg")
+    def _(input, sizes, group, process_group):
+        return reducescatter(input, sizes, group)
 
     @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
@@ -525,9 +534,36 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
-    def _(router_logits, topk):
+    def _(router_logits, topk, output_dtype: torch.dtype = None):
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
+        output_dtype = output_dtype or torch.float32
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
-                                                            dtype=torch.float32)
+                                                            dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::default_moe_routing_op")
+    def _(router_logits, topk, output_dtype: torch.dtype = None):
+        num_tokens = router_logits.shape[0]
+        sz = (num_tokens, topk)
+        output_dtype = output_dtype or torch.float32
+        return router_logits.new_empty(
+            sz, dtype=torch.int32), router_logits.new_empty(sz,
+                                                            dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::alltoall_helix")
+    def _(input_list, group, num_lists):
+        num_ranks = len(group)
+        len(input_list) // num_ranks
+        return [
+            input_list[i].new_empty((num_ranks, ) + i.shape)
+            for i in range(0, len(input_list), num_ranks)
+        ]
+
+    @torch.library.register_fake("trtllm::tinygemm2")
+    def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+        # input [M, K], weight [N, K], bias [N]
+        # Output should be [M, N]
+        m = input.shape[0]
+        n = weight.shape[0]
+        return input.new_empty((m, n), dtype=input.dtype)

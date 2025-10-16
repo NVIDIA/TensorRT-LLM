@@ -81,6 +81,27 @@ __host__ __device__ constexpr T divUpMulLog2(T a, T bLog2)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T mulTileN(T a, T tileN)
+{
+    return a * tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T divUpTileN(T a, T tileN)
+{
+    return (a + tileN - 1) / tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T divUpMulTileN(T a, T tileN)
+{
+    return divUpTileN(a, tileN) * tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __host__ __device__ constexpr int32_t getBits(int32_t value, int idx)
 {
@@ -118,30 +139,35 @@ __device__ void initArr(int startIdx, int numElts, int stride, DataType* arr, Da
 template <typename DataType, int VecSize>
 __device__ void calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, DataType (&scores)[VecSize])
 {
-    DataType maxScore = DataType{-INFINITY};
-    DataType sumScore = DataType{0.f};
-
+    // Compute in float to support half/bfloat16 inputs safely.
+    float maxScore = -INFINITY;
+    float sumScore = 0.f;
     // Get the max score for each token
+#pragma unroll
     for (int i = 0; i < VecSize; ++i)
     {
-        maxScore = scores[i] >= maxScore ? scores[i] : maxScore;
+        float si = static_cast<float>(scores[i]);
+        maxScore = si >= maxScore ? si : maxScore;
     }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<DataType>());
+    maxScore = cg::reduce(warp, maxScore, cg::greater<float>());
 
     // Get the summation of scores for each token
 #pragma unroll
     for (int i = 0; i < VecSize; ++i)
     {
-        scores[i] = static_cast<DataType>(exp(scores[i] - maxScore));
-        sumScore += scores[i];
+        float si = static_cast<float>(scores[i]);
+        float e = expf(si - maxScore);
+        scores[i] = static_cast<DataType>(e);
+        sumScore += e;
     }
-    sumScore = cg::reduce(warp, sumScore, cg::plus<DataType>());
+    sumScore = cg::reduce(warp, sumScore, cg::plus<float>());
 
     // Normalize the scores
 #pragma unroll
     for (int i = 0; i < VecSize; ++i)
     {
-        scores[i] = static_cast<DataType>(scores[i] / sumScore);
+        float si = static_cast<float>(scores[i]) / sumScore;
+        scores[i] = static_cast<DataType>(si);
     }
 }
 
@@ -232,8 +258,16 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
         TypePacked scoreIdx;
         if constexpr (LoadExpertIdxFromGlobal)
         {
-            scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrExpertIdx[expandedIdx].score),
-                static_cast<int16_t>(params.mPtrExpertIdx[expandedIdx].idx)};
+            if (params.mPtrTopKIds != nullptr)
+            {
+                scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
+                    static_cast<int16_t>(params.mPtrTopKIds[expandedIdx])};
+            }
+            else
+            {
+                scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKPacked[expandedIdx].score),
+                    static_cast<int16_t>(params.mPtrTopKPacked[expandedIdx].idx)};
+            }
         }
         else
         {
@@ -248,9 +282,9 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
         expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
-        if (params.mPtrExpertWeights != nullptr)
+        if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr)
         {
-            params.mPtrExpertWeights[expandedIdx] = OutputT{scoreIdx.score};
+            params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
         }
     };
 
@@ -333,7 +367,16 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
     // Compute the runtime config for projections
     // Whether or not an expert is local is taken into account when smemExpertCount is computed
     // so we do not need to take it into account here.
-    const int32_t numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+    int32_t numCta;
+    if constexpr (KernelParams::isPow2)
+    {
+        numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+    }
+    else
+    {
+        numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+    }
+
     int32_t ctaOffset;
     int32_t numNonExitingCtas;
     Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
@@ -346,13 +389,31 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
             const int32_t localExpertIdx
                 = (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
             params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
-            params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta]
-                = min(mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2),
-                    mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count);
+            int32_t mnLimit1;
+            int32_t mnLimit2;
+            if constexpr (KernelParams::isPow2)
+            {
+                mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+                mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
+            }
+            else
+            {
+                mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+                mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
+            }
+            params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
         }
 
         // get the padded offset associated with this expert
-        const int32_t offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+        int32_t offset;
+        if constexpr (KernelParams::isPow2)
+        {
+            offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+        }
+        else
+        {
+            offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+        }
 
         // write expert offsets to shared
         smemExpertOffset[threadIdx.x] = offset + blockExpertOffset;
@@ -361,7 +422,15 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
     // write out padded count
     if (clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync())
     {
-        const int32_t permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        int32_t permutedIdxSize;
+        if constexpr (KernelParams::isPow2)
+        {
+            permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        }
+        else
+        {
+            permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+        }
         params.mPtrPermutedIdxSize[0] = permutedIdxSize;
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
     }
@@ -378,7 +447,7 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
     // We can't do it earlier because FC1 depends on the mPtrCtaIdxXyToBatchIdx,
     // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas and mPtrTotalNumPaddedTokens
     // TODO: this is not sufficient to ensure visibility in the next kernel!
-#if !defined(PDL_PROFILE) || PDL_PROFILE == 0
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
@@ -459,19 +528,29 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     // Define a lambda to avoid code duplication in branches.
     auto loopBody = [&](int expandedIdx)
     {
-        PackedScoreIdx<OutputT> scoreIdx = params.mPtrExpertIdx[expandedIdx];
+        PackedScoreIdx<OutputT> scoreIdx;
+        int idx;
+        if (params.mPtrTopKIds != nullptr)
+        {
+            idx = params.mPtrTopKIds[expandedIdx];
+        }
+        else
+        {
+            // If params.mPtrTopKIds != nullptr, we don't need to store the weights
+            if (params.mPtrTopKWeights != nullptr)
+            {
+                scoreIdx = params.mPtrTopKPacked[expandedIdx];
+                idx = scoreIdx.idx;
+                params.mPtrTopKWeights[expandedIdx] = static_cast<OutputT>(scoreIdx.score);
+            }
+        }
         // check whether this expert is local to our GPU at all and ignore if not
-        auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
+        auto localExpertIdx = idx - params.mLocalExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
         if (isLocalExpert)
         {
-            atomicAdd(&smemExpertCount[scoreIdx.idx], 1);
-        }
-
-        if (params.mPtrExpertWeights != nullptr)
-        {
-            params.mPtrExpertWeights[expandedIdx] = static_cast<OutputT>(scoreIdx.score);
+            atomicAdd(&smemExpertCount[idx], 1);
         }
     };
 
@@ -557,7 +636,15 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     // Compute the runtime config for projections
     // Whether or not an expert is local is taken into account when the histogram is computed
     // so we do not need to take it into account here.
-    const int32_t numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+    int32_t numCta;
+    if constexpr (KernelParams::isPow2)
+    {
+        numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+    }
+    else
+    {
+        numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+    }
     int32_t ctaOffset;
     int32_t numNonExitingCtas;
     Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
@@ -565,7 +652,15 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     if (threadIdx.x < params.mNumExperts)
     {
         // Get the padded offset associated with this expert
-        const int32_t offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+        int32_t offset;
+        if constexpr (KernelParams::isPow2)
+        {
+            offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+        }
+        else
+        {
+            offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+        }
 
         // Write expert offsets to shared
         smemExpertOffset[threadIdx.x] = offset;
@@ -577,7 +672,15 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     // The first block writes out padded count
     if (blockIdx.x == 0 && warpIdx == NumWarpsHist - 1 && cute::elect_one_sync())
     {
-        const int32_t permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        int32_t permutedIdxSize;
+        if constexpr (KernelParams::isPow2)
+        {
+            permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        }
+        else
+        {
+            permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+        }
         params.mPtrPermutedIdxSize[0] = permutedIdxSize;
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
     }
@@ -590,9 +693,19 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
             const int32_t localExpertIdx
                 = (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
             params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
-            params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta]
-                = min(mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2),
-                    mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count);
+            int32_t mnLimit1;
+            int32_t mnLimit2;
+            if constexpr (KernelParams::isPow2)
+            {
+                mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+                mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
+            }
+            else
+            {
+                mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+                mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
+            }
+            params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
         }
     }
 
@@ -625,13 +738,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         // Define a lambda to avoid code duplication in branches.
         auto loopBody = [&](int ii, int expandedIdx)
         {
-            PackedScoreIdx<OutputT> scoreIdx = params.mPtrExpertIdx[expandedIdx];
-            expertIndexes[ii] = scoreIdx.idx;
+            expertIndexes[ii]
+                = params.mPtrTopKIds ? params.mPtrTopKIds[expandedIdx] : params.mPtrTopKPacked[expandedIdx].idx;
             // check whether this expert is local to our GPU at all and ignore if not
-            auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
+            auto localExpertIdx = expertIndexes[ii] - params.mLocalExpertsStartIdx;
             auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
                 && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
-            expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
+            expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIndexes[ii], 1) : 0;
         };
 
         // For all tiles but the last, all indices are in bounds.
@@ -757,17 +870,43 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-// Trigger secondary kernel.
-// Note: this does not guarantee the visibility of prior writes unless the consumer executes a
-// dependency sync.
-#if !defined(PDL_PROFILE) || PDL_PROFILE == 0
+    // Trigger secondary kernel.
+    // Note: this does not guarantee the visibility of prior writes unless the consumer executes a
+    // dependency sync.
     if constexpr (KernelParams::UsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
-#endif
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(NumThreadsHist) routingInitExpertCounts(KernelParams params)
+{
+    // initialize the mPtrExpertCounts
+    int32_t expertCountsNum = 2 * params.mNumExperts;
+    int32_t globalThreadIdx = blockIdx.x * NumThreadsHist + threadIdx.x;
+    int32_t globalThreadStride = gridDim.x * NumThreadsHist;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // Wait on primary grid.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaGridDependencySynchronize();
+    }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+
+    initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // Wait on primary grid.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+}
 } // namespace routing
 } // namespace moe::dev

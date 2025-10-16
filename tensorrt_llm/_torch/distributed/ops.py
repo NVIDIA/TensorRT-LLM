@@ -1,4 +1,3 @@
-import logging
 import math
 import os
 import platform
@@ -8,7 +7,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import mpi_barrier
+from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -17,7 +16,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
-logger = logging.getLogger(__name__)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -55,11 +53,15 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
 def get_allreduce_mnnvl_workspace(
     mapping: Mapping, dtype: torch.dtype
 ) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+
     if not hasattr(_thread_local,
                    f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
                 {})
-
+    # Support topology split
+    comm = mpi_comm().Split(
+        int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
+        mapping.tp_rank)
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
 
     allreduce_mnnvl_workspaces = getattr(
@@ -77,7 +79,9 @@ def get_allreduce_mnnvl_workspace(
             buffer_size_in_bytes,
             mapping.tp_size,
             mapping.tp_rank,
-            torch.device("cuda", mapping.local_rank),
+            # Split the communicator according to the topology
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.local_rank,
             True,  # mnNvlink
         )
 
@@ -87,7 +91,7 @@ def get_allreduce_mnnvl_workspace(
         buffer.fill_(-0.0)
         # CPU barrier since we assume this should not be called in cuda graph
         torch.cuda.synchronize()
-        mpi_barrier()
+        comm.Barrier()
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
@@ -181,26 +185,33 @@ def allgather(
                 val.shape[dim] == sizes[mapping.tp_rank] for val in input
                 if val is not None
             ])
-
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
-        torch_op = torch.ops.trtllm.allgather
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.allgather_pg
+        else:
+            torch_op = torch.ops.trtllm.allgather
+
         output_info = get_output_info(input, dim)
         input = input.contiguous().view(-1, output_info['numel_base'])
     else:
         input, valid = filter_valid_input(input)
-        torch_op = torch.ops.trtllm.allgather_list
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.allgather_list_pg
+        else:
+            torch_op = torch.ops.trtllm.allgather_list
+
         output_info = [get_output_info(val, dim) for val in input]
         input = [
             val.contiguous().view(-1, val_info['numel_base'])
             for val, val_info in zip(input, output_info)
         ]
 
-    output = torch_op(
-        input,
-        sizes,
-        mapping.tp_group,
-    )
+    if mpi_disabled():
+        output = torch_op(input, sizes, mapping.tp_group,
+                          mapping.tp_group_pg.boxed())
+    else:
+        output = torch_op(input, sizes, mapping.tp_group)
 
     def convert_output(x, x_info):
         if dim == 0:
@@ -223,6 +234,44 @@ def allgather(
         ]
         output = restore_full_output(output, valid)
     return output
+
+
+def alltoall_helix(
+    inputs: List[torch.Tensor],
+    group: List[int],
+) -> List[torch.Tensor]:
+    '''
+    Add an operation that performs a collective all-to-all across a given group.
+    The operation is implemented using a torch op that wraps a NCCL group call of a series of
+    NCCL send/recv operations to implement the all-to-all. See the following materials for details.
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/p2p.html#all-to-all,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
+    Args:
+        inputs (List[Tensor]): The input tensors.
+            Its length must be a multiple of the group size,
+            and all tensors in a group must have the same shape.
+        group (List[int]): The group of ranks to participate in the all-to-all.
+    Returns:
+        The output tensors.
+        For each group of input tensors (of size group size),
+        there is one output tensor with shape (group size, *input shape).
+    '''
+    n_ranks = len(group)
+    if n_ranks == 1:
+        return inputs
+
+    assert n_ranks > 0, "group must be non-empty"
+    assert n_ranks == len(set(group)), "group must be unique"
+
+    assert len(inputs) % n_ranks == 0,\
+        "inputs length must be a multiple of the group size"
+    num_lists = len(inputs) // n_ranks
+    for il in range(num_lists):
+        ref_input = inputs[il * n_ranks]
+        assert all([inputs[i].shape == ref_input.shape for i in range(il * n_ranks + 1, (il + 1) * n_ranks)]),\
+            "all input tensors in a group must have the same shape"
+
+    return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
 
 
 def reducescatter(
@@ -258,23 +307,29 @@ def reducescatter(
         return x
 
     if isinstance(input, torch.Tensor):
-        torch_op = torch.ops.trtllm.reducescatter
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.reducescatter_pg
+        else:
+            torch_op = torch.ops.trtllm.reducescatter
         output_info = get_output_info(input, dim)
         input = convert_input(input, output_info)
     else:
         input, valid = filter_valid_input(input)
-        torch_op = torch.ops.trtllm.reducescatter_list
+        if mpi_disabled():
+            torch_op = torch.ops.trtllm.reducescatter_list_pg
+        else:
+            torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
             convert_input(val, val_info)
             for val, val_info in zip(input, output_info)
         ]
 
-    output = torch_op(
-        input,
-        sizes,
-        mapping.tp_group,
-    )
+    if mpi_disabled():
+        output = torch_op(input, sizes, mapping.tp_group,
+                          mapping.tp_group_pg.boxed())
+    else:
+        output = torch_op(input, sizes, mapping.tp_group)
 
     if isinstance(input, torch.Tensor):
         output = output.view(output_info['output_shape'])
@@ -312,6 +367,7 @@ class MNNVLAllReduce(nn.Module):
     def get_supported_dtypes():
         return (torch.float16, torch.bfloat16, torch.float32)
 
+    # Check if MNNVL is supported
     @staticmethod
     def is_mnnvl(mapping: Mapping, dtype: torch.dtype) -> bool:
         from tensorrt_llm._mnnvl_utils import MnnvlMemory
@@ -446,6 +502,9 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
+        self._disable_mpi = mpi_disabled()
+
+        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
@@ -455,7 +514,8 @@ class AllReduce(nn.Module):
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
-            if self.strategy == AllReduceStrategy.MNNVL:
+            if self.strategy in (AllReduceStrategy.AUTO,
+                                 AllReduceStrategy.MNNVL):
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
@@ -473,6 +533,9 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+
+    def is_mnnvl(self) -> bool:
+        return self.mnnvl_allreduce is not None
 
     def forward(
         self,
@@ -525,7 +588,17 @@ class AllReduce(nn.Module):
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
         if allreduce_strategy == AllReduceStrategy.MNNVL:
             allreduce_strategy = AllReduceStrategy.AUTO
-        output = torch.ops.trtllm.allreduce(
+
+        additional_args = {}
+        if self._disable_mpi:
+            pg = self.mapping.tp_group_pg
+            assert pg is not None, "TP ProcessGroup not initialised"
+            additional_args = {
+                "rank": torch.distributed.get_rank(),
+                "pg": pg.boxed(),
+            }
+
+        output = self.all_reduce_op(
             input=input,
             residual=all_reduce_params.residual,
             norm_weight=all_reduce_params.norm_weight,
@@ -538,6 +611,7 @@ class AllReduce(nn.Module):
             eps=all_reduce_params.eps,
             trigger_completion_at_end=all_reduce_params.
             trigger_completion_at_end,
+            **additional_args,
         )
 
         return output if len(output) > 1 else output[0]

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Utility modules for TensorRT-LLM integration tests.
+Utility modules for TensorRT LLM integration tests.
 
 This package provides various utilities to simplify test development and reduce
 boilerplate code.

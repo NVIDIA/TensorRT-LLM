@@ -3,8 +3,9 @@ methods:
     parameters:
       # Experimental features
       additional_model_outputs:
-        annotation: Optional[List[tensorrt_llm.sampling_params.AdditionalModelOutput]]
+        annotation: Optional[List[str]]
         default: null
+        status: prototype
       return_perf_metrics:
         annotation: bool
         default: false

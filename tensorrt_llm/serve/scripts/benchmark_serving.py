@@ -4,7 +4,7 @@
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
-    TensorRT-LLM OpenAI API server
+    TensorRT LLM OpenAI API server
     trtllm-serve <your_model>
 
 On the client side, run:
@@ -12,7 +12,7 @@ On the client side, run:
         --model <your_model> \
         --dataset-name sharegpt \
         --dataset-path <path to dataset> \
-        --request-rate <request_rate> \ # By default <request_rate> is inf
+        --request-rate <request_rate> # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
 
 """
@@ -45,6 +45,7 @@ from tensorrt_llm.serve.scripts.benchmark_dataset import (
     SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
+from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -79,11 +80,7 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
-    # Request accuracy rate metrics
-    mean_request_ar: float
-    median_request_ar: float
-    std_request_ar: float
-    percentiles_request_ar: list[tuple[float, float]]
+    avg_decoded_tokens_per_iter: float
 
 
 async def get_request(
@@ -136,7 +133,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int], list[float]]:
+) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -147,8 +144,13 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
-    request_ars: list[float] = []  # Request accuracy rates
+    latest_avg_decoded_tokens_per_iter: float = 0.0
+    error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
+        if outputs[i].exception_type:
+            exception_type = outputs[i].exception_type
+            error_counts[exception_type] = error_counts.get(exception_type,
+                                                            0) + 1
         if outputs[i].success:
             output_len = outputs[i].output_tokens
             if not output_len:
@@ -173,24 +175,20 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
-
-            # Calculate request accuracy rate (num_generated_tokens / (decode_iteration + 1))
-            decode_iter = outputs[i].decode_iteration
-            if decode_iter >= 0:
-                # For generated tokens, we use output_len - 1 (excluding the first token if needed)
-                # But according to the reference, it should be num_generated_tokens
-                num_generated_tokens = max(0, output_len -
-                                           1) if output_len > 1 else output_len
-                request_ar = num_generated_tokens / (
-                    decode_iter + 1) if decode_iter >= 0 else 0.0
-                request_ars.append(request_ar)
-            else:
-                request_ars.append(0.0)
-
             completed += 1
+
+            # Track the latest avg_decoded_tokens_per_iter if available
+            if hasattr(outputs[i], 'avg_decoded_tokens_per_iter'
+                       ) and outputs[i].avg_decoded_tokens_per_iter is not None:
+                latest_avg_decoded_tokens_per_iter = outputs[
+                    i].avg_decoded_tokens_per_iter
         else:
             actual_output_lens.append(0)
-            request_ars.append(0.0)
+
+    total_error_count = sum(error_counts.values())
+    for exception_type, count in error_counts.items():
+        print(f"Error type: {exception_type}, Count: {count} requests")
+    print(f"Total failed requests: {total_error_count}")
 
     if goodput_config_dict:
         valid_metrics = []
@@ -249,13 +247,9 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
-        mean_request_ar=np.mean(request_ars or 0),
-        median_request_ar=np.median(request_ars or 0),
-        std_request_ar=np.std(request_ars or 0),
-        percentiles_request_ar=[(p, np.percentile(request_ars or 0, p))
-                                for p in selected_percentiles],
+        avg_decoded_tokens_per_iter=latest_avg_decoded_tokens_per_iter,
     )
-    return metrics, actual_output_lens, request_ars
+    return metrics, actual_output_lens
 
 
 async def benchmark(
@@ -353,7 +347,8 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests),
+                                          desc="Benchmarking")
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
@@ -439,7 +434,7 @@ async def benchmark(
     # Close the session
     await session.close()
 
-    metrics, actual_output_lens, request_ars = calculate_metrics(
+    metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -450,7 +445,10 @@ async def benchmark(
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+    print("{:<40} {:<10}".format("Total requests:", len(outputs)))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10}".format("Failed requests:",
+                                 len(outputs) - metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
                                     benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
@@ -467,10 +465,17 @@ async def benchmark(
                                     metrics.total_token_throughput))
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
-    print("{:<40} {:<10.4f}".format("Mean Request AR:",
-                                    metrics.mean_request_ar))
-    print("{:<40} {:<10.4f}".format("Median Request AR:",
-                                    metrics.median_request_ar))
+
+    # Print last avg_decoded_tokens_per_iter value if available
+    if metrics.avg_decoded_tokens_per_iter > 0.0:
+        print("{:<40} {:<10.2f}".format("Avg Decoded Tokens per Iter:",
+                                        metrics.avg_decoded_tokens_per_iter))
+    if len(outputs) - metrics.completed > 0:
+        print(
+            f"=======================!FAILED REQUESTS!=======================")
+        print(f"Total failed requests: {len(outputs) - metrics.completed}")
+        print(
+            f"=====================!CHECK LOG FOR ERRORS!====================")
 
     result = {
         "duration": benchmark_duration,
@@ -483,17 +488,13 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
-        "mean_request_ar": metrics.mean_request_ar,
-        "median_request_ar": metrics.median_request_ar,
-        "std_request_ar": metrics.std_request_ar,
+        "avg_decoded_tokens_per_iter": metrics.avg_decoded_tokens_per_iter,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
-        "request_ars": request_ars,
-        "decode_iterations": [output.decode_iteration for output in outputs],
     }
 
     def process_one_metric(
@@ -579,15 +580,11 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     metrics = [
         "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
         "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms",
-        "mean_request_ar", "median_request_ar", "std_request_ar"
+        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = [
-        "ttfts", "itls", "generated_texts", "errors", "request_ars",
-        "decode_iterations"
-    ]
+    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
@@ -600,6 +597,34 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         # Don't use json suffix here as we don't want CI to pick it up
         pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
         write_to_json(pt_file, pt_records)
+
+
+async def fetch_perf_metrics(base_url: str) -> dict:
+    """
+    Fetch performance metrics from the /perf_metrics endpoint.
+
+    Args:
+        base_url: The base URL of the server
+
+    Returns:
+        Dictionary containing the performance metrics
+    """
+    perf_url = f"{base_url}/perf_metrics"
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(perf_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    print(
+                        f"Failed to fetch performance metrics. Status: {response.status}"
+                    )
+                    return {}
+        except Exception as e:
+            print(f"Error fetching performance metrics: {e}")
+            return {}
 
 
 def main(args: argparse.Namespace):
@@ -798,9 +823,8 @@ def main(args: argparse.Namespace):
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
 
-    # Avoid GC processing "static" data - reduce pause times.
-    gc.collect()
-    gc.freeze()
+    # Avoid GC - reduce pause times.
+    gc.disable()
 
     benchmark_result = asyncio.run(
         benchmark(
@@ -858,8 +882,7 @@ def main(args: argparse.Namespace):
             # Remove fields with too many data points
             for field in [
                     "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors", "request_ars",
-                    "decode_iterations"
+                    "generated_texts", "errors"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -882,6 +905,55 @@ def main(args: argparse.Namespace):
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
+
+    # Save per-request breakdown if requested
+    if args.save_request_time_breakdown:
+        print("Fetching request performance metrics...")
+        perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
+
+        if perf_metrics:
+            # Generate filename for perf metrics
+            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+            base_model_id = model_id.split("/")[-1]
+            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                                   if args.max_concurrency is not None else "")
+            perf_filename = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}-perf_metrics.json"
+
+            if args.result_dir:
+                perf_filename = os.path.join(args.result_dir, perf_filename)
+
+            # Save perf metrics to JSON file
+            with open(perf_filename, "w", encoding='utf-8') as outfile:
+                try:
+                    json.dump(perf_metrics, outfile, indent=2)
+                except Exception as e:
+                    print(f"Failed to save perf metrics: {e}")
+
+            print(f"Request performance metrics saved to: {perf_filename}")
+
+            # Create timing diagram from the saved JSON file
+            try:
+                analyzer = RequestTimeBreakdown()
+
+                print("Creating time diagram from request time breakdown...")
+                timing_data = analyzer.parse_json_file(perf_filename)
+
+                if timing_data:
+                    # Generate HTML filename for the timing diagram
+                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
+                    analyzer.create_timing_diagram(timing_data,
+                                                   diagram_filename)
+
+                    print(f"Time diagram saved to: {diagram_filename}")
+                else:
+                    print(
+                        "No time data found in request time breakdown - skipping diagram creation."
+                    )
+            except Exception as e:
+                print(f"Failed to create time diagram: {e}")
+                print("Performance metrics were still saved successfully.")
+        else:
+            print("Failed to fetch per-request performance metrics.")
 
 
 if __name__ == "__main__":
@@ -1061,11 +1133,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl,request_ar",
+        default="ttft,tpot,itl",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"request_ar\". "
-        "Default value is \"ttft,tpot,itl,request_ar\".")
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
+        "Default value is \"ttft,tpot,itl\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,
@@ -1264,6 +1336,13 @@ if __name__ == "__main__":
         "--no-test-input",
         action="store_true",
         help="Skip initial test run with a single prompt.",
+    )
+
+    parser.add_argument(
+        "--save-request-time-breakdown",
+        action="store_true",
+        help=
+        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
     )
 
     args = parser.parse_args()

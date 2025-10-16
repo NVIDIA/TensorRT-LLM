@@ -42,148 +42,15 @@ struct WeightParams
         ->Apply(argGen<MixtureOfExpertsBenchmark<WeightParams<atype, wtype, otype>>>)
 
 template <class BenchClass>
-auto listAllTactics()
+auto listAllTactics(MoeGemmId gemm_id)
 {
     int const sm = getSMVersion();
     using RunnerType = decltype(BenchClass::mMoERunner);
-    return RunnerType::getTactics(sm);
+    return RunnerType::getTactics(sm, gemm_id);
 }
 
 template <class BenchClass>
-int parseTacticToId(nlohmann::json tactic_config)
-{
-    bool is_tma_warp_specialized = tactic_config.at("is_tma_warp_specialized").get<bool>();
-    int tile_shape_id = -1;
-    std::array<int, 3> tile_shape;
-    if (tactic_config.at("tile_shape").is_array())
-        tactic_config.at("tile_shape").get_to(tile_shape);
-    else
-        tile_shape_id = tactic_config.at("tile_shape").get<int>();
-
-    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> confs = listAllTactics<BenchClass>();
-
-    try
-    {
-        for (int i = 0; i < confs.size(); i++)
-        {
-            auto const& c = confs[i];
-            if (c.is_tma_warp_specialized != is_tma_warp_specialized)
-                continue;
-
-            if (!is_tma_warp_specialized)
-            {
-                int stages = tactic_config.at("stages").get<int>();
-                if (c.stages != stages)
-                    continue;
-            }
-
-            if (tile_shape_id != -1)
-            {
-                int comp = c.getTileConfigAsInt();
-                if (tile_shape_id != comp)
-                    continue;
-                if (is_tma_warp_specialized && (int) c.cluster_shape != tactic_config.at("cluster_shape").get<int>())
-                    continue;
-
-                // Found matching config
-                return i;
-            }
-
-            // Handle if the user provided a shape instead of the enum value
-            if (is_tma_warp_specialized)
-            {
-                // TODO Add cases for blackwell shapes
-                using Kv = uint64_t;
-                constexpr static auto K = [](int m, int n) { return (uint64_t(m) << 32) | uint64_t(n); };
-                static std::unordered_map<Kv, CutlassTileConfigSM90> const tile_map{
-                    {K(64, 16), CutlassTileConfigSM90::CtaShape64x16x128B},
-                    {K(64, 32), CutlassTileConfigSM90::CtaShape64x32x128B},
-                    {K(64, 64), CutlassTileConfigSM90::CtaShape64x64x128B},
-                    {K(64, 128), CutlassTileConfigSM90::CtaShape64x128x128B},
-                    {K(64, 256), CutlassTileConfigSM90::CtaShape64x256x128B},
-
-                    {K(128, 16), CutlassTileConfigSM90::CtaShape128x16x128B},
-                    {K(128, 32), CutlassTileConfigSM90::CtaShape128x32x128B},
-                    {K(128, 64), CutlassTileConfigSM90::CtaShape128x64x128B},
-                    {K(128, 128), CutlassTileConfigSM90::CtaShape128x128x128B},
-                    {K(128, 256), CutlassTileConfigSM90::CtaShape128x256x128B},
-                    {K(256, 128), CutlassTileConfigSM90::CtaShape256x128x128B},
-                };
-
-                if (c.getTileConfigAsInt() != (int) tile_map.at(K(tile_shape[0], tile_shape[1])))
-                    continue;
-
-                static std::unordered_map<Kv, ClusterShape> const cluster_map{
-                    // CTA configs for M=64
-                    {K(1, 1), ClusterShape::ClusterShape_1x1x1},
-                    {K(2, 1), ClusterShape::ClusterShape_2x1x1},
-                    {K(1, 2), ClusterShape::ClusterShape_1x2x1},
-                    {K(2, 2), ClusterShape::ClusterShape_2x2x1},
-                };
-
-                std::array<int, 3> cluster_shape;
-                tactic_config.at("cluster_shape").get_to(cluster_shape);
-
-                if (c.cluster_shape != cluster_map.at(K(cluster_shape[0], cluster_shape[1])))
-                    continue;
-
-                // Found matching config
-                return i;
-            }
-            else
-            {
-                std::array<int, 3> warp_shape;
-                tactic_config.at("warp_shape").get_to(warp_shape);
-
-                using Kv = uint64_t;
-                constexpr static auto K = [](std::array<int, 3> a, std::array<int, 3> b)
-                {
-                    uint64_t sum = 0;
-                    for (auto v : a)
-                        sum = sum * 512 + v;
-                    for (auto v : b)
-                        sum = sum * 256 + v;
-                    return sum;
-                };
-                static std::unordered_map<Kv, CutlassTileConfig> tile_map{
-                    {K({128, 128, 8}, {64, 64, 8}), CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8},
-
-                    {K({16, 128, 64}, {16, 32, 64}), CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64},
-                    {K({32, 128, 64}, {32, 32, 64}), CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64},
-
-                    {K({64, 128, 64}, {32, 64, 64}), CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64},
-                    {K({64, 64, 128}, {32, 64, 64}), CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64},
-                    {K({64, 128, 64}, {64, 32, 64}), CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64},
-
-                    {K({128, 64, 64}, {64, 32, 64}), CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64},
-                    {K({128, 128, 64}, {64, 32, 64}), CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64},
-                    {K({128, 128, 64}, {64, 64, 64}), CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64},
-                    {K({128, 128, 64}, {64, 32, 64}), CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64},
-                    {K({128, 256, 64}, {64, 64, 64}), CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64},
-
-                    {K({256, 128, 64}, {64, 64, 64}), CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64},
-
-                    {K({16, 256, 64}, {16, 64, 64}), CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64}
-
-                };
-                if (c.tile_config_sm80 != tile_map.at(K(tile_shape, warp_shape)))
-                    continue;
-
-                // Found matching config
-                return i;
-            }
-        }
-    }
-    catch (std::out_of_range const& e)
-    {
-        std::cerr << "Warning: error parsing tactic " << tactic_config.dump(2) << std::endl;
-    }
-
-    return -1;
-}
-
-template <class BenchClass>
-void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
+void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids, MoeGemmId gemm_id)
 {
     if (tactic.is_number_integer())
     {
@@ -193,12 +60,8 @@ void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
     {
         for (auto c : tactic)
         {
-            parseTacticToVectorID<BenchClass>(c, tactic_ids);
+            parseTacticToVectorID<BenchClass>(c, tactic_ids, gemm_id);
         }
-    }
-    else if (tactic.is_object())
-    {
-        tactic_ids.push_back(parseTacticToId<BenchClass>(tactic));
     }
     else if (tactic.is_string())
     {
@@ -206,7 +69,7 @@ void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
         auto tactic_name = tactic.get<std::string>();
         if (tactic_name == "all")
         {
-            auto all_tactics = listAllTactics<BenchClass>();
+            auto all_tactics = listAllTactics<BenchClass>(gemm_id);
             tactic_ids.resize(all_tactics.size());
             std::iota(tactic_ids.begin(), tactic_ids.end(), 0);
         }
@@ -297,6 +160,10 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
      */
 
     std::ifstream file{workloadFile};
+    if (!file.is_open())
+    {
+        throw std::invalid_argument("Failed to open benchmark file: " + std::string(workloadFile));
+    }
     std::stringstream buffer;
     buffer << file.rdbuf();
     auto file_contents = buffer.str();
@@ -410,39 +277,15 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         }
 
         // Do this after filtering datatypes as tactics only make sense if we know the data type
-        bool has_tactic_ids2 = false;
         std::vector<int> tactic_ids1{};
         std::vector<int> tactic_ids2{};
-        if (run_config.contains("tactic_id1") || run_config.contains("tactic_id2"))
+        if (run_config.contains("tactic_id1"))
         {
-            if (run_config.contains("tactic_id"))
-            {
-                throw std::invalid_argument("Cannot use tactic_id and tactic_idX");
-            }
-            has_tactic_ids2 = true;
-            parseTacticToVectorID<BenchClass>(run_config["tactic_id1"], tactic_ids1);
-            parseTacticToVectorID<BenchClass>(run_config["tactic_id2"], tactic_ids2);
+            parseTacticToVectorID<BenchClass>(run_config["tactic_id1"], tactic_ids1, MoeGemmId::GEMM_1);
         }
-        else
+        if (run_config.contains("tactic_id2"))
         {
-            parseTacticToVectorID<BenchClass>(run_config["tactic_id"], tactic_ids1);
-            has_tactic_ids2 = false;
-            tactic_ids2.resize(1); // Dummy value so we loop exactly once below
-        }
-        if (tactic_ids1.empty() || tactic_ids2.empty())
-        {
-            std::cerr << "Warning: Skipping benchmark, no valid tactic found" << std::endl;
-            static bool printed = false;
-            if (!printed)
-            {
-                printed = true;
-                std::cerr << __PRETTY_FUNCTION__ << ": Valid Tactics are:\n";
-                auto confs = listAllTactics<BenchClass>();
-                for (auto c : confs)
-                    std::cerr << c.toString();
-            }
-
-            continue;
+            parseTacticToVectorID<BenchClass>(run_config["tactic_id2"], tactic_ids2, MoeGemmId::GEMM_2);
         }
 
         auto get_or = [&](auto name, auto def)
@@ -455,7 +298,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         int gemm_to_profile = get_or("gemm_to_profile", (int) GemmToProfile::LAYER);
         TLLM_CHECK_WITH_INFO(world_rank < tp_size * ep_size, "Rank is out of bounds of tp*ep");
 
-        if (gemm_to_profile != (int) GemmToProfile::LAYER && routing_config != UNIFORM_ROUTING_CONFIG)
+        if (gemm_to_profile != (int) GemmToProfile::LAYER)
         {
             static bool info_printed = false;
             if (!info_printed && LOG_LEVEL >= INFO)
@@ -465,21 +308,20 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             }
 
             static bool printed = false;
-            if (LOG_LEVEL >= ERROR && !printed)
+            if (routing_config != UNIFORM_ROUTING_CONFIG && LOG_LEVEL >= ERROR && !printed)
             {
                 std::cerr << "Warning: Profiling a specific GEMM will always use uniform random token distribution"
                           << std::endl;
                 printed = true;
             }
             routing_config = UNIFORM_ROUTING_CONFIG;
+
             if (gemm_to_profile == (int) GemmToProfile::GEMM_1)
             {
                 tactic_ids2 = {-1};
             }
             else if (gemm_to_profile == (int) GemmToProfile::GEMM_2)
             {
-                if (!has_tactic_ids2)
-                    tactic_ids2 = std::move(tactic_ids1);
                 tactic_ids1 = {-1};
             }
         }
@@ -494,14 +336,31 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             return val;
         };
 
+        if (tactic_ids1.empty() || tactic_ids2.empty())
+        {
+            std::cerr << "Warning: Skipping benchmark, no valid tactic found" << std::endl;
+            static bool printed = false;
+            if (!printed)
+            {
+                printed = true;
+                std::cerr << __PRETTY_FUNCTION__ << ": Valid Tactics are:\n";
+                for (auto gemm_id : {MoeGemmId::GEMM_1, MoeGemmId::GEMM_2})
+                {
+                    std::cerr << "GEMM " << (int) gemm_id << ":\n";
+                    auto confs = listAllTactics<BenchClass>(gemm_id);
+                    for (auto c : confs)
+                        std::cerr << c.toString();
+                    std::cerr << std::endl;
+                }
+            }
+
+            continue;
+        }
+
         for (auto t1 : tactic_ids1)
         {
-            // tactic_ids2 will have one dummy value if has_tactic_ids2 = false
             for (auto t2 : tactic_ids2)
             {
-                if (!has_tactic_ids2)
-                    t2 = t1;
-
                 benchmark->Args({num_experts,                               //
                     get_range("k"),                                         //
                     get_range("hidden_size"),                               //
@@ -531,7 +390,7 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
     // {ActivationType::Relu, ActivationType::Gelu,
     // ActivationType::Silu, ActivationType::Geglu,
     // ActivationType::Swiglu};
-    auto cutlass_tactic = {-1};                           // {0,..., listAllTactics<BenchClass>().size()};
+    auto cutlass_tactic = {-1};                           // {0,..., listAllTactics<BenchClass>(MoeGemmId).size()};
     auto routing_config = {LOAD_BALANCED_ROUTING_CONFIG}; // {0, 1, 2};
 
     for (auto num_expert : num_experts)
@@ -558,14 +417,18 @@ void argGen(benchmark::internal::Benchmark* benchmark)
 {
     if (LOG_LEVEL >= VERBOSE)
     {
-        std::cout << "List of all tactics for dtype " << (int) BenchClass::toDTypeID() << ":\n";
-        int i = 0;
-        for (auto& t : listAllTactics<BenchClass>())
+        std::cout << "== List of all tactics for dtype " << (int) BenchClass::toDTypeID() << " ==\n";
+        for (auto gemm_id : {MoeGemmId::GEMM_1, MoeGemmId::GEMM_2})
         {
-            std::cout << "Tactic " << i << ":\n";
-            std::cout << t.toString() << std::endl;
+            int i = 0;
+            std::cout << "=== GEMM " << (int) gemm_id << " ===\n";
+            for (auto& t : listAllTactics<BenchClass>(gemm_id))
+            {
+                std::cout << "==== Tactic " << i << " ====\n";
+                std::cout << t.toString() << std::endl;
 
-            i++;
+                i++;
+            }
         }
     }
 
@@ -652,7 +515,6 @@ void help()
            "    \"bias\": int, (optional)\n"
            "    \"do_final_scale\": int, (optional)\n"
            "    \"act_fn\": int,\n"
-           "    \"tactic_id\": tactic, (see below)\n"
            "    \"tactic_id1\": tactic, (see below)\n"
            "    \"tactic_id2\": tactic, (see below)\n"
            "    \"dtypes\": [string, ...], (optional)\n"
@@ -676,27 +538,14 @@ void help()
            "- \"do_final_scale\" - If final scales should be applied, 0 = no scale, 1 = scale\n"
            "- \"act_fn\" - The activation function to use, 0 = identity, 1 = relu, 2 = gelu, 3 = silu, 4 = geglu, 5 = "
            "swiglu\n"
-           "- \"tactic_id, tactic_id1, tactic_id2\"\n"
-           "The config for the CUTLASS GEMM. tactic_id sets the same tactic for both to the same tactic (except in "
-           "auto mode)\n"
-           "Use tactic_idX to set the tactic for the corresponding GEMM"
+           "- \"tactic_id1, tactic_id2\"\n"
+           "The config for the CUTLASS GEMM. tactic_idX sets the tactic for the corresponding GEMM"
            "Valid tactics are:\n"
-           " - An object:\n"
-           "   {\n"
-           "      \"is_tma_warp_specialized\": bool,\n"
-           "      \"tile_shape\": [int, int, int] or int,\n"
-           "      \"cluster_shape\": [int, int, int] or int, (required for sm90, type must be an int if tile_shape "
-           "is "
-           "an int)\n"
-           "      \"warp_shape\": [int, int, int], (required for non-sm90 if tile_shape is an array)\n"
-           "      \"stages\": int, (required for non-sm90)\n"
-           "    },\n"
-           " - An integer: corresponds to an index in the tactics array. WARNING this is not stable between test "
-           "configurations\n"
-           " - An array: of integers or objects, forms a list of tactics to sweep\n"
+           " - An integer: corresponds to an index in the tactics array. WARNING this is not stable between data types "
+           "or GPU architectures\n"
+           " - An array: of integers, forms a list of tactics to sweep\n"
            " - The string \"all\": This will sweep through all possible tactics\n"
-           " - The string \"auto\": This runs a short benchmark to pick the fastest tactic before each benchmark "
-           "case. "
+           " - The string \"auto\": This runs a short benchmark to pick the fastest tactic before each benchmark case. "
            "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate "
            "results"
            "- dtypes - A list of dtypes to run this config through.\n"

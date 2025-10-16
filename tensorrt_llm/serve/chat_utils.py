@@ -179,6 +179,7 @@ def parse_chat_messages_coroutines(
         Any, Any, Optional[Dict[str, List[Any]]]]]]:
     """Parse multiple chat messages and return conversation and coroutine."""
     conversation = []
+    mm_placeholder_counts = []
     mm_data_tracker = MultimodalDataTracker(model_config.model_type)
 
     for msg in messages:
@@ -187,11 +188,12 @@ def parse_chat_messages_coroutines(
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
                 mm_data_tracker.add_data(mdata["modality"], mdata["data"])
-    mm_placeholder_counts = mm_data_tracker.placeholder_counts()
-    if mm_placeholder_counts:
-        parsed_msg["content"] = add_multimodal_placeholders(
-            model_config.model_type, parsed_msg["content"],
-            mm_placeholder_counts)
+        mm_placeholder_count = mm_data_tracker.placeholder_counts()
+        if mm_placeholder_count:
+            parsed_msg["content"] = add_multimodal_placeholders(
+                model_config.model_type, parsed_msg["content"],
+                mm_placeholder_count)
+        mm_placeholder_counts.append(mm_placeholder_count)
 
     return conversation, mm_data_tracker.retrieve_all_async(
     ), mm_placeholder_counts

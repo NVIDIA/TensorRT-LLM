@@ -5,7 +5,7 @@ from typing import Optional
 from tensorrt_llm.bindings import executor as tb_executor
 from tensorrt_llm.bindings import internal as tb_internal
 
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
 
@@ -184,9 +184,6 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
-        for request in active_requests:
-            if get_draft_token_length(request) > 0:
-                request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)
 

@@ -4,7 +4,7 @@ AutoDeploy is integrated with the `trtllm-bench` performance benchmarking utilit
 
 ## Getting Started
 
-Before benchmarking with AutoDeploy, review the [TensorRT-LLM benchmarking guide](../../performance/perf-benchmarking.md#running-with-the-pytorch-workflow) to familiarize yourself with the standard trtllm-bench workflow and best practices.
+Before benchmarking with AutoDeploy, review the [TensorRT-LLM benchmarking guide](../../../performance/perf-benchmarking.md#running-with-the-pytorch-workflow) to familiarize yourself with the standard trtllm-bench workflow and best practices.
 
 ## Basic Usage
 

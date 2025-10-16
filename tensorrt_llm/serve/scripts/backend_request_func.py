@@ -45,7 +45,8 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
-    decode_iteration: int = 0  # Number of decoding iterations
+    avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
+    exception_type: str = None  # unset
 
 
 async def async_request_trt_llm(
@@ -82,7 +83,6 @@ async def async_request_trt_llm(
     ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url, json=payload) as response:
             if response.status == 200:
@@ -108,12 +108,15 @@ async def async_request_trt_llm(
                         else:
                             output.itl.append(timestamp - most_recent_timestamp)
 
-                        # Increment decode iteration for each chunk
-                        decode_iteration_count += 1
                         most_recent_timestamp = timestamp
 
+                        # Extract avg_decoded_tokens_per_iter from TensorRT-LLM response
+                        if "avg_decoded_tokens_per_iter" in data:
+                            output.avg_decoded_tokens_per_iter = data[
+                                "avg_decoded_tokens_per_iter"]
+
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
+
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -121,23 +124,27 @@ async def async_request_trt_llm(
                     output.itl = []
                     output.generated_text = data["text_output"]
                     output.latency = time.perf_counter() - st
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = len(output.generated_text.split(
-                    )) if output.generated_text else 1
+
+                    # Extract avg_decoded_tokens_per_iter from non-streaming TensorRT-LLM response
+                    if "avg_decoded_tokens_per_iter" in data:
+                        output.avg_decoded_tokens_per_iter = data[
+                            "avg_decoded_tokens_per_iter"]
 
             else:
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -183,7 +190,6 @@ async def async_request_openai_completions(
     generated_text = ""
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -220,11 +226,13 @@ async def async_request_openai_completions(
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
 
-                                # Increment decode iteration for each chunk with text
-                                if text is not None:
-                                    decode_iteration_count += 1
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
+
+                                # Extract avg_decoded_tokens_per_iter from streaming response
+                                if "avg_decoded_tokens_per_iter" in choices[0]:
+                                    output.avg_decoded_tokens_per_iter = choices[
+                                        0]["avg_decoded_tokens_per_iter"]
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get(
                                     "completion_tokens")
@@ -237,7 +245,6 @@ async def async_request_openai_completions(
                             "This response will be marked as failed!")
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -248,21 +255,27 @@ async def async_request_openai_completions(
                     output.ttft = -1
                     output.itl = []
                     output.output_tokens = data["usage"]["completion_tokens"]
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = output.output_tokens if output.output_tokens > 0 else 1
+                    # Extract avg_decoded_tokens_per_iter if available
+                    choice = data["choices"][0]
+                    if "avg_decoded_tokens_per_iter" in choice:
+                        output.avg_decoded_tokens_per_iter = choice[
+                            "avg_decoded_tokens_per_iter"]
             else:
+                print(f"HTTP Error {response.status}: {response}")
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -322,7 +335,6 @@ async def async_request_openai_chat_completions(
     ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -353,10 +365,12 @@ async def async_request_openai_chat_completions(
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
 
-                                # Increment decode iteration for each chunk with content
-                                if content is not None:
-                                    decode_iteration_count += 1
                                 generated_text += content or ""
+
+                                # Extract avg_decoded_tokens_per_iter from streaming chat response
+                                if "avg_decoded_tokens_per_iter" in choices[0]:
+                                    output.avg_decoded_tokens_per_iter = choices[
+                                        0]["avg_decoded_tokens_per_iter"]
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get(
                                     "completion_tokens")
@@ -365,7 +379,6 @@ async def async_request_openai_chat_completions(
 
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -375,22 +388,29 @@ async def async_request_openai_chat_completions(
                     output.itl = []
                     output.latency = time.perf_counter() - st
                     output.ttft = -1
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = output.output_tokens if output.output_tokens > 0 else 1
+
+                    # Extract avg_decoded_tokens_per_iter if available
+                    choice = data["choices"][0]
+                    if "avg_decoded_tokens_per_iter" in choice:
+                        output.avg_decoded_tokens_per_iter = choice[
+                            "avg_decoded_tokens_per_iter"]
 
             else:
+                # TODO: Need to store the status code to debug and report
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
 
     if pbar:
         pbar.update(1)
+
     return output
 
 

@@ -121,8 +121,8 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
 #endif // ENABLE_MULTI_DEVICE
 }
 
-std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::ModelConfig const& modelConfig)
+void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype)
 {
 #if ENABLE_MULTI_DEVICE
     auto const& worldComm = tensorrt_llm::mpi::MpiComm::world();
@@ -151,10 +151,7 @@ std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
     int64_t dims[2];
     MPICHECK(MPI_Mrecv(&dims, count, MPI_INT64_T, &msg, &status));
 
-    auto const logitsDtype = modelConfig.getLogitsDtype();
-
-    auto tensor = tensorrt_llm::runtime::BufferManager::pinnedPool(
-        runtime::ITensor::makeShape({dims[0], dims[1]}), logitsDtype);
+    draftLogitsHost->reshape(runtime::ITensor::makeShape({dims[0], dims[1]}));
 
     worldComm.mprobe(fastLogitsInfo.draftParticipantId, mpi::MpiTag::kSpecDecLogitsData, &msg, &status);
 
@@ -163,11 +160,7 @@ std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
     uint64_t const expectedSize = static_cast<uint64_t>(dims[0]) * dims[1] * tc::getDTypeSize(logitsDtype);
     TLLM_CHECK((uint64_t) count == expectedSize);
 
-    MPICHECK(MPI_Mrecv(tensor->data(), count, MPI_UINT8_T, &msg, &status));
-
-    return tensor;
-#else
-    return std::nullopt;
+    MPICHECK(MPI_Mrecv(draftLogitsHost->data(), count, MPI_UINT8_T, &msg, &status));
 #endif // ENABLE_MULTI_DEVICE
 }
 

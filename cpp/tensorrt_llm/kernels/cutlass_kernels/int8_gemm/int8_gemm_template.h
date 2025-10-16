@@ -57,7 +57,6 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
-
 template <typename T, typename arch, typename ThreadblockShape, typename WarpShape, int Stages>
 void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol,
     float const* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspace,
@@ -150,7 +149,7 @@ void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMo
     {
         std::string errMsg = "int8gemm cutlass kernel will fail for params. Error: "
             + std::string(cutlassGetStatusString(can_implement));
-        throw std::runtime_error("[TensorRT-LLM Error][int8gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][int8gemm Runner] " + errMsg);
     }
 
     auto initStatus = gemm.initialize(args, workspace, stream);
@@ -158,7 +157,7 @@ void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMo
     {
         std::string errMsg
             = "Failed to initialize cutlass int8 gemm. Error: " + std::string(cutlassGetStatusString(initStatus));
-        throw std::runtime_error("[TensorRT-LLM Error][int8gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][int8gemm Runner] " + errMsg);
     }
 
     auto runStatus = gemm.run(stream);
@@ -166,7 +165,7 @@ void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMo
     {
         std::string errMsg
             = "Failed to run cutlass int8 gemm. Error: " + std::string(cutlassGetStatusString(runStatus));
-        throw std::runtime_error("[TensorRT-LLM Error][int8gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][int8gemm Runner] " + errMsg);
     }
 }
 
@@ -180,7 +179,7 @@ struct dispatchStages
         TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
         std::string errMsg = "Cutlass int8 gemm. Not instantiates for arch "
             + std::to_string(arch::kMinComputeCapability) + " with stages set to " + std::to_string(Stages);
-        throw std::runtime_error("[TensorRT-LLM Error][dispatchStages::dispatch] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][dispatchStages::dispatch] " + errMsg);
     }
 };
 
@@ -248,7 +247,7 @@ void dispatchGemmConfig(int8_t const* A, int8_t const* B, tk::QuantMode quantOpt
         break;
     default:
         std::string errMsg = "dispatchGemmConfig does not support stages " + std::to_string(gemmConfig.stages);
-        throw std::runtime_error("[TensorRT-LLM Error][dispatch_gemm_config] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][dispatch_gemm_config] " + errMsg);
         break;
     }
 }
@@ -288,16 +287,16 @@ void dispatchGemmToCutlass(int8_t const* A, int8_t const* B, tk::QuantMode quant
             quantOption, alphaCol, alphaRow, C, m, n, k, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::Undefined:
-        throw std::runtime_error("[TensorRT-LLM Error][int8][dispatch_gemm_to_cutlass] gemm config undefined.");
+        throw std::runtime_error("[TensorRT LLM Error][int8][dispatch_gemm_to_cutlass] gemm config undefined.");
         break;
     case tkc::CutlassTileConfig::ChooseWithHeuristic:
         throw std::runtime_error(
-            "[TensorRT-LLM Error][int8][dispatch_gemm_to_cutlass] gemm config should have already been set by "
+            "[TensorRT LLM Error][int8][dispatch_gemm_to_cutlass] gemm config should have already been set by "
             "heuristic.");
         break;
     default:
         throw std::runtime_error(
-            "[TensorRT-LLM Error][int8][dispatch_gemm_to_cutlass] Config is invalid for int8 GEMM.");
+            "[TensorRT LLM Error][int8][dispatch_gemm_to_cutlass] Config is invalid for int8 GEMM.");
         break;
     }
 }
@@ -342,7 +341,7 @@ void CutlassInt8GemmRunner<T>::dispatchToArch(int8_t const* A, int8_t const* B, 
     else
     {
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassInt8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS int8 GEMM");
+            "[TensorRT LLM Error][CutlassInt8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS int8 GEMM");
     }
 }
 
@@ -364,7 +363,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassInt8GemmRunner<T>::getConfigs() const
     if (mSm <= 70)
     {
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassInt8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS int8 GEMM");
+            "[TensorRT LLM Error][CutlassInt8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS int8 GEMM");
     }
 
     std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(mSm, SPLIT_K_LIMIT, config_type_param);

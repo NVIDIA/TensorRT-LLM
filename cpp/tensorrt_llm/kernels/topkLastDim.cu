@@ -22,9 +22,17 @@
  */
 #include <cuda_runtime_api.h>
 
+#include "moeTopKFuncs.cuh"
 #include "topkLastDim.h"
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <cub/cub.cuh>
 #include <cuda/atomic>
+#include <cuda/std/limits>
+#include <limits>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <type_traits>
 
 namespace tensorrt_llm
 {
@@ -201,12 +209,12 @@ __host__ __device__ IdxT calc_buf_len(IdxT len)
  * @param len the number of elements to read
  * @param f the lambda taking two arguments (T x, IdxT idx)
  */
-template <typename T, typename idxT, typename Func>
-__device__ void vectorized_process(size_t thread_rank, size_t num_threads, T const* in, idxT len, Func f)
+template <typename T, typename IdxT, typename Func>
+__device__ void vectorized_process(size_t thread_rank, size_t num_threads, T const* in, IdxT len, Func f)
 {
     if constexpr (sizeof(T) >= sizeof(WideT))
     {
-        for (idxT i = thread_rank; i < len; i += num_threads)
+        for (IdxT i = thread_rank; i < len; i += num_threads)
         {
             f(in[i], i);
         }
@@ -231,12 +239,12 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
             skip_cnt = len;
         }
         WideT const* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
-        const idxT len_cast = (len - skip_cnt) / items_per_scalar;
+        const IdxT len_cast = (len - skip_cnt) / items_per_scalar;
 
-        for (idxT i = thread_rank; i < len_cast; i += num_threads)
+        for (IdxT i = thread_rank; i < len_cast; i += num_threads)
         {
             wide.scalar = in_cast[i];
-            const idxT real_i = skip_cnt + i * items_per_scalar;
+            const IdxT real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
             for (int j = 0; j < items_per_scalar; ++j)
             {
@@ -256,7 +264,7 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
         // and so
         // len - (skip_cnt + len_cast * items_per_scalar) < items_per_scalar <= WARP_SIZE
         // no need to use loop
-        const idxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
+        const IdxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
         if (remain_i < len)
         {
             f(in[remain_i], remain_i);
@@ -265,14 +273,14 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
 }
 
 // sync_width should >= WARP_SIZE
-template <typename T, typename idxT, typename Func>
-__device__ void vectorized_process(T const* in, idxT len, Func f, int sync_width)
+template <typename T, typename IdxT, typename Func>
+__device__ void vectorized_process(T const* in, IdxT len, Func f, int sync_width)
 {
-    const idxT stride = blockDim.x * gridDim.x;
-    const idxT tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const IdxT stride = blockDim.x * gridDim.x;
+    const IdxT tid = blockIdx.x * blockDim.x + threadIdx.x;
     if constexpr (sizeof(T) >= sizeof(WideT))
     {
-        for (idxT i = tid; i < len; i += stride)
+        for (IdxT i = tid; i < len; i += stride)
         {
             f(in[i], i, true);
         }
@@ -296,17 +304,17 @@ __device__ void vectorized_process(T const* in, idxT len, Func f, int sync_width
             skip_cnt = len;
         }
         WideT const* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
-        const idxT len_cast = (len - skip_cnt) / items_per_scalar;
+        const IdxT len_cast = (len - skip_cnt) / items_per_scalar;
 
-        const idxT len_cast_for_sync = ((len_cast - 1) / sync_width + 1) * sync_width;
-        for (idxT i = tid; i < len_cast_for_sync; i += stride)
+        const IdxT len_cast_for_sync = ((len_cast - 1) / sync_width + 1) * sync_width;
+        for (IdxT i = tid; i < len_cast_for_sync; i += stride)
         {
             bool valid = i < len_cast;
             if (valid)
             {
                 wide.scalar = in_cast[i];
             }
-            const idxT real_i = skip_cnt + i * items_per_scalar;
+            const IdxT real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
             for (int j = 0; j < items_per_scalar; ++j)
             {
@@ -323,7 +331,7 @@ __device__ void vectorized_process(T const* in, idxT len, Func f, int sync_width
             T value = valid ? in[tid] : T();
             f(value, tid, valid);
 
-            const idxT remain_i = skip_cnt + len_cast * items_per_scalar + tid;
+            const IdxT remain_i = skip_cnt + len_cast * items_per_scalar + tid;
             valid = remain_i < len;
             value = valid ? in[remain_i] : T();
             f(value, remain_i, valid);
@@ -1164,6 +1172,77 @@ __global__ void radix_topk_one_block_kernel(T const* in, IdxT const* in_idx, con
 } // namespace air_topk_stable
 
 //}
+namespace moe_topk
+{
+namespace cg = cooperative_groups;
+static constexpr int kBLOCK_SIZE = 1024;
+static constexpr int kWARP_SIZE = 32;
+static constexpr int kWARPS_PER_BLOCK = kBLOCK_SIZE / kWARP_SIZE;
+
+template <typename T>
+__device__ T negativeInfinity()
+{
+    return -INFINITY;
+}
+
+template <>
+__device__ half negativeInfinity<half>()
+{
+    return -CUDART_INF_FP16;
+}
+
+template <>
+__device__ __nv_bfloat16 negativeInfinity<__nv_bfloat16>()
+{
+    return -CUDART_INF_BF16;
+}
+
+/****************TopK kernel for candidate number<= 128 and K <= 8 **************** */
+template <typename InputT, typename OutputT, typename IdxT, int MaxLen, int MaxTopK>
+__global__ void moe_topk_kernel(
+    InputT const* in, OutputT* out, IdxT* outIdx, int32_t const batchSize, int32_t const len, int32_t const topK)
+{
+
+    uint32_t const blockRank = blockIdx.x;
+    uint32_t const tIdx = kBLOCK_SIZE * blockRank + threadIdx.x;
+    uint32_t const warpIdx = tIdx / kWARP_SIZE;
+    uint32_t const laneIdx = tIdx % kWARP_SIZE;
+    uint32_t const warpNum = gridDim.x * kWARPS_PER_BLOCK;
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<kWARP_SIZE>(block);
+
+    InputT minScore = negativeInfinity<InputT>();
+
+    for (uint32_t tokenId = warpIdx; tokenId < batchSize; tokenId += warpNum)
+    {
+        auto scoreOffset = tokenId * len;
+        auto outputOffset = tokenId * topK;
+        InputT inputScore[MaxLen / kWARP_SIZE];
+        IdxT inputIndex[MaxLen / kWARP_SIZE];
+
+        InputT warpTopKScore[MaxTopK];
+        IdxT warpTopKExpertIdx[MaxTopK];
+
+        // Load scores and indices for this warp
+        for (uint32_t i = 0; i < MaxLen / kWARP_SIZE; ++i)
+        {
+            auto expertIdx = i * kWARP_SIZE + laneIdx;
+            inputScore[i] = expertIdx < len ? static_cast<InputT>(in[scoreOffset + expertIdx]) : minScore;
+            inputIndex[i] = expertIdx;
+        }
+
+        // Reduce topK scores and indices for this warp
+        tensorrt_llm::kernels::reduce_topk::reduceTopK(
+            warp, warpTopKScore, warpTopKExpertIdx, inputScore, inputIndex, minScore);
+
+        if (laneIdx < topK)
+        {
+            out[outputOffset + laneIdx] = static_cast<OutputT>(warpTopKScore[laneIdx]);
+            outIdx[outputOffset + laneIdx] = warpTopKExpertIdx[laneIdx];
+        }
+    } // end for tokenId
+}
+} // namespace moe_topk
 
 /***************Runtime API****************/
 
@@ -1221,9 +1300,11 @@ void standalone_stable_radix_topk_(void* buf, size_t& buf_size, T const* in, Idx
     IdxT* sort_in_idx = nullptr;
 
     air_topk_stable::ComputeOffset<IdxT> computeoffset(k);
-    cub::CountingInputIterator<IdxT> counting_iter(0);
-    cub::TransformInputIterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, cub::CountingInputIterator<IdxT>>
-        transform_iter(counting_iter, computeoffset);
+
+    thrust::counting_iterator<IdxT> counting_iter(0);
+    thrust::transform_iterator<air_topk_stable::ComputeOffset<IdxT>, thrust::counting_iterator<IdxT>> transform_iter(
+        counting_iter, computeoffset);
+
     cub::DeviceSegmentedSort::SortPairs(NULL, temp_storage_bytes, out_idx, out_idx, out, out, k * batch_size,
         batch_size, transform_iter, transform_iter + 1, stream);
     if (sorted)
@@ -1275,8 +1356,8 @@ void standalone_stable_radix_topk_(void* buf, size_t& buf_size, T const* in, Idx
             sort_in = static_cast<decltype(sort_in)>(aligned_pointers[9]);
             sort_in_idx = static_cast<decltype(sort_in_idx)>(aligned_pointers[10]);
         }
-        cudaMemsetAsync(
-            buf, 0, static_cast<char*>(aligned_pointers[2]) - static_cast<char*>(aligned_pointers[0]), stream);
+        cudaMemsetAsync(aligned_pointers[0], 0,
+            static_cast<char*>(aligned_pointers[2]) - static_cast<char*>(aligned_pointers[0]), stream);
     }
 
     T const* in_buf = nullptr;
@@ -1348,9 +1429,9 @@ void standalone_stable_radix_topk_one_block_(void* buf, size_t& buf_size, T cons
     const IdxT buf_len = air_topk_stable::calc_buf_len<T, IdxT, unsigned>(len);
 
     air_topk_stable::ComputeOffset<IdxT> computeoffset(k);
-    cub::CountingInputIterator<IdxT> counting_iter(0);
-    cub::TransformInputIterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, cub::CountingInputIterator<IdxT>>
-        transform_iter(counting_iter, computeoffset);
+    thrust::counting_iterator<IdxT> counting_iter(0);
+    thrust::transform_iterator<air_topk_stable::ComputeOffset<IdxT>, thrust::counting_iterator<IdxT>> transform_iter(
+        counting_iter, computeoffset);
 
     cub::DeviceSegmentedSort::SortPairs(NULL, temp_storage_bytes, out_idx, out_idx, out, out, k * batch_size,
         batch_size, transform_iter, transform_iter + 1, stream);
@@ -1421,36 +1502,120 @@ void standalone_stable_radix_topk_one_block_(void* buf, size_t& buf_size, T cons
     }
 }
 
-template <typename T, typename idxT, bool sorted = false>
-void standalone_stable_radix_11bits(void* buf, size_t& buf_size, T const* in, int batch_size, idxT len, idxT k, T* out,
-    idxT* out_idx, bool greater, cudaStream_t stream = 0)
+template <typename T, typename IdxT, bool sorted = false>
+void standalone_stable_radix_11bits(void* buf, size_t& buf_size, T const* in, int batch_size, IdxT len, IdxT k, T* out,
+    IdxT* out_idx, bool greater, cudaStream_t stream = 0)
 {
     constexpr int items_per_thread = 32;
     constexpr int block_dim = 512;
     constexpr bool fused_last_filter = false;
     if (len <= block_dim * items_per_thread)
     {
-        standalone_stable_radix_topk_one_block_<T, idxT, 11, block_dim>(
-            buf, buf_size, in, static_cast<idxT*>(nullptr), batch_size, len, k, out, out_idx, !greater, stream, sorted);
+        standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim>(
+            buf, buf_size, in, static_cast<IdxT*>(nullptr), batch_size, len, k, out, out_idx, !greater, stream, sorted);
     }
     else
     {
         int sm_cnt = tensorrt_llm::common::getMultiProcessorCount();
-        unsigned grid_dim = air_topk_stable::calc_grid_dim<T, idxT, 11, block_dim>(batch_size, len, sm_cnt);
+        unsigned grid_dim = air_topk_stable::calc_grid_dim<T, IdxT, 11, block_dim>(batch_size, len, sm_cnt);
 
         if (grid_dim == 1)
         {
-            standalone_stable_radix_topk_one_block_<T, idxT, 11, block_dim>(buf, buf_size, in,
-                static_cast<idxT*>(nullptr), batch_size, len, k, out, out_idx, !greater, stream, sorted);
+            standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim>(buf, buf_size, in,
+                static_cast<IdxT*>(nullptr), batch_size, len, k, out, out_idx, !greater, stream, sorted);
         }
         else
         {
-            standalone_stable_radix_topk_<T, idxT, 11, block_dim>(buf, buf_size, in, static_cast<idxT*>(nullptr),
+            standalone_stable_radix_topk_<T, IdxT, 11, block_dim>(buf, buf_size, in, static_cast<IdxT*>(nullptr),
                 batch_size, len, k, out, out_idx, !greater, fused_last_filter, grid_dim, stream, sorted);
         }
     }
 }
 
+int nextPowerOfTwo(int num)
+{
+    if (num <= 0)
+    {
+        return 1; // Handle invalid input
+    }
+    int power = 1;
+    while (power < num)
+    {
+        // Check for overflow before shifting
+        if (power > INT_MAX / 2)
+        {
+            return power;
+        }
+        power <<= 1;
+    }
+    return power;
+}
+
+template <typename T, typename IdxT>
+void moe_reduce_topk(
+    T const* in, int batch_size, IdxT len, IdxT k, T* out, IdxT* out_idx, bool greater, cudaStream_t stream = 0)
+{
+    using InputT = T;
+    using OutputT = T;
+    const uint32_t max_num_blocks = 1024;
+    const uint32_t num_blocks
+        = std::min(static_cast<uint32_t>((batch_size - 1) / moe_topk::kWARPS_PER_BLOCK + 1), max_num_blocks);
+
+    uint32_t max_len = nextPowerOfTwo(len) < 32 ? 32 : nextPowerOfTwo(len);
+    uint32_t moe_topk = nextPowerOfTwo(k);
+
+    auto* kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 128, 8>;
+
+    switch (max_len)
+    {
+    case 32:
+        switch (moe_topk)
+        {
+        case 1: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 32, 1>; break;
+        case 2: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 32, 2>; break;
+        case 4: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 32, 4>; break;
+        case 8: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 32, 8>; break;
+        default: kernel_instance = nullptr; break;
+        }
+        break;
+    case 64:
+        switch (moe_topk)
+        {
+        case 1: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 64, 1>; break;
+        case 2: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 64, 2>; break;
+        case 4: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 64, 4>; break;
+        case 8: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 64, 8>; break;
+        default: kernel_instance = nullptr; break;
+        }
+        break;
+    case 96:
+        switch (moe_topk)
+        {
+        case 1: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 96, 1>; break;
+        case 2: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 96, 2>; break;
+        case 4: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 96, 4>; break;
+        case 8: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 96, 8>; break;
+        default: kernel_instance = nullptr; break;
+        }
+        break;
+    case 128:
+        switch (moe_topk)
+        {
+        case 1: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 128, 1>; break;
+        case 2: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 128, 2>; break;
+        case 4: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 128, 4>; break;
+        case 8: kernel_instance = &moe_topk::moe_topk_kernel<InputT, OutputT, IdxT, 128, 8>; break;
+        default: kernel_instance = nullptr; break;
+        }
+        break;
+    default: kernel_instance = nullptr; break;
+    }
+
+    dim3 moe_topk_grid_dim(num_blocks);
+    dim3 moe_topk_block_dim(moe_topk::kBLOCK_SIZE);
+
+    kernel_instance<<<moe_topk_grid_dim, moe_topk_block_dim, 0, stream>>>(in, out, out_idx, batch_size, len, k);
+}
 #endif
 
 ///////////////
@@ -1459,22 +1624,22 @@ template <typename T>
 size_t invokeComputeTopkLastDimWorkspaceSize(
     SizeType32 batchSize, SizeType32 inputLength, SizeType32 k, bool is_largest)
 {
-    using idxT = SizeType32;
+    using IdxT = SizeType32;
 
     size_t buf_size = 0;
     void* workspace = nullptr;
     T const* in = nullptr;
     T* out_val = nullptr;
-    idxT* out_idx = nullptr;
+    IdxT* out_idx = nullptr;
 
     constexpr int block_dim = 512;
     constexpr bool fused_last_filter = false;
     constexpr bool sorted = true;
 
     int sm_cnt = tensorrt_llm::common::getMultiProcessorCount();
-    unsigned grid_dim = air_topk_stable::calc_grid_dim<T, idxT, 11, block_dim>(batchSize, inputLength, sm_cnt);
+    unsigned grid_dim = air_topk_stable::calc_grid_dim<T, IdxT, 11, block_dim>(batchSize, inputLength, sm_cnt);
 
-    standalone_stable_radix_topk_<T, idxT, 11, block_dim>(workspace, buf_size, in, static_cast<idxT*>(nullptr),
+    standalone_stable_radix_topk_<T, IdxT, 11, block_dim>(workspace, buf_size, in, static_cast<IdxT*>(nullptr),
         batchSize, inputLength, k, out_val, out_idx, !is_largest, fused_last_filter, grid_dim, 0, sorted);
     return buf_size;
 }
@@ -1504,8 +1669,17 @@ void invokeTopkLastDim(SizeType32 batchSize, SizeType32 inputLength, SizeType32 
     T const* in = reinterpret_cast<T const*>(input);
     T* out_val_ = reinterpret_cast<T*>(out_val);
     SizeType32* out_idx_ = reinterpret_cast<SizeType32*>(out_idx);
-    standalone_stable_radix_11bits<T, SizeType32, true>(
-        workspace, buf_size, in, batchSize, inputLength, k, out_val_, out_idx_, is_largest, stream);
+    if (inputLength <= 128 && k <= 8 && is_largest == true)
+    {
+        // This method does not require a buffer, but since the implementation may vary in different cases,
+        // we still allocate the buffer in case AIR TopK is used instead.
+        moe_reduce_topk(in, batchSize, inputLength, k, out_val_, out_idx_, !is_largest, stream);
+    }
+    else
+    {
+        standalone_stable_radix_11bits<T, SizeType32, true>(
+            workspace, buf_size, in, batchSize, inputLength, k, out_val_, out_idx_, is_largest, stream);
+    }
 }
 
 #define INSTANTIATE_TOPK_LastDim_DATA_TYPE(T)                                                                          \

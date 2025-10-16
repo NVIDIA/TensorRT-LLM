@@ -72,6 +72,27 @@ constexpr T divUpMulLog2(T a, T bLog2)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
+__host__ __device__ constexpr T mulTileN(T a, T tileN)
+{
+    return a * tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T divUpTileN(T a, T tileN)
+{
+    return (a + tileN - 1) / tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T divUpMulTileN(T a, T tileN)
+{
+    return divUpTileN(a, tileN) * tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
 constexpr void initData(T* data, int num, int rngSeed)
 {
     std::default_random_engine rng(rngSeed);
@@ -214,12 +235,17 @@ struct RoutingKernelTestParam
     // we don't use any special striding, and we always test the GPU at logical idx 0
     int32_t numLocalExperts{128};
     int32_t paddingLog2{3};
+    int32_t tileTokensDim{1};
 
     int32_t singleClusterTokenNum{1024};
     bool usePdl{true};
     bool getExpWeights{true};
 
     int requiredComputeCapability{9};
+
+    // Check the input parameters
+    bool useTopKAsInput{false};
+
     // Special for renormalize routing method
     bool doSoftmaxBeforeTopK{false};
     bool normTopkProb{true};
@@ -242,17 +268,20 @@ struct RoutingKernelTestParam
 
     // Constructor with all parameters
     RoutingKernelTestParam(RoutingMethodType routingMethod, int32_t numTokens, int32_t numExperts, uint32_t topK,
-        int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t paddingLog2 = 3,
-        int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true, int32_t nGroup = 1,
-        int32_t topkGroup = 1, float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
+        int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t tileTokensDim = 1,
+        int32_t paddingLog2 = 3, int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true,
+        bool useTopKAsInput = false, int32_t nGroup = 1, int32_t topkGroup = 1, float routedScalingFactor = 1.0f,
+        int requiredComputeCapability = 9)
         : routingMethod(routingMethod)
         , numTokens(numTokens)
         , numExperts(numExperts)
         , topK(topK)
+        , tileTokensDim(tileTokensDim)
         , paddingLog2(paddingLog2)
         , localExpertsStrideLog2(localExpertsStrideLog2)
         , usePdl(usePdl)
         , getExpWeights(getExpWeights)
+        , useTopKAsInput(useTopKAsInput)
         , nGroup(nGroup)
         , topkGroup(topkGroup)
         , routedScalingFactor(routedScalingFactor)
@@ -375,6 +404,21 @@ protected:
 
     virtual void setupBuffers(RoutingKernelTestParam const& param);
 
+    inline int32_t computeLog2(int32_t val, std::string const& name = "")
+    {
+        int32_t n = val;
+        int32_t out = 0;
+        while (n >>= 1)
+        {
+            ++out;
+        }
+        if ((1 << out) != val)
+        {
+            out = -1;
+        }
+        return out;
+    }
+
     template <typename RoutingData>
     inline void setCommonParams(RoutingKernelTestParam const& param, RoutingData& routingData)
     {
@@ -382,7 +426,8 @@ protected:
         routingData.mNumTokens = param.numTokens;
         routingData.mNumExperts = param.numExperts;
         routingData.mTopK = param.topK;
-        routingData.mPaddingLog2 = param.paddingLog2;
+        routingData.mTileTokensDim = param.tileTokensDim;
+        routingData.mPaddingLog2 = computeLog2(param.tileTokensDim);
         routingData.mLocalExpertsStartIdx = param.localExpertsStartIdx;
         routingData.mLocalExpertsStrideLog2 = param.localExpertsStrideLog2;
         routingData.mNumLocalExperts = param.numLocalExperts;
@@ -393,8 +438,8 @@ protected:
         routingData.mPtrPermutedIdxSize = bufferCast<int32_t>(*mPtrPermutedIdxSizeDevice);
         routingData.mPtrExpandedIdxToPermutedIdx = bufferCast<int32_t>(*mPtrExpandedIdxToPermutedIdxDevice);
         routingData.mPtrPermutedIdxToTokenIdx = bufferCast<int32_t>(*mPtrPermutedIdxToTokenIdxDevice);
-        routingData.mPtrExpertWeights = bufferCast<T>(*mPtrExpertWeightsDevice);
-        routingData.mPtrExpertIdx = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrExpertIdxDevice));
+        routingData.mPtrTopKWeights = bufferCast<T>(*mPtrTopKWeightsDevice);
+        routingData.mPtrTopKPacked = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrTopKPackedDevice));
 
         // Set grouped gemm launch config buffers
         routingData.mPtrCtaIdxXyToBatchIdx = bufferCast<int32_t>(*mPtrCtaIdxXyToBatchIdxDevice);
@@ -413,7 +458,7 @@ protected:
 
     struct cudaDeviceProp mDeviceProp;
 
-    // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
+    // optional: if `nullptr`, `mPtrTopKPacked` must be provided.
     // If it is given, it represents the scores without sigmoid activation for
     // each token and expert.
     // note: if it is provided, we always re-compute the top1 scores
@@ -426,8 +471,19 @@ protected:
     // the least significant 16 bits represent the index of the chosen expert (unsigned).
     // note: this is required if the number of tokens is large.
     // dim: [mNumTokens, mTopK]
-    TensorPtr mPtrExpertIdxHost;
-    TensorPtr mPtrExpertIdxDevice;
+    TensorPtr mPtrTopKPackedHost;
+    TensorPtr mPtrTopKPackedDevice;
+
+    // optional: Add another input format.
+    // dim: [mNumTokens, mTopK]
+    TensorPtr mPtrTopKIdsHost;
+    TensorPtr mPtrTopKIdsDevice;
+
+    // optional: if `nullptr`, it is not filled
+    // dim: [mNumTokens, mTopK]
+    // Note: this might be reused as input when we take topk_ids as input.
+    TensorPtr mPtrTopKWeightsHost;
+    TensorPtr mPtrTopKWeightsDevice;
 
     // note: at least one of the optional outputs below must be provided
     // optional: only used as an intermediate buffer when the number of tokens is large.
@@ -445,10 +501,7 @@ protected:
     // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
     TensorPtr mPtrPermutedIdxToTokenIdxHost;
     TensorPtr mPtrPermutedIdxToTokenIdxDevice;
-    // optional: if `nullptr`, it is not filled
-    // dim: [mNumTokens, mTopK]
-    TensorPtr mPtrExpertWeightsHost;
-    TensorPtr mPtrExpertWeightsDevice;
+
     //
     // Grouped Gemm Launch Config Buffers
     //

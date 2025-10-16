@@ -1,3 +1,4 @@
+import os
 import threading
 from contextlib import nullcontext
 from multiprocessing import resource_tracker, shared_memory
@@ -9,12 +10,12 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import is_graph_capturing
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...distributed import AllReduce
 from ...utils import EventType
+from ..multi_stream_utils import do_multi_stream
 
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
@@ -176,9 +177,20 @@ class HostMoeTensorSharer:
                 total_size += aligned_size
 
         shm_name = self.get_shared_memory_name()
-        shm = shared_memory.SharedMemory(name=shm_name,
-                                         create=True,
-                                         size=total_size)
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name,
+                                             create=True,
+                                             size=total_size)
+        except FileExistsError:
+            tensorrt_llm.logger.warning(
+                f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
+            )
+            existing_shm = shared_memory.SharedMemory(name=shm_name)
+            existing_shm.close()
+            existing_shm.unlink()
+            shm = shared_memory.SharedMemory(name=shm_name,
+                                             create=True,
+                                             size=total_size)
         self.own_shm = shm
 
         offset = 0
@@ -472,7 +484,7 @@ class SingleLayerMoeLoadBalancer:
         assert self.func_called_count["start_wait_gpu_stage"] == 0
         self.func_called_count["start_wait_gpu_stage"] += 1
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -491,7 +503,7 @@ class SingleLayerMoeLoadBalancer:
         assert self.func_called_count["done_wait_gpu_stage"] == 0
         self.func_called_count["done_wait_gpu_stage"] += 1
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.MoeBalancer].wait()
 
     def start_set_cpu_stage(self):
@@ -502,7 +514,7 @@ class SingleLayerMoeLoadBalancer:
         assert self.func_called_count["start_set_cpu_stage"] == 0
         self.func_called_count["start_set_cpu_stage"] += 1
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -522,7 +534,7 @@ class SingleLayerMoeLoadBalancer:
             self.func_called_count[name] = 0
         self.statistic_flag_tensor = None
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.MoeBalancer].wait()
 
     def update_local_statistic(self, local_raw_expert_ids: torch.Tensor,
@@ -544,7 +556,7 @@ class SingleLayerMoeLoadBalancer:
                     (self.expert_count, ),
                     dtype=torch.int32,
                     device=torch.device('cuda'))
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -569,7 +581,7 @@ class SingleLayerMoeLoadBalancer:
         assert self.func_called_count["update_local_statistic"] > 0
         self.func_called_count["get_local_statistic_tensor"] += 1
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.MoeBalancer].record()
                 self.event_dict[EventType.MoeBalancer].wait()
@@ -598,7 +610,7 @@ class SingleLayerMoeLoadBalancer:
                 self.single_layer_load_balancer_ptr)
 
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -636,7 +648,7 @@ class SingleLayerMoeLoadBalancer:
         if self.updates_enabled:
             self.update_local_statistic(local_raw_expert_ids, is_first_stage,
                                         is_last_stage)
-            if is_graph_capturing():
+            if do_multi_stream():
                 with torch.cuda.stream(self.aux_stream):
                     _update_statistic()
             else:
@@ -660,7 +672,7 @@ class SingleLayerMoeLoadBalancer:
         assert self.func_called_count["update_statistic_with_local_ids"] == 0
         self.func_called_count["update_statistic_with_global_ids"] += 1
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -722,7 +734,7 @@ class MoeLoadBalancer:
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: str = 'moe_shared'):
+                 shared_memory_base_name: Optional[str] = None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -730,7 +742,7 @@ class MoeLoadBalancer:
             ep_rank: The rank of the current process in expert parallelism
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
-            shared_memory_base_name: Shared memory base name
+            shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
         """
         self.is_shutdown = True
         self.ep_rank = ep_rank
@@ -740,7 +752,8 @@ class MoeLoadBalancer:
                                                        layer_updates_per_iter)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
-        self.shared_memory_base_name = shared_memory_base_name
+        self.shared_memory_base_name = shared_memory_base_name or os.getenv(
+            'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
         self._setup_mpi_comm()
         self.is_shutdown = False
 
@@ -851,8 +864,8 @@ class MoeLoadBalancer:
         """
         self.load_balancer_impl.set_warm_up_iter_count(iter_count)
 
-    def set_next_iter_info(self, enable_statistic: Optional[bool],
-                           enable_update_weights: Optional[bool]):
+    def set_iter_info(self, enable_statistic: Optional[bool],
+                      enable_update_weights: Optional[bool]):
         if enable_statistic is not None:
             self.enable_statistic = enable_statistic
         if enable_update_weights is not None:
@@ -998,8 +1011,8 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.set_next_iter_info(self.enable_statistic,
-                                                      self.enable_updates)
+            self.moe_load_balancer.set_iter_info(self.enable_statistic,
+                                                 self.enable_updates)
             self.moe_load_balancer.start_iter()
         return self
 

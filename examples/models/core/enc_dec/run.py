@@ -388,7 +388,7 @@ if __name__ == "__main__":
         if tensorrt_llm.mpi_rank() == 0:
             hf_model = AutoModelForSeq2SeqLM.from_pretrained(
                 args.model_name,  # TODO: use model path instead
-                # torch_dtype=torch.float16 if '16' in dtype else torch.float32,  # TODO: use matched torch dtype
+                # dtype=torch.float16 if '16' in dtype else torch.float32,  # TODO: use matched torch dtype
             ).to('cuda').eval()  # TODO: create config model path instead
             assert type(hf_model) in (
                 T5ForConditionalGeneration, BartForConditionalGeneration,

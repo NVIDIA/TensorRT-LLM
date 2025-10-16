@@ -40,6 +40,7 @@ add_library(
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
+  alltoallOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
@@ -56,6 +57,7 @@ add_library(
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
+  fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
@@ -83,7 +85,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  renormMoeRoutingOp.cpp
+  customMoeRoutingOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
@@ -92,10 +94,12 @@ add_library(
   weightOnlyQuantOp.cpp
   mtpOp.cpp
   loraOp.cpp
-  finegrained_mixed_dtype_gemm_thop.cpp)
+  finegrained_mixed_dtype_gemm_thop.cpp
+  tinygemm2.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
-                                        ${Python3_LIBRARIES} ${SHARED_TARGET})
+target_link_libraries(
+  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+                    ${SHARED_TARGET} pg_utils)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
@@ -119,9 +123,9 @@ endif()
 
 if(NOT WIN32)
   set_target_properties(
-    th_common
-    PROPERTIES LINK_FLAGS
-               "-Wl,-rpath='$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+    th_common PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../nvidia/nccl/lib")
+  set_target_properties(
+    th_common PROPERTIES LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 else()
   target_link_libraries(th_common PRIVATE context_attention_src)
 endif()

@@ -20,7 +20,7 @@ l0_gb202:
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype0]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype1]
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
-  - unittest/_torch/test_attention_mla.py
+  - unittest/_torch/attention/test_attention_mla.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]

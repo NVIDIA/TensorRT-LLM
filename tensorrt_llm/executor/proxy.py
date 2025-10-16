@@ -12,6 +12,7 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -20,7 +21,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -45,7 +46,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -87,14 +88,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        self.garbage_collection_gen0_threshold = worker_kwargs[
+            "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
+                "llm_args", None) is not None else None
 
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
-                             garbage_collection_gen0_threshold=self.
-                             garbage_collection_gen0_threshold)
+                             kv_connector_config=kv_connector_config)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
@@ -118,7 +120,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
-            is_server=True, name="worker_init_status_queue")
+            is_server=True,
+            socket_type=zmq.ROUTER,
+            name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -178,8 +182,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
+            # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
+            #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
             if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
+                    res,
+                    ErrorResponse) or (isinstance(res, PostprocWorker.Output)
+                                       and res.is_final):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
@@ -191,7 +199,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             process_res(i)
 
         if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.warning(
+                    "proxy.py: EventLoopShutdownError because event loop is not running"
+                )
 
         return True  # success
 
@@ -319,7 +332,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         while True:
             if self.worker_init_status_queue.poll(1):
-                ready_signal = self.worker_init_status_queue.get()
+                ready_signal, error_trace = self.worker_init_status_queue.get()
+                # Send ACK to the worker
+                self.worker_init_status_queue.put("ACK")
+                logger.info("get signal from executor worker")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -327,6 +343,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+            logger.error(f"Executor worker initialization error: {error_trace}")
             self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
@@ -350,7 +367,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None)
+            self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
         if not self.workers_started:

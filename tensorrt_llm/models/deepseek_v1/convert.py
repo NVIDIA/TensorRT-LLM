@@ -25,7 +25,7 @@ from ..._utils import pad_vocab_size, release_gc
 def load_hf_deepseek(model_dir):
     model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                  device_map='auto',
-                                                 torch_dtype='auto',
+                                                 dtype='auto',
                                                  trust_remote_code=True)
     return model
 

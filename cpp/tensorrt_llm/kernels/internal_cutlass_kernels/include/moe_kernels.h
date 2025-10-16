@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include <cstdint>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
@@ -797,9 +798,9 @@ private:
         WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
         float const* const token_topk_unpermuted_scales, int const* const unpermuted_row_to_permuted_row,
         int const* const expert_for_source_row, int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
-        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
-        QuantParams& quant_params, cudaStream_t stream);
+        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const unpadded_hidden_size,
+        int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        MOEParallelismConfig parallelism_config, QuantParams& quant_params, cudaStream_t stream);
 
     T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
         int64_t const* num_valid_tokens_ptr, int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq,

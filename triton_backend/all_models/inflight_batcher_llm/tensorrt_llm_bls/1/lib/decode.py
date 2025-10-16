@@ -103,6 +103,7 @@ class Request:
     request_id: Optional[str] = None
     mrope_rotary_cos_sin: Optional[np.ndarray] = None
     mrope_position_deltas: Optional[np.ndarray] = None
+    image_sizes_input: Optional[np.ndarray] = None
 
     def validate(self):
         _validate_non_empty(self.text_input, "text_input is required")

@@ -27,11 +27,41 @@ def _add_trt_llm_dll_directory():
 
 _add_trt_llm_dll_directory()
 
+
+def _preload_python_lib():
+    """
+    Preload Python library.
+
+    On Linux, the python executable links to libpython statically,
+    so the dynamic library `libpython3.x.so` is not loaded.
+    When using virtual environment on top of non-system Python installation,
+    our libraries installed under `$VENV_PREFIX/lib/python3.x/site-packages/`
+    have difficulties loading `$PREFIX/lib/libpython3.x.so.1.0` on their own,
+    since venv does not symlink `libpython3.x.so` into `$VENV_PREFIX/lib/`,
+    and the relative path from `$VENV_PREFIX` to `$PREFIX` is arbitrary.
+
+    We preload the libraries here since the Python executable under `$PREFIX/bin`
+    can easily find the library.
+    """
+    import platform
+    on_linux = platform.system() == "Linux"
+    if on_linux:
+        import sys
+        from ctypes import cdll
+        v_major, v_minor, *_ = sys.version_info
+        pythonlib = f'libpython{v_major}.{v_minor}.so'
+        _ = cdll.LoadLibrary(pythonlib + '.1.0')
+        _ = cdll.LoadLibrary(pythonlib)
+
+
+_preload_python_lib()
+
 import sys
 
-# Need to import xgrammar before tensorrt_llm library,
-# otherwise `MemoryError: std::bad_alloc` pattern error will be raised.
-import xgrammar  # noqa
+# Need to import torch before tensorrt_llm library, otherwise some shared binary files
+# cannot be found for the public PyTorch, raising errors like:
+# ImportError: libc10.so: cannot open shared object file: No such file or directory
+import torch  # noqa
 
 import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.functional as functional
@@ -51,7 +81,7 @@ from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, LlmArgs
+from .llmapi import LLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -105,6 +135,7 @@ __all__ = [
     'quantization',
     'tools',
     'LLM',
+    'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
@@ -117,6 +148,6 @@ __all__ = [
 
 _init()
 
-print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}")
+print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
 
 sys.stdout.flush()

@@ -43,11 +43,13 @@ def _patch_unsupported_input_tensor():
     """
     original_fn = lowering.unsupported_input_tensor
 
-    def patched_fn(t: torch.Tensor, parent=None, node=None):
+    def patched_fn(t: torch.Tensor, *args, **kwargs):
         """Bypass meta tensor check."""
         if t.is_meta:
             return False
-        return original_fn(t, parent, node)
+        return original_fn(
+            t, *args, **kwargs
+        )  # a generic pass-through of the arguments to accommodate torch side change
 
     lowering.unsupported_input_tensor = patched_fn
     try:

@@ -572,11 +572,14 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         = isCrossAttention() ? cross_kv_length : (useKVCache() ? inputs[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
     int const max_num_tokens
         = mRemovePadding ? inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] : max_num_seq * max_context_length;
+    int const max_blocks_per_sequence
+        = (useKVCache() && mPagedKVCache) ? inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)].dims.d[3] : 0;
+
     size_t const context_workspace_size
         = getWorkspaceSizeForContext(type, max_num_seq, max_context_length, cross_kv_length, max_num_tokens);
 
-    size_t const generation_workspace_size
-        = getWorkspaceSizeForGeneration(type, max_num_seq, max_kv_cache_length, max_num_tokens);
+    size_t const generation_workspace_size = getWorkspaceSizeForGeneration(
+        type, max_num_seq, max_kv_cache_length, max_num_tokens, max_blocks_per_sequence);
 
     size_t attention_input_workspace_size = 0;
 
@@ -1046,6 +1049,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         enqueue_params.host_block_offsets = host_block_offsets;
         enqueue_params.batch_size = batch_size;
         enqueue_params.mrope_rotary_cos_sin = mrope_rotary_cos_sin;
+        enqueue_params.total_kv_len = enqueue_params.num_tokens;
 
         if (isCrossAttention())
         {

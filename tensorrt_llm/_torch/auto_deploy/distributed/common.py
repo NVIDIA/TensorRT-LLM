@@ -2,13 +2,14 @@
 
 import atexit
 import os
-import socket
 import sys
 from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tensorrt_llm._utils import get_free_port as _get_free_port
 
 from ..utils.logger import ad_logger
 
@@ -69,10 +70,7 @@ def all_gather_object(object_list, object, group=None):
 
 
 def get_free_port():
-    sock = socket.socket()
-    sock.bind(("", 0))
-    port = sock.getsockname()[1]
-    return port
+    return _get_free_port()
 
 
 def get_world_size() -> int:
@@ -136,12 +134,18 @@ def initialize(rank: int = 0, world_size: int = 1, port: Optional[int] = None) -
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
+    os.environ["LOCAL_RANK"] = str(local_rank)
 
     # Necessary to assign a device to each rank.
     torch.cuda.set_device(local_rank)
 
     # We use nccl backend
-    dist.init_process_group("nccl", world_size=world_size, rank=local_rank)
+    dist.init_process_group(
+        "nccl",
+        world_size=world_size,
+        rank=local_rank,
+        device_id=torch.device(local_rank),
+    )
 
     # Register cleanup function to be called at exit
     atexit.register(cleanup)

@@ -17,6 +17,7 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs.multimodal import default_hasher
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
@@ -72,10 +73,13 @@ def load_base64_image(parsed_url: str) -> Image.Image:
     return image
 
 
-def load_image(image: str,
+def load_image(image: Union[str, Image.Image],
                format: str = "pt",
                device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    if isinstance(image, Image.Image):
+        return image.convert('RGB')
 
     parsed_url = urlparse(image)
 
@@ -94,10 +98,13 @@ def load_image(image: str,
 
 
 async def async_load_image(
-        image: str,
+        image: Union[str, Image.Image],
         format: str = "pt",
         device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    if isinstance(image, Image.Image):
+        return image.convert('RGB')
 
     parsed_url = urlparse(image)
 
@@ -386,12 +393,13 @@ def resolve_hf_chat_template(
 
 def handle_placeholder_exceptions(model_type: str,
                                   conversation: list[ConversationMessage],
-                                  mm_placeholder_counts: dict[str, int]):
+                                  mm_placeholder_counts: list[dict[str, int]]):
     if model_type == "llava_next":
         # we need to convert the flattened content back to conversation format
-        for conv in conversation:
+        for conv, mm_placeholder_count in zip(conversation,
+                                              mm_placeholder_counts):
             conv["content"] = [{"type": "text", "text": conv["content"]}, \
-                *[{"type": "image"} for _ in mm_placeholder_counts]]
+                *[{"type": "image"} for _ in range(mm_placeholder_count['<image>'])]]
     else:
         raise ValueError(f"This path should not be reached for: {model_type}")
     return conversation
@@ -426,7 +434,7 @@ def apply_chat_template(
     if model_type in PLACEHOLDER_EXCEPTIONS:
         # flattened content do not work for these models, so go back to other formats as needed
         conversation = handle_placeholder_exceptions(model_type, conversation,
-                                                     mm_placeholder_counts)
+                                                     [mm_placeholder_counts])
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
@@ -572,7 +580,10 @@ def default_multimodal_input_loader(
             # Check if mdata is a MultimodalData
             if isinstance(mdata,
                           dict) and "modality" in mdata and "data" in mdata:
-                mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+                modality = mdata["modality"]
+                if modality == "multiple_image":
+                    modality = "image"
+                mm_data_tracker.add_data(modality, mdata["data"])
             else:
                 # Add embeddings to the tracker for placeholder handling
                 mm_data_tracker.add_data(mdata["modality"],
@@ -600,3 +611,14 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
+
+
+def get_cache_salt_id(cache_salt: str) -> int:
+    b = cache_salt.encode("utf-8")
+    h = default_hasher(b).digest(length=8)
+    cache_salt_id = int.from_bytes(h, "little", signed=False)
+    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
+        raise ValueError(
+            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
+
+    return cache_salt_id

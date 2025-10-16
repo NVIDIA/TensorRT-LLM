@@ -8,6 +8,7 @@ import torch
 from pydantic import BaseModel
 
 from tensorrt_llm.bindings import executor as tllme
+from tensorrt_llm.logger import logger
 
 
 @dataclass(slots=True, kw_only=True)
@@ -109,19 +110,6 @@ class BatchedLogitsProcessor(ABC):
 
 
 @dataclass(slots=True, kw_only=True)
-class AdditionalModelOutput:
-    """An additional output to gather from the model.
-
-    Args:
-        name (str): The name of the additional output to gather from the model.
-        gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.
-    """  # noqa: E501
-
-    name: str
-    gather_context: bool
-
-
-@dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
 
@@ -153,13 +141,25 @@ class SamplingParams:
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
         use_beam_search (bool): Whether to use beam search. Defaults to False.
 
-        top_k (int, optional): Controls number of logits to sample from. None means using C++ runtime default 0, i.e., all logits. Defaults to None.
-        top_p (float, optional): Controls the top-P probability to sample from. None means using C++ runtime default 0.f. Defaults to None.
+        top_k (int, optional): Controls number of logits to sample from. Can assume non-negative values, where 0 means 'all logits'. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If temperature > 0 and/or top_p < 1 are specified, sampling will proceed accordingly and top_k will default to top_k = 0.
+            Setting top_k = 1 results in greedy sampling.
+        top_p (float, optional): Controls the top-P probability to sample from. Can have values between 0 and 1. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If temperature > 0 and/or top_k > 1 are specified, sampling will proceed accordingly and top_p will default to top_p = 1.
+            Setting top_p = 0 should result in greedy sampling, but is currently disallowed in the backend.
         top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.
         top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
         top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
         seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
-        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. None means using C++ runtime default 1.0f. Defaults to None.
+        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values >= 0.f. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If top_p < 1 and/or top_k > 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.
+            Setting temperature = 0 results in greedy sampling.
         min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
         beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
@@ -178,7 +178,7 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
-        additional_model_outputs (List[tensorrt_llm.sampling_params.AdditionalModelOutput], optional): The additional outputs to gather from the model. Defaults to None.
+        additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
@@ -246,7 +246,7 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
-    additional_model_outputs: Optional[List[AdditionalModelOutput]] = None
+    additional_model_outputs: Optional[List[str]] = None
 
     # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
     # Can be deprecated after migration to PyTorch backend.
@@ -295,11 +295,19 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
-        if self.best_of < self.n:
+        if self.top_p is not None and (self.top_p < 0 or self.top_p > 1):
+            raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
+        if self.top_k is not None and self.top_k < 0:
+            raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.temperature is not None and self.temperature < 0:
+            raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
+
+        if self.best_of is not None and self.best_of < self.n:
             raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
 
         if (
-            self.best_of > 1
+            self.best_of is not None
+            and self.best_of > 1
             and self._greedy_decoding
             and not os.environ.get("TLLM_ALLOW_N_GREEDY_DECODING", None)
         ):
@@ -323,12 +331,25 @@ class SamplingParams:
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
+    # NB: Static, because downstream code only holds instances of
+    #     bindings.SamplingConfig (not SamplingParams).
+    @staticmethod
+    def params_imply_greedy_decoding(
+        *, temperature: Optional[float], top_p: Optional[float], top_k: Optional[int]
+    ):
+        return (
+            (temperature is None and top_p is None and top_k is None)
+            or top_k == 1
+            or top_p == 0.0
+            or temperature == 0
+        )
+
     @property
     def _greedy_decoding(self) -> bool:
-        return (
-            not self.use_beam_search
-            and (self.top_k is None or self.top_k == 1)
-            and (self.top_p is None or self.top_p == 0.0)
+        return not self.use_beam_search and self.params_imply_greedy_decoding(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
         )
 
     @property
@@ -339,10 +360,21 @@ class SamplingParams:
     def _need_return_generation_logits(self) -> bool:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
-    def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
+    def _setup(
+        self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
+    ) -> "SamplingParams":
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
+            # kimi_k2 model uses the eos_token_id in generation config
+            if (
+                hf_model_config is not None
+                and hf_model_config.model_type == "kimi_k2"
+                and generation_config is not None
+                and isinstance(generation_config.eos_token_id, int)
+            ):
+                self.end_id = generation_config.eos_token_id
+
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
@@ -449,8 +481,28 @@ class SamplingParams:
 
         if is_pytorch_backend:
             config_kwargs["return_log_probs"] = bool(self.logprobs)
+            if self.prompt_logprobs and not self.return_context_logits:
+                logger.info(
+                    "Since prompt_logprobs is requested but return_context_logits is False, "
+                    "internally enabling context logits for prompt logprobs computation. "
+                    "context logits will be dropped after computation as the user didn't explicitly request them."
+                )
+                # TODO: Find a more elegant way to do this.
+                # NOTE: This is an internal hack, so we can entirely avoid introducing
+                # `prompt_logprobs` into the executor bindings and further into
+                # model engine / sampler.
+                # This is because, prompt_logprobs is a derived quantity from
+                # context logits, and the capability to post-compute it
+                # already exists in the worker. (see _get_logprobs in worker.py)
+                config_kwargs["return_context_logits"] = True
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
+
+        if config_kwargs.get("additional_model_outputs") is not None:
+            config_kwargs["additional_model_outputs"] = [
+                tllme.AdditionalModelOutput(name=output_name, gather_context=False)
+                for output_name in config_kwargs["additional_model_outputs"]
+            ]
 
         return tllme.OutputConfig(**config_kwargs)
 

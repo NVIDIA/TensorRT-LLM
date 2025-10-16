@@ -110,7 +110,6 @@ def test_llm_phi_3_mini_4k():
         sampling_params=phi3_mini_4k_sampling_params)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5371480")
 @force_ampere
 def test_llm_phi_3_small_8k():
     phi_requirement_path = os.path.join(

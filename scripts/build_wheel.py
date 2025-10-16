@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 import os
 import platform
 import re
+import shutil
 import sys
 import sysconfig
 import tempfile
@@ -154,7 +155,7 @@ def setup_venv(project_dir: Path, requirements_file: Path,
             warnings.warn(
                 f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
                 f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "
-                f"`build_wheel.py` can recreate the virtual environment correctly."
+                f"`build_wheel.py` can recreate a virtual environment using container-provided PyTorch installation."
             )
             print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
             input("Press Ctrl+C to stop, any key to continue...\n")
@@ -187,7 +188,7 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                     f"Incompatible NVIDIA PyTorch container detected. "
                     f"The container provides PyTorch version {version_installed}, "
                     f"but current revision requires {version_required}. "
-                    f"Please recreate your container using image specified in .devcontainer/docker-compose.yml. "
+                    f"Please recreate your container using image specified in jenkins/current_image_tags.properties. "
                     f"NOTE: Please don't try install PyTorch using pip. "
                     f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues."
                 )
@@ -239,9 +240,9 @@ def setup_conan(scripts_dir, venv_python):
     # Create default profile
     build_run(f'"{venv_conan}" profile detect -f')
 
-    # Add the tensorrt-llm remote if it doesn't exist
+    # Add the TensorRT LLM remote if it doesn't exist
     build_run(
-        f'"{venv_conan}" remote add --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
+        f'"{venv_conan}" remote add --force TensorRT-LLM https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
         stdout=DEVNULL,
         stderr=DEVNULL)
 
@@ -253,7 +254,6 @@ def generate_fmha_cu(project_dir, venv_python):
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
-    os.chdir(fmha_v2_dir)
 
     env = os.environ.copy()
     env.update({
@@ -267,19 +267,41 @@ def generate_fmha_cu(project_dir, venv_python):
         "GENERATE_CU_TRTLLM": "true"
     })
 
-    build_run("rm -rf generated")
-    build_run("rm -rf temp")
-    build_run("rm -rf obj")
-    build_run("python3 setup.py", env=env)
+    shutil.rmtree(fmha_v2_dir / "generated", ignore_errors=True)
+    shutil.rmtree(fmha_v2_dir / "temp", ignore_errors=True)
+    shutil.rmtree(fmha_v2_dir / "obj", ignore_errors=True)
+    build_run("python3 setup.py", env=env, cwd=fmha_v2_dir)
+
+    # Only touches generated source files if content is updated
+    def move_if_updated(src, dst):
+        with open(src, "rb") as f:
+            new_content = f.read()
+        try:
+            with open(dst, "rb") as f:
+                old_content = f.read()
+        except FileNotFoundError:
+            old_content = None
+
+        if old_content != new_content:
+            shutil.move(src, dst)
 
     # Copy generated header file when cu path is active and cubins are deleted.
     cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
-    build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+    move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
+                    cubin_dir / "fmha_cubin.h")
 
+    generated_files = set()
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
-        build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
+        dst_file = fmha_v2_cu_dir / os.path.basename(cu_file)
+        move_if_updated(cu_file, dst_file)
+        generated_files.add(str(dst_file.resolve()))
 
-    os.chdir(project_dir)
+    # Remove extra files
+    for root, _, files in os.walk(fmha_v2_cu_dir):
+        for file in files:
+            file_path = os.path.realpath(os.path.join(root, file))
+            if file_path not in generated_files:
+                os.remove(file_path)
 
 
 def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
@@ -329,10 +351,8 @@ def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
     return str(temp_dir_path)
 
 
-def check_missing_libs(so_prefix: str) -> list[str]:
-    result = build_run(f"ldd {so_prefix}.cpython*.so",
-                       capture_output=True,
-                       text=True)
+def check_missing_libs(lib_name: str) -> list[str]:
+    result = build_run(f"ldd {lib_name}", capture_output=True, text=True)
     missing = []
     for line in result.stdout.splitlines():
         if "not found" in line:
@@ -344,7 +364,7 @@ def check_missing_libs(so_prefix: str) -> list[str]:
 
 
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
-                                deep_ep: bool):
+                                deep_ep: bool, binding_lib_name: str):
     is_nanobind = binding_type == "nanobind"
     if is_nanobind:
         build_run(f"\"{venv_python}\" -m pip install nanobind")
@@ -353,7 +373,7 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
         "CUDA_PATH") or "/usr/local/cuda"
-    missing_libs = check_missing_libs("bindings")
+    missing_libs = check_missing_libs(binding_lib_name)
     cuda_stub_dir = f"{cuda_home_dir}/lib64/stubs"
 
     if missing_libs and Path(cuda_stub_dir).exists():
@@ -437,7 +457,7 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         binding_type: str = "pybind",
+         binding_type: str = "nanobind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
@@ -586,7 +606,8 @@ def main(*,
         build_deep_ep = "OFF"
         build_deep_gemm = "OFF"
     else:
-        targets.extend(["th_common", "bindings", "deep_ep", "deep_gemm"])
+        targets.extend(
+            ["th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils"])
         build_pyt = "ON"
         build_deep_ep = "ON"
         build_deep_gemm = "ON"
@@ -608,16 +629,13 @@ def main(*,
     source_dir = get_source_dir()
 
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
-    if clean or generate_fmha:
-        build_run(f"rm -rf {fmha_v2_cu_dir}")
-        generate_fmha_cu(project_dir, venv_python)
-    elif not fmha_v2_cu_dir.exists():
+    if clean or generate_fmha or not fmha_v2_cu_dir.exists():
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --remote=TensorRT-LLM --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -751,6 +769,17 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+            build_run(
+                f'patchelf --set-rpath \'$ORIGIN/ucx/\' {lib_dir / "libtensorrt_llm_ucx_wrapper.so"}'
+            )
+            if os.path.exists("/usr/local/ucx"):
+                ucx_dir = lib_dir / "ucx"
+                if ucx_dir.exists():
+                    clear_folder(ucx_dir)
+                install_tree("/usr/local/ucx/lib", ucx_dir, dirs_exist_ok=True)
+                build_run(
+                    f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
+                )
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
@@ -759,6 +788,22 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
                 lib_dir / "libtensorrt_llm_nixl_wrapper.so")
+            build_run(
+                f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
+            )
+            if os.path.exists("/opt/nvidia/nvda_nixl"):
+                nixl_dir = lib_dir / "nixl"
+                if nixl_dir.exists():
+                    clear_folder(nixl_dir)
+                nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
+                if not os.path.exists(nixl_lib_path):
+                    nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu"
+                if not os.path.exists(nixl_lib_path):
+                    nixl_lib_path = "/opt/nvidia/nvda_nixl/lib64"
+                install_tree(nixl_lib_path, nixl_dir, dirs_exist_ok=True)
+                build_run(
+                    f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
+                )
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -767,6 +812,8 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
+        install_file(build_dir / "tensorrt_llm/runtime/utils/libpg_utils.so",
+                     lib_dir / "libpg_utils.so")
 
     deep_ep_dir = pkg_dir / "deep_ep"
     if deep_ep_dir.is_symlink():
@@ -792,6 +839,15 @@ def main(*,
         install_file(build_dir / "tensorrt_llm/executor_worker/executorWorker",
                      bin_dir / "executorWorker")
 
+    scripts_dir = pkg_dir / "scripts"
+    if scripts_dir.exists():
+        clear_folder(scripts_dir)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    if not on_windows:
+        install_file(project_dir / "docker/common/install_tensorrt.sh",
+                     scripts_dir / "install_tensorrt.sh")
+
     if not cpp_only:
 
         def get_binding_lib(subdirectory, name):
@@ -806,7 +862,9 @@ def main(*,
             ) == 1, f"Exactly one binding library should be present: {binding_lib}"
             return binding_lib[0]
 
-        install_file(get_binding_lib(binding_type, "bindings"), pkg_dir)
+        binding_lib_dir = get_binding_lib(binding_type, "bindings")
+        binding_lib_file_name = binding_lib_dir.name
+        install_file(binding_lib_dir, pkg_dir)
 
         with (build_dir / "tensorrt_llm" / "deep_ep" /
               "cuda_architectures.txt").open() as f:
@@ -846,7 +904,7 @@ def main(*,
                 else:  # on linux
                     generate_python_stubs_linux(
                         binding_type, venv_python,
-                        bool(deep_ep_cuda_architectures))
+                        bool(deep_ep_cuda_architectures), binding_lib_file_name)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -864,6 +922,40 @@ def main(*,
             # This breaks the Windows CI/CD pipeline when building
             # and validating python changes in the whl.
             clear_folder(dist_dir)
+
+        # Modify requirements.txt for wheel build based on CUDA version
+        def modify_requirements_for_cuda():
+            requirements_file = project_dir / "requirements.txt"
+            if os.environ.get("CUDA_VERSION", "").startswith("12."):
+                print(
+                    "Detected CUDA 12 environment, modifying requirements.txt for wheel build..."
+                )
+                with open(requirements_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                modified_lines = []
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    if "<For CUDA 12.9>" in line and line.strip().startswith(
+                            "#"):
+                        new_line = line.replace("# ", "", 1)
+                        print(
+                            f"Enable CUDA 12.9 dependency: {new_line.strip()}")
+                        modified_lines.append(new_line)
+                        print(
+                            f"Disable CUDA 13 dependency: # {lines[i + 1].strip()}"
+                        )
+                        modified_lines.append("# " + lines[i + 1])
+                        i += 1
+                    else:
+                        modified_lines.append(line)
+                    i += 1
+                with open(requirements_file, 'w', encoding='utf-8') as f:
+                    f.writelines(modified_lines)
+                return True
+            return False
+
+        modify_requirements_for_cuda()
 
         build_run(
             f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
@@ -984,8 +1076,8 @@ def add_arguments(parser: ArgumentParser):
     )
     parser.add_argument("--binding_type",
                         choices=["pybind", "nanobind"],
-                        default="pybind",
-                        help="Which binding type to build: pybind or nanobind")
+                        default="nanobind",
+                        help="Which binding library to use: pybind or nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime")

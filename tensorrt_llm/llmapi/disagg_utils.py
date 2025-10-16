@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import IntEnum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -16,9 +16,10 @@ __all__ = [
 ]
 
 
-class ServerRole(Enum):
+class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
+    MM_ENCODER = 2
 
 
 @dataclass
@@ -43,6 +44,21 @@ class ConditionalDisaggConfig():
 
 
 @dataclass
+class MinimalInstances:
+    context_servers: int = 1  # the minimal number of context servers
+    generation_servers: int = 1  # the minimal number of generation servers
+
+
+@dataclass
+class DisaggClusterConfig:
+    cluster_uri: str  # the uri of the cluster storage
+    cluster_name: str = ""  # the name of the cluster, used like a namespace
+    minimal_instances: Optional[MinimalInstances] = None
+    heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
+    inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
+
+
+@dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
     hostname: str = "localhost"
@@ -50,7 +66,8 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
-    max_retries: int = 3
+    max_retries: int = 1
+    perf_metrics_max_requests: int = 0
 
 
 @dataclass
@@ -60,6 +77,20 @@ class MetadataServerConfig():
     port: int = 2379
     health_check_timeout: float = 5.0
     refresh_interval: float = 10.0
+
+
+def get_ctx_gen_server_urls(
+        server_configs: list[CtxGenServerConfig]
+) -> tuple[list[str], list[str]]:
+    ctx_server_urls = []
+    gen_server_urls = []
+    for cfg in server_configs:
+        if cfg.type == "ctx":
+            ctx_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+        else:
+            gen_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+
+    return ctx_server_urls, gen_server_urls
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -75,7 +106,8 @@ def parse_disagg_config_file(yaml_config_file: str):
 
 def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
-                       max_retries: int = 3,
+                       max_retries: int = 1,
+                       perf_metrics_max_requests: int = 0,
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
@@ -114,7 +146,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
-                                conditional_disagg_config, max_retries)
+                                conditional_disagg_config, max_retries,
+                                perf_metrics_max_requests)
 
     return config
 

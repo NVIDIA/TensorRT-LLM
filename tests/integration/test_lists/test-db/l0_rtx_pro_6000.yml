@@ -17,7 +17,7 @@ l0_rtx_pro_6000:
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
-  - unittest/_torch/test_attention_mla.py
+  - unittest/_torch/attention/test_attention_mla.py
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype0]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[dtype1]
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
@@ -26,11 +26,19 @@ l0_rtx_pro_6000:
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-70B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-70B] TIMEOUT (90)
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-70B-FP8-llama-3.1-model/Llama-3.1-70B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-NVFP4-nvfp4-quantized/Llama-3_3-Nemotron-Super-49B-v1_nvfp4_hf]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-FP8-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-NVFP4-nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1]
   - test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-FP8-Mixtral-8x7B-Instruct-v0.1-fp8]
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_fp8_hf-Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf] # 3mins
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf] # 2mins
+  - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-20B-gpt_oss/gpt-oss-20b]
+  - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False] # 8mins
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True] # 8 mins
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-cutlass-auto]
+
 - condition:
     ranges:
       system_gpu_count:
@@ -82,3 +90,15 @@ l0_rtx_pro_6000:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_online_eplb[mtp_nextn=2]
+  # - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False] # hopper only
+  # - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True]
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=0]
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=2]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_cutlass] # 20 mins
+  # - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_cutlass_eagle3] # failed
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True]
+  # - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=False] # failed
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_cutlass-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_cutlass-torch_compile=True]

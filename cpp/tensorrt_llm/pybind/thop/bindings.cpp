@@ -32,8 +32,8 @@ void initBindings(pybind11::module_& m)
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = std::nullopt, py::arg("v") = std::nullopt, py::arg("output"),
         py::arg("output_sf") = std::nullopt, py::arg("out_dtype") = std::nullopt, py::arg("workspace_") = std::nullopt,
-        py::arg("sequence_length"), py::arg("host_past_key_value_lengths"), py::arg("context_lengths"),
-        py::arg("host_context_lengths"), py::arg("host_request_types"),
+        py::arg("sequence_length"), py::arg("host_past_key_value_lengths"), py::arg("host_total_kv_lens"),
+        py::arg("context_lengths"), py::arg("host_context_lengths"), py::arg("host_request_types"),
         py::arg("kv_cache_block_offsets") = std::nullopt, py::arg("host_kv_cache_block_offsets") = std::nullopt,
         py::arg("host_kv_cache_pool_pointers") = std::nullopt, py::arg("host_kv_cache_pool_mapping") = std::nullopt,
         py::arg("cache_indirection") = std::nullopt, py::arg("kv_scale_orig_quant") = std::nullopt,
@@ -48,12 +48,14 @@ void initBindings(pybind11::module_& m)
         py::arg("q_scaling"), py::arg("position_embedding_type"), py::arg("rotary_embedding_dim"),
         py::arg("rotary_embedding_base"), py::arg("rotary_embedding_scale_type"), py::arg("rotary_embedding_scales"),
         py::arg("rotary_embedding_max_position_info"), py::arg("use_paged_context_fmha"),
-        py::arg("attention_input_type") = std::nullopt, py::arg("is_mla_enable"), py::arg("q_lora_rank") = std::nullopt,
+        py::arg("attention_input_type") = std::nullopt, py::arg("is_mla_enable"),
+        py::arg("chunked_prefill_buffer_batch_size") = std::nullopt, py::arg("q_lora_rank") = std::nullopt,
         py::arg("kv_lora_rank") = std::nullopt, py::arg("qk_nope_head_dim") = std::nullopt,
         py::arg("qk_rope_head_dim") = std::nullopt, py::arg("v_head_dim") = std::nullopt,
         py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
-        py::arg("mla_context_paged_kv") = std::nullopt, py::arg("mla_context_kv_cache_block_offsets") = std::nullopt,
-        py::arg("attention_chunk_size") = std::nullopt, py::arg("softmax_stats_tensor") = std::nullopt,
-        py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"), "Multi-head attention operation");
+        py::arg("mla_tensor_params"), py::arg("attention_chunk_size") = std::nullopt,
+        py::arg("softmax_stats_tensor") = std::nullopt, py::arg("spec_decoding_bool_params"),
+        py::arg("spec_decoding_tensor_params"), py::arg("sparse_attention_params"), "Multi-head attention operation",
+        py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop

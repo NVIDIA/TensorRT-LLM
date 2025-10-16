@@ -157,9 +157,9 @@ class FP8Linear(nn.Linear):
         )
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_fp4_linear", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_quant_nvfp4_linear", mutates_args=())
 @torch.compile(dynamic=True)
-def fp4_linear(
+def nvfp4_linear(
     input: torch.Tensor,
     weight_fp4: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -212,7 +212,7 @@ def fp4_linear(
     return output.reshape(*input_shape[:-1], n)
 
 
-@fp4_linear.register_fake
+@nvfp4_linear.register_fake
 def fp4_linear_fake(
     input: torch.Tensor,
     weight_fp4: torch.Tensor,
@@ -299,15 +299,3 @@ def fp8_bmm_fake(
     """Fake implementation of fp8_bmm for testing and tracing."""
     # Use standard bmm
     return torch.bmm(input.to(torch.float), mat2.to(torch.float)).to(input.dtype)
-
-
-QUANT_LINEAR_OPS = [
-    torch.ops.auto_deploy.torch_quant_fp8_linear,
-    torch.ops.auto_deploy.torch_quant_fp4_linear,
-]
-
-QUANT_BMM_OPS = [
-    torch.ops.auto_deploy.torch_quant_fp8_bmm,
-]
-
-QUANT_OPS = QUANT_LINEAR_OPS + QUANT_BMM_OPS
