@@ -6,7 +6,7 @@ import math
 import os
 import types
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
@@ -276,9 +276,8 @@ class AttentionDpConfig(StrictBaseModel):
         return cls(**data)
 
 
-@dataclass
-class _ParallelConfig:
-    ''' The model distribution configs for LLM.  '''
+class _ParallelConfig(StrictBaseModel):
+    """The model distribution configs for LLM."""
     tp_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
@@ -286,11 +285,11 @@ class _ParallelConfig:
     moe_cluster_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
-    cp_config: dict = field(default_factory=dict)
+    cp_config: dict = Field(default_factory=dict)
     enable_attention_dp: bool = False
     enable_lm_head_tp_in_adp: bool = False
 
-    _devices: Optional[List[int]] = field(default=None, init=False)
+    _devices: Optional[List[int]] = PrivateAttr(default=None)
 
     @property
     def devices(self) -> List[int]:
@@ -307,7 +306,7 @@ class _ParallelConfig:
         self._devices = devices
 
     @property
-    def world_size(self) -> bool:
+    def world_size(self) -> int:
         return self.tp_size * self.pp_size * self.cp_size
 
     @property
@@ -1638,7 +1637,7 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype",
     )
 
-    _parallel_config: Optional[object] = PrivateAttr(default=None)
+    _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
     _speculative_model_format: Optional[_ModelFormatKind] = PrivateAttr(

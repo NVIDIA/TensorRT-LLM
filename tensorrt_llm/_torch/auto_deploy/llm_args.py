@@ -391,8 +391,13 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         rank to automatically shard the model. This is just to ensure that other objects in the
         runtime that may read parallel_config can do so.
         """
-        self._parallel_config = _ParallelConfig(gpus_per_node=self.gpus_per_node)
-        self._parallel_config.world_size = self.world_size
+
+        # Set tp_size = self.world_size so that _ParallelConfig.world_size will return the
+        # correct value (computed as tp_size * pp_size * cp_size). This does not necessarily
+        # mean that TP will actually be used.
+        self._parallel_config = _ParallelConfig(
+            tp_size=self.world_size, gpus_per_node=self.gpus_per_node
+        )
         return self
 
     @model_validator(mode="after")
