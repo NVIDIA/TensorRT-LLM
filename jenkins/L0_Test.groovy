@@ -1664,6 +1664,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
         // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
+        // Enable NCCL debug information for multi-GPU tests
+        extraInternalEnv += " NCCL_DEBUG=INFO"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
