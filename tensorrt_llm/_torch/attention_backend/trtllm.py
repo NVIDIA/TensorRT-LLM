@@ -198,6 +198,7 @@ class TrtllmAttentionWrapper:
         sparse_attn_indices: Optional[torch.Tensor] = None,
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         sparse_mla_topk: int = 0,
+        sparse_attn_indices_block_size: int = 1,
         **kwargs,
     ):
         """
@@ -284,6 +285,7 @@ class TrtllmAttentionWrapper:
         self.sparse_attn_indices = sparse_attn_indices
         self.sparse_attn_offsets = sparse_attn_offsets
         self.sparse_mla_topk = sparse_mla_topk
+        self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -532,6 +534,7 @@ class TrtllmAttentionWrapper:
             mla_bmm1_scale,
             mla_bmm2_scale,
             quant_q_buffer,
+            self.sparse_attn_indices_block_size,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -1308,11 +1311,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
 
         sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
+        sparse_attn_indices_block_size = 1
         if self.sparse_attention_config is not None:
             sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
                 q, k, metadata, **kwargs)
             sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
                 q, k, metadata, **kwargs)
+            sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
+            )
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1367,7 +1373,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
-                metadata, 'sparse_mla_topk') else 0)
+                metadata, 'sparse_mla_topk') else 0,
+            sparse_attn_indices_block_size=sparse_attn_indices_block_size,
+        )
         out_dtype = None
         if out_scale is not None:
             if use_nvfp4_output:
@@ -1589,18 +1597,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.v_head_dim,
         )
 
-    def sparse_attn_predict(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        metadata: TrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse attn indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
-
     def sparse_kv_predict(
         self,
         q: torch.Tensor,
@@ -1610,6 +1606,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse kv indices. It's implemented in the derived class.
+        """
+        raise NotImplementedError
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+            Predict sparse attn indices. It's implemented in the derived class.
         """
         raise NotImplementedError
 

@@ -35,6 +35,8 @@ struct SparseAttentionParams
     int32_t sparse_mla_topk{0};              // for DSA attention
     void* sparse_mla_kv_cache_pool{nullptr}; // for DSA attention
 
+    int32_t sparse_attn_indices_block_size{1};
+
     std::string toString() const
     {
         std::stringstream ss;
@@ -43,7 +45,8 @@ struct SparseAttentionParams
            << "sparse_kv_offsets: " << this->sparse_kv_offsets << std::endl
            << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl
            << "sparse_mla_topk: " << this->sparse_mla_topk << std::endl
-           << "sparse_mla_kv_cache_pool: " << this->sparse_mla_kv_cache_pool << std::endl;
+           << "sparse_mla_kv_cache_pool: " << this->sparse_mla_kv_cache_pool << std::endl
+           << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size << std::endl;
         return ss.str();
     }
 };

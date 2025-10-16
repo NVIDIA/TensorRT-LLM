@@ -89,7 +89,7 @@ public:
         torch::optional<torch::Tensor> sparse_attn_offsets, int32_t const sparse_mla_topk,
         std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer) const
+        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer, int64_t const sparse_attn_indices_block_size) const
         = 0;
 };
 
@@ -149,7 +149,7 @@ public:
         torch::optional<torch::Tensor> sparse_attn_offsets, int32_t const sparse_mla_topk,
         std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer) const override
+        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer, int64_t const sparse_attn_indices_block_size) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -395,6 +395,7 @@ public:
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().data_ptr<int32_t>() : nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_offsets
             = sparse_attn_offsets.has_value() ? sparse_attn_offsets.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = sparse_attn_indices_block_size;
         if (op.isMLAEnabled() && op.mUseSparseAttention)
         {
             op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
@@ -592,7 +593,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
     std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
     std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-    std::optional<torch::Tensor> quant_q_buffer)
+    std::optional<torch::Tensor> quant_q_buffer, int64_t const sparse_attn_indices_block_size)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -857,7 +858,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
             sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
-            quant_q_buffer);
+            quant_q_buffer, sparse_attn_indices_block_size);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -876,7 +877,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
             attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
             sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
-            quant_q_buffer);
+            quant_q_buffer, sparse_attn_indices_block_ssize);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
