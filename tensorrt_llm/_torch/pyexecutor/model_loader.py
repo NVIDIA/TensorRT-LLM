@@ -237,9 +237,10 @@ class ModelLoader:
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir)
+                        model.llm_checkpoint_dir, mapping=self.mapping)
                 else:
-                    weights = checkpoint_loader.load_weights(checkpoint_dir)
+                    weights = checkpoint_loader.load_weights(
+                        checkpoint_dir, mapping=self.mapping)
 
                 weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
@@ -249,7 +250,8 @@ class ModelLoader:
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
                     weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model_dir)
+                        self.spec_config.speculative_model_dir,
+                        mapping=self.mapping)
                     self._call_load_weights(model.load_draft_weights, weights,
                                             weight_mapper)
 

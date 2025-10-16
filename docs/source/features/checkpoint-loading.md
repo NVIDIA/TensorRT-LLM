@@ -31,7 +31,7 @@ The `BaseCheckpointLoader` is the central base interface for all checkpoint load
 
 **Key Methods:**
 - `load_config(checkpoint_dir, **kwargs)`: Loads and returns a `ModelConfig` object
-- `load_weights(checkpoint_dir, **kwargs)`: Loads and returns a dictionary of weights
+- `load_weights(checkpoint_dir, mapping, **kwargs)`: Loads and returns a dictionary of weights
 - `get_initialized_weight_mapper(model, config)`: Returns a runtime initialized weight mapper for the model
 - `cleanup()`: Releases resources and cleans up internal state
 
@@ -63,7 +63,7 @@ Handles the loading of model weights from storage:
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 
 class CustomWeightLoader(BaseWeightLoader):
-    def load_weights(self, checkpoint_dir: str) -> dict[str, Any]:
+    def load_weights(self, checkpoint_dir: str, mapping: Mapping) -> dict[str, Any]:
         # Load weights from your custom format
         # Return a dictionary mapping parameter names to tensors
         return weights_dict
@@ -186,11 +186,12 @@ from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_weight
 
 @register_checkpoint_weight_loader("CUSTOM_FORMAT")
 class CustomWeightLoader(BaseWeightLoader):
-    def load_weights(self, checkpoint_dir: str, **kwargs) -> dict[str, Any]:
+    def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
         """
         Load weights from your custom format.
         Args:
             checkpoint_dir: Directory containing checkpoint files
+            mapping: A mapping object containing the distributed configuration.
             **kwargs: Additional loading parameters
         Returns:
             Dictionary mapping parameter names to tensors
