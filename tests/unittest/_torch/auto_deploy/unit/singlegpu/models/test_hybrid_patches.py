@@ -1,12 +1,12 @@
-import torch  # noqa
-import torch.export as te
-from torch.export import Dim  # noqa
 import pytest
+import torch
+import torch.export as te
+from _model_test_utils import get_small_model_config
+from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
-from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device  # noqa
-from _model_test_utils import get_small_model_config
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
