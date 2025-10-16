@@ -146,7 +146,7 @@ def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     group: List[int],
     rank: int,
-    group_boxed: object,
+    group_boxed: Optional[object] = None,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -157,7 +157,7 @@ def _allgather(
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
         group (List[int]): The list of ranks to participate in the all-gather.
         rank (int): The rank of the current process.
-        group_boxed (object): The boxed ProcessGroup object for the list of ranks.
+        group_boxed (object): The boxed ProcessGroup object for the list of ranks, if available.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
@@ -256,8 +256,9 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    return _allgather(input, mapping.tp_group, mapping.tp_rank,
-                      mapping.tp_group_pg.boxed(), dim, sizes)
+    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
+    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
+                      dim, sizes)
 
 
 def cp_allgather(
@@ -279,8 +280,9 @@ def cp_allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    return _allgather(input, mapping.cp_group, mapping.cp_rank,
-                      mapping.cp_group_pg.boxed(), dim, sizes)
+    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
+    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_boxed,
+                      dim, sizes)
 
 
 def alltoall_helix(

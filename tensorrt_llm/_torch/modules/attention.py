@@ -774,7 +774,7 @@ class MLA(nn.Module):
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads_tp * self.qk_head_dim,
+                self.num_heads * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
                 mapping=mapping,
@@ -796,7 +796,7 @@ class MLA(nn.Module):
 
             self.q_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads_tp * self.qk_head_dim,
+                self.num_heads * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
                 mapping=mapping,
@@ -813,8 +813,7 @@ class MLA(nn.Module):
 
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
-            tp_size * self.num_heads_tp *
-            (self.qk_nope_head_dim + self.v_head_dim),
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=bias,
             dtype=dtype,
             mapping=mapping,
@@ -845,7 +844,7 @@ class MLA(nn.Module):
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
         self.o_proj = Linear(
-            self.num_heads_tp_cp * self.v_head_dim * tp_size * cp_size,
+            self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
