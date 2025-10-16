@@ -374,20 +374,25 @@ class GenerationResultBase:
             # each streamed response_tensors.log_probs[src_idx]
             # contains a streamwise monotonically growing list of logprobs.
             # so we need to accumulate only the new ones unique to that particular streamed response
-            assert output._last_logprobs_len <= len(
-                response_tensors.log_probs[src_idx]
-            ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
-                f"{len(response_tensors.log_probs[src_idx])})")
-            output.logprobs += response_tensors.log_probs[src_idx][
-                output._last_logprobs_len:]
-            # overcome some WAR in the cpp executor
-            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
-                # Check if logprobs is a list (not a dict or other structure)
-                if len(output.logprobs) > output.length:
-                    # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
-                    # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
-                    output.logprobs = output.logprobs[:output.length]
+            diff_start = response_tensors.log_probs_diff_start[src_idx]
+            if diff_start != 0:
+                assert (output._last_logprobs_len == diff_start), (
+                    f"New response logprobs indices mismatch for request {self.id}, "
+                    f"expect from {output._last_logprobs_len} but got from index {diff_start} "
+                    f"with logprobs {response_tensors.log_probs[src_idx]}")
+
+                if response_tensors.log_probs[src_idx] is not None:
+                    output.logprobs += response_tensors.log_probs[src_idx][:]
                 assert len(output.logprobs) == output.length
+            else:
+                # beam search case, may reconstruct the full history
+                assert (
+                    len(response_tensors.log_probs[src_idx]) == output.length
+                ), (f"Try to set logprobs from the beginning but with mismatch length "
+                    f"({len(response_tensors.log_probs[src_idx])} != {output.length})"
+                    )
+
+                output.logprobs = response_tensors.log_probs[src_idx]
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[

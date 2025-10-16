@@ -183,15 +183,19 @@ class LogProbStorage:
     beam_width: int = -1
     log_probs: list[TokenLogprobs]
     cum_log_probs: list[float]
+    _should_sent_from: list[
+        int]  # the starting index of next log_probs to be sent
 
     def _init(self, first_input: list[TokenLogprobs]):
         self.beam_width = len(first_input)
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
+        self._should_sent_from = [0 for _ in range(self.beam_width)]
 
-    def append(self,
-               new_probs: list[TokenLogprobs],
-               cum_log_probs: Optional[list[float]] = None):
+    def append_log_probs(self,
+                         new_probs: list[TokenLogprobs],
+                         cum_log_probs: Optional[list[float]] = None,
+                         new_logprobs_start: Optional[list[int]] = None):
         """
         new_probs: [beam_width, num_tokens]
         cum_log_probs: [beam_width]
@@ -208,8 +212,14 @@ class LogProbStorage:
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+            # will only set for result's logprob storage
+            if new_logprobs_start is not None:
+                self._should_sent_from[beam_idx] = new_logprobs_start[beam_idx]
+
+    def set_log_probs(self,
+                      log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float],
+                      logprobs_start: Optional[list[int]] = None):
         """
         Reset the storage and refill it with new values
         log_probs: [beam_width, num_tokens]
@@ -218,7 +228,50 @@ class LogProbStorage:
         # reinitialize the storage to clear the lists
         self._init(log_probs)
         # append the new values
-        self.append(log_probs, cum_log_probs)
+        self.append_log_probs(log_probs, cum_log_probs, logprobs_start)
+
+    def create_log_probs_result(self) -> 'LogProbStorage':
+        result_logprobs = self.__class__()
+        new_logprobs = []
+        new_logprobs_start = []
+
+        for beam_idx in range(self.beam_width):
+            beam_start = self._should_sent_from[beam_idx]
+            beam_len = len(self.log_probs[beam_idx])
+
+            if beam_start < beam_len:
+                new_logprobs.append(self.log_probs[beam_idx][beam_start:])
+                new_logprobs_start.append(beam_start)
+                self._should_sent_from[beam_idx] = beam_len
+            else:
+                new_logprobs.append([])
+                new_logprobs_start.append(beam_len)
+
+        result_logprobs.set_log_probs(new_logprobs, self.cum_log_probs,
+                                      new_logprobs_start)
+        return result_logprobs
+
+    @property
+    def diff_start(self) -> list[int]:
+        return self._should_sent_from
+
+
+class PyLogProbResult:
+
+    def __init__(self, log_probs: LogProbStorage):
+        self._log_probs = log_probs
+
+    @property
+    def log_probs(self) -> LogProbStorage:
+        return self._log_probs and self._log_probs.log_probs
+
+    @property
+    def cum_log_probs(self) -> list[float] | None:
+        return self._log_probs and self._log_probs.cum_log_probs
+
+    @property
+    def log_probs_diff_start(self) -> list[int] | None:
+        return self._log_probs and self._log_probs.diff_start
 
 
 class PyResult:
@@ -229,7 +282,6 @@ class PyResult:
                  max_new_tokens: int,
                  use_device_memory=True,
                  streaming=False,
-                 return_log_probs: bool = False,
                  return_context_logits: bool = False,
                  return_generation_logits: bool = False,
                  exclude_last_generation_logits: bool = False,
@@ -252,7 +304,7 @@ class PyResult:
             exclude_last_generation_logits,
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
-        self._log_probs = LogProbStorage() if return_log_probs else None
+
         self._mm_embeddings = None
         self._additional_context_outputs = {
             name: []
@@ -270,12 +322,6 @@ class PyResult:
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
-
-    def append_log_probs(self,
-                         log_probs: list[TokenLogprobs],
-                         cum_log_probs: Optional[list[float]] = None):
-        if self._log_probs:
-            self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
         self._mm_embeddings = SharedTensorContainer.from_tensor(
@@ -296,16 +342,6 @@ class PyResult:
         self._additional_generation_outputs[name].append(
             additional_generation_outputs.to("cpu", non_blocking=True))
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
-        """
-        Set log_probs and cum_log_probs to the new values
-        log_probs: [beam_width, num_tokens]
-        cum_log_probs: [beam_width]
-        """
-        if self._log_probs:
-            self._log_probs.set_log_probs(log_probs, cum_log_probs)
-
     @property
     def context_logits(self) -> torch.Tensor | None:
         if self._context_logits is None or (storage := self._context_logits.get(
@@ -324,14 +360,6 @@ class PyResult:
         if storage is None:
             return None
         return storage.transpose(0, 1)
-
-    @property
-    def log_probs(self) -> list[TokenLogprobs] | None:
-        return self._log_probs and self._log_probs.log_probs
-
-    @property
-    def cum_log_probs(self) -> list[float] | None:
-        return self._log_probs and self._log_probs.cum_log_probs
 
     @property
     def mm_embedding_handle(self) -> Dict[str, Any] | None:
@@ -365,22 +393,28 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle', 'additional_context_outputs',
-         'additional_generation_outputs'))
+        ('context_logits', 'generation_logits', 'mm_embedding_handle',
+         'additional_context_outputs', 'additional_generation_outputs'))
+
+    py_log_probs_properties = frozenset(
+        ('log_probs', 'cum_log_probs', 'log_probs_diff_start'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
                  py_result: PyResult,
+                 py_log_probs: PyLogProbResult,
                  is_final: bool = False):
         self._result = result
         self._py_result = py_result
+        self._py_log_probs = py_log_probs
         self.is_final = is_final
         self.cached_tokens = 0
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
             return getattr(self._py_result, item)
+        if item in self.py_log_probs_properties:
+            return getattr(self._py_log_probs, item)
         if item == 'is_final':
             return object.__getattribute__(self, 'is_final')
         result = object.__getattribute__(self, '_result')
@@ -494,6 +528,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
+        self.py_log_probs = LogProbStorage() if return_log_probs else None
         self.py_additional_outputs = additional_outputs
 
         self.py_is_draft = is_draft
@@ -522,7 +557,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self.py_max_new_tokens,
             return_logits_device_memory,
             self.streaming,
-            return_log_probs,
             return_context_logits,
             return_generation_logits,
             exclude_last_generation_logits,
@@ -551,6 +585,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
+    def create_py_log_probs_result(self):
+        py_log_probs_result = (self.py_log_probs.create_log_probs_result()
+                               if self.py_return_log_probs else None)
+        return PyLogProbResult(py_log_probs_result)
 
     def create_response(self,
                         use_fast_logits=False,
@@ -587,7 +626,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         return LlmResponse(
             request_id=self.py_request_id
             if self.is_child else self.parent_request_id,
-            result=LlmResult(result, self.py_result, is_final),
+            result=LlmResult(result, self.py_result,
+                             self.create_py_log_probs_result(), is_final),
             client_id=self.py_client_id) if len(result) > 0 else None
 
     @property
