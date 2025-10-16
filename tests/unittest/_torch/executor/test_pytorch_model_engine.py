@@ -7,6 +7,8 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+    KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
