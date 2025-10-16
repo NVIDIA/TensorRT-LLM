@@ -106,6 +106,9 @@ install_python_rockylinux() {
     -y
   echo "Installing Python ${PYTHON_VERSION}..."
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
+  if [ -n "${GITHUB_MIRROR}" ]; then
+    mv /tmp/cpython-${PYTHON_VERSION} /tmp/Python-${PYTHON_VERSION}
+  fi
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
     LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
