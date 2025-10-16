@@ -7,8 +7,7 @@ from typing import Optional
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import (AsyncQueue, _SyncQueue, logger_debug,
-                            print_colored_debug)
+from ..llmapi.utils import AsyncQueue, _SyncQueue, logger_debug
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
@@ -357,13 +356,13 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                print_colored_debug('create comm session ...\n', "yellow")
+                logger_debug('create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                print_colored_debug('create pool session ...\n', "yellow")
+                logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            print_colored_debug('using external mpi session ...\n', "yellow")
+            logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
     @staticmethod
