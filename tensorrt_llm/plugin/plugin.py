@@ -97,7 +97,7 @@ class PluginConfig(BaseModel):
         * True, which means the plugin is enabled;
         * False, which means the plugin is disabled.
     """
-    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+    model_config = ConfigDict(validate_assignment=True, extra="ignore")
 
     dtype: str = Field(default="float16",
                        description="Base dtype for the model and plugins")
