@@ -165,23 +165,23 @@ class PeriodicJUnitXML:
             self.completed_tests += 1
             current_time = time.time()
 
-            # Check if we need to save based on time interval
-            if current_time - self.last_save_time >= self.time_interval:
-                tests_to_process = 0
-                if self.completed_tests >= self.batch_size:
-                    self._log_info(
-                        f"Completed {self.completed_tests} cases during the last "
-                        f"{current_time - self.last_save_time:.0f} seconds")
-                    tests_to_process = self.completed_tests
-                    self.completed_tests = 0  # Reset counter
-                    self.last_save_time = current_time
+            # Flush if batch threshold reached OR time interval elapsed
+            should_flush_by_time = (current_time -
+                                    self.last_save_time) >= self.time_interval
+            should_flush_by_batch = self.completed_tests >= self.batch_size
 
-                if tests_to_process > 0:
-                    try:
-                        self._generate_report()
-                    except Exception as e:
-                        self._log_warning(
-                            f"Error generating periodic report: {e}")
+            if should_flush_by_batch or should_flush_by_time:
+                if should_flush_by_batch:
+                    self._log_info(
+                        f"Completed {self.completed_tests} cases in the last "
+                        f"{current_time - self.last_save_time:.0f} seconds")
+                # Reset counters before generating
+                self.completed_tests = 0
+                self.last_save_time = current_time
+                try:
+                    self._generate_report()
+                except Exception as e:
+                    self._log_warning(f"Error generating periodic report: {e}")
 
     def pytest_sessionfinish(self):
         """Generate final report at session end."""
@@ -233,6 +233,7 @@ class PeriodicJUnitXML:
         if self.logxml is None or not self.logxml.node_reporters_ordered:
             return
 
+        temp_file = None
         try:
             # Always use the same output file
             output_file = self.xmlpath
@@ -283,10 +284,10 @@ class PeriodicJUnitXML:
         except Exception as e:
             self._log_warning(f"Error in report generation: {e}")
             # Clean up temporary file if it exists
-            if os.path.exists(temp_file):
+            if temp_file and os.path.exists(temp_file):
                 try:
                     os.remove(temp_file)
-                except Exception:
+                except OSError:
                     pass
             raise
 

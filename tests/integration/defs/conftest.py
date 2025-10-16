@@ -2229,10 +2229,8 @@ def pytest_configure(config):
     output_dir = config.getoption("--output-dir", default=None)
 
     if periodic and output_dir:
-        periodic_interval = config.getoption("--periodic-interval",
-                                             default=1800)
-        periodic_batch_size = config.getoption("--periodic-batch-size",
-                                               default=10)
+        periodic_interval = config.getoption("--periodic-interval")
+        periodic_batch_size = config.getoption("--periodic-batch-size")
 
         # Create the reporter with logger
         xmlpath = os.path.join(output_dir, "results.xml")
@@ -2250,7 +2248,7 @@ def pytest_configure(config):
         reporter.pytest_configure(config)
         config.pluginmanager.register(reporter, 'periodic_junit')
 
-        print_info(f"PeriodicJUnitXML reporter registered")
+        print_info("PeriodicJUnitXML reporter registered")
         print_info(
             f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
         )
