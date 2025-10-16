@@ -64,6 +64,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         self.main_loop_task_obj = None
         self.main_loop = None
+        self.main_loop_thread = None
 
         self.launch_workers()
 
@@ -333,7 +334,11 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 logger_debug(f"Error cancelling main loop task: {e}",
                              color="yellow")
 
-        self.main_loop_thread.join()
+        # Only join if we're not calling from the main_loop_thread itself
+        # (e.g., during garbage collection in that thread)
+        if self.main_loop_thread and threading.current_thread(
+        ) != self.main_loop_thread:
+            self.main_loop_thread.join()
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
