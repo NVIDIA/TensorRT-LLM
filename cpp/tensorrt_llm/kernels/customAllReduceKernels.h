@@ -106,6 +106,30 @@ inline std::string toString(AllReduceFusionOp op)
     return oss.str();
 }
 
+inline std::ostream& operator<<(std::ostream& os, AllReduceStrategyType op)
+{
+    switch (op)
+    {
+    case AllReduceStrategyType::NCCL: os << "NCCL"; break;
+    case AllReduceStrategyType::MIN_LATENCY: os << "MIN_LATENCY"; break;
+    case AllReduceStrategyType::UB: os << "UB"; break;
+    case AllReduceStrategyType::AUTO: os << "AUTO"; break;
+    case AllReduceStrategyType::ONESHOT: os << "ONESHOT"; break;
+    case AllReduceStrategyType::TWOSHOT: os << "TWOSHOT"; break;
+    case AllReduceStrategyType::LOWPRECISION: os << "LOWPRECISION"; break;
+    case AllReduceStrategyType::MNNVL: os << "MNNVL"; break;
+    case AllReduceStrategyType::NCCL_SYMMETRIC: os << "NCCL_SYMMETRIC"; break;
+    }
+    return os;
+}
+
+inline std::string toString(AllReduceStrategyType op)
+{
+    std::ostringstream oss;
+    oss << op;
+    return oss.str();
+}
+
 struct AllReduceFusionParams
 {
     AllReduceFusionParams()
