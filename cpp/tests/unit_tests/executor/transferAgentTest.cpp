@@ -372,6 +372,9 @@ TEST_P(TransferAgentTest, SyncMessage)
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, TransferAgentTest, ::testing::ValuesIn(getAvailableBackends()),
     [](::testing::TestParamInfo<TransferAgentTest::ParamType> const& info) { return info.param; });
 
+// Skip LoopbackAgentTest for mooncake backend for now
+#ifdef TEST_NIXL_BACKEND
+
 class LoopbackAgentTest : public ::testing::Test,
                           public ::testing::WithParamInterface<bool> // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -486,3 +489,5 @@ TEST_P(LoopbackAgentTest, GpuToFile)
 }
 
 INSTANTIATE_TEST_SUITE_P(, LoopbackAgentTest, ::testing::Values(true, false));
+
+#endif // TEST_NIXL_BACKEND
