@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <chrono>
 #include <dirent.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
@@ -32,6 +33,7 @@
 #include <netinet/in.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -48,7 +50,9 @@ MooncakeTransferStatus::MooncakeTransferStatus(transfer_engine_t engine, uint64_
 void MooncakeTransferStatus::wait() const
 {
     while (!isCompleted())
-        ;
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 [[nodiscard]] bool MooncakeTransferStatus::isCompleted() const
