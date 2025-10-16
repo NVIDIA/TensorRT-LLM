@@ -427,7 +427,9 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     ) and dist_mapping.is_last_pp_rank():
         vocab_size_padded = engine.vocab_size_padded
         if vocab_size_padded is None:
-            raise RuntimeError("Could not determine the vocabulary size.")
+            raise RuntimeError(
+                "Could not determine the vocabulary size. Required for guided decoding."
+            )
         guided_decoding_config = get_guided_decoding_config(
             guided_decoding_backend=guided_decoding_backend, tokenizer=tokenizer
         )
