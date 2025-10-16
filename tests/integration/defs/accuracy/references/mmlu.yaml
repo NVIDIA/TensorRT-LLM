@@ -192,6 +192,12 @@ deepseek-ai/DeepSeek-R1:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 87.573
+deepseek-ai/DeepSeek-V3.2-Exp:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 88.2
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 88.2
 Qwen3/Qwen3-8B:
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 72.70
