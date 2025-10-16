@@ -3436,7 +3436,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig())
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
