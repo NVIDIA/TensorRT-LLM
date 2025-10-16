@@ -76,7 +76,7 @@ init_ubuntu() {
   if [[ $(apt list --installed | grep tensorrt) ]]; then
     apt-get remove --purge -y tensorrt*
   fi
-  pip3 uninstall -y tensorrt
+  pip3 uninstall -y tensorrt pytorch_triton
 }
 
 install_python_rockylinux() {
