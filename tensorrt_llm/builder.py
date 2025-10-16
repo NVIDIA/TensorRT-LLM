@@ -700,7 +700,7 @@ class BuildConfig:
         if output.get('kv_cache_type', None) is not None:
             output['kv_cache_type'] = str(output['kv_cache_type'].name)
         output['plugin_config'] = output['plugin_config'].model_dump()
-        output['lora_config'] = output['lora_config'].to_dict()
+        output['lora_config'] = output['lora_config'].model_dump()
         return output
 
     def update_from_dict(self, config: dict):
