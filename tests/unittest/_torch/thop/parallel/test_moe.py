@@ -26,7 +26,7 @@ from enum import Enum
 
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -958,6 +958,7 @@ class TestMoeFP8:
             topk_ids = None
             topk_weights = None
 
+        AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 expert_logits, routing_bias, hidden_states, hidden_states_scale,
@@ -965,7 +966,7 @@ class TestMoeFP8:
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, routing_method_type,
                 topk_weights, topk_ids)
-
+        torch.cuda.synchronize()
         output_dequant_actual = output.to(torch.float)
         #
         # Run the reference implementations
@@ -1406,6 +1407,7 @@ class TestMoeFp4:
             topk_ids = None
             topk_weights = None
 
+        AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 expert_logits,
@@ -1431,7 +1433,7 @@ class TestMoeFp4:
                 do_finalize=True,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights)
-
+        torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
         check_accuracy(output_dequant_reference,
@@ -1651,6 +1653,7 @@ class TestMoeFp4:
             topk_ids = None
             topk_weights = None
 
+        AutoTuner.get().clear_cache()
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
                 expert_logits,
@@ -1676,7 +1679,7 @@ class TestMoeFp4:
                 act_type=ActType.SwiGlu.value,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights)
-
+        torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
         check_accuracy(output_dequant_reference,
@@ -1813,6 +1816,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         topk_ids = permute_info["topKIndices"].to(torch.int32).cuda()
         topk_weights = permute_info["topKLogits"].to(torch.bfloat16).cuda()
 
+    AutoTuner.get().clear_cache()
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
         expert_logits.to(torch.bfloat16)
         if use_routing_scales_on_input else expert_logits, routing_bias,
@@ -1821,7 +1825,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
         routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
         routing_method_type, topk_weights, topk_ids)
-
+    torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
 
     check_accuracy(output_dequant_reference,
@@ -2178,6 +2182,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     # Run the TRT-LLM kernel
     #
     unpadded_hidden_size = hidden_size
+    AutoTuner.get().clear_cache()
     with autotune(use_autotune):
         if dtype_activation == "mxfp8":
             # Test fused unpadding by checking only half of the output.
@@ -2221,7 +2226,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
-
+    torch.cuda.synchronize()
     output_dequant_actual = output.to(torch.float)
     output_dequant_reference = output_dequant_reference[:, :
                                                         unpadded_hidden_size].contiguous(
