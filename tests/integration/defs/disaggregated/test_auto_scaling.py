@@ -228,8 +228,9 @@ async def test_minimal_instances(model_name, disagg_server_config,
         "context_servers": 2,
         "generation_servers": 2,
     }
-    disagg_server_config["cluster"]["minimal_instances"] = minimal_instances
-    worker_config["cluster"]["minimal_instances"] = minimal_instances
+    disagg_server_config["disagg_cluster"][
+        "minimal_instances"] = minimal_instances
+    worker_config["disagg_cluster"]["minimal_instances"] = minimal_instances
 
     processes = []
 
