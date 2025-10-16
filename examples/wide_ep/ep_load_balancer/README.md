@@ -43,7 +43,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --kv_cache_free_gpu_mem_fraction 0.75 \
     --dataset ./dataset.json \
     --warmup 0 \
-    --eos_id -1
+    --ignore_eos=True
 ```
 
 After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`. For each layer and iteration, the load imbalance can be measured using simple metrics such as the standard deviation or the imbalance ratio. Given the routed token counts for all ranks, the imbalance ratio is defined as $(max - mean) / mean$, which represents the excessive workload received by the hottest rank. A perfectly balanced load would have an imbalance ratio of 0. Run the [`report_load_statistics.py`](./report_load_statistics.py) script:
@@ -134,7 +134,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --kv_cache_free_gpu_mem_fraction 0.75 \
     --dataset ./dataset.json \
     --warmup 0 \
-    --eos_id -1
+    --ignore_eos=True
 ```
 
 Run the [`report_load_statistics.py`](./report_load_statistics.py) script again:
@@ -200,7 +200,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --kv_cache_free_gpu_mem_fraction 0.75 \
     --dataset ./dataset.json \
     --warmup 0 \
-    --eos_id -1
+    --ignore_eos=True
 ```
 
 > **Note:** Similar to offline EP Load Balancer, you can enable expert ID counting to verify the effectiveness of EPLB, but remember to disable it when running inference for benchmarking or production purposes.
