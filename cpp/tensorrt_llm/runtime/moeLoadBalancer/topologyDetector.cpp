@@ -147,6 +147,11 @@ void TopologyDetector::detectCpuTopology()
         // In this case, we simply don't add it to our map, effectively skipping it.
 
         numa_free_cpumask(cpus); // Always free the allocated mask
+
+        // here detect the memory size of current NUMA node
+
+        auto memorySize = numa_node_size64(i, NULL);
+        mDebugStringStream << "Memory size of NUMA node " << i << " is " << memorySize << "\n";
     }
     mNumaToCpuCountMap = tempNumaToCpuCountMap;
 
