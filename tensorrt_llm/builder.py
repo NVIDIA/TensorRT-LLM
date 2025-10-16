@@ -725,7 +725,7 @@ class BuildConfig:
         # the enum KVCacheType cannot be converted automatically
         if output.get('kv_cache_type', None) is not None:
             output['kv_cache_type'] = str(output['kv_cache_type'].name)
-        output['plugin_config'] = output['plugin_config'].to_dict()
+        output['plugin_config'] = output['plugin_config'].model_dump()
         output['lora_config'] = output['lora_config'].to_dict()
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )
