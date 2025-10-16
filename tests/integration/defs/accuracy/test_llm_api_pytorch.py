@@ -1981,7 +1981,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     ])
     @pytest.mark.parametrize("tp_size,ep_size", [(4, 1), (4, 4)],
                              ids=["tp4", "tep4"])
-    def test_weight_prefetching(self, quant_dtype, tp_size, ep_size):
+    @parametrize_with_ids(
+        "moe_backend",
+        ["CUTLASS", pytest.param("TRTLLM", marks=skip_pre_blackwell)])
+    def test_weight_prefetching(self, quant_dtype, tp_size, ep_size,
+                                moe_backend):
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
@@ -1989,7 +1993,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        pytorch_config = dict(moe_config=MoeConfig(use_moe_prefetch=True), )
+        pytorch_config = dict(moe_config=MoeConfig(backend=moe_backend,
+                                                   use_moe_prefetch=True), )
 
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

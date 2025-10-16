@@ -332,9 +332,10 @@ class MoeConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_moe_prefetch_backend(self) -> 'MoeConfig':
-        if self.use_moe_prefetch and self.backend != 'CUTLASS':
+        if self.use_moe_prefetch and (self.backend != 'CUTLASS'
+                                      and self.backend != 'TRTLLM'):
             raise ValueError(
-                f"MoE prefetching is only supported with CUTLASS backend, but got {self.backend}"
+                f"MoE prefetching is only supported with CUTLASS or TRTLLM MoE backends, but got {self.backend}"
             )
         return self
 

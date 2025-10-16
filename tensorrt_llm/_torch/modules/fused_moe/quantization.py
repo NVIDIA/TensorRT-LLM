@@ -175,16 +175,16 @@ class FusedMoEMethodBase(ABC):
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
         if module.use_prefetch:
-            w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                    dtype=weight_dtype,
-                                                    device=torch.device("cpu"),
-                                                    pin_memory=True),
+            w3_w1_weight = nn.Parameter(torch.empty(
+                w3_w1_weight_shape,
+                dtype=weight_dtype,
+                device=torch.device("cpu")).pin_memory(),
                                         requires_grad=False)
-            w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                                 dtype=weight_dtype,
-                                                 device=torch.device("cpu"),
-                                                 pin_memory=True),
-                                     requires_grad=False)
+            w2_weight = nn.Parameter(
+                torch.empty(w2_weight_shape,
+                            dtype=weight_dtype,
+                            device=torch.device("cpu")).pin_memory(),
+                requires_grad=False)
             module.prefetch_proxy.register_weight(w3_w1_weight, w2_weight)
         else:
             # Fused gate_up_proj (column parallel)
@@ -1887,7 +1887,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
         device = dst_w3_w1_weight.device
-        assert device.type == "cuda"
+        if module.use_prefetch:
+            assert (device.type == "cpu" and dst_w3_w1_weight.is_pinned())
+        else:
+            assert device.type == "cuda"
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1926,7 +1929,10 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                               w2_weight: torch.Tensor,
                               dst_w2_weight: torch.Tensor):
         device = dst_w2_weight.device
-        assert device.type == "cuda"
+        if module.use_prefetch:
+            assert (device.type == "cpu" and dst_w2_weight.is_pinned())
+        else:
+            assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,

@@ -114,6 +114,7 @@ def create_moe(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            moe_prefetch_proxy=moe_prefetch_proxy,
         )
     elif moe_cls == CutlassFusedMoE:
         return moe_cls(
