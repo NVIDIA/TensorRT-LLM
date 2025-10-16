@@ -264,7 +264,9 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
-            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            auto validTokenNum = (static_cast<size_t>(alignedWindowSize) < maxNumTokens.value()
+                    ? static_cast<size_t>(alignedWindowSize)
+                    : maxNumTokens.value());
             if (common::getEnvKVCacheTransferAllBlocksForWindow())
             {
                 validTokenNum = maxNumTokens.value();
