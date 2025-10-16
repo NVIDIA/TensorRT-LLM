@@ -558,6 +558,9 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
     T* broadcastBufW = reinterpret_cast<T*>(flag.getCurLamportBuf(mcastPtr, MNNVLTwoShotStage::BROADCAST));
     T* broadcastBufR = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::BROADCAST));
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
     // Make sure the clear function is called before OOB thread exits
     if (packedIdx * kELTS_PER_THREAD >= tokenDim)
     {
@@ -638,9 +641,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
         }
         reinterpret_cast<PackedType*>(&broadcastBufW[token * tokenDim])[packedIdx] = packedAccum.packed;
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
+
     flag.clearDirtyLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::BROADCAST);
 
     // Optionally wait for results if the next layer isn't doing the Lamport check
