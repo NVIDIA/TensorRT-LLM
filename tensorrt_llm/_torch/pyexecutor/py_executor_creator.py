@@ -207,6 +207,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     lora_config: Optional[LoraConfig] = None,
     kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
@@ -570,6 +571,7 @@ def create_py_executor(
             kv_cache_config=kv_cache_config,
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
+            profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
