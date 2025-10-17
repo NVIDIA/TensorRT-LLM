@@ -510,10 +510,6 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if pytorch_backend_config.use_cuda_graph:
-            raise NotImplementedError(
-                "CUDA graphs are not supported with KV connector hooks.")
-
         if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
@@ -542,6 +538,12 @@ def create_py_executor(
                     connector_scheduler = None
 
                 connector_worker = connector_worker_task.result()
+
+            forward_pass_callable = connector_worker.register_forward_pass_callable(
+            )
+            if forward_pass_callable:
+                model_engine.register_forward_pass_callable(
+                    forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)

@@ -95,6 +95,18 @@ class KvCacheConnectorWorker(ABC):
     def _clear_connector_meta(self):
         self._metadata = None
 
+    def register_forward_pass_callable(self) -> Callable:
+        """
+        This callable will be called at the end of the forward pass.
+
+        Any CUDA calls which happen in the callable will execute on the
+        same stream as the forward pass.
+
+        This method is typically used by the connector to insert a
+        cuda event into the forward pass cuda stream to obtain a
+        signal of when it's appropriate to start offloading cache blocks.
+        """
+
     @abstractmethod
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         """
