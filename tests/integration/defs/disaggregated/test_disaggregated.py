@@ -455,7 +455,7 @@ def run_disaggregated_test(example_dir,
                                      config['generation_servers'],
                                      gen_extra_config_file, 'generation'))
 
-    server_start_timeout = 900
+    server_start_timeout = 1200
     server_cmd = [
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file

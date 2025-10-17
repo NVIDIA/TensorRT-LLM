@@ -89,6 +89,7 @@ def get_llm_args(model: str,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
+                 enable_chunked_prefill: bool = False,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -111,44 +112,27 @@ def get_llm_args(model: str,
         dynamic_batch_config=dynamic_batch_config,
     )
     llm_args = {
-        "model":
-        model,
-        "scheduler_config":
-        scheduler_config,
-        "tokenizer":
-        tokenizer,
-        "tensor_parallel_size":
-        tensor_parallel_size,
-        "pipeline_parallel_size":
-        pipeline_parallel_size,
-        "moe_expert_parallel_size":
-        moe_expert_parallel_size,
-        "gpus_per_node":
-        gpus_per_node,
-        "trust_remote_code":
-        trust_remote_code,
-        "build_config":
-        build_config,
-        "max_batch_size":
-        max_batch_size,
-        "max_num_tokens":
-        max_num_tokens,
-        "max_beam_width":
-        max_beam_width,
-        "max_seq_len":
-        max_seq_len,
-        "kv_cache_config":
-        kv_cache_config,
-        "backend":
-        backend,
-        "num_postprocess_workers":
-        num_postprocess_workers,
-        "postprocess_tokenizer_dir":
-        tokenizer or model,
-        "reasoning_parser":
-        reasoning_parser,
+        "model": model,
+        "scheduler_config": scheduler_config,
+        "tokenizer": tokenizer,
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+        "moe_expert_parallel_size": moe_expert_parallel_size,
+        "gpus_per_node": gpus_per_node,
+        "trust_remote_code": trust_remote_code,
+        "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
+        "kv_cache_config": kv_cache_config,
+        "backend": backend,
+        "num_postprocess_workers": num_postprocess_workers,
+        "postprocess_tokenizer_dir": tokenizer or model,
+        "reasoning_parser": reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "enable_chunked_prefill": enable_chunked_prefill,
     }
 
     return llm_args, llm_args_extra_dict
@@ -337,6 +321,10 @@ class ChoiceWithAlias(click.Choice):
               type=str,
               default=None,
               help="URI of the disaggregated cluster.")
+@click.option("--enable_chunked_prefill",
+              is_flag=True,
+              default=False,
+              help="Enable chunked prefill")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -347,7 +335,7 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        disagg_cluster_uri: Optional[str]):
+        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -372,7 +360,8 @@ def serve(
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
-        fail_fast_on_attention_window_too_large)
+        fail_fast_on_attention_window_too_large,
+        enable_chunked_prefill=enable_chunked_prefill)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:

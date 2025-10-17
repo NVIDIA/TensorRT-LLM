@@ -210,6 +210,7 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/nemotron_nas"
 
     @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_tp2(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
 

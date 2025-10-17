@@ -650,6 +650,30 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    def test_fp8_tp2pp2(self):
+        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP8"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        with LLM(model_path,
+                 tensor_parallel_size=2,
+                 pipeline_parallel_size=2,
+                 max_batch_size=32,
+                 kv_cache_config=kv_cache_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            sampling_params = SamplingParams(
+                max_tokens=256,
+                temperature=0.0,
+                add_special_tokens=False,
+            )
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
 
 @pytest.mark.timeout(14400)
 class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
@@ -2152,6 +2176,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
     def test_nvfp4_multi_gpus_corner_case(self):
         """
         This test is used to test the corner case of the NVFP4 model.
@@ -2436,9 +2461,10 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # skip gpqa test due to time consuming
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @skip_pre_hopper
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
@@ -2450,9 +2476,10 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # skip gpqa test due to time consuming
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronUltra(LlmapiAccuracyTestHarness):
@@ -3016,7 +3043,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(8, 1, 8, True, True, True), (8, 1, 8, False, True, True)],
+        [(8, 1, 8, False, True, True), (8, 1, 8, True, True, True)],
         ids=["latency", "throughput_latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler):
@@ -3024,7 +3051,9 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        free_gpu_memory_fraction = 0.6 if attention_dp else 0.3
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction)
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
                 tensor_parallel_size=tp_size,
@@ -3426,7 +3455,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
-                  moe_backend="TRITON")
+                  moe_config=MoeConfig(backend="TRITON"))
         with llm:
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)

@@ -413,4 +413,4 @@ l0_h100:
       stage: post_merge
       backend: fmha
   tests:
-  - test_fmha.py::test_fmha
+  - test_fmha.py::test_fmha TIMEOUT (90)
