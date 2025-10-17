@@ -109,10 +109,6 @@ if is_linux():
                             torch_inductors.append(pid)
                             continue
 
-                        # Readability for ray processes. They have a lot of empty args
-                        if cmdline and cmdline[0].startswith('ray::'):
-                            cmdline = [arg for arg in cmdline if arg]
-
                         lines.append(f"{pid}: {cmdline}")
                     persist_pids.append(pid)
                 except psutil.Error:

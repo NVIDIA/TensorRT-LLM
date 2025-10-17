@@ -67,7 +67,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 29);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 28);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -116,17 +116,10 @@ public:
         NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
     }
 
-    std::optional<tbk::KVCacheBlock::IdType> removeSequence(tb::LlmRequest::RequestIdType requestId,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt,
-        bool pinOnRelease = false) override
+    void removeSequence(tb::LlmRequest::RequestIdType requestId,
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt) override
     {
-        NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
-    }
-
-    std::optional<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
-    {
-        NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
+        NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest);
     }
 
     tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
@@ -197,6 +190,12 @@ public:
         std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const override
     {
         NB_OVERRIDE_PURE(getBatchCacheBlockIds, requestIds, windowSize);
+    }
+
+    std::vector<SizeType32> getNewlyAllocatedBlockIds(
+        tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override
+    {
+        NB_OVERRIDE_PURE(getNewlyAllocatedBlockIds, requestId, windowSize);
     }
 
     SizeType32 getUsedNumBlocks() const override
@@ -354,7 +353,6 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
         .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
-        .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -461,15 +459,13 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
-        .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
-            nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
+        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())
-        .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>());
+        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
@@ -487,12 +483,13 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .value("SELFKONLY", tbk::CacheType::kSELFKONLY);
 
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
-        .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
-                 std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
-                 std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
-                 nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
-                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
+        .def(
+            nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
+                std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
+                std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
+                nvinfer1::DataType, SizeType32, int64_t, std::optional<runtime::SizeType32>, bool, bool, tbk::CacheType,
+                std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
+                bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),

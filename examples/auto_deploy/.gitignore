@@ -2,5 +2,3 @@
 !.vscode
 benchmark_results.json
 *.png
-# ignore config files that users might put here for debugging
-*.yaml

@@ -1,10 +1,9 @@
 import asyncio
-import gc
 import os
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Optional
 
 import click
 import torch
@@ -87,7 +86,6 @@ def get_llm_args(model: str,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
-                 enable_chunked_prefill: bool = False,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -109,28 +107,46 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
+    backend = backend if backend in ["pytorch", "_autodeploy"] else None
     llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
+        "model":
+        model,
+        "scheduler_config":
+        scheduler_config,
+        "tokenizer":
+        tokenizer,
+        "tensor_parallel_size":
+        tensor_parallel_size,
+        "pipeline_parallel_size":
+        pipeline_parallel_size,
+        "moe_expert_parallel_size":
+        moe_expert_parallel_size,
+        "gpus_per_node":
+        gpus_per_node,
+        "trust_remote_code":
+        trust_remote_code,
+        "build_config":
+        build_config,
+        "max_batch_size":
+        max_batch_size,
+        "max_num_tokens":
+        max_num_tokens,
+        "max_beam_width":
+        max_beam_width,
+        "max_seq_len":
+        max_seq_len,
+        "kv_cache_config":
+        kv_cache_config,
+        "backend":
+        backend,
+        "num_postprocess_workers":
+        num_postprocess_workers,
+        "postprocess_tokenizer_dir":
+        tokenizer or model,
+        "reasoning_parser":
+        reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
-        "enable_chunked_prefill": enable_chunked_prefill,
     }
 
     return llm_args, llm_args_extra_dict
@@ -149,23 +165,17 @@ def launch_server(host: str,
     elif backend == '_autodeploy':
         # AutoDeploy does not support build_config
         llm_args.pop("build_config", None)
+        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
+        # AutoDeploy does not support cache reuse yet.
+        llm_args["kv_cache_config"].enable_block_reuse = False
         llm = AutoDeployLLM(**llm_args)
-    elif backend == 'tensorrt' or backend == 'trt':
-        llm_args.pop("backend")
-        llm = LLM(**llm_args)
     else:
-        raise click.BadParameter(
-            f"{backend} is not a known backend, check help for available options.",
-            param_hint="backend")
+        llm = LLM(**llm_args)
 
     server = OpenAIServer(llm=llm,
                           model=model,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
-
-    # Optionally disable GC (default: not disabled)
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-        gc.disable()
 
     asyncio.run(server(host, port))
 
@@ -186,27 +196,6 @@ def launch_mm_encoder_server(
     asyncio.run(server(host, port))
 
 
-class ChoiceWithAlias(click.Choice):
-
-    def __init__(self,
-                 choices: Sequence[str],
-                 aliases: Mapping[str, str],
-                 case_sensitive: bool = True) -> None:
-        super().__init__(choices, case_sensitive)
-        self.aliases = aliases
-
-    def to_info_dict(self) -> Dict[str, Any]:
-        info_dict = super().to_info_dict()
-        info_dict["aliases"] = self.aliases
-        return info_dict
-
-    def convert(self, value: Any, param: Optional["click.Parameter"],
-                ctx: Optional["click.Context"]) -> Any:
-        if value in self.aliases:
-            value = self.aliases[value]
-        return super().convert(value, param, ctx)
-
-
 @click.command("serve")
 @click.argument("model", type=str)
 @click.option("--tokenizer",
@@ -221,10 +210,11 @@ class ChoiceWithAlias(click.Choice):
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option(
     "--backend",
-    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
-                         {"trt": "tensorrt"}),
+    type=click.Choice(["pytorch", "trt", "_autodeploy"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.")
+    help=
+    "Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path."
+)
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -313,10 +303,6 @@ class ChoiceWithAlias(click.Choice):
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
-@click.option("--enable_chunked_prefill",
-              is_flag=True,
-              default=False,
-              help="Enable chunked prefill")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -326,8 +312,7 @@ def serve(
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool):
+        fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -352,8 +337,7 @@ def serve(
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
-        fail_fast_on_attention_window_too_large,
-        enable_chunked_prefill=enable_chunked_prefill)
+        fail_fast_on_attention_window_too_large)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
@@ -498,19 +482,6 @@ def disaggregated(config_file: Optional[str],
                                 server_start_timeout_secs=server_start_timeout,
                                 metadata_server_cfg=metadata_server_cfg,
                                 metrics_interval_secs=metrics_log_interval)
-
-    # Disable GC by default
-    #   When concurrency is high, the number of Python objects increases, so
-    #   GC runs frequently and takes a long time to process. In this case,
-    #   requests are not immediately forwarded to CTX workers and GEN workers,
-    #   causing them to run with small batch sizes. Disabling GC can mitigate
-    #   this problem.
-    #   By testing this feature, we didn't observe significant RSS or VMS
-    #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-    #   increases by fewer than 1,000 after every 200,000 requests, while the
-    #   maximum value of `count0` exceeded 3,000,000 during the test.
-    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
-        gc.disable()
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

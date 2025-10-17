@@ -1,4 +1,3 @@
-import os
 import threading
 from contextlib import nullcontext
 from multiprocessing import resource_tracker, shared_memory
@@ -177,20 +176,9 @@ class HostMoeTensorSharer:
                 total_size += aligned_size
 
         shm_name = self.get_shared_memory_name()
-        try:
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
-        except FileExistsError:
-            tensorrt_llm.logger.warning(
-                f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
-            )
-            existing_shm = shared_memory.SharedMemory(name=shm_name)
-            existing_shm.close()
-            existing_shm.unlink()
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
+        shm = shared_memory.SharedMemory(name=shm_name,
+                                         create=True,
+                                         size=total_size)
         self.own_shm = shm
 
         offset = 0
@@ -734,7 +722,7 @@ class MoeLoadBalancer:
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: Optional[str] = None):
+                 shared_memory_base_name: str = 'moe_shared'):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -742,7 +730,7 @@ class MoeLoadBalancer:
             ep_rank: The rank of the current process in expert parallelism
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
-            shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
+            shared_memory_base_name: Shared memory base name
         """
         self.is_shutdown = True
         self.ep_rank = ep_rank
@@ -752,8 +740,7 @@ class MoeLoadBalancer:
                                                        layer_updates_per_iter)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
-        self.shared_memory_base_name = shared_memory_base_name or os.getenv(
-            'TRTLLM_EPLB_SHM_NAME', 'moe_shared')
+        self.shared_memory_base_name = shared_memory_base_name
         self._setup_mpi_comm()
         self.is_shutdown = False
 

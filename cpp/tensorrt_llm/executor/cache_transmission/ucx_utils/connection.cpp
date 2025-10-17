@@ -18,17 +18,12 @@
 #include "ucxCacheCommunicator.h"
 #if ENABLE_UCX
 
-#include "tensorrt_llm/batch_manager/dataTransceiver.h"
+#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
 namespace tensorrt_llm::executor::kv_cache
 {
-
-// Using declarations to shorten the code
-using RequestSpecificException = tensorrt_llm::common::RequestSpecificException;
-using RequestErrorCode = tensorrt_llm::common::RequestErrorCode;
 
 UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
     UcxConnectionManager* manager, bool fromRequester)
@@ -81,15 +76,15 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
     }
     catch (std::exception const& e)
     {
-        std::string error = std::string("Error in UcxConnection constructor for rank ")
-            + std::to_string(mManager->getRank()) + ": " + e.what();
+        std::string error = "Error in UcxConnection constructor for rank "
+            + std::to_string(mpi::MpiComm::world().getRank()) + ": " + e.what();
         TLLM_THROW(error);
     }
 
     mSendTagPrefix = mConnectionIdInPeer;
     mRecvTagPrefix = mConnectionId;
 
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "UcxConnection::UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
@@ -97,7 +92,7 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
 UcxConnection::~UcxConnection()
 {
 
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     // TODO: how to close the endpoint safely?
@@ -105,7 +100,7 @@ UcxConnection::~UcxConnection()
 
 void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, size_t size) const
 {
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 
@@ -114,8 +109,8 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
 
-    uint64_t tag = ((mSendTagPrefix & 0xFFFFFFFF) << 32)
-        | static_cast<uint64_t>(tensorrt_llm::batch_manager::TransceiverTag::kID_TAG);
+    uint64_t tag
+        = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | static_cast<uint64_t>(batch_manager::TransceiverTag::kID_TAG);
     std::vector<char> buffer(size + sizeof(mConnectionId));
     memcpy(buffer.data(), data, size);
     memcpy(buffer.data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
@@ -126,19 +121,19 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "sendConnectionId should be completed");
     req->checkError();
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 }
 
 void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-    if (ctx.getTag() == tensorrt_llm::batch_manager::TransceiverTag::kID_TAG)
+    if (ctx.getTag() == batch_manager::TransceiverTag::kID_TAG)
     {
         sendConnectionId(ctx, data, size);
         return;
     }
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 
@@ -156,8 +151,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     // throw if there is error
     req->checkError();
-
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
@@ -165,7 +159,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
 void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
     // Guard to ensure CUDA context is initialized for UCX ops
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
@@ -181,8 +175,7 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     // throw if there is error
     req->checkError();
-
-    TLLM_LOG_DEBUG(mManager->getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }

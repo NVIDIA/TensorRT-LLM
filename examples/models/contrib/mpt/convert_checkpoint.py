@@ -124,7 +124,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT LLM checkpoint')
+                        help='The path to save the TensorRT-LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -841,7 +841,8 @@ if __name__ == '__main__':
 
     hf_model = MptForCausalLM.from_pretrained(args.model_dir,
                                               device_map="auto",
-                                              dtype=getattr(torch, args.dtype))
+                                              torch_dtype=getattr(
+                                                  torch, args.dtype))
 
     act_range = {}
     mpt_qkv_para = {}

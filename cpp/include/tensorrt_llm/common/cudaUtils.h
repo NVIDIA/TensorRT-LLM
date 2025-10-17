@@ -295,11 +295,7 @@ struct CudaDataType<__nv_bfloat16>
 };
 #endif
 
-/// @brief Get the SM version of the current device.
-/// @param queryRealSmArch Whether to query the real SM architecture. example usage: use real sm arch when do LUT tuning
-/// and use fake sm arch when reuse sm120 code on sm121 devices.
-/// @return The SM version of the current device.
-inline int getSMVersion(bool queryRealSmArch = false)
+inline int getSMVersion()
 {
     int device{-1};
     check_cuda_error(cudaGetDevice(&device));
@@ -308,17 +304,11 @@ inline int getSMVersion(bool queryRealSmArch = false)
     check_cuda_error(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda_error(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
     int sm = sm_major * 10 + sm_minor;
-    if (sm == 121 && !queryRealSmArch)
+    if (sm == 121)
     {
         return 120;
     }
     return sm;
-}
-
-inline bool isSM100Family()
-{
-    int const sm = getSMVersion();
-    return sm == 100 || sm == 103; // To be continued...
 }
 
 inline int getDevice()

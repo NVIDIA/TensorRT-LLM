@@ -24,17 +24,16 @@ class MultimodalInput:
     """
 
     multimodal_positions: List[int]
-    """Starting positions of each contiguous multimodal token chunk in the token sequence.
+    """Starting positions of each multimodal chunk in the token sequence.
 
     Contains only the start position of each chunk, not all positions of multimodal tokens.
     This is different from mm_positions elsewhere which contains all positions.
     """
 
     multimodal_lengths: List[int]
-    """Length of each contiguous multimodal token chunk, including any special tokens.
+    """Length (number of tokens) of each multimodal item.
 
-    Each span is unique to its multimodal item and may include special tokens for some models,
-    (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
+    Combined with multimodal_positions, this defines the token spans for each multimodal item.
     """
 
     def __post_init__(self):
@@ -90,51 +89,37 @@ class MultimodalRuntimeData:
     """Runtime data for tracking multimodal token caching and reuse per request sequence.
 
     This class tracks which multimodal tokens are cached vs. need to be processed
-    for each request sequence during both KV cache reuse and chunked prefill scenarios.
+    for each request sequence during KV cache reuse scenarios.
 
     Attributes:
-        past_seen_token_num: Total number of tokens seen in previous iterations (cached)
+        num_cached_tokens: Total number of cached tokens for this sequence
         mm_token_lengths: Length of each multimodal token chunk
         mm_token_positions: Starting positions of each multimodal token chunk
-        chunk_end_pos: End position of the current chunk for chunked prefill
-        special_token_offsets: Starting positions of special tokens in the union of all multimodal token chunks (optional, depending on the model)
-
-        num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
-        num_mm_tokens_in_chunk: Number of multimodal tokens in the current chunk (computed)
-        total_mm_tokens_in_request: Total number of multimodal tokens in the request sequence (computed)
-
-        num_unseen_special_tokens: Number of special tokens that are cached (computed)
-        num_special_tokens_in_chunk: Number of special tokens in the current chunk (computed)
-        total_special_tokens_in_request: Total number of special tokens in the request sequence (computed)
+        prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
+        num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
+        total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
     """
-    past_seen_token_num: int
+    num_cached_tokens: int
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
-    chunk_end_pos: int
-    special_token_offsets: List[int]
 
-    num_unseen_mm_tokens: Optional[int] = None
-    num_mm_tokens_in_chunk: Optional[int] = None
-    total_mm_tokens_in_request: Optional[int] = None
+    # TODO: support chunk prefill for multimodal
+    # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
+    prompt_tokens: Optional[List[int]] = None
 
-    num_unseen_special_tokens: Optional[int] = 0
-    num_special_tokens_in_chunk: Optional[int] = 0
-    total_special_tokens_in_request: Optional[int] = 0
-
-    # TODO: fine-grained control of encoder runner/cache to each mm_item
+    num_cached_mm_tokens: Optional[int] = None
+    total_mm_tokens: Optional[int] = None
 
     def __post_init__(self):
         # Validate input data
-        if self.total_mm_tokens_in_request is None:
-            self.total_mm_tokens_in_request = sum(self.mm_token_lengths)
         if len(self.mm_token_positions) != len(self.mm_token_lengths):
             raise ValueError(
                 f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
             )
 
-        if self.past_seen_token_num < 0:
+        if self.num_cached_tokens < 0:
             raise ValueError(
-                f"past_seen_token_num must be non-negative, got {self.past_seen_token_num}"
+                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
             )
 
         if any(length <= 0 for length in self.mm_token_lengths):
@@ -147,49 +132,22 @@ class MultimodalRuntimeData:
                 f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
             )
 
-        if self.num_unseen_mm_tokens is None or self.num_mm_tokens_in_chunk is None:
+        if self.num_cached_mm_tokens is None:
             # Compute cached multimodal tokens based on positions and cached tokens
-            self.num_unseen_mm_tokens = 0
-            self.num_mm_tokens_in_chunk = 0
-            remainder = 0
+            self.num_cached_mm_tokens = 0
             for pos, length in zip(self.mm_token_positions,
                                    self.mm_token_lengths):
-                if pos + length <= self.past_seen_token_num:
-                    self.num_unseen_mm_tokens += length
-                elif pos < self.past_seen_token_num:
+                if pos + length <= self.num_cached_tokens:
+                    self.num_cached_mm_tokens += length
+                elif pos < self.num_cached_tokens:
                     # Partial overlap - only count the cached portion
-                    self.num_unseen_mm_tokens += self.past_seen_token_num - pos
-                    self.num_mm_tokens_in_chunk += min(
-                        self.chunk_end_pos,
-                        pos + length) - self.past_seen_token_num
-                else:
-                    if pos + length > self.chunk_end_pos:
-                        # Partial overlap - only count the cached portion
-                        if pos < self.chunk_end_pos:
-                            self.num_mm_tokens_in_chunk += self.chunk_end_pos - pos
-                        else:
-                            remainder += length
-                    else:
-                        # Full overlap - count the entire mm item chunk
-                        self.num_mm_tokens_in_chunk += length
+                    self.num_cached_mm_tokens += self.num_cached_tokens - pos
 
-        if len(self.special_token_offsets) > 0:
-            self.num_unseen_special_tokens = sum(
-                1 for offset in self.special_token_offsets
-                if offset < self.num_unseen_mm_tokens)
-            mm_tokens_end_pos = self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk
-            self.num_special_tokens_in_chunk = sum(
-                1 for offset in self.special_token_offsets
-                if self.num_unseen_mm_tokens <= offset < mm_tokens_end_pos)
-
-            self.total_special_tokens_in_request = len(
-                self.special_token_offsets)
-
-        if self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk + remainder > sum(
-                self.mm_token_lengths):
+        if self.num_cached_mm_tokens > self.num_cached_tokens:
             raise ValueError(
-                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens_in_chunk ({self.num_mm_tokens_in_chunk}) + remainder ({remainder}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
-            )
+                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
+                f"num_cached_tokens ({self.num_cached_tokens})")
+        self.total_mm_tokens = sum(self.mm_token_lengths)
 
 
 @dataclass
@@ -225,7 +183,6 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
-            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
             # ... other modalities
         }
     """
@@ -404,18 +361,13 @@ class MultimodalParams:
     def to_device(self,
                   element: str,
                   device: str,
-                  pin_memory: bool = False,
-                  target_keywords: Optional[List[str]] = None) -> None:
+                  pin_memory: bool = False) -> None:
         """Move specified multimodal data element to target device.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
-            pin_memory: Whether to pin memory for asynchronous transfers
-            target_keywords: Optional list of keyword paths to filter which data to move.
-                    Each string can be a simple key or dot-separated path
-                    (e.g., ["image.pixel_values", "mrope_config"])
-                    If provided, only data matching these paths will be moved to device.
+            pin_memory: Whether to pin memory for faster transfers
 
         Raises:
             ValueError: If element is not "multimodal_data" or device is invalid
@@ -430,90 +382,30 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to move
 
-        # If keyword is specified, only move data for those keyword paths
-        if target_keywords is not None:
-            if not isinstance(data, dict):
-                raise ValueError(
-                    f"multimodal_data must be a dictionary when keyword is specified, "
-                    f"got {type(data)}")
-
-            # Process multiple keyword paths
-            transformed_data = self._move_multiple_paths_to_device(
-                data, target_keywords, device, pin_memory)
-        else:
-            # Move all data as before
-            transformed_data = self._apply_tensor_operation(
-                data, "to_device", device=device, pin_memory=pin_memory)
-
+        transformed_data = self._apply_tensor_operation(data,
+                                                        "to_device",
+                                                        device=device,
+                                                        pin_memory=pin_memory)
         setattr(self, element, transformed_data)
-
-    def _move_multiple_paths_to_device(self, data: Dict[str, Any],
-                                       target_keywords: List[str], device: str,
-                                       pin_memory: bool) -> Dict[str, Any]:
-        """Move multiple nested data paths to device.
-
-        Args:
-            data: The multimodal data dictionary
-            target_keywords: List of keyword paths (can be dot-separated)
-            device: Target device
-            pin_memory: Whether to pin memory
-
-        Returns:
-            Updated data dictionary with specified paths moved to device
-        """
-        result = data
-        for keyword_path in target_keywords:
-            # Parse each keyword path
-            if '.' in keyword_path:
-                key_path = keyword_path.split('.')
-            else:
-                key_path = [keyword_path]
-
-            # Navigate to the target location and move data
-            current = result
-            parent_path = key_path[:-1]
-            target_key = key_path[-1]
-
-            # Navigate to the parent dictionary
-            for key in parent_path:
-                if not isinstance(current, dict) or key not in current:
-                    # Path doesn't exist, skip this keyword path
-                    break
-                current = current[key]
-            else:
-                # Check if the target key exists and move it to device
-                if isinstance(current, dict) and target_key in current:
-                    current[target_key] = self._apply_tensor_operation(
-                        current[target_key],
-                        "to_device",
-                        device=device,
-                        pin_memory=pin_memory)
-
-        return result
 
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_position_deltas and removes all other multimodal data
+        Keeps only mrope_config and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_position_deltas before clearing
-        mrope_position_deltas = None
+        # Extract mrope_config before clearing
+        mrope_config = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
-            if isinstance(mrope_config,
-                          dict) and 'mrope_position_deltas' in mrope_config:
-                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only position deltas if they exist
+        # Clear all data and restore only mrope_config if it exists
         self.multimodal_data = {}
-        if mrope_position_deltas is not None:
-            self.multimodal_data['mrope_config'] = {
-                'mrope_position_deltas': mrope_position_deltas
-            }
+        if mrope_config is not None:
+            self.multimodal_data['mrope_config'] = mrope_config
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
@@ -593,13 +485,7 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
 
 def find_mm_token_lengths(mm_data: Dict[str, Any],
                           input_processor: Any) -> List[int]:
-    """Get the maximum contiguous multimodal token lengths from multimodal data items.
-
-    Returns the total token count for each multimodal item, including any special tokens
-    (e.g., image_begin, image_end, image_break) that may be mixed with the actual
-    multimodal content tokens. This mm_token_lengths represents the full contiguous chunk from beginning
-    to end, not just pure image/video/audio tokens.
-    """
+    """Get multimodal token lengths from multimodal data items. """
 
     mm_items = {
         modality: items if isinstance(items, list) else [items]
@@ -619,14 +505,19 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 if isinstance(item, torch.Tensor):
                     item = ToPILImage()(item)
                 num_tokens = input_processor.get_num_tokens_per_image(
-                    image=item, )
+                    image_width=item.width,
+                    image_height=item.height,
+                )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
                 assert isinstance(item, list), "Video must be a list of frames"
                 if isinstance(item[0], torch.Tensor):
                     item = [ToPILImage()(frame) for frame in item]
                 num_tokens = input_processor.get_num_tokens_per_video(
-                    video=item, )
+                    video_width=item[0].width,
+                    video_height=item[0].height,
+                    num_frames=len(item),
+                )
                 modality_token_lengths.append(num_tokens)
             else:
                 # TODO: add audio support if needed
@@ -638,30 +529,26 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
 
 
 def find_mm_token_positions(
-    input_ids: Union[torch.Tensor, List[int], np.ndarray],
-    num_mm_tokens: List[int],
-    vocab_size: Optional[int] = None,
-    mm_token_ids: Optional[torch.Tensor] = None,
-    mm_special_token_ids: Optional[torch.Tensor] = None
-) -> Tuple[List[int], List[int]]:
-    """Get starting positions of contiguous multimodal token chunks using known lengths.
+        input_ids: Union[torch.Tensor, List[int], np.ndarray],
+        num_mm_tokens: List[int],
+        vocab_size: Optional[int] = None,
+        mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
+    """Get multimodal token positions using IDs > vocab_size and known lengths.
 
-    This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
-    and uses the provided lengths in num_mm_tokens to identify where each contiguous chunk starts.
-    Each chunk in num_mm_tokens is assumed to be a contiguous block of multimodal tokens for each multimodal item, and may include special tokens (e.g., image_begin, image_end, image_break) within the chunk.
-
-    Note: at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids
-    is provided, vocab_size is ignored.
+    This function finds multimodal tokens (with IDs > vocab_size) and uses the
+    provided lengths in num_mm_tokens to identify where each chunk starts.
+    This works even when there are no gaps between different image sequences
+    (e.g., when all images use the same token IDs).
+    Note at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids is provided, vocab_size is ignored.
 
     Args:
         input_ids: Token sequence (tensor, list, or numpy array)
-        num_mm_tokens: List of contiguous chunk lengths for each multimodal item
-        vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
-        mm_token_ids: Specific token IDs that represent multimodal tokens
+        num_mm_tokens: List of lengths for each multimodal token chunk
+        vocab_size: Size of the model's vocabulary
+        mm_token_ids: Possible token ids for multimodal tokens
 
     Returns:
-        List of starting positions for each contiguous multimodal token
-        (Optional) List of starting positions of special tokens in the union of all multimodal token chunks
+        List of starting positions for each multimodal token chunk
     """
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(
@@ -710,15 +597,7 @@ def find_mm_token_positions(
             # Move to the next chunk
             current_position += length
 
-    start_special_token_positions = []
-    if mm_special_token_ids is not None:
-        mm_token_ids = input_ids[mm_positions]
-        special_token_mask_in_mm = torch.isin(mm_token_ids,
-                                              mm_special_token_ids)
-        start_special_token_positions = torch.where(
-            special_token_mask_in_mm)[0].tolist()
-
-    return start_positions, start_special_token_positions
+    return start_positions
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

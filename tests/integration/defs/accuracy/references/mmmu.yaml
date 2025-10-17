@@ -1,4 +1,2 @@
 Qwen/Qwen2-VL-7B-Instruct:
   - accuracy: 48.44
-nvidia/Nano-v2-VLM:
-  - accuracy: 43.78

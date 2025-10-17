@@ -1,6 +1,5 @@
 from unittest.mock import MagicMock, patch
 
-import pydantic
 import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
@@ -93,7 +92,7 @@ def test_config_params():
 @patch("tensorrt_llm._torch.auto_deploy.llm.DemoGenerationExecutor")
 @patch("tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface.SequenceInfo")
 @patch("tensorrt_llm._torch.auto_deploy.shim.demollm.dist_ad.initialize_or_skip")
-@patch("tensorrt_llm._torch.auto_deploy.llm.LLM._create_input_processor")
+@patch("tensorrt_llm._torch.auto_deploy.llm.create_input_processor")
 @patch("tensorrt_llm._torch.auto_deploy.llm.LLM._build_model")
 def test_config_flow(
     mock_build_model,
@@ -148,19 +147,11 @@ def test_config_flow(
         pass
 
 
-@pytest.mark.parametrize(
-    "model_factory",
-    [
-        "Foo",
-        # typo.
-        "AutomodelForCausalLMFactory",
-    ],
-)
-def test_non_registered_model_factory(model_factory: str):
-    with pytest.raises(
-        pydantic.ValidationError, match="does not exist in the model factory registry"
-    ):
-        LlmArgs(model="test-model", model_factory=model_factory)
+def test_invalid_model_factory():
+    """Test behavior with invalid model factory."""
+    # Pydantic validates Literal types at runtime, so this should raise ValidationError
+    with pytest.raises(Exception):  # Could be ValidationError or ValueError
+        LlmArgs(model="test-model", model_factory="InvalidFactory")
 
 
 @pytest.mark.parametrize(

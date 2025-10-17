@@ -157,13 +157,10 @@ class GemmaDecoderLayer(Module):
                 if default_net().plugin_config.reduce_fusion else
                 AllReduceFusionOp.NONE,
                 residual=residual,
-                norm_weight=self.pre_feedforward_layernorm.weight.value
+                norm_weight=self.pre_feedforward_layernorm.weight.value,
+                norm_pre_residual_weight=self.post_layernorm.weight.value
                 if self.config.inter_layernorms else None,
-                norm_pre_residual_weight=self.post_layernorm.weight.value,
-                eps=self.pre_feedforward_layernorm.eps
-                if self.config.inter_layernorms else 1e-06,
-            ),
-        )
+                eps=self.pre_feedforward_layernorm.eps))
 
         if use_cache:
             attention_output, presents = attention_output
@@ -302,7 +299,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         hf_gemma = transformers.AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             device_map="cpu" if load_model_on_cpu else "auto",
-            dtype='auto',
+            torch_dtype='auto',
         )
         weights = load_gemma_weights_from_hf_model(hf_gemma, trt_llm_config)
         del hf_gemma

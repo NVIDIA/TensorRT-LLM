@@ -125,7 +125,7 @@ class TestFunctional(unittest.TestCase):
             num_attention_heads=num_heads,
             vocab_size=30522,
             hidden_act='gelu',
-            dtype=dtype,
+            torch_dtype=dtype,
         )
         attention = AttentionCls(configuration).cuda().eval()
 

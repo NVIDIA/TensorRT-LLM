@@ -222,7 +222,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         embd_pdrop=0,
         attn_pdrop=0,
         hidden_act='gelu',
-        dtype=dtype,
+        torch_dtype=dtype,
     )
     attention = GPT2Attention(configuration).cuda().eval()
 

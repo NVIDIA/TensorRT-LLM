@@ -16,7 +16,6 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 import pytest
@@ -67,57 +66,6 @@ def compute_threshold(num_samples: int,
         return ref_accuracy - z_alpha * scale
 
 
-@dataclass(slots=True)
-class HypothesisTestingParams:
-    ref_accuracy: float
-    num_samples: int
-    alpha: float = 0.05
-    beta: float = 0.2
-    sigma: float = 50.0
-    higher_is_better: bool = True
-    theta: float = field(init=False)
-    threshold: float = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.theta = compute_theta(self.num_samples,
-                                   sigma=self.sigma,
-                                   alpha=self.alpha,
-                                   beta=self.beta)
-        self.threshold = compute_threshold(
-            self.num_samples,
-            self.ref_accuracy,
-            sigma=self.sigma,
-            alpha=self.alpha,
-            higher_is_better=self.higher_is_better)
-
-    def report(self, accuracy: Optional[float] = None) -> str:
-        report = f"""===========================================================
-= ACCURACY HYPOTHESIS TESTING
-===========================================================
-Alpha (Type I:  False Positive): {self.alpha:.3f}
-Beta  (Type II: False Negative): {self.beta:.3f}
-Sigma (Standard deviation): {self.sigma:.3f}
-#Samples: {self.num_samples}
-Higher is better: {self.higher_is_better}
-Theta (Minimum detectable effect): {self.theta:.3f}
-Reference accuracy: {self.ref_accuracy:.3f}
-Threshold: {self.threshold:.3f}
-==========================================================="""
-        if accuracy is not None:
-            report = f"""{report}
-Evaluated accuracy: {accuracy:.3f}
-==========================================================="""
-        return report
-
-    def assert_passing(self, accuracy: float) -> None:
-        compare_op = ">=" if self.higher_is_better else "<="
-        err_msg = f"Reference accuracy is {self.ref_accuracy:.3f}, threshold is {self.threshold:.3f}. Expected accuracy {compare_op} threshold, but got {accuracy:.3f}. Please see hypothesis testing report:\n{self.report(accuracy)}"
-        if self.higher_is_better:
-            assert accuracy >= self.threshold, err_msg
-        else:
-            assert accuracy <= self.threshold, err_msg
-
-
 class AccuracyTask:
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
 
@@ -145,9 +93,8 @@ class AccuracyTask:
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
             self.reference: List[dict] = yaml.safe_load(f).get(model_name, [])
 
-    def get_hypothesis_testing_params(self,
-                                      **acc_specs) -> HypothesisTestingParams:
-        """Get hypothesis testing parameters via accuracy specifications.
+    def get_num_samples_and_threshold(self, **acc_specs):
+        """Get num_samples and threshold via accuracy specifications.
 
         Args:
             acc_specs: Accuracy specifications, currently including:
@@ -172,22 +119,37 @@ class AccuracyTask:
             else:
                 raise ValueError(f"Not registered specs: {acc_specs}.")
 
-        return HypothesisTestingParams(
-            ref_accuracy=entry.get("accuracy"),
-            alpha=entry.get("alpha", self.ALPHA),
-            beta=entry.get("beta", self.BETA),
-            sigma=entry.get("sigma", self.SIGMA),
-            num_samples=entry.get("num_samples", self.NUM_SAMPLES),
-            higher_is_better=entry.get("higher_is_better",
-                                       self.HIGHER_IS_BETTER))
+        accuracy = entry.get("accuracy")
+        alpha = entry.get("alpha", self.ALPHA)
+        beta = entry.get("beta", self.BETA)
+        sigma = entry.get("sigma", self.SIGMA)
+        num_samples = entry.get("num_samples", self.NUM_SAMPLES)
+        higher_is_better = entry.get("higher_is_better", self.HIGHER_IS_BETTER)
+        theta = compute_theta(num_samples, sigma=sigma, alpha=alpha, beta=beta)
+        threshold = compute_threshold(num_samples,
+                                      accuracy,
+                                      sigma=sigma,
+                                      alpha=alpha,
+                                      higher_is_better=higher_is_better)
+        print("===========================================================\n"
+              "= ACCURACY HYPOTHESIS TESTING\n"
+              "===========================================================\n"
+              f"Alpha (Type I:  False Positive): {alpha:.3f}\n"
+              f"Beta  (Type II: False Negative): {beta:.3f}\n"
+              f"Sigma (Standard deviation): {sigma:.3f}\n"
+              f"#Samples: {num_samples}\n"
+              f"Theta (Minimum detectable effect): {theta:.3f}\n"
+              f"Reference accuracy: {accuracy:.3f}\n"
+              f"Threshold: {threshold:.3f}\n"
+              "===========================================================\n")
+        return num_samples, threshold
 
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False,
-                 is_integration_test: bool = False):
+                 streaming: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -200,17 +162,16 @@ class AccuracyTask:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
             )
-        is_integration_test = is_integration_test or os.getenv(
-            'INTEGRATION_TEST', '0') == '1'
+        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
 
         if is_integration_test:
+            num_samples = 1
             logger.info(
                 "Running in INTEGRATION_TEST mode: using only 1 sample and skipping accuracy verification"
             )
-            hypothesis_testing_params = HypothesisTestingParams(ref_accuracy=0,
-                                                                num_samples=1)
+            threshold = 0
         else:
-            hypothesis_testing_params = self.get_hypothesis_testing_params(
+            num_samples, threshold = self.get_num_samples_and_threshold(
                 dtype=llm.args.dtype,
                 quant_algo=llm.args.quant_config.quant_algo,
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
@@ -232,19 +193,17 @@ class AccuracyTask:
             evaluator_kwargs.update(self.EVALUATOR_KWARGS)
         if extra_evaluator_kwargs is not None:
             evaluator_kwargs.update(extra_evaluator_kwargs)
-        evaluator = self.EVALUATOR_CLS(
-            num_samples=hypothesis_testing_params.num_samples,
-            **evaluator_kwargs)
+        evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
+                                       **evaluator_kwargs)
         evaluate_kwargs = {}
         if hasattr(self, 'EVALUATE_KWARGS'):
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
         accuracy = evaluator.evaluate(llm, sampling_params, streaming,
                                       **evaluate_kwargs)
-
-        logger.info(
-            f"Hypothesis testing report:\n{hypothesis_testing_params.report(accuracy)}"
-        )
-        hypothesis_testing_params.assert_passing(accuracy)
+        if self.HIGHER_IS_BETTER:
+            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
+        else:
+            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}."
 
 
 class CnnDailymail(AccuracyTask):
@@ -458,12 +417,7 @@ class CliFlowAccuracyTestHarness:
     def install_requirements(self):
         requirements = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/requirements.txt"
         if exists(requirements):
-            self.llm_venv.run_cmd(
-                ["-m", "pip", "install", "-r", requirements],
-                env={
-                    "CMAKE_POLICY_VERSION_MINIMUM":
-                    "3.5"  # https://github.com/google/sentencepiece/issues/1111
-                })
+            self.llm_venv.run_cmd(["-m", "pip", "install", "-r", requirements])
 
     def initialize_case(self,
                         tasks: Optional[List[AccuracyTask]] = None,
@@ -498,7 +452,7 @@ class CliFlowAccuracyTestHarness:
         self.env = env
 
     def convert(self):
-        logger.info("Converting model to TensorRT LLM checkpoint...")
+        print("Converting model to TensorRT-LLM checkpoint...")
 
         is_prequantized = False
         for quant_config_file in [
@@ -600,7 +554,7 @@ class CliFlowAccuracyTestHarness:
         venv_check_call(self.llm_venv, convert_cmd)
 
     def build(self):
-        logger.info("Building engines...")
+        print("Building engines...")
         max_batch_size = max(task.MAX_BATCH_SIZE for task in self.tasks)
         max_input_len = max(task.MAX_INPUT_LEN for task in self.tasks)
         max_seq_len = max(task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN
@@ -619,7 +573,7 @@ class CliFlowAccuracyTestHarness:
         check_call(" ".join(build_cmd), shell=True, env=self.llm_venv._new_env)
 
     def summarize(self, task: AccuracyTask):
-        logger.info("Running summarize...")
+        print("Running summarize...")
         summarize_cmd = [
             f"{self.llm_root}/examples/summarize.py",
             f"--engine_dir={self.engine_dir}",
@@ -636,16 +590,12 @@ class CliFlowAccuracyTestHarness:
                 "--no_add_special_tokens"
             ])
 
-        hypothesis_testing_params = task.get_hypothesis_testing_params(
+        num_samples, threshold = task.get_num_samples_and_threshold(
             dtype=self.dtype,
             quant_algo=self.quant_algo,
             kv_cache_quant_algo=self.kv_cache_quant_algo,
             spec_dec_algo=self.spec_dec_algo,
             extra_acc_spec=self.extra_acc_spec)
-        logger.info(
-            f"Hypothesis testing report:\n{hypothesis_testing_params.report()}")
-        num_samples = hypothesis_testing_params.num_samples
-        threshold = hypothesis_testing_params.threshold
 
         if num_samples < task.MAX_BATCH_SIZE:
             max_ite = 1
@@ -687,17 +637,13 @@ class CliFlowAccuracyTestHarness:
                  str(world_size), "--allow-run-as-root"], summarize_cmd)
 
     def mmlu(self, task: AccuracyTask):
-        logger.info("Running mmlu...")
-        hypothesis_testing_params = task.get_hypothesis_testing_params(
+        print("Running mmlu...")
+        num_samples, threshold = task.get_num_samples_and_threshold(
             dtype=self.dtype,
             quant_algo=self.quant_algo,
             kv_cache_quant_algo=self.kv_cache_quant_algo,
             spec_dec_algo=self.spec_dec_algo,
             extra_acc_spec=self.extra_acc_spec)
-        logger.info(
-            f"Hypothesis testing report:\n{hypothesis_testing_params.report()}")
-        num_samples = hypothesis_testing_params.num_samples
-        threshold = hypothesis_testing_params.threshold
 
         mmlu_cmd = [
             "trtllm-eval",
@@ -718,14 +664,14 @@ class CliFlowAccuracyTestHarness:
         check_call(" ".join(mmlu_cmd), shell=True, env=self.llm_venv._new_env)
 
     def eval_long_context(self, task: AccuracyTask):
-        logger.info("Running construct_synthetic_dataset...")
+        print("Running construct_synthetic_dataset...")
         data_gen_cmd = [
             f"{self.llm_root}/examples/infinitebench/construct_synthetic_dataset.py",
             "--test_case=build_passkey", f"--test_level={task.LEVEL}"
         ]
         venv_check_call(self.llm_venv, data_gen_cmd)
 
-        logger.info("Running eval_long_context...")
+        print("Running eval_long_context...")
         eval_cmd = [
             f"{self.llm_root}/examples/eval_long_context.py", "--task=passkey",
             f"--engine_dir={self.engine_dir}",
@@ -733,16 +679,12 @@ class CliFlowAccuracyTestHarness:
             f"--max_input_length={task.MAX_INPUT_LEN}",
             "--enable_chunked_context"
         ]
-        hypothesis_testing_params = task.get_hypothesis_testing_params(
+        num_samples, threshold = task.get_num_samples_and_threshold(
             dtype=self.dtype,
             quant_algo=self.quant_algo,
             kv_cache_quant_algo=self.kv_cache_quant_algo,
             spec_dec_algo=self.spec_dec_algo,
             extra_acc_spec=self.extra_acc_spec)
-        logger.info(
-            f"Hypothesis testing report:\n{hypothesis_testing_params.report()}")
-        num_samples = hypothesis_testing_params.num_samples
-        threshold = hypothesis_testing_params.threshold
 
         batch_size = min(task.MAX_BATCH_SIZE, num_samples)
         eval_cmd.extend([

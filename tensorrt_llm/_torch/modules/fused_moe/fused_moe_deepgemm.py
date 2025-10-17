@@ -9,7 +9,6 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
-from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -221,7 +220,7 @@ def _preprocess_after_permute_kernel(
     expert_offsets_ptr,
     masked_m_ptr,
     token_map_ptr,
-    total_tokens,
+    TOTAL_TOKENS: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
@@ -229,7 +228,7 @@ def _preprocess_after_permute_kernel(
     pid_y = tl.program_id(1)
     if pid_y == 0:
         token_offsets = pid_x * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        token_mask = token_offsets < total_tokens
+        token_mask = token_offsets < TOTAL_TOKENS
         # get expert_id for each token in the block
         expert_ids = tl.full((BLOCK_SIZE_M, ), NUM_EXPERTS - 1, dtype=tl.int32)
         found_mask = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.int1)
@@ -288,7 +287,7 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
         expert_first_token_offset_tensor,
         masked_m,
         token_to_expert_map,
-        total_tokens,
+        TOTAL_TOKENS=total_tokens,
         NUM_EXPERTS=num_experts,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
     )
@@ -366,9 +365,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
-    # To reuse pytorch memory segments allocated during graph capture.
-    buffers = get_memory_buffers()
-
     def __init__(
         self,
         *,
@@ -414,34 +410,28 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
     def get_workspace(self, m_max: int, group_size: int):
-        capture_graph = torch.cuda.is_current_stream_capturing()
         hidden_size = self.hidden_size
         intermediate_size = self.intermediate_size_per_partition
         num_experts = self.expert_size_per_partition
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = DeepGemmFusedMoE.buffers.get_buffer(
-            (num_experts * m_max * fp8_dim, ),
-            dtype=torch.float8_e4m3fn,
-            buffer_name='workspace_0',
-            reserve_buffer=capture_graph)
-        workspace_1 = DeepGemmFusedMoE.buffers.get_buffer(
-            (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
+        workspace_0 = torch.empty((num_experts * m_max * fp8_dim),
+                                  dtype=torch.float8_e4m3fn,
+                                  device='cuda')
+        workspace_1 = torch.empty(
+            (num_experts * m_max * max(intermediate_size * 2, hidden_size)),
             dtype=torch.bfloat16,
-            buffer_name='workspace_1',
-            reserve_buffer=capture_graph)
+            device='cuda')
 
         # create workspace for scaling factors
         m_padded = fp8_utils.align(m_max, 4)
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
-
-        workspace_sf = DeepGemmFusedMoE.buffers.get_buffer(
-            (num_experts * (scale_k_padded // 4) * m_padded, ),
+        workspace_sf = torch.empty(
+            (num_experts * (scale_k_padded // 4) * m_padded),
             dtype=torch.int32,
-            buffer_name='workspace_sf',
-            reserve_buffer=capture_graph)
+            device='cuda')
 
         workspace = {
             "workspace_0": workspace_0,
@@ -647,16 +637,15 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         return final_hidden_states
 
-    def forward_impl(
+    def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
-        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
@@ -674,7 +663,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                           1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens

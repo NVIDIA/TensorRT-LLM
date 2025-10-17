@@ -13,19 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Utility modules for TensorRT LLM integration tests.
+Utility modules for TensorRT-LLM integration tests.
 
 This package provides various utilities to simplify test development and reduce
 boilerplate code.
 """
 
-from .periodic_junit import PeriodicJUnitXML
 from .timeout_manager import (TimeoutManager, create_timeout_manager,
                               with_timeout_management)
 
 __all__ = [
-    'PeriodicJUnitXML',
-    'TimeoutManager',
-    'with_timeout_management',
-    'create_timeout_manager',
+    'TimeoutManager', 'with_timeout_management', 'create_timeout_manager'
 ]

@@ -12,8 +12,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
     raw_probs = torch.softmax(logits, dim=-1)
-    index = token_ids.unsqueeze(1)
-    assert index.device == raw_probs.device, f"index and raw_probs should be on the same device, but got index location: {index.device}, raw_probs location: {raw_probs.device}"
+    index = token_ids.unsqueeze(1).cuda()
     token_probs = torch.gather(raw_probs, dim=1, index=index).squeeze(-1)
     return torch.log(token_probs)
 
@@ -21,7 +20,7 @@ def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
 def extract_prefill_logprobs(result: RequestOutput) -> torch.Tensor:
     token_ids = torch.tensor(result.prompt_token_ids[1:])
     logits = result.context_logits[:-1, :]
-    return get_logprobs(token_ids.cuda(), logits)
+    return get_logprobs(token_ids, logits)
 
 
 def extract_decode_logprobs(result: RequestOutput,

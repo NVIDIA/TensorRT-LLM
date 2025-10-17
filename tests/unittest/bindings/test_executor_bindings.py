@@ -2239,7 +2239,7 @@ def test_request_perf_metrics_draft(model_path_draft_tokens_external,
     timing_metrics = perf_metrics.timing_metrics
     assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
     assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
-    assert timing_metrics.first_token_time <= timing_metrics.last_token_time
+    assert timing_metrics.first_token_time == timing_metrics.last_token_time
 
     assert perf_metrics.first_iter == 0
     assert perf_metrics.iter == 0

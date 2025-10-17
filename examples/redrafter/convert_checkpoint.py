@@ -102,7 +102,7 @@ def parse_arguments():
         "--output_dir",
         type=str,
         default="tllm_checkpoint",
-        help="The path to save the TensorRT LLM checkpoint",
+        help="The path to save the TensorRT-LLM checkpoint",
     )
     parser.add_argument(
         "--workers",
@@ -421,7 +421,7 @@ def main():
         # TODO: When ReDrafter is added to Transformers
         # hf_drafter_model = AutoModel.from_pretrained(
         #     args.drafter_model_dir,
-        #     dtype="auto",
+        #     torch_dtype="auto",
         # )
         ckpt_file = Path(args.drafter_model_dir, "model.safetensors")
         if not Path.exists(ckpt_file):

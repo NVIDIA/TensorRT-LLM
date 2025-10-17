@@ -20,7 +20,6 @@ from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -575,11 +574,11 @@ class TestResourceManager(unittest.TestCase):
 
     @staticmethod
     def _create_kv_cache_config_for_kv_cache_manager(
-            params: dict) -> KvCacheConfig:
+            params: dict) -> tllm.KvCacheConfig:
         """
         Create a KV cache config for KVCacheManager test.
         """
-        return KvCacheConfig(**params)
+        return tllm.KvCacheConfig(**params)
 
     def test_calculate_max_num_blocks_from_cpp(self):
         # Construct a minimal mapping (single-rank, no TP/PP)
@@ -634,8 +633,9 @@ class TestResourceManager(unittest.TestCase):
                     "free_gpu_memory_fraction": free_gpu_memory_fraction,
                     "enable_block_reuse": enable_block_reuse,
                 },
-                expected_memory_bytes=(int(fixed_free_mem *
-                                           free_gpu_memory_fraction), 0),
+                # NOTE: use np.float32 to avoid float precision issue between python(double in most cases) and cpp binding(float)
+                expected_memory_bytes=(int(
+                    fixed_free_mem * np.float32(free_gpu_memory_fraction)), 0),
             ),
         ]
 

@@ -30,34 +30,18 @@ class RMSNorm(torch.nn.Module):
 
 
 class AllreduceResidualNorm(torch.nn.Module):
-    """AllreduceResidualNorm pattern model that do residual plus x"""
-
     def __init__(self, hidden_size, dtype):
         super().__init__()
         self.norm = RMSNorm(hidden_size, 1e-5, dtype)
 
     def forward(self, x, residual):
-        x = torch.ops.auto_deploy.torch_dist_all_reduce.default(x)
-        y = residual + x
-        normed = self.norm(y)
-        return normed, y
-
-
-class AllreduceResidualNorm2(torch.nn.Module):
-    """AllreduceResidualNorm pattern model that do x plus residual"""
-
-    def __init__(self, hidden_size, dtype):
-        super().__init__()
-        self.norm = RMSNorm(hidden_size, 1e-5, dtype)
-
-    def forward(self, x, residual):
-        x = torch.ops.auto_deploy.torch_dist_all_reduce.default(x)
+        x = torch.ops.auto_deploy.torch_dist_all_reduce(x)
         y = x + residual
         normed = self.norm(y)
         return normed, y
 
 
-def _test_allreduce_fusion(port: int, ModuleCls):
+def _test_allreduce_fusion(port: int):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
@@ -69,7 +53,7 @@ def _test_allreduce_fusion(port: int, ModuleCls):
     residual = torch.randn(16, 16).to(dtype).cuda()
 
     # Trace the original model
-    model = ModuleCls(16, dtype)
+    model = AllreduceResidualNorm(16, dtype)
     args = (
         x,
         residual,
@@ -112,16 +96,11 @@ def _test_allreduce_fusion(port: int, ModuleCls):
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize(
-    "ModuleCls",
-    [AllreduceResidualNorm, AllreduceResidualNorm2],
-    ids=["residual_plus_x", "x_plus_residual"],
-)
-def test_allreduce_fusion(device_count, ModuleCls):
+def test_allreduce_fusion(device_count):
     if device_count <= 1:
         pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
     port = dist.get_free_port()
 
     n_workers = device_count
     mpi_pool = MpiPoolSession(n_workers=n_workers)
-    mpi_pool.submit_sync(_test_allreduce_fusion, port=port, ModuleCls=ModuleCls)
+    mpi_pool.submit_sync(_test_allreduce_fusion, port=port)

@@ -27,8 +27,6 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-using tensorrt_llm::common::launchWithPdlWhenEnabled;
-
 // Quantize a contiguous shared-memory buffer containing elements of DType into NVFP4 with per-16-element FP8 scales.
 // Output layout (repeated per 16-element group per lane), followed by one global scale float:
 //   [WARP_SIZE * 8 bytes packed e2m1 values] [WARP_SIZE * 1 byte E4M3 per-group scales] ... [global_scale (4 bytes)]
@@ -1071,10 +1069,6 @@ public:
 
         int sendIndex = mPairInfo.channel;
         uint32_t phaseParity = 0;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaGridDependencySynchronize();
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
         for (; sendIndex < tokenCount; sendIndex += mPairInfo.runChannelCount)
         {
             int tokenIndex = sendIndexMapping == nullptr ? sendIndex : sendIndexMapping[sendIndex];
@@ -1146,10 +1140,6 @@ public:
         int recvIndex = mPairInfo.channel;
         uint32_t phaseParity = 0;
         bool needRelease = false;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaGridDependencySynchronize();
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
         for (; recvIndex < tokenCount; recvIndex += mPairInfo.runChannelCount)
         {
             int tokenIndex = recvIndexMapping == nullptr ? recvIndex : recvIndexMapping[recvIndex];
@@ -1469,8 +1459,7 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
 
     dim3 block = FusedMoeCommunicator::getLaunchBlockDim(groupCountPerCta);
     dim3 grid = FusedMoeCommunicator::getLaunchGridDim(params.worldInfo.epInfo.epSize, groupCountPerCta);
-    launchWithPdlWhenEnabled(
-        "moeAllToAll", kernelFn, grid, block, totalDynamicShmSize, stream, params, workspace, hasBasicFields);
+    kernelFn<<<grid, block, totalDynamicShmSize, stream>>>(params, workspace, hasBasicFields);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

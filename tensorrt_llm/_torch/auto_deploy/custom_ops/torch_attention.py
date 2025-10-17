@@ -63,7 +63,6 @@ def scaled_dot_product_attention(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
-    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """A carbon copy of torch.nn.functional.scaled_dot_product_attention as custom op.
 
@@ -79,21 +78,19 @@ def scaled_dot_product_attention(
         dropout_p=dropout_p,
         is_causal=is_causal,
         scale=scale,
-        enable_gqa=enable_gqa,
     )
 
 
 @scaled_dot_product_attention.register_fake
 def scaled_dot_product_attention_fake(
-    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
 ):
     """Fake implementation of scaled_dot_product_attention."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
-# Unified attention op
-@torch.library.custom_op("auto_deploy::torch_attention", mutates_args=())
-def torch_attention(
+@torch.library.custom_op("auto_deploy::torch_attention_grouped_sdpa", mutates_args=())
+def grouped_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -104,25 +101,8 @@ def torch_attention(
     sinks: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
     logit_cap: Optional[float] = None,
-    layout: str = "bnsd",  # "bnsd" or "bsnd"
 ) -> torch.Tensor:
-    """
-    SDPA attention (with optional GQA) that supports two memory layouts via `layout`:
-      - "bnsd": [batch, num_heads, seq_len, head_dim]
-      - "bsnd": [batch, seq_len, num_heads, head_dim]
-
-    The `attn_mask` is always interpreted as [b, n, s_q, s_k].
-
-    Returns a tensor in the SAME layout as inputs specified by `layout`.
-    """
-    if layout not in ("bnsd", "bsnd"):
-        raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
-
-    if layout == "bsnd":
-        query = query.transpose(1, 2).contiguous()
-        key = key.transpose(1, 2).contiguous()
-        value = value.transpose(1, 2).contiguous()
-
+    """SDPA attention that can handle GQA. Expects bnsd format inputs."""
     b, n_heads, s_q, head_dim = query.shape  # bnsd format: [batch, num_heads, seq_len, head_dim]
     _, n_kv_heads, s_k, _ = key.shape  # bnsd format: [batch, num_kv_heads, seq_len, head_dim]
 
@@ -206,26 +186,72 @@ def torch_attention(
     if dropout_p > 0.0:
         attn_out = F.dropout(attn_out, p=dropout_p, training=False)
 
-    if layout == "bsnd":
-        return attn_out.transpose(1, 2).contiguous()
-    else:
-        return attn_out.contiguous()
+    # Return in bnsd format (same as input format)
+    return attn_out
 
 
-@torch_attention.register_fake
-def torch_attention_fake(
+@grouped_sdpa.register_fake
+def grouped_sdpa_fake(
     query,
     key,
     value,
     attn_mask=None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
+    dropout_p=0.0,
+    is_causal=False,
     scale=None,
     sinks=None,
     sliding_window=None,
     logit_cap=None,
-    layout: str = "bnsd",
 ):
+    """Fake implementation of grouped SDPA."""
+    return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
+
+
+@torch.library.custom_op("auto_deploy::torch_attention_bsnd_grouped_sdpa", mutates_args=())
+def bsnd_grouped_sdpa(
+    query: torch.Tensor,  # layout: [b, s_q, n, d]
+    key: torch.Tensor,  # layout: [b, s_k, n, d]
+    value: torch.Tensor,  # layout: [b, s_k, n, d]
+    attn_mask: Optional[torch.Tensor] = None,  # layout: [b, n, s_q, s_k]
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
+) -> torch.Tensor:
+    """Attention that assumes the input layout is bsnd.
+
+    Note that attn_mask layout is still assumed to be [b, n, s_q, s_k] and is consistent with the
+    original sdpa op!
+    """
+    # Transpose inputs to bnsd format for grouped_sdpa
+    query = query.transpose(1, 2).contiguous()  # [b, s_q, n, d] -> [b, n, s_q, d]
+    key = key.transpose(1, 2).contiguous()  # [b, s_k, n, d] -> [b, n, s_k, d]
+    value = value.transpose(1, 2).contiguous()  # [b, s_k, n, d] -> [b, n, s_k, d]
+
+    # Call grouped_sdpa with bnsd inputs
+    out = grouped_sdpa(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, sinks, sliding_window, logit_cap
+    )
+    # Transpose back to bsnd format
+    return out.transpose(1, 2).contiguous()
+
+
+@bsnd_grouped_sdpa.register_fake
+def bsnd_grouped_sdpa_fake(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    sinks=None,
+    sliding_window=None,
+    logit_cap=None,
+):
+    """Fake implementation of bnsd grouped SDPA."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 

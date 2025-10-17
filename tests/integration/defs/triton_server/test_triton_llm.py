@@ -3632,7 +3632,7 @@ def test_benchmark_core_model(
 def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                         TENSOR_PARALLEL_SIZE,
                         llm_backend_inflight_batcher_llm_root, llm_backend_venv,
-                        llm_backend_dataset_root, tiny_llama_model_root):
+                        llm_backend_dataset_root):
     llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
 
     if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
@@ -3649,7 +3649,6 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
     model_config["triton_config"]["max_batch_size"] = int(TRITON_MAX_BATCH_SIZE)
     model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
     model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
-    model_config["model"] = tiny_llama_model_root
     with open(model_config_path, "w") as f:
         yaml.dump(model_config, f)
 

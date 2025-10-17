@@ -170,8 +170,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   max_draft_tokens: int = 0) -> Self:
         metadata = super().create_cuda_graph_metadata(max_batch_size,
                                                       sub_cross_metadata,
                                                       max_draft_tokens)

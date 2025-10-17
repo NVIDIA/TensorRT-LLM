@@ -120,7 +120,7 @@ def load_hf_model(args):
     model_class = getattr(__import__('transformers'),
                           SUPPORTED_MODEL_TYPES[args.model_type])
     hf_model = model_class.from_pretrained(args.hf_model_dir,
-                                           dtype=torch.float16,
+                                           torch_dtype=torch.float16,
                                            device_map="cuda:0",
                                            trust_remote_code=True)
     profiler.stop('load HF model')
@@ -132,11 +132,11 @@ def load_hf_model(args):
 
 
 def load_trtllm_model(args):
-    profiler.start('load TensorRT LLM model')
+    profiler.start('load TensorRT-LLM model')
     trtllm_model = MultimodalModelRunner(args)
-    profiler.stop('load TensorRT LLM model')
+    profiler.stop('load TensorRT-LLM model')
     logger.info(
-        f'Load TensorRT LLM model takes: {profiler.elapsed_time_in_sec("load TensorRT LLM model")} sec'
+        f'Load TensorRT-LLM model takes: {profiler.elapsed_time_in_sec("load TensorRT-LLM model")} sec'
     )
     return trtllm_model
 

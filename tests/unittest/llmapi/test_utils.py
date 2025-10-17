@@ -1,6 +1,4 @@
-from tensorrt_llm.llmapi import LlmArgs
-from tensorrt_llm.llmapi.utils import (ApiStatusRegistry,
-                                       generate_api_docs_as_docstring)
+from tensorrt_llm.llmapi.utils import ApiStatusRegistry
 
 
 def test_api_status_registry():
@@ -26,9 +24,3 @@ def test_api_status_registry():
             pass
 
     assert ApiStatusRegistry.get_api_status(App._my_method) == "beta"
-
-
-def test_generate_api_docs_as_docstring():
-    doc = generate_api_docs_as_docstring(LlmArgs)
-    assert ":tag:`beta`" in doc, "the label is not generated"
-    print(doc)

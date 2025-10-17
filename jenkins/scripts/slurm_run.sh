@@ -1,9 +1,4 @@
 #!/bin/bash
-
-# Set up error handling
-set -Eeuo pipefail
-trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
-
 cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
@@ -32,24 +27,21 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     git config --global --add safe.directory "*"
     gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
-    hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
-    echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
+    echo "HOST_NODE_NAME = $HOST_NODE_NAME ; GPU_UUIDS = =$gpuUuids ; STAGE_NAME = $stageName"
     touch install_lock.lock
 else
     while [ ! -f install_lock.lock ]; do
         sleep 5
     done
 fi
+testList="$testList_$splitId"
 export CPP_TEST_TIMEOUT_OVERRIDDEN=$pytestTestTimeout
 export LLM_ROOT=$llmSrcNode
 export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
 export UCX_TLS=^gdr_copy
-
-llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
-chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 testCmdLines=(
-    "$llmapiLaunchScript"
+    "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
     "pytest"
     "-v"
     "--timeout-method=thread"
@@ -96,13 +88,6 @@ echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
 fullCmd="${testCmdLines[*]}"
+echo "Running: $testCase"
 echo "Full Command: $fullCmd"
-
-# Turn off "exit on error" so the following lines always run
-set +e
-trap - ERR
-
 eval $fullCmd
-exitCode=$?
-echo "Rank${SLURM_LOCALID} Pytest exit code: $exitCode"
-exit $exitCode

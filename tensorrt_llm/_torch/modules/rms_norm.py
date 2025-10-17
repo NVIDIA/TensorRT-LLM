@@ -14,8 +14,7 @@
 # limitations under the License.
 
 import enum
-from types import EllipsisType  # https://stackoverflow.com/a/66636313
-from typing import Optional, Tuple, TypeAlias, Union, cast
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -25,9 +24,6 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 class RMSNorm(nn.Module):
 
-    _ARGUMENT_NOT_SPECIFIED_SENTINEL = ...
-    _ArgumentNotSpecifiedSentinelType: TypeAlias = EllipsisType
-
     def __init__(
         self,
         *,
@@ -36,20 +32,11 @@ class RMSNorm(nn.Module):
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         has_weights: bool = True,
-        use_gemma: bool = False,
     ):
         super().__init__()
-
-        if use_gemma and not has_weights:
-            raise ValueError("has_weights must be True if use_gemma is True")
-
         if has_weights:
-            if not use_gemma:
-                self.weight = nn.Parameter(
-                    torch.ones(hidden_size, dtype=dtype, device=device))
-            else:
-                self.weight = nn.Parameter(
-                    torch.zeros(hidden_size, dtype=dtype, device=device))
+            self.weight = nn.Parameter(
+                torch.ones(hidden_size, dtype=dtype, device=device))
         else:
             self.register_buffer('weight',
                                  torch.ones(hidden_size,
@@ -57,74 +44,47 @@ class RMSNorm(nn.Module):
                                             device=device),
                                  persistent=False)
         self.variance_epsilon = eps
-        self.use_gemma = use_gemma
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Union[
-            Optional[torch.Tensor],
-            _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        return_residual = True
-        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
-            return_residual = False
-            residual = None
-
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
-                                      flashinfer_gemma_fused_add_rmsnorm,
-                                      flashinfer_gemma_rmsnorm,
                                       flashinfer_rmsnorm)
-            if residual is not None:
-                if not self.use_gemma:
-                    flashinfer_fused_add_rmsnorm(hidden_states, residual,
-                                                 self.weight,
-                                                 self.variance_epsilon)
-                else:
-                    flashinfer_gemma_fused_add_rmsnorm(hidden_states, residual,
-                                                       self.weight,
-                                                       self.variance_epsilon)
+            if isinstance(residual, torch.Tensor):
+                flashinfer_fused_add_rmsnorm(hidden_states, residual,
+                                             self.weight, self.variance_epsilon)
             else:
-                if not self.use_gemma:
-                    hidden_states = flashinfer_rmsnorm(hidden_states,
-                                                       self.weight,
-                                                       self.variance_epsilon)
-                else:
-                    hidden_states = flashinfer_gemma_rmsnorm(
-                        hidden_states, self.weight, self.variance_epsilon)
+                hidden_states = flashinfer_rmsnorm(hidden_states, self.weight,
+                                                   self.variance_epsilon)
         else:
             input_dtype = hidden_states.dtype
             hidden_states = hidden_states.to(torch.float32)
-            if residual is not None:
+            if isinstance(residual, torch.Tensor):
                 hidden_states = hidden_states + residual.to(torch.float32)
                 residual = hidden_states.to(input_dtype)
 
             variance = hidden_states.pow(2).mean(-1, keepdim=True)
             hidden_states = hidden_states * torch.rsqrt(variance +
                                                         self.variance_epsilon)
-            if not self.use_gemma:
-                hidden_states = self.weight * hidden_states.to(input_dtype)
-            else:
-                hidden_states = (self.weight +
-                                 1) * hidden_states.to(input_dtype)
+            hidden_states = self.weight * hidden_states.to(input_dtype)
 
-        if return_residual:
-            return hidden_states, cast(Optional[torch.Tensor], residual)
-        else:
+        if residual is ...:
             return hidden_states
+        else:
+            return hidden_states, residual
 
     def skip_forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Union[
-            Optional[torch.Tensor],
-            _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is ...:
             return hidden_states
         else:
-            return hidden_states, cast(Optional[torch.Tensor], residual)
+            return hidden_states, residual
 
 
 class GroupRMSNormKernelSelection(enum.Enum):

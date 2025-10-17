@@ -92,7 +92,6 @@ class HfWeightLoader(BaseWeightLoader):
 
     @staticmethod
     def _load_safetensors_file(file):
-        logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
     @staticmethod

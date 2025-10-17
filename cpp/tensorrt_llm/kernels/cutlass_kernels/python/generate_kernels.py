@@ -312,12 +312,12 @@ namespace tensorrt_llm
 {{
 namespace kernels
 {{
-namespace cutlass_kernels_oss
+namespace cutlass_kernels
 {{
 
 {instantiations}
 
-}} // namespace cutlass_kernels_oss
+}} // namespace cutlass_kernels
 }} // namespace kernels
 }} // namespace tensorrt_llm
 """
@@ -358,11 +358,6 @@ def is_gemm_op_valid_sm100(op):
     # We use a runtime cluster shape for SM100, so we only use cluster shapes to distinguish between 1SM and 2SM variants.
     if cga_m > 2 or cga_n != 1 or cga_k != 1:
         return False
-
-    if op.arch == 103:
-        return op.act_type == e2m1 and op.weight_type == e2m1 and tile_m == 128 and tile_n in [
-            128, 256
-        ]
 
     # Default shapes
     # This is epilogue tile size. For two CTA this is actually size 128/256 for the MMA
@@ -650,7 +645,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
-    supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
+    supported_dtypes = [e2m1]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [[128, 128, 128], [128, 128, 256], [256, 128, 128],
@@ -678,40 +673,28 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
         epi_schedule = None
 
-        if isinstance(dtype, tuple):
-            act_type, weight_type = dtype
-        else:
-            act_type, weight_type = dtype, dtype
-
-        # Minimal filter: for mixed FP8xFP4 on SM120, only emit 128x128x128
-        if act_type == DataType.e4m3 and weight_type == e2m1:
-            if cta_shape_mnk != [128, 128, 128]:
-                continue
-
-        otypes = [act_type]
-        if act_type in [DataType.e4m3, e2m1]:
+        otypes = [dtype]
+        if dtype in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                act_type,
-                weight_type,
-                act_type,
-                act_type,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
-                swap_ab=swap_ab)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
@@ -722,9 +705,10 @@ def generate_sm120_operations(is_arch_enabled):
     return operations
 
 
-def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
+def generate_sm100_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
+    arch = 100
     supported_dtypes = [
         DataType.f16, DataType.bf16, DataType.f32, DataType.e4m3, e2m1,
         (DataType.e4m3, e2m1)
@@ -732,7 +716,7 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_m = [64, 128]
-    cta_shapes_n = [8, 16, 32, 64, 128, 192, 256]
+    cta_shapes_n = [8, 16, 32, 64, 128, 256]
     cta_shapes_mn = product(cta_shapes_m, cta_shapes_n)
 
     warp_shape = [0, 0, 0]  # ignored except for naming
@@ -803,13 +787,8 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
     return operations
 
 
-def generate_sm103_operations(is_arch_enabled):
-    operations = generate_sm100_grouped_gemm_operations(is_arch_enabled, 103)
-    return operations
-
-
 def generate_sm100_operations(is_arch_enabled):
-    operations = generate_sm100_grouped_gemm_operations(is_arch_enabled, 100)
+    operations = generate_sm100_grouped_gemm_operations(is_arch_enabled)
     return operations
 
 
@@ -889,20 +868,18 @@ if __name__ == "__main__":
         (GemmKind.Gemm, 90): [fpA_intB_inl],
         (GemmKind.Grouped, 90): [moe_gemm_inl],
         (GemmKind.Grouped, 100): [moe_gemm_inl],
-        (GemmKind.Grouped, 103): [moe_gemm_inl],
         (GemmKind.Grouped, 120): [moe_gemm_inl],
         (GemmKind.Grouped, 80): [sm80_moe_gemm_inl]
     }
 
     def has_arch(sm):
-        return f"{sm}" in arches or f"{sm}-real" in arches or f"{sm}f-real" in arches or f"{sm}f" in arches
+        return f"{sm}" in arches or f"{sm}-real" in arches
 
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
     operations = []
     operations += generate_sm120_operations(has_arch(120) or has_arch(121))
-    operations += generate_sm103_operations(has_arch(103))
-    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+    operations += generate_sm100_operations(has_arch(100))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 

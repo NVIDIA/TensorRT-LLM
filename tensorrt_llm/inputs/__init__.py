@@ -1,20 +1,17 @@
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .multimodal import MultimodalInput
-from .registry import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
-                       ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from .registry import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
-                       register_input_processor,
-                       support_multimodal_disaggregated)
+                       register_input_processor)
 from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
                     ConversationMessage, MultimodalData, MultimodalDataTracker,
                     add_multimodal_placeholders, apply_chat_template,
                     async_load_audio, async_load_image, async_load_video,
                     convert_image_mode, default_multimodal_input_loader,
-                    encode_base64_content_from_url, get_cache_salt_id,
-                    load_image, load_video)
+                    encode_base64_content_from_url, load_image, load_video)
 
 __all__ = [
     "ALL_SUPPORTED_MULTIMODAL_MODELS",
@@ -29,9 +26,7 @@ __all__ = [
     "create_input_processor",
     "create_input_processor_with_hash",
     "register_input_processor",
-    "support_multimodal_disaggregated",
     "ExtraProcessedInputs",
-    "BaseDummyInputsBuilder",
     "BaseMultimodalInputProcessor",
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",
@@ -49,5 +44,4 @@ __all__ = [
     "encode_base64_content_from_url",
     "load_image",
     "load_video",
-    "get_cache_salt_id",
 ]

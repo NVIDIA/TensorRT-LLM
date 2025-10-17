@@ -23,8 +23,6 @@
 #include <type_traits>
 
 #include "cute/tensor.hpp"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/tllmException.h"
 
 namespace tensorrt_llm
 {
@@ -156,9 +154,6 @@ enum class CutlassTileConfigSM100 : int
     CtaShape128x128x256B = shape_tuple_to_enum(128, 128, 256),
     CtaShape128x256x256B = shape_tuple_to_enum(128, 256, 256),
 };
-
-// An alias to make the SHAPE_CASE macro work
-using CutlassTileConfigSM103 = CutlassTileConfigSM100;
 
 enum class CutlassTileConfigSM120 : int
 {
@@ -359,8 +354,7 @@ struct CutlassGemmConfig
         BLACKWELL = 1u << 4,
         GROUPED_GEMM = 1u << 5,
         FP8_ONLY = 1u << 6,
-        FP4_ONLY = 1u << 7,
-        FP8FP4_MIXED = 1u << 8
+        FP4_ONLY = 1u << 7
     };
 
     CutlassTileConfig tile_config_sm80 = CutlassTileConfig::ChooseWithHeuristic;
@@ -417,17 +411,16 @@ struct CutlassGemmConfig
     CutlassGemmConfig(CutlassTileConfigSM100 tile_config_sm100, MainloopScheduleType mainloop_schedule,
         EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape,
         ClusterShape dynamic_cluster_shape = ClusterShape::Undefined,
-        ClusterShape fallback_cluster_shape = ClusterShape::Undefined, int sm_version = 100)
+        ClusterShape fallback_cluster_shape = ClusterShape::Undefined)
         : tile_config_sm100(tile_config_sm100)
         , mainloop_schedule(mainloop_schedule)
         , epilogue_schedule(epilogue_schedule)
         , cluster_shape(cluster_shape)
         , dynamic_cluster_shape(dynamic_cluster_shape)
         , fallback_cluster_shape(fallback_cluster_shape)
-        , sm_version(sm_version)
+        , sm_version(100)
         , is_tma_warp_specialized(true)
     {
-        TLLM_CHECK_WITH_INFO(sm_version >= 100 && sm_version < 120, "Expected SM 10x version");
     }
 
     CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120, MainloopScheduleType mainloop_schedule,

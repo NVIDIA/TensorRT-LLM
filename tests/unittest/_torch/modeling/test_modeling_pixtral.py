@@ -35,7 +35,7 @@ def make_pixtral_vision_config():
         pretrained_config=transformers.PixtralVisionConfig(
             hidden_size=1024,
             num_attention_heads=16,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             hidden_act="silu",
         ),
     )

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from typing import Optional
 
 import torch
@@ -256,7 +255,7 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
 
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                re.sub(r'(model\.layers\.)?backbone', 'model', k)
+                k.replace('model.layers.backbone', 'model')
                 for k in model_config.quant_config.exclude_modules
             ]
 

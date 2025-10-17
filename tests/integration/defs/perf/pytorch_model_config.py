@@ -51,13 +51,6 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
-        # Deepseek default cases
-        {
-            'patterns': 'deepseek_r1',
-            'config': {
-                'enable_attention_dp': True,
-            }
-        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
@@ -98,21 +91,6 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
-        # Deepseek R1 model with chunked prefill
-        {
-            'patterns': [
-                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
-                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
-                'deepseek_v3_lite_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
-                'deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
-                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
-                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
-            ],
-            'config': {
-                'enable_attention_dp': True,
-                'enable_chunked_prefill': True,
-            }
-        },
         # Deepseek_v3_lite_cases
         {
             'patterns':
@@ -123,6 +101,13 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'batch_sizes': [1, 512, 1024, 2048]
                 }
+            }
+        },
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
@@ -181,46 +166,6 @@ def get_model_yaml_config(model_label: str,
                     ]
                 }
             }
-        },
-        # GPT-OSS 120B max throughput test
-        {
-            'patterns': [
-                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:1280-con:256',
-                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:2560-con:512',
-                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:5120-con:1024',
-                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:20480-con:4096'
-            ],
-            'config': {
-                'enable_attention_dp': True,
-                'cuda_graph_config': {
-                    'enable_padding': True,
-                    'max_batch_size': 720,
-                },
-                'moe_config': {
-                    'backend': 'CUTLASS'
-                },
-                'stream_interval': 10,
-                'num_postprocess_workers': 4
-            }
-        },
-        # GPT-OSS 120B min latency test
-        {
-            'patterns': [
-                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:8-con:1',
-                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:100-con:32'
-            ],
-            'config': {
-                'enable_attention_dp': False,
-                'cuda_graph_config': {
-                    'enable_padding': True,
-                    'max_batch_size': 720,
-                },
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                },
-                'stream_interval': 10,
-                'num_postprocess_workers': 4
-            }
         }
     ]
 
@@ -236,19 +181,10 @@ def get_model_yaml_config(model_label: str,
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
-        # Derive the requested number of adapters from model_label (segment like "loras:X")
-        lora_count = 1
-        for part in model_label.split('-'):
-            if part.startswith('loras:'):
-                lora_count = max(1, int(part.split(':', 1)[1]))
-                break
-
         lora_config = {
             'lora_config': {
                 'lora_dir': lora_dirs if lora_dirs is not None else [],
-                'max_lora_rank': 64,
-                'max_loras': lora_count,
-                'max_cpu_loras': lora_count,
+                'max_lora_rank': 64
             }
         }
         if 'phi_4_multimodal_instruct' in model_label:

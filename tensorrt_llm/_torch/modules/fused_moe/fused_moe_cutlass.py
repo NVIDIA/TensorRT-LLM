@@ -85,7 +85,6 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
-            layer_idx=layer_idx,
         )
 
         # Store original hidden size before any potential padding
@@ -96,6 +95,8 @@ class CutlassFusedMoE(MoE):
             self.hidden_size = ((self.hidden_size + 127) // 128) * 128
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
+
+        self.layer_idx = layer_idx
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -151,8 +152,7 @@ class CutlassFusedMoE(MoE):
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # Finalize fusion should be disabled if Lora is used.
-        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -449,16 +449,15 @@ class CutlassFusedMoE(MoE):
             split_num_chunks - val_mod)
         return split_chunk_size_list
 
-    def forward_impl(
+    def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
-        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
@@ -468,16 +467,15 @@ class CutlassFusedMoE(MoE):
         else:
             num_rows = x.shape[0]
 
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
-                                          ] * len(all_rank_num_tokens)
-            num_rows = sum(all_rank_num_tokens_padded)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
-
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
+
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens
+                                          ] * len(all_rank_num_tokens)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
 
         if num_chunks == 1:
             outputs = self.forward_chunk(
@@ -562,43 +560,9 @@ class CutlassFusedMoE(MoE):
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
 
-    def forward_fake(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        do_finalize: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        if not self.enable_alltoall:
-            return super().forward_fake(
-                x,
-                router_logits,
-                do_finalize=do_finalize,
-                output_dtype=output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=use_dp_padding,
-                **kwargs,
-            )
-        else:
-            is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
-            data_type = output_dtype if is_nvfp4_input else x.dtype
-            num_tokens = all_rank_num_tokens[
-                self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
-            hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
-            top_k = self.routing_method.experts_per_token
-            return x.new_empty((num_tokens, top_k, hidden_size),
-                               dtype=data_type)
-
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)

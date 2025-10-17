@@ -96,46 +96,19 @@ GPU memory are also on NUMA nodes on GB200 and system can also use that. Bind me
 numactl -m 0,1 <command>
 ```
 
-### Shared Memory on EPLB
+### Shared Memory Clean Up on EPLB
 
-To achieve online load balancing, all expert weights are stored in shared host memory. Four ranks on the same GB200 node share the same expert weights to save memory.
+To achieve online load balance, all expert weights are stored in shared host memory. 4 ranks on same GB200 node share the same expert weights to save memory. Normally, these shared host memory will be cleaned up at process exit, but they may not get chance to be cleaned if an abnormal exit happens.
 
-There is one environment variable `TRTLLM_EPLB_SHM_NAME` to specify the base name of the shared memory. This environment variable may need to be specified if there are multiple instances on one node. If not, you can ignore it.
-
-The default value of `TRTLLM_EPLB_SHM_NAME` is `moe_shared`. When `TRTLLM_EPLB_SHM_NAME` is set to `moe_shared`, the shared memory segments will be named as `moe_shared_l0_lr0_all`, `moe_shared_l1_lr0_all`, and so on. Here `l0` means the first layer with EPLB, and `lr0` means that it is the part loaded by local rank 0, and `all` means it contains all expert weights of each expert.
-
-Normally, these shared memory segments will be cleaned up automatically at process exit. However, they may not get the chance to be cleaned up if an abnormal exit occurs. Therefore, EPLB will automatically clean up leftover shared memory with the same name that already exists before creating new segments.
-
-If you experience an abnormal exit and are concerned about the shared memory usage before the next run, you need to manually check the `/dev/shm` directory and delete any `/dev/shm/moe_shared_*` files if present.
-
-#### Manual Cleanup Commands
-
-For manual cleanup of shared memory, you can use the following commands:
-
-```bash
-# List all moe_shared related shared memory
-ls -la /dev/shm/moe_shared_*
-
-# Remove all moe_shared related shared memory
-rm -f /dev/shm/moe_shared_*
-
-# Or remove specific shared memory segments
-rm -f /dev/shm/moe_shared_l0_lr0_all
+In that case, when seeing the following (or similar) error message:
 ```
-
-**Warning:** Be careful when removing shared memory manually, as this may affect running processes that depend on these shared memory segments.
-
-### Hang issue caused by `UnpicklingError`
-
-It's possible to see hang issue that is caused by an `UnpicklingError`, we've noticed that and recorded it as a known issue. The issue seems to be existing in MPI, because we are not reproducing again after by-passing the MPI route by implementing customized InfiniBand communicator and replacing MPI API calls with that. We did not proceed because:
-1. The implementation only works on InfiniBand, hence not general enough.
-2. The implementation largely duplicated with InfiniBand communicator implementation in NCCL, which is hard to maintain.
-
-That being said, we are aware of the `UnpicklingError`, but instead of pushing further, we decided to keep observing for a while to see if it would be gone with further 3rd-party dependency upgrade. Please let us know if it's a blocker in your workload, and we will do necessary adjustment based on the feedback.
+FileExistsError: [Errno 17] File exists: '/moe_shared_l0_lr0_all'
+```
+you need to manually check `/dev/shm` directory and delete `/dev/shm/moe_shared_*` if any.
 
 ### Disaggregated serving related issues
 
-Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md#troubleshooting-and-faq) section of Disaggregated-Service.
+Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md#troubleshooting-and-faq) section of Disaggregated-Service.
 
 ## References
 

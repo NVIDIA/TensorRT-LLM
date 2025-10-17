@@ -3,7 +3,7 @@ tensorrt_llm>=0.0.0.dev0
 datasets==3.1.0
 evaluate
 rouge_score
-transformers>=4.56.0
+transformers>=4.40.1
 transformers-stream-generator
 sentencepiece>=0.1.99
 tiktoken

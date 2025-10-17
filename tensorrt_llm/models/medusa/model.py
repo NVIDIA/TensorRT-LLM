@@ -224,7 +224,7 @@ class MedusaForCausalLm(PretrainedModel):
             else:
                 hf_model = AutoModelForCausalLM.from_pretrained(
                     hf_model_dir,
-                    dtype="auto",
+                    torch_dtype="auto",
                     trust_remote_code=trust_remote_code)
 
                 assert isinstance(hf_model, transformers.PreTrainedModel)

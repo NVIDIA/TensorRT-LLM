@@ -2,10 +2,10 @@
 
 import torch.nn as nn
 
-from ..compiler import CompileBackendRegistry, CompilerBackend
+from ..compiler import BackendCompiler, BackendRegistry
 
 
-@CompileBackendRegistry.register("torch-simple")
-class TorchCompiler(CompilerBackend):
+@BackendRegistry.register("torch-simple")
+class TorchCompiler(BackendCompiler):
     def compile(self) -> nn.Module:
-        return self.model
+        return self.gm

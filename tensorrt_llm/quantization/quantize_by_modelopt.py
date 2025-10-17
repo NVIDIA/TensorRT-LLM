@@ -285,7 +285,7 @@ def _get_llava_qwen_model(model_dir, dtype, device):
     if "hf" in model_dir:
         from transformers import LlavaOnevisionForConditionalGeneration
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-            model_dir, dtype=dtype, device_map=device)
+            model_dir, torch_dtype=dtype, device_map=device)
         model = model.language_model
     else:
         from llava.model.builder import load_pretrained_model
@@ -328,20 +328,20 @@ def get_model(ckpt_path: str,
         from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
                                                       device_map="cuda",
-                                                      dtype=torch_dtype,
+                                                      torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
     elif model_type_is_enc_dec(hf_config.model_type):
         from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
                                                       device_map=device,
-                                                      dtype=torch_dtype,
+                                                      torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
         model = EncDecModelWrapper(hf_model=model)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
             device_map=device_map if device != "cpu" else "cpu",
-            dtype="auto",
+            torch_dtype="auto",
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model

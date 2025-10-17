@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Set
+from typing import List, Optional, Set
 
 import torch
 from torch import nn
@@ -14,10 +14,6 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 from .mtp import MTPSampler
-from .spec_tree_manager import SpecTreeManager
-
-if TYPE_CHECKING:
-    from ...llmapi.llm_args import EagleDecodingConfig
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -35,17 +31,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
-        # There could be dummy request for padding batch when using CUDA graph.
-        # Reserve one more slot for the dummy request.
-        slot_size = self.max_seq_len + 1
-        self.slot_manager = SlotManager(slot_size)
-        # This class is reused by MTP_EAGLE
-        from ...llmapi.llm_args import EagleDecodingConfig
-
-        if isinstance(config, EagleDecodingConfig):
-            self.max_total_draft_tokens = config.max_total_draft_tokens
-        else:
-            self.max_total_draft_tokens = self.max_draft_len
+        self.slot_manager = SlotManager(max_num_requests)
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
@@ -55,23 +41,11 @@ class Eagle3ResourceManager(BaseResourceManager):
             dtype=self.dtype,
             device='cuda')
         # sequence length, only used for metadata preparation
-        self.seq_lens = {i: 0 for i in range(slot_size)}
+        self.seq_lens = {i: 0 for i in range(max_num_requests)}
         # start indices of each slot
-        self.start_indices = {i: 0 for i in range(slot_size)}
+        self.start_indices = {i: 0 for i in range(max_num_requests)}
         # whether the next draft forward is the first
         self.is_first_draft = True
-        self.spec_tree_manager = None
-
-        if isinstance(config,
-                      EagleDecodingConfig) and config.eagle_choices is not None:
-            self.spec_tree_manager = SpecTreeManager(
-                max_num_requests=self.max_num_requests,
-                use_dynamic_tree=config.use_dynamic_tree,
-                max_draft_len=self.max_draft_len,
-                max_total_draft_tokens=self.max_total_draft_tokens,
-                eagle_choices=config.eagle_choices,
-                dynamic_tree_max_topK=config.dynamic_tree_max_topK,
-            )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
@@ -118,29 +92,20 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_draft_model: bool = False
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
-    is_mtp_eagle: bool = False
-
-    eagle_choices: Optional[List[List[int]]] = None
-    max_total_draft_tokens: int = 0
 
     def __post_init__(self):
-        if self.is_draft_model:
-            self.layers_to_capture = (self.num_layers - 1, )
-        elif self.layers_to_capture is None:
-            if self.num_layers == 1 or self.is_mtp_eagle:
+        if self.layers_to_capture is None:
+            if self.is_draft_model or self.num_layers == 1:
                 self.layers_to_capture = (self.num_layers - 1, )
             else:
                 if self.num_layers <= 5:
                     raise ValueError(
                         "Not enough hidden layers for default EAGLE3 capture")
+
                 self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                           self.num_layers - 4)
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
-            if self.layers_to_capture[0] == -1:
-                self.layers_to_capture = self.layers_to_capture[1:] + [
-                    self.layers_to_capture.pop(0)
-                ]
         self.num_capture_layers = len(self.layers_to_capture)
 
         # Initialize to 0 to avoid reading uninitialized memory during warmup
@@ -152,10 +117,6 @@ class Eagle3SpecMetadata(SpecMetadata):
                                                        device='cuda')
         self.hidden_states_read_indices_host = None
         self.hidden_states_write_indices_host = None
-
-        if self.eagle_choices is not None:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
         is_first_draft = self.eagle3_resource_manager.is_first_draft

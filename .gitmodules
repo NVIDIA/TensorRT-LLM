@@ -28,5 +28,4 @@
 	url = https://github.com/zeromq/cppzmq.git
 [submodule "3rdparty/DeepGEMM"]
 	path = 3rdparty/DeepGEMM
-	url = https://github.com/ruoqianguo/DeepGEMM.git
-	branch = swapab_sm100
+	url = https://github.com/deepseek-ai/DeepGEMM.git

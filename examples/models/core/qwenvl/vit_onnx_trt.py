@@ -66,7 +66,7 @@ class ONNX_TRT:
         model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_path,
             device_map="cuda",
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
             fp16=True,
             trust_remote_code=True,
         ).eval()

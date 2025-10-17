@@ -117,24 +117,14 @@ namespace moe::dev
         TLLM_LOG_ERROR("Unsupported pair");                                                                            \
     }
 
-#define LAUNCH_TILEN(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream)                         \
-    if (data.mPaddingLog2 > 0)                                                                                         \
-    {                                                                                                                  \
-        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(types, true), kernel, numBlocks, numThreads, smemSize, stream);        \
-    }                                                                                                                  \
-    else                                                                                                               \
-    {                                                                                                                  \
-        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(types, false), kernel, numBlocks, numThreads, smemSize, stream);       \
-    }
-
 #define LAUNCH_ROUTING(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                              \
     if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                            \
     {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float), kernel, numBlocks, numThreads, smemSize, stream);     \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float), kernel, numBlocks, numThreads, smemSize, stream);       \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
     {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16), kernel, numBlocks, numThreads,        \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16), kernel, numBlocks, numThreads,          \
             smemSize, stream);                                                                                         \
     }                                                                                                                  \
     else                                                                                                               \
@@ -146,32 +136,31 @@ namespace moe::dev
     data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag, forceFloatInput)                     \
     if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag)                                                               \
     {                                                                                                                  \
-        LAUNCH_TILEN(                                                                                                  \
-            data, coopLaunch, LAUNCH_ESC(float, float, true), kernel, numBlocks, numThreads, smemSize, stream);        \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float, true), kernel, numBlocks, numThreads, smemSize, stream); \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Fp32)                                                                       \
     {                                                                                                                  \
-        LAUNCH_TILEN(                                                                                                  \
+        LAUNCH_PDL(                                                                                                    \
             data, coopLaunch, LAUNCH_ESC(float, float, false), kernel, numBlocks, numThreads, smemSize, stream);       \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag && forceFloatInput)                                   \
     {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, true), kernel, numBlocks, numThreads,          \
-            smemSize, stream);                                                                                         \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, true), kernel, numBlocks, numThreads, smemSize,  \
+            stream);                                                                                                   \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag)                                                      \
     {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, true), kernel, numBlocks, numThreads,  \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, true), kernel, numBlocks, numThreads,    \
             smemSize, stream);                                                                                         \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && forceFloatInput)                                                \
     {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, false), kernel, numBlocks, numThreads,         \
-            smemSize, stream);                                                                                         \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, false), kernel, numBlocks, numThreads, smemSize, \
+            stream);                                                                                                   \
     }                                                                                                                  \
     else if (data.mDtypeExpW == tg::Dtype::Bfloat16)                                                                   \
     {                                                                                                                  \
-        LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, false), kernel, numBlocks, numThreads, \
+        LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, false), kernel, numBlocks, numThreads,   \
             smemSize, stream);                                                                                         \
     }                                                                                                                  \
     else                                                                                                               \

@@ -1,7 +1,6 @@
 import contextlib
 import json
 import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
@@ -83,27 +82,12 @@ def config_file_lock(timeout: int = 10):
     try:
         with lock:
             yield
-    except (PermissionError, filelock.Timeout):
-        # Fallback to tempdir
-        tmp_dir = Path(tempfile.gettempdir())
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock_path = tmp_dir / "_remote_code.lock"
-        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
-        try:
-            with tmp_lock:
-                yield
-        except filelock.Timeout:
-            logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
-            yield
-        except (PermissionError) as e:
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
-            )
-            # proceed without lock
-            yield
+    except filelock.Timeout:
+        logger.warning(
+            f"Failed to acquire config lock within {timeout} seconds, proceeding without lock"
+        )
+        # Fallback: proceed without locking to avoid blocking indefinitely
+        yield
 
 
 @dataclass(kw_only=True)
@@ -121,7 +105,6 @@ class ModelConfig(Generic[TConfig]):
 
     spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
-    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     is_generation: bool = True
     max_num_tokens: int = 8192
@@ -134,8 +117,6 @@ class ModelConfig(Generic[TConfig]):
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
-    # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
-    use_low_precision_moe_combine: bool = False
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
@@ -161,15 +142,13 @@ class ModelConfig(Generic[TConfig]):
         """
         Prevent modification of frozen instance attributes.
         However, we allow modification of 'extra_attrs' attributes for torch.compile
-        and 'pretrained_config' attributes for mutimodal models.
-        'quant_config' is allowed to be modified to set different quantization for VLM.
-        All the other attributes are frozen.
+        and 'pretrained_config' attributes for mutimodal models. All the other
+        attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
-            if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config'):
+            if key not in ('_frozen', 'extra_attrs', 'pretrained_config'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)
@@ -414,23 +393,16 @@ class ModelConfig(Generic[TConfig]):
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
-            # When handling the case where model_format is TLLM_ENGINE
-            # send cyclic requests to the NONE URL.
-            if checkpoint_dir is not None:
-                pretrained_config = transformers.AutoConfig.from_pretrained(
-                    checkpoint_dir,
-                    trust_remote_code=trust_remote_code,
-                )
+            pretrained_config = transformers.AutoConfig.from_pretrained(
+                checkpoint_dir,
+                trust_remote_code=trust_remote_code,
+            )
 
-                # Find the cache path by looking for the config.json file which should be in all
-                # huggingface models
-                model_dir = Path(
-                    transformers.utils.hub.cached_file(checkpoint_dir,
-                                                       'config.json')).parent
-            else:
-                raise ValueError(
-                    "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
-                )
+            # Find the cache path by looking for the config.json file which should be in all
+            # huggingface models
+            model_dir = Path(
+                transformers.utils.hub.cached_file(checkpoint_dir,
+                                                   'config.json')).parent
 
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -522,8 +494,7 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
-                    mlp_hidden_size = self._infer_nemotron_ffn_mult(
-                    ) // self.mapping.tp_size
+                    mlp_hidden_size = self._infer_nemotron_ffn_mult()
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
@@ -535,23 +506,15 @@ class ModelConfig(Generic[TConfig]):
 
         # For kv cache size calculation: set size_per_head
         head_dim_names = ["head_size", "head_dim"]
-        head_size = None
         for head_dim_name in head_dim_names:
-            if hasattr(self.pretrained_config, head_dim_name):
-                value = getattr(self.pretrained_config, head_dim_name)
-                if value is not None:
-                    head_size = value
-                    break
-
-        if head_size is None:
-            assert hidden_size % num_heads == 0, (
-                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
-            )
-            calculated_head_size = hidden_size // num_heads
+            if head_dim_name in self.pretrained_config:
+                head_size = getattr(self.pretrained_config, head_dim_name)
+                break
+        else:
             logger.warning(
-                f"head_size/head_dim is not set or None, using default value {calculated_head_size}"
+                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
             )
-            head_size = calculated_head_size
+            head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size

@@ -506,7 +506,7 @@ class TestLLaMA(unittest.TestCase):
                 "model": "cpu",
                 "lm_head": "cpu"
             },  # Load to CPU memory
-            dtype="auto")
+            torch_dtype="auto")
         assert hf_llama.config.torch_dtype == torch.float16
         kv_dtype = trt.float16 if hf_llama.config.torch_dtype == torch.float16 else trt.float32
         max_context_length = 128  # for loader tests this value does not matter

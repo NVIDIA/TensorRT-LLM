@@ -8,6 +8,7 @@ import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
+from ..custom_ops.quant import QUANT_BMM_OPS, QUANT_LINEAR_OPS
 from .logger import ad_logger
 
 try:
@@ -151,6 +152,9 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
+    assert is_linear_op(mm_node, include_quantization=True) or is_bmm_op(mm_node), (
+        f"Expecting linear or bmm node, Found: {mm_node}"
+    )
     weight_node = extract_weight_node(mm_node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
@@ -239,12 +243,6 @@ def filtered_nodes(
         for node in nodes:
             if target(node):
                 yield node
-    elif isinstance(target, Iterable) and all(isinstance(t, Callable) for t in target):
-        for node in nodes:
-            for t in target:
-                if t(node):
-                    yield node
-                    break
     else:
         # Handle the case where target or ops contains operations
         operations = ops if ops is not None else target
@@ -253,7 +251,7 @@ def filtered_nodes(
                 yield node
 
 
-def is_linear_op(node: Node) -> bool:
+def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
     """Check if the node is a linear op.
 
     Using this function is preferred over `is_op` for linear ops to ensure all variants are covered.
@@ -263,22 +261,19 @@ def is_linear_op(node: Node) -> bool:
         torch.ops.auto_deploy.torch_linear_simple,
     }
 
+    if include_quantization:
+        lin_ops.update(QUANT_LINEAR_OPS)
     return is_op(node, lin_ops)
 
 
-def is_fake_quantized_linear_op(node: Node) -> bool:
-    quantized_linear_op = {
-        torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
-        torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
-    }
+def is_bmm_op(node: Node, include_quantization: bool = False) -> bool:
+    """Check if the node is a distributed op."""
+    dist_ops = {torch.ops.aten.bmm}
 
-    return is_op(node, quantized_linear_op)
+    if include_quantization:
+        dist_ops.update(QUANT_BMM_OPS)
 
-
-def is_bmm_op(node: Node) -> bool:
-    bmm_ops = {torch.ops.aten.bmm}
-
-    return is_op(node, bmm_ops)
+    return is_op(node, dist_ops)
 
 
 def is_dist_op(node: Node) -> bool:
@@ -327,10 +322,9 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     for node in gm.graph.nodes:
         if input_id_node is None and node.op == "placeholder":
             input_id_node = node
-        if node.op == "output":
-            output_node = node
+        output_node = node
     assert input_id_node, "Could not find input node"
-    assert output_node, "Could not find output node"
+    assert output_node.op == "output", "Could not find output node"
 
     # start list of boundary nodes
     boundary_nodes = [input_id_node]
@@ -442,53 +436,3 @@ def extract_op_args(node: Node, *arg_names):
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
     return [_get(n) for n in arg_names]
-
-
-def predecessors(
-    node: Node,
-    depth: int = 1,
-    include: Optional[Callable[[Node], bool]] = None,
-    exclude: Optional[Callable[[Node], bool]] = None,
-) -> List[Node]:
-    """
-    Build predecessor tree of node by recursively traversing node.args up to depth depth.
-    If include is provided, only include nodes that satisfy the condition.
-    If exclude is provided, exclude nodes that satisfy the condition.
-    """
-    preds = []
-    for arg in node.args:
-        if isinstance(arg, Node):
-            if depth > 1:
-                preds.extend(predecessors(arg, depth - 1, include, exclude))
-            # add node arg if either:
-            # a) include and exclude are not specified
-            # b) include is specified and arg satisfies include condition
-            # c) exclude is specified and arg does not satisfy exclude condition
-            if exclude and exclude(arg):
-                continue
-            if (not include) or (include and include(arg)):
-                preds.append(arg)
-    return list(reversed(preds))
-
-
-def successors(
-    node: Node,
-    depth: int = 1,
-    include: Optional[Callable[[Node], bool]] = None,
-    exclude: Optional[Callable[[Node], bool]] = None,
-) -> List[Node]:
-    """
-    Build successor tree of node by recursively traversing node.users up to depth depth.
-    If include is provided, only include nodes that satisfy the condition.
-    If exclude is provided, exclude nodes that satisfy the condition.
-    """
-    succs = []
-    for user in node.users:
-        if depth > 1:
-            succs.extend(successors(user, depth - 1, include, exclude))
-        # analogous logic to predecessors
-        if exclude and exclude(user):
-            continue
-        if (not include) or (include and include(user)):
-            succs.append(user)
-    return list(reversed(succs))

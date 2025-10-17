@@ -25,7 +25,6 @@ class AttentionRuntimeFeatures:
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
     chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
-    chunked_prefill_buffer_batch_size: int = 4  # real chunk size for MLA chunked prefill is chunked_prefill_buffer_batch_size * chunk_size.
 
 
 # The type of requests in qkv passed to attention
@@ -122,7 +121,12 @@ class AttentionMetadata:
         default_factory=AttentionRuntimeFeatures)
 
     # The number of tokens in each rank.
-    all_rank_num_tokens: Optional[List[int]] = None
+    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
+                                                      default=None,
+                                                      repr=False)
+    all_rank_num_tokens: Optional[List[int]]
+    # The max number of tokens among all ranks.
+    all_rank_max_num_tokens: Optional[int] = None
 
     # These fields are set when changing seq_lens and _num_contexts to avoid computation
     # during execution. If the calculation happens during execution, torch compile treats it
@@ -136,11 +140,9 @@ class AttentionMetadata:
 
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
-    cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -163,6 +165,16 @@ class AttentionMetadata:
             self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
             self._num_tokens = self._seq_lens.sum().item()
+
+    @property
+    def all_rank_num_tokens(self) -> Optional[List[int]]:
+        return self._all_rank_num_tokens
+
+    @all_rank_num_tokens.setter
+    def all_rank_num_tokens(self, value: Optional[List[int]]):
+        value = value if value is not AttentionMetadata.all_rank_num_tokens else None
+        self._all_rank_num_tokens = value
+        self.all_rank_max_num_tokens = max(value) if value is not None else None
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -276,8 +288,7 @@ class AttentionMetadata:
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   max_draft_tokens: int = 0) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -289,7 +300,6 @@ class AttentionMetadata:
 
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
-        cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
@@ -512,9 +522,6 @@ class PositionalEmbeddingParams:
     rope: Optional[RopeParams] = None
     is_neox: bool = True
 
-    # mRoPE params (currently, Qwen2/2.5-VL uses it)
-    mrope_section: Optional[List[int]] = None
-
     def __post_init__(self) -> None:
         if self.type.is_deferred():
             assert self.embedder is not None, f"{self.type} requires a not-none external embedder"
@@ -564,7 +571,6 @@ class AttentionBackend(Generic[TMetadata]):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         skip_create_weights_in_init: bool = False,
-        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
         """
@@ -575,14 +581,12 @@ class AttentionBackend(Generic[TMetadata]):
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
-            sparse_attention_config (SparseAttentionConfig): Optional sparse attention configuration. If None, no sparse attention is applied.
         """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
-        self.sparse_attention_config = sparse_attention_config
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         """
@@ -642,4 +646,3 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
-    chunked_prefill_buffer_batch_size: int = 1

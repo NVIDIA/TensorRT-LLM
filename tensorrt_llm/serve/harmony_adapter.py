@@ -6,7 +6,7 @@ import re
 import time
 import traceback
 import uuid
-from typing import Any, List, Literal, Tuple
+from typing import Any, AsyncGenerator, Literal
 
 from openai_harmony import (Author, Conversation, DeveloperContent,
                             HarmonyEncodingName, HarmonyError, Message,
@@ -14,33 +14,19 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             SystemContent, TextContent, ToolDescription,
                             load_harmony_encoding)
 
-from tensorrt_llm.executor import GenerationResult
+from tensorrt_llm.llmapi import RequestOutput
 from tensorrt_llm.logger import logger
 
 # yapf: disable
-from .openai_protocol import (ChatCompletionMessageParam,
+from .openai_protocol import (ChatCompletionMessageParam, ChatCompletionRequest,
                               ChatCompletionResponse,
                               ChatCompletionResponseChoice,
                               ChatCompletionResponseStreamChoice,
-                              ChatCompletionStreamResponse,
-                              ChatCompletionToolsParam, ChatMessage,
+                              ChatCompletionStreamResponse, ChatMessage,
                               DeltaFunctionCall, DeltaMessage, DeltaToolCall,
                               UsageInfo)
 
 # yapf: enable
-
-
-def _check_channel_valid(generated_channels: List[str], channel: str) -> bool:
-
-    if len(generated_channels) == 0 or generated_channels[-1] != channel:
-        generated_channels.append(channel)
-
-    logger.debug(f"generated_channels: {generated_channels}")
-    if "analysis" in generated_channels and "final" in generated_channels and len(
-            generated_channels) > 2:
-        return False
-
-    return True
 
 
 class HarmonyStreamState:
@@ -86,14 +72,12 @@ class HarmonyStreamState:
         # Track channel states for token preservation
         self.has_preamble_content = False
         self.current_channel_state = None  # "analysis", "commentary_preamble", "commentary_tool", "final"
-        self.generated_channels = [
-        ]  # Track generated channels to avoid generating too many messages
         self.channel_started = False  # Track if we've sent opening token for current channel
 
         # Track sent arguments for tool call streaming deltas
         self.sent_tool_arguments = {}  # tool_call_id -> sent_arguments_length
 
-        logger.debug(f"Created HarmonyStreamState for request {request_id}")
+        logger.debug("Created HarmonyStreamState for request %s", request_id)
 
     def get_parser(self) -> StreamableParser:
         return self.parser
@@ -197,10 +181,6 @@ class HarmonyStreamState:
         """Create OpenAI delta from current parser state."""
         if not self.parser.last_content_delta:
             return None
-
-        if not _check_channel_valid(self.generated_channels,
-                                    self.parser.current_channel):
-            return {"should_stop": "Repeated message"}
 
         if self.parser.current_channel == "analysis":
             # Analysis channel -> reasoning (no token wrapping needed)
@@ -317,8 +297,6 @@ class HarmonyStreamState:
             self.parser.last_content_delta,
             "current_channel_state":
             self.current_channel_state,
-            "generated_channels":
-            self.generated_channels,
             "channel_started":
             self.channel_started,
             "has_preamble_content":
@@ -1036,15 +1014,11 @@ class HarmonyAdapter:
             commentary_preambles = []
             tool_calls = []
             final_content = ""
-            generated_channels = []
 
             for msg in harmony_messages:
                 msg_channel = getattr(msg, 'channel', None)
                 msg_recipient = getattr(msg, 'recipient', None)
                 msg_content = getattr(msg, 'content', [])
-
-                if not _check_channel_valid(generated_channels, msg_channel):
-                    continue
 
                 if msg_channel == "analysis":
                     for content in msg_content:
@@ -1325,7 +1299,7 @@ class HarmonyAdapter:
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
             model_name: str = "harmony-model",
-            tool_choice: str | None = None) -> Tuple[list[str], bool]:
+            tool_choice: str | None = None) -> list[str]:
         """
         Create properly formatted OpenAI streaming responses from harmony tokens.
 
@@ -1423,15 +1397,12 @@ class HarmonyAdapter:
                 delta_message.reasoning_content = None
                 # tool_calls will use default factory (empty list)
 
-            should_stop = ("should_stop" in harmony_delta)
-
             # Create the streaming response
-            choice = ChatCompletionResponseStreamChoice(
-                index=0,
-                delta=delta_message,
-                logprobs=None,
-                finish_reason="stop" if should_stop else None,
-                stop_reason=None)
+            choice = ChatCompletionResponseStreamChoice(index=0,
+                                                        delta=delta_message,
+                                                        logprobs=None,
+                                                        finish_reason=None,
+                                                        stop_reason=None)
 
             stream_response = ChatCompletionStreamResponse(model=model_name,
                                                            choices=[choice],
@@ -1441,10 +1412,7 @@ class HarmonyAdapter:
             response_json = stream_response.model_dump_json(exclude_none=True)
             responses.append(f"data: {response_json}\n\n")
 
-            if should_stop:
-                return responses, should_stop
-
-        return responses, False
+        return responses
 
     def create_stream_state(
             self,
@@ -1476,7 +1444,7 @@ class HarmonyAdapter:
         """
         if request_id in self._stream_states:
             del self._stream_states[request_id]
-            logger.debug(f"Cleaned up stream state for request {request_id}")
+            logger.debug("Cleaned up stream state for request %s", request_id)
 
     def get_stream_debug_info(self, request_id: str) -> dict[str, Any] | None:
         """Get debug information for a request's stream state."""
@@ -1517,77 +1485,36 @@ class HarmonyAdapter:
         return True
 
 
-_SERVE_HARMONY_ADAPTER: HarmonyAdapter = None
-
-
-def get_harmony_adapter():
-    global _SERVE_HARMONY_ADAPTER
-    if _SERVE_HARMONY_ADAPTER is None:
-        _SERVE_HARMONY_ADAPTER = HarmonyAdapter()
-
-    return _SERVE_HARMONY_ADAPTER
-
-
-def handle_streaming_response(tools: List[ChatCompletionToolsParam],
-                              tool_choice: str, result: GenerationResult,
-                              model: str, request_id: str, done: bool,
-                              num_prompt_tokens: int) -> List[str]:
+async def handle_streaming_response(
+    harmony_adapter: HarmonyAdapter,
+    generator: RequestOutput,
+    request_id: str,
+    request: ChatCompletionRequest,
+) -> AsyncGenerator[str, None]:
+    """Handle streaming response with harmony format."""
     first_iteration = True
-    output = result.outputs[0]
+    async for res in generator:
+        output = res.outputs[0]
 
-    # Convert tools to dictionary format for harmony adapter (standard pattern)
-    tools_dict = None
-    harmony_adapter = get_harmony_adapter()
-    if tools:
-        tools_dict = [tool.model_dump() for tool in tools]
+        # Convert tools to dictionary format for harmony adapter (standard pattern)
+        tools_dict = None
+        if request.tools:
+            tools_dict = [tool.model_dump() for tool in request.tools]
 
-    # Get tool_choice from request - if "none", don't pass tools to parser
-    if tool_choice == "none":
-        tools_for_parser = None
-    else:
-        tools_for_parser = tools_dict
-
-    def end_streaming(res):
-        # Clean up state
-        harmony_adapter.cleanup_stream_state(request_id)
-
-        # Append usage info
-        usage_info = _create_usage_info(num_prompt_tokens, result.outputs)
-
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=model,
-                                                         usage=usage_info)
-
-        final_usage_json = final_usage_chunk.model_dump_json(exclude_none=True)
-
-        res.append(f"data: {final_usage_json}\n\n")
-
-    # Create OpenAI streaming responses
-    try:
-        res = []
-        if done:
-            # Send final message with finish_reason
-            final_response = ChatCompletionStreamResponse(
-                model=model,
-                choices=[
-                    ChatCompletionResponseStreamChoice(
-                        index=0,
-                        delta=DeltaMessage(),
-                        finish_reason=output.finish_reason,
-                        stop_reason=output.stop_reason)
-                ],
-            )
-
-            final_response_json = final_response.model_dump_json(
-                exclude_none=True)
-            res.append(f"data: {final_response_json}\n\n")
-            end_streaming(res)
+        # Get tool_choice from request - if "none", don't pass tools to parser
+        tool_choice = getattr(request, 'tool_choice', None)
+        if tool_choice == "none":
+            tools_for_parser = None
         else:
-            responses, should_stop = harmony_adapter.create_openai_streaming_response(
+            tools_for_parser = tools_dict
+
+        # Create OpenAI streaming responses
+        try:
+            responses = harmony_adapter.create_openai_streaming_response(
                 request_id=request_id,
                 tokens=output.token_ids_diff,
                 available_tools=tools_for_parser,
-                model_name=model,
+                model_name=request.model,
                 tool_choice=tool_choice)
             # Send first response after receiving the first output
             if first_iteration:
@@ -1598,48 +1525,64 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                                                             delta=first_delta)
 
                 first_response = ChatCompletionStreamResponse(
-                    model=model,
+                    model=request.model,
                     choices=[choice],
                 )
 
                 response_json = first_response.model_dump_json(
                     exclude_none=True)
-                res.append(f"data: {response_json}\n\n")
+                yield f"data: {response_json}\n\n"
 
-            res.extend(responses)
+            for response in responses:
+                yield response
 
-            if should_stop:
-                end_streaming(res)
-                result.abort()
+        except Exception as e:
+            logger.error(f"Failed to create OpenAI streaming response: {e}")
+            logger.debug(f"Streaming error details: {traceback.format_exc()}")
+            # Clean up state
+            harmony_adapter.cleanup_stream_state(request_id)
+            raise e
 
-        return res
+    # Clean up state
+    harmony_adapter.cleanup_stream_state(request_id)
 
-    except Exception as e:
-        logger.error(f"Failed to create OpenAI streaming response: {e}")
-        logger.debug(f"Streaming error details: {traceback.format_exc()}")
-        # Clean up state
-        harmony_adapter.cleanup_stream_state(request_id)
-        raise e
+    # Send final message with finish_reason
+    output = generator.outputs[0]
+    final_response = ChatCompletionStreamResponse(
+        model=request.model,
+        choices=[
+            ChatCompletionResponseStreamChoice(
+                index=0,
+                delta=DeltaMessage(),
+                finish_reason=output.finish_reason,
+                stop_reason=output.stop_reason)
+        ])
+
+    yield f"data: {final_response.model_dump_json(exclude_unset=True)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
-def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
-                                  tool_choice: str, outputs: List, model: str,
-                                  num_prompt_tokens: int):
+async def handle_non_streaming_response(
+        harmony_adapter: HarmonyAdapter, promise: RequestOutput,
+        request: ChatCompletionRequest) -> ChatCompletionResponse:
     """Handle non-streaming response with harmony format."""
+    # Get final result
+    await promise
+
     # Parse harmony output to OpenAI format
     # Convert tools to dictionary format for harmony adapter (standard pattern)
     tools_dict = None
-    harmony_adapter = get_harmony_adapter()
-    if tools:
-        tools_dict = [tool.model_dump() for tool in tools]
+    if request.tools:
+        tools_dict = [tool.model_dump() for tool in request.tools]
 
     # Get tool_choice from request - if "none", don't pass tools to parser
+    tool_choice = getattr(request, 'tool_choice', None)
     if tool_choice == "none":
         tools_for_parser = None
     else:
         tools_for_parser = tools_dict
 
-    output = outputs[0]
+    output = promise.outputs[0]
     parsed_output = harmony_adapter.harmony_output_to_openai(
         output.token_ids, tools_for_parser, tool_choice)
 
@@ -1654,11 +1597,11 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
                                              output.finish_reason)
 
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
-    usage_info = _create_usage_info(num_prompt_tokens, outputs)
+    usage_info = _create_usage_info(promise)
 
     # Create response
     response = ChatCompletionResponse(
-        model=model,
+        model=request.model,
         choices=[
             ChatCompletionResponseChoice(
                 index=0,
@@ -1670,6 +1613,7 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
     # Optional: Log if harmony parsing failed (for debugging)
     if parsed_output.get('_harmony_parsing_failed'):
         logger.warning("⚠️ Harmony parsing fell back to raw text decoding")
+        logger.debug(f"request\n\n{request}")
         logger.debug(f"response\n\n{response}\n")
 
     return response
@@ -1702,10 +1646,15 @@ def _determine_finish_reason(parsed_output: dict[str, Any],
         return reason
 
 
-def _create_usage_info(num_prompt_tokens, outputs) -> UsageInfo:
+def _create_usage_info(final_res: RequestOutput) -> UsageInfo:
     """Create usage info from RequestOutput following serving_chat.py pattern."""
+    # Calculate prompt tokens from prompt_token_ids and encoder_prompt_token_ids
+    assert final_res.prompt_token_ids is not None
+    num_prompt_tokens = len(final_res.prompt_token_ids)
+
     # Calculate completion tokens from all outputs
-    num_generated_tokens = sum(len(output.token_ids) for output in outputs)
+    num_generated_tokens = sum(
+        len(output.token_ids) for output in final_res.outputs)
 
     # Create usage info
     usage = UsageInfo(prompt_tokens=num_prompt_tokens,

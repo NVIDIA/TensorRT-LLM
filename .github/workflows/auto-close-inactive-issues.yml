@@ -3,11 +3,10 @@ name: Close inactive issues
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 * * * *"
 
 jobs:
   stale:
-    if: github.repository == 'NVIDIA/TensorRT-LLM'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -28,4 +27,3 @@ jobs:
           labels-to-remove-when-unstale: 'stale,waiting for feedback'
           stale-issue-label: 'stale'
           stale-pr-label: 'stale'
-          operations-per-run: 1000

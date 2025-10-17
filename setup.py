@@ -103,14 +103,12 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libtensorrt_llm_nixl_wrapper.so', 'libs/nixl/**/*',
-        'libs/ucx/**/*', 'libs/libpg_utils.so',
+        'libs/libtensorrt_llm_nixl_wrapper.so',
         'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
         'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
-        'deep_gemm/LICENSE', 'deep_gemm/include/**/*',
-        'deep_gemm_cpp_tllm.*.so', 'scripts/install_tensorrt.sh'
+        'deep_gemm/LICENSE', 'deep_gemm/include/**/*', 'deep_gemm_cpp_tllm.*.so'
     ]
 
 package_data += [
@@ -244,7 +242,6 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
-    license_files=["LICENSE", "ATTRIBUTIONS-CPP.md"],
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',
@@ -263,4 +260,4 @@ setup(
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.10, <4")
+    python_requires=">=3.7, <4")

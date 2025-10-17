@@ -1,16 +1,15 @@
-import asyncio
 from abc import ABC
-from typing import Callable, Optional
+from typing import Callable
 
 import openai
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .task import GenerationTask, StreamGenerationTask, Task, TaskStatus
+from .task import GenerationTask, Task, TaskStatus
 
 ExecutorCls = GenerationExecutor
 
@@ -151,11 +150,7 @@ class TRTLLMWorker(Worker):
         max_num_tokens: int = 4096,
         kv_cache_free_gpu_memory_fraction: float = 0.9,
         disable_overlap_scheduler: bool = False,
-        scheduler_config: Optional[SchedulerConfig] = None,
     ):
-        if scheduler_config is None:
-            scheduler_config = SchedulerConfig()
-
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
 
@@ -170,11 +165,11 @@ class TRTLLMWorker(Worker):
 
         llm = LLM(model_dir,
                   tokenizer=tokenizer,
+                  enable_mixed_sampler=True,
                   disable_overlap_scheduler=disable_overlap_scheduler,
                   kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
-                  max_num_tokens=max_num_tokens,
-                  scheduler_config=scheduler_config)
+                  max_num_tokens=max_num_tokens)
 
         worker = cls(llm, tokenizer)
         worker.own_llm = True
@@ -186,8 +181,7 @@ class TRTLLMWorker(Worker):
             temperature=task.temperature,
             top_p=task.top_p,
             top_k=task.top_k,
-            return_context_logits=task.return_context_logits,
-            logprobs=task.num_logprobs)
+            return_context_logits=task.return_context_logits)
         return sampling_params
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
@@ -207,44 +201,8 @@ class TRTLLMWorker(Worker):
         # TODO: error handle
         return TaskStatus.SUCCESS
 
-    async def stream_generation_handler(
-            self, task: StreamGenerationTask) -> TaskStatus:
-
-        async def get_step_or_more_tokens(task: StreamGenerationTask):
-            if task.cancel_flag:
-                task.end_flag = True
-                task.request_handle.abort()
-                return TaskStatus.SUCCESS
-
-            for _ in range(task.streaming_step):
-                await task.request_handle._aresult_step()
-                if task.request_handle._done:
-                    break
-
-            while not task.request_handle._done:
-                async_task = asyncio.create_task(
-                    task.request_handle._aresult_step())
-                if not async_task.done():
-                    async_task.cancel()
-                    break
-
-            if task.request_handle._done:
-                task.end_flag = True
-
-        if getattr(task, 'end_flag', False):
-            return TaskStatus.SUCCESS
-        if task.request_handle is None:
-            sampling_params = self.convert_task_params(task)
-            task.request_handle = self.llm.generate_async(
-                task.input_str, sampling_params=sampling_params, streaming=True)
-            task._result = task.request_handle
-        await get_step_or_more_tokens(task)
-
     def shutdown(self):
         if self.own_llm:
             self.llm.shutdown()
 
-    task_handlers = {
-        GenerationTask: generation_handler,
-        StreamGenerationTask: stream_generation_handler
-    }
+    task_handlers = {GenerationTask: generation_handler}

@@ -201,60 +201,56 @@ Metrics Endpoint
 
 .. note::
 
-   The metrics endpoint for the default PyTorch backend are in beta and are not as comprehensive as those for the TensorRT backend.
+   This endpoint is beta maturity.
 
-   Some fields, such as CPU memory usage, are not yet available for the PyTorch backend.
+   The statistics for the PyTorch backend are beta and not as comprehensive as those for the TensorRT backend.
 
-   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration.
+   Some fields, such as CPU memory usage, are not available for the PyTorch backend.
 
-The ``/metrics`` endpoint provides runtime iteration statistics such as GPU memory usage and KV cache details.
+   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can impact performance slightly, depending on the serving configuration.
 
-For the default PyTorch backend, iteration statistics logging is enabled by setting the ``enable_iter_perf_stats`` field in a YAML file:
+The ``/metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
+For the TensorRT backend, these statistics are enabled by default.
+However, for the PyTorch backend, you must explicitly enable iteration statistics logging by setting the `enable_iter_perf_stats` field in a YAML configuration file as shown in the following example:
 
 .. code-block:: yaml
 
-   # extra_llm_config.yaml
-   enable_iter_perf_stats: true
+   # extra-llm-api-config.yml
+   pytorch_backend_config:
+    enable_iter_perf_stats: true
 
-Start the server and specify the ``--extra_llm_api_options`` argument with the path to the YAML file:
-
-.. code-block:: bash
-
-   trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0" --extra_llm_api_options extra_llm_config.yaml
-
-After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint.
-Since the statistics are stored in an internal queue and removed once retrieved, it's recommended to poll the endpoint shortly after each request and store the results if needed.
+Then start the server and specify the ``--extra_llm_api_options`` argument with the path to the YAML file as shown in the following example:
 
 .. code-block:: bash
 
-   curl -X GET http://localhost:8000/metrics
+   trtllm-serve <model> \
+     --extra_llm_api_options <path-to-extra-llm-api-config.yml> \
+     [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
-Example output:
+After at least one inference request is sent to the server, you can fetch the runtime-iteration statistics by polling the `/metrics` endpoint:
+
+.. code-block:: bash
+
+   curl -X GET http://<host>:<port>/metrics
+
+*Example Output*
 
 .. code-block:: json
 
-    [
-        {
-            "gpuMemUsage": 76665782272,
-            "iter": 154,
-            "iterLatencyMS": 7.00688362121582,
-            "kvCacheStats": {
-                "allocNewBlocks": 3126,
-                "allocTotalBlocks": 3126,
-                "cacheHitRate": 0.00128,
-                "freeNumBlocks": 101253,
-                "maxNumBlocks": 101256,
-                "missedBlocks": 3121,
-                "reusedBlocks": 4,
-                "tokensPerBlock": 32,
-                "usedNumBlocks": 3
-            },
-            "numActiveRequests": 1
+   [
+       {
+           "gpuMemUsage": 56401920000,
+        "inflightBatchingStats": {
             ...
-        }
-    ]
-
-
+        },
+        "iter": 1,
+        "iterLatencyMS": 16.505143404006958,
+        "kvCacheStats": {
+            ...
+        },
+        "newActiveRequestsQueueLatencyMS": 0.0007503032684326172
+    }
+]
 
 Syntax
 ------

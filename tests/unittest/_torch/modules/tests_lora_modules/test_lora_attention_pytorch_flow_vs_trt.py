@@ -356,7 +356,7 @@ class TestLoraAttentionPytorchFlowVsTRT(unittest.TestCase):
                                    rms_norm_eps=1e-5,
                                    vocab_size=32000,
                                    num_key_value_heads=self.head_num,
-                                   dtype=self.torch_dtype)
+                                   torch_dtype=self.torch_dtype)
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=max_seq_len)

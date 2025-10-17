@@ -61,7 +61,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT LLM checkpoint')
+                        help='The path to save the TensorRT-LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -87,7 +87,7 @@ def convert_and_save_hf(args):
     quant_config = args_to_quant_config(args)
 
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                    dtype='auto',
+                                                    torch_dtype='auto',
                                                     trust_remote_code=True)
 
     def convert_and_save_rank(args, rank):

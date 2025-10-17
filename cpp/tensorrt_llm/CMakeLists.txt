@@ -294,10 +294,7 @@ if(TARGET ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(NOT WIN32)
-  # Load libraries at $PREFIX/lib from
-  # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs
-  set_target_properties(${SHARED_TARGET}
-                        PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../../..")
+  set_target_properties(${SHARED_TARGET} PROPERTIES BUILD_RPATH "$ORIGIN")
 endif()
 
 if(BUILD_PYT)

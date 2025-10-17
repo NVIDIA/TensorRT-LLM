@@ -176,7 +176,7 @@ cluster_infos = {
             float32=60,
         ),
     ),
-    # from https://images.nvidia.com/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
+    # from https://images.nvidia.cn/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
     "A40":
     ClusterInfo(
         intra_node_bw_per_device=_bandwidths["PCIe-4"],

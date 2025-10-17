@@ -674,7 +674,7 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
                 hf_model_or_dir,
                 device_map='auto' if not load_model_on_cpu else 'cpu',
-                dtype=dtype,
+                torch_dtype=dtype,
                 trust_remote_code=trust_remote_code,
             )
             weights = load_weights_from_hf_model(hf_model, config)

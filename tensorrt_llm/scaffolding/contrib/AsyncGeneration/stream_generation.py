@@ -1,5 +1,4 @@
 import asyncio
-import copy
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -22,15 +21,6 @@ class StreamGenerationTask(GenerationTask):
     request_handle: Any = field(default=None)
     # worker set this field to True when the generation is finished
     end_flag: bool = field(default=False)
-
-    @staticmethod
-    def create_from_generation_task(
-            task: GenerationTask,
-            streaming_step: int) -> "StreamGenerationTask":
-        stream_task = StreamGenerationTask()
-        stream_task.__dict__ = copy.deepcopy(task.__dict__)
-        stream_task.streaming_step = streaming_step
-        return stream_task
 
 
 async def stream_generation_handler(worker,

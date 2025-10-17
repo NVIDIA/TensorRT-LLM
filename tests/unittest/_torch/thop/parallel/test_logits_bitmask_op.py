@@ -21,7 +21,7 @@ def test_logits_bitmask(batch_size: int, vocab_size: int, stride: int,
                               size=(batch_size, vocab_size),
                               dtype=torch.bool,
                               device="cuda")
-    bitmask = xgrammar.testing.bool_mask_to_bitmask(bool_mask)
+    bitmask = xgrammar.testing._bool_mask_to_bitmask(bool_mask)
     token_mask = None
     if stride > 1:
         token_mask = torch.arange(batch_size, dtype=torch.int32,
@@ -53,7 +53,7 @@ def test_logits_bitmask_with_d2t(batch_size: int, vocab_size: int, stride: int,
                               size=(batch_size, vocab_size),
                               dtype=torch.bool,
                               device="cuda")
-    bitmask = xgrammar.testing.bool_mask_to_bitmask(bool_mask)
+    bitmask = xgrammar.testing._bool_mask_to_bitmask(bool_mask)
     token_mask = None
     if stride > 1:
         token_mask = torch.arange(batch_size, dtype=torch.int32,

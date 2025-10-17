@@ -263,9 +263,7 @@ class Gemma3VLM(PreTrainedModel):
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=self.image_token_ids,
-            **kwargs,
-        )
+            mm_token_ids=self.image_token_ids)
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -286,7 +284,3 @@ class Gemma3VLM(PreTrainedModel):
                                                attn_metadata=attn_metadata)[-1]
             image_features = self.mm_projector(image_features)
         return image_features
-
-    @property
-    def mm_token_ids(self):
-        return self.image_token_ids

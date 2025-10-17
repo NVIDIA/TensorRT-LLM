@@ -263,7 +263,6 @@ struct AdaBlockwiseGemmKernel
         cute::clear(tAsA);
         cute::clear(tBsB);
         cute::clear(tAsSFA);
-        cute::clear(tBsSFB);
 
         int k_tile_count = cute::size<2>(gA);
         CUTLASS_PRAGMA_NO_UNROLL

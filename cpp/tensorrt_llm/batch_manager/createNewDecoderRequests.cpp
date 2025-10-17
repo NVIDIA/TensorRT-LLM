@@ -39,6 +39,7 @@ using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
 namespace te = tensorrt_llm::executor;
+namespace tk = tensorrt_llm::kernels;
 namespace tr = tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager

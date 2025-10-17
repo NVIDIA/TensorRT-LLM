@@ -30,8 +30,6 @@ namespace tensorrt_llm::kernels
 namespace moe_prepare
 {
 
-using tensorrt_llm::common::launchWithPdlWhenEnabled;
-
 __device__ __forceinline__ void st_release_sys_global(uint64_t volatile* ptr, uint64_t val)
 {
     asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
@@ -97,7 +95,6 @@ __device__ __forceinline__ void computeCountAndSendStatics(int* experts, int tok
     int tileId = threadIdx.x / kThreadsGroupSize;
     int tileCountPerBlock = blockDim.x / kThreadsGroupSize;
     int expertCountPerRank = slotCount / epSize;
-
     if (threadIdx.x == 0)
     {
         *sharedSendRecvRankCount = 0;
@@ -112,11 +109,6 @@ __device__ __forceinline__ void computeCountAndSendStatics(int* experts, int tok
 
     int* localSendIndice = sendIndiceWorkspace + targetRankId * maxTokenCountPerRank;
     int* localBackwardIndice = backwardIndiceWorkspace + targetRankId * maxTokenCountPerRank;
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 
     for (int i = tileId; i < readRankTokenCount; i += tileCountPerBlock)
     {
@@ -171,7 +163,6 @@ __device__ __forceinline__ void recvCountAndStatics(int* recvIndiceWorkspace, in
 
     CounterCommunicator counter(workspace.getFifoConnInfo(false, rankId, targetRankId, 0, rankCount, 1));
     int communicationCount = gatheredExpertStatics == nullptr ? 1 : expertCount + 1;
-
     for (int i = rankTile.thread_rank(); i < communicationCount; i += THREADS_PER_PIPELINE)
     {
         int recvValue = counter.acquireValue(i);
@@ -192,11 +183,6 @@ __device__ __forceinline__ void recvCountAndStatics(int* recvIndiceWorkspace, in
     {
         *(localRecvIndice + tokenId) = tokenId;
     }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 template <int kThreadsGroupSize>
@@ -224,10 +210,6 @@ __global__ void moveIndiceDevice(int* sendCountsCumsum, int* recvCountsCumsum, i
     int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int maxTokenCountPerRank)
 {
     int targetRankId = blockIdx.x;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     if (blockIdx.y == 0)
     {
         // sendIndice and backwardIndice CTA
@@ -263,11 +245,6 @@ __global__ void computeCumsumDevice(int* sendCountsCumsum, int* recvCountsCumsum
     typedef cub::BlockScan<int, CUMSUM_THREADS_PER_BLOCK> BlockScan;
     __shared__ typename BlockScan::TempStorage temp_storage;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
     int tid = threadIdx.x;
     int threadData = tid < rankCount ? inputOutputPtr[tid] : 0;
     __syncthreads();
@@ -283,10 +260,6 @@ __global__ void memsetExpertIdsDevice(
     int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount, int rankCount)
 {
     int maxTokenCount = maxTokenCountPerRank * rankCount;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     int totalRecvTokenCount = *(recvCountsCumsum + rankCount - 1);
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i + totalRecvTokenCount * topK < maxTokenCount * topK;
          i += gridDim.x * blockDim.x)
@@ -327,10 +300,9 @@ void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* 
     {
         kernelFn = computeCountAndIndiceDevice<2>;
     }
-
-    launchWithPdlWhenEnabled("computeCountAndIndice", kernelFn, grid, block, 0, stream, experts, sendCounts, recvCounts,
-        sendIndiceWorkspace, backwardIndiceWorkspace, recvIndiceWorkspace, expertStatics, gatheredExpertStatics,
-        workspace, tokenCount, maxTokenCountPerRank, topK, slotCount, expertCount, rankId, rankCount);
+    kernelFn<<<grid, block, 0, stream>>>(experts, sendCounts, recvCounts, sendIndiceWorkspace, backwardIndiceWorkspace,
+        recvIndiceWorkspace, expertStatics, gatheredExpertStatics, workspace, tokenCount, maxTokenCountPerRank, topK,
+        slotCount, expertCount, rankId, rankCount);
 }
 
 void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int rankCount, cudaStream_t stream)
@@ -338,9 +310,7 @@ void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int
     int block_size = CUMSUM_THREADS_PER_BLOCK;
     dim3 block(block_size);
     dim3 grid(2);
-
-    launchWithPdlWhenEnabled("computeCumsum", computeCumsumDevice, grid, block, 0, stream, sendCountsCumsum,
-        recvCountsCumsum, rankId, rankCount);
+    computeCumsumDevice<<<grid, block, 0, stream>>>(sendCountsCumsum, recvCountsCumsum, rankId, rankCount);
 }
 
 void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, int* gatherSendIndice,
@@ -349,10 +319,8 @@ void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, i
 {
     dim3 block(512);
     dim3 grid(rankCount, 2);
-
-    launchWithPdlWhenEnabled("moveIndice", moveIndiceDevice, grid, block, 0, stream, sendCountsCumsum, recvCountsCumsum,
-        sendIndice, gatherSendIndice, backwardIndice, gatherBackwardIndice, recvIndice, gatherRecvIndice,
-        maxTokenCountPerRank);
+    moveIndiceDevice<<<grid, block, 0, stream>>>(sendCountsCumsum, recvCountsCumsum, sendIndice, gatherSendIndice,
+        backwardIndice, gatherBackwardIndice, recvIndice, gatherRecvIndice, maxTokenCountPerRank);
 }
 
 void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount,
@@ -360,11 +328,8 @@ void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPer
 {
     int smCount = tensorrt_llm::common::getMultiProcessorCount();
     int block_size = 256;
-    dim3 block(block_size);
-    dim3 grid(smCount);
-
-    launchWithPdlWhenEnabled("memsetExpertIds", memsetExpertIdsDevice, grid, block, 0, stream, expertIds,
-        recvCountsCumsum, maxTokenCountPerRank, topK, slotCount, rankCount);
+    memsetExpertIdsDevice<<<smCount, block_size, 0, stream>>>(
+        expertIds, recvCountsCumsum, maxTokenCountPerRank, topK, slotCount, rankCount);
 }
 
 size_t getMoePrepareWorkspaceSize(int epSize)

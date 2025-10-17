@@ -318,6 +318,18 @@ bool getEnvDisaggLayerwise()
     return disaggLayerwise;
 }
 
+bool getEnvDisableSelectiveCacheTransfer()
+{
+    static bool const disableSelectiveCacheTransfer = getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
+    return disableSelectiveCacheTransfer;
+}
+
+bool getEnvParallelCacheSend()
+{
+    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
+    return parallelCacheSend;
+}
+
 bool getEnvRequestKVCacheConcurrent()
 {
     static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
@@ -402,7 +414,7 @@ bool getEnvKVCacheTransferUseSyncBuffer()
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(1);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
     return maxConcurrenceNum;
 }
 
@@ -448,6 +460,12 @@ bool getEnvDisaggBenchmarkGenOnly()
 bool getEnvDisableChunkedAttentionInGenPhase()
 {
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
+}
+
+bool getEnvEnableKVCachePrecisionConversion()
+{
+    static bool const enableKVCachePrecisionConversion = getBoolEnv("TRTLLM_ENABLE_KV_CACHE_PRECISION_CONVERSION");
+    return enableKVCachePrecisionConversion;
 }
 
 } // namespace tensorrt_llm::common

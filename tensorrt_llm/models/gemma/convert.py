@@ -285,7 +285,7 @@ class HfParser:
         hf_model = AutoModelForCausalLM.from_pretrained(
             checkpoint_path,
             device_map="cpu" if load_model_on_cpu else "auto",
-            dtype='auto',
+            torch_dtype='auto',
             trust_remote_code=True,
         )
         model_params = dict(hf_model.named_parameters())

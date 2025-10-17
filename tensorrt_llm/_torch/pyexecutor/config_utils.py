@@ -11,10 +11,3 @@ def is_mla(config):
             config, "qk_rope_head_dim", None):
         return True
     return False
-
-
-def is_qwen3_next(config):
-    return hasattr(
-        config, 'architectures'
-    ) and config.architectures is not None and config.architectures[
-        0] == 'Qwen3NextForCausalLM'

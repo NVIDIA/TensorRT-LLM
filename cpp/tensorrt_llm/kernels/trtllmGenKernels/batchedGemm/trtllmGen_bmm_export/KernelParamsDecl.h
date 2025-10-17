@@ -1,3 +1,4 @@
+
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
@@ -18,7 +19,6 @@
 
 namespace batchedGemm
 {
-
 // This is device code
 
 struct KernelParams
@@ -29,10 +29,9 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // Maximum number of CTAs in the batch-token dimension.
+    // Maximum number of CTAs
     static constexpr int MaxNumCtas = 2048;
 
-    //
     // TMA descriptor for A.
     // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideAbc.
@@ -212,15 +211,15 @@ struct KernelParams
     //   x_linear = x_linear.clamp(min=-limit, max=limit)
     float const* ptrClampLimit{nullptr};
 
-    // The alpha and beta for SwiGlu or GeGlu.
+    // The alpha and beta for SwiGlu.
     // Shape is [B]. One alpha and one beta per tensor in batch.
     // Alpha is 1.f if nullptr.
     // Beta is 0.f if nullptr.
-    // The formula for SwiGlu (for GeGlu, replace sigmoid with phi):
+    // The formula:
     //
     //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + beta)
-    float const* ptrGatedActAlpha{nullptr};
-    float const* ptrGatedActBeta{nullptr};
+    float const* ptrSwiGluAlpha{nullptr};
+    float const* ptrSwiGluBeta{nullptr};
 
     // The K dimension. It is the hidden dimension of the input matrices.
     int32_t k;

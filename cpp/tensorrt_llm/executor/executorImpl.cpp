@@ -2169,25 +2169,15 @@ void Executor::Impl::terminateCancelledRequests(RequestList& activeRequests)
     }
 }
 
-void Executor::Impl::terminateContextFinishedRequests(InTransList& inTransmissionRequests)
+void Executor::Impl::terminateContextFinishedRequests(RequestList& inTransmissionRequests)
 {
     NVTX3_SCOPED_RANGE(terminateContextFinishedRequests);
     for (auto it = inTransmissionRequests.begin(); it != inTransmissionRequests.end();)
     {
-        auto& item = *it;
-        auto req = item.request;
+        auto req = *it;
         if (req->isDisaggContextCompleteState())
         {
-            // If lastBlockId was tracked, unpin it. Otherwise, just terminate.
-            auto kvMgr = mModel->getKVCacheManager();
-            if (kvMgr && item.lastBlockId.has_value())
-            {
-                kvMgr->unpinBlocksById(item.lastBlockId.value());
-            }
-            else
-            {
-                mModel->terminateRequest(req);
-            }
+            mModel->terminateRequest(req);
             it = inTransmissionRequests.erase(it);
         }
         else
@@ -2210,7 +2200,7 @@ void Executor::Impl::appendNewResponses(std::vector<Response>&& newResponses)
 }
 
 Executor::Impl::RequestList Executor::Impl::populateNewResponses(
-    RequestList& activeRequests, InTransList& inTransmissionRequests, std::vector<Response>& newResponses)
+    RequestList& activeRequests, RequestList& inTransmissionRequests, std::vector<Response>& newResponses)
 {
     NVTX3_SCOPED_RANGE(populateNewResponses);
     RequestList finishedRequests;
@@ -2233,14 +2223,7 @@ Executor::Impl::RequestList Executor::Impl::populateNewResponses(
             // move the in transmission requests to another tracker
             if (llmReq->isDisaggContextTransmissionState())
             {
-                std::optional<SizeType32> lastBlockId{};
-                auto kvMgr = mModel->getKVCacheManager();
-                if (kvMgr && kvMgr->isEnableBlockReuse() && !kvMgr->getBlockManager().isVariableWindow())
-                {
-                    lastBlockId = kvMgr->storeBlocksForReuse(llmReq->mRequestId, llmReq, /*pinBlocks=*/true);
-                    mModel->terminateRequest(llmReq);
-                }
-                inTransmissionRequests.push_back(InTransmissionItem{*it, lastBlockId});
+                inTransmissionRequests.push_back(*it);
             }
             finishedRequests.push_back(*it);
             it = activeRequests.erase(it);
@@ -2269,7 +2252,7 @@ void Executor::Impl::executionLoop()
     std::chrono::time_point<std::chrono::steady_clock> iterEnd;
     bool firstIteration{true};
     RequestList activeRequests;
-    InTransList inTransmissionRequests;
+    RequestList inTransmissionRequests;
     std::vector<Response> newResponses;
     while (!mShutdown || !activeRequests.empty())
     {

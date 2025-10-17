@@ -478,7 +478,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             logger.debug(f"HuggingFace model: {hf_model}")
 
             model = QWenForCausalLM(config)
-            logger.debug(f"TensorRT LLM model: {model}")
+            logger.debug(f"TensorRT-LLM model: {model}")
 
             if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
                 weights = load_weights_from_hf_gptq_model(hf_model, config)

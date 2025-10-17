@@ -691,7 +691,7 @@ def quantize(hf_model_dir: str,
     hf_model = AutoModel.from_pretrained(
         hf_model_dir,
         trust_remote_code=trust_remote_code,
-        dtype='auto' if config.chatglm_version != 'glm' else getattr(
+        torch_dtype='auto' if config.chatglm_version != 'glm' else getattr(
             torch, config.dtype),
         device_map=device_map)
 

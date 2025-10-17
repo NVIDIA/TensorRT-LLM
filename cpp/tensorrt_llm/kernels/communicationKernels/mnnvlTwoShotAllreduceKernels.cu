@@ -396,7 +396,6 @@ __inline__ __device__ T warpReduceSum(T val)
     return val;
 }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 inline __device__ float block_reduce_sum(float val)
 {
     __shared__ float smem[WARP_SIZE];
@@ -427,7 +426,6 @@ __device__ float4 loadfloat4(void const* ptr)
 
     return return_value;
 }
-#endif
 } // namespace
 
 template <int DIM, int NUM_THREADS, int NUM_INPUTS, typename T_OUT, typename T_IN>

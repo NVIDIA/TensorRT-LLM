@@ -111,6 +111,10 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
+      enable_mixed_sampler:
+        annotation: bool
+        default: False
+        status: beta
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
@@ -124,14 +128,6 @@ methods:
         default: False
         status: prototype
       batch_wait_timeout_ms:
-        annotation: float
-        default: 0
-        status: prototype
-      batch_wait_timeout_iters:
-        annotation: int
-        default: 0
-        status: prototype
-      batch_wait_max_tokens_ratio:
         annotation: float
         default: 0
         status: prototype
@@ -175,18 +171,6 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConnectorConfig]
         default: null
         status: prototype
-      enable_lm_head_tp_in_adp:
-        annotation: bool
-        default: False
-        status: prototype
-      orchestrator_type:
-        annotation: Optional[Literal["rpc", "ray"]]
-        default: null
-        status: prototype
-      sparse_attention_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
-        default: null
-        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -198,9 +182,6 @@ methods:
         default: null
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
-        default: null
-      cache_salt:
-        annotation: Union[str, Sequence[str], NoneType]
         default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
@@ -215,9 +196,6 @@ methods:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
         status: prototype
-      cache_salt:
-        annotation: Optional[str]
-        default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:

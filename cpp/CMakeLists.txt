@@ -45,10 +45,6 @@ option(ENABLE_MULTI_DEVICE
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
-option(CUBLAS_DYNAMIC_LINKING
-       "Link against the dynamic cublas/cublasLt libraries" ON)
-option(CURAND_DYNAMIC_LINKING "Link against the dynamic curand library" ON)
-
 option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
@@ -68,7 +64,7 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-# Add TensorRT LLM Gen export interface and CUDA support
+# Add TensorRT-LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
@@ -138,9 +134,9 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 if(TRTLLM_VERSION_RESULT EQUAL 0)
-  message(STATUS "TensorRT LLM version: ${TRTLLM_VERSION}")
+  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
 else()
-  message(FATAL_ERROR "Failed to determine TensorRT LLM version")
+  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
 endif()
 
 configure_file(
@@ -157,54 +153,25 @@ enable_language(C CXX CUDA)
 # after that CMake handles it just fine.
 setup_cuda_architectures()
 
+find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
+                                                  cublas cublasLt curand nvml)
+
+set(CUBLAS_LIB CUDA::cublas)
+set(CUBLASLT_LIB CUDA::cublasLt)
+set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
 set(NVPTX_LIB CUDA::nvptxcompiler_static)
-
-set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml nvptxcompiler_static)
-
-if(CUBLAS_DYNAMIC_LINKING)
-  set(CUBLAS_LIB CUDA::cublas)
-  set(CUBLASLT_LIB CUDA::cublasLt)
-  list(APPEND CUDA_TOOLKIT_COMPONENTS cublas cublasLt)
-else()
-  if(WIN32)
-    message(FATAL_ERROR "Static cublas not available on windows")
-  endif()
-  message(DEBUG "Linking with static cublas libs")
-
-  set(CUBLAS_LIB CUDA::cublas_static)
-  set(CUBLASLT_LIB CUDA::cublasLt_static)
-  list(APPEND CUDA_TOOLKIT_COMPONENTS cublas_static cublasLt_static)
-endif()
-
-if(CURAND_DYNAMIC_LINKING)
-  set(CURAND_LIB CUDA::curand)
-  list(APPEND CUDA_TOOLKIT_COMPONENTS curand)
-else()
-  if(WIN32)
-    message(FATAL_ERROR "Static curand not available on windows")
-  endif()
-  message(DEBUG "Linking with static curand lib")
-
-  set(CURAND_LIB CUDA::curand_static)
-  list(APPEND CUDA_TOOLKIT_COMPONENTS curand_static)
-endif()
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 if(NVRTC_DYNAMIC_LINKING)
   set(NVRTC_LIB CUDA::nvrtc)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
-  list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc nvrtc_builtins)
 else()
   set(NVRTC_LIB CUDA::nvrtc_static)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
-  list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
-
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
-
-set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -248,7 +215,6 @@ endif()
 include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
-  ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${3RDPARTY_DIR}/cutlass/include
@@ -511,6 +477,7 @@ print(os.path.dirname(torch.__file__),end='');"
       endif()
     endif()
   endif()
+
 else()
   if(NOT WIN32)
     if(NOT USE_CXX11_ABI)
@@ -558,7 +525,6 @@ if(ENABLE_UCX)
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
                  NO_DEFAULT_PATH)
   endif()
-  find_package(NIXL)
 endif()
 if(ENABLE_UCX)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=1")
@@ -599,3 +565,13 @@ set(BUILD_WHEEL_TARGETS
     tensorrt_llm;nvinfer_plugin_tensorrt_llm
     CACHE STRING "Targets used to build wheel")
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})
+
+#add_executable(testInvokeConversion
+#        kernels/testInvokeConversion.cpp)
+
+#target_link_libraries(testInvokeConversion PRIVATE
+#        tensorrt_llm_runtime            # BufferManager / Stream
+#        tensorrt_llm_kernels            # unfusedAttentionKernels
+#        gtest gtest_main cuda)
+
+#add_test(NAME InvokeConversionTests COMMAND testInvokeConversion)

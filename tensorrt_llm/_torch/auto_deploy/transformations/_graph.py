@@ -1,7 +1,7 @@
 """Graph-related utilities for transformations."""
 
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,9 +17,6 @@ from torch.utils._pytree import _LEAF_SPEC
 
 from ..utils.logger import ad_logger
 from ..utils.node_utils import is_op
-
-_NoValType = type("_NoValType", (), {})
-_NO_VAL = _NoValType()
 
 
 def get_buffers_and_params(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -132,15 +129,12 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
         gm.recompile()
 
 
-def move_to_device(mod: nn.Module, device: DeviceLikeType) -> None:
+def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> None:
     """Move the entire graph module and all sub-GraphModules to the specified device."""
     # get device
     device = torch.device(device)
 
-    # move the model to the device
-    mod.to(device)
-
-    for _, subgm in reversed(list(named_graphmodules(mod))):
+    for _, subgm in reversed(list(named_graphmodules(gm))):
         # recompile graph to update self generated codes in subgraph
         _move_single_gm_to_device(subgm, device)
 
@@ -174,20 +168,20 @@ def _canonicalize_single_gm(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
-def canonicalize_graph(mod: nn.Module) -> None:
+def canonicalize_graph(gm: GraphModule) -> None:
     """Canonicalize the graph of the given GraphModule.
 
     Args:
-        mod: The model containing GraphModules to canonicalize.
+        gm: The GraphModule to canonicalize.
     Returns:
-        The canonicalized (cleaned-up) model.
+        The canonicalized (cleaned-up) GraphModule.
     """
-    ad_logger.debug(f"Before canonicalizing: {mod}")
+    ad_logger.debug(f"Before canonicalizing: {gm}")
 
-    for _, subgm in reversed(list(named_graphmodules(mod))):
+    for _, subgm in reversed(list(named_graphmodules(gm))):
         _canonicalize_single_gm(subgm)
 
-    ad_logger.debug(f"After canonicalizing: {mod}")
+    ad_logger.debug(f"After canonicalizing: {gm}")
 
 
 def _run_shape_prop_single_gm(
@@ -197,19 +191,18 @@ def _run_shape_prop_single_gm(
     fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
 
     # get fake tensors from placeholder nodes
-    # NOTE: use _NO_VAL instead of None since None is a valid value for node.meta["val"]
-    inps = [node.meta.get("val", _NO_VAL) for node in gm.graph.nodes if node.op == "placeholder"]
+    inps = [node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"]
 
     # check if we need to use args to create fake tensors
-    if any(inp is _NO_VAL for inp in inps):
+    if any(inp is None for inp in inps):
         if args_static is not None and fake_mode is not None and len(args_static) == len(inps):
             inps = [
-                inp if inp is not _NO_VAL else fake_mode.from_tensor(arg, static_shapes=True)
-                for inp, arg in zip(inps, args_static)
+                fake_t if fake_t is not None else fake_mode.from_tensor(arg, static_shapes=True)
+                for fake_t, arg in zip(inps, args_static)
             ]
 
     # run shape propagation if we have all the fake tensors
-    if all(inp is not _NO_VAL for inp in inps):
+    if all(inp is not None for inp in inps):
         FakeTensorProp(gm, fake_mode).propagate(*inps)
     else:
         ad_logger.warning("No fake tensors and no args available for shape propagation")
@@ -219,7 +212,7 @@ def _run_shape_prop_single_gm(
 
 
 def run_shape_prop(
-    mod: nn.Module,
+    gm: GraphModule,
     args_static: Optional[Tuple[Any, ...]] = None,
 ) -> None:
     """Run FakeTensor-based shape propagation on the given GraphModule and its submodules.
@@ -231,27 +224,23 @@ def run_shape_prop(
     are synthesized from the static arguments.
 
     Args:
-        mod: The top-level model containing GraphModules on which to run shape propagation. All
-            nested GraphModules are processed in reverse topological order.
+        gm: The top-level GraphModule on which to run shape propagation. All nested
+            GraphModules are processed in reverse topological order.
         args_static: Optional tuple of concrete tensors used to create FakeTensors
             when placeholder metadata is missing. Only applied to the top-level
             GraphModule; submodules reuse their existing placeholder metadata.
 
     """
-    ad_logger.debug(f"Before running shape propagation: {mod}")
+    ad_logger.debug(f"Before running shape propagation: {gm}")
 
-    for _, subgm in reversed(list(named_graphmodules(mod))):
-        _run_shape_prop_single_gm(subgm, args_static=args_static if subgm is mod else None)
+    for _, subgm in reversed(list(named_graphmodules(gm))):
+        _run_shape_prop_single_gm(subgm, args_static=args_static if subgm is gm else None)
 
-    ad_logger.debug(f"After running shape propagation: {mod}")
+    ad_logger.debug(f"After running shape propagation: {gm}")
 
 
 def add_graph_input(
-    gm: GraphModule,
-    name: str,
-    add_kwargs: bool = True,
-    val: Union[Optional[torch.Tensor], _NoValType] = _NO_VAL,
-    dynamic_shape=None,
+    gm: GraphModule, name: str, val: Optional[torch.Tensor] = None, dynamic_shape=None
 ) -> Node:
     """Add a graph input to the given GraphModule and return the newly created node.
 
@@ -260,7 +249,6 @@ def add_graph_input(
     Args:
         gm (GraphModule): The GraphModule to add the input to.
         name (str): The name of the input.
-        add_kwargs (bool): Whether to add an arg or kwarg to the graph inputs.
         val (torch.Tensor): An example tensor to use for the input.
         dynamic_shape: The dynamic shape of the input tensor [NOT SUPPORTED YET]
     """
@@ -271,24 +259,17 @@ def add_graph_input(
     # extract graph and input spec
     graph: Graph = gm.graph
 
-    orig_args = graph._codegen.pytree_info.orig_args
-
     in_spec = graph._codegen.pytree_info.in_spec
-    in_spec_for_args = in_spec.children_specs[1 if add_kwargs else 0]
-    if add_kwargs:
-        assert in_spec_for_args.type is dict
-    else:
-        assert in_spec_for_args.type is tuple
+    in_spec_for_args = in_spec.children_specs[0]
+    orig_args = graph._codegen.pytree_info.orig_args
+    assert in_spec_for_args.type is tuple
 
     # insert input node after currently last input node
     node_last_input = graph.find_nodes(op="placeholder", sort=True)[-1]
     with graph.inserting_after(node_last_input):
         in_node = graph.placeholder(name)
         in_spec_for_args.children_specs.append(_LEAF_SPEC)
-        orig_args.append(name)
-
-        if add_kwargs:
-            in_spec_for_args.context.append(name)
+        orig_args.append(f"arg_{name}")
 
     # update pytree info recursively with __post_init__ starting at leaves
     def call_post_init(spec):
@@ -300,45 +281,10 @@ def add_graph_input(
 
     # set fake tensor information if all required information is available
     fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
-    if fake_mode and val is not _NO_VAL:
-        if val is None:
-            in_node.meta["val"] = None
-        else:
-            fake_tensor: FakeTensor = fake_mode.from_tensor(val, static_shapes=True)
-            in_node.meta["val"] = fake_tensor
-            in_node.meta["tensor_meta"] = _extract_tensor_metadata(fake_tensor)
+    if fake_mode and val:
+        fake_tensor: FakeTensor = fake_mode.from_tensor(val, static_shapes=True)
+        in_node.meta["val"] = fake_tensor
+        in_node.meta["tensor_meta"] = _extract_tensor_metadata(fake_tensor)
 
     # return new node...
     return in_node
-
-
-def placeholders_on_meta(mod: nn.Module) -> bool:
-    """
-    Return True if any placeholder node in the graph is on the meta device.
-    """
-
-    def _is_meta_tensor(t) -> bool:
-        if t is None:
-            return False
-        # First check device.type == 'meta'
-        dev = getattr(t, "device", None)
-        if getattr(dev, "type", None) == "meta":
-            return True
-        # Fallback for objects with .is_meta attribute
-        return bool(getattr(t, "is_meta", False))
-
-    for _, subgm in reversed(list(named_graphmodules(mod))):
-        for n in subgm.graph.nodes:
-            if n.op != "placeholder":
-                continue
-            val = n.meta.get("val", None)
-
-            # If placeholder packs multiple values, find the first tensor-like leaf
-            t = val
-            if isinstance(val, (list, tuple)):
-                t = next((x for x in val if hasattr(x, "device") or hasattr(x, "is_meta")), None)
-
-            if _is_meta_tensor(t):
-                return True
-
-    return False

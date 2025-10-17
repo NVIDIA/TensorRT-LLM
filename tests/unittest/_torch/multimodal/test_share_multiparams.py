@@ -146,25 +146,6 @@ class TestMultimodalParamsDeviceTransfer(unittest.TestCase):
         result = params.multimodal_data["image"]["pixel_values"]
         self.assertEqual(result.device, torch.device("cuda:0"))
 
-    def test_to_device_with_target_keywords(self):
-        """Test converting data to device with keyword."""
-        params = MultimodalParams()
-        params.multimodal_data = self.sample_multimodal_data.copy()
-
-        params.to_device("multimodal_data",
-                         device="cuda:0",
-                         pin_memory=True,
-                         target_keywords=["image.pixel_values"])
-
-        result = params.multimodal_data["image"]["pixel_values"]
-        self.assertEqual(result.device, torch.device("cuda:0"))
-
-        result = params.multimodal_data["mrope_config"]["mrope_rotary_cos_sin"]
-        self.assertEqual(result.device, torch.device("cpu"))
-
-        result = params.multimodal_data["mrope_config"]["mrope_position_deltas"]
-        self.assertEqual(result.device, torch.device("cpu"))
-
 
 if __name__ == "__main__":
     unittest.main()

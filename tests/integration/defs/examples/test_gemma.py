@@ -254,7 +254,7 @@ def gemma_1gpu_summary(batch_size,
     "run gemm test on 1 gpu"
     skip_fp8_pre_ada(use_fp8=test_case == "fp8_kv_cache")
     if "smooth_quant" in test_case and "bfloat16" in data_type:
-        pytest.skip("TensorRT LLM does not support SmoothQuant with bfloat16.")
+        pytest.skip("TensorRT-LLM does not support SmoothQuant with bfloat16.")
 
     if any(params in gemma_model_root for params in
            ["gemma-7b", "9b", "27b"]) and get_device_memory() < 50000:
@@ -350,7 +350,7 @@ def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
                              llm_rouge_root, llm_datasets_root, test_case):
     "run gemm test on 1 gpu"
     if "smooth_quant" in test_case and "bfloat16" in data_type:
-        pytest.skip("TensorRT LLM does not support SmoothQuant with bfloat16.")
+        pytest.skip("TensorRT-LLM does not support SmoothQuant with bfloat16.")
     ckpt_type = get_ckpt_type(gemma_model_root)
     ckpt_dir = get_ckpt_dir(gemma_model_root)
     vocab_file = get_vocab_file(gemma_model_root)

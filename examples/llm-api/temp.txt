@@ -1,0 +1,490 @@
+
+usage: nsys export [<args>] [nsys-rep-file]
+
+	--append
+
+           This option only applies to "directory of files" output formats
+           with existing export files. If this option is given, an error
+           will not be reported and the existing output files will not be
+           over-written.
+
+	-f, --force-overwrite=
+
+	   Possible values are 'true' or 'false'.
+	   If true, overwrite all existing result files with same output filename
+	   (QDSTRM, nsys-rep, SQLITE, HDF, TEXT, JSON, ARROW, ARROWDIR, PARQUETDIR).
+	   Default is 'false'.
+
+	-h, --help=[<tag>]
+
+	   Print the command's help menu. The switch can take one optional
+	   argument that will be used as a tag. If a tag is provided, only options
+	   relevant to the tag will be printed.
+	   The available help menu tags for this command are:
+
+	   export, output, and type.
+
+	--include-blobs [true|false]
+
+           Optional values are 'true' or 'false'. If no value is given,
+           'true' is assumed. If the flag is not given, the default is 'false'.
+
+           Controls if NVTX extended payloads are exported as binary data. This
+           affects SQLite, Arrow, and Arrow/Parquet directory exports only.
+
+	--include-json [true|false]
+
+           Optional values are 'true' or 'false'. If no value is given,
+           'true' is assumed. If the flag is not given, the default is 'false'.
+
+           Controls if repetitive JSON blocks are included in an export or not.
+
+           Some events contain dynamically defined payloads. These payloads are
+           often exported as JSON blocks to preserve their free-form structure.
+           Unfortunately, blocks of JSON text are not an efficient way to
+           represent data, and can cause the export files to become quite large.
+
+           To address this, some classes of events (such as GENERIC_EVENT data)
+           were extended to export payload data in the native export format.
+           For those events that have an export-native representation, this flag
+           will enable or disable the export of the equivalent JSON blocks.
+
+           Note that this does not suppress all JSON output. Some tables, like
+           META_DATA_* tables and TARGET_INFO_* tables may contain a small
+           number of JSON strings. This flag will not suppress those.
+
+           Additionally, some classes of events (such as ETW events and NVTX
+           events with user-defined payloads) do not have a native export
+           representation. For events where the JSON block is the only export
+           format, it will always be included.
+
+           Please note that this flag has nothing to do with JSON exports,
+           (i.e. --type=json), nor does it alter the JSON export output.
+
+	-l, --lazy=
+
+           Possible values are 'true' or 'false'.
+           Controls if table creation is lazy or not. Lazy table creation will
+           only create a table if it contains data. This affects SQLite, HDF5,
+           Arrow, and Arrow/Parquet directory exports only. Default is 'true',
+           although this is likely to change in a future release.
+
+	-o, --output=
+
+           Path to results file.
+           Default is name of input file with modified extension.
+
+	-q, --quiet=
+
+           Possible values are 'true' or 'false'.
+           If 'true', don't display progress bar.
+           Default is 'false'.
+
+	--separate-strings=
+
+           Possible values are 'true' or 'false'.
+           Output stored strings and thread names separately, one
+           value per line. This affects JSON and text output only.
+           Default is 'false'.
+
+	-t, --type=
+
+           Possible values are: sqlite, hdf, text, json, info, arrow,
+           arrowdir, and parquetdir.
+
+           Export format type.
+
+             sqlite (.sqlite) -- SQLite v3 file. Data sets are stored as
+             tables in a single SQLite file. Schema contains comments
+             trying to explain meaning of tables/columns.
+
+             hdf (.h5) -- HDF5. Data sets are stored in a single H5 file.
+
+             text (.txt) -- Text. Raw event data is dumped in text format,
+             as defined by the Google Protobuf library. File headers,
+             generic events, and some other data is not included.
+
+             json (.json) -- JSON file. Raw event data is dumped in JSON
+             format, as defined by the Google Protobuf library. File headers,
+             generic events, and some other data is not included.
+
+             info (.info.json) -- JSON file.  Dump of header parts of file.
+
+             arrow (.arrows) -- Apache Arrow IPC stream format. All data
+             sets are stored in a single file sequentially. Meta-data is
+             included to identify the table and meaning.
+
+             arrowdir (_arwdir/*.arrow) -- Apache Arrow IPC file format.
+             Each data set is stored in a single file.
+
+             parquetdir (_pqtdir/*.parquet) -- Apache Parquet format. Each
+             data set is stored in a single file.
+
+           HDF format is supported only on x86-64 Linux and Windows.
+
+	--tables=<pattern>[,<pattern>...]
+
+           Value is a comma-separated list of search patterns (no spaces).
+           This option can be given more than once. If set, only tables that
+           match one or more of the patterns will be exported. If not set,
+           all tables will be exported. This feature applies to SQLite, HDFS,
+           Arrow, and Arrow/Parquet directory exports only. The patterns are
+           case-insensitive POSIX basic regular expressions.
+
+           Please note: This is an advanced feature intended for expert users.
+           This option does not enforce any type of dependency or relationship
+           between tables and will truly export only the listed tables. If
+           partial exports are used with analytics features such as "nsys stats"
+           or "nsys analyze", it is the responsibility of the user to ensure
+           all required tables are exported.
+
+	--times=<timerange>[,<timerange>...]
+
+           Value is a comma-separated list of time ranges (no spaces). This
+           option can be given more than once. If set, only events that fall
+           within at least one of the given ranges will be exported. If not
+           set, all events will be exported. This feature applies to SQLite,
+           HDFS, Arrow, and Arrow/Parquet directory exports only.
+
+           Please note: This is an advanced feature intended for expert users.
+           This option does not enforce any type of dependency or relationship
+           between related events (such as CUDA launch APIs and CUDA kernel
+           executions). If filtered exports are used with analytics features
+           such as "nsys stats" or "nsys analyze", no warnings or errors will
+           be generated due to missing data, and unexpected or misleading
+           results may be generated. It is the responsibility of the user
+           to ensure all relevant and interrelated events are exported.
+
+           The format of a time-range is:   [:][<start-time>]/[<end-time>][:]
+
+           A single time range is defined by a pair of time values, separated
+           by a slash. At least one time value is required. Any omitted time
+           value will default to the minimum or maximum value (approximately
+           +/- 290 years from the zero-point). The start time must be less
+           than or equal to the end time.
+
+           The time values are a series of integer or floating-point values
+           followed by an optional unit. If no unit is given, the number is
+           assumed to be in nanoseconds. Positive and negative values are
+           supported, as well as scientific "e" notation. More than one
+           value/unit can be given as long as there are no spaces. The
+           units do not need to be given in any order and can even repeat.
+
+           The following units are understood:
+
+              ns, nsec : nanosecond
+              us, usec : microsecond
+              ms, msec : millisecond
+              s, sec   : second
+              m, min   : minute (60 seconds)
+              h, hour  : hour (3600 seconds)
+
+           For example, the value "1s2ms3us4ns" would indicate 1,002,003,004
+           nanoseconds. "2ns5us2" would be 5004 nanoseconds (2 nanoseconds
+           plus 5 microseconds plus 2 nanoseconds). A floating-point value
+           is converted as a 64-bit "double" and is subject to the precision
+           limitations of that format.
+
+           By default, the time ranges have "strict" boundaries. The presence
+           of a ":" character at the beginning and/or end of a time range
+           makes that boundary "non-strict," meaning the filtered events are
+           allowed to cross the boundary. In essence, if both boundaries are
+           strict, the event must fully exist _within_ the defined range, but
+           if both boundaries are "non-strict," the event must exist _during_
+           the defined range. Given the following timeline, with a single
+           filter range (marked START and END), the given events (marked
+           with "=" characters) would be considered a match (T) or not (F),
+           depending on the strictness of the filter's start/end boundaries.
+
+                START     END             S/E   :S/E    S/E:  :S/E:
+                  |  ====  |               T      T      T      T
+            =============  |               F      T      F      T
+                  |  ============          F      F      T      T
+            =====================          F      F      F      T
+            ===== |   or   | ====          F      F      F      F
+
+           While many events have both a start and end time, some events only
+           have a single timestamp. These types of events are treated as an
+           event with a start time equal to the end time. If an event's end
+           time is before the start time, the end time is adjusted to the
+           start time.
+
+           If used in conjunction with the --ts-normalize and/or --ts-shift
+           options, the time filter is applied after the event's time values
+           have been adjusted.
+
+	--ts-normalize=
+
+           Possible values are 'true' or 'false'.
+           If true, all timestamp values in the report will be shifted to
+           UTC wall-clock time, as defined by the UNIX epoch. This option can
+           be used in conjunction with the --ts-shift option, in which case both
+           adjustments will be applied.
+           If this option is used to align a series of reports from a cluster
+           or distributed system, the accuracy of the alignment is limited by
+           the synchronization precision of the system clocks. For detailed
+           analysis, the use of PTP or another high-precision synchronization
+           methodology is recommended. NTP is unlikely to produce desirable
+           results.
+           This option only applies to SQLite, HDF5, Arrow, and Arrow/Parquet
+           directory exports.
+           Default is 'false'.
+
+	--ts-shift=
+
+           The value is a signed integer in nanoseconds.
+           If given, all timestamp values in the report will be shifted by
+           the given amount. This option can be used in conjunction with the
+           --ts-normalize option, in which case both adjustments will be applied.
+           This option can be used to "hand-align" report files captured at
+           different times, or reports captured on distributed systems with
+           poorly synchronized system clocks.
+           This option only applies to SQLite, HDF5, Arrow, and Arrow/Parquet
+           directory exports.
+           Default is 0.
+
+
+usage: nsys export [<args>] [nsys-rep-file]
+
+	--append
+
+           This option only applies to "directory of files" output formats
+           with existing export files. If this option is given, an error
+           will not be reported and the existing output files will not be
+           over-written.
+
+	-f, --force-overwrite=
+
+	   Possible values are 'true' or 'false'.
+	   If true, overwrite all existing result files with same output filename
+	   (QDSTRM, nsys-rep, SQLITE, HDF, TEXT, JSON, ARROW, ARROWDIR, PARQUETDIR).
+	   Default is 'false'.
+
+	-h, --help=[<tag>]
+
+	   Print the command's help menu. The switch can take one optional
+	   argument that will be used as a tag. If a tag is provided, only options
+	   relevant to the tag will be printed.
+	   The available help menu tags for this command are:
+
+	   export, output, and type.
+
+	--include-blobs [true|false]
+
+           Optional values are 'true' or 'false'. If no value is given,
+           'true' is assumed. If the flag is not given, the default is 'false'.
+
+           Controls if NVTX extended payloads are exported as binary data. This
+           affects SQLite, Arrow, and Arrow/Parquet directory exports only.
+
+	--include-json [true|false]
+
+           Optional values are 'true' or 'false'. If no value is given,
+           'true' is assumed. If the flag is not given, the default is 'false'.
+
+           Controls if repetitive JSON blocks are included in an export or not.
+
+           Some events contain dynamically defined payloads. These payloads are
+           often exported as JSON blocks to preserve their free-form structure.
+           Unfortunately, blocks of JSON text are not an efficient way to
+           represent data, and can cause the export files to become quite large.
+
+           To address this, some classes of events (such as GENERIC_EVENT data)
+           were extended to export payload data in the native export format.
+           For those events that have an export-native representation, this flag
+           will enable or disable the export of the equivalent JSON blocks.
+
+           Note that this does not suppress all JSON output. Some tables, like
+           META_DATA_* tables and TARGET_INFO_* tables may contain a small
+           number of JSON strings. This flag will not suppress those.
+
+           Additionally, some classes of events (such as ETW events and NVTX
+           events with user-defined payloads) do not have a native export
+           representation. For events where the JSON block is the only export
+           format, it will always be included.
+
+           Please note that this flag has nothing to do with JSON exports,
+           (i.e. --type=json), nor does it alter the JSON export output.
+
+	-l, --lazy=
+
+           Possible values are 'true' or 'false'.
+           Controls if table creation is lazy or not. Lazy table creation will
+           only create a table if it contains data. This affects SQLite, HDF5,
+           Arrow, and Arrow/Parquet directory exports only. Default is 'true',
+           although this is likely to change in a future release.
+
+	-o, --output=
+
+           Path to results file.
+           Default is name of input file with modified extension.
+
+	-q, --quiet=
+
+           Possible values are 'true' or 'false'.
+           If 'true', don't display progress bar.
+           Default is 'false'.
+
+	--separate-strings=
+
+           Possible values are 'true' or 'false'.
+           Output stored strings and thread names separately, one
+           value per line. This affects JSON and text output only.
+           Default is 'false'.
+
+	-t, --type=
+
+           Possible values are: sqlite, hdf, text, json, info, arrow,
+           arrowdir, and parquetdir.
+
+           Export format type.
+
+             sqlite (.sqlite) -- SQLite v3 file. Data sets are stored as
+             tables in a single SQLite file. Schema contains comments
+             trying to explain meaning of tables/columns.
+
+             hdf (.h5) -- HDF5. Data sets are stored in a single H5 file.
+
+             text (.txt) -- Text. Raw event data is dumped in text format,
+             as defined by the Google Protobuf library. File headers,
+             generic events, and some other data is not included.
+
+             json (.json) -- JSON file. Raw event data is dumped in JSON
+             format, as defined by the Google Protobuf library. File headers,
+             generic events, and some other data is not included.
+
+             info (.info.json) -- JSON file.  Dump of header parts of file.
+
+             arrow (.arrows) -- Apache Arrow IPC stream format. All data
+             sets are stored in a single file sequentially. Meta-data is
+             included to identify the table and meaning.
+
+             arrowdir (_arwdir/*.arrow) -- Apache Arrow IPC file format.
+             Each data set is stored in a single file.
+
+             parquetdir (_pqtdir/*.parquet) -- Apache Parquet format. Each
+             data set is stored in a single file.
+
+           HDF format is supported only on x86-64 Linux and Windows.
+
+	--tables=<pattern>[,<pattern>...]
+
+           Value is a comma-separated list of search patterns (no spaces).
+           This option can be given more than once. If set, only tables that
+           match one or more of the patterns will be exported. If not set,
+           all tables will be exported. This feature applies to SQLite, HDFS,
+           Arrow, and Arrow/Parquet directory exports only. The patterns are
+           case-insensitive POSIX basic regular expressions.
+
+           Please note: This is an advanced feature intended for expert users.
+           This option does not enforce any type of dependency or relationship
+           between tables and will truly export only the listed tables. If
+           partial exports are used with analytics features such as "nsys stats"
+           or "nsys analyze", it is the responsibility of the user to ensure
+           all required tables are exported.
+
+	--times=<timerange>[,<timerange>...]
+
+           Value is a comma-separated list of time ranges (no spaces). This
+           option can be given more than once. If set, only events that fall
+           within at least one of the given ranges will be exported. If not
+           set, all events will be exported. This feature applies to SQLite,
+           HDFS, Arrow, and Arrow/Parquet directory exports only.
+
+           Please note: This is an advanced feature intended for expert users.
+           This option does not enforce any type of dependency or relationship
+           between related events (such as CUDA launch APIs and CUDA kernel
+           executions). If filtered exports are used with analytics features
+           such as "nsys stats" or "nsys analyze", no warnings or errors will
+           be generated due to missing data, and unexpected or misleading
+           results may be generated. It is the responsibility of the user
+           to ensure all relevant and interrelated events are exported.
+
+           The format of a time-range is:   [:][<start-time>]/[<end-time>][:]
+
+           A single time range is defined by a pair of time values, separated
+           by a slash. At least one time value is required. Any omitted time
+           value will default to the minimum or maximum value (approximately
+           +/- 290 years from the zero-point). The start time must be less
+           than or equal to the end time.
+
+           The time values are a series of integer or floating-point values
+           followed by an optional unit. If no unit is given, the number is
+           assumed to be in nanoseconds. Positive and negative values are
+           supported, as well as scientific "e" notation. More than one
+           value/unit can be given as long as there are no spaces. The
+           units do not need to be given in any order and can even repeat.
+
+           The following units are understood:
+
+              ns, nsec : nanosecond
+              us, usec : microsecond
+              ms, msec : millisecond
+              s, sec   : second
+              m, min   : minute (60 seconds)
+              h, hour  : hour (3600 seconds)
+
+           For example, the value "1s2ms3us4ns" would indicate 1,002,003,004
+           nanoseconds. "2ns5us2" would be 5004 nanoseconds (2 nanoseconds
+           plus 5 microseconds plus 2 nanoseconds). A floating-point value
+           is converted as a 64-bit "double" and is subject to the precision
+           limitations of that format.
+
+           By default, the time ranges have "strict" boundaries. The presence
+           of a ":" character at the beginning and/or end of a time range
+           makes that boundary "non-strict," meaning the filtered events are
+           allowed to cross the boundary. In essence, if both boundaries are
+           strict, the event must fully exist _within_ the defined range, but
+           if both boundaries are "non-strict," the event must exist _during_
+           the defined range. Given the following timeline, with a single
+           filter range (marked START and END), the given events (marked
+           with "=" characters) would be considered a match (T) or not (F),
+           depending on the strictness of the filter's start/end boundaries.
+
+                START     END             S/E   :S/E    S/E:  :S/E:
+                  |  ====  |               T      T      T      T
+            =============  |               F      T      F      T
+                  |  ============          F      F      T      T
+            =====================          F      F      F      T
+            ===== |   or   | ====          F      F      F      F
+
+           While many events have both a start and end time, some events only
+           have a single timestamp. These types of events are treated as an
+           event with a start time equal to the end time. If an event's end
+           time is before the start time, the end time is adjusted to the
+           start time.
+
+           If used in conjunction with the --ts-normalize and/or --ts-shift
+           options, the time filter is applied after the event's time values
+           have been adjusted.
+
+	--ts-normalize=
+
+           Possible values are 'true' or 'false'.
+           If true, all timestamp values in the report will be shifted to
+           UTC wall-clock time, as defined by the UNIX epoch. This option can
+           be used in conjunction with the --ts-shift option, in which case both
+           adjustments will be applied.
+           If this option is used to align a series of reports from a cluster
+           or distributed system, the accuracy of the alignment is limited by
+           the synchronization precision of the system clocks. For detailed
+           analysis, the use of PTP or another high-precision synchronization
+           methodology is recommended. NTP is unlikely to produce desirable
+           results.
+           This option only applies to SQLite, HDF5, Arrow, and Arrow/Parquet
+           directory exports.
+           Default is 'false'.
+
+	--ts-shift=
+
+           The value is a signed integer in nanoseconds.
+           If given, all timestamp values in the report will be shifted by
+           the given amount. This option can be used in conjunction with the
+           --ts-normalize option, in which case both adjustments will be applied.
+           This option can be used to "hand-align" report files captured at
+           different times, or reports captured on distributed systems with
+           poorly synchronized system clocks.
+           This option only applies to SQLite, HDF5, Arrow, and Arrow/Parquet
+           directory exports.
+           Default is 0.
+

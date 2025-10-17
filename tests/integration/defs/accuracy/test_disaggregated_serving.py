@@ -1,3 +1,7 @@
+# I want to create accuracy tests for disaggregated serving.
+# I need to to this by creating a new class that mimics LLM class. Instead of implementing the
+# actual methods it will send OAI requests to the disaggregated serving endpoint.
+# Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
 import itertools
@@ -230,17 +234,11 @@ def launch_disaggregated_llm(
                          streaming: bool):
             kwargs = {}
             if sampling_params is not None:
-                kwargs.update(
-                    max_tokens=sampling_params.max_tokens,
-                    # NB: 'LLM' (cf. SamplingParams) and OpenAI API
-                    #     defaults differ (top_p=0 vs. top_p=1).
-                    # FIXME: Because 'LLM' does not permit expressly setting
-                    #     top_p=0, diverting to temperature=0.
-                    temperature=(sampling_params.temperature
-                                 if sampling_params.top_p is not None else 0),
-                    top_p=sampling_params.top_p,
-                    stop=sampling_params.stop,
-                    seed=sampling_params.seed)
+                kwargs.update(max_tokens=sampling_params.max_tokens,
+                              temperature=sampling_params.temperature,
+                              top_p=sampling_params.top_p,
+                              stop=sampling_params.stop,
+                              seed=sampling_params.seed)
                 if (guided_decoding_params :=
                         sampling_params.guided_decoding) is not None:
                     extra_body = {}
@@ -361,26 +359,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-    @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
-    @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
-    def test_auto_dtype(self, disable_overlap_scheduler, ctx_enable_block_reuse,
-                        gen_enable_block_reuse):
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": {
-                "enable_block_reuse": ctx_enable_block_reuse
-            }
+    def test_auto_dtype(self, disable_overlap_scheduler):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {
+            "disable_overlap_scheduler": disable_overlap_scheduler
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
-        gen_server_config = {
-            "disable_overlap_scheduler": disable_overlap_scheduler,
-            "kv_cache_config": {
-                "enable_block_reuse": gen_enable_block_reuse
-            },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT"
-            }
-        }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -452,7 +436,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(reason="https://nvbugs/5556020")
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
@@ -550,8 +533,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(48000)
+    @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_eagle3(self, backend: str,
@@ -620,9 +602,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
-        if ctx_pp + gen_tp > get_device_count():
+        if ctx_pp * gen_tp * 2 > get_device_count():
             pytest.skip(
-                f"Not enough devices for ctx_pp={ctx_pp}+gen_tp={gen_tp} test")
+                f"Not enough devices for ctx_pp={ctx_pp}*gen_tp={gen_tp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
                                  gen_tp, 1, 1, [get_accuracy_task(testset)])
 
@@ -630,6 +612,152 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_multi_instance(self, testset):
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, 1, 1, 1, 1,
                                  2, 2, [get_accuracy_task(testset)])
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("testset", ["MMLU", "GSM8K"])
+    @pytest.mark.parametrize("ctx_model,gen_model,test_id", [
+        ("/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct",
+         "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct",
+         "Ctx16_Gen16"),
+        ("/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct",
+         "/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-FP8-NO-KV-QUANT",
+         "Ctx16_Gen8"),
+        ("/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-FP8-NO-KV-QUANT",
+         "/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-FP8-NO-KV-QUANT",
+         "Ctx8_Gen8"),
+        ("/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct",
+         "/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-NVFP4-NO-KV-QUANT",
+         "Ctx16_GenNVFP4"),
+        ("/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-NVFP4-NO-KV-QUANT",
+         "/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct",
+         "CtxNVFP4_Gen16"),
+        ("/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-NVFP4-NO-KV-QUANT",
+         "/home/scratch.timothyg_gpu/weights/Llama-3.1-8B-Instruct-NVFP4-NO-KV-QUANT",
+         "CtxNVFP4_GenNVFP4"),
+    ], ids=["Ctx16_Gen16", "Ctx16_Gen8", "Ctx8_Gen8", "Ctx16_GenNVFP4", "CtxNVFP4_Gen16", "CtxNVFP4_GenNVFP4"])
+    def test_mixed_precision_configs(self, ctx_model, gen_model, test_id, testset, capsys):
+        import datetime
+        import json
+        import os
+        import re
+        import sys
+        import time
+        from io import StringIO
+        
+        # Save results to output directory
+        output_dir = "/home/scratch.timothyg_gpu/TensorRT-LLM/tests/integration/defs/accuracy/output"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Capture start time
+        start_time = datetime.datetime.now()
+        timestamp = start_time.strftime("%Y-%m-%dT%H-%M-%S")
+        
+        # Capture stdout/stderr to extract accuracy
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        captured_output = StringIO()
+        
+        class TeeOutput:
+            def __init__(self, *streams):
+                self.streams = streams
+            def write(self, data):
+                for stream in self.streams:
+                    stream.write(data)
+                    stream.flush()
+            def flush(self):
+                for stream in self.streams:
+                    stream.flush()
+        
+        # Tee output so we can see it AND capture it
+        sys.stdout = TeeOutput(old_stdout, captured_output)
+        sys.stderr = TeeOutput(old_stderr, captured_output)
+        
+        result = None
+        test_error = None
+        try:
+            # Run the test
+            result = run_parallel_test(
+                self.MODEL_NAME,
+                ctx_model,
+                ctx_pp=1,
+                ctx_tp=1,
+                gen_pp=1,
+                gen_tp=1,
+                ctx_instances=1,
+                gen_instances=1,
+                test_sets=[get_accuracy_task(testset)],
+                ctx_model=ctx_model,
+                gen_model=gen_model
+            )
+        except Exception as e:
+            test_error = e
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            
+            # CRITICAL: Sleep BEFORE returning to ensure all processes are fully cleaned up
+            # This happens after context managers exit and kill processes
+            print("\n" + "="*60)
+            print("Test execution completed. Waiting 30 seconds for full cleanup...")
+            print("(Ensuring all servers are killed and ports are freed)")
+            print("="*60 + "\n")
+            time.sleep(30)
+        
+        # Save metadata
+        end_time = datetime.datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        # Extract accuracy from captured output
+        log_output = captured_output.getvalue()
+        accuracy_score = None
+        
+        # Capture accuracy. We search for ALL matches and take the last one, because
+        # "Reference accuracy" and other numbers appear earlier in the log and we
+        # want the *final* reported accuracy from lm-eval.
+        accuracy_patterns = [
+            r"lm-eval .* average accuracy: ([\d.]+)",  # preferred
+            r"MMLU weighted average accuracy: ([\d.]+)",
+            r"average accuracy: ([\d.]+)",              # generic
+            r"exact_match,none:\s+([\d.]+)",            # GSM8K metric
+            r"acc,none:\s+([\d.]+)",                   # MMLU metric
+        ]
+        for pattern in accuracy_patterns:
+            matches = re.findall(pattern, log_output, flags=re.IGNORECASE)
+            if matches:
+                accuracy_score = float(matches[-1])  # take last occurrence
+                break
+        
+        result_data = {
+            "config": test_id,
+            "testset": testset,
+            "ctx_model": ctx_model,
+            "gen_model": gen_model,
+            "model_name": self.MODEL_NAME,
+            "timestamp": timestamp,
+            "duration_seconds": duration,
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "accuracy": accuracy_score,
+            "log_output": log_output
+        }
+        
+        # Save to JSON file
+        output_file = os.path.join(output_dir, f"results_{test_id}_{testset}_{timestamp}.json")
+        with open(output_file, 'w') as f:
+            json.dump(result_data, f, indent=2)
+        
+        print(f"\n{'='*60}")
+        print(f"Results saved to: {output_file}")
+        print(f"Config: {test_id}, Test: {testset}, Duration: {duration:.2f}s")
+        if accuracy_score is not None:
+            print(f"Accuracy: {accuracy_score:.2f}")
+        print(f"{'='*60}\n")
+        
+        # Re-raise the exception if one occurred (after saving results)
+        if test_error is not None:
+            raise test_error
+        
+        return result
 
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
@@ -673,7 +801,6 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-@skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
@@ -717,7 +844,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
@@ -756,9 +884,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(60000)
-    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -174,86 +173,3 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
             yield remote_server
 
     return server_with_custom_sampler
-
-
-def expand_slurm_nodelist(nodelist_str):
-    """
-    Expand SLURM nodelist format into individual node names.
-    An equivalent of scontrol show hostname $SLURM_JOB_NODELIST, but
-    scontrol is not available in the container.
-    """
-
-    # Handle empty or None input
-    if not nodelist_str or nodelist_str.strip() == "":
-        return []
-
-    # Split top-level groups by commas not inside brackets.
-    groups: list[str] = []
-    buf: list[str] = []
-    depth = 0
-    for ch in nodelist_str:
-        if ch == '[':
-            depth += 1
-        elif ch == ']' and depth:
-            depth -= 1
-        if ch == ',' and depth == 0:
-            groups.append(''.join(buf).strip())
-            buf = []
-        else:
-            buf.append(ch)
-    if buf:
-        groups.append(''.join(buf).strip())
-
-    for group in groups:
-        bracket_match = re.match(r'^([^\[]+)\[(.+?)\]$', group)
-        if bracket_match:
-            prefix = bracket_match.group(1)
-            range_part = bracket_match.group(2)
-
-    expanded_nodes = []
-
-    for group in groups:
-        # Check if this group has bracket notation
-        bracket_match = re.match(r'^(.+?)\[(.+?)\]$', group)
-        if bracket_match:
-            prefix = bracket_match.group(1)
-            range_part = bracket_match.group(2)
-
-            # Handle ranges and individual numbers within brackets
-            range_parts = range_part.split(',')
-
-            for part in range_parts:
-                part = part.strip()
-
-                # Check if it's a range (contains dash)
-                if '-' in part:
-                    range_match = re.match(r'^(\d+)-(\d+)$', part)
-                    if range_match:
-                        start_num = int(range_match.group(1))
-                        end_num = int(range_match.group(2))
-                        # Determine zero-padding width from the original format
-                        start_str = range_match.group(1)
-                        width = len(start_str)
-
-                        # Generate range
-                        for num in range(start_num, end_num + 1):
-                            node_name = f"{prefix}{num:0{width}d}"
-                            expanded_nodes.append(node_name)
-                    else:
-                        # Handle non-numeric ranges or invalid format
-                        expanded_nodes.append(part)
-                else:
-                    # Individual number
-                    if part.isdigit():
-                        # Preserve zero-padding
-                        node_name = f"{prefix}{part}"
-                        expanded_nodes.append(node_name)
-                    else:
-                        # Handle non-numeric individual items
-                        node_name = f"{prefix}{part}"
-                        expanded_nodes.append(node_name)
-        else:
-            # No brackets, just add the node as-is
-            expanded_nodes.append(group)
-
-    return expanded_nodes

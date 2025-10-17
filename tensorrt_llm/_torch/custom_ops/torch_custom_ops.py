@@ -29,8 +29,8 @@ class MoERunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ),
+            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+            lambda x: min(last_positive_power_of_2(x), 8192)), ),
         tune_max_num_tokens=8192,
     )
 
@@ -926,9 +926,8 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
-        input, _, _ = inputs
-        return [0, 1] if input.shape[0] <= 128 else [0]
+        # Encode swap_ab as False (0) and True (1). Currently only add one tactic here.
+        return [0]
 
     def forward(
         self,
@@ -942,9 +941,9 @@ class fp8SwapABGemmRunner(TunableRunner):
             device=input.device,
             dtype=self.output_dtype,
         )
-
-        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
-        forward_func(
+        # TODO: add swap_ab=tactic == 0 to detemrmine the swap_ab value
+        # Treat the default tactic=-1 as swap_ab=False
+        deep_gemm.fp8_gemm_nt(
             (a, a_sf),
             (weight, weight_scale),
             output,

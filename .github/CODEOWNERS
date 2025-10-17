@@ -34,7 +34,6 @@
 ## TensorRT-LLM Pytorch backend - AutoDeploy flow
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
-/tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 
 ## TensorRT-LLM Pytorch - Speculative Decoding
 /tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
@@ -100,8 +99,6 @@
 /tests/unittest/_torch/modeling/test_modeling_pixtral.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
 
 ### TensorRT-LLM Pytorch - Models - Nemotron
-/tensorrt_llm/_torch/models/modeling_nanov2vlm.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
-/tensorrt_llm/_torch/models/modeling_radio.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
@@ -158,36 +155,6 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 # from a member of this team, PRs affecting public APIs cannot be merged to main or release branches.
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
-
-## OSS Compliance & Legal - License/Attribution Protection
-## IMPORTANT: Changes to any files below may impact legal compliance, attributions, and third-party licenses.
-## These files require review from the TRTLLM OSS compliance team before merging to ensure proper attribution
-## and license compliance when adding, removing, or changing versions of dependencies.
-### License Files
-/LICENSE @NVIDIA/trt-llm-oss-compliance
-/jenkins/license_cpp.json @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
-
-### Python Dependency Management
-/setup.py @NVIDIA/trt-llm-oss-compliance
-/pyproject.toml @NVIDIA/trt-llm-oss-compliance
-/requirements.txt @NVIDIA/trt-llm-oss-compliance
-/requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
-
-### C++ Build & Dependency Management
-/cpp/CMakeLists.txt @NVIDIA/trt-llm-oss-compliance
-/cpp/conanfile.py @NVIDIA/trt-llm-oss-compliance
-/cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
-
-### Third-Party Dependencies
-## Any changes to versions, additions, or removals of third-party libraries
-/3rdparty/** @NVIDIA/trt-llm-oss-compliance
-
-### Docker & Installation Scripts
-## These scripts install and pin dependency versions
-/docker/common/** @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
-
-### CODEOWNERS file itself
-/.github/CODEOWNERS @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 
 # The following rule should only be uncommented on release branches (e.g., release/0.19).
 # The rule below requires that any PR to release/**/* branches must be approved by at least one member

@@ -265,7 +265,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(acc_o);
 
     // Flash attention updater
-    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer(params, binfo);
+    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer;
     float global_max[Softmax::ROWS_PER_THREAD];
     float global_sum[Softmax::ROWS_PER_THREAD];
 
@@ -588,8 +588,6 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     }     // Inner loop over the key/value sequence length.
 
-    // Update the sum if attention sinks are used.
-    acc_o_normalizer.update_sum(global_max, global_sum);
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 

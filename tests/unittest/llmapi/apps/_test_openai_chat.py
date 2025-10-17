@@ -141,14 +141,42 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     message = chat_completion.choices[0].message
     assert message.content is not None
     assert message.role == "assistant"
-    # test logprobs
+
+
+def test_single_chat_session_with_logprobs(client: openai.OpenAI,
+                                           model_name: str, backend: str):
+    if backend == "pytorch":
+        pytest.skip("Logprobs are not supported in PyTorch backend yet")
+
+    messages = [{
+        "role": "system",
+        "content": "you are a helpful assistant"
+    }, {
+        "role": "user",
+        "content": "what is 1+1?"
+    }]
+
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
         max_completion_tokens=10,
         logprobs=True,
     )
+    assert chat_completion.id is not None
+    assert len(chat_completion.choices) == 1
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    # test logprobs
     logprobs = chat_completion.choices[0].logprobs.content
+    finish_reason = chat_completion.choices[0].finish_reason
+    if finish_reason == "length":
+        assert len(logprobs) == 10
+    elif finish_reason == "stop":
+        assert len(logprobs) <= 10
+    else:
+        raise RuntimeError(
+            f"finish_reason {finish_reason} not in [length, stop]")
     for logprob in logprobs:
         assert logprob.token is not None
         assert logprob.logprob is not None
@@ -176,11 +204,10 @@ def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
     assert message.content is not None and len(message.content) >= 0
 
 
-def test_multiple_responses(client: openai.OpenAI, model_name: str,
-                            backend: str):
+def test_multiple_response(client: openai.OpenAI, model_name: str,
+                           backend: str):
     if backend == "pytorch":
-        pytest.skip(
-            "Multiple responses are not supported in PyTorch backend yet")
+        pytest.skip("Beam search is not supported in PyTorch backend yet")
 
     messages = [{
         "role": "system",
@@ -217,6 +244,70 @@ def test_multiple_responses(client: openai.OpenAI, model_name: str,
 @pytest.mark.asyncio(loop_scope="module")
 async def test_chat_streaming(async_client: openai.AsyncOpenAI,
                               model_name: str):
+    messages = [{
+        "role": "system",
+        "content": "you are a helpful assistant"
+    }, {
+        "role": "user",
+        "content": "what is 1+1?"
+    }]
+
+    chat_completion = await async_client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        temperature=0.0,
+        logprobs=False,
+    )
+    output = chat_completion.choices[0].message.content
+    _finish_reason = chat_completion.choices[0].finish_reason
+
+    # test streaming
+    stream = await async_client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        temperature=0.0,
+        logprobs=False,
+        stream=True,
+    )
+    str_chunks: List[str] = []
+
+    finish_reason_counter = 0
+    finish_reason: str = None
+    async for chunk in stream:
+        choice = chunk.choices[0]
+        delta = choice.delta
+        if choice.finish_reason is not None:
+            finish_reason_counter += 1
+            finish_reason = choice.finish_reason
+        if delta.role:
+            assert delta.role == "assistant"
+        if delta.content:
+            str_chunks.append(delta.content)
+    # test finish_reason
+    if delta.content == "":
+        assert finish_reason == "stop"
+    assert finish_reason_counter == 1
+    assert finish_reason == _finish_reason
+    num_tokens = len(str_chunks)
+    if finish_reason == "length":
+        assert num_tokens == 10
+    elif finish_reason == "stop":
+        assert num_tokens <= 10
+    else:
+        raise RuntimeError(
+            f"finish_reason {finish_reason} not in [length, stop]")
+    # test generated tokens
+    assert "".join(str_chunks) == output
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_chat_streaming_with_logprobs(async_client: openai.AsyncOpenAI,
+                                            model_name: str, backend: str):
+    if backend == "pytorch":
+        pytest.skip("Logprobs are not supported in PyTorch backend yet")
+
     messages = [{
         "role": "system",
         "content": "you are a helpful assistant"
@@ -462,120 +553,3 @@ async def test_chat_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys) for chat completions"""
     await invalid_logit_bias_helper(async_client, model_name, 'chat')
-
-
-def test_chat_cached_tokens(client: openai.OpenAI, model_name: str,
-                            backend: str, extra_llm_api_options: bool):
-    if backend == "trt":
-        pytest.skip("Cached tokens is not supported in trt backend yet")
-
-    messages = [{
-        "role": "system",
-        "content": "A system message"
-    }, {
-        "role": "user",
-        "content": "Some user message"
-    }]
-
-    chat_completion = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        logprobs=False,
-    )
-    expected_cached_tokens = chat_completion.usage.prompt_tokens - 1
-
-    # We disable kv cache reuse when using extra_llm_api_options,
-    # in that case, we expect cached tokens to be 0
-    if extra_llm_api_options:
-        expected_cached_tokens = 0
-
-    chat_completion = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        logprobs=False,
-    )
-    assert chat_completion.usage is not None
-    assert chat_completion.usage.prompt_tokens_details is not None
-    assert chat_completion.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
-
-
-@pytest.mark.asyncio(loop_scope="module")
-async def test_chat_cached_tokens_stream(async_client: openai.AsyncOpenAI,
-                                         model_name: str, backend: str,
-                                         extra_llm_api_options: bool):
-    if backend == "trt":
-        pytest.skip("Cached tokens is not supported in trt backend yet")
-
-    messages = [{
-        "role": "system",
-        "content": "A system message"
-    }, {
-        "role": "user",
-        "content": "Some user message"
-    }]
-
-    # Run the chat completion for the first time so that cached tokens are created
-    chat_completion = await async_client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        logprobs=False,
-    )
-    expected_cached_tokens = chat_completion.usage.prompt_tokens - 1
-
-    # We disable kv cache reuse when using extra_llm_api_options,
-    # in that case, we expect cached tokens to be 0
-    if extra_llm_api_options:
-        expected_cached_tokens = 0
-
-    # Test stream=True, stream_options={"include_usage": True,
-    #                                   "continuous_usage_stats": False}}
-    stream = await async_client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        stream=True,
-        stream_options={
-            "include_usage": True,
-            "continuous_usage_stats": False
-        })
-
-    async for chunk in stream:
-        if chunk.choices:
-            assert chunk.usage is None
-        else:
-            assert chunk.usage is not None
-            assert chunk.usage.prompt_tokens > 0
-            assert chunk.usage.completion_tokens > 0
-            assert chunk.usage.total_tokens == (chunk.usage.prompt_tokens +
-                                                chunk.usage.completion_tokens)
-            assert chunk.usage.prompt_tokens_details is not None
-            assert chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
-            assert chunk.choices == []
-
-    # Test stream=True, stream_options={"include_usage": True,
-    #                           "continuous_usage_stats": True}
-    stream = await async_client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_completion_tokens=10,
-        temperature=0.0,
-        stream=True,
-        stream_options={
-            "include_usage": True,
-            "continuous_usage_stats": True
-        },
-    )
-    async for chunk in stream:
-        assert chunk.usage.prompt_tokens >= 0
-        assert chunk.usage.completion_tokens >= 0
-        assert chunk.usage.total_tokens == (chunk.usage.prompt_tokens +
-                                            chunk.usage.completion_tokens)
-        assert chunk.usage.prompt_tokens_details is not None
-        assert chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens

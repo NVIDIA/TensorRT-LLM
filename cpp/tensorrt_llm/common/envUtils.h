@@ -16,9 +16,7 @@
  */
 
 #pragma once
-#include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <optional>
 #include <string>
 
@@ -57,26 +55,6 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
-template <typename KernelFn, typename... Args>
-inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
-    cudaStream_t stream, Args&&... args)
-{
-    TLLM_LOG_DEBUG("Enable PDL in %s", name);
-    cudaLaunchConfig_t kernelConfig;
-    kernelConfig.gridDim = grid;
-    kernelConfig.blockDim = block;
-    kernelConfig.dynamicSmemBytes = dynamicShmSize;
-    kernelConfig.stream = stream;
-
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    kernelConfig.attrs = attrs;
-    kernelConfig.numAttrs = 1;
-
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...));
-}
-
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
@@ -87,6 +65,8 @@ std::string getEnvUCXInterface();
 std::string getEnvNixlInterface();
 
 bool getEnvDisaggLayerwise();
+
+bool getEnvDisableSelectiveCacheTransfer();
 
 bool getEnvParallelCacheSend();
 
@@ -135,5 +115,8 @@ bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
+
+// Whether to enable KV cache precision conversion between context and generation phases
+bool getEnvEnableKVCachePrecisionConversion();
 
 } // namespace tensorrt_llm::common

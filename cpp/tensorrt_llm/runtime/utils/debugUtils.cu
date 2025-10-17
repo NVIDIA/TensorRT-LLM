@@ -54,7 +54,7 @@ __global__ void checkTensorInvalidKernel(T const* data, std::size_t size, int* f
     __shared__ typename BlockReduceT::TempStorage tempStorage;
 
     // Compute block-wide maximum
-    int blockFound = BlockReduceT(tempStorage).Reduce(found, cuda::maximum());
+    int blockFound = BlockReduceT(tempStorage).Reduce(found, cub::Max());
 
     // Have thread 0 write out block's result
     if (threadIdx.x == 0)

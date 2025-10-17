@@ -1,3 +1,4 @@
+import json
 import os
 from abc import ABC, abstractmethod
 
@@ -101,13 +102,24 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 compiled_grammar = self._xgrammar_compiler.compile_json_schema(
                     guide)
             case GuidedDecodingParams.GuideType.REGEX:
-                compiled_grammar = self._xgrammar_compiler.compile_regex(guide)
-            case GuidedDecodingParams.GuideType.EBNF_GRAMMAR:
+                grammar = xgrammar.Grammar.from_regex(guide)
                 compiled_grammar = self._xgrammar_compiler.compile_grammar(
-                    guide)
+                    grammar)
+            case GuidedDecodingParams.GuideType.EBNF_GRAMMAR:
+                grammar = xgrammar.Grammar.from_ebnf(guide)
+                compiled_grammar = self._xgrammar_compiler.compile_grammar(
+                    grammar)
             case GuidedDecodingParams.GuideType.STRUCTURAL_TAG:
+                structural_tag_parameters = json.loads(guide)
+                structures = structural_tag_parameters["structures"]
+                structures = [
+                    xgrammar.StructuralTagItem(begin=s["begin"],
+                                               schema=json.dumps(s["schema"]),
+                                               end=s["end"]) for s in structures
+                ]
+                triggers = structural_tag_parameters["triggers"]
                 compiled_grammar = self._xgrammar_compiler.compile_structural_tag(
-                    guide)
+                    structures, triggers)
             case _:
                 raise ValueError(f"Unsupported guide type: {guide_type}.")
 

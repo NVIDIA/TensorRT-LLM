@@ -19,7 +19,6 @@
 #include <map>
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
 
 #define DEBUG_PIPELINE 0
 

@@ -1,0 +1,14 @@
+# disagg_config.yaml
+
+hostname: localhost
+port: 8400
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8401"
+      # - "localhost:8402"
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8403"

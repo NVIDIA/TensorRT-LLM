@@ -61,8 +61,6 @@ def getSMVersion():
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     verbose = 0
     sm_version = getSMVersion()
-    if flag == "-use-attention-sinks" and sm_version != 90:
-        pytest.skip("use-attention-sinks is only supported on sm90 currently.")
     if sm_version == 90 and tiled_kernel == "-force-non-tiled":
         pytest.skip(
             "Tiled/non-tiled flags only make a difference to ampere-style kernels."
@@ -78,10 +76,6 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     # ada fp8 fmha only supports non-tiled kernels currently.
     if dtype == '-e4m3' and sm_version == 89 and tiled_kernel == "":
         pytest.skip("ada fp8 fmha only supports non-tiled kernels currently.")
-    # Known accuracy issue in this case.
-    skip_dense_mask_test = False
-    if d == 64 and dtype in ['-fp16-fp32', '-bf16'] and tiled_kernel == "":
-        skip_dense_mask_test = True
 
     # use higher error tolerance for bf16 and e4m3.
     epsilon = ''
@@ -111,11 +105,10 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
         if "softcapping-scale-bmm1" in flag:
             pytest.skip("skipping softcapping-scale-bmm1 for sm89 e4m3 fmha.")
 
-    if not skip_dense_mask_test:
-        subprocess.run(
-            f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
-            shell=True,
-            check=True)
+    subprocess.run(
+        f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
+        shell=True,
+        check=True)
     subprocess.run(
         f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
         shell=True,
@@ -183,7 +176,8 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
         check=True)
 
     # For chunked prefill, we need to enable -save-softmax (dtype: bf16, layout: separate-q-k-v).
-    if dtype in ["-bf16", "-e4m3"]:
+    # Currently fp8 kernel doesn't support saving softmax.
+    if dtype == "-bf16":
         # padding mask
         subprocess.run(
             f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "

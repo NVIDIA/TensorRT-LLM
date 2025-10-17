@@ -20,12 +20,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
 
@@ -242,9 +239,6 @@ class LinearMethodBase(ABC):
             self.load_weights_fused_gate_up_linear(module, weights)
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
-
-    def post_load_weights(self, module: Linear):
-        pass
 
     def load_weight_scales(self, weights: List[Dict], *args, **kwargs):
         """
@@ -619,8 +613,8 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
+        if get_sm_version() == 100:
+            if module.use_cute_dsl_blockscaling_mm:
                 # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
@@ -717,24 +711,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
-    def post_load_weights(self, module: Linear):
-        super().post_load_weights(module)
-        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm):
-            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
-                                                        module.weight_scale)
-            transfromed_scale = transform_sf_into_required_layout(
-                weight_scale,
-                mn=weight.shape[0],
-                k=weight.shape[1],
-                recipe=(1, 128, 128),
-                is_sfa=False)
-            module.weight = nn.Parameter(weight, requires_grad=False)
-            module.weight_scale = nn.Parameter(
-                transfromed_scale,
-                requires_grad=False,
-            )
-
 
 class NVFP4LinearMethod(LinearMethodBase):
 
@@ -790,14 +766,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        if IS_CUTLASS_DSL_AVAILABLE and module.use_cute_dsl_nvfp4_blockscaling_mm:
-            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                act_fp4, module.weight, act_sf, module.weight_scale,
-                module.scalar_alpha, module.dtype)
-        else:
-            output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
-                                                 module.weight_scale,
-                                                 module.alpha, module.dtype)
+        output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
+                                             module.weight_scale, module.alpha,
+                                             module.dtype)
         if bias is not None:
             output = output + bias
         return output
@@ -872,7 +843,6 @@ class NVFP4LinearMethod(LinearMethodBase):
         E2M1_MAX = 6.0
         module.inv_input_scale.data = module.input_scale / E2M1_MAX
         copy_weight(module.alpha, alpha)
-        module.scalar_alpha = alpha.item()
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
@@ -890,7 +860,6 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
-        module.scalar_alpha = alpha.item()
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)
 
@@ -928,7 +897,6 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
-        module.scalar_alpha = alpha.item()
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
@@ -1027,12 +995,15 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                        tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
+                # The kernel we use will convert nvfp4 to e4m3 before matmul,
+                # so the range of the scale factor can only be [0,448/6].
+                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
                 weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
                 if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...]
+                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
                 else:
-                    assert weight_scale_2 == w["weight_scale_2"][...], (
+                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
                     )
 
@@ -1317,10 +1288,7 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
 
         copy_weight(module.weight, fused_weight)
 
-        weight_scales = self.load_weight_scales(weights,
-                                                tp_size=module.tp_size,
-                                                tp_rank=module.tp_rank,
-                                                tp_mode=module.tp_mode)
+        weight_scales = self.load_weight_scales(weights)
 
         # Create concatenated weight scale tensor
         cat_weight_scale = torch.cat(weight_scales, dim=0)
@@ -1821,8 +1789,6 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
-        use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
-        disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -1840,8 +1806,6 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
-        self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
-        self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features
         local_out_features = out_features
@@ -2021,6 +1985,3 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         self.quant_method.load_weights(self, weights, weight_mode)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)

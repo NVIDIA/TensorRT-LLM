@@ -1,0 +1,210 @@
+
+NOTICE: Existing SQLite export found: report1.sqlite
+        It is assumed file was previously exported from: report1.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/cuda_memcpy_async.py]... 
+
+ ** CUDA Async Memcpy with Pageable Memory (cuda_memcpy_async):
+
+The following APIs use PAGEABLE memory which causes asynchronous CUDA memcpy
+operations to block and be executed synchronously. This leads to low GPU
+utilization.
+
+Suggestion: If applicable, use PINNED memory instead.
+
+ Duration (ns)  Start (ns)   Src Kind  Dst Kind  Bytes (MB)   PID   Device ID  Context ID  Green Context ID  Stream ID        API Name       
+ -------------  -----------  --------  --------  ----------  -----  ---------  ----------  ----------------  ---------  ---------------------
+      98615233  49628510823  Pageable  Device      2200.097  12974          0           1                           14  cudaMemcpyAsync_v3020
+         11809  33716909214  Pageable  Device         0.524   7418          0           1                           14  cudaMemcpyAsync_v3020
+         11168  49621615188  Pageable  Device         0.525  12974          0           1                           14  cudaMemcpyAsync_v3020
+          1280  50298057503  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+          1248  50277316229  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+          1056  50136706565  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+          1024  50277318757  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           992  50136764358  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           928  50298060095  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50238059596  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50245910890  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50251120137  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50261557287  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50264197799  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50269415526  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50272056582  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50272061254  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50274702469  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50277321061  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50279940677  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50287719138  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50290307554  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50290312034  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50300642366  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50303241438  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50303245918  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           864  50311087612  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50200843403  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50200845963  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50230340910  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50230343278  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50235451148  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50235453420  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50235455916  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50238052811  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50238055211  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50238057420  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50240661323  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50240665035  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50240667563  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50240670091  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50243285867  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50243288395  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50243290507  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50245906538  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50245908682  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50248525290  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50248527434  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50248529642  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+           832  50251115625  Pageable  Device         0.000  12974          0           1                           13  cudaMemcpyAsync_v3020
+
+Only the top 50 results are displayed. More data may be available.
+
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/cuda_memcpy_sync.py]... 
+
+ ** CUDA Synchronous Memcpy (cuda_memcpy_sync):
+
+The following are synchronous memory transfers that block the host. This does
+not include host to device transfers of a memory block of 64 KB or less.
+
+Suggestion: Use cudaMemcpy*Async() APIs instead.
+
+ Duration (ns)  Start (ns)   Src Kind  Dst Kind  Bytes (MB)   PID   Device ID  Context ID  Green Context ID  Stream ID      API Name    
+ -------------  -----------  --------  --------  ----------  -----  ---------  ----------  ----------------  ---------  ----------------
+     107998501  35028487185  Device    Pageable    2200.097   7418          0           1                            7  cudaMemcpy_v3020
+         12544  35028425232  Device    Pageable       0.525   7418          0           1                            7  cudaMemcpy_v3020
+          2112  49730815988  Device    Pageable       0.000  12974          0           1                            7  cudaMemcpy_v3020
+          1888  33969153171  Device    Pageable       0.000   7418          0           1                            7  cudaMemcpy_v3020
+          1696  33969168531  Device    Pageable       0.000   7418          0           1                            7  cudaMemcpy_v3020
+          1696  49730828724  Device    Pageable       0.000  12974          0           1                            7  cudaMemcpy_v3020
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/cuda_memset_sync.py]... 
+
+ ** CUDA Synchronous Memset (cuda_memset_sync):
+
+There were no problems detected related to synchronization APIs.
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/cuda_api_sync.py]... 
+
+ ** CUDA Synchronization APIs (cuda_api_sync):
+
+The following are synchronization APIs that block the host until all issued
+CUDA calls are complete.
+
+Suggestions:
+   1. Avoid excessive use of synchronization.
+   2. Use asynchronous CUDA event calls, such as cudaStreamWaitEvent() and
+cudaEventSynchronize(), to prevent host synchronization.
+
+ Duration (ns)  Start (ns)    PID    TID            API Name          
+ -------------  -----------  -----  -----  ---------------------------
+       1070925  33164628548   7418   7418  cudaStreamSynchronize_v3020
+         32011  23255019749   7418   7418  cudaStreamSynchronize_v3020
+         31320  35773048306   7418   7418  cudaDeviceSynchronize_v3020
+         20910  25897055900   7418   7418  cudaStreamSynchronize_v3020
+         18600  16643927376   7418   7418  cudaStreamSynchronize_v3020
+         17990  28028882236   7418   7418  cudaStreamSynchronize_v3020
+         16220  25442585855   7418   7418  cudaStreamSynchronize_v3020
+         16090  24226695579   7418   7418  cudaStreamSynchronize_v3020
+         14990  23975918919   7418   7418  cudaStreamSynchronize_v3020
+         14830  25195303735   7418   7418  cudaStreamSynchronize_v3020
+         14711  26385088596   7418   7418  cudaStreamSynchronize_v3020
+         14620  26131534806   7418   7418  cudaStreamSynchronize_v3020
+         14560  27306393333   7418   7418  cudaStreamSynchronize_v3020
+         14490  26616938075   7418   7418  cudaStreamSynchronize_v3020
+         14400  24951333343   7418   7418  cudaStreamSynchronize_v3020
+         14390  25677429077   7418   7418  cudaStreamSynchronize_v3020
+         14260  27081033978   7418   7418  cudaStreamSynchronize_v3020
+         14210  23525750386   7418   7418  cudaStreamSynchronize_v3020
+         14100  24704584040   7418   7418  cudaStreamSynchronize_v3020
+         13981  27772536485   7418   7418  cudaStreamSynchronize_v3020
+         13891  27541759692   7418   7418  cudaStreamSynchronize_v3020
+         13720  23749889844   7418   7418  cudaStreamSynchronize_v3020
+         13711  26850653390   7418   7418  cudaStreamSynchronize_v3020
+         13530  50061546331  12974  12974  cudaStreamSynchronize_v3020
+         13450  33716910407   7418   7418  cudaStreamSynchronize_v3020
+         11870  24462581196   7418   7418  cudaStreamSynchronize_v3020
+          9840  33716572342   7418   7418  cudaStreamSynchronize_v3020
+          7760  50861236572  12974  12974  cudaDeviceSynchronize_v3020
+          6761  49734577356  12974  12974  cudaStreamSynchronize_v3020
+          6370  50063498949  12974  12974  cudaDeviceSynchronize_v3020
+          5840  49971098822  12974  12974  cudaStreamSynchronize_v3020
+          5470  33716601322   7418   7418  cudaStreamSynchronize_v3020
+          5060  33652079696   7418   7418  cudaStreamSynchronize_v3020
+          5030  33716872476   7418   7418  cudaStreamSynchronize_v3020
+          4590  34551737902   7418   7418  cudaStreamSynchronize_v3020
+          4430  33167343527   7418   7418  cudaStreamSynchronize_v3020
+          4180  49751410458  12974  12974  cudaStreamSynchronize_v3020
+          4161  33340483642   7418   7418  cudaStreamSynchronize_v3020
+          3840  33716622793   7418   7418  cudaStreamSynchronize_v3020
+          3800  33499966472   7418   7418  cudaStreamSynchronize_v3020
+          3350  34553115142   7418   7418  cudaStreamSynchronize_v3020
+          2480  34551781633   7418   7418  cudaStreamSynchronize_v3020
+          2470  50063521199  12974  12974  cudaStreamSynchronize_v3020
+          2260  35773096197   7418   7418  cudaDeviceSynchronize_v3020
+          2081  33180209711   7418   7418  cudaStreamSynchronize_v3020
+          2000  33656391758   7418   7418  cudaStreamSynchronize_v3020
+          2000  35773749486   7418   7418  cudaDeviceSynchronize_v3020
+          1790  33673456683   7418   7418  cudaStreamSynchronize_v3020
+          1720  33670326888   7418   7418  cudaStreamSynchronize_v3020
+          1710  33658834453   7418   7418  cudaStreamSynchronize_v3020
+
+Only the top 50 results are displayed. More data may be available.
+
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/gpu_gaps.py]... 
+
+ ** GPU Gaps (gpu_gaps):
+
+The following are ranges where a GPU is idle for more than 500ms. Addressing
+these gaps might improve application performance.
+
+Suggestions:
+   1. Use CPU sampling data, OS Runtime blocked state backtraces, and/or OS
+Runtime APIs related to thread synchronization to understand if a sluggish or
+blocked CPU is causing the gaps.
+   2. Add NVTX annotations to CPU code to understand the reason behind the gaps.
+
+ Row#  Duration (ns)  Start (ns)   PID   Device ID  Context ID
+ ----  -------------  -----------  ----  ---------  ----------
+    1      895730872  17822248695  7418          0           1
+    2      861066947  18770697820  7418          0           1
+    3      842491290  22029683249  7418          0           1
+    4      834754182  28689812949  7418          0           1
+    5      693072153  29576819302  7418          0           1
+    6      600517213  32102923387  7418          0           1
+    7      596363206  30269893023  7418          0           1
+    8      511242893  21483801452  7418          0           1
+    9      506719604  19631766303  7418          0           1
+   10      506608813  34521816419  7418          0           1
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/gpu_time_util.py]... 
+
+ ** GPU Time Utilization (gpu_time_util):
+
+The following are time regions with an average GPU utilization below 50%%.
+Addressing the gaps might improve application performance.
+
+Suggestions:
+   1. Use CPU sampling data, OS Runtime blocked state backtraces, and/or OS
+Runtime APIs related to thread synchronization to understand if a sluggish or
+blocked CPU is causing the gaps.
+   2. Add NVTX annotations to CPU code to understand the reason behind the gaps.
+
+ Row#  In-Use (%)  Duration (ns)  Start (ns)    PID   Device ID  Context ID
+ ----  ----------  -------------  -----------  -----  ---------  ----------
+    1         0.6      486148866  49737364918  12974          0           1
+    2         2.9    19110469485  16026016201   7418          0           1
+
+Processing [report1.sqlite] with [/usr/local/cuda-12.9/NsightSystems-cli-2025.3.1/target-linux-x64/rules/dx12_mem_ops.py]... 
+SKIPPED: report1.sqlite could not be analyzed because it does not contain the required DX12 data. Does the application use DX12 APIs?
+

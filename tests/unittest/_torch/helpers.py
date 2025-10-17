@@ -180,26 +180,14 @@ class MockEngine:
 
 def create_mock_engine(batch_size: int):
 
-    class MockSpecConfig:
-
-        class SpecDecMode:
-
-            def needs_kv_cache_recompute(self):
-                return False
-
-        spec_dec_mode = SpecDecMode()
-
     return MockEngine(
         pytorch_backend_config=MockPytorchBackendConfig(
             use_cuda_graph=True, cuda_graph_padding_enabled=False),
         _cuda_graph_batch_sizes=[batch_size],
         _max_cuda_graph_batch_size=batch_size,
         max_beam_width=1,
-        max_num_tokens=8192,
         is_spec_decode=False,
-        enable_spec_decode=False,
-        spec_config=MockSpecConfig(),
-        is_draft_model=False,
+        spec_config=None,
         _cuda_graph_mem_pool=None,
         use_mrope=False,
     )

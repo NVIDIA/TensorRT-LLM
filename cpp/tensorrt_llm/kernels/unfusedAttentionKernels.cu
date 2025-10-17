@@ -132,7 +132,7 @@ void invokeAddQKVBiasIA3Transpose(T* q_buf, T* k_buf, T* v_buf, T* Q, T const* b
     bool is_add_bias = bias_Q != nullptr;
     if (sizeof(T) == 4 || k % 2 != 0)
     {
-        dim3 block(min(k, 512));
+        dim3 block(std::min(k, 512));
         if (is_add_bias)
         {
             addQKVBiasIA3Transpose<T><<<grid, block, 0, stream>>>(q_buf, k_buf, v_buf, Q, bias_Q, K, bias_K, V, bias_V,
@@ -148,7 +148,7 @@ void invokeAddQKVBiasIA3Transpose(T* q_buf, T* k_buf, T* v_buf, T* Q, T const* b
     else
     {
         using T2 = typename TypeConverter<T>::Type; // fp16 to half2, bf16 to bf162
-        dim3 block(min(k / 2, 512));
+        dim3 block(std::min(k / 2, 512));
         if (is_add_bias)
         {
             addQKVBiasIA3Transpose<T2><<<grid, block, 0, stream>>>((T2*) q_buf, (T2*) k_buf, (T2*) v_buf, (const T2*) Q,
@@ -635,7 +635,7 @@ void invokeMaskedSoftmax(MaskedSoftmaxParam<T, T_IN>& param, cudaStream_t stream
     dim3 grid(param.q_length, param.batch_size, param.num_heads);
     if (param.batch_size * param.num_heads > 360)
     {
-        grid.x = ceil(float(param.q_length) / 32.0f);
+        grid.x = (param.q_length + 31) / 32;
     }
 
     bool is_half2 = sizeof(T) == 2 && sizeof(T_IN) == 2 && param.k_length % 2 == 0;
@@ -645,30 +645,8 @@ void invokeMaskedSoftmax(MaskedSoftmaxParam<T, T_IN>& param, cudaStream_t stream
     {
         TLLM_CHECK(false); // Not implemented - it's not clear we want to use the unfused kernel in that case.
     }
-    else if (block.x > 16384)
-    {
-        LAUNCH_MASKED_SOFTMAX(32)
-    }
-    else if (block.x > 8192)
-    {
-        LAUNCH_MASKED_SOFTMAX(16)
-    }
-    else if (block.x > 4096)
-    {
-        LAUNCH_MASKED_SOFTMAX(8)
-    }
-    else if (block.x > 2048)
-    {
-        LAUNCH_MASKED_SOFTMAX(4)
-    }
-    else if (block.x > 1024)
-    {
-        LAUNCH_MASKED_SOFTMAX(2)
-    }
-    else if (block.x > 0)
-    {
-        LAUNCH_MASKED_SOFTMAX(1)
-    }
+
+    LAUNCH_MASKED_SOFTMAX(std::max(1,block.x >> 9));
 }
 
 template void invokeMaskedSoftmax(MaskedSoftmaxParam<float, float>& param, cudaStream_t stream);
@@ -1528,7 +1506,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         int const m = token_num;
         int const n = std::max(head_num, kv_head_num) * size_per_head;
         dim3 block(384);
-        dim3 grid((int) (ceil(1.0 * m * n / 384)));
+        dim3 grid((m * n + 383) / 384);
 
         if (qkv_bias != nullptr)
         {
@@ -1588,13 +1566,13 @@ __global__ void transpose_4d(T* dst, T* src, int const dim0, int const dim1, int
     {
         int index = i;
         int const d3 = index % dim3;
-        index = (index - d3) / dim3;
+        index = index / dim3;
         int const d2 = index % dim2;
-        index = (index - d2) / dim2;
+        index = index / dim2;
         int const d1 = index % dim1;
-        index = (index - d1) / dim1;
+        index = index / dim1;
         int const d0 = index % dim0;
-        index = (index - d0) / dim0;
+        
         dst[d2 * dim0_leading_dim * dim1 * dim3 + (d0 + dim0 * ite) * dim1 * dim3 + d1 * dim3 + d3] = src[i];
     }
 }
@@ -1612,13 +1590,13 @@ __global__ void transpose_4d(half* dst, half* src, int const dim0, int const dim
     {
         int index = i;
         int const d3 = index % half_dim3;
-        index = (index - d3) / half_dim3;
+        index = index / half_dim3;
         int const d2 = index % dim2;
-        index = (index - d2) / dim2;
+        index = index / dim2;
         int const d1 = index % dim1;
-        index = (index - d1) / dim1;
+        index = index / dim1;
         int const d0 = index % dim0;
-        index = (index - d0) / dim0;
+        
         dst_ptr[d2 * dim0_leading_dim * dim1 * half_dim3 + (d0 + dim0 * ite) * dim1 * half_dim3 + d1 * half_dim3 + d3]
             = src_ptr[i];
     }
@@ -1671,7 +1649,7 @@ __global__ void transpose4dBatchMajorKVCache(T const* kSrc, T const* vSrc, KVCac
     int tokenIdx = idx / sizePerHeadDivX;
     // Apply cyclic kv cache if tokenIdx >= max_attention_window_size.
     // which means we will drop the tokens in the beginning if seqLen > max_attention_window_size.
-    int const tokenIdxLowerBound = max(sequence_lengths[batchIdx] - attentionWindowSize, 0);
+    int const tokenIdxLowerBound = std::max(sequence_lengths[batchIdx] - attentionWindowSize, 0);
     // Get channel index
     int const channelIdx = idx % sizePerHeadDivX;
     if (tokenIdx >= sequence_lengths[batchIdx] || tokenIdx < tokenIdxLowerBound)
@@ -2109,31 +2087,26 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
     using SrcPack = Vec<Src, packSize>;
     using DstPack = Vec<Dst, packSize>;
     int64_t const stride = packSize * nbThrds;
-    for (int64_t i = tid * packSize; i < size; i += stride)
+
+    int64_t const aligned_size = (size / packSize) * packSize;
+
+    for (int64_t i = tid * packSize; i < aligned_size; i += stride)
     {
-        if (i + packSize < size)
-        {
-            auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
-            DstPack dstPack;
+        auto const srcPack = reinterpret_cast<SrcPack const&>(src[i]);
+        DstPack dstPack;
+
 #pragma unroll
-            for (int32_t j = 0; j < packSize; j++)
-            {
-                dstPack[j] = Dst{float{srcPack[j]} * scale};
-            }
-            reinterpret_cast<DstPack&>(dst[i]) = dstPack;
-        }
-        else
+        for (int32_t j = 0; j < packSize; j++)
         {
-#pragma unroll
-            for (int64_t j = 0; j < packSize; j++)
-            {
-                if (i + j >= size)
-                {
-                    break;
-                }
-                dst[i + j] = Dst{float{src[i + j]} * scale};
-            }
+            dstPack[j] = Dst{float{srcPack[j]} * scale};
         }
+
+        reinterpret_cast<DstPack&>(dst[i]) = dstPack;
+    }
+    // Handle tail elements
+#pragma unroll
+    for (int64_t j = aligned_size; j < size; j++){
+        dst[j] = Dst{float{src[j]} * scale};
     }
 }
 

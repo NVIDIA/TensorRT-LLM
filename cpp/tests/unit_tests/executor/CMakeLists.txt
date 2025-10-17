@@ -31,7 +31,6 @@ add_gtest(loraConfigTest loraConfigTest.cpp)
 add_gtest(intervalSetTest intervalSetTest.cpp)
 add_gtest(dynamicBatchTunerTest dynamicBatchTunerTest.cpp)
 add_gtest(ucxCommTest ucxCommTest.cpp)
-target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
 
 if(NIXL_ROOT)
   add_gtest(transferAgentTest transferAgentTest.cpp)

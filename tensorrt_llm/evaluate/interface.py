@@ -34,15 +34,13 @@ class Evaluator(ABC):
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  fewshot_as_multiturn: bool = False,
-                 system_prompt: Optional[str] = None,
-                 chat_template_kwargs: Optional[dict[str, Any]] = None):
+                 system_prompt: Optional[str] = None):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
         self.apply_chat_template = apply_chat_template
         self.fewshot_as_multiturn = fewshot_as_multiturn
         self.system_prompt = system_prompt
-        self.chat_template_kwargs = chat_template_kwargs
 
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
@@ -66,9 +64,7 @@ class Evaluator(ABC):
             }] + messages
         return llm.tokenizer.apply_chat_template(messages,
                                                  tokenize=False,
-                                                 add_generation_prompt=True,
-                                                 **(self.chat_template_kwargs
-                                                    or {}))
+                                                 add_generation_prompt=True)
 
     def _get_sampline_params(self, sampling_params: Optional[SamplingParams],
                              sampling_args: Optional[dict]) -> SamplingParams:

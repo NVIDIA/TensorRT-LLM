@@ -1,9 +1,9 @@
 from typing import List, Literal, Optional, Tuple, Type
 
-import torch.nn as nn
 from pydantic import Field
+from torch.fx import GraphModule
 
-from ...compile import CompileBackendRegistry
+from ...compile import compile_and_capture
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
@@ -39,27 +39,27 @@ class CompileModel(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return CompileModelConfig
 
-    def _apply_to_full_model(
+    def _apply(
         self,
-        mod: nn.Module,
+        gm: GraphModule,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[nn.Module, TransformInfo]:
+    ) -> Tuple[GraphModule, TransformInfo]:
         cm.info.set_generate_only_batch()
-
-        compiler_cls = CompileBackendRegistry.get(self.config.compile_backend)
-        mod_compiled = compiler_cls(
-            mod,
-            args=(),
-            kwargs=cm.named_args,
-            max_batch_size=cm.info.max_batch_size,
-            **self.config.model_dump(),
-        ).compile()
-
+        egm_compiled = compile_and_capture(
+            gm,
+            self.config.compile_backend,
+            args=cm.args,
+            dynamic_shapes=cm.dynamic_shapes,
+            compiler_kwargs={
+                "cuda_graph_batch_sizes": self.config.cuda_graph_batch_sizes,
+                "num_batched_inputs": self.config.num_batched_inputs,
+            },
+        )
         cm.info.reset()
 
         # store info object about the transform
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 
-        return mod_compiled, info
+        return egm_compiled, info
