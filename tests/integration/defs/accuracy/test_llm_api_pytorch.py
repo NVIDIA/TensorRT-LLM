@@ -3637,6 +3637,8 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                                            top_p=0.95,
                                            max_tokens=16384)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         chat_template_kwargs = dict(thinking_budget=-1)
