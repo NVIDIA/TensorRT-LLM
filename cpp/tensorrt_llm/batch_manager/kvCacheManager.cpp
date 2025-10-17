@@ -1084,7 +1084,6 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mBufferManager{std::move(stream)}
     , mSchedulingNumFreeBlocks{0}
     , mTokensPerBlock{tokensPerBlock}
-    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0}, windowSize)}
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mTransferManager{std::make_shared<KVCacheTransferManager>(mBufferManager)}

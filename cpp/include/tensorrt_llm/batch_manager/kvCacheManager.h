@@ -908,8 +908,6 @@ private:
     SizeType32 mTokensPerBlock;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
-    // Dummy block acting as root for BlockToken searches
-    BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
     CacheType mCacheType;
     // Eviction Policy
