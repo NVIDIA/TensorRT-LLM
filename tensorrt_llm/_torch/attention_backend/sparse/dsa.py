@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -40,6 +42,222 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (hidden_size & (hidden_size - 1)
             ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+# Triton kernel for converting request-local indices to global KV cache pool indices
+@triton.jit
+def _convert_req_index_to_global_index_kernel_with_stride_factor(
+    req_id_ptr,  # int32 [num_tokens]
+    block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    # shapes (compile-time where possible)
+    max_num_blocks_per_req: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # tile width along columns
+    stride_factor: tl.constexpr,  # for strided memory layout adjustment
+    # strides (in elements)
+    bt_stride0,
+    bt_stride1,
+    ti_stride0,
+    ti_stride1,
+    out_stride0,
+    out_stride1,
+):
+    """
+    Triton kernel for converting request-local token indices to global KV cache pool indices.
+    Derived from vllm's flashmla_sparse.py, with stride_factor fused in the kernel.
+    """
+    # program_id(0) -> token_id (row)
+    # program_id(1) -> tile index along columns
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    # Each program covers BLOCK_N consecutive columns
+    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Load request id for this token (no mask: grid is exact)
+    req = tl.load(req_id_ptr + token_id)
+
+    # Load token indices for this tile
+    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+    tok = tl.load(ti_ptr)  # int32
+
+    # Only token == -1 should propagate as -1
+    is_invalid_tok = tok < 0
+
+    # Compute block id and in-block offset
+    block_id = tok // BLOCK_SIZE
+    inblock_off = tok % BLOCK_SIZE
+
+    # Guard block_table access
+    valid_block = block_id < max_num_blocks_per_req
+    bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
+    base = tl.load(bt_ptr, mask=valid_block, other=0)
+
+    # If token == -1 OR block_id OOB, output -1
+    # Otherwise: base * stride_factor + inblock_off
+    # (stride_factor accounts for layer interleaving in strided KV cache pools)
+    out_val = tl.where(is_invalid_tok | (~valid_block), -1,
+                       base * stride_factor + inblock_off)
+
+    # Store results
+    out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
+    tl.store(out_ptr_ij, out_val)
+
+
+def triton_convert_req_index_to_global_index(
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    BLOCK_SIZE: int = 64,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,  # tile width along columns
+    stride_factor:
+    int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
+):
+    """
+    Convert request-local token indices to global KV cache pool indices.
+
+    out[token_id, indice_id] =
+        block_table[req_id[token_id],
+            token_indices[token_id, indice_id] // BLOCK_SIZE] * stride_factor
+        + token_indices[token_id, indice_id] % BLOCK_SIZE
+
+    Args:
+        stride_factor: Memory stride between consecutive blocks (default: BLOCK_SIZE).
+                        For non-contiguous pools with layer interleaving, use
+                        (num_layers * BLOCK_SIZE) to account for memory gaps.
+
+    Only when token_indices[token_id, indice_id] == -1 do we output -1.
+    For safety, we also output -1 if the derived block_id would be
+        out-of-bounds.
+    """
+    if stride_factor is None:
+        stride_factor = BLOCK_SIZE
+    assert req_id.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert token_indices.dtype == torch.int32
+    assert token_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
+        f"BLOCK_N ({BLOCK_N})"
+
+    num_tokens = req_id.shape[0]
+    num_requests, max_num_blocks_per_req = block_table.shape
+    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+
+    # Ensure contiguous tensors on the same device
+    req_id_c = req_id.contiguous()
+    block_table_c = block_table.contiguous()
+    token_indices_c = token_indices.contiguous()
+    out = torch.empty_like(token_indices_c)
+
+    # Strides in elements
+    bt_stride0, bt_stride1 = block_table_c.stride()
+    ti_stride0, ti_stride1 = token_indices_c.stride()
+    out_stride0, out_stride1 = out.stride()
+
+    # Exact 2D grid: tokens × column tiles
+    grid = (num_tokens, tiles_per_row)
+
+    _convert_req_index_to_global_index_kernel_with_stride_factor[grid](
+        req_id_c,
+        block_table_c,
+        token_indices_c,
+        out,
+        # shapes / constexprs
+        max_num_blocks_per_req,
+        BLOCK_SIZE,
+        BLOCK_N,
+        stride_factor,
+        # strides
+        bt_stride0,
+        bt_stride1,
+        ti_stride0,
+        ti_stride1,
+        out_stride0,
+        out_stride1,
+    )
+    return out
+
+
+def transform_local_topk_and_prepare_pool_view(
+    topk_indices: torch.Tensor,
+    attn_metadata: "DSAtrtllmAttentionMetadata",
+    kv_cache_manager,
+    layer_idx: int,
+    is_generation: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert local topk indices to global pool indices and prepare KV pool.
+    Auto-detects stride and handles both contiguous/strided layouts.
+
+    Args:
+        topk_indices: [num_tokens, NUM_TOPK]
+        attn_metadata: Metadata with block_table and request mappings
+        kv_cache_manager: KV cache manager
+        layer_idx: Layer index
+        is_generation: Generation vs context phase
+
+    Returns:
+        (global_indices, kv_pool):
+            - global_indices: [num_tokens, NUM_TOPK]
+            - kv_pool: [total_tokens, 1, head_dim]
+    """
+    assert topk_indices.dtype == torch.int32
+
+    # Get KV cache pool: [num_blocks, 1, tokens_per_block, 1, head_dim]
+    kv_pool = kv_cache_manager.get_buffers(layer_idx)
+    num_blocks, _, tokens_per_block, _, head_dim = kv_pool.shape
+    assert kv_pool.shape[1] == 1 and kv_pool.shape[3] == 1
+
+    # Squeeze to [num_blocks, tokens_per_block, head_dim]
+    kv_pool = kv_pool.squeeze(1).squeeze(2)
+
+    # Auto-detect stride and prepare view
+    if kv_pool.is_contiguous():
+        stride_factor = tokens_per_block
+        kv_pool = kv_pool.view(-1, 1, head_dim)
+    else:
+        # Here we simply do:
+        # kv_pool = kv_pool.reshape(-1, 1, head_dim) to make it contiguous
+        # however, using strided layout and directly offset topk tokens in the
+        # (layer-interleaved) pool MIGHT be (not benchmarked) more efficient as its zero-copy.
+
+        # Strided layout: compute stride and create efficient view
+        block_stride = kv_pool.stride(0)
+        token_stride = kv_pool.stride(1)
+        assert token_stride == head_dim
+        stride_factor = block_stride // token_stride
+        view_size = (num_blocks - 1) * stride_factor + tokens_per_block
+        kv_pool = torch.as_strided(kv_pool,
+                                   size=(view_size, 1, head_dim),
+                                   stride=(token_stride, 0, 1),
+                                   storage_offset=kv_pool.storage_offset())
+
+    # Get block_table and request indices for this phase
+    if is_generation:
+        block_table = attn_metadata.block_table[
+            attn_metadata.num_contexts:attn_metadata.num_seqs]
+        req_idx = attn_metadata.req_idx_per_token[
+            attn_metadata.num_ctx_tokens:attn_metadata.num_tokens]
+        req_idx = req_idx - attn_metadata.num_contexts
+    else:
+        block_table = attn_metadata.block_table[:attn_metadata.num_contexts]
+        req_idx = attn_metadata.req_idx_per_token[:attn_metadata.num_ctx_tokens]
+
+    # Convert to global indices
+    global_indices = triton_convert_req_index_to_global_index(
+        req_idx,
+        block_table,
+        topk_indices,
+        BLOCK_SIZE=attn_metadata.tokens_per_block,
+        NUM_TOPK_TOKENS=topk_indices.shape[1],
+        stride_factor=stride_factor,
+    )
+
+    return global_indices, kv_pool
 
 
 def split_prefill_chunks(
@@ -203,7 +421,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.sparse_attention_config.indexer_max_chunk_size is not None:
             self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
         else:
-            self.indexer_max_chunk_size = 32768 # Default to 32K tokens for the indexer
+            self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
 
     def __post_init__(self):
         super().__post_init__()
@@ -293,6 +511,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
+        # Per-token request index buffer for topk_indices conversion
+        self.req_idx_per_token = get_empty(
+            (self.max_num_tokens, ),
+            cache_name="req_idx_per_token",
+            dtype=torch.int32,
+        )
+        # Block table for topk_indices conversion (shared for context and generation)
+        self.block_table = get_empty(
+            (self.max_num_requests, self.kv_cache_manager.max_blocks_per_seq),
+            cache_name="block_table",
+            dtype=torch.int32,
+        )
         self.scheduler_metadata_buffer = get_empty(
             (self.num_sms + 1, 2),
             cache_name="scheduler_metadata_buffer",
@@ -306,11 +536,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.cu_seqlen_ke = get_empty(
             (self.max_num_tokens, ),
             cache_name="cu_seqlen_ke",
-            dtype=torch.int32,
-        )
-        self.ctx_kv_offsets = get_empty(
-            (self.max_num_tokens, 1),
-            cache_name="ctx_kv_offsets",
             dtype=torch.int32,
         )
         self.gen_kv_offsets = get_empty(
@@ -327,6 +552,30 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.indexer_k_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
+
+        # Build req_idx_per_token for topk_indices conversion (same pattern as gen_kv_offsets)
+        host_req_idx_per_token = torch.repeat_interleave(torch.arange(
+            self.num_seqs, dtype=torch.int32),
+                                                         self.seq_lens,
+                                                         dim=0)
+        self.req_idx_per_token[:self.num_tokens].copy_(host_req_idx_per_token,
+                                                       non_blocking=True)
+
+        # Build block_table for topk_indices conversion (actual block allocation)
+        block_ids_all = self.kv_cache_manager.get_batch_cache_indices(
+            self.request_ids[:self.num_seqs])
+        max_blocks_used = max(len(b)
+                              for b in block_ids_all) if block_ids_all else 1
+        host_block_table = torch.full((self.num_seqs, max_blocks_used),
+                                      -1,
+                                      dtype=torch.int32)
+        for i, blocks in enumerate(block_ids_all):
+            if len(blocks) > 0:
+                host_block_table[i, :len(blocks)] = torch.tensor(
+                    blocks, dtype=torch.int32)
+        # Copy to GPU
+        self.block_table[:self.num_seqs, :max_blocks_used].copy_(
+            host_block_table, non_blocking=True)
 
         # For mla_rope_append_paged_kv_assign_q
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -604,7 +853,7 @@ class Indexer(nn.Module):
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
-        num_gen_tokens = metadata.num_tokens - num_ctx_tokens
+        metadata.num_tokens - num_ctx_tokens
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
         head_dim = metadata.kv_cache_manager.index_head_dim
@@ -649,13 +898,6 @@ class Indexer(nn.Module):
                                                          non_blocking=True)
             metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
                                                          non_blocking=True)
-            # Prepare context kv offsets to support convert the topk indices to global indices
-            host_ctx_kv_offsets = torch.repeat_interleave(
-                metadata.host_ctx_kv_indptr[:num_contexts],
-                host_seq_lens,
-                dim=0).unsqueeze(1)
-            metadata.ctx_kv_offsets[:num_ctx_tokens].copy_(host_ctx_kv_offsets,
-                                                           non_blocking=True)
 
         # Prepare for decode phase if there are generation requests
         if num_generations > 0:
@@ -667,15 +909,6 @@ class Indexer(nn.Module):
                 gen_seq_lens, tokens_per_block, metadata.num_sms)
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                      non_blocking=True)
-            # Prepare generation kv offsets to support convert the topk indices to global indices
-            host_gen_seq_lens = seq_lens[num_contexts:num_contexts +
-                                         num_generations]
-            host_gen_kv_offsets = torch.repeat_interleave(
-                metadata.host_gen_kv_indptr[:num_generations],
-                host_gen_seq_lens,
-                dim=0).unsqueeze(1)
-            metadata.gen_kv_offsets[:num_gen_tokens].copy_(host_gen_kv_offsets,
-                                                           non_blocking=True)
 
         # Compute slot_mapping for all requests (both context and generation)
         # This maps each token to its flat cache position for vectorized KV cache updates
@@ -874,8 +1107,7 @@ class Indexer(nn.Module):
                                               chunk.cu_seqlen_ks)[:, None] < 0
                     mask = mask_lo & mask_hi
 
-                    # Convert local indices to global indices relative to the KV cache
-                    topk_indices = topk_indices + chunk.ctx_kv_offsets
+                    # local indices per sequence
                     topk_indices = topk_indices.masked_fill(~mask, -1)
 
                     topk_indices_buffer[
@@ -902,9 +1134,8 @@ class Indexer(nn.Module):
                 mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:,
                                                                        None] < 0
                 mask = mask_lo & mask_hi
-                # Convert local indices to global indices relative to the KV cache
-                ctx_kv_offsets = metadata.ctx_kv_offsets[:num_ctx_tokens]
-                topk_indices = topk_indices + ctx_kv_offsets
+
+                # local indices per sequence
                 topk_indices = topk_indices.masked_fill(~mask, -1)
                 topk_indices_buffer[:num_ctx_tokens, :topk_indices.
                                     shape[-1]] = topk_indices.to(
@@ -969,9 +1200,7 @@ class Indexer(nn.Module):
             # this will happen if context length is shorter than K
             mask_decode = topk_indices_decode <= index_end_pos
 
-            # Convert local indices to global indices relative to the KV cache
-            gen_kv_offsets = metadata.gen_kv_offsets[:num_gen_tokens]
-            topk_indices_decode = topk_indices_decode + gen_kv_offsets
+            # local indices per sequence
             topk_indices_decode = topk_indices_decode.masked_fill(
                 ~mask_decode, -1)
 
@@ -1152,65 +1381,6 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
             beam_width,
             self.wrapper.quant_mode,
         )
-
-    def load_paged_kv_cache_for_mla(
-        self,
-        metadata: DSAtrtllmAttentionMetadata,
-        out_dtype: torch.dtype,
-        is_generation: bool = False,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        if is_generation:
-            max_kv_len = metadata.max_gen_kv_len
-            num_cached_tokens = (metadata.num_gen_cached_tokens +
-                                 metadata.num_tokens - metadata.num_ctx_tokens)
-            num_seqs = metadata.num_generations
-            kv_indptr = metadata.gen_kv_indptr
-            block_offsets = metadata.kv_cache_block_offsets[:, metadata.
-                                                            num_contexts:]
-            host_block_offsets = metadata.host_kv_cache_block_offsets[:,
-                                                                      metadata.
-                                                                      num_contexts:]
-        else:
-            max_kv_len = metadata.max_ctx_kv_len
-            num_cached_tokens = metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens
-            num_seqs = metadata.num_contexts
-            kv_indptr = metadata.ctx_kv_indptr
-            block_offsets = metadata.kv_cache_block_offsets
-            host_block_offsets = metadata.host_kv_cache_block_offsets
-
-        assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
-        assert self.is_mla_enable and self.mla_params is not None
-        assert metadata.kv_cache_manager is not None
-        assert max_kv_len > 0
-
-        sink_token_length = 0
-        beam_width = 1
-
-        compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
-            out_dtype,
-            num_seqs,
-            num_cached_tokens,
-            max_kv_len,
-            kv_indptr,
-            block_offsets,
-            host_block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
-            self.get_local_layer_idx(metadata),
-            self.mla_params.kv_lora_rank,
-            self.mla_params.qk_rope_head_dim,
-            metadata.kv_cache_manager.tokens_per_block,
-            metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
-            beam_width,
-            self.wrapper.quant_mode,
-        )
-
-        return compressed_kv, k_pe
 
 
 class DSACacheManager(KVCacheManager):

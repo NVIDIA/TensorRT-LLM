@@ -374,9 +374,16 @@ def test_deepgemm_fp8_mqa_logits_basic():
                    percent=0.9)  # double check for per-element similarity
 
 
-def _create_mock_metadata(request_ids, batch_size, num_contexts,
-                          num_generations, seq_lens, kv_lens, num_cached_tokens,
-                          cache_manager, num_ctx_tokens, num_tokens,
+def _create_mock_metadata(request_ids,
+                          batch_size,
+                          num_contexts,
+                          num_generations,
+                          seq_lens,
+                          kv_lens,
+                          num_cached_tokens,
+                          cache_manager,
+                          num_ctx_tokens,
+                          num_tokens,
                           indexer_max_chunk_size=8194):
     """Helper to create mock metadata for testing."""
 
@@ -464,6 +471,7 @@ def _create_mock_metadata(request_ids, batch_size, num_contexts,
             self.indexer_prefill_chunks = None
 
     return MockMetadata()
+
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="FP8 operations require SM90+")
@@ -802,40 +810,31 @@ def test_compute_cu_seqlen_bounds_nocache():
     "max_chunk_size,seq_lens,start_idx,expected_specs",
     [
         # Small requests - single chunk
-        (1000, [200, 300, 400], 0, [
-            [(0, 0, 200, 0), (1, 0, 300, 200), (2, 0, 400, 500)]
-        ]),
+        (1000, [200, 300, 400], 0, [[(0, 0, 200, 0), (1, 0, 300, 200),
+                                     (2, 0, 400, 500)]]),
         # Small requests - multiple chunks
-        (1000, [400, 500, 300, 600], 0, [
-            [(0, 0, 400, 0), (1, 0, 500, 400)],
-            [(2, 0, 300, 900), (3, 0, 600, 1200)]
-        ]),
+        (1000, [400, 500, 300, 600], 0, [[(0, 0, 400, 0), (1, 0, 500, 400)],
+                                         [(2, 0, 300, 900),
+                                          (3, 0, 600, 1200)]]),
         # Large request - intra-request chunking
-        (1000, [2500], 0, [
-            [(0, 0, 1000, 0)],
-            [(0, 1000, 2000, 0)],
-            [(0, 2000, 2500, 0)]
-        ]),
+        (1000, [2500], 0, [[(0, 0, 1000, 0)], [(0, 1000, 2000, 0)],
+                           [(0, 2000, 2500, 0)]]),
         # Mixed: small + large + small
-        (1000, [400, 2500, 300], 0, [
-            [(0, 0, 400, 0)],
-            [(1, 0, 1000, 400)],
-            [(1, 1000, 2000, 400)],
-            [(1, 2000, 2500, 400)],
-            [(2, 0, 300, 2900)]
-        ]),
+        (1000, [400, 2500, 300], 0, [[
+            (0, 0, 400, 0)
+        ], [(1, 0, 1000, 400)], [(1, 1000, 2000, 400)], [(1, 2000, 2500, 400)],
+                                     [(2, 0, 300, 2900)]]),
         # Edge case: exact chunk size
-        (1000, [1000], 0, [
-            [(0, 0, 1000, 0)]
-        ]),
+        (1000, [1000], 0, [[(0, 0, 1000, 0)]]),
         # Edge case: non-zero start index
-        (1000, [100, 200, 300], 1, [
-            [(1, 0, 200, 100), (2, 0, 300, 300)]
-        ]),
+        (1000, [100, 200, 300], 1, [[(1, 0, 200, 100), (2, 0, 300, 300)]]),
     ],
-    ids=["small_single", "small_multi", "large_chunked", "mixed", "exact_size", "non_zero_start"]
-)
-def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_specs):
+    ids=[
+        "small_single", "small_multi", "large_chunked", "mixed", "exact_size",
+        "non_zero_start"
+    ])
+def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
+                              expected_specs):
     """
     Test split_prefill_chunks covering:
     - Request-level chunking (small requests)
@@ -844,7 +843,9 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_spec
     - Edge cases
     """
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32)
-    chunk_groups = split_prefill_chunks(seq_lens_tensor, max_chunk_size, start_idx=start_idx)
+    chunk_groups = split_prefill_chunks(seq_lens_tensor,
+                                        max_chunk_size,
+                                        start_idx=start_idx)
 
     assert len(chunk_groups) == len(expected_specs), \
         f"Expected {len(expected_specs)} chunks, got {len(chunk_groups)}"
@@ -862,14 +863,15 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_spec
     "chunk_size,seq_lens_list,chunking_type",
     [
         # Request-level chunking: small requests that fit individually but need chunking as batch
-        (512, None, "request_level"),   # Random seq lens, 5 requests
+        (512, None, "request_level"),  # Random seq lens, 5 requests
         (1024, None, "request_level"),  # Random seq lens, 4 requests
         (2048, None, "request_level"),  # Random seq lens, 4 requests
 
         # Two-level chunking: intra-request Q-block splitting for large requests
-        (1024, [512, 2500, 800], "two_level"),        # Middle request needs Q-blocks
-        (1500, [3200, 1200], "two_level"),            # First request needs 3 Q-blocks
-        (1000, [400, 600, 2200, 500], "two_level"),   # Mixed: request 2 needs Q-blocks
+        (1024, [512, 2500, 800], "two_level"),  # Middle request needs Q-blocks
+        (1500, [3200, 1200], "two_level"),  # First request needs 3 Q-blocks
+        (1000, [400, 600, 2200, 500
+                ], "two_level"),  # Mixed: request 2 needs Q-blocks
     ],
 )
 def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
@@ -903,7 +905,8 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
         batch_size = 5 if chunk_size == 512 else 4
         seq_lens_list = []
         for _ in range(batch_size):
-            seq_len = random.randint(int(0.3 * chunk_size), int(0.9 * chunk_size))
+            seq_len = random.randint(int(0.3 * chunk_size),
+                                     int(0.9 * chunk_size))
             seq_lens_list.append(seq_len)
     else:
         # Two-level chunking: use provided seq_lens with large requests
@@ -920,13 +923,16 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
 
     # Identify large requests for two-level chunking
     if chunking_type == "two_level":
-        large_requests = [(i, seq_len) for i, seq_len in enumerate(seq_lens_list)
+        large_requests = [(i, seq_len)
+                          for i, seq_len in enumerate(seq_lens_list)
                           if seq_len > chunk_size]
         if large_requests:
             print(f"  Large requests (Q-block splitting):")
             for req_idx, seq_len in large_requests:
                 num_q_blocks = (seq_len + chunk_size - 1) // chunk_size
-                print(f"    Request {req_idx}: {seq_len} tokens → {num_q_blocks} Q-blocks")
+                print(
+                    f"    Request {req_idx}: {seq_len} tokens → {num_q_blocks} Q-blocks"
+                )
 
     # Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
@@ -946,10 +952,18 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
                                      prepare_resource=True)
 
     # Generate test data
-    q = torch.randn((total_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((total_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn((total_tokens, heads), device="cuda", dtype=torch.float32)
-    hidden_states = torch.randn((total_tokens, 4096), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((total_tokens, heads, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    k = torch.randn((total_tokens, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    weights = torch.randn((total_tokens, heads),
+                          device="cuda",
+                          dtype=torch.float32)
+    hidden_states = torch.randn((total_tokens, 4096),
+                                device="cuda",
+                                dtype=torch.bfloat16)
 
     # Quantize inputs
     q_fp8 = q.to(torch.float8_e4m3fn)
@@ -960,12 +974,16 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     print(f"\n=== Chunked Path ===")
 
     metadata_chunked = _create_mock_metadata(
-        request_ids, batch_size,
-        num_contexts=batch_size, num_generations=0,
-        seq_lens=seq_lens.clone(), kv_lens=seq_lens.clone(),
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=seq_lens.clone(),
+        kv_lens=seq_lens.clone(),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
-        num_ctx_tokens=total_tokens, num_tokens=total_tokens,
+        num_ctx_tokens=total_tokens,
+        num_tokens=total_tokens,
         indexer_max_chunk_size=chunk_size,
     )
 
@@ -979,11 +997,13 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     for i, chunk in enumerate(metadata_chunked.indexer_prefill_chunks):
         num_q = chunk.token_end - chunk.token_start
         num_k = chunk.k_token_end - chunk.k_token_start
-        print(f"  Chunk {i}: Q[{chunk.token_start}:{chunk.token_end}] ({num_q} tokens), "
-              f"K[{chunk.k_token_start}:{chunk.k_token_end}] ({num_k} tokens)")
+        print(
+            f"  Chunk {i}: Q[{chunk.token_start}:{chunk.token_end}] ({num_q} tokens), "
+            f"K[{chunk.k_token_start}:{chunk.k_token_end}] ({num_k} tokens)")
 
-    topk_indices_chunked = indexer.sparse_attn_indexer(
-        metadata_chunked, hidden_states, q_fp8, k, weights)
+    topk_indices_chunked = indexer.sparse_attn_indexer(metadata_chunked,
+                                                       hidden_states, q_fp8, k,
+                                                       weights)
 
     print(f"✓ Chunked execution completed, shape: {topk_indices_chunked.shape}")
 
@@ -991,12 +1011,16 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     print(f"\n=== Non-chunked Baseline ===")
 
     metadata_baseline = _create_mock_metadata(
-        request_ids, batch_size,
-        num_contexts=batch_size, num_generations=0,
-        seq_lens=seq_lens.clone(), kv_lens=seq_lens.clone(),
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=seq_lens.clone(),
+        kv_lens=seq_lens.clone(),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
-        num_ctx_tokens=total_tokens, num_tokens=total_tokens,
+        num_ctx_tokens=total_tokens,
+        num_tokens=total_tokens,
         indexer_max_chunk_size=max_model_len,
     )
 
@@ -1004,12 +1028,17 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
 
     if metadata_baseline.indexer_prefill_chunks is not None:
         num_baseline_chunks = len(metadata_baseline.indexer_prefill_chunks)
-        print(f"✓ Created {num_baseline_chunks} chunk(s) (effectively non-chunked)")
+        print(
+            f"✓ Created {num_baseline_chunks} chunk(s) (effectively non-chunked)"
+        )
 
-    topk_indices_baseline = indexer.sparse_attn_indexer(
-        metadata_baseline, hidden_states, q_fp8, k, weights)
+    topk_indices_baseline = indexer.sparse_attn_indexer(metadata_baseline,
+                                                        hidden_states, q_fp8, k,
+                                                        weights)
 
-    print(f"✓ Non-chunked execution completed, shape: {topk_indices_baseline.shape}")
+    print(
+        f"✓ Non-chunked execution completed, shape: {topk_indices_baseline.shape}"
+    )
 
     # ========== Validation ==========
     print(f"\n=== Validation ===")
@@ -1039,19 +1068,23 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
                 req_mismatches = mismatch_tokens[(mismatch_tokens >= req_start)
                                                  & (mismatch_tokens < req_end)]
                 if len(req_mismatches) > 0:
-                    print(f"    Request {req_idx} (len={seq_lens_list[req_idx]}): "
-                          f"{len(req_mismatches)} mismatches")
+                    print(
+                        f"    Request {req_idx} (len={seq_lens_list[req_idx]}): "
+                        f"{len(req_mismatches)} mismatches")
         else:
             # Show first few mismatches
             for i in range(min(3, len(mismatch_tokens))):
                 token_idx = mismatch_tokens[i].item()
-                diff_count = (topk_indices_chunked[token_idx] !=
-                             topk_indices_baseline[token_idx]).sum().item()
-                print(f"    Token {token_idx}: {diff_count}/{index_topk} indices differ")
+                diff_count = (topk_indices_chunked[token_idx]
+                              != topk_indices_baseline[token_idx]).sum().item()
+                print(
+                    f"    Token {token_idx}: {diff_count}/{index_topk} indices differ"
+                )
 
     assert match_ratio >= 0.99, \
         f"Chunked and non-chunked results differ: {match_ratio:.4f} < 0.99"
 
-    print(f"✅ Test passed! {chunking_type} chunking produces consistent results")
+    print(
+        f"✅ Test passed! {chunking_type} chunking produces consistent results")
     print(f"   Config: chunk_size={chunk_size}, num_chunks={num_chunks}, "
           f"batch={batch_size}, seq_lens={seq_lens_list}")

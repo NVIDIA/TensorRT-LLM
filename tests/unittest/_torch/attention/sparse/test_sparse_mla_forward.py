@@ -318,8 +318,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     hidden_size = 2048
     max_position_embeddings = 4096
     tokens_per_block = 64
-    num_layers = 1
-    layer_idx = 0
+    num_layers = 3  # Test multi-layer pool
+    layer_idx = 1  # Use middle layer to verify layer extraction
 
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -412,33 +412,62 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         is_neox=False,
     )
 
-    # Create MLA module first
-    mla = MLA(
-        hidden_size=hidden_size,
-        num_attention_heads=num_heads,
-        num_key_value_heads=1,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=kv_lora_rank,
-        predicted_tokens_per_seq=1,
-        max_position_embeddings=max_position_embeddings,
-        bias=False,
-        pos_embd_params=pos_embd_params,
-        layer_idx=layer_idx,
-        dtype=dtype,
-        config=model_config,
-    ).to(device)
+    # Create MLA modules for all layers (to test multi-layer pool)
+    mla_layers = []
+    for layer_id in range(num_layers):
+        mla = MLA(
+            hidden_size=hidden_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=1,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            predicted_tokens_per_seq=1,
+            max_position_embeddings=max_position_embeddings,
+            bias=False,
+            pos_embd_params=pos_embd_params,
+            layer_idx=layer_id,
+            dtype=dtype,
+            config=model_config,
+        ).to(device)
+        mla_layers.append(mla)
 
-    # Initialize weights
+    # Use the test layer
+    mla = mla_layers[layer_idx]
+    if num_layers > 1:
+        print(f"  Testing layer {layer_idx} of {num_layers} (multi-layer pool)")
+    else:
+        print(f"  Testing single layer (baseline)")
+
+    # Initialize weights for all layers
+    nn_init_std = 0.02
     with torch.no_grad():
-        # Initialize kv_b_proj weight
-        nn_init_std = 0.02
-        mla.kv_b_proj.weight.normal_(mean=0.0, std=nn_init_std)
+        for mla_layer in mla_layers:
+            # Initialize kv_b_proj weight
+            mla_layer.kv_b_proj.weight.normal_(mean=0.0, std=nn_init_std)
 
-        # Extract W_UK and W_UV for reference calculation
-        kv_b_weight = mla.kv_b_proj.weight.data  # [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+            # Extract weights for this layer
+            kv_b_weight = mla_layer.kv_b_proj.weight.data
+            kv_b_weight_reshaped = kv_b_weight.view(
+                num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+            # v_b_proj and k_b_proj_trans
+            mla_layer.v_b_proj.data = kv_b_weight_reshaped[:,
+                                                           qk_nope_head_dim:, :].contiguous(
+                                                           )
+            mla_layer.k_b_proj_trans.data = kv_b_weight_reshaped[:, :
+                                                                 qk_nope_head_dim, :].transpose(
+                                                                     1, 2
+                                                                 ).contiguous()
+            # Initialize indexer weights
+            mla_layer.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=nn_init_std)
+            mla_layer.mqa.indexer.wk.weight.normal_(mean=0.0, std=nn_init_std)
+            mla_layer.mqa.indexer.weights_proj.weight.normal_(mean=0.0,
+                                                              std=nn_init_std)
+
+        # Extract W_UK and W_UV from test layer for reference calculation
+        kv_b_weight = mla.kv_b_proj.weight.data
         kv_b_weight_reshaped = kv_b_weight.view(num_heads,
                                                 qk_nope_head_dim + v_head_dim,
                                                 kv_lora_rank)
@@ -446,21 +475,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             2, 0, 1).contiguous()  # [kv_lora_rank, num_heads, qk_nope_head_dim]
         W_UV = kv_b_weight_reshaped[:, qk_nope_head_dim:, :].permute(
             2, 0, 1).contiguous()  # [kv_lora_rank, num_heads, v_head_dim]
-
-        # v_b_proj: [num_heads, v_head_dim, kv_lora_rank]
-        mla.v_b_proj.data = kv_b_weight_reshaped[:,
-                                                 qk_nope_head_dim:, :].contiguous(
-                                                 )
-
-        # k_b_proj_trans: [num_heads, kv_lora_rank, qk_nope_head_dim]
-        mla.k_b_proj_trans.data = kv_b_weight_reshaped[:, :
-                                                       qk_nope_head_dim, :].transpose(
-                                                           1, 2).contiguous()
-
-        # Initialize indexer weights
-        mla.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=nn_init_std)
-        mla.mqa.indexer.wk.weight.normal_(mean=0.0, std=nn_init_std)
-        mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=nn_init_std)
 
     # Calculate cached token counts (context already in cache)
     cached_lens = [seq_lens[i] - query_lens[i] for i in range(len(seq_lens))]
@@ -555,6 +569,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
                                           num_cached_tokens_per_seq=[0] *
                                           len(gen_with_cache)),
             mapping=mapping,
+            sparse_attention_config=sparse_config,
         )
         cached_metadata.prepare()
 
@@ -633,6 +648,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
             num_cached_tokens_per_seq=[cached_lens[i] for i in batch_order],
         ),
         mapping=mapping,
+        sparse_attention_config=sparse_config,
     )
     attn_metadata.prepare()
 
@@ -694,9 +710,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     if num_contexts > 0:
         # Transform context indices from local to global
         ctx_topk_local = topk_indices_local[:num_ctx_tokens]
-        ctx_topk_global = local_to_global_indices(ctx_topk_local,
-                                                  ctx_indices,
-                                                  cache_offset_start=0)
 
         # Create expected global indices (sorted) for validation (not used but can be used for validation)
         expected_ctx_indices = create_causal_indices(ctx_indices,
@@ -720,9 +733,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         num_gen_tokens = sum(query_lens[i] for i in gen_indices)
         gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens]
-        gen_topk_global = local_to_global_indices(gen_topk_local,
-                                                  gen_indices,
-                                                  cache_offset_start=0)
 
         # Create expected global indices (sorted) for validation (not used but can be used for validation)
         expected_gen_indices = create_causal_indices(gen_indices,

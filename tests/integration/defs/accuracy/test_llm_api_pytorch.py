@@ -2329,30 +2329,31 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf"
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @skip_pre_blackwell # TODO: Hopper untested
+    @skip_pre_blackwell  # TODO: Hopper untested
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-         (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
-         (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
-         ],
-        ids=[
-            "baseline", "baseline_mtp1"
-        ])
-    def test_baseline_fp8gemm_bf16_kv(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
-                            attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size, moe_backend):
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
+        ],
+        ids=["baseline", "baseline_mtp1"])
+    def test_baseline_fp8gemm_bf16_kv(self, tp_size, pp_size, ep_size,
+                                      mtp_nextn, fp8kv, attention_dp,
+                                      cuda_graph, overlap_scheduler,
+                                      max_batch_size, moe_backend):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
             # TODO: Support block reuse for DeepSeek-V3.2
-            kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
+            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                            free_gpu_memory_fraction=0.6)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
             # TODO: Support block reuse for DeepSeek-V3.2
-            kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.7)
+            kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                            free_gpu_memory_fraction=0.7)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,

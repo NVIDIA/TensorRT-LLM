@@ -233,8 +233,8 @@ class DSASparseAttentionConfig(BaseSparseAttentionConfig):
         default=None, description="The number of heads for the indexer.")
     index_head_dim: Optional[int] = Field(
         default=None, description="The dimension of the indexer heads.")
-    index_topk: Optional[int] = Field(
-        default=None, description="The topk for the indexer.")
+    index_topk: Optional[int] = Field(default=None,
+                                      description="The topk for the indexer.")
     indexer_max_chunk_size: Optional[int] = Field(
         default=None, description="The maximum chunk size for the indexer.")
 

@@ -16,7 +16,8 @@ from ..attention_backend import (AttentionInputType, AttentionMetadata,
 from ..attention_backend.interface import (AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
-from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
+from ..attention_backend.sparse.dsa import (
+    DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -1657,7 +1658,7 @@ class MLA(nn.Module):
         """
         assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), \
             "DSA requires DSAtrtllmAttentionMetadata"
-        # Step 1: Append current tokens to paged cache and apply RoPE to q
+        # Append current tokens to paged cache and apply RoPE to q
         # This writes latent_cache to paged KV and modifies q in-place
         trtllm_attention = self.mqa
         with nvtx_range_debug(
@@ -1666,12 +1667,6 @@ class MLA(nn.Module):
             trtllm_attention.mla_rope_append_paged_kv_assign_q(
                 q, latent_cache, attn_metadata, is_generation=is_generation)
 
-        # Step 2: Load full latent cache from paged memory
-        with nvtx_range_debug(
-                f"load_paged_kv_cache_for_mla_is_generation={is_generation}"):
-            full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
-                attn_metadata, q.dtype, is_generation=is_generation)
-        full_latent_cache = torch.cat([full_compressed_kv, full_k_pe], dim=-1)
         num_tokens = q.shape[0]
         q_nope, q_rope = q.view(-1, self.num_heads, self.qk_head_dim).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1710,13 +1705,7 @@ class MLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
         q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
-        # Shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
 
-        # Step 2: Reshape inputs for sparse kernel
-        kv_c_and_k_pe_cache = full_latent_cache.view(
-            -1, 1, full_latent_cache.shape[-1])
-
-        # Step 3: Handle head padding (kernel requirement)
         sm_version = get_sm_version()
         # sm checking at runtime due to FlashMLA kernel limitation
         padding = 128 if sm_version >= 100 else 64  # kernel limitation to 128 for SM100 and 64 for SM90
@@ -1736,11 +1725,20 @@ class MLA(nn.Module):
             q_padded[:, :self.num_heads, :] = q_concat
             q_concat = q_padded
 
-        topk_indices = topk_indices.view(num_tokens, 1, -1)
+        # Convert indices and prepare KV pool
+        # Note: underlying pool is layer-interleaved: [num_blocks, num_layers, kv_factor, tokens_per_block, num_kv_heads, head_dim]
+        # stride_factor accounts for jumping over interleaved layers in memory
+        topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+            topk_indices,
+            attn_metadata,
+            attn_metadata.kv_cache_manager,
+            layer_idx=self.layer_idx,
+            is_generation=is_generation,
+        )
+        topk_indices_pool = topk_indices_pool.view(num_tokens, 1, -1)
         if flash_mla_sparse_fwd is not None:
-            attn_out_latent = flash_mla_sparse_fwd(q_concat,
-                                                   kv_c_and_k_pe_cache,
-                                                   topk_indices,
+            attn_out_latent = flash_mla_sparse_fwd(q_concat, kv_cache_pool,
+                                                   topk_indices_pool,
                                                    self.softmax_scale)[0]
         else:
             raise RuntimeError(
