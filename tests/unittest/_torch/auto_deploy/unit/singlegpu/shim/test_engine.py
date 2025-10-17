@@ -41,10 +41,8 @@ def get_inference_model(cache_seq_interface):
 
 
 @pytest.mark.parametrize("engine_cls", [ADEngine, DemoEngine])
-@pytest.mark.parametrize(
-    "attn_backend, attn_page_size", [("triton", 0), ("flashinfer", 2), ("torch", 0)]
-)
-def test_engine(engine_cls: Type[ADEngine], attn_backend: str, attn_page_size: int):
+@pytest.mark.parametrize("attn_page_size", [0, 2, 0])
+def test_engine(engine_cls: Type[ADEngine], attn_page_size: int):
     """Test the SimpleEngine functionality."""
 
     seed = 42  # Set random seed for model param init
