@@ -672,7 +672,8 @@ class BuildConfig:
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
-            plugin_config.update_from_dict(config["plugin_config"])
+            plugin_config = plugin_config.model_copy(
+                update=config["plugin_config"], deep=True)
 
         dry_run = config.pop('dry_run', defaults.get('dry_run'))
         visualize_network = config.pop('visualize_network',
