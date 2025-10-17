@@ -101,7 +101,7 @@ class BuilderConfig(object):
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
-            config['plugin_config'] = self.plugin_config.to_dict()
+            config['plugin_config'] = self.plugin_config.model_dump(mode="json")
         return config
 
 
@@ -672,7 +672,8 @@ class BuildConfig:
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
-            plugin_config.update_from_dict(config["plugin_config"])
+            plugin_config = plugin_config.model_copy(
+                update=config["plugin_config"], deep=True)
 
         dry_run = config.pop('dry_run', defaults.get('dry_run'))
         visualize_network = config.pop('visualize_network',
@@ -725,7 +726,7 @@ class BuildConfig:
         # the enum KVCacheType cannot be converted automatically
         if output.get('kv_cache_type', None) is not None:
             output['kv_cache_type'] = str(output['kv_cache_type'].name)
-        output['plugin_config'] = output['plugin_config'].to_dict()
+        output['plugin_config'] = output['plugin_config'].model_dump()
         output['lora_config'] = output['lora_config'].to_dict()
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )
