@@ -835,11 +835,13 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         }
         ctx_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": block_reuse
+            "enable_block_reuse": block_reuse,
+            "enable_partial_reuse": False,
         }
         gen_server_config["kv_cache_config"] = {
             "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": block_reuse
+            "enable_block_reuse": block_reuse,
+            "enable_partial_reuse": False,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
