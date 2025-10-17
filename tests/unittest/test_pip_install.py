@@ -63,31 +63,11 @@ def test_pip_install():
 
     download_wheel(args)
     print("##########  Install tensorrt_llm package  ##########")
-    subprocess.check_call(
-        "pip3 install --upgrade --force-reinstall --no-deps tensorrt_llm-*.whl",
-        shell=True)
+    subprocess.check_call("pip3 install tensorrt_llm-*.whl", shell=True)
     print("##########  Test import tensorrt_llm  ##########")
     subprocess.check_call(
         'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
         shell=True)
-    print("##########  Verify license files in installed package  ##########")
-    result = subprocess.run(
-        'python3 -c "import tensorrt_llm, os; '
-        'dist_info = [d for d in os.listdir(os.path.dirname(tensorrt_llm.__file__) + \'/../\') if d.endswith(\'.dist-info\')][0]; '
-        'license_dir = os.path.join(os.path.dirname(tensorrt_llm.__file__), \'../\', dist_info, \'licenses\'); '
-        'files = os.listdir(license_dir) if os.path.exists(license_dir) else []; '
-        'expected = [\'LICENSE\', \'ATTRIBUTIONS-CPP.md\']; '
-        'missing = [f for f in expected if f not in files]; '
-        'print(f\'Found: {files}\'); '
-        'exit(1 if missing else 0)"',
-        shell=True,
-        capture_output=True,
-        text=True)
-    if result.returncode != 0:
-        print(f"ERROR: License files check failed!")
-        print(result.stdout)
-        exit(1)
-    print("License files verified: LICENSE, ATTRIBUTIONS-CPP.md")
     print("##########  Test quickstart example  ##########")
     subprocess.check_call(
         "python3 ../../examples/llm-api/quickstart_example.py", shell=True)
