@@ -113,6 +113,7 @@ Optimize attention operations with different attention kernel implementations:
 
 | `"attn_backend"` | Description |
 |----------------------|-------------|
+| `torch`  | Custom fused multi-head attention (MHA) with KV Cache reference implementation in pure PyTorch (slow!) |
 | `triton` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
 | `flashinfer`         | Uses optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
