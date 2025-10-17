@@ -75,12 +75,39 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 
 // Type alias for multimodal hash key (hash array + start offset)
 using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
+
+//! \brief Split vector into list of blocks of given size.
+//! \param vec vector to split
+//! \param usableSize part of the vector that is processed
+//! \param elementsPerBlock desired size of blocks
+//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
+//! \return list of blocks
+template <typename T>
+std::list<std::vector<T>> chopVectorIntoBlocks(
+    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
+{
+    TLLM_CHECK_WITH_INFO(
+            usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
+    std::list<std::vector<T>> blockedVectors;
+    auto const vecEnd = vec.begin() + usableSize;
+    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
+    {
+        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
+        auto end = begin + blockSize;
+        if (blockSize == elementsPerBlock || allowPartial)
+        {
+            blockedVectors.emplace_back(begin, end);
+        }
+    }
+    return blockedVectors;
+}
 
 struct TempAttentionWindowInputs
 {
@@ -113,6 +140,9 @@ struct WindowSizeMetadata
     }
 };
 
+std::vector<MmKey> generateBlockHashExtraKeys(
+    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
+
 struct BlockKey
 {
     bool usesExtraIds = false;
@@ -122,6 +152,7 @@ struct BlockKey
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
+    std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
 
     BlockKey() = default;
 
@@ -136,24 +167,21 @@ struct BlockKey
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::vector<MmKey> extraKeys = {})
+        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
         : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
         , extraKeys{std::move(extraKeys)}
+        , cacheSaltID{cacheSaltID}
     {
     }
 
-    bool operator==(BlockKey const& other) const noexcept
-    {
-        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
-    }
+    bool operator==(BlockKey const& other) const noexcept;
 
     int partialMatch(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys)
+        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());

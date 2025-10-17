@@ -50,37 +50,48 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-//! \brief Split vector into list of blocks of given size.
-//! \param vec vector to split
-//! \param usableSize part of the vector that is processed
-//! \param elementsPerBlock desired size of blocks
-//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
-//! \return list of blocks
-template <typename T>
-std::list<std::vector<T>> chopVectorIntoBlocks(
-    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
-{
-    TLLM_CHECK_WITH_INFO(
-        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
-    std::list<std::vector<T>> blockedVectors;
-    auto const vecEnd = vec.begin() + usableSize;
-    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
-    {
-        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
-        auto end = begin + blockSize;
-        if (blockSize == elementsPerBlock || allowPartial)
-        {
-            blockedVectors.emplace_back(begin, end);
-        }
-    }
-    return blockedVectors;
-}
-
 inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
 }
 
+//! \brief Get all blocks in a sequence by traversing backwards from the last block.
+//! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
+//! \return Vector of BlockPtr-s in sequence order
+std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
+{
+    // First count the number of blocks to pre-allocate the vector
+    auto currentBlock = lastBlock;
+    size_t blockCount = 0;
+    while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+    {
+        blockCount++;
+        currentBlock = currentBlock->getPrevBlockInSeq();
+    }
+
+    if (blockCount == 0)
+    {
+        return {};
+    }
+    // Create and pre-allocate the vector with the correct size
+    std::vector<BlockPtr> sequenceBlocks(blockCount);
+
+    // Now traverse backwards and fill from the end
+    currentBlock = lastBlock;
+    size_t currentIndex = blockCount - 1;
+    while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+    {
+        sequenceBlocks[currentIndex--] = currentBlock;
+        currentBlock = currentBlock->getPrevBlockInSeq();
+    }
+
+    return sequenceBlocks;
+}
+
+} // namespace
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
 std::vector<MmKey> generateBlockHashExtraKeys(
     tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx)
 {
@@ -156,55 +167,10 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
-} // namespace
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+bool BlockKey::operator==(BlockKey const& other) const noexcept
 {
-//! \brief Print blockKey to output stream. Intended for debugging.
-std::ostream& operator<<(std::ostream& out, BlockKey const& blockKey) {
-    // Note: << operator requires friend declaration if it will print any protected or private members.
-    // BlockKey is a struct, not a class, hence it has only public members.
-    bool firstIteration = true;
-    for (auto uniqueToken : blockKey.uniqueTokens)
-    {
-	if (firstIteration)
-	{
-	    firstIteration = false;
-            out << "[";
-	}
-	else
-	{
-            out << " ";
-	}
-	if (blockKey.usesExtraIds)
-	{
-            out << "(" << uniqueToken.tokenId << "," << uniqueToken.tokenExtraId << ")";
-	}
-	else
-	{
-            out << uniqueToken.tokenId;
-	}
-    }
-    out << "]";
-    return out;
-}
-
-//! \brief Print vector of BlockKey to output stream. Intended for debugging.
-std::ostream& operator<<(std::ostream& out, std::vector<BlockKey> const& blockKeys) {
-    bool firstIteration = true;
-    for (auto const& blockKey : blockKeys)
-    {
-	if (firstIteration)
-	{
-	    firstIteration = false;
-	}
-	else
-	{
-            out << ", ";
-	}
-        out << blockKey;
-    }
-    return out;
+    return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
+        && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
 }
 
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
@@ -270,6 +236,53 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     }
 
     return seed;
+}
+
+//! \brief Print blockKey to output stream. Intended for debugging.
+std::ostream& operator<<(std::ostream& out, BlockKey const& blockKey) {
+    // Note: << operator requires friend declaration if it will print any protected or private members.
+    // BlockKey is a struct, not a class, hence it has only public members.
+    bool firstIteration = true;
+    for (auto uniqueToken : blockKey.uniqueTokens)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+            out << "[";
+	}
+	else
+	{
+            out << " ";
+	}
+	if (blockKey.usesExtraIds)
+	{
+            out << "(" << uniqueToken.tokenId << "," << uniqueToken.tokenExtraId << ")";
+	}
+	else
+	{
+            out << uniqueToken.tokenId;
+	}
+    }
+    out << "]";
+    return out;
+}
+
+//! \brief Print vector of BlockKey to output stream. Intended for debugging.
+std::ostream& operator<<(std::ostream& out, std::vector<BlockKey> const& blockKeys) {
+    bool firstIteration = true;
+    for (auto const& blockKey : blockKeys)
+    {
+	if (firstIteration)
+	{
+	    firstIteration = false;
+	}
+	else
+	{
+            out << ", ";
+	}
+        out << blockKey;
+    }
+    return out;
 }
 
 KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx, SizeType32 windowSize)
