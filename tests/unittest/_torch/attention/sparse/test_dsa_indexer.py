@@ -414,8 +414,10 @@ def _create_mock_metadata(request_ids,
                 device='cpu',
                 pin_memory=True,
             )
-            self.kv_cache_manager.copy_indexer_k_cache_offsets(
-                self.request_ids, self.host_indexer_k_cache_block_offsets)
+            block_ids = cache_manager.get_batch_cache_indices(request_ids)
+            for i in range(len(block_ids)):
+                self.host_indexer_k_cache_block_offsets[i, :len(block_ids[i])] = torch.tensor(
+                    block_ids[i], dtype=torch.int32)
             self.indexer_k_cache_block_offsets[:batch_size].copy_(
                 self.host_indexer_k_cache_block_offsets[:batch_size],
                 non_blocking=True)

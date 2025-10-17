@@ -270,8 +270,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
-    # 2. Intra-request: Split large requests into chunks if seq_len > max_chunk_size
-    indexer_max_chunk_size: int
+    # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
+    indexer_max_chunk_size = 128000  # Tunable
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -400,8 +400,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare(self):
         super().prepare()
         if self.kv_cache_manager is not None:
-            self.kv_cache_manager.copy_indexer_k_cache_offsets(
-                self.request_ids, self.host_indexer_k_cache_block_offsets)
+            block_ids = self.kv_cache_manager.get_batch_cache_indices(self.request_ids)
+            for i in range(len(block_ids)):
+                self.host_indexer_k_cache_block_offsets[i, :len(block_ids[i])].copy_(
+                    torch.tensor(block_ids[i], dtype=torch.int32, device='cpu'))
             self.indexer_k_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
@@ -1271,6 +1273,7 @@ class DSACacheManager(KVCacheManager):
         self.index_head_dim = sparse_attn_config.index_head_dim
         # Use a fixed tokens_per_block for indexer k cache due to DG kernel constraints
         self.indexer_k_cache_tokens_per_block = 64
+        assert self.indexer_k_cache_tokens_per_block == tokens_per_block, "tokens_per_block must be set to 64 for DeepSeek v3.2"
 
         super().__init__(
             kv_cache_config,
@@ -1288,27 +1291,20 @@ class DSACacheManager(KVCacheManager):
             max_num_tokens=max_num_tokens,
             model_config=model_config,
             max_beam_width=max_beam_width,
+            enable_indexer_k_cache=True,
+            indexer_k_cache_quant_block_size=128,
+            indexer_k_cache_index_head_dim=self.index_head_dim,
             **kwargs,
         )
-
         self.num_blocks = self.blocks_in_primary_pool
-
-        # Block manager to manage the indexer k cache blocks for each request. Different layers share the
-        # same block ids.
-        self.indexer_k_cache_manager = BlockManager(
-            self.num_blocks, self.indexer_k_cache_tokens_per_block)
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.indexer_k_cache_tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
         # Store FP8-quantized k values from the indexer
-        scale_size = self.index_head_dim // self.quant_block_size * 4
         self.indexer_k_cache_pool_per_layer = [
-            torch.empty(
-                (self.num_blocks, self.indexer_k_cache_tokens_per_block *
-                 (self.index_head_dim + scale_size)),
-                device="cuda",
-                dtype=torch.uint8) for _ in range(self.num_local_layers)
+            self.get_indexer_k_cache_pool_data(layer_idx)
+            for layer_idx in range(self.num_local_layers)
         ]
 
     def add_dummy_requests(
@@ -1332,29 +1328,12 @@ class DSACacheManager(KVCacheManager):
             max_beam_width=max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
         )
-        if prepare_resource:
-            for req in requests:
-                request_id = req.py_request_id
-                self.indexer_k_cache_manager.add_tokens(request_id,
-                                                        req.max_beam_num_tokens)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, self.num_extra_kv_tokens)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, num_extra_decoding_steps)
-                if is_gen:
-                    self.indexer_k_cache_manager.add_tokens(
-                        request_id, max_num_draft_tokens)
         return requests
 
-    def copy_indexer_k_cache_offsets(
-            self, request_ids: List[int],
-            block_offsets: torch.Tensor) -> torch.Tensor:
-        self.indexer_k_cache_manager.copy_block_offsets(request_ids,
-                                                        block_offsets)
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
-        block_size = self.indexer_k_cache_manager.tokens_per_block
+        block_size = self.tokens_per_block
         per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
@@ -1365,44 +1344,12 @@ class DSACacheManager(KVCacheManager):
         Prepare resources for both low rank cache and indexer K cache.
         """
         super().prepare_resources(scheduled_batch)
-        context_batch = scheduled_batch.context_requests
-        generation_batch = scheduled_batch.generation_requests
 
-        # Allocate blocks for context requests
-        for req in context_batch:
-            request_id = req.py_request_id
-            if req.is_first_context_chunk:
-                self.indexer_k_cache_manager.add_tokens(request_id,
-                                                        req.prompt_len)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, self.num_extra_kv_tokens)
-                self.indexer_k_cache_manager.add_tokens(
-                    request_id, get_draft_token_length(req))
-
-        # Allocate blocks for generation requests
-        for req in generation_batch:
-            request_id = req.py_request_id
-            self.indexer_k_cache_manager.add_tokens(request_id, 1)
-            self.indexer_k_cache_manager.add_tokens(request_id,
-                                                    get_draft_token_length(req))
-
-        # TODO: Support beam search, current assume beam_width=1
-
-    def update_resources(self,
-                         scheduled_batch,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
-        super().update_resources(scheduled_batch, attn_metadata,
-                                 kv_cache_dtype_byte_size)
-        # rewind indexer k cache
-        for req in scheduled_batch.generation_requests:
-            if req.state != LlmRequestState.GENERATION_COMPLETE and req.py_rewind_len > 0:
-                self.indexer_k_cache_manager.rewind_cache(
-                    req, req.py_rewind_len)
+    def update_resources(self, scheduled_batch):
+        super().update_resources(scheduled_batch)
 
     def free_resources(self, request):
         super().free_resources(request)
-        self.indexer_k_cache_manager.free_resources(request)
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,

@@ -67,7 +67,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 29);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 30);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -223,6 +223,11 @@ public:
     tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override
     {
         NB_OVERRIDE_PURE(getPrimaryPool, layer_idx);
+    }
+
+    tensorrt_llm::runtime::ITensor::SharedPtr getIndexerKCachePool() const override
+    {
+        NB_OVERRIDE_PURE(getIndexerKCachePool);
     }
 
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
@@ -409,6 +414,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_indexer_k_cache_pool_data",
+            [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
+            {
+                auto pool = tr::Torch::tensor(self.getIndexerKCachePool());
+                return pool.index({torch::indexing::Slice(), layer_idx});
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -492,7 +505,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
@@ -501,6 +514,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
+            nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
+            nb::arg("indexer_k_cache_index_head_dim") = 0,
             nb::call_guard<nb::gil_scoped_release>());
 }
 
