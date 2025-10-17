@@ -9,7 +9,13 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import AutoModelForCausalLM
 
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.auto_deploy.models.patches.bamba import _bamba_mixer_torch_forward
+
+# from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+# Remove this patch after TRT-LLM upgrades to the HF transformers version >= 4.57
+# NemotronHConfig.base_model_tp_plan["layers.*.mlp.c_proj"] = "rowwise"
 
 
 # Forked from:
@@ -79,13 +85,41 @@ def _nemotron_h_block_forward(
         elif self.block_type == "attention":
             hidden_states = self.mixer(hidden_states, cache_position=cache_position)
             hidden_states = hidden_states[0]
-        elif self.block_type == "mlp":
+        elif self.block_type in ["mlp", "moe"]:
             hidden_states = self.mixer(hidden_states)
         else:
             raise ValueError(f"Invalid block_type: {self.block_type}")
 
         hidden_states = residual + hidden_states
         return hidden_states
+
+
+# TODO: we assume experts have no bias for now
+def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
+    """
+    Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe_nemo
+    with act_fn='relu2'. Falls back to original forward if any expert has bias.
+    """
+
+    residuals = hidden_states
+    orig_shape = hidden_states.shape
+    topk_indices, topk_weights = self.gate(hidden_states)
+    x_flat = hidden_states.view(-1, hidden_states.shape[-1])
+
+    out_flat = torch.ops.auto_deploy.torch_moe(
+        x_flat,
+        topk_indices,
+        topk_weights,
+        w1_weight=[e.up_proj.weight for e in self.experts],
+        w2_weight=[e.down_proj.weight for e in self.experts],
+        w3_weight=[],
+        act_fn="relu2",
+        mlp_style="mlp",
+    )
+
+    out = out_flat.view(*orig_shape)
+    out = out + self.shared_experts(residuals)
+    return out
 
 
 _from_config_original = AutoModelForCausalLM.from_config
@@ -97,6 +131,7 @@ CUSTOM_MODULE_PATCHES: Dict[str, List[Tuple[str, Callable]]] = {
         ("_update_mamba_mask", _nemotron_h_model_update_mamba_mask),
     ],
     "NemotronHBlock": [("forward", _nemotron_h_block_forward)],
+    "NemotronHMOE": [("forward", _nemotron_h_moe_forward)],
 }
 
 
@@ -111,6 +146,18 @@ def get_model_from_config_patched(config, **kwargs):
 
     return model
 
+
+def _set_sharding_config_patched(self, *args, **kwargs):
+    self._sharding_config["head_dim"] = 128
+    self._sharding_config["tp_plan"] = {
+        "in_proj": "colwise_fused[21504,21504,512,512,32]",
+        "conv1d": "colwise_fused[21504,512,512]",
+        "out_proj": "rowwise",
+        "*": "gather",
+    }
+
+
+AutoModelForCausalLMFactory._set_sharding_config = _set_sharding_config_patched
 
 # TODO: figure out how this can be incorporated into the export patch system
 AutoModelForCausalLM.from_config = get_model_from_config_patched

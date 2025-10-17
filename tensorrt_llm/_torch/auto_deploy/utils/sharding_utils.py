@@ -248,6 +248,8 @@ class TPShardingInfo(ShardingTransformInfo):
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
     min_local_shape: int = 1
+    # used for TP sharding of fused weights
+    fused_weights: Optional[list]
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "TPShardingInfo":
