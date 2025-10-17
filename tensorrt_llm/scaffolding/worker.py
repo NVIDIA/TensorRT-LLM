@@ -153,6 +153,9 @@ class TRTLLMWorker(Worker):
         disable_overlap_scheduler: bool = False,
         scheduler_config: Optional[SchedulerConfig] = None,
     ):
+        if scheduler_config is None:
+            scheduler_config = SchedulerConfig()
+
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
 

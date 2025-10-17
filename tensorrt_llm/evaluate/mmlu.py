@@ -21,6 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import json
 # Not a contribution
 # Changes made by NVIDIA CORPORATION & AFFILIATES or otherwise documented as
 # NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
@@ -34,7 +35,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 import math
-from typing import Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 
 import click
 import numpy as np
@@ -137,10 +138,12 @@ class MMLU(Evaluator):
                  num_fewshot: int = 5,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None):
+                 system_prompt: Optional[str] = None,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None):
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
         if dataset_path is None:
             dataset_path = self.dowload_dataset()
         self.dataset_path = dataset_path
@@ -296,6 +299,13 @@ class MMLU(Evaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -314,6 +324,7 @@ class MMLU(Evaluator):
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
                 num_fewshot: int, random_seed: int, apply_chat_template: bool,
+                chat_template_kwargs: Optional[dict[str, Any]],
                 system_prompt: Optional[str], max_input_length: int,
                 max_output_length: int, check_accuracy: bool,
                 accuracy_threshold: float) -> None:
@@ -326,7 +337,8 @@ class MMLU(Evaluator):
                          num_fewshot=num_fewshot,
                          random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
+                         system_prompt=system_prompt,
+                         chat_template_kwargs=chat_template_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
 

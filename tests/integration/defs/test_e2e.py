@@ -31,9 +31,10 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
                      venv_check_call)
-from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                       skip_pre_hopper, tests_path, unittest_path)
+from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
+                       skip_nvlink_inactive, skip_post_blackwell, skip_pre_ada,
+                       skip_pre_blackwell, skip_pre_hopper, tests_path,
+                       unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -1762,8 +1763,10 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("gen_config", ["gen_tp2pp1", "gen_tp1pp2"])
-@pytest.mark.parametrize("ctx_config", ["ctx_tp2pp1", "ctx_tp1pp2"])
+@pytest.mark.parametrize("gen_config",
+                         ["gen_tp2pp1", "gen_tp1pp2", "gen_tp1pp1"])
+@pytest.mark.parametrize("ctx_config",
+                         ["ctx_tp2pp1", "ctx_tp1pp2", "ctx_tp1pp1"])
 def test_openai_disagg_multi_nodes_completion(llm_root, llm_venv, ctx_config,
                                               gen_config):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1853,9 +1856,10 @@ def test_ptp_quickstart(llm_root, llm_venv):
         'Qwen3-30B-A3B_nvfp4_hf',
         'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
         marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
-    pytest.param('Llama3.3-70B-FP8',
-                 'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
-                 marks=skip_pre_blackwell),
+    pytest.param(
+        'Llama3.3-70B-FP8',
+        'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8',
+        marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(96000))),
     pytest.param('Llama3.3-70B-FP4',
                  'modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4',
                  marks=skip_pre_blackwell),
@@ -2261,35 +2265,41 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("model_name,model_path", [
-    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
-    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1"),
+@pytest.mark.parametrize("model_name,model_path,gpu_count", [
+    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 2),
+    ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
+                 2,
                  marks=skip_pre_hopper),
     pytest.param('Llama3.1-405B-FP8',
                  'llama-3.1-model/Llama-3.1-405B-Instruct-FP8',
+                 8,
                  marks=(skip_pre_hopper, pytest.mark.timeout(7200))),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
+                 8,
                  marks=skip_pre_blackwell),
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 8,
                  marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
     pytest.param('DeepSeek-V3-671B-FP8',
                  'DeepSeek-V3-0324',
+                 8,
                  marks=(skip_post_blackwell,
-                        pytest.mark.skip_less_device_memory(90000))),
+                        pytest.mark.skip_less_device_memory(140000))),
 ])
-def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
-                                       model_path):
+def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
+                                            model_path, gpu_count):
     print(f"Testing {model_name}.")
+    if gpu_count > get_device_count():
+        pytest.skip(f"Not enough GPUs for {model_name}")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     mapping = {
-        "Llama3.1-70B-BF16": 21.0,
+        "Llama3.1-70B-BF16": 91.0,
         "Mixtral-8x7B-BF16": 16.5,
-        "Llama3.1-70B-FP8": 14.9,
+        "Llama3.1-70B-FP8": 58.5,
         "Llama3.1-405B-FP8": 63.2,
         "Mixtral-8x7B-NVFP4": 9.9,
         "Nemotron-Ultra-253B": 72.3,
@@ -2305,13 +2315,14 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             "--enable_chunked_prefill",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
-            "--tp_size=8",
+            f"--tp_size={gpu_count}",
             "--max_batch_size=32",
             "--max_num_tokens=256",
         ],
                          stdout=running_log)
         if model_name in mapping:
-            _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
+            _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0],
+                             gpu_count)
 
 
 @skip_pre_hopper

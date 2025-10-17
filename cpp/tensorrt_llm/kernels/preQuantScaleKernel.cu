@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/kernels/moe_utils.cuh"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 
 namespace tensorrt_llm
@@ -41,7 +42,7 @@ struct Vec2Type<__nv_bfloat16>
 
 template <typename T_in, typename T_out, int kProcessRows, typename AccessType>
 __global__ void apply_per_channel_scale(T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows,
-    int cols, int64_t const* num_valid_tokens_ptr)
+    int cols, int64_t const* num_valid_tokens_ptr, int64_t* expert_first_token_offset, int const num_experts_per_node)
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     T_in scale[kElems], act_vec[kElems];
@@ -53,11 +54,19 @@ __global__ void apply_per_channel_scale(T_out* smoothed_act, T_in const* act, T_
         return;
     act += row_offset * kProcessRows * cols;
     smoothed_act += row_offset * kProcessRows * cols;
-    *reinterpret_cast<AccessType*>(scale) = reinterpret_cast<AccessType const*>(per_channel_scale)[col_offset];
 #pragma unroll
     for (int i = 0; i < kProcessRows; ++i)
     {
         *reinterpret_cast<AccessType*>(act_vec) = reinterpret_cast<AccessType const*>(act + i * cols)[col_offset];
+        int expert = 0;
+        if (expert_first_token_offset != nullptr)
+        {
+            expert = findTotalEltsLessThanTarget(
+                         expert_first_token_offset, num_experts_per_node, (int64_t) row_offset * kProcessRows + i + 1)
+                - 1;
+        }
+        *reinterpret_cast<AccessType*>(scale)
+            = reinterpret_cast<AccessType const*>(per_channel_scale)[expert * cols / kElems + col_offset];
         if constexpr ((std::is_same_v<T_in, half>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
                           || std::is_same_v<T_in, __nv_bfloat16>
@@ -98,13 +107,14 @@ __global__ void apply_per_channel_scale(T_out* smoothed_act, T_in const* act, T_
 
 template <typename T_in, typename T_out, int kProcessRows, typename AccessType = float4>
 void apply_per_channel_scale_kernel_launcher_(T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale,
-    int rows, int cols, int64_t const* num_valid_tokens_ptr = nullptr, cudaStream_t stream = 0)
+    int rows, int cols, int64_t const* num_valid_tokens_ptr = nullptr, cudaStream_t stream = 0,
+    int64_t* expert_first_token_offset = nullptr, int const num_experts_per_node = 0)
 {
     static constexpr int kElems = sizeof(AccessType) / sizeof(T_in);
     dim3 block(128);
     dim3 grid((rows + kProcessRows - 1) / kProcessRows, (cols / kElems + block.x - 1) / block.x);
-    apply_per_channel_scale<T_in, T_out, kProcessRows, AccessType>
-        <<<grid, block, 0, stream>>>(smoothed_act, act, per_channel_scale, rows, cols, num_valid_tokens_ptr);
+    apply_per_channel_scale<T_in, T_out, kProcessRows, AccessType><<<grid, block, 0, stream>>>(smoothed_act, act,
+        per_channel_scale, rows, cols, num_valid_tokens_ptr, expert_first_token_offset, num_experts_per_node);
 }
 
 template <typename T_in, typename T_out>
@@ -134,6 +144,34 @@ void apply_per_channel_scale_kernel_launcher(T_out* smoothed_act, T_in const* ac
     }
 }
 
+template <typename T_in, typename T_out>
+void apply_per_channel_scale_per_expert_kernel_launcher(T_out* smoothed_act, T_in const* act,
+    T_in const* per_channel_scale, int rows, int cols, int64_t* expert_first_token_offset,
+    int const num_experts_per_node, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
+{
+    uint64_t elems = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+    if (elems < 2048 * 2048)
+    {
+        apply_per_channel_scale_kernel_launcher_<T_in, T_out, 1, float4>(smoothed_act, act, per_channel_scale, rows,
+            cols, num_valid_tokens_ptr, stream, expert_first_token_offset, num_experts_per_node);
+    }
+    else if (elems < 4096 * 4096)
+    {
+        apply_per_channel_scale_kernel_launcher_<T_in, T_out, 4, float4>(smoothed_act, act, per_channel_scale, rows,
+            cols, num_valid_tokens_ptr, stream, expert_first_token_offset, num_experts_per_node);
+    }
+    else if (elems < 8192 * 8192)
+    {
+        apply_per_channel_scale_kernel_launcher_<T_in, T_out, 8, float4>(smoothed_act, act, per_channel_scale, rows,
+            cols, num_valid_tokens_ptr, stream, expert_first_token_offset, num_experts_per_node);
+    }
+    else
+    {
+        apply_per_channel_scale_kernel_launcher_<T_in, T_out, 16, float4>(smoothed_act, act, per_channel_scale, rows,
+            cols, num_valid_tokens_ptr, stream, expert_first_token_offset, num_experts_per_node);
+    }
+}
+
 #define INSTANTIATE_PREQUANT_SCALE(T_in, T_out)                                                                        \
     template void apply_per_channel_scale_kernel_launcher<T_in, T_out>(T_out * smoothed_act, const T_in* act,          \
         const T_in* per_channel_scale, int rows, int cols, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
@@ -147,6 +185,23 @@ INSTANTIATE_PREQUANT_SCALE(half, __nv_fp8_e4m3);
 INSTANTIATE_PREQUANT_SCALE(__nv_bfloat16, __nv_bfloat16);
 #if defined(ENABLE_FP8)
 INSTANTIATE_PREQUANT_SCALE(__nv_bfloat16, __nv_fp8_e4m3);
+#endif
+#endif
+
+#define INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(T_in, T_out)                                                             \
+    template void apply_per_channel_scale_per_expert_kernel_launcher<T_in, T_out>(T_out * smoothed_act,                \
+        const T_in* act, const T_in* per_channel_scale, int rows, int cols, int64_t* expert_first_token_offset,        \
+        int const num_experts_per_node, int64_t const* num_valid_tokens_ptr, cudaStream_t stream)
+
+INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(half, half);
+#if defined(ENABLE_FP8)
+INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(half, __nv_fp8_e4m3);
+#endif
+
+#if defined(ENABLE_BF16)
+INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(__nv_bfloat16, __nv_bfloat16);
+#if defined(ENABLE_FP8)
+INSTANTIATE_PREQUANT_SCALE_PER_EXPERT(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
 #endif
 

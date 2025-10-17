@@ -692,11 +692,10 @@ class MultimodalModelRunner:
 
         # Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.
         if self.model_type == "phi-4-multimodal":
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.hf_model_dir,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                device_map='cpu')
+            model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
+                                                         dtype=torch.float16,
+                                                         trust_remote_code=True,
+                                                         device_map='cpu')
             self.vision_model = model.model.embed_tokens_extend.image_embed.to(
                 self.device).eval()
             self.image_newlines = {}
@@ -707,11 +706,10 @@ class MultimodalModelRunner:
             return
 
         if self.model_type == "phi-3-vision":
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.hf_model_dir,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                device_map='cpu')
+            model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
+                                                         dtype=torch.float16,
+                                                         trust_remote_code=True,
+                                                         device_map='cpu')
             self.vision_model = model.model.vision_embed_tokens.to(
                 self.device).eval()
 
@@ -765,7 +763,7 @@ class MultimodalModelRunner:
     def init_audio_encoder(self):
         assert self.model_type == "phi-4-multimodal"
         model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
-                                                     torch_dtype=torch.float16,
+                                                     dtype=torch.float16,
                                                      trust_remote_code=True,
                                                      device_map='cpu')
         self.audio_model = model.model.embed_tokens_extend.audio_embed.to(
@@ -859,7 +857,7 @@ class MultimodalModelRunner:
 
         from transformers import CLIPImageProcessor
         processor = CLIPImageProcessor.from_pretrained(
-            "openai/clip-vit-large-patch14", torch_dtype=torch.bfloat16)
+            "openai/clip-vit-large-patch14", dtype=torch.bfloat16)
         frames = processor.preprocess(frames,
                                       return_tensors="pt")['pixel_values']
         # make dtype consistent with vision encoder

@@ -221,3 +221,5 @@ GPT-OSS/MXFP4:
     accuracy: 90.3
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36
+ByteDance-Seed/Seed-OSS-36B-Instruct:
+  - accuracy: 90.8

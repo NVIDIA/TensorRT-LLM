@@ -210,7 +210,11 @@ CacheTransBufferManager::CacheTransBufferManager(
         {
             auto poolIdx = mCacheManager->getBlockManager().getLayerPoolIdx(layerId);
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
-            auto validTokenNum = (windowSize < maxNumTokens.value() ? windowSize : maxNumTokens.value());
+            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            // if windowSize % (tokensPerBlock) !=0
+            validTokenNum += tokensPerBlock; // add one more block
+
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
         }
     }
@@ -237,7 +241,7 @@ CacheTransBufferManager::CacheTransBufferManager(
     allocateBuffer();
 }
 
-size_t CacheTransBufferManager::preAllocBufferSize(
+size_t CacheTransBufferManager::preAllocBufferSize(size_t tokensPerBlock,
     std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
     std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig)
 {
@@ -256,9 +260,9 @@ size_t CacheTransBufferManager::preAllocBufferSize(
         TransferBufferSize = 0;
         for (auto const& [windowSize, cacheSizeBytesPerToken] : cacheSizeBytesPerTokenPerWindow)
         {
-            auto validTokenNum
-                = (static_cast<size_t>(windowSize) < maxNumTokens.value() ? static_cast<size_t>(windowSize)
-                                                                          : maxNumTokens.value());
+            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            validTokenNum += tokensPerBlock; // add one more block
             TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }

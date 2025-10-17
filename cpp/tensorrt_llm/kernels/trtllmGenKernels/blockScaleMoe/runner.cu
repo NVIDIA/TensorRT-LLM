@@ -44,7 +44,10 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
     {
         ++out;
     }
-    TLLM_CHECK_WITH_INFO((1 << out) == val, "Expected %s to be a power of 2, got %d", name.c_str(), val);
+    if ((1 << out) != val)
+    {
+        out = -1;
+    }
     return out;
 }
 } // namespace
@@ -95,6 +98,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLimitedGroups = topkGroup;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -141,6 +145,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mNumLimitedGroups =topkGroup;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -189,6 +194,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumExperts = numExperts;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
