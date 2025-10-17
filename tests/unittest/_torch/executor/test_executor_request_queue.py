@@ -325,8 +325,8 @@ def test_get_from_waiting_queue_edge_cases(executor_queue, queue_size,
     assert len(executor_queue.waiting_queue) == expected_remaining
 
 
-def test_validate_and_filter_requests(executor_queue):
-    """Test request validation and filtering."""
+def test_handle_special_queue_items(executor_queue):
+    """Test special queue item handling."""
     # Create a mock request without sampling_config to avoid beam validation
     mock_request = Mock()
     delattr(mock_request, 'sampling_config') if hasattr(
@@ -338,7 +338,7 @@ def test_validate_and_filter_requests(executor_queue):
 
     requests = [normal_req, cancel_req, shutdown_req]
 
-    valid_requests = executor_queue._validate_and_filter_requests(requests)
+    valid_requests = executor_queue._handle_special_queue_items(requests)
 
     assert len(valid_requests) == 1
     assert valid_requests[0] == normal_req

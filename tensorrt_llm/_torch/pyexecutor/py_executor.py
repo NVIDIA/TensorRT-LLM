@@ -1313,6 +1313,16 @@ class PyExecutor:
         )
 
     def _validate_request(self, request: LlmRequest):
+        # Validate beam width
+        sampling_config = getattr(request, 'sampling_config', None)
+        if sampling_config is not None:
+            if sampling_config.beam_width != self.max_beam_width:
+                raise ValueError(
+                    f"Request beam width {sampling_config.beam_width} "
+                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
+                )
+
+        # Check token ID ranges
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
             # Only skip token‐range checks for Llama4 when the request has multimodal data
             from ..models.modeling_llama import Llama4ForConditionalGeneration
