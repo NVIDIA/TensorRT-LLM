@@ -346,12 +346,6 @@ bool KVCacheBlock::hasSchedulingRefs() const
     return mSchedulingRefCount > 0;
 }
 
-void KVCacheBlock::clearBlockKey()
-{
-    mBlockKey = BlockKey();
-    mIsFull = false;
-}
-
 void KVCacheBlock::setBlockKey(BlockKey const& blockKey, bool isFull)
 {
     mBlockKey = blockKey;
@@ -437,24 +431,25 @@ bool KVCacheBlock::isFull() const
     return mIsFull;
 }
 
-void KVCacheBlock::setLookupNode(LookupNodePtr lookupNode, BlockPtr block)
+void KVCacheBlock::attachToLookupNode(LookupNodePtr lookupNode, BlockPtr block)
 {
-    if (lookupNode != nullptr)
+    TLLM_CHECK_WITH_INFO(lookupNode != nullptr && block != nullptr, "lookupNode and block arguments cannot be nullptr");
+    TLLM_CHECK_WITH_INFO(getBlockId() == block->getBlockId(), "blockIds differ");
+    mLookupNode = lookupNode;
+    lookupNode->setBlock(mWindowSize, block);
+    mBlockKey = lookupNode->getBlockKey();
+    mIsFull = lookupNode->isFull();
+}
+
+void KVCacheBlock::detachFromLookupNode()
+{
+    if (mLookupNode != nullptr)
     {
-	TLLM_CHECK_WITH_INFO(getBlockId() == block->getBlockId(), "blockIds differ");
-        mLookupNode = lookupNode;
-        lookupNode->setBlock(mWindowSize, block);
-        mBlockKey = lookupNode->getBlockKey();
+        mLookupNode->setBlock(mWindowSize, nullptr);
     }
-    else
-    {
-        if (mLookupNode != nullptr)
-        {
-            mLookupNode->setBlock(mWindowSize, nullptr);
-        }
-        mLookupNode = nullptr;
-        mBlockKey = BlockKey();
-    }
+    mLookupNode = nullptr;
+    mBlockKey = BlockKey();
+    mIsFull = false;
 }
 
 LookupNodePtr KVCacheBlock::getLookupNode() const
@@ -1368,8 +1363,7 @@ BlockPtr WindowBlockManager::getFreeBlock(
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
     // Detach block from search structure
-    block->setLookupNode(nullptr, nullptr);
-    block->clearBlockKey();
+    block->detachFromLookupNode();
 
     return block;
 }
@@ -1538,7 +1532,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                     mEvictionPolicy->claimBlock(
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
 		    // Free block from search structure
-		    matchingBlock->setLookupNode(nullptr, nullptr);
+		    matchingBlock->detachFromLookupNode();
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
                 }
@@ -1809,7 +1803,7 @@ void WindowBlockManager::storeBlocks(
 	    block->setBlockKey(matchedNode->getBlockKey(), matchedNode->isFull());
             block->setPrevBlockInSeq(prevBlock);
             block->setHash(); // TODO: Why this is necessary? Can it be replaced with hash from matchedNode?
-            block->setLookupNode(matchedNode, block);
+            block->attachToLookupNode(matchedNode, block);
             matchedNode->setBlock(mWindowSize, block);
             storedBlocks.push_back(block);
         }

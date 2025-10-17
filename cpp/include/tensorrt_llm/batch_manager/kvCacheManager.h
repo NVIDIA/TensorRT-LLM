@@ -354,7 +354,6 @@ public:
     // This info is duplicated in KVCacheBlock and KVCachePromptLookupNode
     // because it is needed by the former when KVCacheBlock might not be stored
     // in lookup structure and therefore cannot get this value from there
-    void clearBlockKey();
     void setBlockKey(BlockKey const& blockKey, bool isFull);
     BlockKey getBlockKey() const;
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
@@ -387,8 +386,11 @@ public:
 
     size_t getHash() const;
 
-    // set lookup node using this block
-    void setLookupNode(LookupNodePtr node, BlockPtr block);
+    // attach to lookup node (register block for reuse)
+    void attachToLookupNode(LookupNodePtr lookupNode, BlockPtr block);
+
+    // detach from lookup node (unregister block for reuse)
+    void detachFromLookupNode();
 
     // get lookup node using this block. Can be nullptr
     [[nodiscard]] LookupNodePtr getLookupNode() const;
