@@ -206,7 +206,16 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     for (int ii = 0; ii < ExpertsPerThread; ++ii)
     {
         auto count = getBits(expertCount, ii);
-        numCta += divUpLog2<int32_t>(count, params.mPaddingLog2);
+        int32_t num;
+        if constexpr (KernelParams::isPow2)
+        {
+            num = divUpLog2<int32_t>(count, params.mPaddingLog2);
+        }
+        else
+        {
+            num = divUpTileN<int32_t>(count, params.mTileTokensDim);
+        }
+        numCta += num;
     }
     // second, we perform the exclusive sum across the warp
     int32_t ctaOffset;
@@ -220,16 +229,34 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     for (int ii = 0; ii < ExpertsPerThread; ++ii)
     {
         auto count = getBits(expertCount, ii);
-        auto finalNumCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+        int32_t finalNumCta;
+        if constexpr (KernelParams::isPow2)
+        {
+            finalNumCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+        }
+        else
+        {
+            finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+        }
         auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
         // during the scan for expert offsets, we can already write out
         // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
         for (int cta = 0; cta < finalNumCta; ++cta)
         {
             params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = expertIdx;
-            params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta]
-                = min(mulLog2<int32_t>(ctaOffsetExp + cta + 1, params.mPaddingLog2),
-                    mulLog2<int32_t>(ctaOffsetExp, params.mPaddingLog2) + count);
+            int32_t mnLimit1;
+            int32_t mnLimit2;
+            if constexpr (KernelParams::isPow2)
+            {
+                mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, params.mPaddingLog2);
+                mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, params.mPaddingLog2) + count;
+            }
+            else
+            {
+                mnLimit1 = mulTileN<int32_t>(ctaOffsetExp + cta + 1, params.mTileTokensDim);
+                mnLimit2 = mulTileN<int32_t>(ctaOffsetExp, params.mTileTokensDim) + count;
+            }
+            params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
         }
         ctaOffsetExp += finalNumCta;
     }
@@ -237,7 +264,16 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // at this point, we can write out padded count from the warp-aggregate
     if (cute::elect_one_sync())
     {
-        const int32_t permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        int32_t permutedIdxSize;
+        if constexpr (KernelParams::isPow2)
+        {
+            permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        }
+        else
+        {
+            permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+        }
+
         params.mPtrPermutedIdxSize[0] = permutedIdxSize;
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
     }
@@ -257,12 +293,27 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // of registers
     auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
     int32_t finalExpertOffset[ExpertsPerThread];
-    finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+    if constexpr (KernelParams::isPow2)
+    {
+        finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+    }
+    else
+    {
+        finalExpertOffset[0] = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+    }
 #pragma unroll
     for (int ii = 1; ii < ExpertsPerThread; ++ii)
     {
-        finalExpertOffset[ii]
-            = finalExpertOffset[ii - 1] + divUpMulLog2<int32_t>(getBits(expertCount, ii - 1), params.mPaddingLog2);
+        int32_t tmp;
+        if constexpr (KernelParams::isPow2)
+        {
+            tmp = divUpMulLog2<int32_t>(getBits(expertCount, ii - 1), params.mPaddingLog2);
+        }
+        else
+        {
+            tmp = divUpMulTileN<int32_t>(getBits(expertCount, ii - 1), params.mTileTokensDim);
+        }
+        finalExpertOffset[ii] = finalExpertOffset[ii - 1] + tmp;
     }
 
 #pragma unroll
@@ -491,7 +542,6 @@ void run(Data const& data, void* stream)
     static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-    TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
 
     bool const useSingleWarp = (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens)
         || data.mNumTokens < WarpKernelMaxNumTokens;

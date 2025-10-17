@@ -39,7 +39,8 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     auto const numTokens = param.numTokens;
     auto const numExperts = param.numExperts;
     auto const topK = param.topK;
-    auto const paddingLog2 = param.paddingLog2;
+    // auto const paddingLog2 = param.paddingLog2;
+    auto const tileTokensDim = param.tileTokensDim;
     auto const localExpertsStartIdx = param.localExpertsStartIdx;
     auto const localExpertsStrideLog2 = param.localExpertsStrideLog2;
     auto const numLocalExperts = param.numLocalExperts;
@@ -66,7 +67,8 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     mPtrExpandedIdxToPermutedIdxDevice
         = mBufferManager->gpu(ITensor::makeShape({expIdxToPermIdxSize}), nvinfer1::DataType::kINT32);
 
-    int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts << paddingLog2) - numExperts);
+    // int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts << paddingLog2) - numExperts);
+    int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts * tileTokensDim) - numExperts);
     mPtrPermutedIdxToTokenIdxHost
         = mBufferManager->pinned(ITensor::makeShape({permIdxToTokenIdxSize}), nvinfer1::DataType::kINT32);
     mPtrPermutedIdxToTokenIdxDevice
@@ -168,14 +170,14 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
         }
     }
 
-    // Calculate prefix sum of expert counts, padded to power of 2 boundary if hostData.mPaddingLog2
+    // Calculate prefix sum of expert counts, padded to tileTokensDim
     for (int ie = 0; ie < param.numExperts; ++ie)
     {
-        // expertScanCounts stores cumulative sum of padded token counts per expert
-        expertScanCountsHostPtr[ie + 1]
-            = expertScanCountsHostPtr[ie] + divUpMulLog2(expertCountsHostPtr[ie], param.paddingLog2);
-        // ctaScanCounts stores cumulative sum of number of CTAs needed per expert
-        ctaScanCountsHostPtr[ie + 1] = ctaScanCountsHostPtr[ie] + divUpLog2(expertCountsHostPtr[ie], param.paddingLog2);
+        int32_t tmp;
+        tmp = divUpMulTileN<int32_t>(expertCountsHostPtr[ie], param.tileTokensDim);
+        expertScanCountsHostPtr[ie + 1] = expertScanCountsHostPtr[ie] + tmp;
+        tmp = divUpTileN(expertCountsHostPtr[ie], param.tileTokensDim);
+        ctaScanCountsHostPtr[ie + 1] = ctaScanCountsHostPtr[ie] + tmp;
     }
 
     // Store total size needed for permuted indices buffer
@@ -184,8 +186,7 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
     bufferCast<int32_t>(*this->mPtrNumNonExitingCtasHost)[0] = ctaScanCountsHostPtr[param.numExperts];
 
     auto permutedBufferMaxSize
-        = param.numTokens * param.topK + mulLog2(param.numExperts, param.paddingLog2) - param.numExperts;
-
+        = param.numTokens * param.topK + mulTileN(param.numExperts, param.tileTokensDim) - param.numExperts;
     for (int ii = 0; ii < permutedBufferMaxSize; ++ii)
         bufferCast<int32_t>(*this->mPtrPermutedIdxToTokenIdxHost)[ii] = -1;
 
@@ -220,7 +221,9 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             continue;
         }
 
-        int32_t numCta = divUpLog2(m, param.paddingLog2);
+        // int32_t numCta = divUpLog2(m, param.paddingLog2);
+        int32_t numCta = divUpTileN(m, param.tileTokensDim);
+
         const int32_t localExpertIdx = (ie - param.localExpertsStartIdx) >> param.localExpertsStrideLog2;
 
         for (int32_t cta = 0; cta < numCta; ++cta)
@@ -228,8 +231,8 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             // Map CTA index to expert index and compute token range for this CTA
             bufferCast<int32_t>(*this->mPtrCtaIdxXyToBatchIdxHost)[ctaScanCountsHostPtr[ie] + cta] = localExpertIdx;
             bufferCast<int32_t>(*this->mPtrCtaIdxXyToMnLimitHost)[ctaScanCountsHostPtr[ie] + cta]
-                = std::min(mulLog2(ctaScanCountsHostPtr[ie] + cta + 1, param.paddingLog2),
-                    mulLog2(ctaScanCountsHostPtr[ie], param.paddingLog2) + m);
+                = std::min(mulTileN(ctaScanCountsHostPtr[ie] + cta + 1, param.tileTokensDim),
+                    mulTileN(ctaScanCountsHostPtr[ie], param.tileTokensDim) + m);
         }
     }
 }

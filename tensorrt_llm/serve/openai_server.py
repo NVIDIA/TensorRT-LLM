@@ -42,8 +42,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, ResponsesRequest,
-                                                UsageInfo,
+                                                ModelList, PromptTokensDetails,
+                                                ResponsesRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -628,12 +628,13 @@ class OpenAIServer:
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
-            num_prompt_tokens = num_gen_tokens = 0
+            num_prompt_tokens = num_gen_tokens = num_cached_tokens = 0
             for rsp in responses:
                 choices, usage = rsp.choices, rsp.usage
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
+                num_cached_tokens += usage.prompt_tokens_details.cached_tokens
                 # Aggregate prompt token ids for context-only requests
                 if rsp.prompt_token_ids is not None:
                     all_prompt_token_ids.append(rsp.prompt_token_ids)
@@ -642,6 +643,9 @@ class OpenAIServer:
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_gen_tokens,
                 total_tokens=num_gen_tokens + num_prompt_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=num_cached_tokens,
+                ),
             )
             merged_rsp = CompletionResponse(
                 model=self.model,

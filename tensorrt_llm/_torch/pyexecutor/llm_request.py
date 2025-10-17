@@ -234,7 +234,8 @@ class PyResult:
                  return_generation_logits: bool = False,
                  exclude_last_generation_logits: bool = False,
                  use_chunked_generation_logits: bool = True,
-                 chunk_size: int = 8):
+                 chunk_size: int = 8,
+                 additional_outputs: Optional[List[str]] = None):
         if streaming and use_chunked_generation_logits:
             assert chunk_size == 1, "chunk_size must be 1 in streaming mode"
         self._streaming = streaming
@@ -253,6 +254,14 @@ class PyResult:
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
+        self._additional_context_outputs = {
+            name: []
+            for name in additional_outputs
+        } if additional_outputs else None
+        self._additional_generation_outputs = {
+            name: []
+            for name in additional_outputs
+        } if additional_outputs else None
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -276,6 +285,16 @@ class PyResult:
         """Finalize any remaining generation logits transfers (for chunked mode)"""
         if self._generation_logits:
             self._generation_logits.finalize_chunked_transfer()
+
+    def append_additional_context_outputs(
+            self, name: str, additional_context_outputs: torch.Tensor):
+        self._additional_context_outputs[name].append(
+            additional_context_outputs.to("cpu", non_blocking=True))
+
+    def append_additional_generation_outputs(
+            self, name: str, additional_generation_outputs: torch.Tensor):
+        self._additional_generation_outputs[name].append(
+            additional_generation_outputs.to("cpu", non_blocking=True))
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -318,12 +337,37 @@ class PyResult:
     def mm_embedding_handle(self) -> Dict[str, Any] | None:
         return self._mm_embeddings
 
+    @property
+    def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
+        if self._additional_context_outputs is None:
+            return None
+        outputs = {}
+        for name, output_list in self._additional_context_outputs.items():
+            if len(output_list) == 0:
+                continue
+            outputs[name] = torch.cat(
+                output_list, dim=0) if len(output_list) > 1 else output_list[0]
+        return outputs
+
+    @property
+    def additional_generation_outputs(self) -> Dict[str, torch.Tensor] | None:
+        if self._additional_generation_outputs is None:
+            return None
+        outputs = {}
+        for name, output_list in self._additional_generation_outputs.items():
+            if len(output_list) == 0:
+                continue
+            outputs[name] = torch.cat(
+                output_list, dim=0) if len(output_list) > 1 else output_list[0]
+        return outputs
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle'))
+         'mm_embedding_handle', 'additional_context_outputs',
+         'additional_generation_outputs'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -332,6 +376,7 @@ class LlmResult:
         self._result = result
         self._py_result = py_result
         self.is_final = is_final
+        self.cached_tokens = 0
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
@@ -388,6 +433,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
+            additional_outputs: Optional[List[str]] = None,
             return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
@@ -448,14 +494,20 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
+        self.py_additional_outputs = additional_outputs
+
         self.py_is_draft = is_draft
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
+        self.d2t = None
+        self.py_draft_use_greedy_sampling = False
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
@@ -475,7 +527,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_generation_logits,
             exclude_last_generation_logits,
             use_chunked_generation_logits=self.py_use_chunked_generation_logits,
-            chunk_size=self.py_logits_chunk_size)
+            chunk_size=self.py_logits_chunk_size,
+            additional_outputs=additional_outputs)
         self.child_requests = []
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
@@ -485,6 +538,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
+
+    @property
+    def cached_tokens(self) -> int:
+        return self._cached_tokens
+
+    @cached_tokens.setter
+    def cached_tokens(self, value: int):
+        if not self._cached_tokens_set:
+            self._cached_tokens = value
+            self._cached_tokens_set = True
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
@@ -673,6 +736,11 @@ def executor_request_to_llm_request(
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
         exclude_last_generation_logits=exclude_last_generation_logits,
+        additional_outputs=[
+            output.name for output in
+            executor_request.output_config.additional_model_outputs
+        ] if executor_request.output_config.additional_model_outputs is not None
+        else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
         draft_logits=None,
         exclude_input_from_output=executor_request.output_config.

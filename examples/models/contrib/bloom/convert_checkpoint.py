@@ -898,7 +898,7 @@ def main():
     if not convert_from_ckpt:
         logger.info(f'Convert by using model')
         hf_bloom = BloomForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto",
+                                                    dtype="auto",
                                                     device_map="auto",
                                                     trust_remote_code=True)
     else:

@@ -28,15 +28,20 @@ if TYPE_CHECKING:
 
 # Place the tool function here to avoid circular import
 def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
-                           input_tokens: torch.Tensor) -> torch.Tensor:
+                           request: LlmRequest) -> List[int]:
     """
     Can be used to modify prompts for speculative algorithms that need to update tokens
     before drafting.
     """
+    draft_input_tokens = request.get_tokens(0)
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         # EAGLE3 always throws away the first token when processing draft inputs
-        return input_tokens[1:]
-    return input_tokens
+        draft_input_tokens = draft_input_tokens[1:]
+    if request.is_context_init_state:
+        # A draft request's prompt is its target request's prompt adding the first golden token.
+        # Add a fake golden token here since the real one has not been generated.
+        draft_input_tokens.append(0)
+    return draft_input_tokens
 
 
 class ModelDrafter(Drafter):
@@ -163,7 +168,7 @@ class ModelDrafter(Drafter):
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
-                                              request.get_tokens(0))
+                                              request)
 
         is_eagle_style = self.spec_config.spec_dec_mode.is_eagle3(
         ) or self.spec_config.spec_dec_mode.is_mtp_eagle()
@@ -226,6 +231,12 @@ class ModelDrafter(Drafter):
             ScheduledRequests: The prepared draft batch
         """
         try:
+            for req in scheduled_requests.all_requests():
+                draft_model = self.draft_model_engine.model.draft_model if self.use_static_draft_loop else self.draft_model_engine.model
+                if hasattr(draft_model.model, "d2t"):
+                    req.d2t = draft_model.model.d2t.data
+                req.py_draft_use_greedy_sampling = self.use_static_draft_loop
+
             draft_batch = ScheduledRequests()
 
             for request in scheduled_requests.context_requests:
@@ -236,9 +247,8 @@ class ModelDrafter(Drafter):
                 # We hit this path if we're doing chunked prefill. The target model processed
                 # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
                 # for the draft model too.
-                all_tokens = request.get_tokens(0)
                 input_tokens = get_draft_model_prompt(
-                    self.spec_config.spec_dec_mode, all_tokens)
+                    self.spec_config.spec_dec_mode, request)
 
                 new_request = self._create_context_request(
                     request, input_tokens)
@@ -526,7 +536,8 @@ class ModelDrafter(Drafter):
         return draft_batch, req_id_to_old_request
 
     def process_static_draft_outputs(
-            self, outputs: torch.Tensor | SampleState,
+            self,
+            outputs: dict[str, torch.Tensor] | tuple[torch.Tensor, SampleState],
             draft_batch: ScheduledRequests,
             req_id_to_old_request: Dict[int, LlmRequest]) -> None:
         """
@@ -537,23 +548,26 @@ class ModelDrafter(Drafter):
             draft_batch: The draft batch that was processed
             req_id_to_old_request: Mapping from draft request ID to original request
         """
-        if isinstance(outputs, torch.Tensor):
-            # For non-overlap scheduler path.
-            outputs_host = outputs.cpu()
+
+        if isinstance(outputs, dict):
+            draft_tokens_host = outputs["new_draft_tokens"].cpu()
+            draft_logits = outputs["draft_logits"]
         else:
-            outputs_host = outputs.host.new_tokens
-            outputs.sampler_event.synchronize()
+            draft_logits = outputs[0]
+            draft_tokens_host = outputs[1].host.new_tokens
+            outputs[1].sampler_event.synchronize()
 
-        for token_idx in range(self.max_draft_tokens):
-            for req_idx, req in enumerate(draft_batch.all_requests()):
-                target_model_req = req_id_to_old_request[req.py_request_id]
-                if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
-                    # Chunked prefill request in progress; no need to append draft tokens
-                    continue
-
-                target_req = req_id_to_old_request[req.py_request_id]
-                target_req.py_draft_tokens.append(
-                    outputs_host[token_idx][req_idx])
+        for req_idx, req in enumerate(draft_batch.all_requests()):
+            target_model_req = req_id_to_old_request[req.py_request_id]
+            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                # Chunked prefill request in progress; no need to append draft tokens
+                continue
+            py_draft_logits = []
+            for token_idx in range(self.max_draft_tokens):
+                target_model_req.py_draft_tokens.append(
+                    draft_tokens_host[token_idx][req_idx])
+                py_draft_logits.append(draft_logits[token_idx][req_idx])
+            target_model_req.py_draft_logits = torch.stack(py_draft_logits)
 
         # Clean up draft resources
         for req in draft_batch.all_requests():
@@ -706,23 +720,26 @@ class ModelDrafter(Drafter):
             # Only update target inputs, cleanup will be done in executor loop
             self._update_target_inputs_with_draft_tokens(
                 target_inputs,
-                outputs,
+                outputs["new_draft_tokens"],
                 draft_position=0,
                 draft_length=self.max_draft_tokens,
                 draft_batch=draft_batch,
                 req_id_to_old_request=req_id_to_old_request)
 
-            new_tokens_host = outputs.to(device='cpu', non_blocking=True)
+            new_tokens_host = outputs["new_draft_tokens"].to(device='cpu',
+                                                             non_blocking=True)
             sampler_event = torch.cuda.Event()
             sampler_event.record()
 
-            outputs = SampleState(
+            sample_state = SampleState(
                 scheduled_requests=draft_batch,
-                device=SampleStateTensors(new_tokens=outputs),
+                device=SampleStateTensors(
+                    new_tokens=outputs["new_draft_tokens"]),
                 host=SampleStateTensors(new_tokens=new_tokens_host),
                 sampler_event=sampler_event)
 
-            return target_inputs, outputs, draft_batch
+            return target_inputs, (outputs["draft_logits"],
+                                   sample_state), draft_batch
 
         # Handle guided decoder and sampling for non-static loop
         if self.guided_decoder is not None:

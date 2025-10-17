@@ -25,7 +25,7 @@ from ...pyexecutor.scheduler import (
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
 from ..llm_args import AutoDeployConfig, LlmArgs
-from ..transformations.transform import InferenceOptimizer
+from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -106,15 +106,11 @@ class ADEngine(ModelEngine):
 
         factory = ad_config.create_factory()
 
-        # pass in extra arguments defined by the model factory
-        for name, (none_input, dynamic_shape_callback) in factory.get_extra_inputs().items():
-            seq_info.add_extra_arg(name, none_input, dynamic_shape_callback)
-
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
+        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
         return cls(build_and_optimize, seq_info, device, max_beam_width)
