@@ -66,7 +66,7 @@ transforms:
     # compilation backend
     backend: torch-opt
     # CUDA Graph optimization
-    cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+    cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
 ```
 
 ## Limitations and tips

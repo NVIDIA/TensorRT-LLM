@@ -129,7 +129,7 @@ transforms:
   ############################################################################################
   visualize_namespace:
     stage: visualize
-    enabled: false #TODO (hg): visualization has some errors now
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################

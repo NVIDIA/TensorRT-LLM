@@ -49,9 +49,6 @@ skip_loading_weights: false
 # Sequence configuration
 max_batch_size: 256
 
-# multi-gpu execution
-world_size: 1
-
 # transform options
 transforms:
   insert_cached_attention:
@@ -67,7 +64,7 @@ transforms:
     cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
 ```
 
-Enable multi-GPU execution by specifying `world_size: n`, where `n` is the number of GPUs.
+Enable multi-GPU execution by specifying `--tp n`, where `n` is the number of GPUs.
 
 ## Configuration Options Reference
 
