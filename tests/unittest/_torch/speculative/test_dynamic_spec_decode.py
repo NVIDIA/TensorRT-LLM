@@ -79,10 +79,17 @@ def test_dynamic_spec_decode(enforce_single_worker,
                 continue
 
             mock_should_use_spec_decode.call_count += 1
-            # Turn off spec decode when we've called it 5 times.
-            # In the current case, at the 5th call, there are 2 accepted draft tokens,
-            # so we can have better coverage for the switching between spec decode on and off.
-            if mock_should_use_spec_decode.call_count > 5:
+            # Turn spec decoding on/off alternately.
+            # When call_count % 4 is 0 or 1, spec decoding is on.
+            # When call_count % 4 is 2 or 3, spec decoding is off.
+            # By doing this, we can cover all the cases of dynamic spec decoding.
+            # 1. Using spec decoding in iteration i, then using spec decoding in iteration i+1.
+            # 2. Using spec decoding in iteration i, then not using spec decoding in iteration i+1.
+            # 3. Not using spec decoding in iteration i, then using spec decoding in iteration i+1.
+            # 4. Not using spec decoding in iteration i, then not using spec decoding in iteration i+1.
+            if mock_should_use_spec_decode.call_count % 4 < 2:
+                return True
+            else:
                 return False
         return True
 

@@ -512,6 +512,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_is_first_draft = is_first_draft
         self.d2t = None
         self.py_draft_use_greedy_sampling = False
+        self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits

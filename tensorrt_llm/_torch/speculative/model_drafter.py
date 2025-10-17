@@ -247,6 +247,8 @@ class ModelDrafter(Drafter):
             draft_batch = ScheduledRequests()
 
             for request in scheduled_requests.context_requests:
+                if request.py_disable_speculative_decoding:
+                    continue
                 if request.is_first_context_chunk:
                     # Ignore requests which still need to be processed by the target model.
                     continue
@@ -262,6 +264,8 @@ class ModelDrafter(Drafter):
                 self._add_to_draft_batch(draft_batch, new_request, request)
 
             for request in scheduled_requests.generation_requests:
+                if request.py_disable_speculative_decoding:
+                    continue
                 if request.state == LlmRequestState.GENERATION_COMPLETE:
                     # Skip generation complete requests. This could happen when enabling overlap scheduler.
                     continue
