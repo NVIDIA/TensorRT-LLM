@@ -5,6 +5,7 @@ set -ex
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
+    PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
 set_bash_env() {
@@ -118,11 +119,7 @@ install_python_rockylinux() {
 }
 
 install_pyp_rockylinux() {
-  if [ -n "${GITHUB_MIRROR}" ]; then
-      PIP_INDEX_URL ="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
-  fi
   bash -c "pip3 install 'urllib3<2.0' pytest"
-  PIP_INDEX_URL=""
 }
 
 install_gcctoolset_rockylinux() {
