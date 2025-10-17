@@ -3883,7 +3883,7 @@ class TestEXAONE4(LlmapiAccuracyTestHarness):
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-VL-7B-Instruct"
-
+    MAX_NUM_TOKENS = 16384
     # NOTE: MMMU adds <|endoftext|> to the stop token.
     sampling_params = SamplingParams(max_tokens=MMMU.MAX_OUTPUT_LEN,
                                      truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
@@ -3894,7 +3894,7 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip(reason="https://nvbugs/5601909")
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH,
-                 max_num_tokens=16384,
+                 max_num_tokens=self.MAX_NUM_TOKENS,
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
@@ -3903,6 +3903,7 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
 class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2.5-VL-7B-Instruct"
+    MAX_NUM_TOKENS = 16384
 
     # NOTE: MMMU adds <|endoftext|> to the stop token.
     sampling_params = SamplingParams(max_tokens=MMMU.MAX_OUTPUT_LEN,
@@ -3913,7 +3914,7 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
 
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH,
-                 max_num_tokens=16384,
+                 max_num_tokens=self.MAX_NUM_TOKENS,
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
@@ -4014,3 +4015,23 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(
                               apply_chat_template=True,
                               chat_template_kwargs=chat_template_kwargs))
+
+
+class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b"
+    MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b"
+    MAX_NUM_TOKENS = 16384
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(max_tokens=MMMU.MAX_OUTPUT_LEN,
+                                     truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+                                     stop="<|endoftext|>")
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=self.MAX_NUM_TOKENS,
+                 kv_cache_config=self.kv_cache_config) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)

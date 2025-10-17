@@ -4,3 +4,5 @@ Qwen/Qwen2.5-VL-7B-Instruct:
   - accuracy: 51.22
 nvidia/Nano-v2-VLM:
   - accuracy: 43.78
+llava-hf/llava-v1.6-mistral-7b:
+  - accuracy: 35.33
