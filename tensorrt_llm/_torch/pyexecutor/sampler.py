@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from itertools import repeat
 from typing import Any, Callable, List, Optional, Type, TypeVar, cast
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import torch
@@ -97,9 +98,20 @@ class SampleState:
     scheduled_requests: ScheduledRequests
 
     device: Optional[SampleStateTensors] = None
-    host: Optional[SampleStateTensors] = None
+    host: Optional[SampleStateTensors | Future[SampleStateTensors]] = None
+    _host: SampleStateTensors | Future[SampleStateTensors] = dataclasses.field(init=False, repr=False)
 
     sampler_event: Optional[torch.cuda.Event] = None
+
+    @property
+    def host(self) -> SampleStateTensors:
+        if isinstance(self._host, Future):
+            return self._host.result()
+        return self._host
+
+    @host.setter
+    def host(self, host: SampleStateTensors | Future[SampleStateTensors]):
+        self._host = host
 
 
 class Sampler(ABC):
@@ -613,6 +625,7 @@ class TorchSampler(Sampler):
         max_beam_width: int
         max_total_draft_tokens: int
         disable_flash_infer_sampling: bool = False
+        use_host_copy_thread: Optional[bool] = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -658,6 +671,59 @@ class TorchSampler(Sampler):
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
         self._generator = None
+
+        self.use_host_copy_thread = args.use_host_copy_thread
+        self.host_copy_thread = None
+
+    def host_copy_thread_active(self) -> bool:
+        return self.host_copy_thread is not None
+
+    def start_host_copy_thread(self):
+        assert self.use_host_copy_thread
+        assert not self.host_copy_thread_active()
+
+        def _host_copy_thread_init(device_id):
+            # The current device is set per thread, so we need to set it again here
+            torch.cuda.set_device(device_id)
+            # Submit the host copies in a separate stream to prevent the blocking
+            # copies from gating subsequent async work
+            torch.cuda.set_stream(torch.cuda.Stream())
+
+        self.host_copy_thread = ThreadPoolExecutor(
+            max_workers=1,
+            initializer=_host_copy_thread_init,
+            initargs=(torch.cuda.current_device(),)
+        )
+
+    def stop_host_copy_thread(self):
+        if self.host_copy_thread_active():
+            self.host_copy_thread.shutdown(wait=True)
+            self.host_copy_thread = None
+
+    def _to_host_tensor(self, tensor, copy_ready=None) -> torch.Tensor:
+        if copy_ready is not None:
+            # Threaded copy - make sure the copy to host takes place after all
+            # prior operations on the primary stream. synchronize() is
+            # intentionally chosen instead of wait() here; otherwise, the
+            # blocking copy will stall subsequent CUDA API calls on the main
+            # thread
+            copy_ready.synchronize()
+            return tensor.to("cpu", non_blocking=False)
+        else:
+            return tensor.to("cpu", non_blocking=True)
+
+    def _to_host_sample_state_tensors(self, tensor, copy_ready=None) -> SampleStateTensors:
+        return SampleStateTensors(new_tokens=self._to_host_tensor(tensor, copy_ready=copy_ready))
+
+    def _copy_tensor(self, func, tensor) -> SampleStateTensors | Future[SampleStateTensors] | torch.Tensor | Future[torch.Tensor]:
+        if self.host_copy_thread_active():
+            # Record an event on the main thread/stream that we will
+            # synchronize with on the worker thread/stream
+            copy_ready = torch.cuda.Event()
+            copy_ready.record()
+            return self.host_copy_thread.submit(func, tensor, copy_ready=copy_ready)
+        else:
+            return func(tensor)
 
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
@@ -742,8 +808,15 @@ class TorchSampler(Sampler):
         count: int,
     ):
         if request.py_return_log_probs:
-            topk_log_probs_vals = request.py_topk_logprobs_vals[:count]
-            topk_log_probs_indices = request.py_topk_logprobs_indices[:count]
+            if self.host_copy_thread_active():
+                # These are futures if we used a threaded copy
+                vals = request.py_topk_logprobs_vals.result()
+                indices = request.py_topk_logprobs_indices.result()
+            else:
+                vals = request.py_topk_logprobs_vals
+                indices = request.py_topk_logprobs_indices
+            topk_log_probs_vals = vals[:count]
+            topk_log_probs_indices = indices[:count]
 
             token_log_probs = [
                 {
@@ -947,7 +1020,10 @@ class TorchSampler(Sampler):
             new_draft_tokens_cuda.transpose(0, 1).to(torch.int, non_blocking=True).unsqueeze(dim=-1)
         )
 
-        new_draft_tokens_host = int_new_draft_tokens.to("cpu", non_blocking=True)
+        new_draft_tokens_host = self._copy_tensor(
+            self._to_host_sample_state_tensors,
+            int_new_draft_tokens
+        )
 
         return new_draft_tokens_host
 
@@ -1148,8 +1224,13 @@ class TorchSampler(Sampler):
         )
         finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        if self.host_copy_thread_active():
+            # With the host copy thread, futures replace the sampler_event
+            sampler_event = None
+        else:
+            sampler_event = torch.cuda.Event()
+            sampler_event.record()
+
         return SampleStateTorch(
             scheduled_requests=scheduled_requests,
             device=SampleStateTensors(new_tokens=new_tokens),
@@ -1409,9 +1490,12 @@ class TorchSampler(Sampler):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:])[:, beam, ...].scatter_(
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
-        new_tokens_host = new_tokens_cuda.to("cpu", non_blocking=True)
+        host_sample_state_tensors = self._copy_tensor(
+            self._to_host_sample_state_tensors,
+            new_tokens_cuda
+        )
 
-        return new_tokens_host
+        return host_sample_state_tensors
 
     @staticmethod
     @torch.inference_mode()
@@ -1732,14 +1816,14 @@ class TorchSampler(Sampler):
         if spec_tree_manager is not None and logits_cuda.size(0) == len(
             scheduled_requests.all_requests()
         ):
-            new_tokens_host = self._tree_sampling_batch(
+            host_sample_state_tensors = self._tree_sampling_batch(
                 requests,
                 self.max_num_sequences,
                 seq_slots,
                 model_outputs,
                 spec_tree_manager,
             )
-            return new_tokens_host
+            return host_sample_state_tensors
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
@@ -1802,7 +1886,7 @@ class TorchSampler(Sampler):
         )
 
         # Fill results into output buffers
-        new_tokens_host = self._unbatch_sampling_results(
+        host_sample_state_tensors = self._unbatch_sampling_results(
             batched_sampling_result,
             new_tokens_cuda=new_tokens_cuda,
             req_num_steps=req_num_steps,
@@ -1810,7 +1894,7 @@ class TorchSampler(Sampler):
         )
 
         # NB: update_requests syncs w/ device computation and async D2H copies
-        return new_tokens_host
+        return host_sample_state_tensors
 
     @override
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
@@ -1849,7 +1933,18 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
 class SampleStateTRTLLM(SampleState):
     finalize_events: dict[str, CudaEvent] | None = None
     """`Optional` to accommodate `_forward_step_inter_pp` which creates a `SampleState` without `finalize_events`"""
-    host: Optional[SampleStateTensorsHostTRTLLM] = None
+    host: Optional[SampleStateTensorsHostTRTLLM | Future[SampleStateTensorsHostTRTLLM]] = None
+    _host: SampleStateTensorsHostTRTLLM | Future[SampleStateTensorsHostTRTLLM] = dataclasses.field(init=False, repr=False)
+
+    @property
+    def host(self) -> SampleStateTensorsHostTRTLLM:
+        if isinstance(self._host, Future):
+            return self._host.result()
+        return self._host
+
+    @host.setter
+    def host(self, host: SampleStateTensorsHostTRTLLM | Future[SampleStateTensorsHostTRTLLM]):
+        self._host = host
 
 
 class TRTLLMSampler(Sampler):
@@ -1872,6 +1967,7 @@ class TRTLLMSampler(Sampler):
         max_beam_width: int,
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
+        use_host_copy_thread: Optional[bool] = False,
     ):
         vocab_size = model.config.vocab_size
         num_hidden_layers = model.config.num_hidden_layers
@@ -1921,6 +2017,34 @@ class TRTLLMSampler(Sampler):
 
         self._initialize_store()
         self._instantiate_algorithms()
+
+        self.use_host_copy_thread = use_host_copy_thread
+        self.host_copy_thread = None
+
+    def host_copy_thread_active(self) -> bool:
+        return self.host_copy_thread is not None
+
+    def start_host_copy_thread(self):
+        assert self.use_host_copy_thread
+        assert not self.host_copy_thread_active()
+
+        def _host_copy_thread_init(device_id):
+            # The current device is set per thread, so we need to set it again here
+            torch.cuda.set_device(device_id)
+            # Submit the host copies in a separate stream to prevent the blocking
+            # copies from gating subsequent async work
+            torch.cuda.set_stream(torch.cuda.Stream())
+
+        self.host_copy_thread = ThreadPoolExecutor(
+            max_workers=1,
+            initializer=_host_copy_thread_init,
+            initargs=(torch.cuda.current_device(),)
+        )
+
+    def stop_host_copy_thread(self):
+        if self.host_copy_thread_active():
+            self.host_copy_thread.shutdown(wait=True)
+            self.host_copy_thread = None
 
     def _initialize_store(self):
         torch_stream = torch.cuda.current_stream().cuda_stream
@@ -2068,7 +2192,7 @@ class TRTLLMSampler(Sampler):
         )
 
         finalize_events = {}
-        gathered_ids = None
+        gather_ids = False
         if beam_width > 1:
             finished_sum_device = self.store["decoder_state"].finished_sum
 
@@ -2079,32 +2203,61 @@ class TRTLLMSampler(Sampler):
                     finalize_events[request.request_id] = self._finalize_request(request, False)
                 elif request.streaming:
                     finalize_events[request.request_id] = self._finalize_request(request, True)
-            gathered_ids = self.store["decoder_state"].gathered_ids.to("cpu", non_blocking=True)
-        new_output_tokens = self.store["decoder_state"].all_new_tokens.to("cpu", non_blocking=True)
-        finished_sum = self.store["decoder_state"].finished_sum.to("cpu", non_blocking=True)
-        finish_reasons = self.store["decoder_state"].finish_reasons.to("cpu", non_blocking=True)
-        sequence_lengths = self.store["decoder_state"].sequence_lengths.to("cpu", non_blocking=True)
-
-        log_probs = None
-        cum_log_probs = None
-        if any(request.py_return_log_probs for request in scheduled_requests.all_requests()):
-            log_probs = self.store["decoder_state"].log_probs.to("cpu", non_blocking=True)
-            cum_log_probs = self.store["decoder_state"].cum_log_probs.to("cpu", non_blocking=True)
+            gather_ids = True
 
         device = SampleStateTensors(new_tokens=self.store["decoder_state"].all_new_tokens)
 
-        host = SampleStateTensorsHostTRTLLM(
-            new_tokens=new_output_tokens,
-            finished_sum=finished_sum,
-            finish_reasons=finish_reasons,
-            sequence_lengths=sequence_lengths,
-            log_probs=log_probs,
-            cum_log_probs=cum_log_probs,
-            gathered_ids=gathered_ids,
-        )
+        @nvtx_range("_copy_tensors_to_host")
+        def _copy_tensors_to_host(gather_ids, scheduled_requests, copy_ready):
+            if copy_ready is not None:
+                # Threaded copy - make sure the copy to host takes place after
+                # all prior operations on the primary stream. synchronize() is
+                # intentionally chosen instead of wait() here; otherwise, the
+                # blocking copy will stall subsequent CUDA API calls on the
+                # main thread
+                copy_ready.synchronize()
+                non_blocking = False
+            else:
+                non_blocking = True
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+            ds = self.store["decoder_state"]
+
+            gathered_ids = ds.gathered_ids.to('cpu', non_blocking=non_blocking) if gather_ids else None
+            new_output_tokens = ds.all_new_tokens.to('cpu', non_blocking=non_blocking)
+            finished_sum = ds.finished_sum.to('cpu', non_blocking=non_blocking)
+            finish_reasons = ds.finish_reasons.to('cpu', non_blocking=non_blocking)
+            sequence_lengths = ds.sequence_lengths.to('cpu', non_blocking=non_blocking)
+
+            log_probs = None
+            cum_log_probs = None
+            if any(request.py_return_log_probs
+                   for request in scheduled_requests.all_requests()):
+                log_probs = ds.log_probs.to('cpu', non_blocking=non_blocking)
+                cum_log_probs = ds.cum_log_probs.to('cpu', non_blocking=non_blocking)
+
+            return SampleStateTensorsHostTRTLLM(new_tokens=new_output_tokens,
+                                                finished_sum=finished_sum,
+                                                finish_reasons=finish_reasons,
+                                                sequence_lengths=sequence_lengths,
+                                                log_probs=log_probs,
+                                                cum_log_probs=cum_log_probs,
+                                                gathered_ids=gathered_ids)
+
+        if self.host_copy_thread_active():
+            # Record an event on the main thread/stream that we will
+            # synchronize with on the worker thread/stream
+            copy_ready = torch.cuda.Event()
+            copy_ready.record()
+            host = self.host_copy_thread.submit(_copy_tensors_to_host,
+                                                   gather_ids,
+                                                   scheduled_requests,
+                                                   copy_ready)
+            # With the host copy thread, futures replace the sampler_event
+            sampler_event = None
+        else:
+            host = _copy_tensors_to_host(gather_ids, scheduled_requests, None)
+            sampler_event = torch.cuda.Event()
+            sampler_event.record()
 
         self.micro_batch_idx = (self.micro_batch_idx + 1) % self.num_micro_batches
 
