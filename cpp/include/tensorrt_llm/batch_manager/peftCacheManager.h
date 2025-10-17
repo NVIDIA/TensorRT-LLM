@@ -58,6 +58,9 @@ public:
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
     using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using TaskPeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using TaskIdToReqIds = std::map<uint64_t, std::vector<uint64_t>>;
+    using EnsureBatchTaskResult = std::tuple<TaskPeftTable, TaskIdToReqIds>;
 
     virtual ~BasePeftCacheManager() = default;
 
@@ -99,6 +102,8 @@ public:
 class PeftCacheManager : public BasePeftCacheManager
 {
 public:
+    using EnsureBatchTaskResult = BasePeftCacheManager::EnsureBatchTaskResult;
+
     PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
@@ -108,6 +113,9 @@ public:
 
     PeftTable ensureBatch(RequestVector const& contextRequests, RequestVector const& generationRequests,
         bool resetGpuCache = false) override;
+
+    EnsureBatchTaskResult ensureBatchMapTaskId(
+        RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache = false);
 
     [[nodiscard]] bool isTaskCached(uint64_t taskId) const;
 
