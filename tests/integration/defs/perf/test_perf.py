@@ -1570,7 +1570,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             metric.metric_regex.search(line)
             for line in outputs[cmd_idx].split("\n")
         ]
-        print_info(outputs[cmd_idx].split("\n"))
         metric_values = [
             float(match.group(1)) for match in regex_matches if match
         ]
