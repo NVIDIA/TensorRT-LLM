@@ -31,6 +31,7 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     filtered_nodes,
     identify_regions_between_residuals,
+    is_fake_quantized_linear_op,
     is_linear_op,
     is_op,
 )
@@ -109,8 +110,8 @@ def _append_simple_shard(
     for node_group in nodes_linear.values():
         for n in node_group:
             tp_shards.append(
-                TPShardingInfo(
-                    target_node=n.name,
+                TPShardingInfo.from_node(
+                    n,
                     split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
@@ -126,6 +127,7 @@ class ShardingTransformConfig(TransformConfig):
 
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = Field(default=False)
+    support_partial_config: bool = Field(default=False)
     # Which sharding families to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[str] = Field(default_factory=lambda: ["tp", "ep", "bmm"])
 
@@ -184,6 +186,9 @@ class Sharding(BaseTransform):
             else ShardingConfigSource.UNKNOWN
         )
         shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
+        shared_config.sharding_config.support_partial_config = self.config.support_partial_config
+        shared_config.sharding_config.sharding_dims = self.config.sharding_dims
+
         shared_config.sharding_config.use_sharding_from_factory = (
             self.config.use_sharding_from_factory
         )
@@ -198,8 +203,6 @@ class Sharding(BaseTransform):
             ad_logger.info("Applying sharding from config")
             factory_info = detect_sharding_from_factory_config(gm, sharding_config)
             return gm, factory_info
-
-        shared_config.sharding_config.sharding_dims = self.config.sharding_dims
 
         ad_logger.info(
             f"Running autodeploy sharding heuristics: {shared_config.sharding_config.sharding_dims}"
@@ -289,7 +292,7 @@ def detect_sharding_from_factory_config(
     num_simple_shards = 0
     num_row_col_shards = 0
 
-    for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
+    for lin_node in filtered_nodes(gm.graph.nodes, [is_linear_op, is_fake_quantized_linear_op]):
         # use node's weight name to get the module name
         module_name = lin_node.args[1].target
 
@@ -312,8 +315,8 @@ def detect_sharding_from_factory_config(
                 config = tp_plan[key]
                 if config == "colwise":
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.COLUMN,
                             rank=rank,
                             world_size=world_size,
@@ -323,8 +326,8 @@ def detect_sharding_from_factory_config(
                     )
                 elif config == "rowwise":
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.ROW,
                             rank=rank,
                             world_size=world_size,
@@ -337,13 +340,44 @@ def detect_sharding_from_factory_config(
                     # TODO: Sequence parallelism is not supported yet.
                     ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
                 elif "local" in config:
-                    # TODO: local refers to hybrid EP+TP parallelism. Not supported yet.
-                    ad_logger.warning("Local EP+TP sharding is not supported yet. Skipping.")
+                    # Check if this applies to shared experts in EP parallelism.
+                    # If yes, apply the TP col-row shard.
+                    if "shared" in module_name:
+                        col_row_action = config.replace("local_", "")
+                        if col_row_action == "colwise":
+                            sharding_config.tp_transforms.append(
+                                TPShardingInfo(
+                                    target_node=lin_node.name,
+                                    split_dim=SplitDimension.COLUMN,
+                                    rank=rank,
+                                    world_size=world_size,
+                                    dist_op=None,
+                                    min_local_shape=min_local_shape,
+                                )
+                            )
+                        elif col_row_action == "rowwise":
+                            sharding_config.tp_transforms.append(
+                                TPShardingInfo(
+                                    target_node=lin_node.name,
+                                    split_dim=SplitDimension.ROW,
+                                    rank=rank,
+                                    world_size=world_size,
+                                    dist_op="all_reduce",
+                                    min_local_shape=min_local_shape,
+                                )
+                            )
+                            num_row_col_shards += 1
+                        else:
+                            ad_logger.warning(f"Unsupported sharding action {config}. Skipping.")
+                    else:
+                        # TODO: local refers to hybrid EP+TP parallelism. Not supported yet.
+                        ad_logger.warning("Local EP+TP sharding is not supported yet. Skipping.")
+
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.COLUMN,
                             rank=rank,
                             world_size=world_size,
@@ -353,7 +387,19 @@ def detect_sharding_from_factory_config(
                     )
                     num_simple_shards += 1
                 else:
-                    ad_logger.warning("Invalid sharding config. Skipping.")
+                    ad_logger.warning(
+                        f"Unsupported sharding action {config}. Fallback to simple shard"
+                    )
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            lin_node,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op="all_gather",
+                            min_local_shape=1,
+                        )
+                    )
                 # after successful match, break the loop
                 break
 
@@ -361,9 +407,35 @@ def detect_sharding_from_factory_config(
         f"Applied {num_shards} TP shards (simple: {num_simple_shards}, "
         f"row-col pattern: {num_row_col_shards})"
     )
+
+    num_matches = len(sharding_config.tp_transforms)
+
+    if sharding_config.support_partial_config:
+        ad_logger.info(
+            f"Partial factory config applied only for TP. "
+            f"Applying heuristics for {sharding_config.sharding_dims}."
+        )
+
+        # run EP sharding across ranks
+        if "ep" in sharding_config.sharding_dims:
+            ep_info = detect_ep_shard(gm, sharding_config)
+        else:
+            ep_info = TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # run BMM sharding across ranks
+        if "bmm" in sharding_config.sharding_dims:
+            dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
+        else:
+            dp_bmm_info = TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        num_matches += ep_info.num_matches + dp_bmm_info.num_matches
+
     return TransformInfo(
         skipped=False,
-        num_matches=len(sharding_config.tp_transforms),
+        num_matches=num_matches,
         is_clean=False,
         has_valid_shapes=False,
     )
@@ -419,8 +491,7 @@ def detect_column_row_shard(
     # acceptable attention nodes between sharded GEMMs
     shardable_attention_nodes = {
         torch.ops.auto_deploy.torch_attention_sdpa,
-        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
-        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention,
     }
 
     # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
@@ -455,7 +526,7 @@ def detect_column_row_shard(
         unaccounted_nodes: Set[Node] = set()
         current_node = n_start
         while current_node != n_end:
-            if is_linear_op(current_node, include_quantization=True):
+            if is_linear_op(current_node) or is_fake_quantized_linear_op(current_node):
                 nodes_linear[current_node.args[0]].append(current_node)
             elif is_op(current_node, shardable_attention_nodes):
                 attention_nodes.add(current_node)
@@ -540,8 +611,8 @@ def detect_column_row_shard(
                 else:
                     dist_op = None
                 sharding_config.tp_transforms.append(
-                    TPShardingInfo(
-                        target_node=n.name,
+                    TPShardingInfo.from_node(
+                        n,
                         split_dim=i,
                         rank=rank,
                         world_size=world_size,
@@ -654,13 +725,14 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
             (
                 torch.ops.auto_deploy.torch_moe,
                 torch.ops.auto_deploy.torch_quant_fp8_moe,
-                torch.ops.auto_deploy.torch_quant_fp4_moe,
+                torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+                torch.ops.auto_deploy.triton_mxfp4_moe,
             ),
         ):
             continue
         sharding_config.ep_transforms.append(
-            EPShardingInfo(
-                target_node=node.name,
+            EPShardingInfo.from_node(
+                node,
                 rank=rank,
                 world_size=world_size,
             )

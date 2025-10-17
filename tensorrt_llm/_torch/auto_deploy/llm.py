@@ -1,19 +1,116 @@
 import types
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
 
 from ...executor.result import CompletionOutput
-from ...inputs.registry import create_input_processor
+from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
 from ...llmapi.llm import RequestOutput, _TorchLLM
-from ...llmapi.tokenizer import TokenizerBase, tokenizer_factory
+from ...llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
+from ...sampling_params import SamplingParams
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
+from .models.factory import ModelFactory
 from .shim.demollm import DemoGenerationExecutor
+
+
+class ADInputProcessor(DefaultInputProcessor):
+    """Input processor for AutoDeploy backend.
+
+    This is a wrapper to either support standard TRT-LLM text-only input processing or use HF's
+    message chat template system to process multimodal inputs.
+    """
+
+    def __init__(self, tokenizer: Optional[TokenizerBase], processor: Optional[Any] = None):
+        super().__init__(model_path=None, model_config=None, tokenizer=tokenizer)
+        # NOTE: HF's tokenizer/processor that has the apply_chat_template method
+        self.processor = processor or getattr(tokenizer, "tokenizer", None)
+
+    def __call__(
+        self, inputs: Dict[str, Any], sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        if self.processor is None:
+            raise ValueError("processor is required to tokenize inputs")
+
+        # construct kwargs to reflect DefaultInputProcessor
+        kwargs = {
+            "add_special_tokens": sampling_params.add_special_tokens,
+        }
+        if sampling_params.truncate_prompt_tokens is not None:
+            kwargs = {
+                "truncation": True,
+                "max_length": sampling_params.truncate_prompt_tokens,
+            }
+        # check for messages field and if yes, use the apply_chat_template method
+        if "messages" in inputs:
+            # multi_modal_data should not be present in the messages field
+            assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
+
+            # TODO: we don't really need this but it makes for a good sanity check. Consider
+            # removing this in the future if we need to speed things up.
+            prompt = self.processor.apply_chat_template(
+                inputs["messages"],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            inputs["prompt"] = prompt
+
+            all_args = self.processor.apply_chat_template(
+                inputs["messages"],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                padding=False,  # there shouldn't be a need for padding ever...
+                return_attention_mask=False,
+                **kwargs,
+            )
+        # check if multi_modal_data has already been pre-processed/added to the inputs
+        # for example, this might be the case when invoking AD via trtllm-serve
+        elif "multi_modal_data" in inputs:
+            images = inputs["multi_modal_data"]["image"]
+            if images is not None and isinstance(images[0], torch.Tensor):
+                # The default multimodal input loader will normalize images to [0, 1] when the requested
+                # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
+                do_rescale = False
+            all_args = self.processor(
+                text=inputs["prompt"],
+                images=images,
+                return_dict=True,
+                return_tensors="pt",
+                do_rescale=do_rescale,
+            )
+        else:
+            all_args = None
+
+        if all_args is not None:
+            # TODO: is there a more reliable way to avoid the attention_mask here?
+            all_args.pop("attention_mask", None)
+
+            # TODO: can we avoid the extra tolist() here eventually?
+            token_ids = all_args.pop("input_ids")
+            assert token_ids.shape[0] == 1, "messages should be unbatched at this point."
+            if all_args:
+                extra_processed_inputs = {"multimodal_data": all_args}
+            else:
+                extra_processed_inputs = None
+            return token_ids[0].tolist(), extra_processed_inputs
+        else:
+            token_ids = self.tokenizer.encode(inputs["prompt"], **kwargs)
+            return token_ids, None
 
 
 class LLM(_TorchLLM):
     """LLM class is the main class for running an LLM model using AutoDeploy backend."""
 
     args: LlmArgs
+    _factory: ModelFactory
+
+    @property
+    def factory(self) -> ModelFactory:
+        if not getattr(self, "_factory", None):
+            self._factory = self.args.create_factory()
+        return self._factory
 
     def __init__(self, *args, **kwargs):
         kwargs["backend"] = "_autodeploy"
@@ -23,16 +120,18 @@ class LLM(_TorchLLM):
         if self.args.skip_tokenizer_init:
             return None
 
-        factory = self.args.create_factory()
-        return tokenizer_factory(factory.init_tokenizer())
+        return tokenizer_factory(self.factory.init_tokenizer())
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """We don't need to validate args for AutoDeploy backend for now."""
         pass
 
+    def _create_input_processor(self) -> ADInputProcessor:
+        return ADInputProcessor(self.tokenizer, self.factory.init_processor())
+
     def _prefetch_model(self):
         """Prefetch the model for the LLM."""
-        self.args.create_factory().prefetch_checkpoint()
+        self.factory.prefetch_checkpoint()
 
     def _build_model(self):
         """Build the model for the LLM.
@@ -46,6 +145,11 @@ class LLM(_TorchLLM):
         # NOTE (lucaslie): do regular build model, we bypass the regular LLM CachedModelLoader in
         # _autodeploy backend.
         super()._build_model()
+
+        # now correct input processor
+        assert isinstance(self.input_processor, DefaultInputProcessor)
+        assert self.tokenizer is None or isinstance(self.tokenizer, TransformersTokenizer)
+        self.input_processor = self._create_input_processor()
 
 
 class DemoLLM(LLM):
@@ -63,7 +167,9 @@ class DemoLLM(LLM):
         # prefetch model and load tokenizer
         self._prefetch_model()
         self._tokenizer = self._try_load_tokenizer()
-        self.input_processor = create_input_processor(None, self.tokenizer)
+        self._hf_model_config = self._try_load_hf_model_config()
+        self._generation_config = self._try_load_generation_config()
+        self.input_processor = self._create_input_processor()
 
         # construct demo executor + engine
         self._executor = DemoGenerationExecutor(

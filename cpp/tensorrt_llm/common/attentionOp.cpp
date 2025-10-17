@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
@@ -281,13 +282,15 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
-    xqaParams.is_fp8_output = mFP8ContextFMHA;
-    xqaParams.fp8_out_scale
-        = ((mFP8ContextFMHA || mFP8ContextMLA) ? generationsParams.attention_output_orig_quant : nullptr);
+    xqaParams.is_fp8_output = mFP8AttenOutput;
+    xqaParams.fp8_out_scale = ((mFP8AttenOutput) ? generationsParams.attention_output_orig_quant : nullptr);
     // Parameters required for FP4 output.
     xqaParams.output_sf = generationsParams.context_buf_sf;
     xqaParams.fp4_out_sf_scale = generationsParams.attention_output_sf_scale;
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
+    // Parameters for sparse attention
+    xqaParams.sparse_params = mRuntimeSparseAttentionParams;
+    xqaParams.use_sparse_attention = useTllmGenSparseAttention();
 
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
@@ -379,7 +382,7 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
     }
 
     // transpose_2_reverse
-    if (mFP8ContextFMHA)
+    if (mFP8AttenOutput)
     {
         invokeCpTransposeToSeqMajor2(reinterpret_cast<__nv_fp8_e4m3*>(buffer),
             reinterpret_cast<__nv_fp8_e4m3 const*>(input), params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens,
@@ -399,7 +402,7 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
     {
         if (cpIdx != mCpRank)
         {
-            if (mFP8ContextFMHA)
+            if (mFP8AttenOutput)
             {
                 NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum, ncclInt8,
                     cpIdx, *mCpNcclComm, stream));
@@ -419,7 +422,7 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
 #endif // ENABLE_MULTI_DEVICE
 
     // transpose_1_reverse + view
-    if (mFP8ContextFMHA)
+    if (mFP8AttenOutput)
     {
         invokeCpTransposeToSeqMajor<__nv_fp8_e4m3>(reinterpret_cast<__nv_fp8_e4m3*>(output),
             reinterpret_cast<__nv_fp8_e4m3 const*>(buffer), reinterpret_cast<__nv_fp8_e4m3 const*>(input),
@@ -502,7 +505,7 @@ int AttentionOp::ulyssesGenerationPostprocess(T* input, T* output, T* buffer, in
     {
         if (cpIdx != mCpRank)
         {
-            if (mFP8ContextFMHA)
+            if (mFP8AttenOutput)
             {
                 NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum, ncclInt8,
                     cpIdx, *mCpNcclComm, stream));
@@ -522,7 +525,7 @@ int AttentionOp::ulyssesGenerationPostprocess(T* input, T* output, T* buffer, in
 #endif // ENABLE_MULTI_DEVICE
 
     // do transpose_1_reverse
-    if (mFP8ContextFMHA)
+    if (mFP8AttenOutput)
     {
         invokeCpTransposeToSeqMajor<__nv_fp8_e4m3>(reinterpret_cast<__nv_fp8_e4m3*>(output),
             reinterpret_cast<__nv_fp8_e4m3 const*>(input), reinterpret_cast<__nv_fp8_e4m3 const*>(buffer),
@@ -765,8 +768,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
     {
         fp8_q_buf_size = max_num_tokens * static_cast<size_t>(total_q_dim_all_heads);
-        fp8_k_buf_size = max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-        fp8_v_buf_size = max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+        fp8_k_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
+        fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
     }
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
@@ -814,7 +817,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 }
 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
-    int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
+    int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -910,11 +913,15 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     size_t xqa_workspace_size = 0;
     if (mEnableXQA)
     {
-        int const XQA_NUM_BUFFERS = 7;
+        int const XQA_NUM_BUFFERS = 8;
         size_t xqa_workspaces[XQA_NUM_BUFFERS];
         size_t const cu_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
+        // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
+        size_t const sparse_attn_cache_size = useTllmGenSparseAttention()
+            ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
+            : 0;
         xqa_workspaces[0] = cu_seqlens_size;
         xqa_workspaces[1] = cu_kv_seqlens_size;
         xqa_workspaces[2] = rotary_inv_freq_size;
@@ -923,7 +930,8 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         // Scales used for trtllm-gen kernels.
         xqa_workspaces[4] = sizeof(float) * 2;
         xqa_workspaces[5] = sizeof(float);
-        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
+        xqa_workspaces[6] = sparse_attn_cache_size;
+        xqa_workspaces[7] = mXqaDispatcher->getWorkspaceSize(
             std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
@@ -1055,6 +1063,9 @@ int AttentionOp::mlaGeneration(
 
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
+
+        // softmax stats if needed
+        tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
 
         // MLA uses different head dimensions for Qk and V.
         tllmRunnerParams.mHeadDimQk = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
@@ -1645,6 +1656,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.spec_decoding_position_offsets = nullptr;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
+        // Sparse KV write
+        preprocessingParams.sparse_kv_indices = mRuntimeSparseAttentionParams.sparse_kv_indices;
+        preprocessingParams.sparse_kv_offsets = mRuntimeSparseAttentionParams.sparse_kv_offsets;
+
         // Scalars
         preprocessingParams.batch_size = params.batch_size;
         preprocessingParams.max_input_seq_len = params.input_seq_length;
@@ -1674,6 +1689,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         preprocessingParams.rotary_vision_start = mVisionStart;
         preprocessingParams.rotary_vision_length = mVisionLength;
+        preprocessingParams.is_last_chunk
+            = !mAttentionChunkSize.has_value() || (params.input_seq_length == params.max_past_kv_length);
 
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
@@ -1822,7 +1839,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
-        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
+        fmhaParams.softmaxStatsPtr = params.softmax_stats;
 
         if (mAttentionChunkSize)
         {
@@ -1837,6 +1854,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             this->template ulyssesContextPostprocess<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
                 gatherInBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, stream);
+            sync_check_cuda_error(stream);
+        }
+
+        if (!mIsMLAEnabled) // Only for non-MLA attention
+        {
+            invokeKvCachePostprocessing(preprocessingParams, stream);
             sync_check_cuda_error(stream);
         }
     }
@@ -2531,22 +2554,22 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
-            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100, sm_120 or sm_121.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 103 || mSM == 120 || mSM == 121,
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f, sm_120 or sm_121.");
     }
 
     // Pre-Check of FP8 Generation MLA.
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 103 || mSM == 120 || mSM == 121,
             "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100 || mSM == 120 || mSM == 121,
-        "fuse_fp4_quant only supports SM100 or SM120 or SM121 devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || (mSM == 100 || mSM == 103) || mSM == 120 || mSM == 121,
+        "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
 
     // Check requirements for FP4 KV cache.
     TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA,
@@ -2570,8 +2593,7 @@ int AttentionOp::initialize() noexcept
     if (mIsMLAEnabled)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "MLA(Deepseek v2) only support fmha");
-        TLLM_CHECK_WITH_INFO(
-            !mFP8ContextFMHA && !mDenseContextFMHA, "MLA(Deepseek v2) currently not support FP8 and dense fmha");
+        TLLM_CHECK_WITH_INFO(!mDenseContextFMHA, "MLA(Deepseek v2) currently not support dense fmha");
         TLLM_CHECK_WITH_INFO(
             mPagedKVCache && mUseKVCache && mRemovePadding, "MLA(Deepseek v2) only support paged kv cache");
         TLLM_CHECK_WITH_INFO(!mCrossAttention, "MLA(Deepseek v2) do not support cross attention right now");
@@ -2594,6 +2616,9 @@ int AttentionOp::initialize() noexcept
 
     if (mEnableContextFMHA)
     {
+        // Construct the fmha runner.
+        MHARunnerFixedParams fmhaParams{};
+
         // Pre-checked during constructing.
         Data_type data_type;
         if (mType == nvinfer1::DataType::kHALF)
@@ -2608,6 +2633,8 @@ int AttentionOp::initialize() noexcept
         {
             TLLM_CHECK_WITH_INFO(false, "GPTAttentionPlugin received wrong data type.");
         }
+        // The output dtype.
+        fmhaParams.dataTypeOut = mFP8AttenOutput ? DATA_TYPE_E4M3 : data_type;
 
         // FP8 FMHA should be used with fp8 workflow together.
         if (mFP8ContextFMHA || mFP8ContextMLA)
@@ -2615,8 +2642,6 @@ int AttentionOp::initialize() noexcept
             data_type = DATA_TYPE_E4M3;
         }
 
-        // Construct the fmha runner.
-        MHARunnerFixedParams fmhaParams{};
         // The input dtype.
         fmhaParams.dataType = data_type;
         // The KV input data type. The default is same as dataType.
@@ -2633,8 +2658,6 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.dataTypeKv = DATA_TYPE_E2M1;
             }
         }
-        // The output dtype.
-        fmhaParams.dataTypeOut = data_type;
         if (mFuseFp4Quant)
         {
             // If FP4 quantization workflow is enabled, set output type to FP4.
@@ -2735,11 +2758,6 @@ int AttentionOp::initialize() noexcept
                 {
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
-                }
-                // When FP8 Context FMHA is enabled, the output data type needs to be E4M3.
-                if (mFP8ContextFMHA)
-                {
-                    outputDataType = DATA_TYPE_E4M3;
                 }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
@@ -2856,8 +2874,7 @@ int AttentionOp::initialize() noexcept
         {
             fixedParams.outputDataType = DATA_TYPE_E2M1;
         }
-        // If FP8 context FMHA is enable, FP8 output is expected.
-        else if (mFP8ContextFMHA)
+        else if (mFP8AttenOutput)
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
         }
@@ -2975,6 +2992,7 @@ std::string AttentionOp::toString() const
     ss << "mPosShiftEnabled: " << std::boolalpha << mPosShiftEnabled << std::endl;
     ss << "mPagedContextFMHA: " << std::boolalpha << mPagedContextFMHA << std::endl;
     ss << "mFP8ContextFMHA: " << std::boolalpha << mFP8ContextFMHA << std::endl;
+    ss << "mFP8AttenOutput: " << std::boolalpha << mFP8AttenOutput << std::endl;
     ss << "mFP8ContextMLA: " << std::boolalpha << mFP8ContextMLA << std::endl;
     ss << "mDenseContextFMHA: " << std::boolalpha << mDenseContextFMHA << std::endl;
     ss << "mEnableContextFMHA: " << std::boolalpha << mEnableContextFMHA << std::endl;

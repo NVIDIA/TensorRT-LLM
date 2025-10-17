@@ -15,6 +15,7 @@
 # -*- coding: utf-8 -*-
 
 import datetime
+import gc
 import os
 import platform
 import re
@@ -36,6 +37,7 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -75,12 +77,20 @@ def wget(url, out):
 
 
 def llm_models_root() -> str:
-    '''return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path
-    '''
-    DEFAULT_LLM_MODEL_ROOT = os.path.join("/scratch.trt_llm_data", "llm-models")
-    LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT", DEFAULT_LLM_MODEL_ROOT)
+    """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
 
-    return LLM_MODELS_ROOT
+    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    assert root.exists(), (
+        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
+    )
+
+    return str(root)
 
 
 def tests_path() -> Path:
@@ -97,7 +107,7 @@ def integration_path() -> Path:
 
 def cached_in_llm_models_root(path_relative_to_llm_models_root,
                               fail_if_path_is_invalid=False):
-    '''
+    """
     Use this decorator to declare a cached path in the LLM_MODELS_ROOT directory.
 
     That decorator is intended to be used with pytest.fixture functions which prepare and return a data path for some tests.
@@ -136,18 +146,19 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
         @cached_in_llm_models_root("santacoder")
         def llm_gpt2_santacoder_model_root(llm_venv):
             ... keep the original code
-    '''
+    """
 
     def wrapper(f):
 
         @wraps(f)
         def decorated(*args, **kwargs):
-            if llm_models_root() is not None:
-                cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
-                if os.path.exists(cached_dir):
-                    return cached_dir
-                elif fail_if_path_is_invalid:
-                    assert False, f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
+            cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
+            if os.path.exists(cached_dir):
+                return cached_dir
+            elif fail_if_path_is_invalid:
+                assert (
+                    False
+                ), f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
             return f(*args, **kwargs)
 
         return decorated
@@ -248,8 +259,11 @@ def llama_example_root(llm_root, llm_venv):
     example_root = os.path.join(llm_root, "examples", "models", "core", "llama")
     try:
         llm_venv.run_cmd([
-            "-m", "pip", "install", "-r",
-            os.path.join(example_root, "requirements.txt")
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            os.path.join(example_root, "requirements.txt"),
         ])
     except:
         print("pip install error!")
@@ -280,31 +294,11 @@ def gemma_example_root(llm_root, llm_venv):
     "Get gemma example root"
 
     example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
-    # https://nvbugs/4559583 Jax dependency broke the entire pipeline in TRT container
-    # due to the dependency incompatibility with torch, which forced reinstall everything
-    # and caused pipeline to fail. We manually install gemma dependency as a WAR.
-    llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
-    # Install Jax because it breaks dependency
-    google_extension = [
-        "-f",
-        "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
-    ]
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
 
-    # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
-    # "jax[cuda12_pip]~=0.4.19" specifies "nvidia-cudnn-cu12>=8.9" but actually requires "nvidia-cudnn-cu12~=8.9".
-    if "x86_64" in platform.machine():
-        llm_venv.run_cmd(["-m", "pip", "install", "nvidia-cudnn-cu12~=8.9"])
-
-    if "Windows" in platform.system():
-        llm_venv.run_cmd([
-            "-m", "pip", "install", "jax~=0.4.19", "jaxlib~=0.4.19", "--no-deps"
-        ] + google_extension)
-    else:
-        llm_venv.run_cmd([
-            "-m", "pip", "install", "jax[cuda12_pip]~=0.4.19",
-            "jaxlib[cuda12_pip]~=0.4.19", "--no-deps"
-        ] + google_extension)
-    llm_venv.run_cmd(["-m", "pip", "install", "flax~=0.8.0"])
     return example_root
 
 
@@ -620,15 +614,15 @@ def deepseek_v2_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="function")
 def deepseek_v3_model_root(request):
     models_root = llm_models_root()
-    if (request.param == "DeepSeek-V3"):
+    if request.param == "DeepSeek-V3":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3")
-    elif (request.param == "DeepSeek-V3-Lite-bf16"):
+    elif request.param == "DeepSeek-V3-Lite-bf16":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
                                               "bf16")
-    elif (request.param == "DeepSeek-V3-Lite-fp8"):
+    elif request.param == "DeepSeek-V3-Lite-fp8":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
                                               "fp8")
-    elif (request.param == "DeepSeek-V3-Lite-nvfp4_moe_only"):
+    elif request.param == "DeepSeek-V3-Lite-nvfp4_moe_only":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
                                               "nvfp4_moe_only")
     assert exists(
@@ -711,6 +705,7 @@ def llm_venv(llm_root, custom_user_workspace):
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
     from defs.local_venv import PythonVenvRunnerImpl
+
     venv = PythonVenvRunnerImpl("", "", "python3",
                                 os.path.join(os.getcwd(), workspace_dir))
     yield venv
@@ -775,7 +770,8 @@ def whisper_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
     assert request.param in [
-        "large-v2", "large-v3"
+        "large-v2",
+        "large-v3",
     ], "whisper only supports large-v2 or large-v3 for now"
     tllm_model_name = request.param
     whisper_model_root = os.path.join(models_root, "whisper-models",
@@ -795,30 +791,30 @@ def whisper_example_audio_file(whisper_model_root):
 @pytest.fixture(scope="function")
 def multimodal_model_root(request, llm_venv):
     "Get multimodal model root"
-    models_root = os.path.join(llm_models_root(), 'multimodals')
+    models_root = os.path.join(llm_models_root(), "multimodals")
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if 'VILA' in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), 'vila')
-    if 'cogvlm-chat' in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), 'cogvlm-chat')
-    if 'video-neva' in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), 'video-neva')
+    if "VILA" in tllm_model_name:
+        models_root = os.path.join(llm_models_root(), "vila")
+    if "cogvlm-chat" in tllm_model_name:
+        models_root = os.path.join(llm_models_root(), "cogvlm-chat")
+    if "video-neva" in tllm_model_name:
+        models_root = os.path.join(llm_models_root(), "video-neva")
         tllm_model_name = tllm_model_name + ".nemo"
-    if 'neva-22b' in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), 'neva')
+    if "neva-22b" in tllm_model_name:
+        models_root = os.path.join(llm_models_root(), "neva")
         tllm_model_name = tllm_model_name + ".nemo"
-    elif 'Llama-3.2' in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
-    elif 'Mistral-Small' in tllm_model_name:
+    elif "Llama-3.2" in tllm_model_name:
+        models_root = os.path.join(llm_models_root(), "llama-3.2-models")
+    elif "Mistral-Small" in tllm_model_name:
         models_root = llm_models_root()
 
     multimodal_model_root = os.path.join(models_root, tllm_model_name)
 
-    if 'llava-onevision' in tllm_model_name and 'video' in tllm_model_name:
+    if "llava-onevision" in tllm_model_name and "video" in tllm_model_name:
         multimodal_model_root = multimodal_model_root[:-6]
-    elif 'llava-v1.6' in tllm_model_name and 'vision-trtllm' in tllm_model_name:
+    elif "llava-v1.6" in tllm_model_name and "vision-trtllm" in tllm_model_name:
         multimodal_model_root = multimodal_model_root[:-14]
 
     assert os.path.exists(
@@ -827,8 +823,8 @@ def multimodal_model_root(request, llm_venv):
 
     yield (tllm_model_name, multimodal_model_root)
 
-    if 'llava-onevision' in tllm_model_name:
-        llm_venv.run_cmd(['-m', 'pip', 'uninstall', 'llava', '-y'])
+    if "llava-onevision" in tllm_model_name:
+        llm_venv.run_cmd(["-m", "pip", "uninstall", "llava", "-y"])
 
 
 def remove_file(fn):
@@ -1021,6 +1017,9 @@ def llama_model_root(request):
     elif request.param == "llama-3.1-8b-instruct-hf-fp8":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Llama-3.1-8B-Instruct-FP8")
+    elif request.param == "llama-3.1-8b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.1-model",
+                                        "Llama-3.1-8B-Instruct")
     elif request.param == "llama-3.1-8b-hf-nvfp4":
         llama_model_root = os.path.join(models_root, "nvfp4-quantized",
                                         "Meta-Llama-3.1-8B")
@@ -1030,9 +1029,18 @@ def llama_model_root(request):
     elif request.param == "llama-3.2-1b":
         llama_model_root = os.path.join(models_root, "llama-3.2-models",
                                         "Llama-3.2-1B")
+    elif request.param == "llama-3.2-1b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.2-models",
+                                        "Llama-3.2-1B-Instruct")
     elif request.param == "llama-3.2-3b":
         llama_model_root = os.path.join(models_root, "llama-3.2-models",
                                         "Llama-3.2-3B")
+    elif request.param == "llama-3.2-3b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.2-models",
+                                        "Llama-3.2-3B-Instruct")
+    elif request.param == "llama-3.3-70b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.3-models",
+                                        "Llama-3.3-70B-Instruct")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -1194,40 +1202,40 @@ def mamba_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
-    mamba_model_root = os.path.join(models_root, 'mamba', "mamba-130m-hf")
+    mamba_model_root = os.path.join(models_root, "mamba", "mamba-130m-hf")
     if hasattr(request, "param"):
         if request.param == "mamba-2.8b":
-            mamba_model_root = os.path.join(models_root, 'mamba',
+            mamba_model_root = os.path.join(models_root, "mamba",
                                             "mamba-2.8b-hf")
         elif request.param == "mamba-130m":
-            mamba_model_root = os.path.join(models_root, 'mamba',
+            mamba_model_root = os.path.join(models_root, "mamba",
                                             "mamba-130m-hf")
         elif request.param == "mamba-1.4b":
-            mamba_model_root = os.path.join(models_root, 'mamba',
+            mamba_model_root = os.path.join(models_root, "mamba",
                                             "mamba-1.4b-hf")
         elif request.param == "mamba-790m":
-            mamba_model_root = os.path.join(models_root, 'mamba',
+            mamba_model_root = os.path.join(models_root, "mamba",
                                             "mamba-790m-hf")
         elif request.param == "mamba-370m":
-            mamba_model_root = os.path.join(models_root, 'mamba',
+            mamba_model_root = os.path.join(models_root, "mamba",
                                             "mamba-370m-hf")
         elif request.param == "mamba2-2.7b":
-            mamba_model_root = os.path.join(models_root, 'mamba2',
+            mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba2-2.7b")
         elif request.param == "mamba2-1.3b":
-            mamba_model_root = os.path.join(models_root, 'mamba2',
+            mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba2-1.3b")
         elif request.param == "mamba2-780m":
-            mamba_model_root = os.path.join(models_root, 'mamba2',
+            mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba2-780m")
         elif request.param == "mamba2-370m":
-            mamba_model_root = os.path.join(models_root, 'mamba2',
+            mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba2-370m")
         elif request.param == "mamba2-130m":
-            mamba_model_root = os.path.join(models_root, 'mamba2',
+            mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba2-130m")
         elif request.param == "mamba-codestral-7B-v0.1":
-            mamba_model_root = os.path.join(models_root, 'mamba2',
+            mamba_model_root = os.path.join(models_root, "mamba2",
                                             "mamba-codestral-7B-v0.1")
 
     assert exists(mamba_model_root), f"{mamba_model_root} does not exist!"
@@ -1317,14 +1325,23 @@ def llm_lora_model_root(request):
                              "Phi-3-mini-4k-instruct-ru-lora"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
-                os.path.join(models_root, "lora", "starcoder",
-                             "peft-lora-starcoder2-15b-unity-copilot"))
+                os.path.join(
+                    models_root,
+                    "lora",
+                    "starcoder",
+                    "peft-lora-starcoder2-15b-unity-copilot",
+                ))
         elif item == "chinese-mixtral-lora":
             model_root_list.append(
                 os.path.join(models_root, "chinese-mixtral-lora"))
         elif item == "komt-mistral-7b-v1-lora":
             model_root_list.append(
                 os.path.join(models_root, "komt-mistral-7b-v1-lora"))
+        elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
+            model_root_list.append(
+                os.path.join(
+                    models_root, "nemotron-nas",
+                    "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
 
     return ",".join(model_root_list)
 
@@ -1345,9 +1362,14 @@ def llm_dora_model_root(request):
     for item in model_list:
         if item == "commonsense-llama-v3-8b-dora-r32":
             model_root_list.append(
-                os.path.join(models_root, "llama-models-v3", "DoRA-weights",
-                             "llama_dora_commonsense_checkpoints", "LLama3-8B",
-                             "dora_r32"))
+                os.path.join(
+                    models_root,
+                    "llama-models-v3",
+                    "DoRA-weights",
+                    "llama_dora_commonsense_checkpoints",
+                    "LLama3-8B",
+                    "dora_r32",
+                ))
 
     return ",".join(model_root_list)
 
@@ -1360,6 +1382,8 @@ def llm_mistral_model_root(request):
     model_root = os.path.join(models_root, "mistral-7b-v0.1")
     if request.param == "mistral-7b-v0.1":
         model_root = os.path.join(models_root, "mistral-7b-v0.1")
+    if request.param == "mistral-nemo-instruct-2407":
+        model_root = os.path.join(models_root, "Mistral-Nemo-Instruct-2407")
     if request.param == "komt-mistral-7b-v1":
         model_root = os.path.join(models_root, "komt-mistral-7b-v1")
     if request.param == "mistral-7b-v0.3":
@@ -1423,10 +1447,10 @@ def llm_phi_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
-    if 'Phi-3.5' in request.param:
-        phi_model_root = os.path.join(models_root, 'Phi-3.5/' + request.param)
-    elif 'Phi-3' in request.param:
-        phi_model_root = os.path.join(models_root, 'Phi-3/' + request.param)
+    if "Phi-3.5" in request.param:
+        phi_model_root = os.path.join(models_root, "Phi-3.5/" + request.param)
+    elif "Phi-3" in request.param:
+        phi_model_root = os.path.join(models_root, "Phi-3/" + request.param)
     else:
         phi_model_root = os.path.join(models_root, request.param)
 
@@ -1489,7 +1513,8 @@ def llm_internlm_7b_model_root(llm_venv):
 
     call(
         f"git clone https://huggingface.co/internlm/internlm-chat-7b {model_root}",
-        shell=True)
+        shell=True,
+    )
 
     return model_root
 
@@ -1501,8 +1526,10 @@ def llm_internlm2_7b_model_root(llm_venv):
     workspace = llm_venv.get_working_directory()
     model_root = os.path.join(workspace, "internlm2-7b")
 
-    call(f"git clone https://huggingface.co/internlm/internlm2-7b {model_root}",
-         shell=True)
+    call(
+        f"git clone https://huggingface.co/internlm/internlm2-7b {model_root}",
+        shell=True,
+    )
 
     return model_root
 
@@ -1516,7 +1543,8 @@ def llm_internlm_20b_model_root(llm_venv):
 
     call(
         f"git clone https://huggingface.co/internlm/internlm-chat-20b {model_root}",
-        shell=True)
+        shell=True,
+    )
 
     return model_root
 
@@ -1737,8 +1765,11 @@ def qcache_dir(llm_venv, llm_root):
     # Fix the issue that the requirements.txt is not available on aarch64.
     if "aarch64" not in platform.machine() and get_sm_version() >= 89:
         llm_venv.run_cmd([
-            "-m", "pip", "install", "-r",
-            os.path.join(quantization_root, "requirements.txt")
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            os.path.join(quantization_root, "requirements.txt"),
         ])
 
     if not exists(cache_dir):
@@ -1783,11 +1814,12 @@ def star_attention_input_root(llm_root):
     return star_attention_input_root
 
 
-def parametrize_with_ids(argnames: str | Sequence[str],
-                         argvalues: Iterable[ParameterSet | Sequence[object]
-                                             | object], **kwargs):
-    """An alternative to pytest.mark.parametrize with automatically generated test ids.
-    """
+def parametrize_with_ids(
+    argnames: str | Sequence[str],
+    argvalues: Iterable[ParameterSet | Sequence[object] | object],
+    **kwargs,
+):
+    """An alternative to pytest.mark.parametrize with automatically generated test ids."""
     if isinstance(argnames, str):
         argname_list = [n.strip() for n in argnames.split(",")]
     else:
@@ -1814,19 +1846,19 @@ def parametrize_with_ids(argnames: str | Sequence[str],
 @pytest.fixture(autouse=True)
 def skip_by_device_count(request):
     "fixture for skip less device count"
-    if request.node.get_closest_marker('skip_less_device'):
+    if request.node.get_closest_marker("skip_less_device"):
         device_count = get_device_count()
         expected_count = request.node.get_closest_marker(
-            'skip_less_device').args[0]
+            "skip_less_device").args[0]
         if expected_count > int(device_count):
             pytest.skip(
-                f'Device count {device_count} is less than {expected_count}')
+                f"Device count {device_count} is less than {expected_count}")
 
 
 @pytest.fixture(autouse=True)
 def skip_by_mpi_world_size(request):
     "fixture for skip less mpi world size"
-    if request.node.get_closest_marker('skip_less_mpi_world_size'):
+    if request.node.get_closest_marker("skip_less_mpi_world_size"):
         mpi_world_size = get_mpi_world_size()
         device_count = get_device_count()
         if mpi_world_size == 1:
@@ -1836,22 +1868,22 @@ def skip_by_mpi_world_size(request):
             # Otherwise, we follow the mpi world size setting
             total_count = mpi_world_size
         expected_count = request.node.get_closest_marker(
-            'skip_less_mpi_world_size').args[0]
+            "skip_less_mpi_world_size").args[0]
         if expected_count > int(total_count):
             pytest.skip(
-                f'Total world size {total_count} is less than {expected_count}')
+                f"Total world size {total_count} is less than {expected_count}")
 
 
 @pytest.fixture(autouse=True)
 def skip_by_device_memory(request):
     "fixture for skip less device memory"
-    if request.node.get_closest_marker('skip_less_device_memory'):
+    if request.node.get_closest_marker("skip_less_device_memory"):
         device_memory = get_device_memory()
         expected_memory = request.node.get_closest_marker(
-            'skip_less_device_memory').args[0]
+            "skip_less_device_memory").args[0]
         if expected_memory > int(device_memory):
             pytest.skip(
-                f'Device memory {device_memory} is less than {expected_memory}')
+                f"Device memory {device_memory} is less than {expected_memory}")
 
 
 def get_sm_version():
@@ -1882,23 +1914,28 @@ skip_pre_ada = pytest.mark.skipif(
 
 skip_pre_hopper = pytest.mark.skipif(
     get_sm_version() < 90,
-    reason="This test is not supported in pre-Hopper architecture")
+    reason="This test is not supported in pre-Hopper architecture",
+)
 
 skip_pre_blackwell = pytest.mark.skipif(
     get_sm_version() < 100,
-    reason="This test is not supported in pre-Blackwell architecture")
+    reason="This test is not supported in pre-Blackwell architecture",
+)
 
 skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
-    reason="This test is not supported in post-Blackwell architecture")
+    reason="This test is not supported in post-Blackwell architecture",
+)
 
 skip_post_blackwell_ultra = pytest.mark.skipif(
     get_sm_version() >= 103,
-    reason="This test is not supported in post-Blackwell-Ultra architecture")
+    reason="This test is not supported in post-Blackwell-Ultra architecture",
+)
 
 skip_device_contain_gb200 = pytest.mark.skipif(
     check_device_contain(["GB200"]),
-    reason="This test is not supported on GB200 or GB100")
+    reason="This test is not supported on GB200 or GB100",
+)
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
@@ -1911,7 +1948,8 @@ skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
 
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
-    reason="This test is not supported on ARM architecture")
+    reason="This test is not supported on ARM architecture",
+)
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1929,9 +1967,9 @@ def skip_fp4_pre_blackwell(use_fp4):
 @pytest.fixture(autouse=True)
 def skip_device_not_contain(request):
     "skip test if device not contain keyword"
-    if request.node.get_closest_marker('skip_device_not_contain'):
+    if request.node.get_closest_marker("skip_device_not_contain"):
         keyword_list = request.node.get_closest_marker(
-            'skip_device_not_contain').args[0]
+            "skip_device_not_contain").args[0]
         if not check_device_contain(keyword_list):
             pytest.skip(
                 f"Device {get_gpu_device_list()[0]} does not contain keyword in {keyword_list}."
@@ -1965,9 +2003,9 @@ def get_device_memory():
         except (sp.CalledProcessError, ValueError, IndexError):
             # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
             try:
-                with open('/proc/meminfo', 'r') as f:
+                with open("/proc/meminfo", "r") as f:
                     for line in f:
-                        if line.startswith('MemTotal:'):
+                        if line.startswith("MemTotal:"):
                             memory = int(
                                 line.split()[1]) // 1024  # Convert kB to MiB
                             break
@@ -1983,13 +2021,15 @@ def pytest_addoption(parser):
         "-F",
         action="store",
         default=None,
-        help="Path to the file containing the list of tests to run")
+        help="Path to the file containing the list of tests to run",
+    )
     parser.addoption(
         "--workspace",
         "--ws",
         action="store",
         default=None,
-        help="Workspace path to store temp data generated during the tests")
+        help="Workspace path to store temp data generated during the tests",
+    )
     parser.addoption(
         "--waives-file",
         "-S",
@@ -1997,7 +2037,7 @@ def pytest_addoption(parser):
         default=None,
         help=
         "Specify a file containing a list of waives, one per line. After filtering collected tests, Pytest will "
-        "apply the waive state specified by this file to the set of tests to be run."
+        "apply the waive state specified by this file to the set of tests to be run.",
     )
     parser.addoption(
         "--output-dir",
@@ -2005,7 +2045,7 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help=
-        "Directory to store test output. Should point to a new or existing empty directory."
+        "Directory to store test output. Should point to a new or existing empty directory.",
     )
     parser.addoption(
         "--test-prefix",
@@ -2013,35 +2053,53 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help=
-        "It is useful when using such prefix to mapping waive lists for specific GPU, such as 'GH200'"
+        "It is useful when using such prefix to mapping waive lists for specific GPU, such as 'GH200'",
     )
-    parser.addoption("--regexp",
-                     "-R",
-                     action='store',
-                     default=None,
-                     help="A regexp to specify which tests to run")
+    parser.addoption(
+        "--regexp",
+        "-R",
+        action="store",
+        default=None,
+        help="A regexp to specify which tests to run",
+    )
     parser.addoption(
         "--apply-test-list-correction",
         "-C",
-        action='store_true',
+        action="store_true",
         help=
         "Attempt to automatically correct invalid test names in filter files and print the correct name in terminal. "
-        "If the correct name cannot be determined, the invalid test name will be printed to the terminal as well."
+        "If the correct name cannot be determined, the invalid test name will be printed to the terminal as well.",
     )
     parser.addoption("--perf",
                      action="store_true",
                      help="'--perf' will run perf tests")
     parser.addoption(
+        "--run-ray",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Ray orchestrator path for integration tests (disables MPI).",
+    )
+    parser.addoption(
         "--perf-log-formats",
         help=
         "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",
         action="append",
-        default=[])
+        default=[],
+    )
+    parser.addoption(
+        "--test-model-suites",
+        action="store",
+        default=None,
+        help=
+        "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
+        "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
+    )
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_generate_tests(metafunc: pytest.Metafunc):
-    if metafunc.definition.function.__name__ != 'test_unittests_v2':
+    if metafunc.definition.function.__name__ != "test_unittests_v2":
         return
     testlist_path = metafunc.config.getoption("--test-list")
     if not testlist_path:
@@ -2060,7 +2118,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
                 case_part, timeout_part = line.split(" TIMEOUT ", 1)
                 case = case_part.strip()
                 timeout_str = timeout_part.strip()
-                timeout_num_match = re.search(r'\(?(\d+)\)?', timeout_str)
+                timeout_num_match = re.search(r"\(?(\d+)\)?", timeout_str)
                 if timeout_num_match:
                     timeout_min = int(timeout_num_match.group(1))
                     timeout_sec = timeout_min * 60
@@ -2083,6 +2141,7 @@ def pytest_collection_modifyitems(session, config, items):
     waives_file = config.getoption("--waives-file")
     test_prefix = config.getoption("--test-prefix")
     perf_test = config.getoption("--perf")
+    test_model_suites = config.getoption("--test-model-suites")
 
     if perf_test:
         global ALL_PYTEST_ITEMS
@@ -2113,6 +2172,10 @@ def pytest_collection_modifyitems(session, config, items):
     if regexp is not None:
         deselect_by_regex(regexp, items, test_prefix, config)
 
+    if test_model_suites:
+        deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                      config)
+
     if waives_file:
         apply_waives(waives_file, items, config)
 
@@ -2130,11 +2193,62 @@ def pytest_collection_modifyitems(session, config, items):
 def pytest_configure(config):
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+    if config.getoption("--run-ray"):
+        os.environ["TLLM_DISABLE_MPI"] = "1"
+
+
+def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                  config):
+    """Filter tests based on the test model suites specified.
+    If a test matches any of the test model suite names, it is considered selected.
+
+    Args:
+        test_model_suites: String containing test model suite names separated by semicolons
+        items: List of pytest items to filter
+        test_prefix: Test prefix if any
+        config: Pytest config object
+    """
+    if not test_model_suites:
+        return
+
+    # Split by semicolon or space and strip whitespace
+    suite_names = [
+        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
+        if suite.strip()
+    ]
+
+    if not suite_names:
+        return
+
+    selected = []
+    deselected = []
+
+    for item in items:
+        # Get the test name without prefix for comparison
+        test_name = item.nodeid
+        if test_prefix and test_name.startswith(f"{test_prefix}/"):
+            test_name = test_name[len(f"{test_prefix}/"):]
+
+        # Check if any suite name matches the test name
+        found = False
+        for suite_name in suite_names:
+            if suite_name in test_name or test_name.endswith(suite_name):
+                found = True
+                break
+
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):
     """Filter out tests based on the patterns specified in the given list of regular expressions.
-        If a test matches *any* of the expressions in the list it is considered selected."""
+    If a test matches *any* of the expressions in the list it is considered selected."""
     compiled_regexes = []
     regex_list = []
     r = re.compile(regexp)
@@ -2198,7 +2312,7 @@ def test_case(request, llm_root):
     test_cases_file_path = os.path.join(llm_root, test_cases_file)
     case_name = request.param
 
-    with open(test_cases_file_path, 'r', encoding='UTF-8') as file:
+    with open(test_cases_file_path, "r", encoding="UTF-8") as file:
         test_cases = yaml.safe_load(file)
 
     case = test_cases["test_cases"][case_name]
@@ -2229,6 +2343,10 @@ def check_nvlink():
 skip_nvlink_inactive = pytest.mark.skipif(check_nvlink() is False,
                                           reason="nvlink is inactive.")
 
+skip_ray = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="This test is skipped for Ray orchestrator.")
+
 
 @pytest.fixture(scope="function")
 def eval_venv(llm_venv):
@@ -2251,16 +2369,16 @@ def get_host_total_memory():
 @pytest.fixture(autouse=True)
 def skip_by_host_memory(request):
     "fixture for skip less host memory"
-    if request.node.get_closest_marker('skip_less_host_memory'):
+    if request.node.get_closest_marker("skip_less_host_memory"):
         host_memory = get_host_total_memory()
         expected_memory = request.node.get_closest_marker(
-            'skip_less_host_memory').args[0]
+            "skip_less_host_memory").args[0]
         if expected_memory > int(host_memory):
             pytest.skip(
-                f'Host memory {host_memory} is less than {expected_memory}')
+                f"Host memory {host_memory} is less than {expected_memory}")
 
 
-IS_UNDER_CI_ENV = 'JENKINS_HOME' in os.environ
+IS_UNDER_CI_ENV = "JENKINS_HOME" in os.environ
 
 gpu_warning_threshold = 1024 * 1024 * 1024
 
@@ -2271,6 +2389,7 @@ def collect_status(item: pytest.Item):
 
     import psutil
     import pynvml
+
     pynvml.nvmlInit()
 
     handles = {
@@ -2305,17 +2424,20 @@ def collect_status(item: pytest.Item):
             try:
                 p = psutil.Process(entry.pid)
                 host_memory_in_mbs = p.memory_full_info().uss // 1024 // 1024
-                process[entry.pid] = (entry.usedGpuMemory // 1024 // 1024,
-                                      host_memory_in_mbs, p.cmdline())
+                process[entry.pid] = (
+                    entry.usedGpuMemory // 1024 // 1024,
+                    host_memory_in_mbs,
+                    p.cmdline(),
+                )
             except Exception:
                 pass
 
         gpu_memory[idx] = {
             "total_used": total_used,
-            'total': total,
+            "total": total,
             "process": process
         }
-    print('\nCurrent memory status:')
+    print("\nCurrent memory status:")
     print(gpu_memory)
 
 
@@ -2345,6 +2467,14 @@ def disaggregated_test_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="function")
+def serve_test_root(llm_root):
+    "Get servetest root"
+    serve_root = os.path.join(llm_root, "tests/integration/defs/examples/serve")
+
+    return serve_root
+
+
+@pytest.fixture(scope="function")
 def tritonserver_test_root(llm_root):
     "Get tritonserver test root"
     tritonserver_root = os.path.join(llm_root,
@@ -2356,7 +2486,7 @@ def tritonserver_test_root(llm_root):
 @pytest.fixture
 def timeout_from_marker(request):
     """Get timeout value from pytest timeout marker."""
-    timeout_marker = request.node.get_closest_marker('timeout')
+    timeout_marker = request.node.get_closest_marker("timeout")
     if timeout_marker:
         return timeout_marker.args[0] if timeout_marker.args else None
     return None
@@ -2395,3 +2525,16 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def ray_cleanup(llm_venv) -> None:
+    yield
+
+    if mpi_disabled():
+        llm_venv.run_cmd([
+            "-m",
+            "ray.scripts.scripts",
+            "stop",
+        ])

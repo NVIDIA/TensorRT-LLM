@@ -147,7 +147,12 @@ class WorkerCommIpcAddrs(NamedTuple):
 
 
 def is_llm_response(instance):
-    return hasattr(instance, "result")
+    # Duck typing, expect one of:
+    #  tensorrt_llm.bindings.executor.Response
+    #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
+    # Avoid testing for "result", because an error bindings.executor.Response
+    # throws when accessing its result property.
+    return hasattr(instance, "has_error")
 
 
 def print_alive_threads():

@@ -15,28 +15,16 @@ l0_l40s:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_siglip"
+  - unittest/_torch/modeling -k "modeling_qwen2_5vl"
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
   - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image-False]
   - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video-False]
   - test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-image-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-image-True]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-video-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-video-True]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[audio]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
-  - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
-  - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
-  - test_e2e.py::test_openai_completions_with_logit_bias[trtllm_sampler]
-  - test_e2e.py::test_openai_chat_with_logit_bias[trtllm_sampler]
   - accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
 - condition:
     ranges:
@@ -77,7 +65,7 @@ l0_l40s:
   - llmapi/test_llm_examples.py::test_llmapi_example_multilora
   - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
   - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
-  - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+  - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
 - condition:
     ranges:
       system_gpu_count:
@@ -114,3 +102,17 @@ l0_l40s:
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] TIMEOUT (90)
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-v3-8b-instruct-hf]
   - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*l40s*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: fmha
+  tests:
+  - test_fmha.py::test_fmha

@@ -4,7 +4,7 @@
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
-    TensorRT-LLM OpenAI API server
+    TensorRT LLM OpenAI API server
     trtllm-serve <your_model>
 
 On the client side, run:
@@ -45,6 +45,7 @@ from tensorrt_llm.serve.scripts.benchmark_dataset import (
     SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
+from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -144,7 +145,12 @@ def calculate_metrics(
     e2els: list[float] = []
     tput_user: list[float] = []
     latest_avg_decoded_tokens_per_iter: float = 0.0
+    error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
+        if outputs[i].exception_type:
+            exception_type = outputs[i].exception_type
+            error_counts[exception_type] = error_counts.get(exception_type,
+                                                            0) + 1
         if outputs[i].success:
             output_len = outputs[i].output_tokens
             if not output_len:
@@ -178,6 +184,11 @@ def calculate_metrics(
                     i].avg_decoded_tokens_per_iter
         else:
             actual_output_lens.append(0)
+
+    total_error_count = sum(error_counts.values())
+    for exception_type, count in error_counts.items():
+        print(f"Error type: {exception_type}, Count: {count} requests")
+    print(f"Total failed requests: {total_error_count}")
 
     if goodput_config_dict:
         valid_metrics = []
@@ -336,7 +347,8 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests),
+                                          desc="Benchmarking")
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
@@ -433,7 +445,10 @@ async def benchmark(
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+    print("{:<40} {:<10}".format("Total requests:", len(outputs)))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10}".format("Failed requests:",
+                                 len(outputs) - metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
                                     benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
@@ -455,6 +470,12 @@ async def benchmark(
     if metrics.avg_decoded_tokens_per_iter > 0.0:
         print("{:<40} {:<10.2f}".format("Avg Decoded Tokens per Iter:",
                                         metrics.avg_decoded_tokens_per_iter))
+    if len(outputs) - metrics.completed > 0:
+        print(
+            f"=======================!FAILED REQUESTS!=======================")
+        print(f"Total failed requests: {len(outputs) - metrics.completed}")
+        print(
+            f"=====================!CHECK LOG FOR ERRORS!====================")
 
     result = {
         "duration": benchmark_duration,
@@ -576,6 +597,34 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         # Don't use json suffix here as we don't want CI to pick it up
         pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
         write_to_json(pt_file, pt_records)
+
+
+async def fetch_perf_metrics(base_url: str) -> dict:
+    """
+    Fetch performance metrics from the /perf_metrics endpoint.
+
+    Args:
+        base_url: The base URL of the server
+
+    Returns:
+        Dictionary containing the performance metrics
+    """
+    perf_url = f"{base_url}/perf_metrics"
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(perf_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    print(
+                        f"Failed to fetch performance metrics. Status: {response.status}"
+                    )
+                    return {}
+        except Exception as e:
+            print(f"Error fetching performance metrics: {e}")
+            return {}
 
 
 def main(args: argparse.Namespace):
@@ -774,9 +823,8 @@ def main(args: argparse.Namespace):
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
 
-    # Avoid GC processing "static" data - reduce pause times.
-    gc.collect()
-    gc.freeze()
+    # Avoid GC - reduce pause times.
+    gc.disable()
 
     benchmark_result = asyncio.run(
         benchmark(
@@ -857,6 +905,55 @@ def main(args: argparse.Namespace):
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
+
+    # Save per-request breakdown if requested
+    if args.save_request_time_breakdown:
+        print("Fetching request performance metrics...")
+        perf_metrics = asyncio.run(fetch_perf_metrics(base_url))
+
+        if perf_metrics:
+            # Generate filename for perf metrics
+            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+            base_model_id = model_id.split("/")[-1]
+            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                                   if args.max_concurrency is not None else "")
+            perf_filename = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}-perf_metrics.json"
+
+            if args.result_dir:
+                perf_filename = os.path.join(args.result_dir, perf_filename)
+
+            # Save perf metrics to JSON file
+            with open(perf_filename, "w", encoding='utf-8') as outfile:
+                try:
+                    json.dump(perf_metrics, outfile, indent=2)
+                except Exception as e:
+                    print(f"Failed to save perf metrics: {e}")
+
+            print(f"Request performance metrics saved to: {perf_filename}")
+
+            # Create timing diagram from the saved JSON file
+            try:
+                analyzer = RequestTimeBreakdown()
+
+                print("Creating time diagram from request time breakdown...")
+                timing_data = analyzer.parse_json_file(perf_filename)
+
+                if timing_data:
+                    # Generate HTML filename for the timing diagram
+                    diagram_filename = f"{os.path.splitext(perf_filename)[0]}-time_diagram.html"
+                    analyzer.create_timing_diagram(timing_data,
+                                                   diagram_filename)
+
+                    print(f"Time diagram saved to: {diagram_filename}")
+                else:
+                    print(
+                        "No time data found in request time breakdown - skipping diagram creation."
+                    )
+            except Exception as e:
+                print(f"Failed to create time diagram: {e}")
+                print("Performance metrics were still saved successfully.")
+        else:
+            print("Failed to fetch per-request performance metrics.")
 
 
 if __name__ == "__main__":
@@ -1239,6 +1336,13 @@ if __name__ == "__main__":
         "--no-test-input",
         action="store_true",
         help="Skip initial test run with a single prompt.",
+    )
+
+    parser.add_argument(
+        "--save-request-time-breakdown",
+        action="store_true",
+        help=
+        "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
     )
 
     args = parser.parse_args()

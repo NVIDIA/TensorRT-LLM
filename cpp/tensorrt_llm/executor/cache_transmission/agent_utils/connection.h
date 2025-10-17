@@ -71,6 +71,38 @@ struct RequestAndBufferInfo
     }
 };
 
+struct ReadySignalInfo
+{
+    std::string mAgentName;
+    DataContext mContext;
+    bool mIsReady;
+
+    static void serialize(ReadySignalInfo const& readySignalInfo, std::ostream& os)
+    {
+        namespace su = executor::serialize_utils;
+        su::serialize(readySignalInfo.mAgentName, os);
+        su::serialize(readySignalInfo.mContext.getTag(), os);
+        su::serialize(readySignalInfo.mIsReady, os);
+    }
+
+    static ReadySignalInfo deserialize(std::istream& is)
+    {
+        namespace su = executor::serialize_utils;
+        auto agentName = su::deserialize<decltype(mAgentName)>(is);
+        auto contextTag = su::deserialize<decltype(mContext.getTag())>(is);
+        DataContext context{contextTag};
+        auto isReady = su::deserialize<decltype(mIsReady)>(is);
+        return ReadySignalInfo{agentName, context, isReady};
+    }
+
+    static size_t serializedSize(ReadySignalInfo const& readySignalInfo)
+    {
+        namespace su = executor::serialize_utils;
+        return su::serializedSize(readySignalInfo.mAgentName) + su::serializedSize(readySignalInfo.mContext.getTag())
+            + su::serializedSize(readySignalInfo.mIsReady);
+    }
+};
+
 struct NotificationSyncInfo
 {
 
@@ -104,7 +136,7 @@ struct NotificationSyncInfo
 struct NotificationInfo
 {
 
-    std::variant<RequestAndBufferInfo, NotificationSyncInfo> mInfo;
+    std::variant<RequestAndBufferInfo, NotificationSyncInfo, ReadySignalInfo> mInfo;
 
     static void serialize(NotificationInfo const& notificationInfo, std::ostream& os)
     {
@@ -118,6 +150,10 @@ struct NotificationInfo
         {
             NotificationSyncInfo::serialize(std::get<NotificationSyncInfo>(notificationInfo.mInfo), os);
         }
+        else if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
+        {
+            ReadySignalInfo::serialize(std::get<ReadySignalInfo>(notificationInfo.mInfo), os);
+        }
         else
         {
             TLLM_THROW("Unknown variant type");
@@ -130,6 +166,7 @@ struct NotificationInfo
         auto variantIdx = su::deserialize<std::size_t>(is);
         constexpr std::size_t requestAndBufferInfoIdx{0};
         constexpr std::size_t notificationSyncInfoIdx{1};
+        constexpr std::size_t readySignalInfoIdx{2};
         if (variantIdx == requestAndBufferInfoIdx)
         {
             return NotificationInfo{RequestAndBufferInfo::deserialize(is)};
@@ -137,6 +174,10 @@ struct NotificationInfo
         else if (variantIdx == notificationSyncInfoIdx)
         {
             return NotificationInfo{NotificationSyncInfo::deserialize(is)};
+        }
+        else if (variantIdx == readySignalInfoIdx)
+        {
+            return NotificationInfo{ReadySignalInfo::deserialize(is)};
         }
         else
         {
@@ -157,6 +198,10 @@ struct NotificationInfo
         {
             totalSize += NotificationSyncInfo::serializedSize(std::get<NotificationSyncInfo>(notificationInfo.mInfo));
         }
+        else if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
+        {
+            totalSize += ReadySignalInfo::serializedSize(std::get<ReadySignalInfo>(notificationInfo.mInfo));
+        }
         else
         {
             TLLM_THROW("Unknown variant type");
@@ -175,10 +220,13 @@ public:
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(
         batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx);
-    void setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx);
+    void setSenderState(
+        MemoryDesc mCacheReceiverBufferDesc, int valideSegmentIdx, std::pair<size_t, size_t> offsetRatio);
     [[nodiscard]] std::optional<size_t> getCacheBufferId() const;
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
+    void sendReadySignal(DataContext const& ctx, bool isReady) const;
+    bool recvReadySignal(DataContext const& ctx) const;
 
 private:
     std::string mAgentName;
@@ -186,8 +234,9 @@ private:
 
     struct SenderState
     {
-        MemoryDesc mReceiverBufferDesc{nullptr, 0, 0};
+        MemoryDesc mCacheReceiverBufferDesc{nullptr, 0, 0};
         int validSegmentIdx{0};
+        std::pair<size_t, size_t> mOffsetRatio;
         SenderState() = default;
     };
 
@@ -203,7 +252,8 @@ private:
 class AgentConnectionManager : public ConnectionManager
 {
 public:
-    AgentConnectionManager(batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager);
+    AgentConnectionManager(
+        batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -216,12 +266,17 @@ public:
         std::optional<std::string> metadata = std::nullopt, bool isSender = false);
     int getDeviceId() const;
     [[nodiscard]] std::string const& getAgentName() const;
-    void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo);
+
+    template <typename NotificationType>
+    void waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo);
+    void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo);
+    void waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo);
 
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
     CommState mCommState;
+    CacheState mCacheState;
     batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
     std::mutex mNotificationMutex;
     std::unordered_map<std::string, std::list<std::string>> mUnhandledNotifications;

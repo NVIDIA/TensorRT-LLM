@@ -15,7 +15,7 @@ from tensorrt_llm import LLM, SamplingParams, logger
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 
 # This is a simple example of the use of the KV cache connector.
 # It persists KV cache contents into a folder, and can load them back on subsequent runs.
@@ -33,8 +33,8 @@ class PersistentKvCacheConnectorMetadata:
 
 class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, llm_args: TorchLlmArgs):
+        super().__init__(llm_args)
 
         self.kv_cache_tensor = None
 
@@ -80,10 +80,10 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
 class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
-    def __init__(self, tokens_per_block):
-        super().__init__()
+    def __init__(self, llm_args: TorchLlmArgs):
+        super().__init__(llm_args)
 
-        self.block_size = tokens_per_block
+        self.block_size = self._llm_args.kv_cache_config.tokens_per_block
         self.pending_loads = {}
 
         self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY,

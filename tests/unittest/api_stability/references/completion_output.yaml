@@ -10,13 +10,21 @@ methods:
       request_perf_metrics:
         annotation: Optional[tensorrt_llm.bindings.executor.RequestPerfMetrics]
         default: null
+      additional_context_outputs:
+        annotation: Optional[Dict[str, torch.Tensor]]
+        default: null
+        status: prototype
+      additional_generation_outputs:
+        annotation: Optional[Dict[str, torch.Tensor]]
+        default: null
+        status: prototype
     return_annotation: None
 properties:
   length:
     annotation: int
     default: inspect._empty
   logprobs_diff:
-    annotation: List[float]
+    annotation: list[dict[int, tensorrt_llm.executor.result.Logprob]] | List[float]
     default: inspect._empty
   text_diff:
     annotation: str
