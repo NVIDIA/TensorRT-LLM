@@ -35,8 +35,7 @@ def enforce_single_worker(monkeypatch):
         [True, "TRTLLM", False, True, True, False, True, False, False],
         [True, "TRTLLM", True, False, True, True, True, False, False],
         [True, "TRTLLM", True, False, True, False, True, False, False],
-        # TODO: nvbugs/5461761
-        # [True, "TRTLLM", True, False, False, True, True, False],
+        [True, "TRTLLM", True, False, False, True, True, False, False],
         [True, "TRTLLM", False, False, False, False, True, False, False],
         [False, "TRTLLM", False, False, False, False, True, False, False],
         [True, "TRTLLM", False, False, False, False, False, True, False],

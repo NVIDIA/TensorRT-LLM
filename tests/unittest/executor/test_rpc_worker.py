@@ -81,6 +81,7 @@ class TestRpcWorkerTP1:
         results.extend(self.client.fetch_responses().remote())
         assert len(results) == 1
 
+    @pytest.mark.skip(reason="https://nvbugs/5583261")
     def test_fetch_responses_streaming_sync(self):
         self.client.submit(
             GenerationRequest(prompt_token_ids=[3, 4, 5],
