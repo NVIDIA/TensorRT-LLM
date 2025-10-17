@@ -462,7 +462,7 @@ def predecessors(
                 continue
             if (not include) or (include and include(arg)):
                 preds.append(arg)
-    return preds.reverse()
+    return list(reversed(preds))
 
 
 def successors(
@@ -485,4 +485,4 @@ def successors(
             continue
         if (not include) or (include and include(user)):
             succs.append(user)
-    return succs.reverse()
+    return list(reversed(succs))
