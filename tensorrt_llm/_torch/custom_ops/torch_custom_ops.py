@@ -539,23 +539,6 @@ def _(
                              dtype=output_dtype)
 
 
-# Legacy cublas_fp4_scaled_mm - for testing and backward compatibility
-@torch.library.register_fake("trtllm::cublas_fp4_scaled_mm")
-def _(
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Fake tensor implementation for cuBLASLt FP4 GEMM (legacy)."""
-    # Output shape: [M, N] where M = mat_a.size(0), N = mat_b.size(0)
-    output_size = [mat_a.size(0), mat_b.size(0)]
-    return mat_a.new_empty(output_size, dtype=out_dtype)
-
-
 @torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
 def nvfp4_gemm(
     act_fp4: torch.Tensor,

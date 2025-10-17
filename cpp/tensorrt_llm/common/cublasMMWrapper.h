@@ -84,10 +84,19 @@ public:
         cublasLtMatmulAlgo_t const& algo, bool hasAlgo, bool usingCublasLt);
 
 #ifdef ENABLE_CUBLASLT_FP4_GEMM
-    /********************** FP4 GEMMs **********************/
-    void Fp4Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
+    /********************** Block-Scaled GEMMs **********************/
+    // Generic block-scaled GEMM interface supporting FP4, FP8, and other quantized formats
+    // that require per-block scaling factors (a_sf, b_sf)
+
+    // Uses default/heuristic algorithm
+    void BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
         void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
-        void const* b_sf, float const* alpha, float const* beta);
+        void const* b_sf, float const* alpha);
+
+    // Uses specified algorithm (for autotuning)
+    void BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
+        void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+        void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo);
 #endif
 
     void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,

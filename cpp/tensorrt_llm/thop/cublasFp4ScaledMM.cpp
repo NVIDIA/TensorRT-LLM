@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "cublasFp4ScaledMM.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -77,7 +76,7 @@ inline cudaDataType_t getCudaDataType(at::ScalarType dtype)
 }
 
 void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
-    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha, torch::Tensor const& beta)
+    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha)
 {
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[0];
@@ -120,17 +119,13 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     TLLM_CHECK_WITH_INFO(a_sf_ptr != nullptr, "a_sf_ptr is null");
     TLLM_CHECK_WITH_INFO(b_sf_ptr != nullptr, "b_sf_ptr is null");
 
-    // Validate alpha and beta tensors before accessing data
+    // Validate alpha tensor before accessing data
     TLLM_CHECK_WITH_INFO(alpha.numel() > 0, "Alpha tensor is empty");
-    TLLM_CHECK_WITH_INFO(beta.numel() > 0, "Beta tensor is empty");
     TLLM_CHECK_WITH_INFO(alpha.dtype() == torch::kFloat32, "Alpha tensor must be float32");
-    TLLM_CHECK_WITH_INFO(beta.dtype() == torch::kFloat32, "Beta tensor must be float32");
 
     auto* alpha_ptr = alpha.data_ptr<float>();
-    auto* beta_ptr = beta.data_ptr<float>();
 
     TLLM_CHECK_WITH_INFO(alpha_ptr != nullptr, "alpha_ptr is null");
-    TLLM_CHECK_WITH_INFO(beta_ptr != nullptr, "beta_ptr is null");
 
     // Set workspace and stream
     cublasWrapper->setStream(stream);
@@ -145,90 +140,15 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     //   2. Using CUBLAS_OP_T for first matrix, CUBLAS_OP_N for second
     //   3. Passing dimensions as (n, m, k) instead of (m, n, k)
     //   4. Swapping scaling factors to match (b_sf_ptr, a_sf_ptr)
-    cublasWrapper->Fp4Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr, k, // B matrix (swapped to first position)
-        a_ptr, k,                                                       // A matrix (swapped to second position)
-        out_ptr, n,                                                     // Output: C[m, n] in row-major
-        b_sf_ptr, a_sf_ptr,                                             // Scaling factors (also swapped)
-        alpha_ptr, beta_ptr);
+    // Note: beta is always 0 and is managed internally by BlockScaleGemm
+    cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr, k, // B matrix (swapped to first position)
+        a_ptr, k,                                                              // A matrix (swapped to second position)
+        out_ptr, n,                                                            // Output: C[m, n] in row-major
+        b_sf_ptr, a_sf_ptr,                                                    // Scaling factors (also swapped)
+        alpha_ptr);                                                            // Uses default algorithm (nullptr)
 }
 
 } // namespace
-
-Tensor& cublas_fp4_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    Tensor const& alpha, Tensor const& beta, Tensor& out)
-{
-    // Check device
-    CHECK_TH_CUDA(mat_a);
-    CHECK_TH_CUDA(mat_b);
-    CHECK_TH_CUDA(scale_a);
-    CHECK_TH_CUDA(scale_b);
-    CHECK_TH_CUDA(alpha);
-    CHECK_TH_CUDA(beta);
-    CHECK_TH_CUDA(out);
-
-    // Ensure all tensors are on the same device
-    auto const deviceIndex = mat_a.get_device();
-    TORCH_CHECK(mat_b.get_device() == deviceIndex, "mat_b must be colocated with mat_a");
-    TORCH_CHECK(scale_a.get_device() == deviceIndex, "scale_a must be colocated with mat_a");
-    TORCH_CHECK(scale_b.get_device() == deviceIndex, "scale_b must be colocated with mat_a");
-    TORCH_CHECK(alpha.get_device() == deviceIndex, "alpha must be colocated with mat_a");
-    TORCH_CHECK(beta.get_device() == deviceIndex, "beta must be colocated with mat_a");
-    TORCH_CHECK(out.get_device() == deviceIndex, "out must be colocated with mat_a");
-
-    // Check dimensions
-    TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && out.dim() == 2);
-    TORCH_CHECK(out.sizes()[0] == mat_a.sizes()[0] && // m
-        mat_a.sizes()[1] == mat_b.sizes()[1] &&       // k
-        mat_b.sizes()[0] == out.sizes()[1]);          // n
-
-    // Check scaling factors
-    TORCH_CHECK(alpha.numel() == 1);
-    TORCH_CHECK(beta.numel() == 1);
-
-    // Check data types - FP4 is typically represented as uint8 in PyTorch
-    TORCH_CHECK(mat_a.dtype() == torch::kUInt8);
-    TORCH_CHECK(mat_b.dtype() == torch::kUInt8);
-    TORCH_CHECK(scale_a.dtype() == torch::kUInt8);
-    TORCH_CHECK(scale_b.dtype() == torch::kUInt8);
-    TORCH_CHECK(alpha.dtype() == torch::kFloat32);
-    TORCH_CHECK(beta.dtype() == torch::kFloat32);
-
-    cublas_fp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, beta);
-    return out;
-}
-
-Tensor cublas_fp4_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    Tensor const& alpha, Tensor const& beta, std::optional<c10::ScalarType> out_dtype)
-{
-    TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
-    TORCH_CHECK(mat_a.sizes()[1] == mat_b.sizes()[1]);            // mat_a is [m, k], mat_b is [n, k]
-
-    auto const out_dtype_ = out_dtype.value_or(torch::kBFloat16); // Default to BF16
-    std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[0]};
-
-    Tensor out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
-
-    return cublas_fp4_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, alpha, beta, out);
-}
-
-torch::Tensor cublas_fp4_scaled_mm_meta(torch::Tensor const& mat_a, torch::Tensor const& mat_b,
-    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha, torch::Tensor const& beta,
-    c10::optional<torch::ScalarType> out_dtype)
-{
-    auto const out_dtype_ = out_dtype.value_or(torch::kBFloat16);
-
-    // Simplified and more stable shape inference
-    // Avoid complex checks that might trigger recompilation
-    auto m = mat_a.size(0);
-    auto n = mat_b.size(0);
-
-    // Output shape: [M, N]
-    std::vector<int64_t> output_size = {m, n};
-
-    // Use the most stable tensor creation method
-    // Copy all properties from input tensor to ensure consistency
-    return torch::empty(output_size, mat_a.options().dtype(out_dtype_));
-}
 
 // CublasLt FP4 GEMM Runner with auto-tuning support
 class CublasLtFP4GemmRunner : public torch::CustomClassHolder
@@ -278,9 +198,6 @@ public:
         // Get algorithm cache
         auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);
 
-        // Get shared beta tensor (zero, per-device)
-        auto const& beta = getBetaTensor(mat1.device());
-
         // Select algorithm
         bool has_algo = false;
         cublasLtMatmulAlgo_t const* algo_ptr = nullptr;
@@ -305,11 +222,10 @@ public:
                 best_idx, cache.heuristics.size(), m, n, k);
         }
 
-        // Execute GEMM
+        // Execute GEMM (beta is always 0 and is managed internally)
         if (has_algo)
         {
-            cublas_fp4_gemm_caller_with_algo(
-                out, mat1, mat2, mat1_scale, mat2_scale, alpha, beta, *algo_ptr, mOutputDtype);
+            cublas_fp4_gemm_caller_with_algo(out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype);
         }
         else
         {
@@ -318,7 +234,7 @@ public:
                 "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
                 "for shape (m=%d, n=%d, k=%d)",
                 tactic, cache.heuristics.size(), m, n, k);
-            cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha, beta);
+            cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha);
         }
 
         return out;
@@ -352,20 +268,6 @@ public:
     }
 
 private:
-    // Get or create a zero beta tensor for the given device
-    static at::Tensor const& getBetaTensor(c10::Device device)
-    {
-        thread_local std::unordered_map<int, at::Tensor> beta_tensors;
-        int device_id = device.index();
-
-        if (beta_tensors.find(device_id) == beta_tensors.end())
-        {
-            beta_tensors[device_id] = torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        }
-
-        return beta_tensors[device_id];
-    }
-
     struct AlgoCache
     {
         std::vector<cublasLtMatmulHeuristicResult_t> heuristics;
@@ -483,7 +385,7 @@ private:
     // Helper function to run GEMM with a specific algorithm
     static void cublas_fp4_gemm_caller_with_algo(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
         torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha,
-        torch::Tensor const& beta, cublasLtMatmulAlgo_t const& algo, at::ScalarType output_dtype)
+        cublasLtMatmulAlgo_t const& algo, at::ScalarType output_dtype)
     {
         int32_t m = a.sizes()[0];
         int32_t n = b.sizes()[0];
@@ -518,17 +420,13 @@ private:
         void const* a_sf_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(scale_a.data_ptr());
         void const* b_sf_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(scale_b.data_ptr());
 
-        // Validate alpha and beta tensors before accessing data
+        // Validate alpha tensor before accessing data
         TLLM_CHECK_WITH_INFO(alpha.numel() > 0, "Alpha tensor is empty");
-        TLLM_CHECK_WITH_INFO(beta.numel() > 0, "Beta tensor is empty");
         TLLM_CHECK_WITH_INFO(alpha.dtype() == torch::kFloat32, "Alpha tensor must be float32");
-        TLLM_CHECK_WITH_INFO(beta.dtype() == torch::kFloat32, "Beta tensor must be float32");
 
         auto* alpha_ptr = alpha.data_ptr<float>();
-        auto* beta_ptr = beta.data_ptr<float>();
 
         TLLM_CHECK_WITH_INFO(alpha_ptr != nullptr, "alpha_ptr is null");
-        TLLM_CHECK_WITH_INFO(beta_ptr != nullptr, "beta_ptr is null");
 
         cublasWrapper->setStream(stream);
         cublasWrapper->setWorkspace(ws_ptr);
@@ -537,31 +435,20 @@ private:
         //   PyTorch uses row-major layout: A[m, k] x B[n, k]^T = C[m, n]
         //   cuBLASLt expects column-major layout: B^T[k, n] x A^T[k, m] = C[m, n]
         // Conversion is achieved by:
-        //   1. Creating descriptors with swapped dimensions (n, m, k)
-        //   2. Swapping matrix pointers in cublasLtMatmul call (b_ptr, a_ptr)
-        //   3. Swapping scaling factors to match matrices (b_sf_ptr, a_sf_ptr)
+        //   1. Swapping A and B matrices (b_ptr comes before a_ptr)
+        //   2. Using CUBLAS_OP_T for first matrix, CUBLAS_OP_N for second
+        //   3. Passing dimensions as (n, m, k) instead of (m, n, k)
+        //   4. Swapping scaling factors to match matrices (b_sf_ptr, a_sf_ptr)
 
-        // Create descriptors with CUBLAS_OP_T for first matrix, CUBLAS_OP_N for second
-        cublasWrapper->createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, 0);
-
-        // Create D descriptor for output matrix (use the same outType computed earlier)
-        cublasLtMatrixLayout_t Ddesc = NULL;
-        check_cuda_error(cublasLtMatrixLayoutCreate(&Ddesc, outType, n, m, n));
-
-        // Set scale descriptors (swapped to match the swapped matrices)
-        cublasWrapper->setScaleDescriptors(const_cast<void*>(b_sf_ptr), const_cast<void*>(a_sf_ptr));
-
-        // Execute with specified algorithm
-        // b_ptr pairs with ADesc, a_ptr pairs with BDesc (matching the createDescriptors call)
-        check_cuda_error(cublasLtMatmul(cublasWrapper->getCublasLtHandle(), cublasWrapper->getOperationDesc(),
-            alpha_ptr, b_ptr, cublasWrapper->getADesc(), a_ptr, cublasWrapper->getBDesc(), beta_ptr, out_ptr,
-            cublasWrapper->getCDesc(), out_ptr, Ddesc, &algo, ws_ptr, CUBLAS_WORKSPACE_SIZE, stream));
-
-        sync_check_cuda_error(stream);
-
-        if (Ddesc)
-            cublasLtMatrixLayoutDestroy(Ddesc);
-        cublasWrapper->destroyDescriptors();
+        // Use BlockScaleGemm with specified algorithm for autotuning
+        // Note: beta is always 0 and is managed internally by BlockScaleGemm
+        cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr,
+            k,                  // B matrix (swapped to first position)
+            a_ptr, k,           // A matrix (swapped to second position)
+            out_ptr, n,         // Output: C[m, n] in row-major
+            b_sf_ptr, a_sf_ptr, // Scaling factors (also swapped)
+            alpha_ptr,          // Alpha
+            &algo);             // Use specified algorithm
     }
 };
 
@@ -574,14 +461,4 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def("run_gemm", &torch_ext::CublasLtFP4GemmRunner::runGemm)
         .def("get_num_heuristic_algos", &torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos)
         .def("set_best_tactic", &torch_ext::CublasLtFP4GemmRunner::setBestTactic);
-
-    // Legacy cublas_fp4_scaled_mm op - for testing and backward compatibility
-    m.def(
-        "cublas_fp4_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b,"
-        " Tensor alpha, Tensor beta, ScalarType? out_dtype=None) -> (Tensor out)");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("cublas_fp4_scaled_mm", &torch_ext::cublas_fp4_scaled_mm);
 }

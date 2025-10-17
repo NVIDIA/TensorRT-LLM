@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cublasVersionCheck.h"
 #include <algorithm>
+#include <unordered_map>
 
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
@@ -538,56 +539,114 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasL
 }
 
 #ifdef ENABLE_CUBLASLT_FP4_GEMM
-void CublasMMWrapper::Fp4Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k,
-    void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
-    void const* b_sf, float const* alpha, float const* beta)
+
+namespace
 {
-    // Verify FP4 configuration
+// Helper function: Get or create a zero beta tensor on GPU for the given device
+// Beta is always 0 for FP4 GEMM and is allocated once per device per thread
+float const* getBetaDevicePointer()
+{
+    thread_local static std::unordered_map<int, float*> beta_per_device;
+
+    int current_device;
+    cudaGetDevice(&current_device);
+
+    auto it = beta_per_device.find(current_device);
+    if (it == beta_per_device.end())
+    {
+        // Allocate GPU memory for beta and initialize to 0
+        float* d_beta;
+        cudaMalloc(&d_beta, sizeof(float));
+        cudaMemset(d_beta, 0, sizeof(float));
+        beta_per_device[current_device] = d_beta;
+        return d_beta;
+    }
+
+    return it->second;
+}
+} // namespace
+
+// BlockScaleGemm Version 1: Default algorithm (uses first valid heuristic)
+void CublasMMWrapper::BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
+    int const k, void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+    void const* b_sf, float const* alpha)
+{
+    // Forward to the overloaded version with nullptr (use default algorithm)
+    BlockScaleGemm(transa, transb, m, n, k, A, lda, B, ldb, C, ldc, a_sf, b_sf, alpha, nullptr);
+}
+
+// BlockScaleGemm Version 2: Specified algorithm (unified implementation)
+void CublasMMWrapper::BlockScaleGemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
+    int const k, void const* A, int const lda, void const* B, int const ldb, void* C, int const ldc, void const* a_sf,
+    void const* b_sf, float const* alpha, cublasLtMatmulAlgo_t const* algo)
+{
+    // Verify input data types (currently supports FP4, can be extended to more formats in the future)
     TLLM_CHECK_WITH_INFO(mAType == CUDA_R_4F_E2M1 && mBType == CUDA_R_4F_E2M1,
-        "FP4 GEMM requires FP4 input types. Call setFP4GemmConfig() first.");
+        "BlockScaleGemm currently requires FP4 input types. "
+        "Future versions may support other quantized formats with block-wise scaling.");
 
     // Validate input pointers
     TLLM_CHECK_WITH_INFO(A != nullptr, "A pointer is null");
     TLLM_CHECK_WITH_INFO(B != nullptr, "B pointer is null");
     TLLM_CHECK_WITH_INFO(C != nullptr, "C pointer is null");
-    TLLM_CHECK_WITH_INFO(a_sf != nullptr, "a_sf pointer is null");
-    TLLM_CHECK_WITH_INFO(b_sf != nullptr, "b_sf pointer is null");
+    TLLM_CHECK_WITH_INFO(a_sf != nullptr, "a_sf (A scale factor) pointer is null");
+    TLLM_CHECK_WITH_INFO(b_sf != nullptr, "b_sf (B scale factor) pointer is null");
     TLLM_CHECK_WITH_INFO(alpha != nullptr, "alpha pointer is null");
-    TLLM_CHECK_WITH_INFO(beta != nullptr, "beta pointer is null");
 
-    // Create descriptors for FP4 GEMM
+    // Beta is always 0 for FP4 GEMM, get per-device GPU pointer
+    float const* beta = getBetaDevicePointer();
+
+    // Create descriptors for block-scaled GEMM
     createDescriptors(transa, transb, m, n, k, lda, ldb, ldc, 0);
 
-    // Create D descriptor for FP4 GEMM (output descriptor)
+    // Create D descriptor for output matrix
     cublasLtMatrixLayout_t Ddesc = NULL;
     check_cuda_error(cublasLtMatrixLayoutCreate(&Ddesc, mCType, m, n, ldc));
 
-    // Set scaling descriptors
+    // Set block-wise scaling descriptors
     setScaleDescriptors(const_cast<void*>(a_sf), const_cast<void*>(b_sf));
 
     // Validate cuBLASLt handle
     TLLM_CHECK_WITH_INFO(mCublasLtHandle != nullptr, "cuBLASLt handle is null");
 
-    // Get heuristic algorithm using D descriptor
-    auto heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, Ddesc);
+    // Determine which algorithm to use
+    cublasLtMatmulAlgo_t const* selected_algo = algo;
+    cublasLtMatmulAlgo_t default_algo;
 
-    if (heuristics.empty())
+    if (algo == nullptr)
     {
-        if (Ddesc)
-            cublasLtMatrixLayoutDestroy(Ddesc);
-        destroyDescriptors();
-        throw std::runtime_error("No suitable cuBLASLt algorithm found for FP4 GEMM");
-    }
+        // No algorithm specified, use heuristic (default behavior)
+        auto heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, Ddesc);
 
-    // Use the first valid heuristic
-    auto const& heuristic = heuristics[0];
-    bool hasAlgo = heuristic.state == CUBLAS_STATUS_SUCCESS && heuristic.workspaceSize <= CUBLAS_WORKSPACE_SIZE;
+        if (heuristics.empty())
+        {
+            if (Ddesc)
+                cublasLtMatrixLayoutDestroy(Ddesc);
+            destroyDescriptors();
+            throw std::runtime_error("No suitable cuBLASLt algorithm found for block-scaled GEMM");
+        }
+
+        // Use the first valid heuristic
+        auto const& heuristic = heuristics[0];
+        bool hasAlgo = heuristic.state == CUBLAS_STATUS_SUCCESS && heuristic.workspaceSize <= CUBLAS_WORKSPACE_SIZE;
+
+        if (hasAlgo)
+        {
+            default_algo = heuristic.algo;
+            selected_algo = &default_algo;
+        }
+        else
+        {
+            selected_algo = nullptr; // No valid algorithm, let cuBLASLt choose
+        }
+    }
 
     int workspaceSize = mCublasWorkspace == NULL ? 0 : CUBLAS_WORKSPACE_SIZE;
 
-    // Call cuBLASLt matmul directly
+    // Call cuBLASLt matmul with selected or default algorithm
     check_cuda_error(cublasLtMatmul(getCublasLtHandle(), mOperationDesc, alpha, A, mADesc, B, mBDesc, beta, C, mCDesc,
-        C, Ddesc, (hasAlgo ? (&heuristic.algo) : NULL), mCublasWorkspace, workspaceSize, mStream));
+        C, Ddesc, selected_algo, // nullptr or specific algorithm
+        mCublasWorkspace, workspaceSize, mStream));
 
     // Synchronize stream
     sync_check_cuda_error(mStream);
@@ -597,6 +656,7 @@ void CublasMMWrapper::Fp4Gemm(cublasOperation_t transa, cublasOperation_t transb
         cublasLtMatrixLayoutDestroy(Ddesc);
     destroyDescriptors();
 }
+
 #endif
 
 } // namespace common
