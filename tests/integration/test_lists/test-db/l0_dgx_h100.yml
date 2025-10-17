@@ -35,6 +35,8 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True]
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
+  # llmapi
+  - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
 - condition:
     ranges:
       system_gpu_count:
