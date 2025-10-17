@@ -10,9 +10,9 @@ __global__ void kernel_warmup(uint64_t cycles)
     }
 }
 
-void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr)
+void warmup(cudaDeviceProp const& prop, int const& clockRate, float ms, cudaStream_t stream = nullptr)
 {
-    uint64_t const nbCycles = std::round(prop.clockRate * ms); // clockRate is in kHz
+    uint64_t const nbCycles = std::round(clockRate * ms); // clockRate is in kHz
     kernel_warmup<<<16, 128, 0, stream>>>(nbCycles);
     checkCuda(cudaGetLastError());
 }

@@ -39,7 +39,7 @@
 #define USE_SMALL_IO 1
 #endif
 
-void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr);
+void warmup(cudaDeviceProp const& prop, int const& clockRate, float ms, cudaStream_t stream = nullptr);
 bool const isTracing = []()
 {
     auto const v = std::getenv("XQA_IS_TRACING");
@@ -79,7 +79,18 @@ public:
     {
         if (!isTracing)
         {
-            checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), dstDevice, stream));
+            cudaMemLocation loc;
+            if (dstDevice >= 0)
+            {
+                loc.type = cudaMemLocationTypeDevice;
+            }
+            else
+            {
+                loc.type = cudaMemLocationTypeHost;
+            }
+            loc.id = dstDevice;
+            // flag must be zero now according to CUDA API document
+            checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), loc, 0 /* flag */, stream));
         }
     }
 
@@ -161,10 +172,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 
     checkCuda(cudaFree(nullptr));
-    int device;
+    int device, clockRate;
     checkCuda(cudaGetDevice(&device));
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties(&prop, device));
+    cudaDeviceGetAttribute(&clockRate, cudaDevAttrMemoryClockRate, device);
     if (verbose)
     {
         printf("SM count: %d\n", prop.multiProcessorCount);
@@ -760,7 +772,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             printf("warming up\n");
         }
 
-        warmup(prop, 20.F, stream);
+        warmup(prop, clockRate, 20.F, stream);
         for (int32_t i = 0; i < 20; i++)
         {
             runKernel();
@@ -790,7 +802,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         float ms;
         checkCuda(cudaEventElapsedTime(&ms, tic, toc));
         ms /= nbIters;
-        float const bandwidth = 2.f * prop.memoryBusWidth * prop.memoryClockRate * 1000 / 8;
+        float const bandwidth = 2.f * prop.memoryBusWidth * clockRate * 1000 / 8;
 #if BEAM_WIDTH == 1
         size_t nbLoadedCacheTokens = seqLen * beamWidth * batchSize;
 #else
@@ -819,7 +831,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         {
             printf("done\n");
             printf("time: %f ms\n", ms);
-            printf("mem bus width = %d\nmem clock rate = %d\n", prop.memoryBusWidth, prop.memoryClockRate);
+            printf("mem bus width = %d\nmem clock rate = %d\n", prop.memoryBusWidth, clockRate);
             printf("bandwidth = %e\n", (float) bandwidth);
             printf("traffic=%e\n", (float) totalTraffic);
         }
