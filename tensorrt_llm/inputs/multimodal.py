@@ -723,7 +723,7 @@ def find_mm_token_positions(
     mm_positions = torch.where(mm_mask)[0].tolist()
     assert len(mm_positions) == sum(
         num_mm_tokens
-    ), f"Number of multimodal tokens does not match sum of all lengths"
+    ), f"Number of multimodal tokens does not match sum of all lengths {len(mm_positions)} != {sum(num_mm_tokens)}"
 
     # Use num_mm_tokens to find the starting position of each chunk
     start_positions = []

@@ -27,6 +27,8 @@ from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
 VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
+# Set max_num_tiles to 1 for video modality, to match the training behavior.
+VIDEO_MAX_NUM_TILES = 1
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
@@ -323,8 +325,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
         image_height = image.height
         image_width = image.width
-        target_ratios = _get_internvl_target_ratios(
-            1, self.processor.max_num_tiles)
+        if "max_num_tiles" in kwargs:
+            max_num_tiles = kwargs["max_num_tiles"]
+        else:
+            max_num_tiles = self.processor.max_num_tiles
+        target_ratios = _get_internvl_target_ratios(1, max_num_tiles)
         blocks = _calculate_targets(image_width, image_height, target_ratios,
                                     self.image_size)
         if self.processor.use_thumbnail and blocks != 1:
@@ -348,6 +353,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         num_frames = len(video)
         if video_pruning_ratio > 0:
             num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
+                                                                 max_num_tiles=VIDEO_MAX_NUM_TILES,
                                                                  **kwargs)
             num_image_tokens_per_frame = num_tokens_per_frame - len(
                 self.get_mm_special_token_ids())
@@ -365,7 +371,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             # No pruning - sum tokens for all frames
             num_total_tokens = sum(
                 self.get_num_tokens_per_image(
-                    image=frame, video_pruning_ratio=None, **kwargs)
+                    image=frame, video_pruning_ratio=None, max_num_tiles=VIDEO_MAX_NUM_TILES, **kwargs)
                 for frame in video)
         return num_total_tokens
 
@@ -446,9 +452,12 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                     ]
 
                 # Process video frames.
+                orig_max_num_tiles = self.processor.max_num_tiles
+                self.processor.max_num_tiles = VIDEO_MAX_NUM_TILES
                 processed_images = self.processor(images=video,
                                                   return_tensors='pt').to(
                                                       self.device)
+                self.processor.max_num_tiles = orig_max_num_tiles
                 t, _, h, w = processed_images['pixel_values'].shape
                 num_patches_list.append(processed_images['num_patches'])
                 pixel_values_list.append(processed_images['pixel_values'])

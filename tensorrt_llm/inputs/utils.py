@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import math
+import os
 import tempfile
 from collections import defaultdict
 from io import BytesIO
@@ -126,7 +127,7 @@ async def async_load_image(
         return image
 
 
-def load_video(
+def _load_video_by_cv2(
         video: str,
         num_frames: int = 10,
         fps: int = 30,
@@ -138,6 +139,7 @@ def load_video(
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     # Load video frames from a video file
+    video_path = video
     vidcap = cv2.VideoCapture(video)
 
     if not vidcap.isOpened():
@@ -155,7 +157,7 @@ def load_video(
             break
         frame_count -= 1
     else:
-        raise ValueError(f"Video '{video}' has no frames.")
+        raise ValueError(f"Video has no frames.")
 
     duration = frame_count / original_fps if original_fps > 0 else 0
     num_frames_to_sample = frame_count
@@ -207,6 +209,41 @@ def load_video(
     return {"frames": loaded_frames, "metadata": metadata}
 
 
+def load_base64_video(video: str) -> BytesIO:
+    parsed_url = urlparse(video)
+    data_spec, data = parsed_url.path.split(",", 1)
+    media_type, data_type = data_spec.split(";", 1)
+
+    if data_type != "base64":
+        msg = "Only base64 data URLs are supported for now."
+        raise NotImplementedError(msg)
+
+    content = base64.b64decode(data)
+    return content
+
+
+def load_video(
+        video: str,
+        num_frames: int = 10,
+        fps: int = 30,
+        format: str = "pt",
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
+    parsed_url = urlparse(video)
+    if parsed_url.scheme in ["http", "https", ""]:
+        video_path = video
+    elif parsed_url.scheme == "data":
+        decoded_video = load_base64_video(video)
+        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
+        with tempfile.NamedTemporaryFile(delete=False,
+                                         suffix='.mp4') as tmp_file:
+            tmp_file.write(decoded_video)
+            tmp_file.flush()
+            video_path = tmp_file.name
+    else:
+        raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
+    return _load_video_by_cv2(video_path, num_frames, fps, format, device)
+
+
 async def async_load_video(
         video: str,
         num_frames: int = 10,
@@ -223,12 +260,22 @@ async def async_load_video(
                 with tempfile.NamedTemporaryFile(delete=False,
                                                  suffix='.mp4') as tmp:
                     tmp.write(await response.content.read())
+                    tmp.flush()
                     video_path = tmp.name
-    # TODO: add case for video encoded in base64
+                    results = _load_video_by_cv2(video_path, num_frames, fps, format, device)
+        return results
+    elif parsed_url.scheme == "data":
+        decoded_video = load_base64_video(video)
+        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix='.mp4') as tmp_file:
+            tmp_file.write(decoded_video)
+            tmp_file.flush()
+            video_path = tmp_file.name
+            results = _load_video_by_cv2(video_path, num_frames, fps, format, device)
+        return results
     else:
-        video_path = video
-
-    return load_video(video_path, num_frames, fps, format, device)
+        return _load_video_by_cv2(video, num_frames, fps, format, device)
 
 
 def load_audio(
@@ -535,8 +582,8 @@ def default_multimodal_input_loader(
             mm_data = [
                 MultimodalData(modality=modality,
                                data=load_video(i,
-                                               num_frames,
-                                               fps,
+                                               128,
+                                               2,
                                                format=image_data_format,
                                                device=device)) for i in media
             ]
