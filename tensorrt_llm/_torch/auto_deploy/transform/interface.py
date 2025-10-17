@@ -155,6 +155,16 @@ class TransformInfo(BaseModel):
             has_valid_shapes=info.has_valid_shapes,
         )
 
+    # overload += operator to concatenate TransformInfo objects
+    def __iadd__(self, other: "TransformInfo") -> "TransformInfo":
+        # since TransformInfo is frozen, instead, we return a new TransformInfo object
+        return TransformInfo(
+            skipped=self.skipped & other.skipped,
+            num_matches=self.num_matches + other.num_matches,
+            is_clean=self.is_clean & other.is_clean,
+            has_valid_shapes=self.has_valid_shapes & other.has_valid_shapes,
+        )
+
     def __or__(self, other: "TransformInfo") -> "TransformInfo":
         """Merge two TransformInfo objects."""
         return TransformInfo(
