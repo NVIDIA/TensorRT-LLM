@@ -442,3 +442,51 @@ def extract_op_args(node: Node, *arg_names):
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
     return [_get(n) for n in arg_names]
+
+
+def predecessors(
+    node: Node,
+    depth: int = 1,
+    include: Callable[[Node], bool] = None,
+    exclude: Callable[[Node], bool] = None,
+) -> List[Node]:
+    """
+    Build predecessor tree of node by recursively traversing node.args up to depth depth.
+    If include is provided, only include nodes that satisfy the condition.
+    If exclude is provided, exclude nodes that satisfy the condition.
+    """
+    preds = []
+    for arg in node.args:
+        if isinstance(arg, Node):
+            include and include(arg)
+            if include and include(arg):
+                preds.append(arg)
+            if exclude and exclude(arg):
+                continue
+
+            if depth > 1:
+                preds.extend(predecessors(arg, depth - 1, include, exclude))
+    return preds
+
+
+def successors(
+    node: Node,
+    depth: int = 1,
+    include: Callable[[Node], bool] = None,
+    exclude: Callable[[Node], bool] = None,
+) -> List[Node]:
+    """
+    Build successor tree of node by recursively traversing node.users up to depth depth.
+    If include is provided, only include nodes that satisfy the condition.
+    If exclude is provided, exclude nodes that satisfy the condition.
+    """
+    succs = []
+    for user in node.users:
+        if include and not include(user):
+            continue
+        if exclude and exclude(user):
+            continue
+        succs.append(user)
+        if depth > 1:
+            succs.extend(successors(user, depth - 1, include, exclude))
+    return succs
