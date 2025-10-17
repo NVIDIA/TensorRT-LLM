@@ -447,8 +447,8 @@ def extract_op_args(node: Node, *arg_names):
 def predecessors(
     node: Node,
     depth: int = 1,
-    include: Callable[[Node], bool] = None,
-    exclude: Callable[[Node], bool] = None,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
 ) -> List[Node]:
     """
     Build predecessor tree of node by recursively traversing node.args up to depth depth.
@@ -458,22 +458,24 @@ def predecessors(
     preds = []
     for arg in node.args:
         if isinstance(arg, Node):
-            include and include(arg)
-            if include and include(arg):
-                preds.append(arg)
-            if exclude and exclude(arg):
-                continue
-
             if depth > 1:
                 preds.extend(predecessors(arg, depth - 1, include, exclude))
-    return preds
+            # add node arg if either:
+            # a) include and exclude are not specified
+            # b) include is specified and arg satisfies include condition
+            # c) exclude is specified and arg does not satisfy exclude condition
+            if exclude and exclude(arg):
+                continue
+            if (not include) or (include and include(arg)):
+                preds.append(arg)
+    return list(reversed(preds))
 
 
 def successors(
     node: Node,
     depth: int = 1,
-    include: Callable[[Node], bool] = None,
-    exclude: Callable[[Node], bool] = None,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
 ) -> List[Node]:
     """
     Build successor tree of node by recursively traversing node.users up to depth depth.
@@ -482,11 +484,11 @@ def successors(
     """
     succs = []
     for user in node.users:
-        if include and not include(user):
-            continue
-        if exclude and exclude(user):
-            continue
-        succs.append(user)
         if depth > 1:
             succs.extend(successors(user, depth - 1, include, exclude))
-    return succs
+        # analogous logic to predecessors
+        if exclude and exclude(user):
+            continue
+        if (not include) or (include and include(user)):
+            succs.append(user)
+    return list(reversed(succs))
