@@ -118,6 +118,7 @@ COPY docker/common/install_triton.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
+     docker/common/install_mooncake.sh \
      ./
 
 RUN bash ./install_triton.sh && rm install_triton.sh
