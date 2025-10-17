@@ -442,3 +442,53 @@ def extract_op_args(node: Node, *arg_names):
         raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
 
     return [_get(n) for n in arg_names]
+
+
+def predecessors(
+    node: Node,
+    depth: int = 1,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
+) -> List[Node]:
+    """
+    Build predecessor tree of node by recursively traversing node.args up to depth depth.
+    If include is provided, only include nodes that satisfy the condition.
+    If exclude is provided, exclude nodes that satisfy the condition.
+    """
+    preds = []
+    for arg in node.args:
+        if isinstance(arg, Node):
+            if depth > 1:
+                preds.extend(predecessors(arg, depth - 1, include, exclude))
+            # add node arg if either:
+            # a) include and exclude are not specified
+            # b) include is specified and arg satisfies include condition
+            # c) exclude is specified and arg does not satisfy exclude condition
+            if exclude and exclude(arg):
+                continue
+            if (not include) or (include and include(arg)):
+                preds.append(arg)
+    return list(reversed(preds))
+
+
+def successors(
+    node: Node,
+    depth: int = 1,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
+) -> List[Node]:
+    """
+    Build successor tree of node by recursively traversing node.users up to depth depth.
+    If include is provided, only include nodes that satisfy the condition.
+    If exclude is provided, exclude nodes that satisfy the condition.
+    """
+    succs = []
+    for user in node.users:
+        if depth > 1:
+            succs.extend(successors(user, depth - 1, include, exclude))
+        # analogous logic to predecessors
+        if exclude and exclude(user):
+            continue
+        if (not include) or (include and include(user)):
+            succs.append(user)
+    return list(reversed(succs))
