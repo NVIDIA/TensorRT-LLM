@@ -358,9 +358,13 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     @staticmethod
-    def _create_ray_executor(worker_kwargs: Dict, model_world_size: int,
-                             postproc_worker_config: PostprocWorkerConfig,
-                             is_llm_executor: bool, tp_size: int):
+    def _create_ray_executor(
+        worker_kwargs: Dict,
+        model_world_size: int,
+        postproc_worker_config: PostprocWorkerConfig,
+        is_llm_executor: bool,
+        tp_size: int,
+    ):
         from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
@@ -370,10 +374,13 @@ class GenerationExecutor(ABC):
                            tp_size=tp_size)
 
     @staticmethod
-    def _create_rpc_executor(worker_kwargs: Dict, model_world_size: int,
-                             mpi_session: Optional[MpiSession],
-                             postproc_worker_config: PostprocWorkerConfig,
-                             is_llm_executor: bool):
+    def _create_rpc_executor(
+        worker_kwargs: Dict,
+        model_world_size: int,
+        mpi_session: Optional[MpiSession],
+        postproc_worker_config: PostprocWorkerConfig,
+        is_llm_executor: bool,
+    ):
         """Create RPC-based executor (GenerationExecutorRpcProxy)."""
         from .rpc_proxy import GenerationExecutorRpcProxy
         return GenerationExecutorRpcProxy(
@@ -384,12 +391,14 @@ class GenerationExecutor(ABC):
             is_llm_executor=is_llm_executor)
 
     @staticmethod
-    def _create_ipc_executor(worker_kwargs: Dict,
-                             model_world_size: int,
-                             mpi_session: Optional[MpiSession],
-                             postproc_worker_config: PostprocWorkerConfig,
-                             is_llm_executor: bool,
-                             use_worker: bool = False):
+    def _create_ipc_executor(
+        worker_kwargs: Dict,
+        model_world_size: int,
+        mpi_session: Optional[MpiSession],
+        postproc_worker_config: PostprocWorkerConfig,
+        is_llm_executor: bool,
+        use_worker: bool = False,
+    ):
         """Create IPC-based executor (GenerationExecutorProxy or GenerationExecutorWorker).
 
         Args:
