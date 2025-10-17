@@ -13,7 +13,8 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SparseAttentionConfig,
+                                          SamplerType, SchedulerConfig,
+                                          SparseAttentionConfig,
                                           SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -663,8 +664,8 @@ def create_py_executor_instance(
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
     max_num_tokens: Optional[int] = None,
-    peft_cache_config: Optional[trtllm.PeftCacheConfig] = None,
-    scheduler_config: Optional[trtllm.SchedulerConfig] = None,
+    peft_cache_config: Optional[PeftCacheConfig] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
@@ -728,16 +729,14 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        peft_cache_config_model = PeftCacheConfig.from_pybind(
-            peft_cache_config
-        ) if peft_cache_config is not None else PeftCacheConfig()
+        peft_cache_config_model = PeftCacheConfig(
+        ) if peft_cache_config is None else peft_cache_config
         if lora_config.max_loras is not None:
             peft_cache_config_model.num_device_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_loras
         if lora_config.max_cpu_loras is not None:
             peft_cache_config_model.num_host_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
-        peft_cache_config = peft_cache_config_model._to_pybind()
 
         from tensorrt_llm.bindings import WorldConfig
         world_config = WorldConfig(
@@ -748,7 +747,7 @@ def create_py_executor_instance(
             gpus_per_node=dist.mapping.gpus_per_node,
         )
         peft_cache_manager = PeftCacheManager(
-            peft_cache_config=peft_cache_config,
+            peft_cache_config=peft_cache_config_model._to_pybind(),
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
@@ -782,7 +781,7 @@ def create_py_executor_instance(
         scheduler_capacity,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         peft_cache_manager.impl if peft_cache_manager is not None else None,
-        scheduler_config.capacity_scheduler_policy,
+        scheduler_config.capacity_scheduler_policy._to_pybind(),
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                            ctx_chunk_config)

@@ -27,11 +27,12 @@ from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
-                                            PeftCacheConfig, RequestStage,
-                                            RequestStats, SpecDecodingStats,
+                                            RequestStage, RequestStats,
+                                            SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT

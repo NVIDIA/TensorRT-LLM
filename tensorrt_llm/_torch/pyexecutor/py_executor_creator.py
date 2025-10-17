@@ -13,11 +13,11 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
-from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
-                                            ContextChunkingPolicy,
+from tensorrt_llm.bindings.executor import (ContextChunkingPolicy,
                                             GuidedDecodingConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import LoadFormat, PybindMirror, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy, LoadFormat,
+                                          PybindMirror, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -214,12 +214,11 @@ def create_py_executor(
     if pytorch_backend_config is None:
         pytorch_backend_config = PyTorchConfig()
 
-    scheduler_config = PybindMirror.maybe_to_pybind(llm_args.scheduler_config)
+    scheduler_config = llm_args.scheduler_config
 
-    peft_cache_config = None
-    if llm_args.peft_cache_config is not None:
-        peft_cache_config = PybindMirror.maybe_to_pybind(
-            llm_args.peft_cache_config)
+    # Since peft_cache_config may be subject to change, avoid these changes propagate back
+    # to llm_args.peft_cache_config
+    peft_cache_config = copy.deepcopy(llm_args.peft_cache_config)
 
     assert llm_args.kv_cache_config, "Expect llm_args.kv_cache_config is not None"
     kv_cache_config = llm_args.kv_cache_config
@@ -451,9 +450,10 @@ def create_py_executor(
             logger.info(
                 f"ChunkUnitSize is set to {chunk_unit_size} as sliding window attention is used."
             )
-        chunking_policy = (scheduler_config.context_chunking_policy if
-                           scheduler_config.context_chunking_policy is not None
-                           else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        chunking_policy = (
+            scheduler_config.context_chunking_policy._to_pybind()
+            if scheduler_config.context_chunking_policy is not None else
+            ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
         assert chunk_unit_size is not None, "chunk_unit_size must be set"
         ctx_chunk_config = ContextChunkingConfig(chunking_policy,
                                                  chunk_unit_size)
