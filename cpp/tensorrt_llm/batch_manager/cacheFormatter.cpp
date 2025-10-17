@@ -164,17 +164,13 @@ std::vector<size_t> CacheFormatter::pickRecvConnections(
         return ret;
     }
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
-    int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     std::vector<size_t> ret;
-    for (int i = 0; i < targetInfo.mDomainTPSize; i++)
+    for (int i = 0; i < targetInfo.mDomainTPSize; i+=targetInfo.mPeerDupHeadFactor)
     {
-        if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
+        for (int j = 0; j < targetInfo.mDomainPPSize; j++)
         {
-            for (int j = 0; j < targetInfo.mDomainPPSize; j++)
-            {
-                ret.push_back((i * targetInfo.mDomainPPSize) + j);
-            }
+            ret.push_back((i * targetInfo.mDomainPPSize) + j);
         }
     }
     return ret;
