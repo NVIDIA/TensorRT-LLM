@@ -9,8 +9,9 @@ IS_CUBLASLT_AVAILABLE = False
 try:
     import torch
 
-    # Check if cublas_fp4_scaled_mm is available
-    if hasattr(torch.ops.trtllm, 'cublas_fp4_scaled_mm'):
+    # Check if CublasLtFP4GemmRunner (used by nvfp4_gemm_cublaslt) is available
+    if hasattr(torch.classes, 'trtllm') and hasattr(torch.classes.trtllm,
+                                                    'CublasLtFP4GemmRunner'):
         logger.info(f"cuBLASLt FP4 GEMM is available")
         IS_CUBLASLT_AVAILABLE = True
 except ImportError:

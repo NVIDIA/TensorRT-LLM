@@ -767,8 +767,6 @@ class NVFP4LinearMethod(LinearMethodBase):
         # (amax_input * amax_weight) / (448*6 * 448*6)
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
-        module.beta = Parameter(torch.zeros([1], dtype=torch.float32),
-                                requires_grad=False)
 
         # K, V scales for NVFP4 KV cache
         module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
@@ -798,9 +796,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
         elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
-            output = torch.ops.trtllm.cublas_fp4_scaled_mm(
+            output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
                 act_fp4, module.weight, act_sf, module.weight_scale,
-                module.alpha, module.beta, module.dtype)
+                module.alpha, module.dtype)
         else:
             output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
                                                  module.weight_scale,

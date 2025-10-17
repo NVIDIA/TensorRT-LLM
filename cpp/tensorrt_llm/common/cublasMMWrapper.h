@@ -152,6 +152,26 @@ public:
     {
         return *(this->mCublasLtHandle);
     }
+
+    cublasLtMatmulDesc_t getOperationDesc() const
+    {
+        return mOperationDesc;
+    }
+
+    cublasLtMatrixLayout_t getADesc() const
+    {
+        return mADesc;
+    }
+
+    cublasLtMatrixLayout_t getBDesc() const
+    {
+        return mBDesc;
+    }
+
+    cublasLtMatrixLayout_t getCDesc() const
+    {
+        return mCDesc;
+    }
 };
 
 } // namespace common

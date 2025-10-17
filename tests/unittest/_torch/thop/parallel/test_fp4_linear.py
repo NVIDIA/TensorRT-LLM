@@ -422,17 +422,15 @@ def test_fp4_linear_cublaslt(dtype, mnk):
 
         alpha_ref = 1.0 / (w_sf_global * x_sf_global)
         alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
-        beta_tensor = torch.tensor(0.0, dtype=torch.float32).cuda()
 
-        # Use cuBLASLt FP4 GEMM
-        output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
-            mat_a=x_fp4,
-            mat_b=w_fp4,
-            scale_a=x_sf_block,
-            scale_b=w_sf_block,
+        # Use cuBLASLt FP4 GEMM with autotuning support
+        output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+            act_fp4=x_fp4,
+            weight=w_fp4,
+            act_sf=x_sf_block,
+            weight_scale=w_sf_block,
             alpha=alpha_tensor,
-            beta=beta_tensor,
-            out_dtype=dtype)
+            output_dtype=dtype)
 
     # Reference implementation: use torch.ops.trtllm.nvfp4_gemm (CUTLASS)
     with torch.inference_mode():
@@ -473,21 +471,19 @@ def cublaslt_fp4_gemm_perf_test(
     # Calculate correct alpha scaling factor
     alpha_ref = 1.0 / (w_sf_global * x_sf_global)
     alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
-    beta_tensor = torch.tensor(0.0, dtype=torch.float32).cuda()
 
     if test_ref:
         with nvtx.annotate(
                 f"cublaslt tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
                 color="blue"):
             with torch.inference_mode(), autotune():
-                output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
-                    mat_a=x_fp4,
-                    mat_b=w_fp4,
-                    scale_a=x_sf_block,
-                    scale_b=w_sf_block,
+                output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                    act_fp4=x_fp4,
+                    weight=w_fp4,
+                    act_sf=x_sf_block,
+                    weight_scale=w_sf_block,
                     alpha=alpha_tensor,
-                    beta=beta_tensor,
-                    out_dtype=dtype)
+                    output_dtype=dtype)
 
         # Compare with CUTLASS reference implementation
         with nvtx.annotate(
@@ -510,28 +506,26 @@ def cublaslt_fp4_gemm_perf_test(
             f"cublaslt warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
             color="green"):
         for _ in range(warmup_iterations):
-            output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
-                mat_a=x_fp4,
-                mat_b=w_fp4,
-                scale_a=x_sf_block,
-                scale_b=w_sf_block,
+            output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4=x_fp4,
+                weight=w_fp4,
+                act_sf=x_sf_block,
+                weight_scale=w_sf_block,
                 alpha=alpha_tensor,
-                beta=beta_tensor,
-                out_dtype=dtype)
+                output_dtype=dtype)
 
     # Performance test
     with nvtx.annotate(
             f"cublaslt run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
             color="green"):
         for i in range(iterations):
-            output_cublaslt = torch.ops.trtllm.cublas_fp4_scaled_mm(
-                mat_a=x_fp4,
-                mat_b=w_fp4,
-                scale_a=x_sf_block,
-                scale_b=w_sf_block,
+            output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4=x_fp4,
+                weight=w_fp4,
+                act_sf=x_sf_block,
+                weight_scale=w_sf_block,
                 alpha=alpha_tensor,
-                beta=beta_tensor,
-                out_dtype=dtype)
+                output_dtype=dtype)
 
     if test_ref:
         torch.testing.assert_close(output_cublaslt,

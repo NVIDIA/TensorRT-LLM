@@ -431,6 +431,131 @@ class FP4GemmRunner(TunableRunner):
         )
 
 
+class CublasLtFP4GemmRunner(TunableRunner):
+    """CublasLt-based FP4 GEMM runner with auto-tuning support.
+
+    Uses cuBLASLt's heuristic to discover and tune across multiple algorithms.
+    """
+    runner_dict = dict()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+                                 constraint_specs=(ConstraintSpec(
+                                     2, 0, fp4_scale_infer_shape), ))
+
+    def __init__(
+        self,
+        to_userbuffers: bool,
+        output_dtype: torch.dtype,
+    ):
+        self.output_dtype = output_dtype
+        self.to_userbuffers = to_userbuffers
+        instance_key = (output_dtype, )
+
+        if instance_key not in CublasLtFP4GemmRunner.runner_dict:
+            CublasLtFP4GemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.CublasLtFP4GemmRunner(
+                    output_dtype)
+
+        self.cublaslt_runner = CublasLtFP4GemmRunner.runner_dict[instance_key]
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        """Get all valid tactics (algorithms) from cuBLASLt heuristic."""
+        mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
+        # Pass actual scale tensors to avoid creating dummy tensors in C++
+        num_algos = self.cublaslt_runner.get_num_heuristic_algos(
+            mat1, mat2, mat1_scale, mat2_scale)
+        return list(range(num_algos))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
+        result = self.cublaslt_runner.run_gemm(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            alpha,
+            self.to_userbuffers,
+            tactic,
+        )
+        return result
+
+    def set_best_tactic(self, inputs: List[torch.Tensor], best_tactic: int):
+        """Update the best tactic after tuning."""
+        mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
+        self.cublaslt_runner.set_best_tactic(mat1, mat2, mat1_scale, mat2_scale,
+                                             best_tactic)
+
+
+@torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
+def nvfp4_gemm_cublaslt(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning."""
+    tuner = AutoTuner.get()
+
+    # Use CublasLt runner with heuristic-based tuning
+    nvfp4_gemm_runner = CublasLtFP4GemmRunner(to_userbuffers, output_dtype)
+
+    runner_type = type(nvfp4_gemm_runner).__name__
+    op_key = f"trtllm::fp4_gemm_cublaslt::gemm::{runner_type}"
+
+    _, best_tactic = tuner.choose_one(
+        op_key,
+        [nvfp4_gemm_runner],
+        nvfp4_gemm_runner.tuning_config,
+        [act_fp4, weight, act_sf, weight_scale, alpha],
+    )
+
+    result = nvfp4_gemm_runner(
+        inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+        tactic=best_tactic)
+
+    return result
+
+
+@nvfp4_gemm_cublaslt.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
+                             dtype=output_dtype)
+
+
+# Legacy cublas_fp4_scaled_mm - for testing and backward compatibility
+@torch.library.register_fake("trtllm::cublas_fp4_scaled_mm")
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Fake tensor implementation for cuBLASLt FP4 GEMM (legacy)."""
+    # Output shape: [M, N] where M = mat_a.size(0), N = mat_b.size(0)
+    output_size = [mat_a.size(0), mat_b.size(0)]
+    return mat_a.new_empty(output_size, dtype=out_dtype)
+
+
 @torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
@@ -441,17 +566,18 @@ def nvfp4_gemm(
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
 ) -> torch.Tensor:
-
+    """CUTLASS-based NVFP4 GEMM with auto-tuning."""
     tuner = AutoTuner.get()
 
-    # allocate workspace for profiling
+    # Use Cutlass runner with predefined configs
     nvfp4_gemm_runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
                                       to_userbuffers, output_dtype)
 
+    runner_type = type(nvfp4_gemm_runner).__name__
     _, best_tactic = tuner.choose_one(
-        "trtllm::fp4_gemm::gemm",
+        f"trtllm::fp4_gemm::gemm::{runner_type}",
         [nvfp4_gemm_runner],
-        FP4GemmRunner.tuning_config,
+        nvfp4_gemm_runner.tuning_config,
         [act_fp4, weight, act_sf, weight_scale, alpha],
     )
 
@@ -472,24 +598,6 @@ def _(
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
-
-
-# cuBLASLt FP4 GEMM - using Python fake tensor registration only
-# The actual implementation is in C++, we just provide fake tensor support
-@torch.library.register_fake("trtllm::cublas_fp4_scaled_mm")
-def _(
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Fake tensor implementation for cuBLASLt FP4 GEMM."""
-    # Output shape: [M, N] where M = mat_a.size(0), N = mat_b.size(0)
-    output_size = [mat_a.size(0), mat_b.size(0)]
-    return mat_a.new_empty(output_size, dtype=out_dtype)
 
 
 class FP8BatchedGemmRunner(TunableRunner):
