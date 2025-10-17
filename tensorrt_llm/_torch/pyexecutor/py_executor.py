@@ -451,6 +451,9 @@ class PyExecutor:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
                 del self.virtual_memory_pools[key]
+        # Stop the sampler's host copy thread, if it was used
+        if hasattr(self.sampler, 'stop_host_copy_thread'):
+            self.sampler.stop_host_copy_thread()
 
     def can_enqueue_requests(self) -> bool:
         """

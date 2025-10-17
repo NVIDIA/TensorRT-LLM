@@ -1174,6 +1174,15 @@ def set_prometheus_multiproc_dir() -> object:
     logger.info(
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
+def confidential_compute_enabled() -> bool:
+    import pynvml
+
+    # Determine if Confidential Compute is enabled
+    pynvml.nvmlInit()
+    conf_compute_enabled = bool(pynvml.nvmlSystemGetConfComputeState().ccFeature)
+    pynvml.nvmlShutdown()
+
+    return conf_compute_enabled
 
 P = ParamSpec("P")
 
