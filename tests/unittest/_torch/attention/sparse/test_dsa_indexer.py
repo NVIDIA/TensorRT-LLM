@@ -456,7 +456,6 @@ def _create_mock_metadata(request_ids,
                                                   dtype=torch.int64)
             self.num_ctx_tokens = num_ctx_tokens
             self.num_tokens = num_tokens
-            self.num_ctx_cached_tokens_for_spec_dec = self.num_ctx_tokens - self.num_contexts
             torch.cumsum(kv_lens[:num_contexts],
                          dim=0,
                          dtype=torch.int64,

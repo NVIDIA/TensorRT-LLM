@@ -1213,14 +1213,18 @@ class BlockManager:
                                                dtype=torch.int32)
 
         self.block_ids = dict()
+        self.num_sequences = dict()
         self.free_blocks = deque(range(self.num_blocks))
 
     def add_tokens(self, request_id: int, num_tokens: int):
         if num_tokens > 0:
-            block_count_needed = self.compute_block_count(
-                num_tokens, self.tokens_per_block)
             if request_id not in self.block_ids:
                 self.block_ids[request_id] = []
+                self.num_sequences[request_id] = num_tokens
+            else:
+                self.num_sequences[request_id] += num_tokens
+            block_count_needed = self.compute_block_count(
+                self.num_sequences[request_id], self.tokens_per_block)
             if len(self.block_ids[request_id]) < block_count_needed:
                 new_blocks = self._allocate_blocks(
                     block_count_needed - len(self.block_ids[request_id]))
@@ -1244,11 +1248,13 @@ class BlockManager:
         request_id = request.py_request_id
         self._free_blocks(self.block_ids[request_id])
         del self.block_ids[request_id]
+        del self.num_sequences[request_id]
 
     def rewind_cache(self, request: LlmRequest, rewind_len: int):
         if rewind_len == 0:
             return
         request_id = request.py_request_id
+        self.num_sequences[request_id] -= rewind_len
         num_tokens = request.max_beam_num_tokens
         updated_token_num = num_tokens - rewind_len
         block_count_needed = self.compute_block_count(updated_token_num,
