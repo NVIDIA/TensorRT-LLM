@@ -124,7 +124,7 @@ async def async_load_image(
         return image
 
 
-def load_video(
+def _load_video_by_cv2(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
@@ -151,7 +151,7 @@ def load_video(
             break
         frame_count -= 1
     else:
-        raise ValueError(f"Video '{video}' has no frames.")
+        raise ValueError(f"Video has no frames.")
 
     # Extract frames uniformly
     indices = np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int)
@@ -173,6 +173,38 @@ def load_video(
     ]
 
 
+def load_base64_video(video: str) -> BytesIO:
+    parsed_url = urlparse(video)
+    data_spec, data = parsed_url.path.split(",", 1)
+    media_type, data_type = data_spec.split(";", 1)
+
+    if data_type != "base64":
+        msg = "Only base64 data URLs are supported for now."
+        raise NotImplementedError(msg)
+
+    content = base64.b64decode(data)
+    return content
+
+
+def load_video(
+        video: str,
+        num_frames: int = 10,
+        format: str = "pt",
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
+    parsed_url = urlparse(video)
+    if parsed_url.scheme in ["http", "https", ""]:
+        video_path = video
+    elif parsed_url.scheme == "data":
+        decoded_video = load_base64_video(video)
+        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+            tmp_file.write(decoded_video)
+            video_path = tmp_file.name
+    else:
+        raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
+    return _load_video_by_cv2(video_path, num_frames, format, device)
+
+
 async def async_load_video(
         video: str,
         num_frames: int = 10,
@@ -189,11 +221,16 @@ async def async_load_video(
                                                  suffix='.mp4') as tmp:
                     tmp.write(await response.content.read())
                     video_path = tmp.name
-    # TODO: add case for video encoded in base64
+    elif parsed_url.scheme == "data":
+        decoded_video = load_base64_video(video)
+        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+            tmp_file.write(decoded_video)
+            video_path = tmp_file.name
     else:
         video_path = video
 
-    return load_video(video_path, num_frames, format, device)
+    return _load_video_by_cv2(video_path, num_frames, format, device)
 
 
 def load_audio(
