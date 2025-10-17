@@ -1249,12 +1249,12 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             kv_cache_manager: KVCacheManager,
-            peft_cache_manager: PeftCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None,
-            maybe_graph: bool = False):
+            maybe_graph: bool = False,
+            peft_cache_manager: Optional[PeftCacheManager] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -2340,10 +2340,14 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                       peft_cache_manager, attn_metadata,
-                                       spec_metadata, new_tensors_device,
-                                       cache_indirection_buffer, maybe_graph)
+        return self._prepare_tp_inputs(scheduled_requests,
+                                       kv_cache_manager,
+                                       attn_metadata,
+                                       spec_metadata,
+                                       new_tensors_device,
+                                       cache_indirection_buffer,
+                                       maybe_graph,
+                                       peft_cache_manager=peft_cache_manager)
 
     @nvtx_range("PyTorchModelEngine.forward")
     @torch.inference_mode()
