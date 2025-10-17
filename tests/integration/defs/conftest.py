@@ -49,6 +49,7 @@ from .test_list_parser import (TestCorrectionMode, apply_waives,
 from .trt_test_alternative import (call, check_output, exists, is_windows,
                                    is_wsl, makedirs, print_info, print_warning,
                                    wsl_to_win_path)
+from .utils.periodic_junit import PeriodicJUnitXML
 
 try:
     from llm import trt_environment
@@ -2095,6 +2096,33 @@ def pytest_addoption(parser):
         "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
         "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
     )
+    parser.addoption(
+        "--periodic-junit",
+        action="store_true",
+        default=False,
+        help=
+        "Enable periodic JUnit XML reporter. This reporter leverages pytest's built-in junitxml "
+        "for reliable test result handling. Saves progress periodically to prevent data loss on "
+        "interruption. Requires --output-dir to be set.",
+    )
+    parser.addoption(
+        "--periodic-interval",
+        action="store",
+        type=int,
+        default=18000,
+        help=
+        "Time interval in seconds between periodic saves (default: 18000s = 5 hours). "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-batch-size",
+        action="store",
+        type=int,
+        default=10,
+        help=
+        "Number of completed tests before triggering a periodic save (default: 10). "
+        "Only used with --periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2195,6 +2223,40 @@ def pytest_configure(config):
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
+
+    # Initialize PeriodicJUnitXML reporter if enabled
+    periodic = config.getoption("--periodic-junit", default=False)
+    output_dir = config.getoption("--output-dir", default=None)
+
+    if periodic and output_dir:
+        periodic_interval = config.getoption("--periodic-interval")
+        periodic_batch_size = config.getoption("--periodic-batch-size")
+
+        # Create the reporter with logger
+        xmlpath = os.path.join(output_dir, "results.xml")
+        reporter = PeriodicJUnitXML(
+            xmlpath=xmlpath,
+            interval=periodic_interval,
+            batch_size=periodic_batch_size,
+            logger={
+                'info': print_info,
+                'warning': print_warning
+            },
+        )
+
+        # Configure and register the reporter
+        reporter.pytest_configure(config)
+        config.pluginmanager.register(reporter, 'periodic_junit')
+
+        print_info("PeriodicJUnitXML reporter registered")
+        print_info(
+            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
+        )
+        print_info(f"  Batch size: {periodic_batch_size} tests")
+    elif periodic and not output_dir:
+        print_warning(
+            "Warning: --periodic-junit requires --output-dir to be set. "
+            "Periodic reporting disabled.")
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,

@@ -88,6 +88,7 @@ def get_llm_args(model: str,
                  reasoning_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
                  otlp_traces_endpoint: Optional[str] = None,
+                 enable_chunked_prefill: bool = False,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -131,6 +132,7 @@ def get_llm_args(model: str,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
         "otlp_traces_endpoint": otlp_traces_endpoint,
+        "enable_chunked_prefill": enable_chunked_prefill,
     }
 
     return llm_args, llm_args_extra_dict
@@ -317,6 +319,10 @@ class ChoiceWithAlias(click.Choice):
               type=str,
               default=None,
               help="Target URL to which OpenTelemetry traces will be sent.")
+@click.option("--enable_chunked_prefill",
+              is_flag=True,
+              default=False,
+              help="Enable chunked prefill")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -327,7 +333,7 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str]):
+        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -353,7 +359,8 @@ def serve(
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
         fail_fast_on_attention_window_too_large,
-        otlp_traces_endpoint=otlp_traces_endpoint)
+        otlp_traces_endpoint=otlp_traces_endpoint,
+        enable_chunked_prefill=enable_chunked_prefill)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:

@@ -322,12 +322,24 @@ def test_multiple_dynamic_shapes_cache():
         f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
 
 
-class GemmRunnerWithTacticConfigs(TunableRunner):
+class GemmRunnerComplexTuningConfigs(TunableRunner):
     valid_tactic_ids = [-1, 0, 1]
+    tune_max_num_tokens = 32
 
-    def get_valid_tactics(self, inputs: List[FakeTensor],
-                          profile: OptimizationProfile,
-                          **kwargs) -> List[Dict[str, int]]:
+    def get_valid_tactics(
+        self,
+        inputs: List[FakeTensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[Dict[str, int]]:
+        # During the tuning process, we verify if the tuning config behaves as expected
+
+        assert inputs[0].shape[0] <= self.tune_max_num_tokens, \
+            f"Input shape {inputs[0].shape[0]} is larger than the max num tokens {self.tune_max_num_tokens}"
+
+        assert inputs[0][-1, 0] == inputs[0].shape[0], \
+            f"Input shape {inputs[0].shape[0]} is not set through the pre_hook correctly"
+
         # The simulated delay is not deterministic, so we need to return specific tactics here
         return [{
             "block_size": block_size,
@@ -350,12 +362,30 @@ class GemmRunnerWithTacticConfigs(TunableRunner):
         assert tactic_id in self.valid_tactic_ids
         return [gemm_0, gemm_1, gemm_fallback][tactic_id](*inputs)
 
+    @staticmethod
+    def inputs_pre_hook(inputs: List[torch.Tensor]):
+        # always set the first element to bo iota in x
+        x, w = inputs
+        x_hooked = torch.zeros_like(x)
+        x_hooked[-1, 0] = x.shape[0]
+        return [x_hooked, w]
 
-def test_autotuner_tactic_configs():
-    runner_0 = GemmRunnerWithTacticConfigs()
+
+def test_autotuner_tuning_configs():
+    runner_0 = GemmRunnerComplexTuningConfigs()
     runners = [runner_0]
     x, w = torch.randn(64, 64), torch.randn(64, 128)
-    tuning_config = TuningConfig()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            input_idx=0,
+            dim_idx=0,
+            gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+            map_to_tuning_buckets=next_positive_power_of_2,
+        ), ),
+        # Test if the number of tuning tokens is clipped to 32
+        tune_max_num_tokens=GemmRunnerComplexTuningConfigs.tune_max_num_tokens,
+        inputs_pre_hook=GemmRunnerComplexTuningConfigs.inputs_pre_hook,
+    )
     with autotune():
         tuner = AutoTuner.get()
         runner, tactic = tuner.choose_one("test_autotuner_tactic_configs",
