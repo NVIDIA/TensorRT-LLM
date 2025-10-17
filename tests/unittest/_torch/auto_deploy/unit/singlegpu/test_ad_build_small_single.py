@@ -107,6 +107,13 @@ def test_build_ad(experiment_config: Dict, mode: str):
     ):
         pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")
 
+    if (
+        "Mixtral-8x7B-Instruct-v0.1" in experiment_config["args"]["model"]
+        or "Qwen3-30B-A3B" in experiment_config["args"]["model"]
+        and mode == "graph"
+    ):
+        pytest.skip(f"{experiment_config['args']['model']} is not supported in graph mode")
+
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
     experiment_config["args"]["mode"] = mode
