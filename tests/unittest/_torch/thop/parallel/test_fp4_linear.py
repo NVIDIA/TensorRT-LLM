@@ -391,7 +391,7 @@ def nvfp4_gemm_perf_test(
 
 
 @pytest.mark.skipif(
-    get_sm_version() != 100,
+    get_sm_version() not in [100, 103],
     reason="This test is only supported in Blackwell architecture",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
