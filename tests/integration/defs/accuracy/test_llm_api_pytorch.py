@@ -690,6 +690,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         if get_device_count() != tp_size * pp_size:
             pytest.skip("Device count mismatch with world size")
+        if get_device_memory() < 240000 and get_device_count() < 8:
+            pytest.skip("Not enough memory for this test")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         with LLM(
