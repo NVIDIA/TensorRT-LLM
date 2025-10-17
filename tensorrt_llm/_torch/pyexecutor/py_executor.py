@@ -1604,27 +1604,23 @@ class PyExecutor:
         if timeout_ms is None or timeout_ms <= 0:
             return
 
-        current_time = time.time()
-
-        for req in self.ctx_in_transmission_requests:
+        def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
+            current_time = time.time()
             if req.py_kv_transfer_start_time is None:
-                continue
+                return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
-                    f"Terminating context request {req.py_request_id} due to KV cache transfer timeout"
+                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
                 )
                 req.py_kv_transfer_timed_out = True
 
+        for req, _ in self.ctx_in_transmission_requests:
+            flag_if_kv_transfer_timed_out(req, "context")
+
         for req in self.active_requests:
-            if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_start_time is not None:
-                elapsed_time = (current_time -
-                                req.py_kv_transfer_start_time) * 1000
-                if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
-                    logger.warning(
-                        f"Terminating generation request {req.py_request_id} due to KV cache transfer timeout"
-                    )
-                    req.py_kv_transfer_timed_out = True
+            if req.is_disagg_generation_transmission_in_progress:
+                flag_if_kv_transfer_timed_out(req, "generation")
 
         return
 
@@ -1764,9 +1760,8 @@ class PyExecutor:
         ]
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-            for req in ctx_in_transmission_requests:
-                if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.time()
+            for req in ctx_transmission_reqs:
+                req.py_kv_transfer_start_time = time.time()
 
         return ctx_transmission_reqs
 
@@ -2100,7 +2095,7 @@ class PyExecutor:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
                     self._handle_errors(
-                        error_msg=f"Request {py.request_id} timed out",
+                        error_msg=f"Request {request.py_request_id} timed out",
                         requests=[request])
                 continue
 
@@ -2178,12 +2173,16 @@ class PyExecutor:
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
         for request, block_id in self.ctx_in_transmission_requests[:]:
+
+            if request.py_kv_transfer_timed_out:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                # If cancel is successful, mark as complete so it can be cleaned up
+                # Otherwise, try at next iteration
+                if is_cancelled:
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
             if request.is_disagg_context_complete_state:
-                if request.py_kv_transfer_timed_out:
-                    is_cancelled = self.kv_cache_transceiver.cancel_request(
-                        request)
-                    if is_cancelled:
-                        request.py_kv_transfer_start_time = None
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
                 else:

@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import sys
+import time
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -28,11 +29,13 @@ import transformers
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
                                    GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
-                                 KvCacheConfig, KvCacheRetentionConfig,
+from tensorrt_llm.llmapi import (BuildCacheConfig, CacheTransceiverConfig,
+                                 EagleDecodingConfig, KvCacheConfig,
+                                 KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
@@ -2573,3 +2576,120 @@ def test_llm_api_draft_target():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+def test_llm_context_only_timed_out():
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+    LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    cache_transceiver_config=CacheTransceiverConfig(
+                        backend="DEFAULT", kv_transfer_timeout_ms=1000),
+                    **llm_args_extra)
+
+    max_tokens = 1
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+
+    prompts0 = [
+        "What is your name?",
+    ]
+    prompts1 = [
+        "Nvidia is awesome because",
+    ]
+
+    # Send context-only request
+    for output in llm.generate(prompts1,
+                               sampling_params=sampling_params,
+                               disaggregated_params=disaggregated_params):
+        print(output)
+
+    results = llm.get_stats(2)
+    assert len(results) == 1
+    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    print(f"Context only used num blocks: {context_only_used_num_blocks}")
+
+    # Sleep 5 seconds to allow context only request to time out
+    time.sleep(5)
+
+    # Send regular request
+    for output in llm.generate(prompts0, sampling_params=sampling_params):
+        print(output)
+
+    # Get number of allocated blocks
+    results = llm.get_stats(2)
+    assert len(results) == 1
+    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+
+    assert final_used_num_blocks == 0
+
+
+def test_llm_gen_only_timed_out():
+
+    pytest.skip(
+        f"Skipping for now since it hangs when processing gen only request")
+
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+    LLM_CLASS = LLM_torch
+    max_tokens = 1
+    sampling_params = SamplingParams(max_tokens=max_tokens)
+
+    my_prompts = [
+        "What is your name?",
+    ]
+
+    # Send context-only request
+    gen_disagg_params = None
+
+    ctx_llm = LLM_CLASS(
+        model=llama_model_path,
+        kv_cache_config=global_kvcache_config,
+        tensor_parallel_size=tp_size,
+        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+        **llm_args_extra)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+    for output in ctx_llm.generate(my_prompts,
+                                   sampling_params=sampling_params,
+                                   disaggregated_params=disaggregated_params):
+        print(output, flush=True)
+        gen_disagg_params = output.disaggregated_params
+
+    del ctx_llm
+
+    assert gen_disagg_params is not None
+    gen_disagg_params.request_type = "generation_only"
+
+    gen_llm = LLM_CLASS(model=llama_model_path,
+                        kv_cache_config=global_kvcache_config,
+                        tensor_parallel_size=tp_size,
+                        cache_transceiver_config=CacheTransceiverConfig(
+                            backend="DEFAULT", kv_transfer_timeout_ms=1000),
+                        **llm_args_extra)
+
+    # Send gen-only request, normally would hang forever since context server was destroyed
+    for output in gen_llm.generate(my_prompts,
+                                   sampling_params=sampling_params,
+                                   disaggregated_params=gen_disagg_params):
+        print(output, flush=True)

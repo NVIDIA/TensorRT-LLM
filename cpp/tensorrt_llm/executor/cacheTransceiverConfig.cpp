@@ -47,6 +47,10 @@ void CacheTransceiverConfig::setMaxTokensInBuffer(std::optional<size_t> maxToken
 
 void CacheTransceiverConfig::setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs)
 {
+    if (kvTransferTimeoutMs.has_value() && kvTransferTimeoutMs.value() <= 0)
+    {
+        TLLM_THROW("kvTransferTimeoutMs must be positive");
+    }
     mKvTransferTimeoutMs = kvTransferTimeoutMs;
 }
 

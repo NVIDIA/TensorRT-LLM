@@ -1381,6 +1381,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
     kv_transfer_timeout_ms: Optional[int] = Field(
         default=None,
+        gt=0,
         description=
         "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
     )
