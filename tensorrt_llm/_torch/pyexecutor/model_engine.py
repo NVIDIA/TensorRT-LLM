@@ -18,6 +18,8 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
+from tensorrt_llm.inputs.registry import (create_input_processor,
+                                          create_input_processor_with_hash)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -172,7 +174,9 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-
+        self.input_processor = create_input_processor(model_path, None)
+        self.input_processor_with_hash = create_input_processor_with_hash(
+            self.input_processor)
         if model is None:
             loader = ModelLoader(
                 pytorch_backend_config=pytorch_backend_config,
@@ -1224,6 +1228,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
 
             # Multimodal
             py_multimodal_runtime = MultimodalRuntimeData(
@@ -1334,6 +1339,7 @@ class PyTorchModelEngine(ModelEngine):
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -1367,6 +1373,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     num_cached_tokens_per_seq.append(past_seen_token_num +
                                                      self.runtime_draft_len + 1)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     prompt_lengths.append(1 + self.runtime_draft_len)
@@ -1427,6 +1434,7 @@ class PyTorchModelEngine(ModelEngine):
                     position_id = sum(past_seen_token_nums)
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
@@ -1949,6 +1957,7 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_contexts = len(sequence_lengths)
         for request in scheduled_requests.context_requests:
             ctx_iter = request.ctx_iters
@@ -1988,6 +1997,7 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_queries = len(sequence_lengths) - num_contexts
 
         # Requests with draft tokens are treated like extend requests.
@@ -2045,6 +2055,7 @@ class PyTorchModelEngine(ModelEngine):
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
