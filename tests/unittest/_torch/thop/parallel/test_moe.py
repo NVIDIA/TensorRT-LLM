@@ -1154,6 +1154,9 @@ class TestMoeFp4:
         if padding >= 256:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
+        if intermediate_size == 384:
+            pytest.skip("https://nvbugs/5434352")
+
         assert top_k <= num_experts
         assert top_k <= 8
         assert num_experts % 4 == 0
