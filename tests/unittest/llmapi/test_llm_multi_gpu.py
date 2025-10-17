@@ -75,7 +75,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@pytest.mark.skip(reason="https://nvbugs/5532023")
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
@@ -98,7 +97,6 @@ def test_llm_generate_tp2():
                      kv_cache_config=global_kv_cache_config)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5532023")
 def test_llm_explicit_shutdown():
     # with-statement will invoke `shutdown()` explicitly
     with LLM(model=llama_model_path,
@@ -137,7 +135,6 @@ def test_llm_return_logprobs_tp2(prompt_logprobs: Optional[int],
                                      tp_size=2)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5532023")
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
                          ids=["enable_auto_parallel", "disable_auto_parallel"])
 @pytest.mark.parametrize("from_ckpt", [True, False],
@@ -170,7 +167,6 @@ def test_llm_generate_mixtral_for_tp2():
         print(output)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5532023")
 @skip_gpu_memory_less_than(70 * 1024**3)
 @pytest.mark.gpu2
 @pytest.mark.part1
@@ -316,7 +312,6 @@ def run_command(command: str):
         raise e
 
 
-@pytest.mark.skip(reason="https://nvbugs/5532023")
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     nworkers = 2
@@ -521,7 +516,6 @@ def llm_for_sampling_params_tp2():
     llm.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5532023")
 @pytest.mark.parametrize("sampling_params",
                          sampling_params_for_aborting_request)
 def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,

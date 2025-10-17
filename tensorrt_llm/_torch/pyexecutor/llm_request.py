@@ -376,6 +376,7 @@ class LlmResult:
         self._result = result
         self._py_result = py_result
         self.is_final = is_final
+        self.cached_tokens = 0
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
@@ -501,6 +502,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
         self.d2t = None
@@ -535,6 +538,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
+
+    @property
+    def cached_tokens(self) -> int:
+        return self._cached_tokens
+
+    @cached_tokens.setter
+    def cached_tokens(self, value: int):
+        if not self._cached_tokens_set:
+            self._cached_tokens = value
+            self._cached_tokens_set = True
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY

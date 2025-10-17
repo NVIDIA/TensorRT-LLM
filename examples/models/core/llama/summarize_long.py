@@ -356,7 +356,7 @@ def main(args):
         profiler.start('load HF model')
         hf_model = AutoModelForCausalLM.from_pretrained(
             args.hf_model_location,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             use_flash_attention_2=True)
         profiler.stop('load HF model')
         tensorrt_llm.logger.info(

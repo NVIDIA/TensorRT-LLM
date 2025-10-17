@@ -108,22 +108,6 @@ def run_cache_transceiver_tests(build_dir: _pl.Path,
                      env=mgpu_env,
                      timeout=timeout)
 
-    # Nixl transfer agent tests
-    new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.NIXL)
-
-    # Cache transceiver tests
-    cache_trans_test_8_proc = [
-        "mpirun",
-        "-n",
-        "8",
-        "--allow-run-as-root",
-        "cacheTransceiverTest",
-    ]
-    _cpp.run_command(cache_trans_test_8_proc,
-                     cwd=tests_dir,
-                     env=new_env,
-                     timeout=600)
-
 
 def run_user_buffer_tests(build_dir: _pl.Path, nprocs=2, timeout=300):
     tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
@@ -500,8 +484,8 @@ def test_fused_gemm_allreduce(build_google_tests, nprocs, build_dir):
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-@pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
-                         ids=["mpi_kvcache", "ucx_kvcache"])
+@pytest.mark.parametrize("kvcache_type", [KVCacheType.NIXL, KVCacheType.UCX],
+                         ids=["nixl_kvcache", "ucx_kvcache"])
 @pytest.mark.parametrize("nprocs", [2, 8], ids=["2proc", "8proc"])
 def test_cache_transceiver(build_google_tests, nprocs, kvcache_type, build_dir):
 

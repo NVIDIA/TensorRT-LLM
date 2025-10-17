@@ -445,7 +445,7 @@ class WideEPMoE(MoE):
         if not self.use_postquant_alltoall:
             return False
         if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-            return False
+            return True
         elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
             return self.has_nvfp4
         elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:

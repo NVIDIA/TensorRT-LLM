@@ -65,10 +65,9 @@ def test_single_completion(client: openai.OpenAI, model_name):
     assert completion.choices is not None and len(completion.choices) == 1
     completion_tokens = 5
     prompt_tokens = 6
-    assert completion.usage == openai.types.CompletionUsage(
-        completion_tokens=completion_tokens,
-        prompt_tokens=prompt_tokens,
-        total_tokens=prompt_tokens + completion_tokens)
+    assert completion.usage.completion_tokens == completion_tokens
+    assert completion.usage.prompt_tokens == prompt_tokens
+    assert completion.usage.total_tokens == prompt_tokens + completion_tokens
 
     # test using token IDs
     completion = client.completions.create(
@@ -416,3 +415,111 @@ async def test_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
     await invalid_logit_bias_helper(async_client, model_name, 'completions')
+
+
+def test_completion_cached_tokens(client: openai.OpenAI, model_name: str,
+                                  backend: str):
+    if backend == "trt":
+        pytest.skip("Cached tokens is not supported in trt backend yet")
+
+    prompt = "This is a test prompt"
+
+    # Run the completion for the first time
+    single_completion = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    expected_cached_tokens = single_completion.usage.prompt_tokens - 1
+
+    # Run the completion for the second time
+    single_completion = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    assert single_completion.usage is not None
+    assert single_completion.usage.prompt_tokens_details is not None
+    assert single_completion.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_cached_tokens_stream(async_client: openai.AsyncOpenAI,
+                                               model_name: str, backend: str):
+    if backend == "trt":
+        pytest.skip("Cached tokens is not supported in trt backend yet")
+
+    prompt = "This is a test prompt"
+
+    # Run the completion for the first time so that cached tokens are created
+    single_completion = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    expected_cached_tokens = single_completion.usage.prompt_tokens - 1
+
+    # Test stream=True, stream_options=
+    #     {"include_usage": True, "continuous_usage_stats": False}
+    stream = await async_client.completions.create(model=model_name,
+                                                   prompt=prompt,
+                                                   max_tokens=5,
+                                                   temperature=0.0,
+                                                   stream=True,
+                                                   stream_options={
+                                                       "include_usage":
+                                                       True,
+                                                       "continuous_usage_stats":
+                                                       False,
+                                                   })
+    async for chunk in stream:
+        if chunk.choices[0].finish_reason is None:
+            assert chunk.usage is None
+        else:
+            assert chunk.usage is None
+            final_chunk = await stream.__anext__()
+            assert final_chunk.usage is not None
+            assert final_chunk.usage.prompt_tokens > 0
+            assert final_chunk.usage.completion_tokens > 0
+            assert final_chunk.usage.total_tokens == (
+                final_chunk.usage.prompt_tokens +
+                final_chunk.usage.completion_tokens)
+            assert final_chunk.usage.prompt_tokens_details is not None
+            assert final_chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+            assert final_chunk.choices == []
+
+    # Test stream=True, stream_options=
+    #     {"include_usage": True, "continuous_usage_stats": True}
+    stream = await async_client.completions.create(model=model_name,
+                                                   prompt=prompt,
+                                                   max_tokens=5,
+                                                   temperature=0.0,
+                                                   stream=True,
+                                                   stream_options={
+                                                       "include_usage":
+                                                       True,
+                                                       "continuous_usage_stats":
+                                                       True,
+                                                   })
+    async for chunk in stream:
+        assert chunk.usage is not None
+        assert chunk.usage.prompt_tokens > 0
+        assert chunk.usage.completion_tokens > 0
+        assert chunk.usage.prompt_tokens_details is not None
+        assert chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+        assert chunk.usage.total_tokens == (chunk.usage.prompt_tokens +
+                                            chunk.usage.completion_tokens)
+        if chunk.choices[0].finish_reason is not None:
+            final_chunk = await stream.__anext__()
+            assert final_chunk.usage is not None
+            assert final_chunk.usage.prompt_tokens > 0
+            assert final_chunk.usage.completion_tokens > 0
+            assert final_chunk.usage.total_tokens == (
+                final_chunk.usage.prompt_tokens +
+                final_chunk.usage.completion_tokens)
+            assert final_chunk.usage.prompt_tokens_details is not None
+            assert final_chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+            assert final_chunk.choices == []

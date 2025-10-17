@@ -21,7 +21,7 @@ class WorkerInfo:
     role: ServerRole = ServerRole.CONTEXT
 
 
-def get_worker_key_prefix(cluster_name: str):
+def get_worker_key_prefix(cluster_name: str) -> str:
     return f"/trtllm-disagg/{cluster_name}/workers"
 
 
@@ -47,13 +47,14 @@ class DisaggClusterManager:
 
     def __del__(self):
         if asyncio.get_event_loop():
-            asyncio.run_coroutine_threadsafe(self.unwatch_workers(),
+            asyncio.run_coroutine_threadsafe(self.stop(),
                                              asyncio.get_event_loop())
 
     async def start(self) -> None:
         await self._cluster_storage.start()
 
     async def stop(self) -> None:
+        await self.unwatch_workers()
         await self._cluster_storage.stop()
 
     async def cluster_info(self) -> Dict[str, Any]:
@@ -104,8 +105,9 @@ class DisaggClusterManager:
         return workers
 
     async def unwatch_workers(self) -> None:
-        await self._cluster_storage.unwatch(self.worker_key_prefix)
-        self._watch_handle = None
+        if self._watch_handle:
+            await self._cluster_storage.unwatch(self.worker_key_prefix)
+            self._watch_handle = None
 
     async def get_worker_events(
             self) -> List[Tuple[WorkerInfo, WatchEventType]]:

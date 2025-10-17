@@ -289,6 +289,8 @@ class TestMixtral8x7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1"
 
     @skip_post_blackwell
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_awq_tp2(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
         with LLM(self.MODEL_PATH,
