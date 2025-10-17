@@ -391,6 +391,42 @@ class LlavaNextVisionModel(nn.Module):
                                     device=image_features[0].device)
         return new_image_features, feature_lens
 
+    def _pad_for_batching(
+        self,
+        pixel_values: list[torch.Tensor],
+    ):
+        """
+        Pads images on the `num_of_patches` dimension with zeros to form a batch of same number of patches.
+
+        Args:
+            pixel_values (`list[torch.Tensor]`):
+                A list of pixel value tensors, each of shape (`batch`, `num_patches`, `channels`, `height`, `width`)
+
+        Returns:
+            list[`torch.Tensor`]: The padded image tensors.
+        """
+        if not pixel_values:
+            return pixel_values
+
+        # Find max patches across all images
+        max_patches = max(tensor.shape[1] for tensor in pixel_values)
+
+        # Pad each tensor by concatenating zeros on dim=1 (num_patches)
+        padded_values = []
+
+        for pixel_value in pixel_values:
+            current_patches = pixel_value.shape[1]
+            if current_patches < max_patches:
+                pad_len = max_patches - current_patches
+                zeros = pixel_value.new_zeros(
+                    (pixel_value.shape[0], pad_len, *pixel_value.shape[2:]))
+                padded_pixel_value = torch.cat([pixel_value, zeros], dim=1)
+            else:
+                padded_pixel_value = pixel_value
+            padded_values.append(padded_pixel_value)
+
+        return padded_values
+
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
         pixel_values = [
@@ -401,6 +437,7 @@ class LlavaNextVisionModel(nn.Module):
             multimodal_param.multimodal_data["image"]["image_sizes"]
             for multimodal_param in multimodal_params
         ]
+        pixel_values = self._pad_for_batching(pixel_values)
         pixel_values = torch.cat(pixel_values, dim=0)
         image_sizes = torch.cat(image_sizes, dim=0)
 
