@@ -40,8 +40,13 @@ def test_guided_decoding_json_output():
         },
     ]
 
-    llm = LLM(model="meta-llama/Meta-Llama-3.1-8B-Instruct", guided_decoding_backend="xgrammar")
-
+    # TODO: Can test that if we make an LLM with guided_decoding_backend=None, it will throw an error.
+    # This should work if inference is deterministic here - but if it is not we can omit the test.
+    guided_decoding_backend = "xgrammar"
+    llm = LLM(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        guided_decoding_backend=guided_decoding_backend,
+    )
     sampling_params = SamplingParams(
         max_tokens=100,
         top_k=None,
@@ -63,6 +68,7 @@ def test_guided_decoding_json_output():
         # Validate each output is valid JSON
         for i, output in enumerate(outputs):
             generated_text = output.outputs[0].text.strip()
+
             # Test that the output is valid JSON
             try:
                 parsed_json = json.loads(generated_text)
