@@ -386,46 +386,43 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
         gamma.packed = *reinterpret_cast<PackedType const*>(&gammaPtr[packedIdx * kELTS_PER_THREAD]);
 
         float threadSum = 0.F;
-        __shared__ float sharedVal; // Temporary variable to share the sum within block
 #pragma unroll
         for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
             // FIXME: Use float square if accuracy issue
             threadSum += cuda_cast<float, T>(packedAccum.elements[i] * packedAccum.elements[i]);
         }
-        float tokenSum = blockReduceSum<float, false>(threadSum);
+        float blockSum = blockReduceSum<float, true>(threadSum);
+
+        __shared__ float sharedVal[8]; // Temporary variable to share the sum within block
+        float fullSum = blockSum;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
-        if (cluster.num_blocks() > 1)
+        int const numBlocks = cluster.num_blocks();
+        if (numBlocks > 1)
         {
+            fullSum = 0.F;
             // Need to reduce over the entire cluster
-            if (threadIdx.x == 0)
+            int const blockRank = cluster.block_rank();
+            if (threadIdx.x < numBlocks)
             {
-                sharedVal = tokenSum;
-                tokenSum = 0.F;
+                cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
             }
-            cluster.sync();
-            if (threadIdx.x == 0)
+            // cluster.sync();
+            cluster.barrier_wait(cluster.barrier_arrive());
+            for (int i = 0; i < numBlocks; ++i)
             {
-                for (int i = 0; i < cluster.num_blocks(); ++i)
-                {
-                    tokenSum += *cluster.map_shared_rank(&sharedVal, i);
-                }
+                fullSum += sharedVal[i];
             }
-            cluster.sync();
         }
 #endif
-        if (threadIdx.x == 0)
-        {
-            sharedVal = rsqrtf(tokenSum / tokenDim + epsilon);
-        }
-        __syncthreads();
+        float rcpRms = rsqrtf(fullSum / tokenDim + epsilon);
 #pragma unroll
         for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
             packedAccum.elements[i] = cuda_cast<T, float>(
-                cuda_cast<float, T>(packedAccum.elements[i]) * sharedVal * cuda_cast<float, T>(gamma.elements[i]));
+                cuda_cast<float, T>(packedAccum.elements[i]) * rcpRms * cuda_cast<float, T>(gamma.elements[i]));
         }
     }
     reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
@@ -805,39 +802,32 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 
     __pipeline_wait_prior(0);
 
-    // Sum is only used in thread 0!
-    float clusterSum = blockReduceSum<float, false>(threadSum);
+    float blockSum = blockReduceSum<float, true>(threadSum);
 
-    float rcpRms;
-    __shared__ float sharedVal;
+    float fullSum = blockSum;
+    __shared__ float sharedVal[8];
     // Use CGA Reduction if supported
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if (cluster.num_blocks() > 1)
+    int const numBlocks = cluster.num_blocks();
+    if (numBlocks > 1)
     {
+        fullSum = 0.F;
         // Need to reduce over the entire cluster
-        if (threadIdx.x == 0)
+        int const blockRank = cluster.block_rank();
+        if (threadIdx.x < numBlocks)
         {
-            sharedVal = clusterSum;
-            clusterSum = 0.F;
+            cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
         }
-        cluster.sync();
-        if (threadIdx.x == 0)
+        // cluster.sync();
+        cluster.barrier_wait(cluster.barrier_arrive());
+        for (int i = 0; i < numBlocks; ++i)
         {
-            for (int i = 0; i < clusterSize; ++i)
-            {
-                clusterSum += *cluster.map_shared_rank(&sharedVal, i);
-            }
+            fullSum += sharedVal[i];
         }
-        cluster.sync();
     }
 #endif
 
-    if (threadIdx.x == 0)
-    {
-        sharedVal = rsqrtf(clusterSum / dim + epsilon);
-    }
-    __syncthreads();
-    rcpRms = sharedVal;
+    float rcpRms = rsqrtf(fullSum / dim + epsilon);
 
 #pragma unroll
     for (int i = 0; i < LoadsPerThread; i++)
