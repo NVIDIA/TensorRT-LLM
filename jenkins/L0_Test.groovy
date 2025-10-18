@@ -305,9 +305,11 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (Exception e) {
             def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
             if (isRerunFailed) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
+                }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
-                echo "Isolated test ${i} (${isolateTestName}) failed after rerun attempt, continuing with remaining tests"
             }
         } finally {
             // Clean up the temporary test file
