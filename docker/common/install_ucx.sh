@@ -26,3 +26,4 @@ cd ucx
 make install -j$(nproc)
 cd ..
 rm -rf ucx  # Remove UCX source to save space
+echo "export LD_LIBRARY_PATH=${UCX_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
