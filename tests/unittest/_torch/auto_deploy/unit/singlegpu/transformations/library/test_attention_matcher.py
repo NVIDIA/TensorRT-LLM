@@ -7,7 +7,6 @@ from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -1014,21 +1013,6 @@ class Llama3CausalAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
-class MockAttentionDescriptor(AttentionDescriptor):
-    """A mock class that mimics the AttentionDescriptor interface for testing."""
-
-    layout: str = "bnsd"
-    source_attention_op: Callable = torch.ops.auto_deploy.torch_attention_sdpa
-
-    @classmethod
-    def get_attention_layout(cls) -> str:
-        return cls.layout
-
-    @classmethod
-    def get_source_attention_op(cls) -> Callable:
-        return cls.source_attention_op
-
-
 class AttentionLayoutModel(torch.nn.Module):
     """Model that uses SDPA for testing the layout transformation."""
 
@@ -1168,17 +1152,6 @@ def test_match_attention_layout(layout, model_config, has_mask):
     batch_size, seq_len = 4, 12
     hidden_size = 512
     num_heads = 8
-
-    # Set up the mock attention descriptor class with the specified layout
-    MockAttentionDescriptor.layout = layout
-    if layout == "bnsd":
-        if model_config.get("use_grouped_sdpa"):
-            source_op = torch.ops.auto_deploy.torch_attention
-        else:
-            source_op = torch.ops.auto_deploy.torch_attention_sdpa
-    else:
-        source_op = torch.ops.auto_deploy.torch_attention
-    MockAttentionDescriptor.source_attention_op = source_op
 
     # Create appropriate model based on model_config
     if model_config["type"] == "standard":
@@ -1329,7 +1302,7 @@ def test_match_attention_layout(layout, model_config, has_mask):
             {
                 "match_attention_layout": {
                     "stage": "pattern_matcher",
-                    "attention_op": MockAttentionDescriptor,
+                    "attn_layout": layout,
                 },
             },
         )(None, gm),

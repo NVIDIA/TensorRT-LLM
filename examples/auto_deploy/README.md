@@ -128,9 +128,7 @@ llm = LLM(
     attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
-    mla_backend="MultiHeadLatentAttention", # for models that support MLA
     free_mem_ratio=0.8, # fraction of available memory for cache
-    simple_shard_only=False, # tensor parallelism sharding strategy
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )
@@ -218,15 +216,15 @@ args:
     num_hidden_layers: 12
     hidden_size: 1024
   world_size: 4
-  compile_backend: torch-compile
-  attn_backend: triton
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    sharding:
-      strategy: auto
-    quantization:
-      enabled: false
+    detect_sharding:
+      support_partial_config: true
+    insert_cached_attention:
+      backend: triton
+    compile_model:
+      backend: torch-compile
 
 prompt:
   batch_size: 8
@@ -234,13 +232,6 @@ prompt:
     max_tokens: 150
     temperature: 0.8
     top_k: 50
-
-benchmark:
-  enabled: true
-  num: 20
-  bs: 4
-  isl: 1024
-  osl: 256
 ```
 
 Create an additional override file (e.g., `production.yaml`):
@@ -249,11 +240,10 @@ Create an additional override file (e.g., `production.yaml`):
 # production.yaml
 args:
   world_size: 8
-  compile_backend: torch-opt
   max_batch_size: 32
-
-benchmark:
-  enabled: false
+  transforms:
+    compile_model:
+      backend: torch-opt
 ```
 
 Then use these configurations:

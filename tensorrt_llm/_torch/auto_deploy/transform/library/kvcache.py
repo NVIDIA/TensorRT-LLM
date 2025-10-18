@@ -12,7 +12,7 @@ from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegi
 from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import add_graph_input
+from ...utils._graph import add_graph_input
 from ...utils.node_utils import get_all_input_output_nodes, is_op
 from ..interface import (
     BaseTransform,
@@ -64,16 +64,13 @@ class UpdateInOutNodes(BaseTransform):
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
-    attn_backend: Optional[str] = Field(default=None, description="The attention backend to use.")
+    backend: Optional[str] = Field(default=None, description="The attention backend to use.")
 
 
 @TransformRegistry.register("insert_cached_attention")
 class InsertCachedAttention(BaseTransform):
     """
-    A transform to insert cached attention into the graph module.
-
-    If attn_backend is not provided in transform config, will find from shared config.
-    """
+    A transform to insert cached attention into the graph module."""
 
     config: InsertCachedAttentionConfig
 
@@ -83,7 +80,7 @@ class InsertCachedAttention(BaseTransform):
 
     @property
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
-        return AttentionRegistry.get(self.config.attn_backend)
+        return AttentionRegistry.get(self.config.backend)
 
     def _process_get_metadata(
         self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
@@ -222,7 +219,7 @@ class ResizeKVCacheConfig(TransformConfig):
     """Configuration for the resize kv cache transform."""
 
     free_mem_ratio: float = Field(
-        description="The fraction of available memory to occupy.", default=0.8
+        default=0.0, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
     )
 
 
