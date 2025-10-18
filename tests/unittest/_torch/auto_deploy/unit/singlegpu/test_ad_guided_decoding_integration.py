@@ -47,7 +47,6 @@ def test_guided_decoding_json_output():
         top_k=None,
         temperature=0.1,
         guided_decoding=GuidedDecodingParams(json=json_schema),
-        ignore_eos=True,
     )
 
     try:
