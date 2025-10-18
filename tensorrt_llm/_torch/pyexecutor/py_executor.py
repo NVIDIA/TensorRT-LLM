@@ -40,6 +40,7 @@ from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
+from ..speculative.speculation_gate import SpeculationGate
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -210,6 +211,20 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
+
+        # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
+        spec_config = getattr(self.model_engine, 'spec_config', None)
+        self.acceptance_window = getattr(
+            spec_config, 'acceptance_window',
+            None) if spec_config is not None else None
+        self.acceptance_length_threshold = getattr(
+            spec_config, 'acceptance_length_threshold',
+            None) if spec_config is not None else None
+        self.speculation_permanently_disabled = False
+        self.speculation_gate = None
+        if self.acceptance_window and self.acceptance_length_threshold is not None:
+            self.speculation_gate = SpeculationGate(
+                self.acceptance_window, self.acceptance_length_threshold)
 
         # response used data
         self.response_lock = threading.Lock()
@@ -1018,10 +1033,15 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self.use_spec_decode = self.drafter.should_use_spec_decode(
-                self.active_requests, self.max_batch_size,
-                self.model_engine.max_num_tokens,
-                self.model_engine.spec_config.max_draft_len)
+            # Honor permanent disable flag based on rolling acceptance first
+            if getattr(self, 'speculation_permanently_disabled', False):
+                self.use_spec_decode = False
+            else:
+                self.use_spec_decode = self.drafter.should_use_spec_decode(
+                    self.active_requests, self.max_batch_size,
+                    self.model_engine.max_num_tokens,
+                    self.model_engine.spec_config.max_draft_len)
+            logger.debug(f"Use spec decode: {self.use_spec_decode}")
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
             # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
@@ -2053,9 +2073,34 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
+                    response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
 
             if request_done:
+                if (self.drafter is not None and getattr(
+                        self.model_engine, 'enable_spec_decode', False)
+                        and not self.speculation_permanently_disabled
+                        and not request.is_dummy and not self.is_warmup):
+                    if self.speculation_gate is not None:
+                        # Response handling runs on multiple PP ranks. Only the last PP rank performs
+                        # sampling; restrict rolling stat updates to it to avoid overcounting.
+                        if (not getattr(self.dist, 'has_pp',
+                                        False)) or self.dist.is_last_pp_rank:
+                            avg_decoded = getattr(
+                                request, 'avg_decoded_tokens_per_iter', None)
+                            if avg_decoded is not None:
+                                disabled_now, _ = self.speculation_gate.record_avg_decoded(
+                                    avg_decoded,
+                                    request_id=getattr(request, 'py_request_id',
+                                                       None))
+                                if disabled_now:
+                                    # disable speculation permanently
+                                    # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
+                                    self.speculation_permanently_disabled = True
+                            else:
+                                logger.debug(
+                                    f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
+                                )
                 if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
                     requests_to_terminate.append(request)
                 else:

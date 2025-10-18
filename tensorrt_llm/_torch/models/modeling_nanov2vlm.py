@@ -70,7 +70,8 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         # Construct the vision encoder.
         vision_model_config = copy.deepcopy(model_config)
         vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
-        self.vision_model = RADIOVisionModel(vision_model_config)
+        self.vision_model = RADIOVisionModel(vision_model_config,
+                                             disable_quantization=True)
 
     def load_weights(self, weights):
         # Load mlp1 weights.
@@ -191,6 +192,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         image: Image.Image,
         **kwargs,
     ):
+        # The logic is copied and modified from HuggingFace ImageProcessor.
 
         def _get_internvl_target_ratios(
             min_num: int,
@@ -205,18 +207,20 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
         def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width,
                                        height, image_size):
-            best_factor = float('-inf')
+            best_ratio_diff = float("inf")
             best_ratio = (1, 1)
             area = width * height
             for ratio in target_ratios:
                 target_aspect_ratio = ratio[0] / ratio[1]
-                factor_based_on_area_n_ratio = min(
-                    (ratio[0] * ratio[1] * image_size * image_size) / area,
-                    0.6) * min(target_aspect_ratio / aspect_ratio,
-                               aspect_ratio / target_aspect_ratio)
-                if factor_based_on_area_n_ratio > best_factor:
-                    best_factor = factor_based_on_area_n_ratio
+                ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+                if ratio_diff < best_ratio_diff:
+                    best_ratio_diff = ratio_diff
                     best_ratio = ratio
+                elif ratio_diff == best_ratio_diff:
+                    image_area = image_size * image_size
+                    ratio_prod = ratio[0] * ratio[1]
+                    if area > 0.5 * image_area * ratio_prod:
+                        best_ratio = ratio
             return best_ratio
 
         def _calculate_targets(
@@ -270,12 +274,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             return input_ids[0].to(torch.int32).tolist(), {}
 
         if images is not None:
-            if isinstance(images[0], torch.Tensor):
-                # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
-                images = [
-                    Image.fromarray((image.permute(1, 2, 0) * 255).to(
-                        torch.uint8).cpu().numpy()) for image in images
-                ]
             # Processing for multimodal data.
             processed_images = self.processor(images=images,
                                               return_tensors='pt').to(
@@ -304,16 +302,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             # Process videos one by one to get correct processed_query.
             processed_query = ""
             for video_index, video in enumerate(videos):
-                if isinstance(video[0], torch.Tensor):
-                    # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
-                    images = [
-                        Image.fromarray((image.permute(1, 2, 0) * 255).to(
-                            torch.uint8).cpu().numpy()) for image in video
-                    ]
-                else:
-                    images = video
                 # Processing for multimodal data.
-                processed_images = self.processor(images=images,
+                processed_images = self.processor(images=video,
                                                   return_tensors='pt').to(
                                                       self.device)
                 num_patches_list.append(processed_images['num_patches'])

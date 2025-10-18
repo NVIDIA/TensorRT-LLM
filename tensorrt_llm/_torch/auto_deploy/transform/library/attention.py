@@ -2,14 +2,13 @@
 
 from inspect import Parameter, Signature
 from itertools import product
-from typing import Any, Callable, Dict, List, Tuple, Type
+from typing import Any, Callable, Dict, List, Literal, Tuple, Type
 
 import torch
 import torch.nn.functional as F
 from pydantic import Field
 from torch.fx import GraphModule
 
-from ...custom_ops.attention_interface import AttentionDescriptor
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -754,9 +753,11 @@ def register_match_attn_layout(patterns: ADPatternMatcherPass):
 
 
 class MatchAttentionLayoutConfig(TransformConfig):
-    """Configuration for the insert cached attention transform."""
+    """Configuration for the match attention layout transform."""
 
-    attention_op: Type[AttentionDescriptor] = Field(description="The attention descriptor to use.")
+    attn_layout: Literal["bsnd", "bnsd"] = Field(
+        description="Layout expected by the attention backend."
+    )
 
 
 @TransformRegistry.register("match_attention_layout")
@@ -779,13 +780,8 @@ class MatchAttentionLayout(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        attention_layout = self.config.attention_op.get_attention_layout()
-
-        if attention_layout not in ("bnsd", "bsnd"):
-            raise ValueError(f"Unsupported attention layout: {attention_layout}")
-
         # If backend expects bnsd, nothing to do.
-        if attention_layout == "bnsd":
+        if self.config.attn_layout == "bnsd":
             return gm, TransformInfo(
                 skipped=False, num_matches=0, is_clean=False, has_valid_shapes=False
             )

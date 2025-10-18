@@ -1,6 +1,5 @@
 import os
 import random
-from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
@@ -8,18 +7,21 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import \
+    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SpeculativeConfig,
-                                          TorchLlmArgs)
+                                          SamplerType, SparseAttentionConfig,
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
+from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
@@ -42,6 +44,20 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
+def get_kv_cache_manager_cls(model_config: ModelConfig):
+    config = model_config.pretrained_config
+    sparse_attn_config = model_config.sparse_attention_config
+    if is_mla(config):
+        return KVCacheManager
+    elif is_nemotron_hybrid(config):
+        return MambaHybridCacheManager
+    else:
+        if sparse_attn_config is not None:
+            return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        else:
+            return KVCacheManager
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -61,6 +77,8 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
         pytorch_backend_config: PyTorchConfig,
         speculative_config: SpeculativeConfig,
+        sparse_attention_config: SparseAttentionConfig,
+        profiling_stage_data: Optional[dict],
     ):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -72,50 +90,15 @@ class KvCacheCreator:
         self._kv_connector_manager = kv_connector_manager
         self._pytorch_backend_config = pytorch_backend_config
         self._speculative_config = speculative_config
+        self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
-
-    @staticmethod
-    def _get_cache_size_per_token(model_config: ModelConfig,
-                                  mapping: Mapping) -> int:
-        mem_per_token = 2
-        quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
-
-        config = model_config.pretrained_config
-
-        num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                      config.num_attention_heads)
-        if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
-
-        mla = is_mla(config)
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-
-        kv_factor = 2
-        if mla:
-            # MLA has kv_lora_rank and qk_rope_head_dim
-            head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-            kv_factor = 1
-        else:
-            _head_dim = getattr(config, 'head_dim', None)
-            if not isinstance(_head_dim, int):
-                _head_dim = config.hidden_size // config.num_attention_heads
-            head_dim = _head_dim * num_key_value_heads // tp_size
-
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
-        mem_per_token *= num_attention_layers * head_dim
-        # K and V
-        mem_per_token *= kv_factor
-        return mem_per_token
+        self._profiling_stage_data = profiling_stage_data
+        self._kv_cache_manager_cls = get_kv_cache_manager_cls(
+            model_engine.model.model_config)
 
     def _get_free_gpu_memory_fraction(self) -> float:
         fraction = self._kv_cache_config.free_gpu_memory_fraction
@@ -126,12 +109,14 @@ class KvCacheCreator:
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
-        kv_size_per_token = self._get_cache_size_per_token(
-            model_config, mapping)
+        kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
+            model_config, mapping, tokens_per_block=self._tokens_per_block)
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
-            kv_size_per_token += self._get_cache_size_per_token(
-                draft_model_config, mapping)
+            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                draft_model_config,
+                mapping,
+                tokens_per_block=self._tokens_per_block)
         return kv_size_per_token
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -152,13 +137,76 @@ class KvCacheCreator:
             f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
         return int(available_kv_mem)
 
+    def _create_dummy_mm_context_request(
+            self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
+        if isinstance(
+                self._profiling_stage_data,
+                dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
+            return requests
+
+        input_processor = self._model_engine.input_processor
+        if not (hasattr(input_processor, "get_dummy_prompt")):
+            logger.warning("The input processor of the model does not have the method [get_dummy_prompt] implemented." \
+            "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
+            "the image encoder")
+            return requests
+        prompt = input_processor.get_dummy_prompt(input_seq_len)
+
+        prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
+            prompt, None)
+
+        multimodal_input = extra_processed_inputs.get('multimodal_input')
+        multimodal_data = extra_processed_inputs.get('multimodal_data')
+
+        max_num_tokens = len(prompt_token_ids)
+        assert max_num_tokens > 0, "the length of the prompt of the dummy mm req is less than or equal to 0"
+        remaining_tokens = min(max_num_tokens, input_seq_len)
+        if remaining_tokens > input_seq_len:
+            logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len. " \
+                           f"Multimodal prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
+        while remaining_tokens > 0:
+            req_mm_input = trtllm.MultimodalInput(
+                multimodal_hashes=multimodal_input.multimodal_hashes,
+                multimodal_positions=multimodal_input.multimodal_positions,
+                multimodal_lengths=multimodal_input.multimodal_lengths
+            ) if multimodal_input else None
+            request = trtllm.Request(prompt_token_ids,
+                                     max_tokens=1,
+                                     streaming=False,
+                                     sampling_config=trtllm.SamplingConfig(
+                                         beam_width=self._max_beam_width, ),
+                                     output_config=trtllm.OutputConfig(),
+                                     end_id=-1,
+                                     multimodal_input=req_mm_input)
+            # TODO:
+            # create_input_processor_with_hash shouldn’t be required during profiling,
+            # but is temporarily needed due to the multimodal input dependency for chunked prefill
+            request.py_multimodal_data = multimodal_data
+            remaining_tokens -= max_num_tokens
+            requests.append(request)
+
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
+
+        return requests
+
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
+        if hasattr(self._model_engine.model,
+                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                       self._model_engine.model.original_arch, None):
+            input_seq_len = min(self._max_num_tokens, input_seq_len)
+            requests = self._create_dummy_mm_context_request(input_seq_len)
+        # if succeed profiling with multimodal requests then return, otherwise profile
+        # with default case
+        if requests:
+            return requests
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
-        requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
@@ -231,6 +279,12 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+            estimating_kv_cache = False
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
@@ -362,6 +416,8 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        if isinstance(self._profiling_stage_data, dict):
+            self._profiling_stage_data["activation_bytes"] = activation_bytes
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
@@ -374,6 +430,7 @@ class KvCacheCreator:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         spec_config = self._speculative_config
+        sparse_attn_config = self._sparse_attention_config
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -396,7 +453,7 @@ class KvCacheCreator:
         num_hidden_layers = config.num_hidden_layers
 
         if is_mla(config):
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 self._kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
@@ -434,8 +491,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
-
-            kv_cache_manager = MambaHybridCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 # mamba cache parameters
                 config.ssm_state_size,
                 config.conv_kernel,
@@ -518,7 +574,7 @@ class KvCacheCreator:
             binding_model_config = model_engine.model.model_config.get_bindings_model_config(
                 tokens_per_block=self._tokens_per_block) if is_vswa else None
 
-            kv_cache_manager = KVCacheManager(
+            kv_cache_manager = self._kv_cache_manager_cls(
                 self._kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
@@ -536,6 +592,7 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+                sparse_attn_config=sparse_attn_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
