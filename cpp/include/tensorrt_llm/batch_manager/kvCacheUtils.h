@@ -27,8 +27,11 @@ class BlockIterator;
 class BlockRangeForWindow
 {
 public:
-    BlockRangeForWindow(std::vector<SizeType32> blockIds, runtime::ITensor::SharedPtr pool)
-        : mBlockIds(std::move(blockIds))
+    BlockRangeForWindow(BaseKVCacheManager const* cacheManager, SizeType32 windowSize, std::vector<SizeType32> blockIds,
+        runtime::ITensor::SharedPtr pool)
+        : mCacheManager(cacheManager)
+        , mWindowSize(windowSize)
+        , mBlockIds(std::move(blockIds))
         , mPool(std::move(pool))
     {
     }
@@ -51,6 +54,8 @@ public:
     }
 
 private:
+    BaseKVCacheManager const* mCacheManager;
+    SizeType32 mWindowSize;
     std::vector<SizeType32> mBlockIds;
     runtime::ITensor::SharedPtr mPool;
 };
@@ -137,7 +142,7 @@ public:
             mPoolsPerWindow.find(windowSize) != mPoolsPerWindow.end(), "Window size %d not found", windowSize);
         auto pool = mPoolsPerWindow.at(windowSize).front();
         auto blockIds = mBlockIdsPerWindow.at(windowSize);
-        return BlockRangeForWindow(std::move(blockIds), std::move(pool));
+        return BlockRangeForWindow(mManager, windowSize, std::move(blockIds), std::move(pool));
     }
 
     std::vector<SizeType32> getWindowSizes() const
@@ -264,7 +269,11 @@ private:
     {
         if (mIdx < mRange->mBlockIds.size())
         {
-            mCurrent = runtime::ITensor::slice(mRange->mPool, mRange->mBlockIds.at(mIdx), 1);
+            BlockPtr const& block = mRange->mCacheManager->getBlockManager().getBlockById(
+                mRange->mBlockIds.at(mIdx), mRange->mWindowSize);
+            TLLM_CHECK_WITH_INFO(block->isPrimary(), "cache transceiver only supports primary blocks");
+            auto const blockOffset = block->getMemoryPoolBlockIndex();
+            mCurrent = runtime::ITensor::slice(mRange->mPool, blockOffset, 1);
         }
     }
 
