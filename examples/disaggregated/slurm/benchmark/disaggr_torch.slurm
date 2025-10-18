@@ -32,15 +32,16 @@ container_mount=${27}
 container_image=${28}
 model_path=${29}
 trtllm_repo=${30}
-build_wheel=${31}
-work_dir=${32}
-nsys_on=${33}
-seq_offset=${34}  # Offset added to sequence lengths
-numa_bind=${35}    # Whether to enable NUMA binding
-benchmark_mode=${36}  # Benchmark mode: e2e or gen_only
-log_dir=${37}
-enable_time_breakdown=${38}  # Whether to enable request time breakdown
-perf_metrics_max_requests=${39}  # Maximum number of requests to store perf metrics for
+install_trtllm=${31}
+build_wheel=${32}
+work_dir=${33}
+scripts_dir=${34}
+nsys_on=${35}
+seq_offset=${36}  # Offset added to sequence lengths
+numa_bind=${37}    # Whether to enable NUMA binding
+benchmark_mode=${38}  # Benchmark mode: e2e or gen_only
+enable_time_breakdown=${39}  # Whether to enable request time breakdown
+perf_metrics_max_requests=${40}  # Maximum number of requests to store perf metrics for
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -86,9 +87,10 @@ echo "  container_mount: ${container_mount}"
 echo "  container_image: ${container_image}"
 echo "  model_path: ${model_path}"
 echo "  trtllm_repo: ${trtllm_repo}"
+echo "  install_trtllm: ${install_trtllm}"
 echo "  build_wheel: ${build_wheel}"
 echo "  work_dir: ${work_dir}"
-echo "  log_dir: ${log_dir}"
+echo "  scripts_dir: ${scripts_dir}"
 echo "  nsys_on: ${nsys_on}"
 echo "  enable_time_breakdown: ${enable_time_breakdown}"
 echo "  perf_metrics_max_requests: ${perf_metrics_max_requests}"
@@ -96,7 +98,7 @@ echo "  perf_metrics_max_requests: ${perf_metrics_max_requests}"
 container_name="disaggr-test"
 
 # Setup logging directory
-log_base="${log_dir}/${isl}-${osl}/" # path to the log directory
+log_base="${work_dir}/${isl}-${osl}/" # path to the log directory
 full_logdir=${log_base}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
 enable_pdl=false
 if [ "${gen_enable_attention_dp}" = "false" ]; then
@@ -124,7 +126,11 @@ if ! srun -l --container-image=${container_image} \
 fi
 
 # Build TensorRT-LLM if needed
-if [ -d "${trtllm_repo}" ]; then
+if [ "${install_trtllm}" = "true" ]; then
+    if [ ! -d "${trtllm_repo}" ]; then
+        cleanup_on_failure "install_trtllm is true but trtllm_repo directory not found: ${trtllm_repo}"
+    fi
+
     echo "Installing TensorRT-LLM from ${trtllm_repo}..."
     TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
@@ -151,6 +157,8 @@ if [ -d "${trtllm_repo}" ]; then
         cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
     fi
     echo "TensorRT-LLM installation completed successfully"
+else
+    echo "Skipping TensorRT-LLM installation (install_trtllm is false)"
 fi
 
 # Generate worker config
@@ -162,7 +170,7 @@ if ! srun -l -N 1 -n 1 \
         --container-name=${container_name} \
         --container-mounts=${container_mount} \
         --mpi=pmix --overlap \
-        python3 ${work_dir}/gen_worker_config.py \
+        python3 ${scripts_dir}/gen_worker_config.py \
                 --work_dir ${full_logdir} \
                 --ctx_tp_size ${ctx_tp_size} \
                 --ctx_pp_size ${ctx_pp_size} \
@@ -219,7 +227,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-name=${container_name} \
         --container-mounts=${container_mount} \
         --mpi=pmix \
-        bash ${work_dir}/start_worker.sh \
+        bash ${scripts_dir}/start_worker.sh \
         "GEN" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" \
         &> ${full_logdir}/output_gen_${i}.log &
 done
@@ -234,7 +242,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-name=${container_name} \
         --container-mounts=${container_mount} \
         --mpi=pmix \
-        bash ${work_dir}/start_worker.sh \
+        bash ${scripts_dir}/start_worker.sh \
         "CTX" ${i} ${model_path} "8336" "${benchmark_mode}" "${concurrency_list}" "${enable_pdl}" "${numa_bind}" "${full_logdir}" "${nsys_on}" \
         &> ${full_logdir}/output_ctx_${i}.log &
 done
@@ -245,7 +253,7 @@ srun -l --container-name=${container_name} \
     --container-image=${container_image} \
     --container-mounts=${container_mount} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${work_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${work_dir} ${enable_time_breakdown} ${perf_metrics_max_requests} \
+    bash ${scripts_dir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${scripts_dir} ${enable_time_breakdown} ${perf_metrics_max_requests} \
         &> ${full_logdir}/output_server.log &
 
 # Start benchmarking
@@ -255,7 +263,7 @@ if [ "${use_nv_sa_benchmark}" = "true" ]; then
     if ! srun -l --container-name=${container_name} \
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 -n 1 \
-            bash ${work_dir}/run_benchmark_nv_sa.sh \
+            bash ${scripts_dir}/run_benchmark_nv_sa.sh \
             "${model_path}" "${isl}" "${osl}" "${benchmark_ratio}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" \
             &> ${full_logdir}/bench.log; then
         cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/bench.log for details"
@@ -265,7 +273,7 @@ else
     if ! srun -l --container-name=${container_name} \
             --container-mounts=${container_mount} \
             --mpi=pmix --overlap -N 1 -n 1 \
-            bash ${work_dir}/run_benchmark.sh \
+            bash ${scripts_dir}/run_benchmark.sh \
             "${model_path}" "${isl}" "${osl}" "${dataset_file}" "${multi_round}" "${num_gen_servers}" "${concurrency_list}" "${streaming}" "${full_logdir}/" "${enable_time_breakdown}" \
             &> ${full_logdir}/bench.log; then
         cleanup_on_failure "Benchmark failed. Check ${full_logdir}/bench.log for details"

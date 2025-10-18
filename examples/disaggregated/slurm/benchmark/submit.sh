@@ -38,17 +38,18 @@ container_image="<container_image>"
 model_path="<model_path>"
 # Path to the TensorRT-LLM repository
 trtllm_repo="<trtllm_repo>"
-# Set to true to do a clean build of TensorRT-LLM from source
+# Set to true to install TensorRT-LLM
+install_trtllm=false
+# Set to true to do a clean build of TensorRT-LLM from source (only if install_trtllm is true)
 build_wheel=false
 
 # Workspace Configuration
 work_dir=$(pwd) # path to the work directory containing the scripts
 
-# Path to
-log_dir=$work_dir
-
-# Configuration
-slurm_file=$work_dir/"disaggr_torch.slurm"
+# Path to scripts directory containing the SLURM file
+scripts_dir="${trtllm_repo}/examples/disaggregated/slurm/benchmark"
+# Path to the SLURM file
+slurm_file="${scripts_dir}/disaggr_torch.slurm"
 
 # Profiling Configuration
 nsys_on=false  # Set to true to enable profiling
@@ -67,6 +68,7 @@ fi
 
 # Validate required paths
 [[ ! -d "${model_path}" ]] && { echo "Error: model_path not found: ${model_path}" >&2; exit 1; }
+[[ ! -d "${trtllm_repo}" ]] && { echo "Error: trtllm_repo not found: ${trtllm_repo}" >&2; exit 1; }
 [[ ! -d "${work_dir}" ]] && { echo "Error: work_dir '${work_dir}' not found" >&2; exit 1; }
 [[ ! -f "${dataset_file}" ]] && { echo "Error: dataset_file '${dataset_file}' not found" >&2; exit 1; }
 
@@ -128,7 +130,7 @@ run_single() {
         "${gen_eplb_num_slots}" "${mtp_size}" "${gen_concurrency_list}" \
         "${gpus_per_node}" "${use_nv_sa_benchmark}" "${isl}" "${osl}" "${multi_round}" "${benchmark_ratio}" \
         "${streaming}" "${cache_max_tokens}" "${dataset_file}" "${container_mount}" "${container_image}" \
-        "${model_path}" "${trtllm_repo}" "${build_wheel}" "${work_dir}" "${nsys_on}" "${seq_offset}" "${numa_bind}" "${benchmark_mode}" "${log_dir}" \
+        "${model_path}" "${trtllm_repo}" "${install_trtllm}" "${build_wheel}" "${work_dir}" "${scripts_dir}" "${nsys_on}" "${seq_offset}" "${numa_bind}" "${benchmark_mode}" \
         "${enable_time_breakdown}" "${perf_metrics_max_requests}"
     set +x
 }
