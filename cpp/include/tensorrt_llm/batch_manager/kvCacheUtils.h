@@ -269,11 +269,18 @@ private:
     {
         if (mIdx < mRange->mBlockIds.size())
         {
-            BlockPtr const& block = mRange->mCacheManager->getBlockManager().getBlockById(
-                mRange->mBlockIds.at(mIdx), mRange->mWindowSize);
-            TLLM_CHECK_WITH_INFO(block->isPrimary(), "cache transceiver only supports primary blocks");
-            auto const blockOffset = block->getMemoryPoolBlockIndex();
-            mCurrent = runtime::ITensor::slice(mRange->mPool, blockOffset, 1);
+            if (mRange->mCacheManager != nullptr)
+            {
+                BlockPtr const& block = mRange->mCacheManager->getBlockManager().getBlockById(
+                    mRange->mBlockIds.at(mIdx), mRange->mWindowSize);
+                TLLM_CHECK_WITH_INFO(block->isPrimary(), "cache transceiver only supports primary blocks");
+                auto const blockOffset = block->getMemoryPoolBlockIndex();
+                mCurrent = runtime::ITensor::slice(mRange->mPool, blockOffset, 1);
+            }
+            else
+            {
+                mCurrent = runtime::ITensor::slice(mRange->mPool, mRange->mBlockIds.at(mIdx), 1);
+            }
         }
     }
 
