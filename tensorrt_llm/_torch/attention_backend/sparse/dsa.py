@@ -69,34 +69,17 @@ def transform_local_topk_and_prepare_pool_view(
     """
     assert topk_indices.dtype == torch.int32
 
-    # Get KV cache pool: [num_blocks, 1, tokens_per_block, 1, head_dim]
-    kv_pool = kv_cache_manager.get_buffers(layer_idx)
-    num_blocks, _, tokens_per_block, _, head_dim = kv_pool.shape
-    assert kv_pool.shape[1] == 1 and kv_pool.shape[3] == 1
-
-    # Squeeze to [num_blocks, tokens_per_block, head_dim]
-    kv_pool = kv_pool.squeeze(1).squeeze(2)
-
-    # Auto-detect stride and prepare view
-    if kv_pool.is_contiguous():
-        stride_factor = tokens_per_block
-        kv_pool = kv_pool.view(-1, 1, head_dim)
-    else:
-        # Here we simply do:
-        # kv_pool = kv_pool.reshape(-1, 1, head_dim) to make it contiguous
-        # however, using strided layout and directly offset topk tokens in the
-        # (layer-interleaved) pool MIGHT be (not benchmarked) more efficient as its zero-copy.
-
-        # Strided layout: compute stride and create efficient view
-        block_stride = kv_pool.stride(0)
-        token_stride = kv_pool.stride(1)
-        assert token_stride == head_dim
-        stride_factor = block_stride // token_stride
-        view_size = (num_blocks - 1) * stride_factor + tokens_per_block
-        kv_pool = torch.as_strided(kv_pool,
-                                   size=(view_size, 1, head_dim),
-                                   stride=(token_stride, 0, 1),
-                                   storage_offset=kv_pool.storage_offset())
+    # Get all layer KV cache pool: [num_blocks, num_layers, kv_factor, blockSize]
+    all_layer_kv_pool = kv_cache_manager.get_unique_primary_pool(
+    )  # [num_blocks, num_layers, kv_factor, blockSize]
+    num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
+    tokens_per_block = kv_cache_manager.tokens_per_block
+    head_dim = kv_cache_manager.head_dim
+    assert num_layers == kv_cache_manager.num_local_layers, "PP is not enable yet for DS32"
+    assert all_layer_kv_pool.is_contiguous(
+    ), "all_layer_kv_pool should be contiguous"
+    all_layer_kv_pool = all_layer_kv_pool.squeeze(2).view(-1, 1, head_dim)
+    stride_factor = num_layers * tokens_per_block
 
     # Get block_table and request indices for this phase
     if is_generation:
@@ -114,12 +97,13 @@ def transform_local_topk_and_prepare_pool_view(
         req_idx,
         block_table,
         topk_indices,
-        BLOCK_SIZE=attn_metadata.tokens_per_block,
+        BLOCK_SIZE=tokens_per_block,
         NUM_TOPK_TOKENS=topk_indices.shape[1],
         stride_factor=stride_factor,
+        layer_id=layer_idx,
     )
 
-    return global_indices, kv_pool
+    return global_indices, all_layer_kv_pool
 
 
 def split_prefill_chunks(
@@ -1262,7 +1246,7 @@ class DSACacheManager(KVCacheManager):
         assert not kv_cache_config.enable_block_reuse, "DSA cache requires block reuse to be disabled in KV cache config"
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
-        # Use a fixed tokens_per_block for indexer k cache
+        # Use a fixed tokens_per_block for indexer k cache due to DG kernel constraints
         self.indexer_k_cache_tokens_per_block = 64
 
         super().__init__(

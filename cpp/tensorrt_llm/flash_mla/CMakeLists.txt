@@ -144,8 +144,8 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     ${FLASH_MLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu)
 endif()
 
-# Disable LTO before creating target (matching DeepEP's approach) Let CMake
-# generate fatbinData for CUDA separable compilation
+# Disable LTO before creating target (similar to DeepEP) Let CMake generate
+# fatbinData for CUDA separable compilation
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 pybind11_add_module(flash_mla_cpp_tllm ${FLASH_MLA_SOURCES})
@@ -174,7 +174,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
 endif()
 set_cuda_architectures(flash_mla_cpp_tllm ${FLASH_MLA_BUILD_ARCHS})
 
-# Compiler options matching FlashMLA setup.py
+# Copy of compiler options from FlashMLA setup.py
 target_compile_options(
   flash_mla_cpp_tllm
   PRIVATE
@@ -215,7 +215,11 @@ target_include_directories(
 # Link libraries (matching FlashMLA setup.py: cuda, cudart + torch)
 target_link_libraries(
   flash_mla_cpp_tllm PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB}
-                             CUDA::cuda_driver CUDA::cudart CUDA::cudart_static)
+                             CUDA::cuda_driver CUDA::cudart)
+target_link_options(
+  flash_mla_cpp_tllm PRIVATE
+  -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/flash_mla_cpp_tllm.version
+  -Wl,--no-undefined-version)
 
 # Link directories
 target_link_directories(

@@ -325,7 +325,6 @@ class ModelLoader:
                 if hasattr(config.pretrained_config, sub_config):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
-
         return config
 
     def _call_load_weights(self, load_method: Callable, weights, weight_mapper):

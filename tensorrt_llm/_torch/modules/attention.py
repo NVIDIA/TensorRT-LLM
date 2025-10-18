@@ -1530,7 +1530,6 @@ class MLA(nn.Module):
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
-
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             attn_metadata, output, latent_cache)
 
@@ -1601,9 +1600,6 @@ class MLA(nn.Module):
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-            hidden_states=hidden_states,
-            qr=qr,
-            position_ids=position_ids,
         )
         fused_q = None
 

@@ -318,9 +318,9 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     # shapes (compile-time where possible)
     max_num_blocks_per_req: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    BLOCK_N: tl.constexpr,  # tile width along columns
+    BLOCK_N: tl.constexpr,  # tile width along columns # strides (in elements)
     stride_factor: tl.constexpr,  # for strided memory layout adjustment
-    # strides (in elements)
+    layer_id: tl.constexpr,  # for layer interleaving layout
     bt_stride0,
     bt_stride1,
     ti_stride0,
@@ -352,7 +352,7 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
 
     # Compute block id and in-block offset
     block_id = tok // BLOCK_SIZE
-    inblock_off = tok % BLOCK_SIZE
+    inblock_off = tok % BLOCK_SIZE + layer_id * BLOCK_SIZE
 
     # Guard block_table access
     valid_block = block_id < max_num_blocks_per_req
@@ -371,14 +371,16 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
 
 
 def triton_convert_req_index_to_global_index(
-    req_id: torch.Tensor,  # int32 [num_tokens]
-    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
-    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-    BLOCK_SIZE: int = 64,
-    NUM_TOPK_TOKENS: int = 2048,
-    BLOCK_N: int = 128,  # tile width along columns
-    stride_factor:
+        req_id: torch.Tensor,  # int32 [num_tokens]
+        block_table: torch.
+    Tensor,  # int32 [num_requests, max_num_blocks_per_req]
+        token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+        BLOCK_SIZE: int,
+        NUM_TOPK_TOKENS: int = 2048,
+        BLOCK_N: int = 128,  # tile width along columns
+        stride_factor:
     int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
+        layer_id: int = 0,  # for layer interleaving layout
 ):
     """
     Convert request-local token indices to global KV cache pool indices.
@@ -436,6 +438,7 @@ def triton_convert_req_index_to_global_index(
         BLOCK_N,
         stride_factor,
         # strides
+        layer_id,
         bt_stride0,
         bt_stride1,
         ti_stride0,

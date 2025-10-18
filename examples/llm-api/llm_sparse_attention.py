@@ -64,18 +64,10 @@ def parse_arguments():
                         type=int,
                         default=2048,
                         help="The prompt budget for RocketKV.")
-    parser.add_argument('--index_n_heads',
+    parser.add_argument('--index_max_chunk_size',
                         type=int,
-                        default=64,
-                        help="The number of heads for the indexer.")
-    parser.add_argument('--index_head_dim',
-                        type=int,
-                        default=128,
-                        help="The dimension of the indexer heads.")
-    parser.add_argument('--index_topk',
-                        type=int,
-                        default=2048,
-                        help="The topk for the indexer.")
+                        default=32768,
+                        help="The maximum chunk size for the indexer.")
     parser.add_argument("--max_seq_len",
                         type=int,
                         default=8192,
@@ -198,11 +190,8 @@ def run_RocketKV(args):
 
 def run_DSA(args):
     sparse_attention_config = DSASparseAttentionConfig(
-        index_n_heads=args.index_n_heads,
-        index_head_dim=args.index_head_dim,
-        index_topk=args.index_topk,
-    )
-    run_llm(args, None)
+        indexer_max_chunk_size=args.index_max_chunk_size, )
+    run_llm(args, sparse_attention_config)
 
 
 def main():
