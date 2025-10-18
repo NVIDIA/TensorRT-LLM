@@ -1121,7 +1121,7 @@ public:
         LookupResults const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize, bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(lookupNodes, blockIds, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
@@ -1344,48 +1344,6 @@ public:
     //! detach more than a single block since there may be more than one
     //! context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence);
-
-    //! \brief Return whether the sequence is already managed by the block manager
-    [[nodiscard]] bool isSequenceHeld(LlmRequest::RequestIdType requestId) const
-    {
-        return mManagedSequences.count(requestId) > 0;
-    }
-
-    //! \brief Add a sequence to the managed sequences
-    //! \details Take the sequence into account for the manager. Initialize
-    //! sequence storage validity under all window sizes.
-    void holdSequence(LlmRequest::RequestIdType requestId)
-    {
-        mManagedSequences.insert(requestId);
-        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
-        {
-            mWindowBlockManagers.at(windowSize).initializeSequenceStorageValidity(requestId);
-        }
-    }
-
-    //! \brief Remove a sequence from the managed sequences.
-    //! \details Remove sequence from the managed sequences and remove sequence
-    //! storage
-    void releaseSequence(LlmRequest::RequestIdType requestId)
-    {
-        mManagedSequences.erase(requestId);
-        for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
-        {
-            mWindowBlockManagers.at(windowSize).releaseSequenceStorageValidity(requestId);
-        }
-    }
-
-    //! \brief Return whether the sequence is still valid for store-for-reuse
-    //! regarding the specific window size.
-    //! \details Currently this utility function is only used under
-    //! kvCacheManagerTest.cpp. Checking for store-for-reuse for each window
-    //! size is done in an iterating fashion under BlockManager::releaseBlocks.
-    bool isSequenceValidForStoreForReuse(LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
-    {
-        TLLM_CHECK_WITH_INFO(
-            mWindowBlockManagers.count(windowSize) > 0, "Querying window size is not found under mWindowBlockManager");
-        return mWindowBlockManagers.at(windowSize).isSequenceValidForStoreForReuse(requestId);
-    }
 
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
