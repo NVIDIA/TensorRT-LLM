@@ -15,8 +15,8 @@ from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC
 
-from ..utils.logger import ad_logger
-from ..utils.node_utils import is_op
+from .logger import ad_logger
+from .node_utils import is_op
 
 _NoValType = type("_NoValType", (), {})
 _NO_VAL = _NoValType()

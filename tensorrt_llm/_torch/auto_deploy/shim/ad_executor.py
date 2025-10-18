@@ -9,7 +9,8 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
-from ....bindings.internal.batch_manager import CacheType
+from ....bindings.executor import ContextChunkingPolicy
+from ....bindings.internal.batch_manager import CacheType, ContextChunkingConfig
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine
@@ -25,7 +26,7 @@ from ...pyexecutor.scheduler import (
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
 from ..llm_args import AutoDeployConfig, LlmArgs
-from ..transformations.transform import InferenceOptimizer
+from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -110,7 +111,7 @@ class ADEngine(ModelEngine):
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
+        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
         return cls(build_and_optimize, seq_info, device, max_beam_width)
@@ -200,9 +201,10 @@ class ADEngine(ModelEngine):
             request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
 
-            # get cache indices
+            # get cache indices and truncate the number of blocks according to end_compute
             cache_indices = kv_cache_manager.get_cache_indices(request)
-            page_assignments.append(cache_indices)
+            num_active_blocks = kv_cache_manager.get_num_kv_blocks(end_compute)
+            page_assignments.append(cache_indices[:num_active_blocks])
 
             # store seq slot idx
             slot_idx.append(request.seq_slot)
@@ -368,12 +370,28 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     )
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
+    # TODO: consider passing through scheduler_config arguments here. Not doing this for now since
+    # it requires correctly setting up the C++ pybind scheduler config from the LLMArgs and then
+    # processing the arguments here...
+
+    # Chunked prefill
+    if ad_config.enable_chunked_prefill:
+        chunk_unit_size = ad_config.attn_page_size
+        chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
+        ctx_chunk_config = ContextChunkingConfig(chunking_policy, chunk_unit_size)
+    else:
+        ctx_chunk_config = None
+
     # scheduling
     capacitor_scheduler = BindCapacityScheduler(
-        ad_config.max_batch_size, kv_cache_manager.impl, peft_cache_manager=None
+        max_num_requests=ad_config.max_batch_size,
+        kv_cache_manager=kv_cache_manager.impl,
+        peft_cache_manager=None,
     )
     mb_scheduler = BindMicroBatchScheduler(
-        ad_config.max_batch_size, engine.cache_seq_interface.info.max_num_tokens
+        max_batch_size=ad_config.max_batch_size,
+        max_num_tokens=engine.cache_seq_interface.info.max_num_tokens,
+        ctx_chunk_config=ctx_chunk_config,
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 

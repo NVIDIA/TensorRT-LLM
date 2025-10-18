@@ -17,13 +17,11 @@ from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
                                             GuidedDecodingConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig, LoadFormat,
-                                          PybindMirror, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import LoadFormat, PybindMirror, TorchLlmArgs
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -205,12 +203,12 @@ def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: str = None,
     tokenizer: Optional[TokenizerBase] = None,
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+    lora_config = llm_args.lora_config
+    kv_connector_config = llm_args.kv_connector_config
 
     pytorch_backend_config = llm_args.get_pytorch_backend_config()
     if pytorch_backend_config is None:
@@ -510,10 +508,6 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if pytorch_backend_config.use_cuda_graph:
-            raise NotImplementedError(
-                "CUDA graphs are not supported with KV connector hooks.")
-
         if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
@@ -542,6 +536,12 @@ def create_py_executor(
                     connector_scheduler = None
 
                 connector_worker = connector_worker_task.result()
+
+            forward_pass_callable = connector_worker.register_forward_pass_callable(
+            )
+            if forward_pass_callable:
+                model_engine.register_forward_pass_callable(
+                    forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)
