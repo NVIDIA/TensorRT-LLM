@@ -1630,9 +1630,8 @@ def getSSHConnectionPorts(portConfigFile, stageName)
 
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            error "There is no ${resultFileName} file, skip the rerun step"
-        }
+        echo "There is no ${resultFileName} file, skip the rerun step"
+        return true
     }
 
     // Create rerun directory structure to avoid conflicts
@@ -1672,8 +1671,10 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     }
     if (validLineCount > 5) {
         echo "There are more than 5 failed ${testType} tests, skip the rerun step."
+        return true
     } else if (validLineCount == 0) {
         echo "No failed ${testType} tests need to be rerun, skip the rerun step."
+        return true
     }
 
     // Rerun tests
