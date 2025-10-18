@@ -14,6 +14,11 @@ class CachedSequenceInterface:
     def __init__(
         self, sequence_info: SequenceInfo, device: Optional[DeviceLikeType] = None
     ) -> None:
+        # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
+        # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
+        # here to read the desired device across the inference optimizer pipeline. We should ideally
+        # think about a better way to handle this,
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/8371
         self.device = device or "cuda"
         self.info = sequence_info
         self._cache_initializers: Dict[str, GetCacheCallable] = {}

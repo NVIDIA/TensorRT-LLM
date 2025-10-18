@@ -3,12 +3,24 @@
 import json
 from typing import Tuple
 
-import model_explorer
 import torch
 import torch.export as te
-from model_explorer.graph_builder import GraphNode, KeyValue, MetadataItem
-from model_explorer.pytorch_exported_program_adater_impl import PytorchExportedProgramAdapterImpl
-from torch import fx
+from torch.fx import GraphModule
+
+from ...models.factory import ModelFactory
+from ...shim.interface import CachedSequenceInterface
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+
+try:
+    import model_explorer
+    from model_explorer.graph_builder import GraphNode, KeyValue, MetadataItem
+    from model_explorer.pytorch_exported_program_adater_impl import (
+        PytorchExportedProgramAdapterImpl,
+    )
+except ImportError:
+    model_explorer = None
+    GraphNode = KeyValue = MetadataItem = PytorchExportedProgramAdapterImpl = None
+    # Optionally, you can log a warning or handle this gracefully elsewhere
 
 
 def print_tensor(self, tensor: torch.Tensor, size_limit: int = 16):
@@ -62,9 +74,6 @@ def add_outputs_metadata(self, fx_node: torch.fx.node.Node, node: GraphNode):
         raise ValueError(f"Unsupported output type: {type(out_vals)}")
 
 
-PytorchExportedProgramAdapterImpl.print_tensor = print_tensor
-PytorchExportedProgramAdapterImpl.add_outputs_metadata = add_outputs_metadata
-
 # TODO(yudong): make custom_ops configurable
 CUSTOM_OPS = (
     torch.ops.auto_deploy.torch_dist_all_reduce.default,
@@ -76,13 +85,26 @@ CUSTOM_OPS = (
 )
 
 
-# TODO(yudong): make viz as non-block call.
-def visualize_namespace(gm: fx.GraphModule, args: Tuple[torch.Tensor, ...], dynamic_shapes):
-    ep = te.export(gm, args=args, dynamic_shapes=dynamic_shapes)
-    graph = ep.graph
-    # Ensure the ops land up in the right module for better viz
-    for n in graph.nodes:
-        if n.target in CUSTOM_OPS:
-            n.meta["nn_module_stack"] = n.args[0].meta["nn_module_stack"]
+@TransformRegistry.register("visualize_namespace")
+class VisualizeNamespace(BaseTransform):
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        PytorchExportedProgramAdapterImpl.print_tensor = print_tensor
+        PytorchExportedProgramAdapterImpl.add_outputs_metadata = add_outputs_metadata
 
-    model_explorer.visualize_pytorch("model-viz", ep)
+        # TODO(yudong): make viz as non-block call.
+        ep = te.export(gm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+        graph = ep.graph
+        # Ensure the ops land up in the right module for better viz
+        for n in graph.nodes:
+            if n.target in CUSTOM_OPS:
+                n.meta["nn_module_stack"] = n.args[0].meta["nn_module_stack"]
+
+        model_explorer.visualize_pytorch("model-viz", ep)
+
+        return gm, TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

@@ -10,12 +10,7 @@ import torch.export as te
 import torch.nn as nn
 from torch import fx
 
-from ..transformations._graph import (
-    canonicalize_graph,
-    lift_to_meta,
-    load_buffers_and_params,
-    tree_to,
-)
+from ..utils._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
 from ..utils.logger import ad_logger
 from ..utils.node_utils import is_op
 from .interface import apply_export_patches

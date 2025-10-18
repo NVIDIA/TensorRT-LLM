@@ -42,23 +42,31 @@ trtllm-serve \
 Example `autodeploy_config.yaml`:
 
 ```yaml
-# Compilation backend for AutoDeploy
-compile_backend: torch-opt  # options: torch-simple, torch-compile, torch-cudagraph, torch-opt
+# runtime engine
+runtime: trtllm
 
-# Runtime engine
-runtime: trtllm                # options: trtllm, demollm
+# model loading
+skip_loading_weights: false
 
-# Model loading
-skip_loading_weights: false    # set true for architecture-only perf runs
+# Sequence configuration
+max_batch_size: 256
 
-# KV cache memory
-free_mem_ratio: 0.8            # fraction of free GPU mem for KV cache
+# multi-gpu execution
+world_size: 1
 
-# CUDA graph optimization
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
-
-# Attention backend
-attn_backend: flashinfer       # recommended for best performance
+# transform options
+transforms:
+  insert_cached_attention:
+    # attention backend
+    backend: flashinfer
+  resize_kv_cache:
+    # fraction of free memory to use for kv-caches
+    free_mem_ratio: 0.8
+  compile_model:
+    # compilation backend
+    backend: torch-opt
+    # CUDA Graph optimization
+    cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
 ```
 
 ## Limitations and tips
