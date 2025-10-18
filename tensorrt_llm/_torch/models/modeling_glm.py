@@ -1,30 +1,3 @@
-# --------------------------------------------------
-# Portions of this code were derived from DeepSeek‑V3:
-#   https://github.com/deepseek-ai/DeepSeek-V3
-#
-# MIT License
-
-# Copyright (c) 2023 DeepSeek
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-# --------------------------------------------------
-
 import math
 import os
 from typing import Dict, List, Optional, Tuple
@@ -70,28 +43,13 @@ class Glm4Attention(QKNormRoPEAttention):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        fuse_qk_norm_rope: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-
-        if getattr(config, "rope_scaling", None) is not None:
-            if "type" in config.rope_scaling:
-                pos_type = config.rope_scaling["type"]
-            elif "rope_type" in config.rope_scaling:
-                pos_type = config.rope_scaling["rope_type"]
-            else:
-                raise ValueError(
-                    "rope_scaling must have type or rope_type field")
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(pos_type),
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=RopeParams.from_config(config),
-            )
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams.from_config(config),
+        )
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -100,7 +58,7 @@ class Glm4Attention(QKNormRoPEAttention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            fuse_qk_norm_rope=fuse_qk_norm_rope,
+            fuse_qk_norm_rope=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
@@ -152,14 +110,7 @@ class Glm4MoE(nn.Module):
             override_quant_config=override_quant_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
-            # DS-R1 W4A8 is only supported through custom quantization script from
-            # examples/quantization/quantize_mixed_precision_moe.py
-            weight_loading_mode=(
-                MoEWeightLoadingMode.W4A8_CUSTOM
-                if self._get_experts_quant_config(
-                    model_config,
-                    layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
-                else MoEWeightLoadingMode.VANILLA),
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
 
         self.mapping = model_config.mapping
@@ -193,14 +144,13 @@ class Glm4MoE(nn.Module):
             self, intermediate_size: int,
             block_size: int) -> tuple[int, float | None]:
         """
-        In the case of Deepseek-R1, the TP size of MLP is capped by intermediate_size // block_size.
+        In the case of GLM4, the TP size of MLP is capped by intermediate_size // block_size.
         For example, when the intermediate_size is 2048 and block scaling size is 128,
         TP sizes are limited to {1, 2, 4, 8, 16} because of 2048/128 = 16.
 
         Args:
             intermediate_size (int): MLP intermediate size.
-            block_size (int): The quantization block scale size. In the case of Deepseek FP8 recipe,
-                it's 128. For NVFP4, it's 16.
+            block_size (int): The quantization block scale size. For NVFP4, it's 16.
 
         Returns:
             tuple[int, float | None]: A tuple containing (shared_tp_size, shared_output_scale).
@@ -344,7 +294,6 @@ class Glm4DecoderLayer(DecoderLayer):
         self.self_attn = Glm4Attention(
             model_config,
             layer_idx=layer_idx_for_attention,
-            fuse_qk_norm_rope=False,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.enable_attention_dp = mapping.enable_attention_dp
 
@@ -352,8 +301,8 @@ class Glm4DecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = os.environ.get("TRTLLM_GLM_EAGER_FUSION_DISABLED",
+                                            "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode
@@ -443,13 +392,12 @@ class Glm4DecoderLayer(DecoderLayer):
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:
         """
-        For DeepSeek‑R1, MLP TP size is limited by intermediate_size // block_size
+        For GLM4, MLP TP size is limited by intermediate_size // block_size
         and must also be multiples of gpus_per_node to avoid expensive inter‑node allreduce.
 
         Args:
             intermediate_size (int): MLP intermediate size.
-            block_size (int): The quantization block scale size. In the case of Deepseek FP8 recipe,
-                it's 128. For NVFP4, it's 16.
+            block_size (int): The quantization block scale size. For NVFP4, it's 16.
 
         Returns:
             int: The computed tp_size.
