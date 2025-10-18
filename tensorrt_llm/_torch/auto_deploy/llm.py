@@ -159,7 +159,7 @@ class DemoLLM(LLM):
     """
 
     def __init__(self, **kwargs):
-        self.args: LlmArgs = LlmArgs.from_kwargs(**kwargs)
+        self.args: LlmArgs = LlmArgs(**kwargs)
 
         self.mpi_session = None
         self.runtime_context = None

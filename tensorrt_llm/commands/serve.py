@@ -24,7 +24,6 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
@@ -71,6 +70,7 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
+# TODO
 def get_llm_args(model: str,
                  tokenizer: Optional[str] = None,
                  backend: str = "pytorch",
@@ -136,12 +136,14 @@ def get_llm_args(model: str,
     return llm_args, llm_args_extra_dict
 
 
+# TODO: this expects a dict!
 def launch_server(host: str,
                   port: int,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
                   server_role: Optional[ServerRole] = None):
 
+    # TODO
     backend = llm_args["backend"]
     model = llm_args["model"]
     if backend == 'pytorch':
@@ -334,6 +336,7 @@ def serve(
     """
     logger.set_level(log_level)
 
+    # TODO
     llm_args, _ = get_llm_args(
         model=model,
         tokenizer=tokenizer,
@@ -426,6 +429,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    # TODO
 
     # TODO: expose more argument progressivly
     llm_args, _ = get_llm_args(model=model,
@@ -561,11 +566,13 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
+        # TODO
         llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
         # Ignore the non-LLM args
+        # TODO this expects a dict
         llm_args.pop("router", None)
         _launch_disaggregated_server(config_file, llm_args)
         return
@@ -587,6 +594,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
         llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
+        # TODO
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
@@ -606,6 +614,7 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
 
 
+# TODO
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     # Launching the server
     instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)

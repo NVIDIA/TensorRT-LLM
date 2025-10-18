@@ -299,22 +299,21 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_cuda_graph_enable(self):
         # Test 1: Default behavior (no cuda_graph_config specified)
-        llm_args_default = LlmArgs.from_kwargs(model="dummy_model")
+        llm_args_default = LlmArgs(model="dummy_model")
         pytorch_config_default = llm_args_default.get_pytorch_backend_config()
         self.assertTrue(pytorch_config_default.use_cuda_graph,
                         "CUDA graphs should be enabled by default")
 
         # Test 2: Explicit CudaGraphConfig()
-        llm_args_explicit = LlmArgs.from_kwargs(
-            model="dummy_model", cuda_graph_config=CudaGraphConfig())
+        llm_args_explicit = LlmArgs(model="dummy_model",
+                                    cuda_graph_config=CudaGraphConfig())
         pytorch_config_explicit = llm_args_explicit.get_pytorch_backend_config()
         self.assertTrue(
             pytorch_config_explicit.use_cuda_graph,
             "CUDA graphs should be enabled when CudaGraphConfig() is provided")
 
         # Test 3: cuda_graph_config=None (explicitly disabled)
-        llm_args_disabled = LlmArgs.from_kwargs(model="dummy_model",
-                                                cuda_graph_config=None)
+        llm_args_disabled = LlmArgs(model="dummy_model", cuda_graph_config=None)
         pytorch_config_disabled = llm_args_disabled.get_pytorch_backend_config()
         self.assertFalse(
             pytorch_config_disabled.use_cuda_graph,
@@ -322,8 +321,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Test 4: Custom CudaGraphConfig with specific settings
         custom_config = CudaGraphConfig(max_batch_size=256, enable_padding=True)
-        llm_args_custom = LlmArgs.from_kwargs(model="dummy_model",
-                                              cuda_graph_config=custom_config)
+        llm_args_custom = LlmArgs(model="dummy_model",
+                                  cuda_graph_config=custom_config)
         pytorch_config_custom = llm_args_custom.get_pytorch_backend_config()
         self.assertTrue(pytorch_config_custom.use_cuda_graph,
                         "CUDA graphs should be enabled with custom config")

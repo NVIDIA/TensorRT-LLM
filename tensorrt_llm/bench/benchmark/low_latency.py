@@ -305,6 +305,7 @@ def latency_command(
             "use_beam_search": options.beam_width > 1
         }
 
+        # TODO??
         sampler_args = update_sampler_args_with_extra_options(
             sampler_args, params.pop("sampler_options"))
         sampling_params = SamplingParams(**sampler_args)
