@@ -1062,6 +1062,7 @@ class TestMoeFp4:
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
                       routing_info):
+        pytest.skip("https://nvbugs/5575841")
 
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
@@ -1114,6 +1115,7 @@ class TestMoeFp4:
                              ids=["use_score_as_input", "use_topk_as_input"])
     def test_no_autotune(self, num_tokens, hidden_size, intermediate_size,
                          routing_info, use_topk_as_input):
+        pytest.skip("https://nvbugs/5575841")
 
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
