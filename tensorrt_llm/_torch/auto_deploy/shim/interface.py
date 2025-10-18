@@ -74,6 +74,17 @@ class CachedSequenceInterface:
                 total_size += cache.element_size() * cache.numel()
         return total_size
 
+    def current_kv_cache_size_bytes(self) -> int:
+        """Return size in bytes of KV caches only (k_cache_*, v_cache_*).
+
+        Excludes SSM/conv/etc. which do not scale with num_pages.
+        """
+        total_size = 0
+        for name, cache in self._caches.items():
+            if name.startswith("k_cache_") or name.startswith("v_cache_"):
+                total_size += cache.element_size() * cache.numel()
+        return total_size
+
     def resize_cache(self, new_num_pages: int):
         """Resize the cache to the new number of pages."""
         # TODO: We should do some sanity check on the new number of pages.

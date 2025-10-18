@@ -56,7 +56,10 @@ def _joint_transform(gm: GraphModule) -> None:
             "match_eager_attention": {
                 "stage": "pattern_matcher",
             },
-            "match_grouped_attention": {
+            "match_grouped_attention_with_repeat_kv": {
+                "stage": "pattern_matcher",
+            },
+            "match_grouped_attention_without_repeat_kv": {
                 "stage": "pattern_matcher",
             },
             "match_attention_layout": {

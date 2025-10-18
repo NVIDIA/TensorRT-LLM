@@ -1,7 +1,29 @@
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
+
+
+def _resolve_activation(name: Optional[str]) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Returns an elementwise activation callable matching the given name.
+    Supported: "silu", "swish", "gelu", "gelu_tanh", "relu", "tanh", "identity".
+    Defaults to SiLU when name is None or empty.
+    """
+    if not name:
+        name = "silu"
+    key = name.lower()
+
+    if key == "silu":
+        return F.silu
+    elif key == "relu2":
+
+        def relu2(x: torch.Tensor) -> torch.Tensor:
+            return torch.square(F.relu(x))
+
+        return relu2
+    else:
+        raise ValueError(f"Unsupported activation '{name}'. Use one of: silu, relu2.")
 
 
 def _template_moe(
@@ -48,10 +70,12 @@ def torch_moe(
     w1_weight: List[torch.Tensor],
     w2_weight: List[torch.Tensor],
     w3_weight: List[torch.Tensor],
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """
-    A reference implementation of a Mixture-of-Experts (MoE) layer computation in the Mixtral style,
-    compatible with DeepSeek by using index_add_ for in-place updates.
+    Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
+    (token routing + index_add_ accumulation) and a selectable per-expert MLP.
     Parameters:
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
             S is the sequence length, and H is the hidden size.
@@ -59,22 +83,55 @@ def torch_moe(
             of the selected experts for each token. Only experts within range [0,num_experts) is processed
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
-        w1_weight (List[torch.Tensor]): A list of expert weight tensors for w1, each of shape
-            (I, H), where I is the intermediate size.
-        w2_weight (List[torch.Tensor]): A list of expert weight tensors for w2, each of shape
-            (H, I).
-        w3_weight (List[torch.Tensor]): A list of expert weight tensors for w3, each of shape
-            (I, H).
+        w1_weight:
+            List of per-expert weight tensors:
+              • mlp_style=="gated_mlp": W1 with shape (I, H)  — "gate" projection.
+              • mlp_style=="mlp":       W_up with shape (I, H) — up projection.
+        w2_weight:
+            List of per-expert weight tensors:
+              • gated_mlp: W2 with shape (H, I) — down projection.
+              • mlp:       W_down with shape (H, I) — down projection.
+        w3_weight:
+            List of per-expert weight tensors:
+              • gated_mlp: W3 with shape (I, H) — “up” (second) projection in gated MLP.
+              • mlp:       pass an empty list []; ignored.
+        mlp_style:
+            Selects the per-expert MLP computation:
+              • "gated_mlp" (default, Mixtral/DeepSeek-style):
+                    y = W2( act(W1 x) * (W3 x) )
+              • "mlp" (NemotronH-style 2-layer MLP):
+                    y = W_down( act(W_up x) )
+        act_fn:
+            Elementwise activation applied inside the expert MLP.
+            Supported: "silu" (default), "relu2" (ReLU then square).
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
+    act_fn = _resolve_activation(act_fn)
+    style = mlp_style.lower()
 
-    def make_mlp(i):
-        return lambda inp: F.linear(
-            F.silu(F.linear(inp, w1_weight[i])) * F.linear(inp, w3_weight[i]), w2_weight[i]
-        )
+    if style == "gated_mlp":
 
-    mlps = [make_mlp(i) for i in range(len(w1_weight))]
+        def make_mlp(i: int):
+            W1 = w1_weight[i]  # (I, H)
+            W2 = w2_weight[i]  # (H, I)
+            W3 = w3_weight[i]  # (I, H)
+            return lambda inp: F.linear(act_fn(F.linear(inp, W1)) * F.linear(inp, W3), W2)
+
+        mlps = [make_mlp(i) for i in range(len(w1_weight))]
+
+    elif style == "mlp":
+
+        def make_mlp(i: int):
+            W_up = w1_weight[i]  # (I, H)
+            W_down = w2_weight[i]  # (H, I)
+            return lambda inp: F.linear(act_fn(F.linear(inp, W_up)), W_down)
+
+        mlps = [make_mlp(i) for i in range(len(w1_weight))]
+
+    else:
+        raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
+
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
 
@@ -86,6 +143,8 @@ def torch_moe_fake(
     w1_weight: List[torch.Tensor],
     w2_weight: List[torch.Tensor],
     w3_weight: List[torch.Tensor],
+    mlp_style: str = "gated_mlp",
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

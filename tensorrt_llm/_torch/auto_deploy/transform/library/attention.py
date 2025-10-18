@@ -453,7 +453,9 @@ def make_grouped_attn_pair(
     return pattern_fn, replacement_fn, argnames
 
 
-def generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern: Callable):
+def generate_and_register_grouped_attn_patterns(
+    patterns, register_ad_pattern: Callable, only_repeat_kv: bool = None
+):
     """
     Auto-generate all grouped attention patterns across these axes:
       1) repeat_kv:        [False, True]
@@ -462,6 +464,13 @@ def generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern: C
       4) enable_gqa:       [False, True]   (only a kwarg to SDPA side)
       5) has_attn_mask:    [False, True]
       6) has_dropout:      [False, True]
+
+    Args:
+        patterns: The ADPatternMatcherPass instance to register patterns to
+        register_ad_pattern: The function to call to register each pattern
+        only_repeat_kv: If True, only register patterns with repeat_kv=True.
+                        If False, only register patterns with repeat_kv=False.
+                        If None, register all patterns.
 
     For each valid combo, we:
       - build pattern/replacement functions with exact-arg parity
@@ -481,6 +490,12 @@ def generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern: C
     total = 0
     axes = ((False, True),) * 6
     for repeat_kv, is_causal, has_scale, enable_gqa, has_attn_mask, has_dropout in product(*axes):
+        if only_repeat_kv is not None:
+            if only_repeat_kv and not repeat_kv:
+                continue  # Skip patterns without repeat_kv
+            if not only_repeat_kv and repeat_kv:
+                continue  # Skip patterns with repeat_kv
+
         pat_fn, rep_fn, argnames = make_grouped_attn_pair(
             repeat_kv=repeat_kv,
             is_causal=is_causal,
@@ -525,11 +540,12 @@ def generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern: C
     return total
 
 
-@TransformRegistry.register("match_grouped_attention")
-class MatchGroupedAttention(BaseTransform):
+@TransformRegistry.register("match_grouped_attention_with_repeat_kv")
+class MatchGroupedAttentionWithRepeatKV(BaseTransform):
     """
-    Match and replace the grouped attention pattern with
+    Match and replace grouped attention patterns WITH repeat_kv to
     torch.ops.auto_deploy.torch_attention.
+
     """
 
     def _apply(
@@ -539,14 +555,56 @@ class MatchGroupedAttention(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        def register_grouped_attention(patterns: ADPatternMatcherPass):
-            return generate_and_register_grouped_attn_patterns(patterns, register_ad_pattern)
+        def register_grouped_attention_with_repeat_kv(patterns: ADPatternMatcherPass):
+            return generate_and_register_grouped_attn_patterns(
+                patterns, register_ad_pattern, only_repeat_kv=True
+            )
 
-        num_grouped_patterns = _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
+        num_grouped_patterns = _apply_pattern(
+            gm, "Grouped Attention (with repeat_kv)", register_grouped_attention_with_repeat_kv
+        )
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_grouped_patterns,
+            is_clean=False,
+            has_valid_shapes=False,
+        )
+        return gm, info
+
+
+@TransformRegistry.register("match_grouped_attention_without_repeat_kv")
+class MatchGroupedAttentionWithoutRepeatKV(BaseTransform):
+    """
+    Match and replace grouped attention patterns WITHOUT repeat_kv to
+    torch.ops.auto_deploy.torch_attention.
+
+    This transform should run AFTER match_grouped_attention_with_repeat_kv
+    to avoid incorrectly matching patterns that should have repeat_kv.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        def register_grouped_attention_without_repeat_kv(patterns: ADPatternMatcherPass):
+            return generate_and_register_grouped_attn_patterns(
+                patterns, register_ad_pattern, only_repeat_kv=False
+            )
+
+        num_grouped_patterns = _apply_pattern(
+            gm,
+            "Grouped Attention (without repeat_kv)",
+            register_grouped_attention_without_repeat_kv,
+        )
 
         if num_grouped_patterns == 0:
             ad_logger.warning(
-                "Fail to find any Group Attention Pattern, output or performance may be incorrect"
+                "Fail to find any Group Attention Pattern (without repeat_kv), "
+                "output or performance may be incorrect"
             )
 
         info = TransformInfo(
