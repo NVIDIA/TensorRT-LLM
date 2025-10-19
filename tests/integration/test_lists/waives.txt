@@ -380,4 +380,7 @@ test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Ins
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp4_plugin SKIP (https://nvbugs/5451207)
 accuracy/test_cli_flow.py::TestMixtral8x22B::test_fp8_tp2pp2 SKIP (https://nvbugs/5511944)
 examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-3.1-70b-instruct-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-bfloat16] SKIP (https://nvbugs/5543383)
-cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90] SKIP (https://nvbugs/5594880)
+cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] SKIP (https://nvbugs/5492250)
+triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora] SKIP (https://nvbugs/5470830)
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[llguidance] SKIP (https://nvbugs/5594703)
+cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90] SKIP (https://nvbugs/5492250)
