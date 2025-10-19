@@ -50,7 +50,7 @@ public:
 
     CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
-        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2)
+        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false)
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
               worldConfig.getContextParallelism(), worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(),
@@ -58,32 +58,35 @@ public:
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
     }
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false)
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
         , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
               attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false)
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
         , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
               attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
     }
 
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
@@ -166,6 +169,11 @@ public:
         return mDataType;
     }
 
+    [[nodiscard]] bool getEnableBlockReuse() const
+    {
+        return mEnableBlockReuse;
+    }
+
     [[nodiscard]] std::string toString() const
     {
         std::stringstream sstring;
@@ -185,6 +193,7 @@ public:
         sstring << "kvFactor:" << mAttentionConfig.mKvFactor << "\n";
         sstring << "dpRank:" << mParallelConfig.mDPrank << "\n";
         sstring << "dpSize:" << mParallelConfig.mDPsize << "\n";
+        sstring << "enableBlockReuse:" << mEnableBlockReuse << "\n";
         return sstring.str();
     }
 
@@ -194,6 +203,7 @@ private:
     ParallelConfig mParallelConfig;
     nvinfer1::DataType mDataType;
     AttentionConfig mAttentionConfig;
+    bool mEnableBlockReuse{false};
 };
 
 struct MpiState

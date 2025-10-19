@@ -1,25 +1,24 @@
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import torch
 from torch import nn
 from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe)
+                                 create_moe, get_moe_cls)
+from ..modules.fused_moe.interface import MoE
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -39,16 +38,17 @@ class Qwen3Gate(nn.Module):
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
         routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
-        moe_backend: str = "CUTLASS",
+        moe_backend_cls: Type[MoE] = CutlassFusedMoE,
     ):
         super().__init__()
         self.top_k = top_k
+        self.moe_backend_cls = moe_backend_cls
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
         self.routing_method_type = routing_method_type
         # FIXME: out_dtype=float32 does not work
-        # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
+        # self.out_dtype = torch.float32 if moe_backend_cls == TRTLLMGenFusedMoE else dtype
         self.out_dtype = dtype
 
         assert not apply_routing, "Qwen3Gate routing is called inside MoE"
@@ -65,10 +65,13 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
+        output_dtype = torch.bfloat16 if self.moe_backend_cls == TRTLLMGenFusedMoE else torch.float32
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
-            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k,
+                                                    output_dtype=output_dtype)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
-            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k,
+                                               output_dtype=output_dtype)
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
@@ -101,7 +104,7 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend=model_config.moe_backend,
+            moe_backend_cls=get_moe_cls(model_config),
         )
 
         self.experts = create_moe(
@@ -131,13 +134,6 @@ class Qwen3MoE(nn.Module):
 
         if not do_finalize:
             assert not self.enable_attention_dp
-
-        if self.enable_attention_dp and self.mapping.tp_size > 1:
-            if isinstance(self.experts, TRTLLMGenFusedMoE):
-                hidden_states = allgather(hidden_states,
-                                          self.mapping,
-                                          dim=0,
-                                          sizes=all_rank_num_tokens)
 
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
@@ -169,6 +165,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
+            disable_deep_gemm=True,
         )
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
@@ -391,9 +388,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
-        super().load_weights(weights, weight_mapper)
-
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

@@ -28,7 +28,8 @@ import transformers
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
+from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
+                                   GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheConfig, KvCacheRetentionConfig,
@@ -549,6 +550,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
+@pytest.mark.mpi_ray_parity
 def test_llm_generate_async_with_stream_interval(chunked):
     model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
@@ -1804,14 +1806,20 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      backend=None):
     LLM_CLASS = LLM
     llm_args_extra = {}
+    kv_cache_args_extra = {}
     if backend in ["pytorch", "autodeploy"]:
         LLM_CLASS = LLM_torch
+        if streaming:
+            # need this so that context_logits / prompt_logprobs are not dropped
+            # in the 2nd reuse of llm.generate() in streaming mode
+            kv_cache_args_extra["enable_block_reuse"] = False
     else:
         llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(
         llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                      **kv_cache_args_extra),
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
@@ -1855,6 +1863,18 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                 logprobs_result[0].keys()) in {logprobs, logprobs + 1}
             # Most contain log prob of the sample token, even if it's not within K
             assert token_ids[0] in logprobs_result[0].keys()
+            for step_logprobs in logprobs_result:
+                assert len(step_logprobs) == logprobs
+                logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
+                                 for logprob_obj in step_logprobs.values()]
+                sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+
+                for i in range(logprobs - 1):
+                    current_logprob, current_rank = sorted_by_rank[i]
+                    next_logprob, next_rank = sorted_by_rank[i + 1]
+                    assert current_logprob >= next_logprob
+                    assert current_rank == i + 1
+                    assert next_rank == current_rank + 1
             print("logprobs[0]: ", logprobs_result[0])
 
     if streaming:
@@ -1864,7 +1884,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             async for output in llm.generate_async(prompt,
                                                    sampling_params,
                                                    streaming=True):
-                logprobs_result_streaming += output.outputs[0].logprobs
+                logprobs_result_streaming += output.outputs[0].logprobs_diff
 
             # comparing streaming logprobs result to non-streaming
             assert logprobs_result_streaming == logprobs_result
@@ -1877,21 +1897,28 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         asyncio.run(main())
 
 
-@pytest.mark.skip(reason="https://nvbugs/5516660")
 @force_ampere
 @pytest.mark.parametrize(
-    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
-    [(2, None, True, False), (None, 2, False, False)])
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
+    [
+        # TRT backend test cases
+        (2, None, True, False, "trt"),  # prompt_logprobs with context_logits
+        (None, 2, False, False, "trt"),  # generation logprobs only (top-2)
+        (2, None, False, False,
+         "trt"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "trt"),  # no logprobs at all
+    ])
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],
                              return_context_logits: bool,
-                             return_generation_logits: bool):
-    llm_return_logprobs_test_harness(prompt_logprobs, logprobs,
+                             return_generation_logits: bool, backend: str):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
                                      return_context_logits,
-                                     return_generation_logits)
+                                     return_generation_logits,
+                                     backend=backend)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5516660")
 @force_ampere
 def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
@@ -1907,27 +1934,37 @@ class DummyExecutorWorker3(GenerationExecutorWorker):
         self.failed_requests = set()
 
     def _engine_response_callback(self, response: tllm.Response):
-        if response.client_id in self.failed_requests:
+        client_id = response.client_id
+        if client_id in self.failed_requests:
             return response
         # Making the first response failed, and the subsequent responses successful
         if DummyExecutorWorker3.should_raise_error:
             DummyExecutorWorker3.should_raise_error = False
-            print(f"Raise error for {response.client_id}")
-            self.failed_requests.add(response.client_id)
+            print(f"Raise error for {client_id}")
+            self.failed_requests.add(client_id)
+            if not response.result.is_final:
+                self.abort_request(client_id)
             return tllm.Response(
-                request_id=0,  # dummy value
-                client_id=response.client_id,
+                request_id=self._client_id_to_request_id[client_id],
+                client_id=client_id,
                 error_msg="Test error")
         else:
             return response
+
+    def _pop_result(self, client_id: int):
+        # The actual worker didn't error, so it may continue generating result,
+        # until the abort message reached it.
+        # So we avoid removing the result queue.
+        if client_id in self.failed_requests:
+            return
+        super()._pop_result(client_id)
 
 
 DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    worker_cls=DummyExecutorWorker3)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error():
+def test_llm_handling_per_request_error():
     llm = LLM(
         model=llama_model_path,
         executor_cls=DummyExecutor3,
@@ -1950,8 +1987,7 @@ def test_llm_handling_per_requeust_error():
     batch_task()
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error_async():
+def test_llm_handling_per_request_error_async():
     llm = LLM(
         model=llama_model_path,
         executor_cls=DummyExecutor3,
@@ -1978,6 +2014,45 @@ def test_llm_handling_per_requeust_error_async():
             print(output)
 
     asyncio.run(task())
+
+
+class DummyExecutorWorker4(GenerationExecutorWorker):
+    should_raise_error = True
+
+    def submit(self, request: GenerationRequest) -> GenerationResult:
+        # Making the first response failed, and the subsequent responses successful
+        if DummyExecutorWorker4.should_raise_error:
+            DummyExecutorWorker4.should_raise_error = False
+            raise RequestError("Test error")
+
+        return super().submit(request)
+
+
+DummyExecutor4 = DummyExecutorMeta("DummyExecutor4", (), {},
+                                   worker_cls=DummyExecutorWorker4)
+
+
+def test_llm_handling_per_request_submit_error():
+    llm = LLM(
+        model=llama_model_path,
+        executor_cls=DummyExecutor4,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    def batch_task():
+        DummyExecutorWorker4.should_raise_error = True
+        with pytest.raises(RequestError):
+            for output in llm.generate(prompts,
+                                       sampling_params=sampling_params):
+                print(output)
+
+        for output in llm.generate(prompts, sampling_params=sampling_params):
+            print(output)
+
+    batch_task()
 
 
 def validate_stats(results,

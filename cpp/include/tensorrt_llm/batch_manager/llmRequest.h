@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <list>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -56,9 +58,9 @@ enum class LlmRequestState : int32_t
                                             /// used in layer-wise transmission
     kDISAGG_GENERATION_TRANS_COMPLETE = 12, ///< Kv cache transmission are finished
     kGENERATION_IN_PROGRESS = 13,           ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
 
     // schedulable states ends
+    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
     kGENERATION_COMPLETE = 20,              ///< Generation phase completed
     kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
                                             /// after computation finished
@@ -101,6 +103,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+    using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
     using CacheSaltIDType = runtime::CacheSaltIDType;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
@@ -1074,7 +1077,6 @@ public:
         TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
             "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
             promptLen, mRequestId);
-        TLLM_CHECK(prepopulatedPromptLen < promptLen);
 
         auto& prePromptLen = mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
         auto& contextCurrentPosition = mUseDraftModel ? mContextCurrentPositionDraft : mContextCurrentPositionTarget;
@@ -1115,9 +1117,9 @@ public:
         mDraftLogits = draftLogits;
     }
 
-    [[nodiscard]] SizeType32 getNumDraftTokens() const
+    [[nodiscard]] SizeType32 getNumDraftTokens() const noexcept
     {
-        return hasDraftTokens() ? mDraftTokens->size() : 0;
+        return hasDraftTokens() ? static_cast<SizeType32>(mDraftTokens->size()) : 0;
     }
 
     void discardDraftTokens(SizeType32 numTokensToDiscard)
@@ -1255,7 +1257,7 @@ public:
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.firstScheduledTime = getSteadyClockNow();
         }
     }
 
@@ -1378,17 +1380,17 @@ public:
         mGenerationLogitsFragments.push_back(genLogits);
     }
 
-    SizeType32 getGenerationLogitsFragmentsSize()
+    [[nodiscard]] SizeType32 getGenerationLogitsFragmentsSize() const noexcept
     {
-        return mGenerationLogitsFragments.size();
+        return static_cast<SizeType32>(mGenerationLogitsFragments.size());
     }
 
-    void clearGenerationLogitsFragments()
+    void clearGenerationLogitsFragments() noexcept
     {
         mGenerationLogitsFragments.clear();
     }
 
-    bool hasAdditionalOutputs()
+    [[nodiscard]] bool hasAdditionalOutputs() const noexcept
     {
         return !mAdditionalContextOutputTensors.empty() || !mAdditionalGenerationOutputTensors.empty();
     }
@@ -1689,22 +1691,22 @@ public:
         mDecodingIter = iter;
     }
 
-    void setKvCacheTransferStart(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferStart(TimePoint const& time)
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferStart = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
     }
 
-    void setKvCacheTransferEnd(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferEnd(TimePoint const& time)
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferStart()
+    TimePoint getKvCacheTransferStart()
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferStart;
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferEnd()
+    TimePoint getKvCacheTransferEnd()
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
@@ -1788,7 +1790,7 @@ public:
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
             TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
-                std::chrono::duration<float>(std::chrono::steady_clock::now() - mStartTime).count());
+                std::chrono::duration<float>(getSteadyClockNow() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
@@ -1826,7 +1828,7 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
-        auto const currentTokenTime = std::chrono::steady_clock::now();
+        auto const currentTokenTime = getSteadyClockNow();
 
         if (!mPerfMetrics.firstIter)
         {
@@ -1841,16 +1843,6 @@ public:
             mPerfMetrics.lastIter = iter;
             mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
-    }
-
-    void setRequestedBlockHashes(std::vector<size_t> hashes)
-    {
-        mRequestedBlockHashes = std::move(hashes);
-    }
-
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
-    {
-        return mRequestedBlockHashes;
     }
 
     void setIsDummyRequest(bool isDummyRequest)
@@ -1873,6 +1865,15 @@ public:
         return mUseDraftModel;
     }
 
+    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // time point
+    [[nodiscard]] TimePoint getSteadyClockNow() const
+    {
+        const TimePoint time_point = std::chrono::steady_clock::now();
+
+        return maybeToGlobalSteadyClock(time_point);
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1891,6 +1892,9 @@ public:
 
     // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
+
+    // The offset between local steady clock and global steady clock (at rank 0)
+    inline static std::optional<Duration> mGlobalSteadyClockOffset{std::nullopt};
 
 protected:
     bool mIsStreaming;
@@ -2044,9 +2048,6 @@ protected:
     // Tensors containing the additional generation output.
     TensorMap mAdditionalGenerationOutputTensors;
 
-    // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
-    std::vector<size_t> mRequestedBlockHashes;
-
     bool mIsDummyRequest{false};
 
     bool mUseDraftModel{false};
@@ -2150,7 +2151,8 @@ private:
 
         if (mReturnPerfMetrics)
         {
-            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(std::chrono::steady_clock::now());
+            // arrivalTime is assumed to be recorded at the rank 0, so no need to convert it to global clock
+            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getSteadyClockNow());
         }
         mStartTime = std::chrono::steady_clock::now();
     }
@@ -2179,6 +2181,18 @@ private:
         tensor->unsqueeze(0);
 
         return tensor;
+    }
+
+    TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point) const
+    {
+        if (mGlobalSteadyClockOffset.has_value())
+        {
+            return time_point + *mGlobalSteadyClockOffset;
+        }
+        else
+        {
+            return time_point;
+        }
     }
 };
 

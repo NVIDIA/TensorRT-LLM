@@ -101,7 +101,7 @@ class BuilderConfig(object):
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
-            config['plugin_config'] = self.plugin_config.to_dict()
+            config['plugin_config'] = self.plugin_config.model_dump(mode="json")
         return config
 
 
@@ -303,7 +303,7 @@ class Builder():
                                    builder_config) -> bool:
         '''
             For each profile, validate that the named dimensions of different input tensors in this profile all have same range.
-            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT-LLM are correct and
+            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT LLM are correct and
             makes the error msg more user friendly.
         '''
         valid = True
@@ -479,9 +479,9 @@ class Builder():
 
 @dataclass
 class BuildConfig:
-    """Configuration class for TensorRT-LLM engine building parameters.
+    """Configuration class for TensorRT LLM engine building parameters.
 
-    This class contains all the configuration parameters needed to build a TensorRT-LLM engine,
+    This class contains all the configuration parameters needed to build a TensorRT LLM engine,
     including sequence length limits, batch sizes, optimization settings, and various features.
 
     Args:
@@ -509,7 +509,7 @@ class BuildConfig:
         auto_parallel_config (AutoParallelConfig): Configuration for automatic parallelization. Defaults to default AutoParallelConfig.
         weight_sparsity (bool): Whether to enable weight sparsity optimization. Defaults to False.
         weight_streaming (bool): Whether to enable weight streaming for large models. Defaults to False.
-        plugin_config (PluginConfig): Configuration for TensorRT-LLM plugins. Defaults to default PluginConfig.
+        plugin_config (PluginConfig): Configuration for TensorRT LLM plugins. Defaults to default PluginConfig.
         use_strip_plan (bool): Whether to use stripped plan for engine building. Defaults to False.
         max_encoder_input_len (int): Maximum encoder input length for encoder-decoder models. Defaults to 1024.
         dry_run (bool): Whether to perform a dry run without actually building the engine. Defaults to False.
@@ -672,7 +672,8 @@ class BuildConfig:
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
-            plugin_config.update_from_dict(config["plugin_config"])
+            plugin_config = plugin_config.model_copy(
+                update=config["plugin_config"], deep=True)
 
         dry_run = config.pop('dry_run', defaults.get('dry_run'))
         visualize_network = config.pop('visualize_network',
@@ -725,7 +726,7 @@ class BuildConfig:
         # the enum KVCacheType cannot be converted automatically
         if output.get('kv_cache_type', None) is not None:
             output['kv_cache_type'] = str(output['kv_cache_type'].name)
-        output['plugin_config'] = output['plugin_config'].to_dict()
+        output['plugin_config'] = output['plugin_config'].model_dump()
         output['lora_config'] = output['lora_config'].to_dict()
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
         )

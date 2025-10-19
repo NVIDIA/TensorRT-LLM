@@ -7,7 +7,6 @@ from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -414,6 +413,7 @@ def _get_match_repeat_kv_optimizer() -> Callable:
         },
         "match_repeat_kv": {
             "stage": "pattern_matcher",
+            "run_shape_prop": True,
         },
     }
 
@@ -741,14 +741,12 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 
-    # We should find 1 instance of torch_attention_grouped_sdpa
+    # We should find 1 instance of torch_attention
     expected_matches = 1
 
     def verify_matcher(gm):
         grouped_sdpa_nodes = [
-            n
-            for n in gm.graph.nodes
-            if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention)
         ]
 
         # Check that we have the expected number of replacements
@@ -879,7 +877,7 @@ class CausalAttentionModel(torch.nn.Module):
 
         # Choose the appropriate attention implementation
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention(
                 q,
                 k,
                 v,
@@ -985,7 +983,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
         # Choose the appropriate attention implementation
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention(
                 q,
                 k,
                 v,
@@ -1013,21 +1011,6 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
-
-
-class MockAttentionDescriptor(AttentionDescriptor):
-    """A mock class that mimics the AttentionDescriptor interface for testing."""
-
-    layout: str = "bnsd"
-    source_attention_op: Callable = torch.ops.auto_deploy.torch_attention_sdpa
-
-    @classmethod
-    def get_attention_layout(cls) -> str:
-        return cls.layout
-
-    @classmethod
-    def get_source_attention_op(cls) -> Callable:
-        return cls.source_attention_op
 
 
 class AttentionLayoutModel(torch.nn.Module):
@@ -1089,7 +1072,7 @@ class AttentionLayoutModel(torch.nn.Module):
 
         # Apply scaled dot product attention
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention(
                 q,
                 k,
                 v,
@@ -1136,7 +1119,7 @@ class BsndAttentionModel(AttentionLayoutModel):
         attn_mask = self._get_attn_mask(x) if self.has_mask else None
 
         # Apply bsnd_grouped_sdpa directly
-        attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa.default(
+        attn_output = torch.ops.auto_deploy.torch_attention.default(
             q,
             k,
             v,
@@ -1144,6 +1127,7 @@ class BsndAttentionModel(AttentionLayoutModel):
             dropout_p=0.0,
             is_causal=True,
             scale=1.0 / (self.head_dim**0.5),
+            layout="bsnd",
         )
 
         # Reshape output for the linear projection (no transpose needed)
@@ -1157,7 +1141,6 @@ class BsndAttentionModel(AttentionLayoutModel):
 @pytest.mark.parametrize(
     "model_config",
     [
-        {"type": "standard", "use_grouped_sdpa": False, "name": "SDPA"},
         {"type": "standard", "use_grouped_sdpa": True, "name": "GroupedSDPA"},
         {"type": "already_bsnd", "name": "DirectBSND"},
     ],
@@ -1169,17 +1152,6 @@ def test_match_attention_layout(layout, model_config, has_mask):
     batch_size, seq_len = 4, 12
     hidden_size = 512
     num_heads = 8
-
-    # Set up the mock attention descriptor class with the specified layout
-    MockAttentionDescriptor.layout = layout
-    if layout == "bnsd":
-        if model_config.get("use_grouped_sdpa"):
-            source_op = torch.ops.auto_deploy.torch_attention_grouped_sdpa
-        else:
-            source_op = torch.ops.auto_deploy.torch_attention_sdpa
-    else:
-        source_op = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
-    MockAttentionDescriptor.source_attention_op = source_op
 
     # Create appropriate model based on model_config
     if model_config["type"] == "standard":
@@ -1211,7 +1183,8 @@ def test_match_attention_layout(layout, model_config, has_mask):
                 original_nodes = [
                     n
                     for n in gm.graph.nodes
-                    if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+                    if is_op(n, torch.ops.auto_deploy.torch_attention)
+                    and not (isinstance(n.args[-1], str) and n.args[-1] == "bsnd")
                 ]
             else:
                 original_nodes = [
@@ -1225,7 +1198,11 @@ def test_match_attention_layout(layout, model_config, has_mask):
         bsnd_nodes = [
             n
             for n in gm.graph.nodes
-            if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa)
+            if (
+                is_op(n, torch.ops.auto_deploy.torch_attention)
+                and isinstance(n.args[-1], str)
+                and n.args[-1] == "bsnd"
+            )
         ]
         transpose_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.aten.transpose.int)]
 
@@ -1325,7 +1302,7 @@ def test_match_attention_layout(layout, model_config, has_mask):
             {
                 "match_attention_layout": {
                     "stage": "pattern_matcher",
-                    "attention_op": MockAttentionDescriptor,
+                    "attn_layout": layout,
                 },
             },
         )(None, gm),

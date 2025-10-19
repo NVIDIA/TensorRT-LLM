@@ -12,39 +12,32 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
                                             GuidedDecodingConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig, LoadFormat,
-                                          PybindMirror, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import LoadFormat, PybindMirror, TorchLlmArgs
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..distributed import MPIDist
+from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla)
+                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    validate_feature_combination)
 from .config import PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-
-
-# Development function to control chain drafter feature.
-# It's here so that unit tests can mock it and turn it off.
-def _get_allow_chain_drafter() -> bool:
-    return True
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -85,9 +78,8 @@ class _ExecutorMemoryMonitor():
         elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
               and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
               in str(e)):
-            msg = (
-                "Executor creation failed with an error which might indicate "
-                "insufficient GPU memory.")
+            msg = (f"Executor creation failed with NCCL error: {str(e)}")
+            return msg
         else:
             return None
 
@@ -127,8 +119,8 @@ class _ExecutorMemoryMonitor():
                f"{self._bytes_to_gib(sample.free_gpu_memory_bytes_pre):.2f} / {self._bytes_to_gib(sample.free_gpu_memory_bytes_post):.2f}"
                ) for sample in self._samples),
             "",
-            ("Please refer to the TensorRT-LLM documentation for information on how "
-             "to control the memory usage through TensorRT-LLM configuration options. "
+            ("Please refer to the TensorRT LLM documentation for information on how "
+             "to control the memory usage through TensorRT LLM configuration options. "
              "Possible options include:"),
             *(f"  {stage.value}: {tuning_knobs[stage]}"
               for stage in chain((sample.creation_stage
@@ -211,11 +203,12 @@ def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: str = None,
     tokenizer: Optional[TokenizerBase] = None,
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+    lora_config = llm_args.lora_config
+    kv_connector_config = llm_args.kv_connector_config
 
     pytorch_backend_config = llm_args.get_pytorch_backend_config()
     if pytorch_backend_config is None:
@@ -229,7 +222,7 @@ def create_py_executor(
             llm_args.peft_cache_config)
 
     assert llm_args.kv_cache_config, "Expect llm_args.kv_cache_config is not None"
-    kv_cache_config = PybindMirror.maybe_to_pybind(llm_args.kv_cache_config)
+    kv_cache_config = llm_args.kv_cache_config
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
@@ -254,10 +247,9 @@ def create_py_executor(
         max_batch_size,
     ) = llm_args.get_runtime_sizes()
 
-    if max_num_tokens is None:
-        max_num_tokens = 8192
-
-    tokens_per_block = llm_args.kv_cache_config.tokens_per_block
+    tokens_per_block = kv_cache_config.tokens_per_block
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        tokens_per_block = max_num_tokens
 
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
@@ -298,7 +290,10 @@ def create_py_executor(
         pytorch_backend_config.disable_overlap_scheduler = True
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
-    dist = MPIDist(mapping=mapping)
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
 
     cache_transceiver_config = None
     if llm_args.cache_transceiver_config is not None:
@@ -310,6 +305,8 @@ def create_py_executor(
     if spec_config is not None:
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
+
+    sparse_attention_config = llm_args.sparse_attention_config
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -334,25 +331,24 @@ def create_py_executor(
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
+            sparse_attention_config=sparse_attention_config,
             lora_config=lora_config,
             checkpoint_loader=checkpoint_loader,
         )
+
+    validate_feature_combination(llm_args, model_engine,
+                                 pytorch_backend_config.sampler_type)
 
     if has_draft_model_engine:
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            # The draft model won't have any draft tokens attached to
-            # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_len = 0
 
-            if _get_allow_chain_drafter():
-                use_chain_drafter = (
-                    guided_decoding_config is None
-                    and not pytorch_backend_config.enable_mixed_sampler
-                    and pytorch_backend_config.attn_backend == "TRTLLM")
-            else:
-                use_chain_drafter = False
+            use_chain_drafter = (
+                guided_decoding_config is None
+                and draft_spec_config._allow_chain_drafter
+                and draft_spec_config._allow_greedy_draft_tokens
+                and pytorch_backend_config.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
@@ -512,10 +508,6 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if pytorch_backend_config.use_cuda_graph:
-            raise NotImplementedError(
-                "CUDA graphs are not supported with KV connector hooks.")
-
         if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
@@ -545,6 +537,12 @@ def create_py_executor(
 
                 connector_worker = connector_worker_task.result()
 
+            forward_pass_callable = connector_worker.register_forward_pass_callable(
+            )
+            if forward_pass_callable:
+                model_engine.register_forward_pass_callable(
+                    forward_pass_callable)
+
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)
 
@@ -573,6 +571,8 @@ def create_py_executor(
             kv_cache_config=kv_cache_config,
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
+            profiling_stage_data=profiling_stage_data,
+            sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(

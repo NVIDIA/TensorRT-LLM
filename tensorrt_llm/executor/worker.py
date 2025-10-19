@@ -1,27 +1,26 @@
-import json
+import gc
 import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from queue import Queue
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Union
 
 import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
+from .._utils import mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
-from ..lora_helper import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .executor import IterationResultQueue
@@ -40,9 +39,6 @@ __all__ = [
 
 class GenerationExecutorWorker(BaseWorker):
 
-    class WorkerExit(GeneratorExit):
-        pass
-
     def __init__(
         self,
         engine: Union[Path, Engine],
@@ -50,8 +46,6 @@ class GenerationExecutorWorker(BaseWorker):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -62,8 +56,6 @@ class GenerationExecutorWorker(BaseWorker):
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args,
@@ -143,25 +135,9 @@ class GenerationExecutorWorker(BaseWorker):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
-
-        # Define a Callable to join iteration and request stats
-        def stats_serializer(
-                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-            iteration_stats, req_stats = stats
-            stats_dict = json.loads(iteration_stats.to_json_str())
-
-            if req_stats is not None and len(req_stats) > 0:
-                stats_dict["requestStats"] = []
-                for req_stat in req_stats:
-                    stats_dict["requestStats"].append(
-                        json.loads(req_stat.to_json_str()))
-
-            # Convert back to JSON string
-            return json.dumps(stats_dict)
-
         return self._iteration_result_task(self.stats_queues, self.fetch_stats,
                                            self._iter_stats_result,
-                                           stats_serializer)
+                                           self._stats_serializer)
 
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
@@ -172,14 +148,14 @@ class GenerationExecutorWorker(BaseWorker):
                 events_api = lambda: [None]
             else:
                 events_api = event_manager.get_latest_events
-            return self._iteration_result_task(
-                self.kv_events_queues, events_api, self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
+            return self._iteration_result_task(self.kv_events_queues,
+                                               events_api,
+                                               self._iter_kv_events_result,
+                                               self._kv_cache_events_serializer)
         else:
             return self._iteration_result_task(
                 self.kv_events_queues, self.engine.get_latest_kv_cache_events,
-                self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
+                self._iter_kv_events_result, self._kv_cache_events_serializer)
 
     def start(self):
         # create iteration result queues
@@ -262,8 +238,6 @@ def worker_main(
     ready_signal: Optional[str] = None,
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     hf_model_dir: Optional[Path] = None,
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
@@ -393,8 +367,6 @@ def worker_main(
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args)
@@ -408,6 +380,10 @@ def worker_main(
             if not worker_init_status_queue.notify_with_retry(error_msg):
                 logger.error("Failed to deliver error message to proxy")
         return
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
+        gc.disable()
 
     with worker:
         try:

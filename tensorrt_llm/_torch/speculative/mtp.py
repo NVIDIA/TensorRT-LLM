@@ -226,6 +226,7 @@ class MTPSampler(TorchSampler):
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
+        max_total_draft_tokens: torch.Tensor
 
     def create_store(self) -> Store:
         num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
@@ -236,6 +237,7 @@ class MTPSampler(TorchSampler):
             next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
             next_draft_tokens=int_tensor((seq_slots, draft_len)),
             new_tokens_lens=int_tensor((seq_slots, )),
+            max_total_draft_tokens=int_tensor((seq_slots, draft_len)),
         )
 
     def _request_common_handling(self, request: LlmRequest,
@@ -246,11 +248,15 @@ class MTPSampler(TorchSampler):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
-    def update_requests(self, state: SampleStateMTP) -> None:
+    def update_requests(
+            self,
+            state: SampleStateMTP,
+            resource_manager: Optional[BaseResourceManager] = None) -> None:
+        # resource_manager will be not be used in this function
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens
+        new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = self.BEAM
@@ -513,7 +519,7 @@ class MTPWorker(nn.Module):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn metadata
-        if attn_metadata.is_cuda_graph and attn_metadata is not None:
+        if attn_metadata is not None:
             self.restore_attn_metadata(attn_metadata=attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
@@ -1195,20 +1201,17 @@ class MTPEagleWorker(MTPWorker):
             position_ids = position_ids.squeeze(0)
             last_tokens_idx = torch.cumsum(
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            last_tokens_idx_host = torch.cumsum(
-                attn_metadata.seq_lens, dim=0, dtype=torch.long) - 1
-            return position_ids, last_tokens_idx, last_tokens_idx_host
+            return position_ids, last_tokens_idx
 
-        position_ids, last_tokens_idx, last_tokens_idx_host = prepare_position_ids_and_last_tokens(
+        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(
             position_ids, attn_metadata)
-        inputs = self.prepare_drafter_inputs(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            last_tokens_idx_host=last_tokens_idx_host,
-            hidden_states=hidden_states,
-            accepted_tokens=accepted_tokens,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata)
+        inputs = self.prepare_drafter_inputs(input_ids=input_ids,
+                                             position_ids=position_ids,
+                                             last_tokens_idx=last_tokens_idx,
+                                             hidden_states=hidden_states,
+                                             accepted_tokens=accepted_tokens,
+                                             attn_metadata=attn_metadata,
+                                             spec_metadata=spec_metadata)
 
         # Predict draft tokens
         next_draft_tokens = []
@@ -1355,7 +1358,7 @@ class MTPEagleWorker(MTPWorker):
         self,
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
-        last_tokens_idx_host: torch.LongTensor,
+        last_tokens_idx: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -1370,9 +1373,7 @@ class MTPEagleWorker(MTPWorker):
                                          device="cuda")
         input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
         input_ids_ctx[
-            last_tokens_idx_host[:
-                                 num_contexts]] = accepted_tokens[:num_contexts,
-                                                                  0]
+            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()

@@ -61,6 +61,7 @@ def gen_config_file(work_dir: str,
         'enable_attention_dp': True if ctx_enable_attention_dp else False,
         'pipeline_parallel_size': ctx_pp_size,
         'print_iter_log': True,
+        'cuda_graph_config': None,
         'disable_overlap_scheduler': True,
         'kv_cache_config': {
             'enable_block_reuse': False,
@@ -91,7 +92,8 @@ def gen_config_file(work_dir: str,
         },
         'tensor_parallel_size': gen_tp_size,
         'moe_expert_parallel_size': gen_tp_size,
-        'enable_attention_dp': True if gen_enable_attention_dp else False,
+        'enable_attention_dp': gen_enable_attention_dp,
+        'enable_lm_head_tp_in_adp': gen_enable_attention_dp and mtp_size > 0,
         'pipeline_parallel_size': gen_pp_size,
         'max_batch_size': gen_batch_size,
         'max_num_tokens': gen_max_num_tokens,
@@ -108,12 +110,14 @@ def gen_config_file(work_dir: str,
         },
         'moe_config': {
             'backend': gen_moe_backend,
+            'use_low_precision_moe_combine': True,
         },
         'cache_transceiver_config': {
             'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
             'backend': 'DEFAULT',
         },
         'stream_interval': 20,
+        'num_postprocess_workers': 4,
     }
 
     if gen_tp_size == 8 and not gen_enable_attention_dp:

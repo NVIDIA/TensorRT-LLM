@@ -39,13 +39,15 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     auto const numTokens = param.numTokens;
     auto const numExperts = param.numExperts;
     auto const topK = param.topK;
-    auto const paddingLog2 = param.paddingLog2;
+    // auto const paddingLog2 = param.paddingLog2;
+    auto const tileTokensDim = param.tileTokensDim;
     auto const localExpertsStartIdx = param.localExpertsStartIdx;
     auto const localExpertsStrideLog2 = param.localExpertsStrideLog2;
     auto const numLocalExperts = param.numLocalExperts;
     auto const usePdl = param.usePdl;
     auto const doSoftmaxBeforeTopK = param.doSoftmaxBeforeTopK;
     auto const normTopkProb = param.normTopkProb;
+    auto const useTopKAsInput = param.useTopKAsInput;
 
     int64_t countsSize = 2 * numExperts;
     if (param.routingMethod == RoutingMethodType::DeepSeekV3)
@@ -65,15 +67,28 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
     mPtrExpandedIdxToPermutedIdxDevice
         = mBufferManager->gpu(ITensor::makeShape({expIdxToPermIdxSize}), nvinfer1::DataType::kINT32);
 
-    int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts << paddingLog2) - numExperts);
+    // int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts << paddingLog2) - numExperts);
+    int64_t permIdxToTokenIdxSize = (numTokens * topK + (numExperts * tileTokensDim) - numExperts);
     mPtrPermutedIdxToTokenIdxHost
         = mBufferManager->pinned(ITensor::makeShape({permIdxToTokenIdxSize}), nvinfer1::DataType::kINT32);
     mPtrPermutedIdxToTokenIdxDevice
         = mBufferManager->gpu(ITensor::makeShape({permIdxToTokenIdxSize}), nvinfer1::DataType::kINT32);
 
     int64_t expWeightsSize = numTokens * topK;
-    mPtrExpertWeightsHost = mBufferManager->pinned(ITensor::makeShape({expWeightsSize}), TRTDataType<T>::value);
-    mPtrExpertWeightsDevice = mBufferManager->gpu(ITensor::makeShape({expWeightsSize}), TRTDataType<T>::value);
+    mPtrTopKWeightsHost = mBufferManager->pinned(ITensor::makeShape({expWeightsSize}), TRTDataType<T>::value);
+    mPtrTopKWeightsDevice = mBufferManager->gpu(ITensor::makeShape({expWeightsSize}), TRTDataType<T>::value);
+
+    if (useTopKAsInput)
+    {
+        int64_t topKIdsSize = numTokens * topK;
+        mPtrTopKIdsHost = mBufferManager->pinned(ITensor::makeShape({topKIdsSize}), nvinfer1::DataType::kINT32);
+        mPtrTopKIdsDevice = mBufferManager->gpu(ITensor::makeShape({topKIdsSize}), nvinfer1::DataType::kINT32);
+    }
+    else
+    {
+        mPtrTopKIdsHost = nullptr;
+        mPtrTopKIdsDevice = nullptr;
+    }
 
     int64_t ctaIdxSize = numTokens * topK;
     mPtrCtaIdxXyToBatchIdxHost = mBufferManager->pinned(ITensor::makeShape({ctaIdxSize}), nvinfer1::DataType::kINT32);
@@ -89,8 +104,8 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
         = mBufferManager->gpu(ITensor::makeShape({numNonExitingCtasSize}), nvinfer1::DataType::kINT32);
 
     int64_t idxSize = numTokens * topK * sizeof(PackedType);
-    mPtrExpertIdxHost = mBufferManager->pinned(ITensor::makeShape({idxSize}), nvinfer1::DataType::kINT8);
-    mPtrExpertIdxDevice = mBufferManager->gpu(ITensor::makeShape({idxSize}), nvinfer1::DataType::kINT8);
+    mPtrTopKPackedHost = mBufferManager->pinned(ITensor::makeShape({idxSize}), nvinfer1::DataType::kINT8);
+    mPtrTopKPackedDevice = mBufferManager->gpu(ITensor::makeShape({idxSize}), nvinfer1::DataType::kINT8);
     mCurandStatesDevice
         = mBufferManager->gpu(ITensor::makeShape({numTokens, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 }
@@ -109,7 +124,7 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
 {
 
     int32_t* expertCountsHostPtr = bufferCast<int32_t>(*this->mPtrExpertCountsHost);
-    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrExpertIdxHost));
+    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost));
 
     auto tokenToExpertHost
         = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), nvinfer1::DataType::kINT32);
@@ -155,14 +170,14 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
         }
     }
 
-    // Calculate prefix sum of expert counts, padded to power of 2 boundary if hostData.mPaddingLog2
+    // Calculate prefix sum of expert counts, padded to tileTokensDim
     for (int ie = 0; ie < param.numExperts; ++ie)
     {
-        // expertScanCounts stores cumulative sum of padded token counts per expert
-        expertScanCountsHostPtr[ie + 1]
-            = expertScanCountsHostPtr[ie] + divUpMulLog2(expertCountsHostPtr[ie], param.paddingLog2);
-        // ctaScanCounts stores cumulative sum of number of CTAs needed per expert
-        ctaScanCountsHostPtr[ie + 1] = ctaScanCountsHostPtr[ie] + divUpLog2(expertCountsHostPtr[ie], param.paddingLog2);
+        int32_t tmp;
+        tmp = divUpMulTileN<int32_t>(expertCountsHostPtr[ie], param.tileTokensDim);
+        expertScanCountsHostPtr[ie + 1] = expertScanCountsHostPtr[ie] + tmp;
+        tmp = divUpTileN(expertCountsHostPtr[ie], param.tileTokensDim);
+        ctaScanCountsHostPtr[ie + 1] = ctaScanCountsHostPtr[ie] + tmp;
     }
 
     // Store total size needed for permuted indices buffer
@@ -171,8 +186,7 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
     bufferCast<int32_t>(*this->mPtrNumNonExitingCtasHost)[0] = ctaScanCountsHostPtr[param.numExperts];
 
     auto permutedBufferMaxSize
-        = param.numTokens * param.topK + mulLog2(param.numExperts, param.paddingLog2) - param.numExperts;
-
+        = param.numTokens * param.topK + mulTileN(param.numExperts, param.tileTokensDim) - param.numExperts;
     for (int ii = 0; ii < permutedBufferMaxSize; ++ii)
         bufferCast<int32_t>(*this->mPtrPermutedIdxToTokenIdxHost)[ii] = -1;
 
@@ -207,7 +221,9 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             continue;
         }
 
-        int32_t numCta = divUpLog2(m, param.paddingLog2);
+        // int32_t numCta = divUpLog2(m, param.paddingLog2);
+        int32_t numCta = divUpTileN(m, param.tileTokensDim);
+
         const int32_t localExpertIdx = (ie - param.localExpertsStartIdx) >> param.localExpertsStrideLog2;
 
         for (int32_t cta = 0; cta < numCta; ++cta)
@@ -215,8 +231,8 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             // Map CTA index to expert index and compute token range for this CTA
             bufferCast<int32_t>(*this->mPtrCtaIdxXyToBatchIdxHost)[ctaScanCountsHostPtr[ie] + cta] = localExpertIdx;
             bufferCast<int32_t>(*this->mPtrCtaIdxXyToMnLimitHost)[ctaScanCountsHostPtr[ie] + cta]
-                = std::min(mulLog2(ctaScanCountsHostPtr[ie] + cta + 1, param.paddingLog2),
-                    mulLog2(ctaScanCountsHostPtr[ie], param.paddingLog2) + m);
+                = std::min(mulTileN(ctaScanCountsHostPtr[ie] + cta + 1, param.tileTokensDim),
+                    mulTileN(ctaScanCountsHostPtr[ie], param.tileTokensDim) + m);
         }
     }
 }
@@ -247,7 +263,7 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
     mStream->synchronize();
 
     int32_t* expIdxToPermHostptr = bufferCast<int32_t>(*mPtrExpandedIdxToPermutedIdxHost);
-    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrExpertIdxHost));
+    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrTopKPackedHost));
 
     for (int ie = 0; ie < param.numExperts; ++ie)
     {
@@ -283,7 +299,7 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
 template <typename T>
 void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
 {
-    auto const expertWeightsHost = mBufferManager->copyFrom(*mPtrExpertWeightsDevice, MemoryType::kCPU);
+    auto const expertWeightsHost = mBufferManager->copyFrom(*mPtrTopKWeightsDevice, MemoryType::kCPU);
     auto const expertCountsHost = mBufferManager->copyFrom(*mPtrExpertCountsDevice, MemoryType::kCPU);
     auto const permutedIdxSizeHost = mBufferManager->copyFrom(*mPtrPermutedIdxSizeDevice, MemoryType::kCPU);
     auto const numNonExitingCtasHost = mBufferManager->copyFrom(*mPtrNumNonExitingCtasDevice, MemoryType::kCPU);
@@ -301,7 +317,7 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
 
     if (param.getExpWeights)
     {
-        EXPECT_EQ(isClose(bufferCast<T>(*mPtrExpertWeightsHost), expertWeightsPtr, param.numTokens * param.topK,
+        EXPECT_EQ(isClose(bufferCast<T>(*mPtrTopKWeightsHost), expertWeightsPtr, param.numTokens * param.topK,
                       "expert weights"),
             true);
     }
@@ -344,6 +360,15 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     // Setup buffers
     setupBuffers(param);
 
+    // Call host function
+    callHostFunction(param);
+    if (param.useTopKAsInput)
+    {
+        // Set the topk_ids as input
+        mBufferManager->copy(*mPtrTopKIdsHost, *mPtrTopKIdsDevice);
+        mBufferManager->copy(*mPtrTopKWeightsHost, *mPtrTopKWeightsDevice);
+        mStream->synchronize();
+    }
     // Retrieve the workspace size of the routing kernel.
     auto const workspaceSize = getDeviceWorkspaceSize(param);
     TensorPtr workspaceDevice
@@ -351,10 +376,6 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
 
     // Call tested function routing
     callTestedFunction(param, workspaceDevice);
-
-    // Call host function
-    callHostFunction(param);
-
     // Verify results
     verifyResult(param);
 }

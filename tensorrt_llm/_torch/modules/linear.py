@@ -20,6 +20,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
@@ -240,6 +242,9 @@ class LinearMethodBase(ABC):
             self.load_weights_fused_gate_up_linear(module, weights)
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
+
+    def post_load_weights(self, module: Linear):
+        pass
 
     def load_weight_scales(self, weights: List[Dict], *args, **kwargs):
         """
@@ -712,6 +717,24 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
+    def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
+        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm):
+            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
+                                                        module.weight_scale)
+            transfromed_scale = transform_sf_into_required_layout(
+                weight_scale,
+                mn=weight.shape[0],
+                k=weight.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
+            module.weight = nn.Parameter(weight, requires_grad=False)
+            module.weight_scale = nn.Parameter(
+                transfromed_scale,
+                requires_grad=False,
+            )
+
 
 class NVFP4LinearMethod(LinearMethodBase):
 
@@ -1004,15 +1027,12 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                        tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
-                # The kernel we use will convert nvfp4 to e4m3 before matmul,
-                # so the range of the scale factor can only be [0,448/6].
-                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
                 weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
                 if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
+                    weight_scale_2 = w["weight_scale_2"][...]
                 else:
-                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
+                    assert weight_scale_2 == w["weight_scale_2"][...], (
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
                     )
 
@@ -2001,3 +2021,6 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         self.quant_method.load_weights(self, weights, weight_mode)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)

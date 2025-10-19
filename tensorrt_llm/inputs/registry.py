@@ -42,6 +42,16 @@ class InputProcessor(Protocol):
         ...
 
 
+class BaseDummyInputsBuilder:
+    """
+    Base class for generating dummy inputs. Specially for profiling
+    """
+
+    def get_dummy_prompt(self, input_seq_len: int):
+        raise NotImplementedError(
+            "Please ensure this method is implemented in your inherited class")
+
+
 class BaseMultimodalInputProcessor:
     """
     Base class for multimodal input processors with default implementations
@@ -377,6 +387,36 @@ class InputProcessorRegistry:
 
 
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
+
+
+def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
+    """
+    Model-class decorator to declare support for multimodal disaggregated inputs.
+
+    Apply this to a model class AFTER its input processor has been registered via
+    @register_input_processor. The decorator will locate the processor class,
+    validate requirements, and set `supports_multimodal_disagg = True` on both
+    the processor class and the model class.
+    """
+    processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.get(
+        model_cls)
+    if processor_cls is None:
+        raise RuntimeError(
+            f"No input processor registered for {model_cls.__name__}; ensure @register_input_processor is applied closer to the class than @supports_multimodal_disagg."
+        )
+    if not issubclass(processor_cls, BaseMultimodalInputProcessor):
+        raise TypeError(
+            f"{processor_cls.__name__} must inherit from BaseMultimodalInputProcessor to support multimodal disagg"
+        )
+    method = getattr(processor_cls, "get_prompt_token_ids", None)
+    if method is None or not callable(method):
+        raise TypeError(
+            f"{processor_cls.__name__} must implement a callable method `get_prompt_token_ids` to support multimodal disagg"
+        )
+
+    setattr(processor_cls, "support_mm_disagg", True)
+    setattr(model_cls, "support_mm_disagg", True)
+    return model_cls
 
 
 def register_input_processor(

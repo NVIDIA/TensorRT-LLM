@@ -2,13 +2,14 @@
 
 import atexit
 import os
-import socket
 import sys
 from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tensorrt_llm._utils import get_free_port as _get_free_port
 
 from ..utils.logger import ad_logger
 
@@ -69,10 +70,7 @@ def all_gather_object(object_list, object, group=None):
 
 
 def get_free_port():
-    sock = socket.socket()
-    sock.bind(("", 0))
-    port = sock.getsockname()[1]
-    return port
+    return _get_free_port()
 
 
 def get_world_size() -> int:

@@ -12,7 +12,7 @@ The `trtllm-serve` command supports the `extra-llm-config.yaml` parameter. In th
 
 ```yaml
 cache_transceiver_config:
-  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., UCX), `UCX`, `NIXL`.
+  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., NIXL), `UCX`, `NIXL`.
   backend: <str>
   # KV cache buffer size. Set it ≥ the maximum ISL (Input Sequence Length) for best performance.
   max_tokens_in_buffer: <int>
@@ -248,8 +248,7 @@ CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 ```
-
-TensorRT-LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
+TensorRT LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
 
 ### Dynamically removing servers
 

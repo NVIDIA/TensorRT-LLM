@@ -1,6 +1,8 @@
 import asyncio
 import collections
+import datetime
 import hashlib
+import inspect
 import io
 import os
 import re
@@ -64,8 +66,61 @@ def print_colored(message,
 def print_colored_debug(message,
                         color: Optional[str] = None,
                         writer: io.TextIOWrapper = sys.stderr):
-    if enable_llm_debug():
+    if enable_llmapi_debug():
         print_colored(message, color, writer)
+
+
+def get_current_location(skip_frames: int = 2) -> str:
+    """
+    Get the current execution location in format 'module.class.function'.
+
+    Args:
+        skip_frames: Number of stack frames to skip (default 2 to skip this function and its caller)
+
+    Returns:
+        String in format 'module.class.function' or 'module.function' if not in a class
+    """
+    stack = inspect.stack()
+    if len(stack) <= skip_frames:
+        return "unknown"
+
+    frame = stack[skip_frames]
+    module_name = frame.frame.f_globals.get('__name__', 'unknown')
+    function_name = frame.function
+
+    # Try to determine if we're in a class method
+    class_name = None
+    if 'self' in frame.frame.f_locals:
+        # This is likely an instance method
+        obj = frame.frame.f_locals['self']
+        class_name = obj.__class__.__name__
+    elif 'cls' in frame.frame.f_locals:
+        # This might be a class method
+        cls = frame.frame.f_locals['cls']
+        if inspect.isclass(cls):
+            class_name = cls.__name__
+
+    # Build the location string
+    if class_name:
+        return f"{module_name}.{class_name}.{function_name}"
+    else:
+        return f"{module_name}.{function_name}"
+
+
+def logger_debug(message,
+                 color: Optional[str] = None,
+                 writer: io.TextIOWrapper = sys.stderr):
+    """ Print the message if the llmapi debug mode is enabled. Fallback to logger.debug if not. """
+    if enable_llmapi_debug():
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        location = get_current_location()
+        cur_dualname = "..." + location[-47:] if len(
+            location) > 50 else location
+        print_colored(f"{timestamp} [{cur_dualname}]", "bold_green", writer)
+        print_colored(f" {message}\n", color, writer)
+    else:
+        # Fallback to logger.debug
+        logger.debug(message)
 
 
 def file_with_glob_exists(directory, glob) -> bool:
@@ -244,14 +299,14 @@ class ManagedThread(threading.Thread):
                  task: Callable[..., bool],
                  error_queue: Queue,
                  name: Optional[str] = None,
+                 stop_event: Optional[threading.Event] = None,
                  **kwargs):
         super().__init__(name=name)
         self.task = task
         self.error_queue = error_queue
         self.kwargs = kwargs
         self.daemon = True
-
-        self.stop_event = threading.Event()
+        self.stop_event = stop_event or threading.Event()
 
     def run(self):
 
@@ -288,6 +343,17 @@ def enable_llm_debug() -> bool:
     if _enable_llm_debug_ is None:
         _enable_llm_debug_ = os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
     return _enable_llm_debug_
+
+
+_enable_llmapi_debug_ = None
+
+
+def enable_llmapi_debug() -> bool:
+    global _enable_llmapi_debug_
+    if _enable_llmapi_debug_ is None:
+        _enable_llmapi_debug_ = os.environ.get("TLLM_LLMAPI_ENABLE_DEBUG",
+                                               "0") == "1"
+    return _enable_llmapi_debug_
 
 
 @cache
@@ -355,9 +421,26 @@ class AsyncQueue:
         if self._tainted:
             raise AsyncQueue.MixedSyncAsyncAPIError()
 
-        if timeout is None or timeout > 0:
-            # This may raise asyncio.TimeoutError
-            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        # Blocking path: timeout is None (wait indefinitely)
+        if timeout is None:
+            # Wait indefinitely until the queue is non-empty.
+            # It is necessary to check if the queue is empty after waking.
+            # Because multiple waiting coroutines may be awakened simultaneously when a new item entries empty queue.
+            # These coroutines will all pop this item from queue, and then raise IndexError.
+            while not self._q:
+                await self._event.wait()
+        # Blocking path: timeout > 0 (timed wait, retry with remaining time).
+        elif timeout > 0:
+            # Compute the deadline; if the queue is still empty after waking, continue waiting for the remaining time.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while not self._q:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                # This may raise asyncio.TimeoutError.
+                await asyncio.wait_for(self._event.wait(), timeout=remaining)
+        # Non-blocking path: timeout <= 0.
         elif not self._q:
             raise asyncio.QueueEmpty()
 
@@ -567,7 +650,9 @@ class ApiParamTagger:
 
     def __call__(self, cls: Type[BaseModel]) -> None:
         """ The main entry point to tag the api doc. """
-        self._process_pydantic_model(cls)
+        if cls.__name__ in ["LlmArgs", "TorchLlmArgs"]:
+            # TODO: apply this to other classes
+            self._process_pydantic_model(cls)
 
     def _process_pydantic_model(self, cls: Type[BaseModel]) -> None:
         """Process the Pydantic model to add tags to the fields.
@@ -577,6 +662,9 @@ class ApiParamTagger:
                 status = field_info.json_schema_extra['status']
                 self._amend_pydantic_field_description_with_tags(
                     cls, [field_name], status)
+            else:
+                self._amend_pydantic_field_description_with_tags(
+                    cls, [field_name], "stable")
 
     def _amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
                                                     field_names: list[str],

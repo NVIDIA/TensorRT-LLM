@@ -1,11 +1,14 @@
 import unittest
 from dataclasses import dataclass
+from unittest.mock import MagicMock, Mock
 
 import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+    KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
@@ -15,10 +18,13 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManagerType
                                                              )
 # isort: on
+from utils.util import skip_ray
+
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig, LlmArgs, SamplingParams
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 
 @dataclass
@@ -32,6 +38,12 @@ class Config:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
+
+
+class DummyKvCacheConnectorWorker(KvCacheConnectorWorker):
+
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+        pass
 
 
 class DummyModel(torch.nn.Module):
@@ -67,16 +79,14 @@ class DummyModelEngine(PyTorchModelEngine):
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
-        self.model_is_wrapped = False
+        model = DummyModel(self.dtype)
         super().__init__(model_path="",
                          pytorch_backend_config=pytorch_backend_config,
                          checkpoint_loader=None,
                          batch_size=batch_size,
                          max_seq_len=max_seq_len,
-                         mapping=mapping)
-
-    def _load_model(self, mode_path: str, **kwargs) -> torch.nn.Module:
-        return DummyModel(self.dtype)
+                         mapping=mapping,
+                         model=model)
 
 
 def _create_request(num_tokens, req_id: int):
@@ -321,6 +331,209 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          "Custom max_batch_size should be respected")
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
+
+    def test_forward_pass_callable_on_cuda_graph_on(self):
+        config = PyTorchConfig(use_cuda_graph=True,
+                               cuda_graph_padding_enabled=True)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+
+        mock_callable = Mock()
+        model_engine.register_forward_pass_callable(mock_callable)
+
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        mock_callable.assert_called_once()
+
+    def test_forward_pass_callable_on_cuda_graph_off(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+
+        mock_callable = Mock()
+        model_engine.register_forward_pass_callable(mock_callable)
+
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        mock_callable.assert_called_once()
+
+    def test_foward_pass_callable_off(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        self.assertTrue(model_engine.forward_pass_callable is None,
+                        "forward_pass_callback should be None by default")
+
+        # Assert we can run `forward` without a forward_pass_callback without error
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+    def test_foward_pass_callable_backward_compat(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        self.assertTrue(model_engine.forward_pass_callable is None,
+                        "forward_pass_callback should be None by default")
+
+        # Assert we can run `forward` without a forward_pass_callback without error
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+    @skip_ray
+    def test_prepare_tp_inputs_with_helix_parallelism(self) -> None:
+        """Test _prepare_tp_inputs function with helix parallelism."""
+
+        # Create model engine with helix parallelism.
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine = DummyModelEngine(config, batch_size=4, dtype=torch.half)
+
+        # Provide mapping for model engine.
+        cp_size = 2
+        cp_rank = 0
+        cp_config = {"cp_type": CpType.HELIX, "tokens_per_block": 4}
+        mapping = Mapping(world_size=cp_size,
+                          tp_size=1,
+                          pp_size=1,
+                          cp_size=cp_size,
+                          cp_config=cp_config,
+                          rank=cp_rank)
+        model_engine.mapping = mapping
+
+        # Mock model_engine's dist and its cp_allgather to return different values per CP rank.
+        mock_dist = MagicMock()
+
+        def mock_cp_allgather(obj):
+            # Simulate allgather across CP ranks: [past_seen_token_num_rank0, past_seen_token_num_rank1]
+            if cp_rank == 0:
+                return [obj, obj + 10]  # Rank 0 sees tokens [obj, obj+10]
+            else:
+                return [obj - 10, obj]  # Rank 1 sees tokens [obj-10, obj]
+
+        mock_dist.cp_allgather.side_effect = mock_cp_allgather
+        model_engine.dist = mock_dist
+
+        # Create scheduled requests with two generation requests.
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = []
+        prompt_lens = [20, 15]
+        gen_requests = []
+        for idx in range(len(prompt_lens)):
+            req = _create_request(num_tokens=prompt_lens[idx], req_id=idx + 1)
+            req.py_prompt_len = prompt_lens[idx]
+            req.py_batch_idx = None
+            req.is_dummy_request = False
+            req.py_seq_slot = idx
+            req.sampling_config.beam_width = 1
+            req.py_multimodal_data = {}
+            gen_requests.append(req)
+        scheduled_requests.generation_requests = gen_requests
+
+        # Create KV cache manager for attention metadata.
+        kv_cache_config = KvCacheConfig(max_tokens=512)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=16,
+            head_dim=16,
+            tokens_per_block=1,
+            max_seq_len=512,
+            max_batch_size=4,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=512,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        # Initialize model engine buffers.
+        max_num_tokens = 512
+        model_engine.max_num_tokens = max_num_tokens
+        model_engine.input_ids_cuda = torch.zeros(max_num_tokens,
+                                                  dtype=torch.int32,
+                                                  device='cuda')
+        model_engine.position_ids_cuda = torch.zeros(max_num_tokens,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+        model_engine.previous_batch_indices_cuda = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device='cuda')
+
+        result, _ = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        # Verify expected keys are present.
+        self.assertIsNotNone(result)
+        self.assertIn('input_ids', result)
+        self.assertIn('position_ids', result)
+        self.assertIn('attn_metadata', result)
+
+        # Check that cp_allgather was called for position calculation.
+        # Also, verify that position_ids are properly calculated.
+        self.assertTrue(mock_dist.cp_allgather.called)
+        position_ids = result['position_ids']
+        self.assertIsInstance(position_ids, torch.Tensor)
+        # For cp_rank=0, the expected position_ids should be:
+        # req1: past_seen_token_num=19 (prompt_len0-1), allgather=[19, 29], sum=48.
+        # req2: past_seen_token_num=14 (prompt_len1-1), allgather=[14, 24], sum=38.
+        expected_positions = [48, 38]
+        actual_positions = position_ids.squeeze(0).cpu().tolist()[:2]
+        self.assertEqual(
+            actual_positions, expected_positions,
+            f"Position IDs should reflect CP allgather results. Expected: {expected_positions}, Got: {actual_positions}"
+        )
+
+        # Verify attention metadata is properly configured.
+        self.assertEqual(attn_metadata.request_ids, [1, 2])
+        self.assertEqual(attn_metadata.prompt_lens, [20, 15])
+        self.assertEqual(attn_metadata.num_contexts, 0)
+
+        # Verify KV cache parameters
+        self.assertIsNotNone(attn_metadata.kv_cache_params)
+        self.assertTrue(attn_metadata.kv_cache_params.use_cache)
+
+        # Verify sequence lengths are correct.
+        expected_seq_lens = [1, 1]
+        if hasattr(attn_metadata,
+                   'seq_lens') and attn_metadata.seq_lens is not None:
+            actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
+            self.assertEqual(actual_seq_lens, expected_seq_lens)
 
 
 if __name__ == "__main__":

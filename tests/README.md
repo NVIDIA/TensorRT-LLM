@@ -9,7 +9,7 @@ Unit test should be small, fast, and test only for specific function.
 If you need to run them locally, the only dependencies are `requirements-dev.txt`.
 
 ```bash
-# in tensorrt-llm source repo root dir
+# in TensorRT LLM source repo root dir
 # use editable install, such that your local changes will be used immedietely in the tests w/o another install
 # see https://setuptools.pypa.io/en/latest/userguide/development_mode.html
 pip install -e ./
@@ -236,6 +236,55 @@ To set a timeout for specific long-running test cases, follow these steps:
    disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
    ```
 
-### Notes:
-- The `TIMEOUT` setting ensures that the test case will be terminated if it exceeds the specified time limit.
-- This setting is useful for preventing long-running or stuck tests from blocking the pipeline or local testing.
+## 6. Set isolated execution for cases individually
+
+Some test cases may experience intermittent failures due to resource conflicts, memory leaks, or state pollution when run together with other tests. The `ISOLATION` marker ensures these cases run in a separate pytest process, avoiding such issues.
+
+### When to use the `ISOLATION` marker:
+- Tests that modify global state or environment variables
+- Tests with memory-intensive operations that may affect subsequent tests
+- Tests that experience intermittent failures only when run with other tests
+- Tests that require exclusive access to certain resources (GPU memory, files, etc.)
+
+### Usage:
+Add `ISOLATION` to the test case line with proper spacing:
+
+**For CI (test-db YAML files):**
+```yaml
+- disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
+```
+
+**For Local Testing (TXT files):**
+```
+disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
+```
+
+## 7. Combining test markers
+
+Multiple markers can be combined for the same test case using commas. Both formats are valid:
+
+```yaml
+- test_case.py::test_function[param] ISOLATION, TIMEOUT (90)
+- test_case.py::test_function[param] TIMEOUT (90), ISOLATION
+```
+
+### Example:
+```yaml
+# Regular test (runs with other tests)
+- accuracy/test_llm_api.py::test_basic_functionality[gpt2]
+
+# Test with timeout only
+- accuracy/test_llm_api.py::test_long_running[model] TIMEOUT (60)
+
+# Isolated test (runs in separate process)
+- accuracy/test_llm_api.py::test_memory_intensive[large_model] ISOLATION
+
+# Isolated test with timeout
+- accuracy/test_llm_api.py::test_complex_workflow[model] ISOLATION, TIMEOUT (120)
+```
+
+### Important Notes:
+- **TIMEOUT**: Ensures the test terminates if it exceeds the specified time limit (in minutes). Useful for preventing stuck tests from blocking the pipeline.
+- **ISOLATION**: Runs the test in a separate pytest process to avoid resource conflicts and state pollution. Use sparingly as it increases execution time.
+- Ensure there is **at least one space** before and after each marker keyword
+- Both markers are case-sensitive and must be written exactly as `TIMEOUT` and `ISOLATION`

@@ -40,14 +40,12 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.quantization.utils.fp8_utils import (
-    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -58,8 +56,7 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
-                                 MoEWeightLoadingMode, TRTLLMGenFusedMoE,
-                                 create_moe)
+                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -394,28 +391,6 @@ class DeepseekV3WeightLoader:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
 
-                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and is_sm_100f() and hasattr(module, "weight_scale"):
-                    weight, weight_scale = resmooth_to_fp8_e8m0(
-                        module.weight, module.weight_scale)
-                    transfromed_scale = transform_sf_into_required_layout(
-                        weight_scale,
-                        mn=weight.shape[0],
-                        k=weight.shape[1],
-                        recipe=(1, 128, 128),
-                        is_sfa=False)
-                    module.weight = nn.Parameter(weight, requires_grad=False)
-                    module.weight_scale = nn.Parameter(transfromed_scale,
-                                                       requires_grad=False)
-        if not self.is_draft_model:
-            for idx, layer in enumerate(
-                    self.model.model.layers[:self.config.num_hidden_layers]):
-                if idx == self.config.num_hidden_layers - 1:
-                    layer.next_layer_layernorm = self.model.model.norm
-                else:
-                    layer.next_layer_layernorm = self.model.model.layers[
-                        idx + 1].input_layernorm
-
 
 class DeepseekV3MTPHead(nn.Module):
 
@@ -427,12 +402,8 @@ class DeepseekV3MTPHead(nn.Module):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        if self.model_config.mapping.enable_attention_dp and \
-            getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
-            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
-                self.model_config.mapping)
-        else:
-            self.mapping_lm_head_tp = self.model_config.mapping
+
+        self.mapping_lm_head_tp = None
 
     @torch.compile(options={"max-autotune": True})
     def get_last_token_states(self, hidden_states, attn_metadata):
@@ -456,11 +427,13 @@ class DeepseekV3MTPHead(nn.Module):
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
-        enable_lm_head_tp_in_adp = self.model_config.mapping.enable_lm_head_tp_in_adp
+        enable_lm_head_tp_in_adp = enable_attention_dp and self.model_config.mapping.enable_lm_head_tp_in_adp
 
         # Add pre-lm gather logic
         if enable_lm_head_tp_in_adp:
             # ADP + LM TP mode: perform All-Gather before LM_head
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
+                self.model_config.mapping, hidden_states.shape[0])
             hidden_states = allgather(hidden_states,
                                       self.mapping_lm_head_tp,
                                       dim=0)
@@ -468,7 +441,9 @@ class DeepseekV3MTPHead(nn.Module):
         # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = False
-        logits = lm_head(hidden_states, is_spec_decoding_head=True)
+        logits = lm_head(hidden_states,
+                         mapping_lm_head_tp=self.mapping_lm_head_tp,
+                         is_spec_decoding_head=True)
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = True
         return logits
@@ -854,12 +829,13 @@ class Deepseekv3MoE(nn.Module):
                               all_rank_num_tokens, do_finalize):
         # max-throughput
         use_dp_padding = False
-        if self.use_dp and self.mapping.tp_size > 1:
-            if isinstance(self.experts, TRTLLMGenFusedMoE):
-                hidden_states = allgather(hidden_states,
-                                          self.mapping,
-                                          dim=0,
-                                          sizes=all_rank_num_tokens)
+        # Add DP padding on SM120 for context comm performance
+        # TODO: Move this model-agonostic part to MoE
+        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
+            use_dp_padding = True
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
 
@@ -1548,3 +1524,12 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def load_weights(self, weights: Dict):
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
+
+    def post_load_weights(self):
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
