@@ -326,5 +326,4 @@ class InitializeCache(BaseTransform):
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
         )
-
         return mod, info

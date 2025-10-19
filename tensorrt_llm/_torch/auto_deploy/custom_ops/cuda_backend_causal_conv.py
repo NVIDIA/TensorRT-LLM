@@ -74,8 +74,10 @@ def cuda_causal_conv_prepare_metadata(
         seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
 
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized)
+    # This is only used during prefill to determine if we should use the initial states from the cache.
+    print(f"input_pos: {input_pos}")
+    use_initial_states = input_pos > 0
+    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @cuda_causal_conv_prepare_metadata.register_fake
@@ -101,6 +103,7 @@ def _cuda_cached_causal_conv1d(
     seq_len: torch.Tensor,  # [num_seq]
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
     # CONSTANTS
@@ -161,7 +164,7 @@ def _cuda_cached_causal_conv1d(
             dim=0,
         ).contiguous()
         cache_indices = slot_idx[:num_prefill].to(torch.int32).contiguous()
-        has_initial_state = torch.zeros(num_prefill, dtype=torch.bool, device=input.device)
+        has_initial_state = use_initial_states[:num_prefill].to(torch.bool)
 
         # Run varlen conv; updates conv_state_cache in-place per cache_indices
         y_varlen = causal_conv1d_fn(
@@ -215,6 +218,7 @@ def _cuda_cached_causal_conv1d_fake(
     seq_len: torch.Tensor,
     seq_start: torch.Tensor,
     slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     conv_state_cache: torch.Tensor,
     # CONSTANTS
@@ -256,8 +260,8 @@ class CudaBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata, 3
+        # Returns (seq_len, seq_start, slot_idx, use_initial_states)
+        return torch.ops.auto_deploy.cuda_causal_conv_prepare_metadata, 4
 
     @classmethod
     def get_cache_initializers(

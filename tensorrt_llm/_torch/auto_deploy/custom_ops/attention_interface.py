@@ -271,6 +271,7 @@ class SequenceInfo:
         # is part of the graph, e.g., in situations where the graph is a submodule of the overall
         # model. In such instances, the graph usually sees inputs_embeds. However, we assume for
         # now that position_ids is always part of the graph.
+        print(self._cached_arg_names)
         return ("position_ids",) + self._cached_arg_names
 
     @property

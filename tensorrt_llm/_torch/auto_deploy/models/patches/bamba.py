@@ -100,7 +100,7 @@ def _bamba_mixer_torch_forward(
 
     if use_caching:
         # Use new flattened cached op for both cache updates and outputs
-        y = torch.ops.auto_deploy.torch_cached_ssm_transform(
+        y = torch.ops.auto_deploy.torch_cached_ssm(
             # INPUTS
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
@@ -120,7 +120,7 @@ def _bamba_mixer_torch_forward(
             chunk_size=self.chunk_size,
         )
     else:
-        y = torch.ops.auto_deploy.torch_ssm_transform(
+        y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
             B=B.view(batch_size, seq_len, -1, self.ssm_state_size),
