@@ -89,6 +89,7 @@ def cuda_causal_conv_prepare_metadata_fake(
         torch.empty_like(seq_len_sanitized),
         torch.empty_like(seq_len_sanitized),
         torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
+        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
     )
 
 

@@ -154,6 +154,7 @@ def _torch_ssm_prepare_metadata_fake(
         torch.empty_like(seq_len_sanitized),
         torch.empty_like(seq_len_sanitized),
         torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
+        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
     )
 
 
@@ -308,7 +309,7 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_ssm_transform_prefill
+        return torch.ops.auto_deploy.torch_ssm_prefill
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
