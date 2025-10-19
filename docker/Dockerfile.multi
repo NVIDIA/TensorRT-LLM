@@ -93,11 +93,11 @@ RUN if [ -f /etc/redhat-release ]; then \
 
 # Install UCX first
 COPY docker/common/install_ucx.sh install_ucx.sh
-RUN bash ./install_ucx.sh && rm install_ucx.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && rm install_ucx.sh
 
 # Install NIXL
 COPY docker/common/install_nixl.sh install_nixl.sh
-RUN bash ./install_nixl.sh && rm install_nixl.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && rm install_nixl.sh
 
 # Install etcd
 COPY docker/common/install_etcd.sh install_etcd.sh

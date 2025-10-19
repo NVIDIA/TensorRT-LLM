@@ -17,6 +17,7 @@ fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
   export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export NIXL_REPO="https://gitlab-master.nvidia.com/ftp/GitHubSync/nixl.git"
 fi
 pip3 install --no-cache-dir meson ninja pybind11
 
