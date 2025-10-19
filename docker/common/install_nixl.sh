@@ -16,7 +16,7 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 pip3 install --no-cache-dir meson ninja pybind11
 
