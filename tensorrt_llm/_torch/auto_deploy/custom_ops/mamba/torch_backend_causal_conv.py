@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
@@ -317,6 +317,8 @@ class TorchBackendCausalConv(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
+        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+        # reference implementation to support chunked prefill.
         # Returns (seq_len, seq_start, slot_idx)
         return torch.ops.auto_deploy.torch_causal_conv_prepare_metadata, 3
 

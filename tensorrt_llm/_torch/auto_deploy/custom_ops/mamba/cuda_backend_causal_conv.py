@@ -18,8 +18,8 @@ from torch.fx import Node
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,

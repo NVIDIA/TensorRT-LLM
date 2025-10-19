@@ -53,7 +53,7 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
     seq_start = torch.zeros(batch, device=device, dtype=torch.int32)
 
     # Torch reference
-    y_torch = torch.ops.auto_deploy.torch_cached_ssm_transform(
+    y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
         A,
         B,
@@ -70,7 +70,7 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
     )
 
     # Triton under test
-    y_triton = torch.ops.auto_deploy.triton_cached_ssm_transform(
+    y_triton = torch.ops.auto_deploy.triton_cached_ssm(
         hidden_states,
         A,
         B,
@@ -122,9 +122,9 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
 
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
-
+    use_initial_states = torch.tensor([0] * batch, device=device).to(torch.bool)
     # Torch reference
-    y_torch = torch.ops.auto_deploy.torch_cached_ssm_transform(
+    y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,
         A,
         B,
@@ -141,7 +141,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
     )
 
     # Triton under test
-    y_triton = torch.ops.auto_deploy.triton_cached_ssm_transform(
+    y_triton = torch.ops.auto_deploy.triton_cached_ssm(
         hidden_states,
         A,
         B,
@@ -152,6 +152,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         seq_len,
         seq_start,
         slot_idx,
+        use_initial_states,
         ssm_state_cache_triton,
         time_step_limit,
         chunk_size,

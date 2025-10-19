@@ -70,7 +70,7 @@ def test_generate_only_with_slot_mapping(mamba_env):
     gathered_before = ssm_state_cache.clone().index_select(0, slot_idx)
 
     # Run cached op
-    y = torch.ops.auto_deploy.torch_cached_ssm_transform(
+    y = torch.ops.auto_deploy.torch_cached_ssm(
         # INPUTS
         hidden_states,
         A,
@@ -95,7 +95,7 @@ def test_generate_only_with_slot_mapping(mamba_env):
 
     # Reference: use pre-op gathered states, run decode helper directly, compare
     y_ref, updated = (
-        tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_mamba._torch_cached_ssm_transform_decode(  # type: ignore  # noqa: E501
+        tensorrt_llm._torch.auto_deploy.custom_ops.mamba.torch_backend_mamba._torch_cached_ssm_decode(  # type: ignore  # noqa: E501
             hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size, gathered_before
         )
     )
@@ -136,7 +136,7 @@ def test_context_flattened_and_state_writeback(mamba_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
 
-    y = torch.ops.auto_deploy.torch_cached_ssm_transform(
+    y = torch.ops.auto_deploy.torch_cached_ssm(
         # INPUTS
         hidden_states,
         A,
@@ -167,10 +167,8 @@ def test_context_flattened_and_state_writeback(mamba_env):
         Bb = B[:, st : st + ln]
         Cb = C[:, st : st + ln]
         dtb = dt[:, st : st + ln]
-        y_i, s_i = (
-            tensorrt_llm._torch.auto_deploy.custom_ops.torch_mamba._torch_ssm_transform_prefill(  # type: ignore  # noqa: E501
-                hs, A, Bb, Cb, D, dtb, dt_bias, time_step_limit, chunk_size
-            )
+        y_i, s_i = tensorrt_llm._torch.auto_deploy.custom_ops.mamba.torch_mamba._torch_ssm_prefill(  # type: ignore  # noqa: E501
+            hs, A, Bb, Cb, D, dtb, dt_bias, time_step_limit, chunk_size
         )
         y_ref[:, st : st + ln].copy_(y_i)
         # Cache should hold final state at slot
@@ -202,7 +200,7 @@ def test_prepare_metadata(mamba_env):
         page_size,
     )
     # Returns a list of tensors from custom op API
-    assert len(out) == 3
-    seq_len_s, seq_start, slot_s = out
+    assert len(out) == 4
+    seq_len_s, seq_start, slot_s, _ = out
     assert seq_len_s.numel() == 2 and slot_s.numel() == 2
     assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))

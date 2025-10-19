@@ -56,7 +56,6 @@ def test_generate_only_with_slot_mapping(conv_env):
     # Metadata (not used in generate-only op entry, but required by the interface)
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     seq_start = torch.zeros(batch, device=device, dtype=torch.int32)
-
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
 
@@ -85,7 +84,7 @@ def test_generate_only_with_slot_mapping(conv_env):
 
     # Reference: use pre-op gathered states, run decode helper directly, compare
     y_ref, updated = (
-        tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_causal_conv._torch_causal_conv1d_decode(  # type: ignore  # noqa: E501
+        tensorrt_llm._torch.auto_deploy.custom_ops.mamba.torch_backend_causal_conv._torch_causal_conv1d_decode(  # type: ignore  # noqa: E501
             x, w, b, s, p, d, g, pm, gathered_before
         )
     )
@@ -148,7 +147,7 @@ def test_context_flattened_and_state_writeback(conv_env):
         st = 0 if i == 0 else lens[0]
         x_i = x[:, st : st + ln]
         y_i, s_i = (
-            tensorrt_llm._torch.auto_deploy.custom_ops.torch_backend_causal_conv._torch_causal_conv1d_prefill(  # type: ignore  # noqa: E501
+            tensorrt_llm._torch.auto_deploy.custom_ops.mamba.torch_backend_causal_conv._torch_causal_conv1d_prefill(  # type: ignore  # noqa: E501
                 x_i, w, b, s, p, d, g, pm
             )
         )
@@ -186,7 +185,7 @@ def test_prepare_metadata(conv_env):
         slot_idx,
         page_size,
     )
-    assert len(out) == 3
-    seq_len_s, seq_start, slot_s = out
+    assert len(out) == 4
+    seq_len_s, seq_start, slot_s, use_initial_states = out
     assert seq_len_s.numel() == 2 and slot_s.numel() == 2
     assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))

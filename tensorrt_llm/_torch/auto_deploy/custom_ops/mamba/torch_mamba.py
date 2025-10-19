@@ -163,7 +163,7 @@ def _torch_ssm_prefill(
 
 
 @torch.library.custom_op("auto_deploy::torch_ssm", mutates_args={})
-def _torch_ssm_transform(
+def _torch_ssm(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -180,8 +180,8 @@ def _torch_ssm_transform(
     return y
 
 
-@_torch_ssm_transform.register_fake
-def _torch_ssm_transform_meta(
+@_torch_ssm.register_fake
+def _torch_ssm_meta(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,

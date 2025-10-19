@@ -9,8 +9,8 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chun
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
