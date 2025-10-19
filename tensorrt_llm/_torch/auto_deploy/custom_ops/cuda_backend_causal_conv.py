@@ -75,7 +75,6 @@ def cuda_causal_conv_prepare_metadata(
 
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # This is only used during prefill to determine if we should use the initial states from the cache.
-    print(f"input_pos: {input_pos}")
     use_initial_states = input_pos > 0
     return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
