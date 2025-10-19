@@ -43,7 +43,6 @@ class Glm4Attention(QKNormRoPEAttention):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
         pos_embd_params = PositionalEmbeddingParams(
@@ -63,7 +62,6 @@ class Glm4Attention(QKNormRoPEAttention):
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
-            aux_stream=aux_stream,
         )
 
 
@@ -294,7 +292,7 @@ class Glm4DecoderLayer(DecoderLayer):
         self.self_attn = Glm4Attention(
             model_config,
             layer_idx=layer_idx_for_attention,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention])
+        )
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
