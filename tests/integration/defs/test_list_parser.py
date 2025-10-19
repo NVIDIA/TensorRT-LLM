@@ -18,7 +18,7 @@ from .trt_test_alternative import print_info, print_warning
 
 # from misc.reorder_venv_tests import reorder_tests
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT"]
+kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT", "ISOLATION"]
 record_invalid_tests = True
 
 kSTRIP_PARENS_PAT = re.compile(r'\((.*?)\)')
@@ -137,6 +137,10 @@ def parse_test_list_lines(test_list, lines, test_prefix):
                             f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
                             "Expected a numeric value in parentheses.")
                     timeout = int(timeout) * 60
+                elif marker == "ISOLATION":
+                    # Additional processing needed for ISOLATION marker
+                    print_info(f"Isolation setting for {test_name}")
+                    marker = "forked"
                 elif len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
