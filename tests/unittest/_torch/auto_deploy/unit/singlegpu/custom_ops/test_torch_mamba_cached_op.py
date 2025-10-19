@@ -200,7 +200,7 @@ def test_prepare_metadata(mamba_env):
         page_size,
     )
     # Returns a list of tensors from custom op API
-    assert len(out) == 4
-    seq_len_s, seq_start, slot_s, _ = out
+    assert len(out) == 3
+    seq_len_s, seq_start, slot_s = out
     assert seq_len_s.numel() == 2 and slot_s.numel() == 2
     assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))
