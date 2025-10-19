@@ -135,12 +135,9 @@ def _torch_ssm_prepare_metadata(
 
     # Truncate slot indices to match active sequences
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-
-    # Determine whether to use initial states.
-    # This is only used during prefill to determine if we should use the initial states from the cache.
-    use_initial_states = input_pos > 0
-
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
+    # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+    # reference implementation to support chunked prefill.
+    return (seq_len_sanitized, seq_start, slot_idx_sanitized)
 
 
 @_torch_ssm_prepare_metadata.register_fake
@@ -309,7 +306,7 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_ssm_prefill
+        return torch.ops.auto_deploy.torch_ssm
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
@@ -317,8 +314,8 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx, use_initial_states)
-        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
+        # Returns (seq_len, seq_start, slot_idx)
+        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 3
 
     @classmethod
     def get_cache_initializers(
