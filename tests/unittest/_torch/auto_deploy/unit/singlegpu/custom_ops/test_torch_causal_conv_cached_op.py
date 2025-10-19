@@ -185,7 +185,7 @@ def test_prepare_metadata(conv_env):
         slot_idx,
         page_size,
     )
-    assert len(out) == 4
-    seq_len_s, seq_start, slot_s, use_initial_states = out
+    assert len(out) == 3
+    seq_len_s, seq_start, slot_s = out
     assert seq_len_s.numel() == 2 and slot_s.numel() == 2
     assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))
