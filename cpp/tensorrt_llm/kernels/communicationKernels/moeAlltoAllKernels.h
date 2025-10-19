@@ -44,19 +44,21 @@ struct DispatchKernelPointers
     void const* src_data_ptrs[kMaxPayloads];     // Array of source data pointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
-    
+
     // Completion flags for synchronization
-    uint32_t* completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
-    uint32_t* flag_val;                     // The value of the flag for this round (stored on the local rank)
-    
+    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
+                                           // rank has signaled the target rank
+    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+
     // Local aux data pointers
-    int* send_counters;       // [ep_size] How many tokens have been sent to each target rank
-    int* recv_counters[kMaxRanks];       // How many tokens have been received from each source rank. Each rank has [ep_size] counters
-    int* local_token_counter; // Atomic counter for completed tokens
+    int* send_counters;            // [ep_size] How many tokens have been sent to each target rank
+    int* recv_counters[kMaxRanks]; // How many tokens have been received from each source rank. Each rank has [ep_size]
+                                   // counters
+    int* local_token_counter;      // Atomic counter for completed tokens
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks;   // target rank per k, -1 for duplicates
-    int* topk_send_indices;   // dst index per k, -1 for duplicates
+    int* topk_target_ranks; // target rank per k, -1 for duplicates
+    int* topk_send_indices; // dst index per k, -1 for duplicates
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -65,14 +67,15 @@ struct CombineKernelPointers
     // Payload pointers
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
-    
+
     // Completion flags for synchronization
-    uint32_t* completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
-    uint32_t* flag_val;                     // The value of the flag for this round (stored on the local rank)
-    
+    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
+                                           // rank has signaled the target rank
+    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks;   // target rank per k, -1 for duplicates
-    int const* topk_send_indices;   // dst index per k, -1 for duplicates
+    int const* topk_target_ranks; // target rank per k, -1 for duplicates
+    int const* topk_send_indices; // dst index per k, -1 for duplicates
 };
 
 // Dispatch phase parameters
@@ -82,8 +85,8 @@ struct MoeA2ADispatchParams
 
     // Threading policy
     // EP configuration
-    int ep_size; // Number of EP ranks
-    int ep_rank; // Current EP rank
+    int ep_size;              // Number of EP ranks
+    int ep_rank;              // Current EP rank
     int num_experts_per_rank; // Number of experts per rank (num_experts / ep_size)
 
     // Token configuration
@@ -102,17 +105,18 @@ struct MoeA2ADispatchParams
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
 
     // Synchronization
-    uint32_t* completion_flags[kMaxRanks];        // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
-    uint32_t* flag_val;                           // The value of the flag for this round (stored on the local rank)
+    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
+                                           // rank has signaled the target rank
+    uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
 
     // Communication tracking
-    int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
-    int* recv_counters[kMaxRanks];       // tracks tokens received from each source rank. Each rank has [ep_size] counters
-    int* local_token_counter; // Atomic counter for completed tokens on this rank
+    int* send_counters;            // [ep_size] atomic counters - tracks tokens sent to each target rank
+    int* recv_counters[kMaxRanks]; // tracks tokens received from each source rank. Each rank has [ep_size] counters
+    int* local_token_counter;      // Atomic counter for completed tokens on this rank
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks;   // target rank per k, -1 for duplicates
-    int* topk_send_indices;   // dst index per k, -1 for duplicates
+    int* topk_target_ranks; // target rank per k, -1 for duplicates
+    int* topk_send_indices; // dst index per k, -1 for duplicates
 
     cudaStream_t stream;
 };
@@ -140,8 +144,8 @@ struct MoeA2ACombineParams
     int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks;   // target rank per k, -1 for duplicates
-    int const* topk_send_indices;   // dst index per k, -1 for duplicates
+    int const* topk_target_ranks; // target rank per k, -1 for duplicates
+    int const* topk_send_indices; // dst index per k, -1 for duplicates
 
     // Single payload information
     void const* recv_buffers[kMaxRanks]; // Per-rank receive buffers (only for single payload)
@@ -150,7 +154,8 @@ struct MoeA2ACombineParams
     nvinfer1::DataType dtype;            // Data type for proper summation
 
     // Synchronization
-    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
+    uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
+                                           // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
 
     cudaStream_t stream;
@@ -167,8 +172,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)
 // recv_counters: [ep_size] (int32), number of valid tokens per source
 // invalid_id: value to fill for invalid tokens' expert ids
-void moe_a2a_sanitize_expert_ids_launch(
-    int32_t* expert_ids, const int32_t* recv_counters, int32_t invalid_id,
+void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
     int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::moe_a2a

@@ -259,8 +259,7 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& unpadded_hidden_size,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -412,8 +411,8 @@ public:
         {
             auto const& provided = out_tensor.value();
             CHECK_INPUT(provided, mOutputDtype);
-            TORCH_CHECK(provided.sizes() == output_shape,
-                "Provided out tensor has incorrect shape. Expected ", output_shape, ", got ", provided.sizes());
+            TORCH_CHECK(provided.sizes() == output_shape, "Provided out tensor has incorrect shape. Expected ",
+                output_shape, ", got ", provided.sizes());
             output = provided;
         }
         else
@@ -580,8 +579,8 @@ public:
         {
             auto const& provided = out_tensor.value();
             CHECK_INPUT(provided, mOutputDtype);
-            TORCH_CHECK(provided.sizes() == output_shape,
-                "Provided out tensor has incorrect shape. Expected ", output_shape, ", got ", provided.sizes());
+            TORCH_CHECK(provided.sizes() == output_shape, "Provided out tensor has incorrect shape. Expected ",
+                output_shape, ", got ", provided.sizes());
             output = provided;
         }
         else
