@@ -426,6 +426,9 @@ def run_disaggregated_test(example_dir,
             config_file
         ]
     else:
+        pytest.skip(
+            "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
+        )
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
 
