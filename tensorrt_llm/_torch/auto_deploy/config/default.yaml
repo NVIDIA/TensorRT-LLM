@@ -156,9 +156,11 @@ transforms:
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
+  absorb_mla_weights:
+    stage: cache_init
   insert_cached_mla_attention:
     stage: cache_init
-    backend: MultiHeadLatentAttention
+    attn_backend: TorchMLABackend
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm

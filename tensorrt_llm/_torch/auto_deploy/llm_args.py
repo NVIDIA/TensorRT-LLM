@@ -163,6 +163,11 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
+    mla_backend: Literal["TorchMLABackend", "FlashinferMLABackend"] = Field(
+        default="TorchMLABackend",
+        description="The Multi-Head Latent Attention backend to use.",
+    )
+
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
