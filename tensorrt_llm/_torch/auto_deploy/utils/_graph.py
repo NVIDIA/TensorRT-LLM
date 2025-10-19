@@ -342,3 +342,40 @@ def placeholders_on_meta(mod: nn.Module) -> bool:
                 return True
 
     return False
+
+
+def prune_unused_parameters_and_buffers(gm: torch.fx.GraphModule) -> int:
+    """
+    Remove parameters and buffers that are no longer referenced by the FX graph.
+
+    The function scans the graph for `get_attr` nodes to build the set of
+    attribute names still used by the compiled forward, then unregisters any
+    entries in `gm._parameters` and `gm._buffers` that are not in that set.
+
+    Notes:
+    - Run after graph cleanup (e.g., `gm.graph.eliminate_dead_code()` and
+      recompilation) so dead `get_attr` users have been removed.
+    - Use on `GraphModule`s that execute via the FX graph; attributes accessed
+      outside of the FX path may otherwise be removed.
+
+    Returns:
+        int: The number of parameters and buffers removed from the module.
+    """
+    # Step 1: collect all attribute names that the graph still uses
+    used_attrs = set()
+    for n in gm.graph.nodes:
+        if n.op == "get_attr" and isinstance(n.target, str):
+            used_attrs.add(n.target)
+
+    # Step 2: delete unused parameters/buffers registered on the module
+    removed = 0
+    for name in list(gm._parameters.keys()):
+        if name not in used_attrs:
+            del gm._parameters[name]
+            removed += 1
+    for name in list(gm._buffers.keys()):
+        if name not in used_attrs:
+            del gm._buffers[name]
+            removed += 1
+
+    return removed

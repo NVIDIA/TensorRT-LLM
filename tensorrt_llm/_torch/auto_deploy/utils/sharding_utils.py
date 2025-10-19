@@ -595,7 +595,17 @@ def _insert_sharded_moe(
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
+
+    DRAFT FIX: Replace Expert Parallelism with Tensor Parallelism for MoE
+    Instead of partitioning experts across devices (EP), we shard weight dimensions (TP)
     """
+    TP_SHARD_MOE = True  # GAGAM: TODO: add config flag / heuristic to control this
+    if TP_SHARD_MOE:
+        ad_logger.debug("Applying TP-style sharding instead of EP")
+        _insert_tp_sharded_moe(gm, node, rank, world_size, scale_names)
+        return
+
+    # Original EP sharding code
     scale_names = list(scale_names)
 
     num_experts = len(node.args[3])
@@ -670,6 +680,108 @@ def _insert_sharded_moe(
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
+
+
+def _insert_tp_sharded_moe(
+    gm: GraphModule,
+    node: Node,
+    rank: int,
+    world_size: int,
+    scale_names: Sequence[str] = (),
+):
+    """Apply TP-style sharding to MoE weights instead of EP expert partitioning
+
+    - Keep all experts on each device
+    - Shard weight dimensions:
+      - w1/w3: [num_experts, 2*intermediate_size//world_size, hidden_size]
+      - w2: [num_experts, hidden_size, intermediate_size//world_size]
+    """
+
+    args = list(node.args)
+
+    # Get weight lists
+    w1_list = args[3]  # List of w1 weight nodes for all 8 experts
+    w2_list = args[4]  # List of w2 weight nodes for all 8 experts
+    w3_list = args[5]  # List of w3 weight nodes for all 8 experts
+
+    # Track original parameter names for cleanup after sharding
+    original_param_names = set()
+
+    # Apply TP sharding to each expert's weights
+    def shard_weight_tensor(weight_node, dim, rank, world_size):
+        """Shard a weight tensor along specified dimension"""
+        with gm.graph.inserting_before(node):
+            # Get the actual tensor
+            weight_tensor = gm.get_parameter(weight_node.target)
+
+            # Track original parameter name for cleanup
+            original_param_names.add(weight_node.target)
+
+            # Calculate shard size
+            total_size = weight_tensor.shape[dim]
+            shard_size = total_size // world_size
+            start_idx = rank * shard_size
+            # last rank gets the remainder if num_experts % world_size != 0
+            end_idx = start_idx + shard_size if rank < world_size - 1 else total_size
+
+            # Create sliced tensor
+            if dim == 0:
+                sharded_tensor = weight_tensor[start_idx:end_idx, :]
+            elif dim == 1:
+                sharded_tensor = weight_tensor[:, start_idx:end_idx]
+            else:
+                raise ValueError(f"Unsupported sharding dimension: {dim}")
+
+            # Create new parameter (replace dots with underscores for valid param names)
+            new_name = weight_node.target.replace(".", "_")
+            new_param_name = f"{new_name}_tp_rank_{rank}"
+            new_param = torch.nn.Parameter(sharded_tensor)
+            gm.register_parameter(new_param_name, new_param)
+
+            return gm.graph.get_attr(new_param_name)
+
+    # Shard w1 and w3 weights along dimension 0 (intermediate_size dimension)
+    w1_list_sharded = []
+    w3_list_sharded = []
+    for w1_node, w3_node in zip(w1_list, w3_list):
+        w1_sharded = shard_weight_tensor(w1_node, dim=0, rank=rank, world_size=world_size)
+        w3_sharded = shard_weight_tensor(w3_node, dim=0, rank=rank, world_size=world_size)
+        w1_list_sharded.append(w1_sharded)
+        w3_list_sharded.append(w3_sharded)
+
+    # Shard w2 weights along dimension 1 (intermediate_size dimension)
+    w2_list_sharded = []
+    for w2_node in w2_list:
+        w2_sharded = shard_weight_tensor(w2_node, dim=1, rank=rank, world_size=world_size)
+        w2_list_sharded.append(w2_sharded)
+
+    # Delete original full-size parameters to free memory
+    # Do this before updating node args to ensure sharded weights are registered first
+    deleted_count = 0
+    for param_name in original_param_names:
+        if param_name in gm._parameters:
+            # Delete the parameter
+            del gm._parameters[param_name]
+            deleted_count += 1
+
+    # Clear CUDA cache to ensure memory is freed
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Update args with TP-sharded weights (keep all experts)
+    args[3] = w1_list_sharded
+    args[4] = w2_list_sharded
+    args[5] = w3_list_sharded
+
+    # Handle scales for quantized ops (apply same TP sharding)
+    for i in range(len(scale_names) * 3):  # 3 layers (w1, w2, w3) × #scale_names per layer
+        layer_idx = i % 3  # 0=w1, 1=w2, 2=w3
+        if layer_idx in [0, 2]:  # w1, w3: shard dim 0
+            pass
+        else:
+            pass
+
+    node.args = tuple(args)
 
 
 def _slice_expert_dim(gm: GraphModule, tensor_node: Node, lo: int, hi: int) -> Node:

@@ -710,7 +710,7 @@ class AutoTuner:
             # Expect no cache miss in inference. Thus, any cache miss should be recorded.
             if not is_cache_hit:
                 logger.warning_once(
-                    f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
+                    f"[AutoTuner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=custom_op)
 
             return (best_runner, best_tactic)
