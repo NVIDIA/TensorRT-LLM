@@ -58,7 +58,7 @@ def test_generate_only_with_slot_mapping(conv_env):
     seq_start = torch.zeros(batch, device=device, dtype=torch.int32)
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
-
+    use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
     # Run cached op
     y = torch.ops.auto_deploy.torch_cached_causal_conv1d(
         # INPUTS
@@ -69,6 +69,7 @@ def test_generate_only_with_slot_mapping(conv_env):
         seq_len,
         seq_start,
         slot_idx,
+        use_initial_states,
         # CACHES
         conv_state_cache,
         # CONSTANTS
@@ -118,7 +119,7 @@ def test_context_flattened_and_state_writeback(conv_env):
 
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     seq_start = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
-
+    use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
     y = torch.ops.auto_deploy.torch_cached_causal_conv1d(
         # INPUTS
         x,
@@ -128,6 +129,7 @@ def test_context_flattened_and_state_writeback(conv_env):
         seq_len,
         seq_start,
         slot_idx,
+        use_initial_states,
         # CACHES
         conv_state_cache,
         # CONSTANTS
@@ -185,7 +187,7 @@ def test_prepare_metadata(conv_env):
         slot_idx,
         page_size,
     )
-    assert len(out) == 3
-    seq_len_s, seq_start, slot_s = out
+    assert len(out) == 4
+    seq_len_s, seq_start, slot_s, use_initial_states = out
     assert seq_len_s.numel() == 2 and slot_s.numel() == 2
     assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))

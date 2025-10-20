@@ -276,6 +276,7 @@ def _torch_cached_ssm_fake(
     seq_len: torch.Tensor,
     seq_start: torch.Tensor,
     slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
     # CACHES
     ssm_state_cache: torch.Tensor,
     # CONSTANTS
@@ -317,7 +318,7 @@ class TorchBackendSSM(AttentionDescriptor):
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
         # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 3
+        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
 
     @classmethod
     def get_cache_initializers(

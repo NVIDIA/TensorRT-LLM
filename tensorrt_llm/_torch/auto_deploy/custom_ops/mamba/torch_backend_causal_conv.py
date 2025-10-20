@@ -160,8 +160,8 @@ def torch_causal_conv_prepare_metadata(
         seq_start[1:] = torch.cumsum(seq_len_sanitized[:-1], 0)
 
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized)
+    use_initial_states = input_pos > 0
+    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @torch_causal_conv_prepare_metadata.register_fake
@@ -174,6 +174,7 @@ def torch_causal_conv_prepare_metadata_fake(
         torch.empty_like(seq_len_sanitized),
         torch.empty_like(seq_len_sanitized),
         torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
+        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
     )
 
 
@@ -187,6 +188,7 @@ def _torch_cached_causal_conv1d(
     seq_len: torch.Tensor,  # [num_seq]
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k]
     # CONSTANTS
@@ -275,6 +277,7 @@ def _torch_cached_causal_conv1d_fake(
     seq_len: torch.Tensor,
     seq_start: torch.Tensor,
     slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     conv_state_cache: torch.Tensor,
     # CONSTANTS
@@ -320,7 +323,7 @@ class TorchBackendCausalConv(AttentionDescriptor):
         # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
         # reference implementation to support chunked prefill.
         # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_causal_conv_prepare_metadata, 3
+        return torch.ops.auto_deploy.torch_causal_conv_prepare_metadata, 4
 
     @classmethod
     def get_cache_initializers(

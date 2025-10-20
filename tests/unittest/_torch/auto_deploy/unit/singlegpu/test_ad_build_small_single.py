@@ -190,8 +190,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     ],
 )
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):
-    if model_hub_id == "meta-llama/Meta-Llama-3.1-8B-Instruct":
-        pytest.skip("https://nvbugs/5595652")
+    # if model_hub_id == "meta-llama/Meta-Llama-3.1-8B-Instruct":
+    #     pytest.skip("https://nvbugs/5595652")
     experiment_config = get_small_model_config(model_hub_id, **llm_extra_args)
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
