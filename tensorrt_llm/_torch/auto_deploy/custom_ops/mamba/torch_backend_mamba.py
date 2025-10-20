@@ -211,6 +211,14 @@ def _torch_cached_ssm(
         # return in the same dtype as the input
         return y.to(hidden_states.dtype)
 
+    # Prefill
+    if any(use_initial_states):
+        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+        # reference implementation to support chunked prefill.
+        raise ValueError(
+            "torch mamba backend does not yet support chunked prefill "
+            "and can not correctly handle initial states."
+        )
     # Context/mixed phase (flattened sequences). Expect b == 1, but handle general b robustly.
     # We'll iterate over sequences defined by (seq_len, seq_start) and update state per slot.
     # Process across the flattened second dimension.
