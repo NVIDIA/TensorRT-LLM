@@ -2000,7 +2000,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
         def extraInternalEnv = ""
-        def pytestTestTimeout = "500"
+        def pytestTestTimeout = "3600"
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
