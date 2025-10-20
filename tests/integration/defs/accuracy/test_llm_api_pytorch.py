@@ -3314,6 +3314,24 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    def test_fp4(self):
+        model_path = f"{self.MODEL_PATH}-FP4"
+        with LLM(model_path, max_seq_len=4096) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        model_path = f"{self.MODEL_PATH}-FP8"
+        with LLM(model_path, max_seq_len=4096) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
