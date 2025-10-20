@@ -148,7 +148,7 @@ class TestTimingMetricsConfig(unittest.TestCase):
         self.assertEqual(metric.display_name, 'Disagg Relay')
         self.assertEqual(metric.start_field, 'ctx_server_first_token_time')
         self.assertEqual(metric.end_field, 'gen_server_arrival_time')
-        self.assertEqual(metric.server_type, 'ctx')
+        self.assertEqual(metric.server_type, 'disagg')
 
     def test_disagg_relay_calculation(self):
         """Test disagg_relay duration calculation."""
