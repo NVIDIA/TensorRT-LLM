@@ -1,7 +1,8 @@
+import importlib
 import os
 from pathlib import Path
 from queue import Queue
-from typing import Optional, Union
+from typing import Any, Optional, Type, Union
 
 import ray
 import torch
@@ -20,6 +21,13 @@ __all__ = [
     "RayGPUWorker",
     "RayWorkerWrapper",
 ]
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """Resolve an object by its fully qualified name."""
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)
 
 
 @ray.remote
@@ -54,6 +62,8 @@ class RayWorkerWrapper:
 
         torch.cuda.set_device(local_gpu)
 
+        worker_cls = self._inject_worker_extension(
+            worker_cls, worker_kwargs.pop("worker_extension_cls", None))
         self.worker = worker_cls(device_id=local_gpu, **worker_kwargs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -88,10 +98,40 @@ class RayWorkerWrapper:
                 return method(*args, **kwargs)
             else:
                 raise AttributeError(
-                    f"'{method_name}' is not callable on the underlying worker")
+                    f"'{method_name}' is not a callable method of RayGPUWorker."
+                )
         else:
             raise AttributeError(
-                f"Underlying worker has no method '{method_name}'")
+                f"The RayGPUWorker has no method called '{method_name}'.")
+
+    def _inject_worker_extension(
+            self, worker_class: Type['GenerationExecutor'],
+            extension_cls_name: Optional[str]) -> Type['GenerationExecutor']:
+        """Inject worker extension into the worker class if specified."""
+        if not extension_cls_name:
+            return worker_class
+
+        try:
+            extension_cls = resolve_obj_by_qualname(extension_cls_name)
+            # Check for conflicts
+            for attr in dir(extension_cls):
+                if attr.startswith("__"):
+                    continue
+                if hasattr(worker_class, attr):
+                    raise ValueError(
+                        f"Worker class {worker_class.__name__} already has method called '{attr}', "
+                        f"which conflicts with extension {extension_cls.__name__}. "
+                    )
+
+            if extension_cls not in worker_class.__bases__:
+                worker_class.__bases__ = worker_class.__bases__ + (
+                    extension_cls, )
+
+            return worker_class
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load worker extension '{extension_cls_name}': {e}")
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
