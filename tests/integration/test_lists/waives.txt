@@ -384,3 +384,4 @@ cpp/test_multi_gpu.py::test_cache_transceiver[8proc-nixl_kvcache-90] SKIP (https
 triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora] SKIP (https://nvbugs/5470830)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[llguidance] SKIP (https://nvbugs/5594703)
 cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90] SKIP (https://nvbugs/5492250)
+cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] SKIP (https://nvbugs/5492250)
