@@ -77,6 +77,8 @@ def _pack_routed_tokens_reference(
 def test_triton_moe_matches_torch_moe_mlp_relu2():
     torch.manual_seed(0)
 
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for triton_moe fused MLP test")
     device = "cuda"
     dtype = torch.bfloat16
 

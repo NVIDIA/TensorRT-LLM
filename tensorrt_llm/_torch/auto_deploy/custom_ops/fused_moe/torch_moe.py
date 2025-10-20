@@ -7,7 +7,7 @@ import torch.nn.functional as F
 def _resolve_activation(name: Optional[str]) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Returns an elementwise activation callable matching the given name.
-    Supported: "silu", "swish", "gelu", "gelu_tanh", "relu", "tanh", "identity".
+    Supported: "silu", "relu2".
     Defaults to SiLU when name is None or empty.
     """
     if not name:

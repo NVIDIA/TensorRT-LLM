@@ -91,7 +91,7 @@ def _nemotron_h_block_forward(
 # Note: we assume experts have no bias for now
 def _nemotron_h_moe_forward(self, hidden_states: torch.Tensor):
     """
-    Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe_nemo
+    Uses NemotronH router (returns indices, weights) and dispatches through auto_deploy::torch_moe
     with act_fn='relu2'. Falls back to original forward if any expert has bias.
     """
 

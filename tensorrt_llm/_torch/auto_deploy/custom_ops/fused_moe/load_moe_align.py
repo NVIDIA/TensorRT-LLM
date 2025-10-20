@@ -62,6 +62,27 @@ def moe_align_block_size(
         expert_ids: Output tensor for expert IDs per block
         num_tokens_post_pad: Output tensor for total tokens after padding
     """
+    # Basic validation
+    if not topk_ids.is_cuda:
+        raise ValueError("topk_ids must be a CUDA tensor")
+    if not topk_ids.is_contiguous():
+        topk_ids = topk_ids.contiguous()
+    for t, name in [
+        (sorted_token_ids, "sorted_token_ids"),
+        (expert_ids, "expert_ids"),
+        (num_tokens_post_pad, "num_tokens_post_pad"),
+    ]:
+        if not t.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if (
+        sorted_token_ids.dtype != torch.int32
+        or expert_ids.dtype != torch.int32
+        or num_tokens_post_pad.dtype != torch.int32
+    ):
+        raise TypeError("sorted_token_ids, expert_ids, num_tokens_post_pad must be int32 tensors")
+
     moe_align_ext.moe_align_block_size(
         topk_ids, num_experts, block_size, sorted_token_ids, expert_ids, num_tokens_post_pad
     )
