@@ -116,7 +116,7 @@ class TimingMetricsConfig:
                 'Time duration from context server sends the first token response to the generation server receives it',
                 start_field='ctx_server_first_token_time',
                 end_field='gen_server_arrival_time',
-                server_type='ctx'),
+                server_type='disagg'),
             TimingMetric(
                 name='gen_preprocessing',
                 display_name='Generation Preprocessing',

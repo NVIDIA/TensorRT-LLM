@@ -233,7 +233,7 @@ class TestRequestDataParser(unittest.TestCase):
         self.assertEqual(parsed['ctx_first_token_time'], 1.5)
         self.assertEqual(parsed['ctx_server_first_token_time'], 1.6)
 
-        # Gen metrics should be 0 in aggregated format
+        # Gen metrics should be NaN in aggregated format
         self.assertTrue(math.isnan(parsed['gen_server_arrival_time']))
         self.assertTrue(math.isnan(parsed['disagg_server_arrival_time']))
 
@@ -298,7 +298,7 @@ class TestRequestDataParser(unittest.TestCase):
 
         parsed = parser.parse_request(request_data, 0)
 
-        # All timing fields should default to 0
+        # All timing fields should default to NaN
         self.assertTrue(math.isnan(parsed['ctx_server_first_token_time']))
         self.assertTrue(math.isnan(parsed['ctx_arrival_time']))
         self.assertTrue(math.isnan(parsed['gen_server_arrival_time']))
