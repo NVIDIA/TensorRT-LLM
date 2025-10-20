@@ -360,22 +360,37 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
 
 def bfs(
-    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
-) -> Node:
-    queue = [node]
+    node: Node,
+    target: Callable,
+    attr_next: str = "users",
+    boundary: Optional[Node] = None,
+    include_root: bool = True,
+) -> Tuple[Node, int]:
+    """
+    Breadth-first search of the graph.
+    Returns the found node and the depth of the node.
+    """
+    depth = 0
+    queue_at_depth = [node]
+    queue_at_depth_next = []
     visited = set()
-    while queue:
-        cur_node = queue.pop(0)
+    while queue_at_depth or queue_at_depth_next:
+        cur_node = queue_at_depth.pop(0)
         if boundary is not None and cur_node == boundary:
             continue  # Skip the boundary node.
-        if target(cur_node):
-            return cur_node
+        if target(cur_node) and (include_root or depth > 0):
+            return cur_node, depth
         for next_node in getattr(cur_node, attr_next):
             if boundary is not None and next_node == boundary:
                 continue  # Do not expand past the boundary.
             if next_node not in visited:
                 visited.add(next_node)
-                queue.append(next_node)
+                queue_at_depth_next.append(next_node)
+        if not queue_at_depth:
+            queue_at_depth = queue_at_depth_next
+            queue_at_depth_next = []
+            depth += 1
+
     raise RuntimeError(f"Could not find node with target condition {target}.")
 
 
@@ -450,19 +465,19 @@ def predecessors(
     If exclude is provided, exclude nodes that satisfy the condition.
     """
     preds = []
+    seen = set()
     for arg in node.args:
         if isinstance(arg, Node):
+            if ((not include) or (include and include(arg))) and (not exclude or not exclude(arg)):
+                if arg not in seen:
+                    preds.append(arg)
+                    seen.add(arg)
             if depth > 1:
-                preds.extend(predecessors(arg, depth - 1, include, exclude))
-            # add node arg if either:
-            # a) include and exclude are not specified
-            # b) include is specified and arg satisfies include condition
-            # c) exclude is specified and arg does not satisfy exclude condition
-            if exclude and exclude(arg):
-                continue
-            if (not include) or (include and include(arg)):
-                preds.append(arg)
-    return list(reversed(preds))
+                for p in predecessors(arg, depth - 1, include, exclude):
+                    if p not in seen:
+                        preds.append(p)
+                        seen.add(p)
+    return preds
 
 
 def successors(
@@ -477,12 +492,83 @@ def successors(
     If exclude is provided, exclude nodes that satisfy the condition.
     """
     succs = []
+    seen = set()
     for user in node.users:
+        if ((not include) or (include and include(user))) and (not exclude or not exclude(user)):
+            if user not in seen:
+                succs.append(user)
+                seen.add(user)
         if depth > 1:
-            succs.extend(successors(user, depth - 1, include, exclude))
-        # analogous logic to predecessors
-        if exclude and exclude(user):
+            for s in successors(user, depth - 1, include, exclude):
+                if s not in seen:
+                    succs.append(s)
+                    seen.add(s)
+    return succs
+
+
+def subgraph(
+    sources: list[Node],
+    sinks: list[Node],
+    include_boundary_nodes: bool = True,
+    include: Optional[Callable[[Node], bool]] = None,
+    exclude: Optional[Callable[[Node], bool]] = None,
+) -> List[Node]:
+    """
+    Returns a list of nodes in a subgraph in computation DAG defined as all nodes
+    succeeding any of the node in sources and preceding any of the nodes in sinks.
+    It is built by a BFS traversal from sinks, where the sources list acts as a
+    boundary. We do it in this order (and not from sources to sinks) to include
+    nodes like weights or other inputs (they are not successors of sinks, so otherwise
+    they wouldn't be included).
+
+    Optionally, include or exclude conditions may be specified to include [exclude]
+    only nodes that meet [don't meet] certain condition.
+    """
+    subgraph_nodes = []
+    seen = set()
+    queue = list(sinks)
+    sources_set = set(sources)
+
+    # Initialize queue with sinks and mark them as seen
+    for node in sinks:
+        if node not in seen:
+            seen.add(node)
+
+    # BFS traversal from sinks backwards through predecessors
+    while queue:
+        node = queue.pop(0)
+
+        # Check if node should be included based on filters
+        should_include = True
+        if include is not None and not include(node):
+            should_include = False
+        if exclude is not None and exclude(node):
+            should_include = False
+        if not include_boundary_nodes and (node in sources_set) or (node in sinks):
+            should_include = False
+
+        if should_include:
+            subgraph_nodes.append(node)
+
+        # Stop traversal at source nodes (boundary) - don't explore their predecessors
+        if node in sources_set:
             continue
-        if (not include) or (include and include(user)):
-            succs.append(user)
-    return list(reversed(succs))
+
+        # Traverse to predecessor nodes (all inputs to this node)
+        for arg in node.args:
+            if isinstance(arg, Node) and arg not in seen:
+                seen.add(arg)
+                queue.append(arg)
+
+    return subgraph_nodes
+
+
+def draw_graph(gm: GraphModule, filename: str):
+    """
+    Dump graphmodule to SVG file using PyTorch's built-in drawer.
+    """
+    from torch.fx.passes.graph_drawer import FxGraphDrawer
+
+    drawer = FxGraphDrawer(gm, filename)
+    with open(f"{filename}.svg", "wb") as f:
+        f.write(drawer.get_dot_graph().create_svg())

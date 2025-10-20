@@ -2,10 +2,11 @@
 
 import math
 import operator
+import re
 from abc import ABC, abstractmethod
-from enum import IntEnum
+from enum import Enum, IntEnum
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,15 @@ from torch.fx import GraphModule, Node
 
 from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
-from .node_utils import extract_param_names_from_lin_node, is_op, num_users_of_weight_node
+from .node_utils import (
+    bfs,
+    extract_param_names_from_lin_node,
+    is_linear_op,
+    is_op,
+    num_users_of_weight_node,
+    subgraph,
+    successors,
+)
 from .quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
@@ -54,23 +63,289 @@ def _load_hook_remove(
     state_dict.pop(key, None)
 
 
-def _update_view_nodes(node: Node) -> None:
+def _validate_sharded_shapes(
+    node: Node, fused_weight_dims: Optional[list] = None, world_size: int = None
+) -> None:
     """
-    After sharding weights of the linear node, using column split
+    Update the shapes of the view nodes and the split node parameters to account for the TP sharding.
+    1. After sharding weights of the linear node using column split
     in attention module (Q, K, V),
-    the output Y = X @ W^T is [batch, seq, num_heads // TP_size, head_dim]
-    Some models hardcode the shape of the output to be [batch, seq, num_heads, head_dim]
+    the output Y = X @ W^T shape is [batch, seq, num_heads // TP_size, head_dim].
+    Some models hardcode the shape of the output to [batch, seq, num_heads, head_dim]
     instead of implicit [batch, seq, -1, head_dim].
     Detect such cases and update the shape of the view node accordingly.
+    2. If the weights are fused (e.g,. QKV, gate_up, SSM, etc.), the follow-up split node parameters
+    need to be updated to account for the TP sharding.
     """
-    view_nodes = [n for n in node.users if is_op(n, torch.ops.aten.view)]
-    for view_node in view_nodes:
+
+    # get the subgraph of this module. Subgraph boundary is the next linear node.
+    next_lin_node, depth = bfs(node, is_linear_op, include_root=False)
+    # split nodes can't have "-1" for split size.
+    nodes_to_validate = successors(
+        node,
+        depth=depth,
+        exclude=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+    )
+    for view_node in nodes_to_validate:
+        # shard weight tensors for RMS norm and conv1d
+        if len(view_node.args) < 2:
+            continue
         view_shape = view_node.args[1]
-        if len(view_shape) == 4 and view_shape[2] != -1:
+        if not isinstance(view_shape, list):
+            continue
+        if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
             args = list(view_node.args)
-            args[1] = [view_shape[0], view_shape[1], -1, view_shape[3]]
+            args[1] = [view_shape[0], view_shape[1], -1] + view_shape[3:]
             view_node.args = tuple(args)
             ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
+
+    # if fused_weight_dims is provided, we need to update all split sizes
+    if fused_weight_dims is not None:
+        assert world_size is not None, "World size is required to update the split node params"
+        assert len(node.users) == 1, "Fused linear node should have only one user: a split node"
+        # find all split nodes in the region between this linear node and the next
+        split_nodes = successors(
+            node,
+            depth=depth,
+            include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+        )
+        for split_node in split_nodes:
+            orig_sizes = split_node.args[1]
+            new_sizes = [orig_sizes[i] // world_size for i in range(len(orig_sizes))]
+            args = list(split_node.args)
+            args[1] = new_sizes
+            split_node.args = tuple(args)
+            ad_logger.debug(f"\nUpdated split node {split_node} arguments to {split_node.args}")
+
+
+def shard_weight_tensor(
+    gm: GraphModule,
+    weight_tensor: torch.Tensor,
+    param_key: str,
+    dim: int,
+    rank: int,
+    world_size: int,
+    min_local_shape: int = 1,
+    fused_weight_dims: Optional[list] = None,
+    custom_shard_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    requires_grad: bool = False,
+    update_param: bool = True,
+) -> Tuple[torch.Tensor, torch.Size]:
+    """Shard a weight tensor across ranks and register load hook.
+
+    Args:
+        gm: GraphModule containing the weight
+        weight_tensor: The weight tensor to shard
+        param_key: Parameter key for registering load hook
+        dim: Dimension to shard along
+        rank: Current rank
+        world_size: Total number of ranks
+        min_local_shape: Minimum local shape constraint (for GQA)
+        fused_weight_dims: List of dimensions for fused weights
+        custom_shard_fn: Optional custom function to shard the tensor
+        requires_grad: Whether the parameter should require gradients
+        update_param: Whether to update the parameter in the module
+
+    Returns:
+        Tuple of (sharded_tensor, sharded_shape)
+    """
+
+    # Use custom shard function if provided
+    if custom_shard_fn is not None:
+        sharded_weight = custom_shard_fn(weight_tensor)
+        sharded_shape = sharded_weight.shape
+        # Register load hook with custom function
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook, f_split=custom_shard_fn, param_key=param_key, param_shape=sharded_shape
+            )
+        )
+    else:
+
+        def split_tensor(
+            t: torch.Tensor,
+            d: int = dim,
+            r: int = rank,
+            ws: int = world_size,
+            min_d_shape: int = min_local_shape,
+        ) -> torch.Tensor:
+            # The local tensor shape has to be divisible by min_d_shape
+            max_split_size = t.shape[d] // min_d_shape
+            if ws > max_split_size:
+                num_groups = math.ceil(ws / max_split_size)
+                ad_logger.debug(
+                    f"World size {ws} is greater than the max split size {max_split_size}. "
+                    + f"Splitting tensor to {num_groups} chunks"
+                )
+                return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
+            return torch.tensor_split(t, ws, dim=d)[r]
+
+        # Handle fused weights
+        if fused_weight_dims is not None:
+            # Split fused weights, apply TP sharding to each, then concatenate back
+            sharded_weight = torch.cat(
+                [split_tensor(w) for w in torch.split(weight_tensor, fused_weight_dims, dim=dim)],
+                dim=dim,
+            )
+        else:
+            sharded_weight = split_tensor(weight_tensor)
+
+        sharded_shape = sharded_weight.shape
+
+        # Register load hook
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook, f_split=split_tensor, param_key=param_key, param_shape=sharded_shape
+            )
+        )
+
+    # Update the parameter in the module
+    if update_param:
+        modname, _, param_name = param_key.rpartition(".")
+        submod = gm.get_submodule(modname)
+        param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
+        setattr(submod, param_name, param_new)
+
+    return sharded_weight, sharded_shape
+
+
+def get_all_weights_in_subgraph(
+    sources: list[Node],
+    sinks: list[Node],
+):
+    """Get all weight nodes (get_attr nodes) in the subgraph between sources and sinks."""
+    weight_nodes = subgraph(
+        sources, sinks, include_boundary_nodes=False, include=lambda n: n.op == "get_attr"
+    )
+    return weight_nodes
+
+
+def _insert_sharded_mamba(
+    gm: GraphModule,
+    entry_node: Node,
+    dim: int,
+    rank: int,
+    world_size: int,
+    add_dist: bool = False,
+    min_local_shape: int = 1,
+    weights_to_shard: Optional[list[str]] = None,
+    weight_shard_dims: Optional[Dict[str, int]] = None,
+    fused_weight_dims: Optional[Dict[str, list]] = None,
+    quantization_cb: Optional[
+        Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
+    ] = None,
+) -> None:
+    """
+    To shard Mamba layer, first column-shard the first linear layer: entry_node,
+    then shard all remaining weight tensors found in the subgraph defined between
+    entry_node and the next successor linear node.
+    First, validate if this is indeed a mamba module: within the subgraph,
+    there should be an torch_ssm node and conv1d node.
+
+    Args:
+        gm: GraphModule
+        entry_node: The first linear node of the Mamba layer
+        dim: Default shard dimension
+        rank: Current rank
+        world_size: Total number of ranks
+        add_dist: Whether to add distribution op after entry_node
+        min_local_shape: Minimum local shape constraint
+        weights_to_shard: Optional list of regex patterns to match weight names
+        weight_shard_dims: Optional dict mapping weight keys to their shard dimensions
+        fused_weight_dims: Optional dict mapping weight keys to their fused dimension lists
+        quantization_cb: Optional quantization callback
+    """
+    # Find next linear node to define subgraph boundary
+    try:
+        next_lin_node, depth = bfs(entry_node, is_linear_op, include_root=False)
+    except RuntimeError:
+        ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
+        return
+
+    # Get subgraph between entry_node and next linear node
+    subgraph_nodes = subgraph([entry_node], [next_lin_node])
+
+    # Validate this is a Mamba module by checking for torch_ssm_transform and conv1d
+    has_ssm = any(is_op(n, torch.ops.auto_deploy.torch_ssm_transform) for n in subgraph_nodes)
+    has_conv1d = any(
+        is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
+        for n in subgraph_nodes
+    )
+
+    if not (has_ssm and has_conv1d):
+        ad_logger.warning(
+            f"Subgraph does not contain both torch_ssm_transform and conv1d nodes. "
+            f"Skipping Mamba sharding. has_ssm={has_ssm}, has_conv1d={has_conv1d}"
+        )
+        return
+
+    # First, shard the entry_node (the first linear layer)
+    # Extract entry node's fused_weight_dims by matching weight name against patterns
+    entry_fused_dims = None
+    if fused_weight_dims:
+        entry_weight_key, _ = extract_param_names_from_lin_node(entry_node)
+        for pattern, dims in fused_weight_dims.items():
+            if re.search(pattern, entry_weight_key):
+                entry_fused_dims = dims
+                break
+
+    _insert_sharded_matmul(
+        gm=gm,
+        node=entry_node,
+        dim=dim,
+        rank=rank,
+        world_size=world_size,
+        add_dist=add_dist,
+        min_local_shape=min_local_shape,
+        fused_weight_dims=entry_fused_dims,
+        quantization_cb=quantization_cb,
+    )
+
+    # Get all weight nodes in the subgraph
+    weight_nodes = [
+        n
+        for n in get_all_weights_in_subgraph([entry_node], [next_lin_node])
+        if "out_proj" not in str(n)
+    ]
+
+    # Shard remaining weights
+    for weight_node in weight_nodes:
+        weight_key = weight_node.target
+
+        # Filter by regex patterns if provided
+        if weights_to_shard is not None:
+            if not any(re.search(pattern, weight_key) for pattern in weights_to_shard):
+                continue
+
+        # Determine shard dimension for this weight
+        shard_dim = weight_shard_dims.get(weight_key, dim) if weight_shard_dims else dim
+
+        # Get the weight parameter
+        try:
+            weight_param = gm.get_parameter(weight_key)
+        except AttributeError:
+            ad_logger.debug(f"Could not get parameter for {weight_key}, skipping")
+            continue
+
+        # Get fused dims for this weight if specified
+        fused_dims = fused_weight_dims.get(weight_key) if fused_weight_dims else None
+
+        # Shard the weight tensor (also updates the parameter in the module)
+        _, sharded_shape = shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_param,
+            param_key=weight_key,
+            dim=shard_dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+            fused_weight_dims=fused_dims,
+        )
+
+        ad_logger.debug(
+            f"Sharded weight {weight_key} on dim {shard_dim}: "
+            f"{weight_param.shape} -> {sharded_shape}"
+        )
 
 
 def _insert_sharded_matmul(
@@ -81,6 +356,7 @@ def _insert_sharded_matmul(
     world_size: int,
     add_dist: bool = False,
     min_local_shape: int = 1,
+    fused_weight_dims: Optional[list] = None,
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
@@ -91,24 +367,6 @@ def _insert_sharded_matmul(
     """
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
-
-    def split_tensor(
-        t: torch.Tensor,
-        d: int = dim,
-        r: int = rank,
-        ws: int = world_size,
-        min_d_shape: int = min_local_shape,
-    ) -> torch.Tensor:
-        # The local tensor shape has to be divisible by min_d_shape
-        max_split_size = t.shape[d] // min_d_shape
-        if ws > max_split_size:
-            num_groups = math.ceil(ws / max_split_size)
-            ad_logger.debug(
-                f"World size {ws} is greater than the max split size {max_split_size}. "
-                + f"Splitting tensor to {num_groups} chunks"
-            )
-            return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
-        return torch.tensor_split(t, ws, dim=d)[r]
 
     num_users = num_users_of_weight_node(node)
     if num_users > 1 or num_users == 0:
@@ -122,36 +380,31 @@ def _insert_sharded_matmul(
     modname = weight_key.rpartition(".")[0]
     submod = gm.get_submodule(modname)
 
-    def set_new_param(submod: nn.Module, param_key: str, remove: bool = False) -> torch.Size:
-        # split or remove it
-        param_new = (
-            None
-            if remove
-            else nn.Parameter(
-                split_tensor(gm.get_parameter(param_key)).detach().clone(), requires_grad=False
-            )
-        )
-
-        # update the parameter
-        param_name = param_key.rpartition(".")[-1]
-        setattr(submod, param_name, param_new)
-        return torch.Size() if param_new is None else param_new.shape
-
-    # update weight
-    weight_new_shape = set_new_param(submod, weight_key)
-    gm._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook, f_split=split_tensor, param_key=weight_key, param_shape=weight_new_shape
-        )
+    # Shard weight using the unified function (also updates the parameter)
+    original_weight = gm.get_parameter(weight_key)
+    _, weight_new_shape = shard_weight_tensor(
+        gm=gm,
+        weight_tensor=original_weight,
+        param_key=weight_key,
+        dim=dim,
+        rank=rank,
+        world_size=world_size,
+        min_local_shape=min_local_shape,
+        fused_weight_dims=fused_weight_dims,
     )
 
     if bias_key is not None and dim == 0:
         # update bias for dim 0 --> we can handle it like the weight
-        bias_new_shape = set_new_param(submod, bias_key)
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                _load_hook, f_split=split_tensor, param_key=bias_key, param_shape=bias_new_shape
-            )
+        original_bias = gm.get_parameter(bias_key)
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=original_bias,
+            param_key=bias_key,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+            fused_weight_dims=None,
         )
     elif bias_key is not None and rank != world_size - 1:
         # update the bias for dim 1 --> in this case only the last rank gets the bias to avoid
@@ -161,7 +414,8 @@ def _insert_sharded_matmul(
         args[2] = None
         node.args = tuple(args)
         gm.graph.erase_node(node_bias)
-        set_new_param(submod, bias_key, remove=True)
+        bias_param_name = bias_key.rpartition(".")[-1]
+        setattr(submod, bias_param_name, None)
         gm._register_load_state_dict_pre_hook(partial(_load_hook_remove, param_key=bias_key))
 
     if quantization_cb is not None:
@@ -178,7 +432,7 @@ def _insert_sharded_matmul(
 
     # column shard with no gather: the output is sharded
     if not add_dist:
-        _update_view_nodes(node)
+        _validate_sharded_shapes(node, fused_weight_dims=fused_weight_dims, world_size=world_size)
         return
 
     # figure out the right dist op
@@ -242,14 +496,24 @@ class ShardingTransformInfo(BaseModel, ABC):
         return True
 
 
+class LayerType(Enum):
+    ATTENTION = "attention"
+    MAMBA = "mamba"
+    MLP = "mlp"
+    MOE = "moe"
+
+
 class TPShardingInfo(ShardingTransformInfo):
     """Configuration for TP sharding transformations."""
 
     split_dim: SplitDimension
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
     min_local_shape: int = 1
+    layer_type: LayerType = LayerType.MLP
     # used for TP sharding of fused weights
-    fused_weights: Optional[list]
+    # For MLP/Attention: list of dimensions for fused weights (e.g., [dim1, dim2] for QKV)
+    # For Mamba: dict mapping weight keys to their fused dimensions
+    fused_weight_dims: Optional[Union[list, Dict[str, list]]] = None
 
     @classmethod
     def from_node(cls, node: Node, **kwargs) -> "TPShardingInfo":
@@ -279,15 +543,30 @@ class TPShardingInfo(ShardingTransformInfo):
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply TP sharding transformation to the graph module."""
 
-        _insert_sharded_matmul(
-            gm=gm,
-            node=node,
-            dim=self.split_dim.value,
-            rank=self.rank,
-            world_size=self.world_size,
-            add_dist=self.dist_op is not None,
-            min_local_shape=self.min_local_shape,
-        )
+        if self.layer_type == LayerType.MAMBA:
+            _insert_sharded_mamba(
+                gm=gm,
+                entry_node=node,
+                dim=self.split_dim.value,
+                rank=self.rank,
+                world_size=self.world_size,
+                add_dist=self.dist_op is not None,
+                min_local_shape=self.min_local_shape,
+                fused_weight_dims=self.fused_weight_dims
+                if isinstance(self.fused_weight_dims, dict)
+                else None,
+            )
+        else:
+            _insert_sharded_matmul(
+                gm=gm,
+                node=node,
+                dim=self.split_dim.value,
+                rank=self.rank,
+                world_size=self.world_size,
+                add_dist=self.dist_op is not None,
+                min_local_shape=self.min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
+            )
 
 
 class QuantizationShardingMixin(ABC):
@@ -538,28 +817,25 @@ class BMMShardingInfo(ShardingTransformInfo):
                 end_idx: End index for sharding
             """
 
-            # Define slice function for the sharding
-            def slice_tensor(t: torch.Tensor) -> torch.Tensor:
-                return t[start_idx:end_idx]
-
             if tensor_node.op == "get_attr":
-                # Handle parameter tensor
+                # Handle parameter tensor using unified shard_weight_tensor
                 weight_key = tensor_node.target
-                modname, _, param_name = weight_key.rpartition(".")
                 param = gm.get_parameter(weight_key)
 
-                # Update the parameter with its shard
-                param_new = nn.Parameter(slice_tensor(param).detach().clone(), requires_grad=True)
-                gm.get_submodule(modname).register_parameter(param_name, param_new)
+                # Define slice function for the sharding
+                def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+                    return t[start_idx:end_idx]
 
-                # Register load state dict hook
-                gm._register_load_state_dict_pre_hook(
-                    partial(
-                        _load_hook,
-                        f_split=slice_tensor,
-                        param_key=weight_key,
-                        param_shape=param_new.shape,
-                    )
+                # Use shard_weight_tensor with custom shard function (also updates the parameter)
+                shard_weight_tensor(
+                    gm=gm,
+                    weight_tensor=param,
+                    param_key=weight_key,
+                    dim=0,  # BMM slices along batch dimension
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    custom_shard_fn=slice_tensor,
+                    requires_grad=True,  # BMM parameters require gradients
                 )
             else:
                 # Handle dynamic tensor
@@ -911,27 +1187,3 @@ class ShardingConfig(BaseModel):
 
     def get_predefined_config(self) -> Dict[str, Any]:
         return self.predefined_config
-
-
-def _append_simple_shard(
-    nodes_linear: Dict[Node, List[Node]],
-    rank: int,
-    world_size: int,
-    sharding_config: ShardingConfig,
-) -> None:
-    # for every linear node:
-    # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
-    tp_shards: List[TPShardingInfo] = []
-    for node_group in nodes_linear.values():
-        for n in node_group:
-            tp_shards.append(
-                TPShardingInfo(
-                    target_node=n.name,
-                    split_dim=SplitDimension.COLUMN,
-                    rank=rank,
-                    world_size=world_size,
-                    dist_op="all_gather",
-                    min_local_shape=1,
-                )
-            )
-    sharding_config.tp_transforms.extend(tp_shards)

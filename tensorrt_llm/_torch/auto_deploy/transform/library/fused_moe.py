@@ -317,7 +317,7 @@ def _find_final_hidden_state_node(
         if not (hasattr(mul_node, "args") and len(mul_node.args) >= 2):
             return None
         index_node = mul_node.args[1]
-        index_add_node = bfs(
+        index_add_node, _ = bfs(
             index_node, lambda n: is_op(n, torch.ops.aten.index_add_), boundary=end_boundary
         )
         if not index_add_node:
@@ -383,7 +383,7 @@ def _remove_dead_inplace_nodes_in_region(
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
-        node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+        node_to_remove, _ = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
         graph.erase_node(node_to_remove)
         return True
     except RuntimeError:
@@ -453,7 +453,7 @@ class MatchMoePattern(BaseTransform):
             common_ancessor2 = _find_lowest_common_ancessor(arg2_list)
             if not common_ancessor2:
                 continue
-            selected_experts = bfs(
+            selected_experts, _ = bfs(
                 common_ancessor2,
                 lambda node: is_op(node, torch.ops.aten.one_hot),
                 attr_next="all_input_nodes",
