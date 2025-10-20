@@ -1,10 +1,12 @@
 import os
 import tempfile
+from pathlib import Path
 from typing import List
 
 import openai
 import pytest
 import yaml
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm.inputs import encode_base64_content_from_url
 
@@ -66,8 +68,10 @@ def async_client(server: RemoteOpenAIServer):
 
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Describe the natural environment in the image."
-    image_url = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
+    image_url = str(test_data_root / "seashore.png")
     messages = [{
         "role":
         "user",
@@ -120,9 +124,11 @@ def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_multi_image(client: openai.OpenAI,
                                          model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Tell me the difference between two images"
-    image_url1 = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png"
-    image_url2 = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
+    image_url1 = str(test_data_root / "inpaint.png")
+    image_url2 = str(test_data_root / "seashore.png")
     messages = [{
         "role":
         "user",
@@ -179,8 +185,10 @@ def test_single_chat_session_multi_image(client: openai.OpenAI,
 
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_video(client: openai.OpenAI, model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Tell me what you see in the video briefly."
-    video_url = "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"
+    video_url = str(test_data_root / "OAI-sora-tokyo-walk.mp4")
     messages = [{
         "role":
         "user",
@@ -233,8 +241,10 @@ def test_single_chat_session_video(client: openai.OpenAI, model_name: str):
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_image_embed(client: openai.OpenAI,
                                          model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Describe the natural environment in the image."
-    image_url = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
+    image_url = str(test_data_root / "seashore.png")
     image64 = encode_base64_content_from_url(image_url)
     messages = [{
         "role":
@@ -288,8 +298,10 @@ def test_single_chat_session_image_embed(client: openai.OpenAI,
 @pytest.mark.asyncio(loop_scope="module")
 async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
                                     model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Describe the natural environment in the image."
-    image_url = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
+    image_url = str(test_data_root / "seashore.png")
     messages = [{
         "role":
         "user",
