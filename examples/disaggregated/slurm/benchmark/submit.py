@@ -58,6 +58,11 @@ def submit_job(config):
     ctx_num = hw_config['num_ctx_servers']
     gen_num = hw_config['num_gen_servers']
 
+    # Get mtp_size from gen config's speculative_config
+    gen_config = config['worker_config']['gen']
+    mtp_size = gen_config.get('speculative_config',
+                              {}).get('num_nextn_predict_layers', 0)
+
     ctx_nodes = calculate_nodes(ctx_tp_size, ctx_num,
                                 hw_config['gpus_per_node'])
     gen_nodes = calculate_nodes(gen_tp_size, gen_num,
@@ -77,9 +82,9 @@ def submit_job(config):
 
     # Determine directory suffix based on attention_dp
     if gen_enable_attention_dp:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{config['worker_config']['mtp_size']}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{mtp_size}"
     else:
-        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{config['worker_config']['mtp_size']}"
+        dir_suffix = f"ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{config['worker_config']['eplb_num_slots']}_mtp{mtp_size}"
 
     # Create full log directory path
     log_dir = os.path.join(log_base, dir_suffix)
@@ -117,7 +122,6 @@ def submit_job(config):
         ctx_config_path,
         str(gen_num),
         gen_config_path,
-        str(config['worker_config']['mtp_size']),
         config['benchmark']['concurrency_list'],
 
         # Sequence and benchmark parameters

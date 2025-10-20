@@ -15,31 +15,30 @@ num_ctx_servers=${7}
 ctx_config_path=${8}
 num_gen_servers=${9}
 gen_config_path=${10}
-mtp_size=${11}
-concurrency_list=${12}
+concurrency_list=${11}
 
 # Sequence and benchmark parameters
-isl=${13}
-osl=${14}
-multi_round=${15}
-benchmark_ratio=${16}
-streaming=${17}
-use_nv_sa_benchmark=${18}
-benchmark_mode=${19}
-cache_max_tokens=${20}
+isl=${12}
+osl=${13}
+multi_round=${14}
+benchmark_ratio=${15}
+streaming=${16}
+use_nv_sa_benchmark=${17}
+benchmark_mode=${18}
+cache_max_tokens=${19}
 
 # Environment and paths
-dataset_file=${21}
-model_path=${22}
-trtllm_repo=${23}
-work_dir=${24}
-full_logdir=${25}
-container_mount=${26}
-container_image=${27}
-build_wheel=${28}
+dataset_file=${20}
+model_path=${21}
+trtllm_repo=${22}
+work_dir=${23}
+full_logdir=${24}
+container_mount=${25}
+container_image=${26}
+build_wheel=${27}
 
 # Profiling
-nsys_on=${29}
+nsys_on=${28}
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -56,7 +55,6 @@ echo "  num_ctx_servers: ${num_ctx_servers}"
 echo "  ctx_config_path: ${ctx_config_path}"
 echo "  num_gen_servers: ${num_gen_servers}"
 echo "  gen_config_path: ${gen_config_path}"
-echo "  mtp_size: ${mtp_size}"
 echo "  concurrency_list: ${concurrency_list}"
 echo
 echo "Benchmark Configuration:"

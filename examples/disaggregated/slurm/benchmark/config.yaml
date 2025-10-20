@@ -43,7 +43,6 @@ profiling:
 
 worker_config:
   eplb_num_slots: 0  # Number of slots for EPLB
-  mtp_size: 0  # MTP size
   gen:
     tensor_parallel_size: 8
     moe_expert_parallel_size: 8
@@ -83,7 +82,7 @@ worker_config:
       backend: DEFAULT
     stream_interval: 20
     num_postprocess_workers: 4
-    speculative_config:
+    speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP
       num_nextn_predict_layers: 1
   ctx:
@@ -104,6 +103,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: DEFAULT
-    speculative_config:
+    speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP
       num_nextn_predict_layers: 1
