@@ -2,8 +2,8 @@ from abc import ABC, abstractmethod
 from collections import namedtuple
 from typing import Optional
 
-from tensorrt_llm.bindings import executor as tb_executor
 from tensorrt_llm.bindings import internal as tb_internal
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 from .llm_request import LlmRequest, LlmRequestState
 
@@ -74,8 +74,8 @@ class BindCapacityScheduler(CapacityScheduler):
         max_num_requests: int,
         kv_cache_manager,
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
-        scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
-        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.
+        GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
     ):
         super(BindCapacityScheduler, self).__init__()
@@ -84,7 +84,7 @@ class BindCapacityScheduler(CapacityScheduler):
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
-            capacity_scheduler_policy=scheduler_policy,
+            capacity_scheduler_policy=scheduler_policy._to_pybind(),
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
