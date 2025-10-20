@@ -12,7 +12,10 @@ from torch.utils.cpp_extension import load
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9;9.0")
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_ROOT = os.environ.get("AD_CACHE_DIR", "/tmp/ad_cache")
+CACHE_ROOT = os.environ.get("AD_CACHE_DIR") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache")),
+    "ad_cache",
+)
 BUILD_DIR = os.path.join(CACHE_ROOT, "auto_deploy", "fused_moe", "moe_align")
 try:
     os.makedirs(BUILD_DIR, exist_ok=True)
