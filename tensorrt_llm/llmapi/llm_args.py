@@ -2585,6 +2585,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    worker_extension_cls: Optional[str] = Field(
+        default=None,
+        description="The full worker extension class name including module path."
+        "Allows users to extend the functions of the RayGPUWorker class.",
+        status="prototype")
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2801,6 +2807,14 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.batch_wait_max_tokens_ratio < 0 or self.batch_wait_max_tokens_ratio > 1:
             raise ValueError(
                 f"batch_wait_max_tokens_ratio must be in range [0, 1], got {self.batch_wait_max_tokens_ratio}"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_worker_extension_cls(self) -> 'TorchLlmArgs':
+        if self.worker_extension_cls is not None and self.orchestrator_type != "ray":
+            raise ValueError(
+                f"worker_extension_cls is currently only supported with orchestrator_type='ray'"
             )
         return self
 
