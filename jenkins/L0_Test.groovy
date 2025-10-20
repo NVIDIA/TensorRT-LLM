@@ -1630,6 +1630,7 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+// Return true means the test rerun also fails. Return false otherwise.
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         echo "There is no ${resultFileName} file, skip the rerun step"
