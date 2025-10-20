@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/yiqingy/retry_stage']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -122,6 +122,12 @@ ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+
+class MachineError extends Exception {
+    MachineError(String message, Throwable cause) {
+        super(message, cause)
+    }
+}
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
@@ -952,6 +958,8 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+    static def stageAttemptTimes = [:]
+    static def maxStageRetryTimes = 2
 }
 
 String getShortenedJobName(String path)
@@ -990,13 +998,31 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
     def Boolean stageIsFailed = true
+    def isLastRun = true
     try {
         taskRunner()
         stageIsFailed = false
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
+    } catch (MachineError e) {
+        echo "catch MachineError"
+        if (GlobalState.stageAttemptTimes[stageName] < GlobalState.maxStageRetryTimes) {
+            isLastRun = false
+        }
+        throw e
     } finally {
+        echo "GlobalState.stageAttemptTimes: ${GlobalState.stageAttemptTimes}"
+        if (!isLastRun) {
+            echo "Stage ${stageName} is not the last run, skip to upload test result."
+            // Clean up the workspace
+            sh """
+                env | sort
+                pwd && ls -alh
+                rm -rf ./*
+            """
+            return
+        }
         ensureStageResultNotUploaded(stageName + postTag)
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
@@ -1639,12 +1665,14 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    // Escape single quotes in the fail signatures list to avoid shell parsing issues
+    def escapedFailSignaturesList = failSignaturesList.replace("'", "'\\''")
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
+        --fail-signatures='${escapedFailSignaturesList}'
     """
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
@@ -2109,6 +2137,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
+                    def curTry = GlobalState.stageAttemptTimes[stageName]
+                    echo "curTry: ${curTry}"
+                    def failsigList = trtllm_utils.getFailSignaturesList()
+                    echo "failsigList: ${failsigList}"
+                    def isMachineOrInfraError = trtllm_utils.matchFailsigByStageLog(pipeline, "${stageName} : Attempt ${curTry}", failsigList)
+                    echo "isMachineOrInfraError: ${isMachineOrInfraError}"
+                    if (isMachineOrInfraError) {
+                        echo "There is a machine or infrastructure error, skip the rerun step."
+                        throw new MachineError("Machine or infrastructure error", e)
+                    }
                     def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine, "results.xml", "regular")
                     if (isRerunFailed) {
                         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
@@ -2352,8 +2390,10 @@ def checkStageName(stageNames) {
 }
 
 def ensureStageResultNotUploaded(stageName) {
+    echo "GlobalState.uploadResultStageNames: ${GlobalState.uploadResultStageNames}"
     if(!GlobalState.uploadResultStageNames.contains(stageName)) {
         GlobalState.uploadResultStageNames.add(stageName)
+        echo "GlobalState.uploadResultStageNames: ${GlobalState.uploadResultStageNames}"
     } else {
         stage('Upload Test Results') {
             catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
@@ -3004,17 +3044,20 @@ def launchTestJobs(pipeline, testFilter)
 
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
         stage(key) {
-            if (key in testFilter[REUSE_STAGE_LIST]) {
-                stage("Skip - reused") {
-                    echo "Skip - Passed in the last pipeline."
+            trtllm_utils.llmStageWithRetry(pipeline, key, {
+                if (key in testFilter[REUSE_STAGE_LIST]) {
+                    stage("Skip - reused") {
+                        echo "Skip - Passed in the last pipeline."
+                    }
+                } else if (values instanceof List) {
+                    trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
+                        GlobalState.stageAttemptTimes[key] = (GlobalState.stageAttemptTimes[key] ?: 0) + 1
+                        values[1]()
+                    })
+                } else {
+                    values()
                 }
-            } else if (values instanceof List) {
-                trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                    values[1]()
-                })
-            } else {
-                values()
-            }
+            }, [maxStageRetryTimes: GlobalState.maxStageRetryTimes, sleepTimeInSecs: 120, failSignatures: ["Stage ${key} is not the last run, skip to upload test result."]])
         }
     }]}
 
@@ -3081,21 +3124,25 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
         if (values.wheelInstalled) {
             stage(values.name) {
-                echo "Run ${values.name} sanity test."
-                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    sh "env | sort"
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage")
+                trtllm_utils.llmStageWithRetry(pipeline, values.name, {
+                    echo "Run ${values.name} sanity test."
+                    imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                    trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                        sh "env | sort"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
+                        runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null, "-SubJob-TestImage")
+                    })
                 })
             }
         } else {
             stage(values.name) {
-                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    sh "env | sort"
-                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
-                    runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                trtllm_utils.llmStageWithRetry(pipeline, values.name, {
+                    imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                    trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                        sh "env | sort"
+                        def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                        runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                    })
                 })
             }
         }
