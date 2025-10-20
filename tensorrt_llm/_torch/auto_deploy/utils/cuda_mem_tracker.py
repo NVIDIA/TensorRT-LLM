@@ -1,5 +1,6 @@
 import gc
 from contextlib import contextmanager
+from typing import Tuple
 
 import torch
 
@@ -24,3 +25,12 @@ def cuda_memory_tracker(logger=ad_logger):
         leaked = mem_after - mem_before
         if leaked > 0:
             logger.warning(f"Potential memory leak detected, leaked memory: {leaked} bytes")
+
+
+def get_mem_info_in_mb(empty_cache: bool = True) -> Tuple[int, int]:
+    if empty_cache:
+        # Clear the memory cache to get the exact free memory
+        torch.cuda.empty_cache()
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    MB = 1024**2
+    return free_mem // MB, total_mem // MB
