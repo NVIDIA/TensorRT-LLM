@@ -747,7 +747,7 @@ def create_py_executor_instance(
             gpus_per_node=dist.mapping.gpus_per_node,
         )
         peft_cache_manager = PeftCacheManager(
-            peft_cache_config=peft_cache_config_model._to_pybind(),
+            peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,

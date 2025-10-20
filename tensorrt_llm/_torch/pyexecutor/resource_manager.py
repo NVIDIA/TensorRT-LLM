@@ -11,7 +11,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PybindMirror
+from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
+                                          PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
@@ -39,7 +40,6 @@ DataType = tensorrt_llm.bindings.DataType
 KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
-PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
 BlocksPerWindow = Dict[int, Tuple[
@@ -1163,6 +1163,8 @@ class PeftCacheManager(BaseResourceManager):
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
+
+        peft_cache_config = peft_cache_config._to_pybind()
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
             num_host_module_layer=peft_cache_config.num_host_module_layer,
