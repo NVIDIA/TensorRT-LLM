@@ -987,7 +987,9 @@ class PyExecutor:
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
-                            previous_scheduled_batch)
+                            previous_scheduled_batch,
+                            self.model_engine.attn_metadata,
+                            self.model_engine.kv_cache_dtype_byte_size)
                         self._remove_inflight_ids(previous_scheduled_batch)
 
                     self.wait_on_pp_send_handles(prev_microbatch_id)
@@ -1195,7 +1197,9 @@ class PyExecutor:
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
-                    self.resource_manager.update_resources(scheduled_batch)
+                    self.resource_manager.update_resources(
+                        scheduled_batch, self.model_engine.attn_metadata,
+                        self.model_engine.kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -1397,7 +1401,9 @@ class PyExecutor:
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
-        self.resource_manager.update_resources(scheduled_requests)
+        self.resource_manager.update_resources(
+            scheduled_requests, self.model_engine.attn_metadata,
+            self.model_engine.kv_cache_dtype_byte_size)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 

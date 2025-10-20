@@ -1,4 +1,7 @@
+from dataclasses import dataclass
 from typing import Optional
+
+import torch
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
@@ -238,3 +241,18 @@ def update_spec_config_from_model_config(spec_config, model_config):
         spec_config.max_draft_len = spec_config.num_nextn_predict_layers
         # Use `num_nextn_predict_layers_from_model_config` to decide decoding mode MTP / MTP_EAGLE.
         spec_config.num_nextn_predict_layers_from_model_config = model_config.num_nextn_predict_layers
+
+
+@dataclass
+class SpecDecodingTensor:
+    """
+    Container for speculative decoding tensor parameters.
+
+    Attributes:
+        position_offsets: Position offsets for speculative decoding
+        packed_mask: Packed attention mask for speculative decoding
+        generation_lengths: Optional generation lengths for speculative decoding
+    """
+    position_offsets: torch.Tensor
+    packed_mask: torch.Tensor
+    generation_lengths: Optional[torch.Tensor] = None

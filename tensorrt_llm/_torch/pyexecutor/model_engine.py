@@ -49,6 +49,7 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
 from ..speculative.drafting_loops import ChainDrafter
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -359,8 +360,23 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.cache_indirection_attention = None
 
+        self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
+
+    def get_kv_cache_dtype_byte_size(self) -> float:
+        """
+        Returns the size (in bytes) occupied by kv cache type.
+        """
+        layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
+        if layer_quant_mode.has_fp4_kv_cache():
+            return 1 / 2
+        elif layer_quant_mode.has_fp8_kv_cache(
+        ) or layer_quant_mode.has_int8_kv_cache():
+            return 1
+        else:
+            return 2
 
     @property
     def runtime_draft_len(self):
@@ -2238,6 +2254,7 @@ class PyTorchModelEngine(ModelEngine):
         new_tensors_device: Optional[SampleStateTensors] = None,
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
+        spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
     ):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -2256,7 +2273,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.update_spec_dec_param(
                 is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,
-                self.original_max_draft_len)
+                self.original_max_draft_len, spec_decoding_tensor)
         else:
             spec_resource_manager = None
             spec_metadata = None
