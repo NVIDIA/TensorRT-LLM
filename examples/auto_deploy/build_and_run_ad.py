@@ -1,5 +1,6 @@
 """Main entrypoint to build, test, and prompt AutoDeploy inference models."""
 
+import uuid
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -65,6 +66,10 @@ class PromptConfig(BaseModel):
         default_factory=lambda: {"max_tokens": 100, "top_k": None, "temperature": 1.0},
         description="Sampling parameter kwargs passed on the SamplingParams class. "
         "Defaults are set to the values used in the original model.",
+    )
+    multi_turn: bool = Field(
+        default=False,
+        description="If true, run a two-turn chat demonstrating KV cache reuse.",
     )
 
     def model_post_init(self, __context: Any):
@@ -259,6 +264,79 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
     return prompts_and_outputs
 
 
+def _build_messages_from_query_entry(entry: PromptInput) -> List[Dict[str, str]]:
+    """Convert a prompt entry into HF chat messages without introducing defaults.
+
+    - If entry has messages, return a shallow copy of them.
+    - If entry is a dict with a prompt, make a single user message from it.
+    - If entry is a plain string, treat it as a single user message.
+    """
+    if isinstance(entry, list):
+        # already messages (HF template)
+        return list(entry)
+    if isinstance(entry, dict):
+        if "messages" in entry:
+            return list(entry["messages"])  # shallow copy
+        if "prompt" in entry and isinstance(entry["prompt"], str):
+            return [{"role": "user", "content": entry["prompt"]}]
+    if isinstance(entry, str):
+        return [{"role": "user", "content": entry}]
+    raise ValueError(f"Unsupported query entry type: {type(entry)}")
+
+
+def run_multi_turn(
+    llm: LLM, prompt_cfg: PromptConfig, sampling_params: SamplingParams
+) -> Dict[str, Any]:
+    """Run a two-turn chat using prompt_cfg.queries as turn1 and optional turn2."""
+    queries = prompt_cfg.queries if isinstance(prompt_cfg.queries, list) else [prompt_cfg.queries]
+    if len(queries) == 0:
+        raise ValueError("prompt.queries must contain at least one entry for multi-turn")
+
+    # Turn 1
+    messages = _build_messages_from_query_entry(queries[0])
+    session_salt = f"ad-session-{uuid.uuid4()}"
+    turn1 = llm.generate_async(
+        {
+            "prompt": "Fake prompt. Check out messages field for the HF chat template.",
+            "messages": messages,
+        },
+        sampling_params=sampling_params,
+        cache_salt=session_salt,
+    )
+    turn1_res = turn1.result()
+    _ = print_outputs(turn1_res)
+
+    # Append assistant reply
+    turn1_text = turn1_res.outputs[0].text
+    messages.append({"role": "assistant", "content": turn1_text})
+
+    # Turn 2 (if provided): add follow-up from queries[1]
+    if len(queries) > 1:
+        follow_messages = _build_messages_from_query_entry(queries[1])
+        # Use the first user message in the follow-up entry
+        follow_up = None
+        for msg in follow_messages:
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                follow_up = msg["content"]
+                break
+        if follow_up is not None:
+            messages.append({"role": "user", "content": follow_up})
+    else:
+        # No second query provided; do not introduce a default per user request.
+        return {"multi_turn": print_outputs(turn1_res)}
+
+    turn2 = llm.generate_async(
+        {
+            "prompt": "Fake prompt. Check out messages field for the HF chat template.",
+            "messages": messages,
+        },
+        sampling_params=sampling_params,
+        cache_salt=session_salt,
+    )
+    turn2_res = turn2.result()
+    return {"multi_turn": print_outputs(turn2_res)}
+
+
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
         config: ExperimentConfig = CliApp.run(ExperimentConfig)
@@ -270,12 +348,19 @@ def main(config: Optional[ExperimentConfig] = None):
     llm = build_llm_from_config(config)
 
     # prompt the model and print its output
-    ad_logger.info("Running example prompts...")
-    outs = llm.generate(
-        config.prompt.queries,
-        sampling_params=SamplingParams(**config.prompt.sp_kwargs),
-    )
-    results = {"prompts_and_outputs": print_outputs(outs)}
+    sampling_params = SamplingParams(**config.prompt.sp_kwargs)
+    results: Dict[str, Any] = {}
+
+    if config.prompt.multi_turn:
+        ad_logger.info("Running multi-turn chat demo with KV cache reuse...")
+        results.update(run_multi_turn(llm, config.prompt, sampling_params))
+    else:
+        ad_logger.info("Running example prompts...")
+        outs = llm.generate(
+            config.prompt.queries,
+            sampling_params=sampling_params,
+        )
+        results["prompts_and_outputs"] = print_outputs(outs)
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
