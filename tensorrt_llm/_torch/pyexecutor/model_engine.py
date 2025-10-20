@@ -147,6 +147,7 @@ class PyTorchModelEngine(ModelEngine):
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
     ):
+        self.forward_pass_callable = None
         self.ub_buffers = None
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
@@ -357,6 +358,9 @@ class PyTorchModelEngine(ModelEngine):
                 dtype=torch.int32)
         else:
             self.cache_indirection_attention = None
+
+    def register_forward_pass_callable(self, callable: Callable):
+        self.forward_pass_callable = callable
 
     @property
     def runtime_draft_len(self):
@@ -2321,6 +2325,9 @@ class PyTorchModelEngine(ModelEngine):
                     else:
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             outputs = self.cuda_graph_runner.replay(key, inputs)
+
+            if self.forward_pass_callable is not None:
+                self.forward_pass_callable()
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
