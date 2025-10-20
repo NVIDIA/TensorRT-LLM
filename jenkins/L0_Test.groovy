@@ -1665,12 +1665,14 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    // Escape single quotes in the fail signatures list to avoid shell parsing issues
+    def escapedFailSignaturesList = failSignaturesList.replace("'", "'\\''")
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
+        --fail-signatures='${escapedFailSignaturesList}'
     """
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
@@ -2137,7 +2139,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (Exception e) {
                     def curTry = GlobalState.stageAttemptTimes[stageName]
                     echo "curTry: ${curTry}"
-                    def isMachineOrInfraError = trtllm_utils.matchFailsigByStageLog(pipeline, "${stageName} : Attempt ${curTry}", trtllm_utils.getFailSignaturesList())
+                    def failsigList = trtllm_utils.getFailSignaturesList()
+                    echo "failsigList: ${failsigList}"
+                    def isMachineOrInfraError = trtllm_utils.matchFailsigByStageLog(pipeline, "${stageName} : Attempt ${curTry}", failsigList)
                     echo "isMachineOrInfraError: ${isMachineOrInfraError}"
                     if (isMachineOrInfraError) {
                         echo "There is a machine or infrastructure error, skip the rerun step."
