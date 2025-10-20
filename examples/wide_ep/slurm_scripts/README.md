@@ -34,6 +34,6 @@ Before running the scripts, ensure you have:
 ### Run Benchmarks
 
 ```bash
-# Refer to `examples/disaggregated/slurm/benchmark/`
+# Please find the `submit.py` script and an example `config.yaml` in the `examples/disaggregated/slurm/benchmark/` directory.
 python3 submit.py -c your_config.yaml
 ```
