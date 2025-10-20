@@ -137,7 +137,8 @@ def _torch_ssm_prepare_metadata(
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
     # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
     # reference implementation to support chunked prefill.
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized)
+    use_initial_states = input_pos > 0
+    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @_torch_ssm_prepare_metadata.register_fake
@@ -169,6 +170,7 @@ def _torch_cached_ssm(
     seq_len: torch.Tensor,  # [num_seq]
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
