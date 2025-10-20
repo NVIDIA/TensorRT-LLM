@@ -71,15 +71,14 @@ async def test_tool_parser(client: openai.AsyncOpenAI, model_name: str):
             "content": "What's the temperature in San Francisco now?"
         }],
         tools=TOOLS)
-    assert response.choices[0].message.content is not None
-    assert response.choices[0].message.tool_calls is not None
-    assert len(response.choices[0].message.tool_calls) == 1
-    assert response.choices[0].message.tool_calls[
-        0].function.name == "get_current_temperature"
-    assert response.choices[0].message.tool_calls[
-        0].function.arguments is not None
-    args = json.loads(
-        response.choices[0].message.tool_calls[0].function.arguments)
+    assert response.choices[0].finish_reason == "tool_calls"
+    message = response.choices[0].message
+    assert message.content is not None
+    assert message.tool_calls is not None
+    assert len(message.tool_calls) == 1
+    tool_call = message.tool_calls[0]
+    assert tool_call.function.name == "get_current_temperature"
+    args = json.loads(tool_call.function.arguments)
     get_current_temperature(**args)
 
 
@@ -97,6 +96,7 @@ async def test_tool_parser_streaming(client: openai.AsyncOpenAI,
     tool_id = None
     tool_name = None
     parameters = ""
+    finish_reason = None
 
     async for chunk in response:
         if chunk.choices[0].delta.tool_calls:
@@ -111,9 +111,11 @@ async def test_tool_parser_streaming(client: openai.AsyncOpenAI,
                 tool_name = tool_call.function.name
             if tool_call.function.arguments:
                 parameters += tool_call.function.arguments
-
+        if chunk.choices[0].finish_reason:
+            finish_reason = chunk.choices[0].finish_reason
     assert tool_id is not None
     assert tool_name == "get_current_temperature"
+    assert finish_reason == "tool_calls"
     assert parameters
     args = json.loads(parameters)
     get_current_temperature(**args)

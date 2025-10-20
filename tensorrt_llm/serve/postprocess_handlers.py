@@ -53,6 +53,7 @@ class ChatPostprocArgs(PostprocArgs):
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
+    has_tool_call: dict[int, bool] = field(default_factory=dict)
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -140,6 +141,8 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
+        if result.calls:
+            args.has_tool_call[output_index] = True
     else:
         normal_text, calls = text, []
 
@@ -236,7 +239,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            if tool_calls or delta_text or reasoning_delta_text:
+            if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
                 delta_message = DeltaMessage(
                     content=delta_text,
                     reasoning_content=reasoning_delta_text,
@@ -247,17 +250,22 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         choice = ChatCompletionResponseStreamChoice(
             index=i,
             delta=delta_message,
-            finish_reason=None,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
-                                                None))
+                                                None),
+            stop_reason=output.stop_reason,
+        )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
             choice.logprobs = create_logprobs(token_ids, args.tokenizer,
                                               logprobs, args.top_logprobs)
         if output.finish_reason is not None:
-            choice.finish_reason = output.finish_reason
+            if output.finish_reason == "stop" and args.has_tool_call.get(
+                    i, False):
+                choice.finish_reason = "tool_calls"
+            else:
+                choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
         chunk = ChatCompletionStreamResponse(choices=[choice], model=args.model)
@@ -325,13 +333,17 @@ def chat_response_post_processor(
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
-            finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
             disaggregated_params=disaggregated_params,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if output.finish_reason == "stop" and args.has_tool_call.get(
+                output.index, False):
+            choice.finish_reason = "tool_calls"
+        else:
+            choice.finish_reason = output.finish_reason
 
         if args.return_logprobs:
             choice.logprobs = create_logprobs(output.token_ids, args.tokenizer,
