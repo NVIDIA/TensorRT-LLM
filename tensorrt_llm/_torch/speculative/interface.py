@@ -175,6 +175,14 @@ class SpecMetadata:
     gather_ids: Optional[torch.Tensor] = None
     # The number of accepted draft tokens for each request.
     num_accepted_draft_tokens: Optional[torch.Tensor] = None
+    # The temperatures for requests.
+    temperatures: Optional[torch.Tensor] = None
+    # The top_k for requests.
+    top_k: Optional[torch.Tensor] = None
+    # The top_p for requests.
+    top_p: Optional[torch.Tensor] = None
+    # The min_p for requests.
+    min_p: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank

@@ -552,6 +552,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
+    use_advanced_spec_dec_sampling: Optional[bool] = False
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -764,6 +765,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
     mtp_eagle_one_model: bool = True
+    use_advanced_spec_dec_sampling: Optional[bool] = False
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
