@@ -16,11 +16,10 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, print_colored_debug
-from ..lora_helper import LoraConfig
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -54,8 +53,6 @@ class BaseWorker(GenerationExecutor):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -73,8 +70,6 @@ class BaseWorker(GenerationExecutor):
         self._batched_logits_processor = batched_logits_processor
         self._postproc_worker_config = postproc_worker_config
         self._is_llm_executor = is_llm_executor
-        self._lora_config = lora_config
-        self._kv_connector_config = kv_connector_config
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
         self.llm_args = llm_args
@@ -92,10 +87,7 @@ class BaseWorker(GenerationExecutor):
         self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
             "pytorch", "_autodeploy"
         ]
-
-        if not self._is_pytorch_backend and kv_connector_config is not None:
-            raise ValueError(
-                "KV connector config is only supported for PyTorch backend")
+        self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -130,8 +122,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-                args["lora_config"] = self._lora_config
-                args["kv_connector_config"] = self._kv_connector_config
             elif self.llm_args.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs

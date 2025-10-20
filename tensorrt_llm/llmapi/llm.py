@@ -973,8 +973,7 @@ class _TrtLLM(BaseLLM):
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True,
-            lora_config=lora_config)
+            is_llm_executor=True)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -1076,9 +1075,6 @@ class _TorchLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config,
-            # Autodeploy does not support kv_connector_config
-            kv_connector_config=getattr(self.args, "kv_connector_config", None),
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)

@@ -41,8 +41,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_PATH = _hf_model_dir_or_hub_id("llama-3.1-model/Meta-Llama-3.1-8B",
                                          MODEL_NAME)
 
-    def get_default_kwargs(self):
-        return {
+    def get_default_kwargs(self, enable_chunked_prefill=False):
+        config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "max_batch_size": 512,
@@ -52,10 +52,23 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # Set it explicitly here to 8192 which is the default in build_config.
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
-            "compile_backend": "torch-opt",
-            "free_mem_ratio": 0.7,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+            "transforms": {
+                "resize_kv_cache": {
+                    "free_mem_ratio": 0.7
+                },
+                "compile_model": {
+                    "backend":
+                    "torch-opt",
+                    "cuda_graph_batch_sizes":
+                    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                },
+            },
         }
+        if enable_chunked_prefill:
+            config["enable_chunked_prefill"] = True
+            config[
+                "max_num_tokens"] = 512  # NOTE: must be > max(attn_page_size, max_batch_size)
+        return config
 
     def get_default_sampling_params(self):
         eos_id = -1
@@ -67,8 +80,9 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
-    def test_auto_dtype(self, world_size):
-        kwargs = self.get_default_kwargs()
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+    def test_auto_dtype(self, world_size, enable_chunked_prefill):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
@@ -84,8 +98,8 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-H-8B-Base-8K"
     MODEL_PATH = f"{llm_models_root()}/Nemotron-H-8B-Base-8K"
 
-    def get_default_kwargs(self):
-        return {
+    def get_default_kwargs(self, enable_chunked_prefill=False):
+        config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             # SSMs do not support cache reuse.
@@ -99,10 +113,21 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             # Set explicitly to match default build_config behavior
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
-            "compile_backend": "torch-opt",
-            "free_mem_ratio": 0.7,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "transforms": {
+                "resize_kv_cache": {
+                    "free_mem_ratio": 0.7
+                },
+                "compile_model": {
+                    "backend": "torch-opt",
+                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                },
+            },
         }
+        if enable_chunked_prefill:
+            config["enable_chunked_prefill"] = True
+            config[
+                "max_num_tokens"] = 512  # NOTE: must be > max(attn_page_size, max_batch_size)
+        return config
 
     def get_default_sampling_params(self):
         eos_id = -1
@@ -113,8 +138,12 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_auto_dtype(self):
-        kwargs = self.get_default_kwargs()
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+    def test_auto_dtype(self, enable_chunked_prefill):
+        if enable_chunked_prefill:
+            pytest.skip(
+                "see https://github.com/NVIDIA/TensorRT-LLM/issues/8272")
+        kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,

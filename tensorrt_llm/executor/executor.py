@@ -16,13 +16,12 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
-from tensorrt_llm.lora_helper import LoraConfig
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, TorchLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -363,29 +362,28 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def _create_ray_executor(
-            worker_kwargs: Dict,
-            model_world_size: int,
-            postproc_worker_config: PostprocWorkerConfig,
-            is_llm_executor: bool,
-            tp_size: int,
-            kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+        worker_kwargs: Dict,
+        model_world_size: int,
+        postproc_worker_config: PostprocWorkerConfig,
+        is_llm_executor: bool,
+        tp_size: int,
+    ):
         from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,
                            postproc_worker_config=postproc_worker_config,
                            is_llm_executor=is_llm_executor,
-                           tp_size=tp_size,
-                           kv_connector_config=kv_connector_config)
+                           tp_size=tp_size)
 
     @staticmethod
     def _create_rpc_executor(
-            worker_kwargs: Dict,
-            model_world_size: int,
-            mpi_session: Optional[MpiSession],
-            postproc_worker_config: PostprocWorkerConfig,
-            is_llm_executor: bool,
-            kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+        worker_kwargs: Dict,
+        model_world_size: int,
+        mpi_session: Optional[MpiSession],
+        postproc_worker_config: PostprocWorkerConfig,
+        is_llm_executor: bool,
+    ):
         """Create RPC-based executor (GenerationExecutorRpcProxy)."""
         from .rpc_proxy import GenerationExecutorRpcProxy
         return GenerationExecutorRpcProxy(
@@ -393,18 +391,17 @@ class GenerationExecutor(ABC):
             model_world_size=model_world_size,
             mpi_session=mpi_session,
             postproc_worker_config=postproc_worker_config,
-            is_llm_executor=is_llm_executor,
-            kv_connector_config=kv_connector_config)
+            is_llm_executor=is_llm_executor)
 
     @staticmethod
     def _create_ipc_executor(
-            worker_kwargs: Dict,
-            model_world_size: int,
-            mpi_session: Optional[MpiSession],
-            postproc_worker_config: PostprocWorkerConfig,
-            is_llm_executor: bool,
-            use_worker: bool = False,
-            kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+        worker_kwargs: Dict,
+        model_world_size: int,
+        mpi_session: Optional[MpiSession],
+        postproc_worker_config: PostprocWorkerConfig,
+        is_llm_executor: bool,
+        use_worker: bool = False,
+    ):
         """Create IPC-based executor (GenerationExecutorProxy or GenerationExecutorWorker).
 
         Args:
@@ -413,10 +410,8 @@ class GenerationExecutor(ABC):
         """
         if use_worker:
             from .worker import GenerationExecutorWorker
-            return GenerationExecutorWorker(
-                **worker_kwargs,
-                is_llm_executor=is_llm_executor,
-                kv_connector_config=kv_connector_config)
+            return GenerationExecutorWorker(**worker_kwargs,
+                                            is_llm_executor=is_llm_executor)
         else:
             from .proxy import GenerationExecutorProxy
             return GenerationExecutorProxy(
@@ -424,8 +419,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                kv_connector_config=kv_connector_config)
+                is_llm_executor=is_llm_executor)
 
     @staticmethod
     def create(
@@ -439,8 +433,6 @@ class GenerationExecutor(ABC):
         return_logits: bool = False,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -472,9 +464,6 @@ class GenerationExecutor(ABC):
             "llm_args": llm_args,
         }
 
-        if lora_config:
-            worker_kwargs["lora_config"] = lora_config
-
         orchestrator_type = None if not isinstance(
             llm_args, TorchLlmArgs) else llm_args.orchestrator_type
         if orchestrator_type == "ray":
@@ -483,8 +472,7 @@ class GenerationExecutor(ABC):
                 model_world_size,
                 postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                tp_size=args.get("tp_size", 1),
-                kv_connector_config=kv_connector_config)
+                tp_size=args.get("tp_size", 1))
         elif orchestrator_type is not None and orchestrator_type != "rpc":
             raise ValueError(
                 f"Unsupported orchestrator_type: {orchestrator_type}")
@@ -505,8 +493,7 @@ class GenerationExecutor(ABC):
                     model_world_size=model_world_size,
                     mpi_session=mpi_session,
                     postproc_worker_config=postproc_worker_config,
-                    is_llm_executor=is_llm_executor,
-                    kv_connector_config=kv_connector_config)
+                    is_llm_executor=is_llm_executor)
 
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
@@ -514,8 +501,7 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                use_worker=False,
-                kv_connector_config=kv_connector_config)
+                use_worker=False)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -531,8 +517,7 @@ class GenerationExecutor(ABC):
                     model_world_size=model_world_size,
                     mpi_session=mpi_session,
                     postproc_worker_config=postproc_worker_config,
-                    is_llm_executor=is_llm_executor,
-                    kv_connector_config=kv_connector_config)
+                    is_llm_executor=is_llm_executor)
 
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
@@ -540,8 +525,7 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                use_worker=True,
-                kv_connector_config=kv_connector_config)
+                use_worker=True)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -554,8 +538,7 @@ class GenerationExecutor(ABC):
                     model_world_size=model_world_size,
                     mpi_session=mpi_session,
                     postproc_worker_config=postproc_worker_config,
-                    is_llm_executor=is_llm_executor,
-                    kv_connector_config=kv_connector_config)
+                    is_llm_executor=is_llm_executor)
 
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
@@ -563,8 +546,7 @@ class GenerationExecutor(ABC):
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                use_worker=False,
-                kv_connector_config=kv_connector_config)
+                use_worker=False)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -577,8 +559,7 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                use_worker=False,
-                kv_connector_config=kv_connector_config)
+                use_worker=False)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]
