@@ -2122,22 +2122,23 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         rerunFailed = true
                     }
                 }
-            }
-        }
 
-        // Run the isolated tests if exists
-        if (preprocessedLists.isolateCount > 0) {
-            stage ("[${stageName}] Run Pytest (Isolated)") {
-                echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                rerunFailed = runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) || rerunFailed
-            }
-        } else {
-            echo "No isolated tests to run for stage ${stageName}"
-            noIsolateTests = true
-        }
+                // Run the isolated tests if exists
+                if (preprocessedLists.isolateCount > 0) {
+                    stage ("[${stageName}] Run Pytest (Isolated)") {
+                        echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
+                        rerunFailed = runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) || rerunFailed
+                    }
+                } else {
+                    echo "No isolated tests to run for stage ${stageName}"
+                    noIsolateTests = true
+                }
 
-        if (noRegularTests && noIsolateTests) {
-            error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                if (noRegularTests && noIsolateTests) {
+                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                }
+
+            }
         }
 
         // Generate comprehensive rerun report if any reruns occurred
