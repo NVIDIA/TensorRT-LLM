@@ -33,7 +33,7 @@ def test_get_rejected_indices():
             sampled_tokens.append(draft_tokens[0])
         else:
             sampled_tokens.append(
-                sample_rejected(draft_probs, target_probs, generator, 0).item())
+                sample_rejected(draft_probs, target_probs, generator, 0))
         sampled_regular.append(
             torch.multinomial(target_probs[0],
                               num_samples=1,

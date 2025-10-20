@@ -5,7 +5,6 @@ import os
 import threading
 from typing import Optional
 
-from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import (AsyncQueue, _SyncQueue, logger_debug,
@@ -33,7 +32,6 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         *,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ):
         """
         Args:
@@ -42,7 +40,6 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             mpi_session: the mpi session to use
             postproc_worker_config: the postproc worker config
             is_llm_executor: whether this is an llm executor
-            kv_connector_config: the kv cache connector config
         """
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.rpc_addr = self.gen_uniq_rpc_addr()

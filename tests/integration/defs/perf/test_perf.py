@@ -127,6 +127,14 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_fp4_image":
+    "multimodals/Phi-4-multimodal-instruct-FP4",
+    "phi_4_multimodal_instruct_fp4_audio":
+    "multimodals/Phi-4-multimodal-instruct-FP4",
+    "phi_4_multimodal_instruct_fp8_image":
+    "multimodals/Phi-4-multimodal-instruct-FP8",
+    "phi_4_multimodal_instruct_fp8_audio":
+    "multimodals/Phi-4-multimodal-instruct-FP8",
     "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
@@ -177,6 +185,14 @@ LORA_MODEL_PATH = {
     "multimodals/Phi-4-multimodal-instruct/vision-lora",
     "phi_4_multimodal_instruct_audio":
     "multimodals/Phi-4-multimodal-instruct/speech-lora",
+    "phi_4_multimodal_instruct_fp4_image":
+    "multimodals/Phi-4-multimodal-instruct-FP4/vision-lora",
+    "phi_4_multimodal_instruct_fp4_audio":
+    "multimodals/Phi-4-multimodal-instruct-FP4/speech-lora",
+    "phi_4_multimodal_instruct_fp8_image":
+    "multimodals/Phi-4-multimodal-instruct-FP8/vision-lora",
+    "phi_4_multimodal_instruct_fp8_audio":
+    "multimodals/Phi-4-multimodal-instruct-FP8/speech-lora",
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")

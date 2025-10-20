@@ -569,9 +569,6 @@ class Deepseekv3RoutingImpl():
 
     def noaux_tc(self, logits, e_score_correction_bias):
         n_group = self.n_group
-        scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
-            logits, e_score_correction_bias)
-        scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
             has_nan = torch.isnan(scores_with_bias).any()
@@ -580,7 +577,27 @@ class Deepseekv3RoutingImpl():
                     "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
                 )
 
+        _, num_experts = logits.shape
+        if self.n_group > 1:
+            if self.top_k > 8 or (num_experts / n_group) > 32 or (
+                    num_experts / n_group) * self.topk_group > 128:
+                if (self.is_fused):
+                    warnings.warn(
+                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
+                    )
+                self.is_fused = False
+        else:
+            if num_experts > 384 or self.top_k > 8:
+                if (self.is_fused):
+                    warnings.warn(
+                        "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
+                    )
+                self.is_fused = False
+
         if not self.is_fused:
+            scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
+                logits, e_score_correction_bias)
+            scores_shape = list(scores_with_bias.shape)
             group_scores = torch.sum(torch.topk(
                 scores_with_bias.view(scores_shape[:-1] +
                                       [n_group, scores_shape[-1] // n_group]),
@@ -618,8 +635,8 @@ class Deepseekv3RoutingImpl():
             return topk_values, topk_indices
         else:
             topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
-                scores, scores_with_bias, n_group, self.topk_group, self.top_k,
-                self.routed_scaling_factor)
+                logits, e_score_correction_bias, n_group, self.topk_group,
+                self.top_k, self.routed_scaling_factor)
             return topk_values, topk_indices
 
     def apply(

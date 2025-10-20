@@ -22,9 +22,9 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image-False]
   - test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video-False]
   - test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image-False]
-  - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[audio]
-  - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image]
-  - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
+  - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-audio]
+  - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image]
+  - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-image_audio]
   - accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
 - condition:
     ranges:
@@ -65,7 +65,7 @@ l0_l40s:
   - llmapi/test_llm_examples.py::test_llmapi_example_multilora
   - llmapi/test_llm_examples.py::test_llmapi_example_guided_decoding
   - llmapi/test_llm_examples.py::test_llmapi_example_logits_processor
-  - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] ISOLATION
+  - examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
 - condition:
     ranges:
       system_gpu_count:

@@ -10,10 +10,9 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
-from ..lora_manager import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
@@ -42,10 +41,8 @@ class RpcWorker(BaseWorker):
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -54,11 +51,9 @@ class RpcWorker(BaseWorker):
             engine=engine,
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
             llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
         )
@@ -198,9 +193,7 @@ class RpcWorker(BaseWorker):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
         llm_args: Optional[BaseLlmArgs] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         **kwargs,
@@ -213,11 +206,9 @@ class RpcWorker(BaseWorker):
             engine=engine,
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
             llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
         )

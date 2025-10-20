@@ -17,13 +17,11 @@ from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
                                             GuidedDecodingConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig, LoadFormat,
-                                          PybindMirror, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import LoadFormat, PybindMirror, TorchLlmArgs
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -205,12 +203,12 @@ def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: str = None,
     tokenizer: Optional[TokenizerBase] = None,
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+    lora_config = llm_args.lora_config
+    kv_connector_config = llm_args.kv_connector_config
 
     pytorch_backend_config = llm_args.get_pytorch_backend_config()
     if pytorch_backend_config is None:

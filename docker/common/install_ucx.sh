@@ -1,11 +1,14 @@
 #!/bin/bash
 set -ex
 
-GITHUB_URL="https://github.com"
 UCX_VERSION="v1.19.x"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 UCX_REPO="https://github.com/openucx/ucx.git"
+
+if [ -n "${GITHUB_MIRROR}" ]; then
+  export UCX_REPO="https://gitlab-master.nvidia.com/ftp/GitHubSync/ucx.git"
+fi
 
 rm -rf ${UCX_INSTALL_PATH}
 git clone --depth 1 -b ${UCX_VERSION} ${UCX_REPO}
