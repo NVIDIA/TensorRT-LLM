@@ -423,11 +423,6 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        // output is smaller than workspace. Create output after workspace to avoid output_shape occupied a little
-        // piece of memory which makes a big partition of memory segment can't be used by workspace.
-        std::vector<int64_t> output_shape = {num_rows, unpadded_hidden_size_val};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
-
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
 
