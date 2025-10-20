@@ -135,6 +135,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         seq_len,
         seq_start,
         slot_idx,
+        use_initial_states,
         ssm_state_cache_torch,
         time_step_limit,
         chunk_size,
