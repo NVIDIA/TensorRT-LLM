@@ -2645,16 +2645,16 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             "prompt":
             "Describe the two images in detail.",
             "media": [
-                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-                "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
             ],
         },
         "video": {
             "prompt":
             "Tell me what you see in the video briefly.",
             "media": [
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4",
-                "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4",
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+                str(test_data_root / "world.mp4"),
             ],
         },
     }
@@ -3203,7 +3203,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         },
         "Phi-4-multimodal-instruct": {
             "image": [
-                ["depicts", "landscape", "mountain", "half", "dome"],
+                ["depicts", "view", "mountain", "large", "rugged"],
                 ["atmosphere", "serene", "sense", "scene", "majestic"],
             ],
         },
