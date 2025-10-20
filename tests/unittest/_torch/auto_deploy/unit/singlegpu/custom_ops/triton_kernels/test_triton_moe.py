@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.load_moe_align import moe_align_block_size
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.load_moe_align import moe_align_block_size
 
 
 def _pack_routed_tokens_reference(
