@@ -123,6 +123,12 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
+class MachineError extends Exception {
+    MachineError(String message, Throwable cause) {
+        super(message, cause)
+    }
+}
+
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
@@ -952,6 +958,8 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+    static def stageAttemptTimes = [:]
+    static def maxStageRetryTimes = 2
 }
 
 String getShortenedJobName(String path)
@@ -990,13 +998,31 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
     def Boolean stageIsFailed = true
+    def isLastRun = true
     try {
         taskRunner()
         stageIsFailed = false
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
+    } catch (MachineError e) {
+        echo "catch MachineError"
+        if (GlobalState.stageAttemptTimes[stageName] < GlobalState.maxStageRetryTimes) {
+            isLastRun = false
+        }
+        throw e
     } finally {
+        echo "GlobalState.stageAttemptTimes: ${GlobalState.stageAttemptTimes}"
+        if (!isLastRun) {
+            echo "Stage ${stageName} is not the last run, skip to upload test result."
+            // Clean up the workspace
+            sh """
+                env | sort
+                pwd && ls -alh
+                rm -rf ./*
+            """
+            return
+        }
         ensureStageResultNotUploaded(stageName + postTag)
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
@@ -2109,11 +2135,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    def failedSigs = trtllm_utils.getFailSignaturesList()
-                    def isMachineOrInfraError = failedSigs.any { sig -> e.message?.toLowerCase().contains(sig.toLowerCase()) }
+                    def curTry = GlobalState.stageAttemptTimes[stageName]
+                    echo "curTry: ${curTry}"
+                    def isMachineOrInfraError = trtllm_utils.matchFailsigByStageLog(pipeline, "${stageName} : Attempt ${curTry}", trtllm_utils.getFailSignaturesList())
+                    echo "isMachineOrInfraError: ${isMachineOrInfraError}"
                     if (isMachineOrInfraError) {
                         echo "There is a machine or infrastructure error, skip the rerun step."
-                        throw e
+                        throw new MachineError("Machine or infrastructure error", e)
                     }
                     def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine, "results.xml", "regular")
                     if (isRerunFailed) {
@@ -3019,17 +3047,13 @@ def launchTestJobs(pipeline, testFilter)
                     }
                 } else if (values instanceof List) {
                     trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                        try {
-                            values[1]()
-                        } catch (Exception e) {
-                            GlobalState.uploadResultStageNames.remove(key)
-                            throw e
-                        }
+                        GlobalState.stageAttemptTimes[key] = (GlobalState.stageAttemptTimes[key] ?: 0) + 1
+                        values[1]()
                     })
                 } else {
                     values()
                 }
-            }, [sleepTimeInSecs: 120])
+            }, [maxStageRetryTimes: GlobalState.maxStageRetryTimes, sleepTimeInSecs: 120, failSignatures: ["Stage ${key} is not the last run, skip to upload test result."]])
         }
     }]}
 
