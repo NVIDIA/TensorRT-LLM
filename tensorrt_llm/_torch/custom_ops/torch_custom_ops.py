@@ -240,6 +240,7 @@ def fused_moe(
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
         unpadded_hidden_size,
+        tuner_num_tokens,
     )
 
     return output if min_latency_mode else [output]
