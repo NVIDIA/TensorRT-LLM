@@ -418,10 +418,11 @@ class TestEXAONE4(unittest.TestCase):
 
         config_dict = deepcopy(EXAONE4_SINGLE_LAYER_CONFIG)
         if quant_algo == "FP8":
-            config_dict.update(EXAONE4_FP8_QUANT_CONFIG)
+            if getSMVersion() < 89:
+                self.skipTest(
+                    "This test is not supported in pre-Ada architecture")
 
-        if quant_algo == "FP8" and getSMVersion() < 89:
-            self.skipTest("This test is not supported in pre-Ada architecture")
+            config_dict.update(EXAONE4_FP8_QUANT_CONFIG)
 
         tmp_model_dir = f"/tmp/exaone4_llm_load_test_model"
         dump_config_json(tmp_model_dir, config_dict)
