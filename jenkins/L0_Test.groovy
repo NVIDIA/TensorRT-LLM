@@ -1656,6 +1656,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
         echo "There are some failed tests that cannot be rerun, skip the rerun step."
+        return true
     }
 
     // If the stage has more than 5 failed tests, skip the rerun step
