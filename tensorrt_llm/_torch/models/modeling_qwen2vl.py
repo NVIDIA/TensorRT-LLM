@@ -2,7 +2,6 @@ import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -284,44 +283,15 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_dummy_text(self, input_seq_len: int) -> str:
-        ids = np.random.randint(
-            low=0,
-            high=int(
-                self.model_config.vocab_size),  # high is exclusive in NumPy
-            size=input_seq_len,
-        ).tolist()
-        return self.tokenizer.decode(ids, skip_special_tokens=True)
-
     def get_dummy_image(self, max_width: int, max_height: int):
         image = Image.new("RGB", (max_width, max_height), color=255)
         return image
 
     def get_dummy_prompt(self, input_seq_len: int):
-        text = ""
         # we use the max resolution as starting point
-        img_max_dim = 3584
-        image = self.get_dummy_image(max_width=img_max_dim,
-                                     max_height=img_max_dim)
+        img_max_dim = input_seq_len  # TODO: Find better starting resolution
 
-        test_mm_prompt = default_multimodal_input_loader(
-            tokenizer=self.tokenizer,
-            model_dir=self.model_path,
-            model_type=self.model_config.model_type,
-            modality="image",
-            prompts=[text],
-            media=[[image]],
-            image_data_format="pt")[0]
-
-        prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
-
-        # if the max img resolution results in a number of tokens greater then
-        # input_seq_len, we keep lowering the resolution such as to find the
-        # max resolution such as it does not exceed the input_seq_len
-        while len(prompt_token_ids_single_img) > input_seq_len:
-            # reduce img resolution
-            img_max_dim = img_max_dim >> 1
-
+        while img_max_dim > 0:
             image = self.get_dummy_image(max_width=img_max_dim,
                                          max_height=img_max_dim)
 
@@ -330,34 +300,19 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
                 model_dir=self.model_path,
                 model_type=self.model_config.model_type,
                 modality="image",
-                prompts=[text],
+                prompts=[""],
                 media=[[image]],
                 image_data_format="pt")[0]
 
             prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
 
-        len_prompt_tokens_ids = len(prompt_token_ids_single_img)
-        # There are corner cases where if we strictly try to generate a text based
-        # on how many tokens we need to complete the input_seq_len, the output of
-        # default_multimodal_input_loader may give more tokens then the input_seq_len and this
-        # can lead to errors.
-        # That is why we try to clip the variable text_token_left to a lower threshold
-        # but close enough to the actual input_seq_len
-        text_generation_perc_threshold = 0.95
-        text_token_left = int((input_seq_len - len_prompt_tokens_ids) *
-                              text_generation_perc_threshold)
+            if len(prompt_token_ids_single_img) <= input_seq_len:
+                return test_mm_prompt
 
-        if text_token_left > 0:
-            text = self.get_dummy_text(text_token_left)
+            # reduce img resolution
+            img_max_dim = img_max_dim >> 1
 
-        return default_multimodal_input_loader(
-            tokenizer=self.tokenizer,
-            model_dir=self.model_path,
-            model_type=self.model_config.model_type,
-            modality="image",
-            prompts=[text],
-            media=[[image]],
-            image_data_format="pt")[0]
+        return None
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):

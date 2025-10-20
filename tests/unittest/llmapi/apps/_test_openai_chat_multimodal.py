@@ -1,5 +1,6 @@
 import os
 import tempfile
+from pathlib import Path
 from typing import List
 
 import openai
@@ -69,6 +70,8 @@ def async_client(server: RemoteOpenAIServer):
 
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Describe the natural environment in the image."
     image_url = str(llm_models_root() / "multimodals" / "test_data" /
                     "seashore.png")
@@ -124,6 +127,8 @@ def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_multi_image(client: openai.OpenAI,
                                          model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Tell me the difference between two images"
     image_url1 = str(llm_models_root() / "multimodals" / "test_data" /
                      "inpaint.png")
@@ -185,6 +190,8 @@ def test_single_chat_session_multi_image(client: openai.OpenAI,
 
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_video(client: openai.OpenAI, model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Tell me what you see in the video briefly."
     video_url = str(llm_models_root() / "multimodals" / "test_data" /
                     "OAI-sora-tokyo-walk.mp4")
@@ -240,6 +247,8 @@ def test_single_chat_session_video(client: openai.OpenAI, model_name: str):
 @pytest.mark.asyncio(loop_scope="module")
 def test_single_chat_session_image_embed(client: openai.OpenAI,
                                          model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Describe the natural environment in the image."
     image_url = str(llm_models_root() / "multimodals" / "test_data" /
                     "seashore.png")
@@ -296,6 +305,8 @@ def test_single_chat_session_image_embed(client: openai.OpenAI,
 @pytest.mark.asyncio(loop_scope="module")
 async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
                                     model_name: str):
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
     content_text = "Describe the natural environment in the image."
     image_url = str(llm_models_root() / "multimodals" / "test_data" /
                     "seashore.png")
