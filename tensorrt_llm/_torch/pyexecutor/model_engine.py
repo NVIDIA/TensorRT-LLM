@@ -20,6 +20,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -38,7 +39,6 @@ from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
-from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -52,7 +52,7 @@ from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
-from .config import PyTorchConfig
+from .config import PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -131,28 +131,35 @@ class PyTorchModelEngine(ModelEngine):
         *,
         model_path: str,
         pytorch_backend_config: PyTorchConfig,
-        checkpoint_loader: BaseCheckpointLoader,
-        batch_size: int = 8,
-        max_beam_width: int = 1,
-        max_num_tokens: int = 8192,
-        max_seq_len: Optional[int] = None,
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
-        lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ):
+        assert llm_args is not None, "llm_args must be provided for PyTorchModelEngine"
+
         self.forward_pass_callable = None
         self.ub_buffers = None
-        self.batch_size = batch_size
+        (
+            max_beam_width,
+            max_num_tokens,
+            max_seq_len,
+            max_batch_size,
+        ) = llm_args.get_runtime_sizes()
+
+        self.batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
+
+        checkpoint_loader = _construct_checkpoint_loader(
+            llm_args.backend, llm_args.checkpoint_loader,
+            llm_args.checkpoint_format)
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -171,7 +178,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_config.max_total_draft_tokens = 0
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
-        self.sparse_attention_config = sparse_attention_config
+        self.sparse_attention_config = None if is_draft_model else llm_args.sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
 
@@ -181,13 +188,15 @@ class PyTorchModelEngine(ModelEngine):
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
         if model is None:
+            lora_config: Optional[
+                LoraConfig] = None if is_draft_model else llm_args.lora_config
             loader = ModelLoader(
                 pytorch_backend_config=pytorch_backend_config,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
                 sparse_attention_config=self.sparse_attention_config,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
+                max_num_tokens=self.max_num_tokens,
+                max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
             )
             self.model, moe_load_balancer = loader.load(
@@ -273,29 +282,27 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(
             pytorch_backend_config.attn_backend,
-            sparse_attn_config=sparse_attention_config)
+            sparse_attn_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
-            max_num_draft_tokens = self.original_max_total_draft_tokens * batch_size
+            max_num_draft_tokens = self.original_max_total_draft_tokens * self.batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
             self.gather_ids_cuda = torch.empty((self.max_num_tokens, ),
                                                dtype=torch.int,
                                                device='cuda')
-            self.num_accepted_draft_tokens_cuda = torch.empty((batch_size, ),
-                                                              dtype=torch.int,
-                                                              device='cuda')
+            self.num_accepted_draft_tokens_cuda = torch.empty(
+                (self.batch_size, ), dtype=torch.int, device='cuda')
             self.previous_pos_indices_cuda = torch.empty(
                 (self.max_num_tokens, ), dtype=torch.int, device='cuda')
             self.previous_pos_id_offsets_cuda = torch.zeros(
                 (self.max_num_tokens, ), dtype=torch.int, device='cuda')
-            self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
-                                                             dtype=torch.int,
-                                                             device='cuda')
+            self.previous_kv_lens_offsets_cuda = torch.zeros(
+                (self.batch_size, ), dtype=torch.int, device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_draft_len = spec_config.max_draft_len
