@@ -1234,16 +1234,21 @@ class PyTorchModelEngine(ModelEngine):
         def collect_req_spec_dec_sampling_params(request: LlmRequest,
                                                  draft_len: int = 0):
 
-            def get_request_temperature(request: LlmRequest) -> float:
+            def get_request_temperature(request: LlmRequest,
+                                        is_greedy: bool) -> float:
+                if is_greedy:
+                    return 0.01  # avoid numerical errors and keep the same behavior as greedy sampling
                 if not request.sampling_config.temperature:
                     return 1.0
                 temperature = request.sampling_config.temperature[0]
-                if 0 < temperature < 1e-2:
+                if 0 <= temperature < 1e-2:
                     # temperature less than 0.01 may cause numerical errors
                     temperature = 0.01
                 return temperature
 
-            def get_request_top_k(request: LlmRequest) -> int:
+            def get_request_top_k(request: LlmRequest, is_greedy: bool) -> int:
+                if is_greedy:
+                    return 1
                 if not request.sampling_config.top_k:
                     top_k = 0
                 else:
@@ -1269,9 +1274,20 @@ class PyTorchModelEngine(ModelEngine):
                     min_p = request.sampling_config.min_p[0]
                 return min_p
 
-            temperatures.extend([get_request_temperature(request)] *
-                                (draft_len + 1))
-            top_k.extend([get_request_top_k(request)] * (draft_len + 1))
+            def is_greedy_sampling(request: LlmRequest) -> bool:
+                if (request.sampling_config.temperature is None
+                        and request.sampling_config.top_p is None
+                        and request.sampling_config.top_k is None):
+                    return True
+                return False
+
+            is_greedy_req = is_greedy_sampling(request)
+
+            temperatures.extend(
+                [get_request_temperature(request, is_greedy_req)] *
+                (draft_len + 1))
+            top_k.extend([get_request_top_k(request, is_greedy_req)] *
+                         (draft_len + 1))
             top_p.extend([get_request_top_p(request)] * (draft_len + 1))
             min_p.extend([get_request_min_p(request)] * (draft_len + 1))
 

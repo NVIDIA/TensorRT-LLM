@@ -317,10 +317,6 @@ def apply_top_k_top_p(
     return logits
 
 
-def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
-    return logits.argmax(dim=-1).view(-1)
-
-
 def apply_temperature(
     logits: torch.Tensor,
     temp: torch.Tensor,
@@ -337,19 +333,12 @@ def sampling_batch_spec_dec_one_model(
     min_p: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     raw_probs = torch.softmax(logits, dim=-1)
-    greedy_sampled = greedy_sample(logits)
     logits = apply_temperature(logits, temperatures)
     logits = apply_min_p(logits, min_p)
     random_sampled = forward_native(logits, top_k, top_p)
-    next_tokens = torch.where(
-        temperatures <= 1e-2,  # Match the clamping threshold
-        greedy_sampled,
-        random_sampled,
-        out=greedy_sampled,  # Reuse tensor
-    )
-    token_probs = torch.gather(raw_probs, dim=1, index=next_tokens.unsqueeze(1)).squeeze(-1)
+    token_probs = torch.gather(raw_probs, dim=1, index=random_sampled.unsqueeze(1)).squeeze(-1)
     log_probs = torch.log(token_probs)
-    return next_tokens, log_probs
+    return random_sampled, log_probs
 
 
 # Due to tensorrt_llm::runtime::SamplingConfig using vectors, params

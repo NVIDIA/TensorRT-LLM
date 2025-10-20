@@ -370,7 +370,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             # sampling default config vals set in
             # [tensorrt_llm/_torch/pyexecutor/model_engine.py:get_request_[param_name]]
             temperatures.extend([0.01] * (num_draft_tokens + 1))
-            top_k.extend([2147483647] * (num_draft_tokens + 1))
+            top_k.extend([1] * (num_draft_tokens + 1))
             top_p.extend([1.0] * (num_draft_tokens + 1))
             min_p.extend([0.0] * (num_draft_tokens + 1))
         spec_metadata.temperatures = torch.tensor(temperatures,
