@@ -12,13 +12,17 @@ from torch.utils.cpp_extension import load
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9;9.0")
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-BUILD_DIR = os.path.join(THIS_DIR, "_moe_align_build")
+CACHE_ROOT = os.environ.get("AD_CACHE_DIR", "/tmp/ad_cache")
+BUILD_DIR = os.path.join(CACHE_ROOT, "auto_deploy", "fused_moe", "moe_align")
 try:
     os.makedirs(BUILD_DIR, exist_ok=True)
 except PermissionError:
     import tempfile
 
-    BUILD_DIR = os.path.join(tempfile.gettempdir(), "_moe_align_build")
+    # Fallback to the system temp dir while maintaining a stable subfolder layout
+    BUILD_DIR = os.path.join(
+        tempfile.gettempdir(), "ad_cache", "auto_deploy", "fused_moe", "moe_align"
+    )
     os.makedirs(BUILD_DIR, exist_ok=True)
 
 moe_align_ext = load(
