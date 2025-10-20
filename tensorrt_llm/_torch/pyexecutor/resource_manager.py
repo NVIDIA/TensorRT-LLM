@@ -573,11 +573,12 @@ class KVCacheManager(BaseResourceManager):
         run_kv_cache_rellocation = False
         for request in scheduled_batch.generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if request.py_num_accepted_draft_tokens > 0:
+                if request.py_num_accepted_draft_tokens > 0 and len(
+                        request.py_num_accepted_draft_tokens_indices) > 0:
                     run_kv_cache_rellocation = True
         if not run_kv_cache_rellocation:
             return
-        requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
+        requests = scheduled_batch.all_requests()
         accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = self.locate_accepted_draft_tokens(
             requests)
         past_key_value_lengths = attn_metadata.kv_lens_cuda
