@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from typing import Optional
+from typing import Optional, Tuple
+
+from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
@@ -172,14 +174,19 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: int = None,
-        ctx_chunk_config: Optional[
-            tb_internal.batch_manager.ContextChunkingConfig] = None,
+        ctx_chunk_config: Optional[Tuple[StrEnum, int]] = None,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+
+        ctx_chunk_config_cpp = None
+        if ctx_chunk_config is not None:
+            ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
+                ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1])
+
         self.impl = tb_internal.algorithms.MicroBatchScheduler(
-            ctx_chunk_config, max_num_tokens)
+            ctx_chunk_config_cpp, max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]

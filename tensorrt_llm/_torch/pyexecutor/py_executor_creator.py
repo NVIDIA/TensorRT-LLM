@@ -6,17 +6,17 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
-from tensorrt_llm.bindings.executor import (ContextChunkingPolicy,
-                                            GuidedDecodingConfig)
-from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy, LoadFormat,
+from tensorrt_llm.bindings.executor import GuidedDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          ContextChunkingPolicy, LoadFormat,
                                           PybindMirror, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -450,13 +450,12 @@ def create_py_executor(
             logger.info(
                 f"ChunkUnitSize is set to {chunk_unit_size} as sliding window attention is used."
             )
-        chunking_policy = (
-            scheduler_config.context_chunking_policy._to_pybind()
-            if scheduler_config.context_chunking_policy is not None else
-            ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        chunking_policy = (scheduler_config.context_chunking_policy if
+                           scheduler_config.context_chunking_policy is not None
+                           else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
         assert chunk_unit_size is not None, "chunk_unit_size must be set"
-        ctx_chunk_config = ContextChunkingConfig(chunking_policy,
-                                                 chunk_unit_size)
+        ctx_chunk_config: Tuple[StrEnum,
+                                int] = (chunking_policy, chunk_unit_size)
     else:
         ctx_chunk_config = None
 
