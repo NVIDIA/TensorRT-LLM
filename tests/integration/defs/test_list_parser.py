@@ -575,9 +575,10 @@ def handle_corrections(corrections, test_prefix):
 
 def record_invalid_tests(output_file, corrections):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, "w") as f:
+    with open(output_file, "a") as f:
         invalid_tests = {"invalid": list(corrections.keys())}
         json.dump(invalid_tests, f)
+        f.write("\n")
 
 
 def parse_and_validate_test_list(
