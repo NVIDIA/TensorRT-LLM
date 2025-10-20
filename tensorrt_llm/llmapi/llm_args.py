@@ -282,9 +282,10 @@ class _ParallelConfig(StrictBaseModel):
     pp_size: int = 1
     cp_size: int = 1
     gpus_per_node: int = 8
-    moe_cluster_size: int = 1
-    moe_tp_size: int = 1
-    moe_ep_size: int = 1
+    # Set default for MoE fields to -1 to trigger auto-calculation in Mapping
+    moe_cluster_size: int = -1
+    moe_tp_size: int = -1
+    moe_ep_size: int = -1
     cp_config: dict = Field(default_factory=dict)
     enable_attention_dp: bool = False
     enable_lm_head_tp_in_adp: bool = False
