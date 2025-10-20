@@ -1703,17 +1703,17 @@ class MLA(nn.Module):
         q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
 
         sm_version = get_sm_version()
-        # sm checking at runtime due to FlashMLA kernel limitation
-        padding = 128 if sm_version >= 100 else 64  # kernel limitation to 128 for SM100 and 64 for SM90
+        padding = 128 if sm_version >= 100 else 64
         if self.num_heads % padding != 0:
-            # Assert that padding is mathematically valid
+            # To use FlashMLA sparse_prefill_fwd kernel, the number of heads must be (padded to) 128 for SM100 and multiple of 64 for SM90
             assert padding % self.num_heads == 0, (
                 f"Cannot pad num_heads={self.num_heads} to {padding}. "
                 f"Padding must be a multiple of num_heads.")
 
             logger.warning_once(
                 f"Padding num_heads from {self.num_heads} to {padding} "
-                f"due to FlashMLA sparse attention kernel requirement")
+                f"due to FlashMLA sparse attention kernel requirement",
+                key="sparse_mla_padding_warning")
 
             # Create padded tensor with zeros for extra heads
             q_padded = q_concat.new_empty(
@@ -1721,9 +1721,9 @@ class MLA(nn.Module):
             q_padded[:, :self.num_heads, :] = q_concat
             q_concat = q_padded
 
-        # Convert indices and prepare KV pool
+        # Convert indices and return all-layer KV pool
         # Note: underlying pool is layer-interleaved: [num_blocks, num_layers, kv_factor, tokens_per_block, num_kv_heads, head_dim]
-        # stride_factor accounts for jumping over interleaved layers in memory
+        # to avoid reshape(copy) per-layer KV cache, we return all-layer KV pool w/ topk indices adjusted by stride_factor=num_layers*tokens_per_block
         topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
             topk_indices,
             attn_metadata,

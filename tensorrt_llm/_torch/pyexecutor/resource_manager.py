@@ -1231,7 +1231,7 @@ class BlockManager:
                 self.block_ids[request_id].extend(new_blocks)
 
     def copy_block_offsets(self, request_ids: List[int],
-                           block_offsets: torch.Tensor) -> torch.Tensor:
+                           block_offsets: torch.Tensor) -> None:
         for i in range(len(request_ids)):
             block_ids = self.block_ids[request_ids[i]]
             block_num = len(block_ids)
@@ -1255,8 +1255,7 @@ class BlockManager:
             return
         request_id = request.py_request_id
         self.num_sequences[request_id] -= rewind_len
-        num_tokens = request.max_beam_num_tokens
-        updated_token_num = num_tokens - rewind_len
+        updated_token_num = max(self.num_sequences[request_id], 0)
         block_count_needed = self.compute_block_count(updated_token_num,
                                                       self.tokens_per_block)
         num_rewind_pages = len(self.block_ids[request_id]) - block_count_needed

@@ -32,7 +32,7 @@ from tensorrt_llm.mapping import Mapping
 def has_deep_gemm():
     try:
         return deep_gemm is not None
-    except:
+    except Exception:
         return False
 
 
@@ -707,7 +707,6 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     gen_offset = 0
     for seq_idx in range(batch_size):
         seq_context_len = context_lens_context[seq_idx].item()
-        final_lens[seq_idx].item()
 
         # Write context tokens
         for token_pos in range(seq_context_len):

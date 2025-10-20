@@ -27,6 +27,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
+from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -75,7 +76,7 @@ def transform_local_topk_and_prepare_pool_view(
     num_blocks, num_layers, _, _ = all_layer_kv_pool.shape
     tokens_per_block = kv_cache_manager.tokens_per_block
     head_dim = kv_cache_manager.head_dim
-    assert num_layers == kv_cache_manager.num_local_layers, "PP is not enable yet for DS32"
+    assert num_layers == kv_cache_manager.num_local_layers, "PP is not enabled yet for DeepSeek V3.2"
     assert all_layer_kv_pool.is_contiguous(
     ), "all_layer_kv_pool should be contiguous"
     all_layer_kv_pool = all_layer_kv_pool.squeeze(2).view(-1, 1, head_dim)
@@ -687,7 +688,6 @@ class Indexer(nn.Module):
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
-        metadata.num_tokens - num_ctx_tokens
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
         head_dim = metadata.kv_cache_manager.index_head_dim
@@ -1115,6 +1115,10 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
             dtype: Optional[torch.dtype] = None,
             aux_stream: Optional[torch.cuda.Stream] = None,
             **kwargs):
+        if sparse_attention_config is None:
+            raise ValueError(
+                "sparse_attention_config is required for DSATrtllmAttention and cannot be None"
+            )
         TrtllmAttention.__init__(
             self,
             layer_idx,
@@ -1239,11 +1243,13 @@ class DSACacheManager(KVCacheManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
-        sparse_attn_config: Optional["SparseAttentionConfig"] = None,
+        sparse_attn_config: "SparseAttentionConfig",
         **kwargs,
     ) -> None:
 
-        assert not kv_cache_config.enable_block_reuse, "DSA cache requires block reuse to be disabled in KV cache config"
+        if kv_cache_config.enable_block_reuse:
+            raise NotImplementedError(
+                "DSA indexer K-cache manager does not support block reuse yet")
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
         # Use a fixed tokens_per_block for indexer k cache due to DG kernel constraints

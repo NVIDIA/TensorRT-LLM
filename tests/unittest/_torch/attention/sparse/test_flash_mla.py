@@ -1,8 +1,5 @@
 """
-Test suite for FlashMLA sparse attention kernels.
-
-Adapted from flash-mla/tests/test_flash_mla_prefill.py
-Tests basic sparse MLA forward pass to verify kernels are working correctly.
+Test basic sparse MLA forward pass to verify kernels are working correctly.
 """
 
 import math
@@ -15,6 +12,7 @@ from utils.util import getSMVersion
 def has_flash_mla():
     """Check if FlashMLA module is available."""
     try:
+        from tensorrt_llm.flash_mla import flash_mla_sparse_fwd  # noqa: F401
         return True
     except ImportError:
         return False

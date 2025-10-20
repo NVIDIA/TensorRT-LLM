@@ -172,14 +172,12 @@ def calculate_reference_output_prefill_only(q_c, kv_c, k_pe, W_UK, W_UV,
                           dim=-1)
         v_mqa = kv_seq.unsqueeze(1).expand(-1, num_heads, -1)
 
-        attn_mask = torch.tril(
-            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
         q_in = q_mqa.unsqueeze(0).transpose(1, 2)
         k_in = k_mqa.unsqueeze(0).transpose(1, 2)
         v_in = v_mqa.unsqueeze(0).transpose(1, 2)
 
         out = torch.nn.functional.scaled_dot_product_attention(
-            q_in, k_in, v_in, attn_mask=attn_mask,
+            q_in, k_in, v_in, is_causal=True,
             scale=softmax_scale).transpose(1, 2).squeeze(0)
 
         results.append(
@@ -377,7 +375,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     # Setup model config
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     max_seqlen = max(seq_lens)
-    sum(seq_lens)
     max_tokens = 16384
 
     # Create sparse attention config (DSA - DeepSeek Sparse Attention)
@@ -495,7 +492,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
         model_config=model_config,
     )
 
-    list(range(batch_spec.batch_size))
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
 
     # Allocate and pre-populate KV cache in batch order [context...][generation...]

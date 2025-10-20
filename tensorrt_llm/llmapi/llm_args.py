@@ -187,6 +187,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
             raise ValueError(f"Invalid algorithm: {algorithm}")
 
         # Remove 'algorithm' before passing to subclass constructor
+        # It's a ClassVar in subclasses, and used for dispatching to the correct subclass
         data = {k: v for k, v in data.items() if k != 'algorithm'}
         return config_class(**data)
 
