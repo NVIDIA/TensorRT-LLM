@@ -46,10 +46,12 @@ The script includes a user configuration section where you can set various param
    - `container_image`: Path to container image
    - `model_path`: Path to model directory
    - `trtllm_repo`: Path to TensorRT-LLM repository
-   - `build_wheel`: Whether to build TensorRT-LLM from source
+   - `install_trtllm`: Whether to install TensorRT-LLM (true/false)
+   - `build_wheel`: Whether to build TensorRT-LLM from source (only if install_trtllm is true)
 
 5. Workspace and Profiling Configuration:
-   - `work_dir`: Path to work directory
+   - `work_dir`: Path to work directory for logs and output
+   - `scripts_dir`: Path to scripts directory containing benchmark scripts
    - `nsys_on`: Enable nsys profiling (true/false)
 
 **Usage:**
@@ -99,9 +101,14 @@ It takes the following arguments in order:
 28. `container_image`: Path to container image.
 29. `model_path`: Path to model directory.
 30. `trtllm_repo`: Path to TensorRT-LLM repository.
-31. `build_wheel`: Whether to build TensorRT-LLM from source.
-32. `work_dir`: Path to work directory.
-33. `nsys_on`: Enable nsys profiling.
+31. `install_trtllm`: Whether to install TensorRT-LLM (true/false).
+32. `build_wheel`: Whether to build TensorRT-LLM from source (only if install_trtllm is true).
+33. `work_dir`: Path to work directory for logs and output.
+34. `scripts_dir`: Path to scripts directory containing benchmark scripts.
+35. `nsys_on`: Enable nsys profiling.
+36. `seq_offset`: Offset added to sequence lengths.
+37. `numa_bind`: Whether to enable NUMA binding.
+38. `benchmark_mode`: Benchmark mode (e2e or gen_only).
 
 ### `gen_worker_config.py`
 
@@ -113,11 +120,11 @@ The script is called from within `disaggr_torch.slurm`. It takes numerous argume
 
 ### `gen_server_config.py`
 
-This Python script generates the server configuration YAML file that configures the `trtllm-serve` disaggregated server. It reads hostname information from the work directory and creates a configuration that specifies the URLs for context and generation servers.
+This Python script generates the server configuration YAML file that configures the `trtllm-serve` disaggregated server. It reads hostname information from the work directory (logs directory) and creates a configuration that specifies the URLs for context and generation servers.
 
 **Usage:**
 
-The script is called from within `start_server.sh`. It takes arguments for the number of context and generation servers and the work directory.
+The script is called from within `start_server.sh`. It takes arguments for the number of context and generation servers and the work directory (logs directory).
 
 ### `start_worker.sh`
 
@@ -142,7 +149,7 @@ This script starts the `trtllm-serve disaggregated` server. It first generates t
 1.  `num_ctx_servers`: Number of context servers.
 2.  `num_gen_servers`: Number of generation servers.
 3.  `work_dir`: Work directory for logs and configuration.
-4.  `script_dir`: Directory containing the scripts.
+4.  `scripts_dir`: Directory containing the scripts.
 
 ### `run_benchmark.sh` and `run_benchmark_nv_sa.sh`
 
@@ -183,7 +190,7 @@ The script supports various metrics collection including:
 3.  `submit.sh` calculates required nodes based on tensor/pipeline parallelism and submits the job to SLURM using `sbatch disaggr_torch.slurm`.
 4.  For each job, SLURM allocates resources and runs `disaggr_torch.slurm`.
 5.  `disaggr_torch.slurm` validates all required parameters.
-6.  `disaggr_torch.slurm` starts the container and optionally builds/installs TensorRT-LLM from source.
+6.  `disaggr_torch.slurm` starts the container and optionally builds/installs TensorRT-LLM from source (controlled by `install_trtllm` and `build_wheel` flags).
 7.  `disaggr_torch.slurm` runs `gen_worker_config.py` to create worker configuration files with tensor/pipeline parallelism settings.
 8.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on allocated nodes for context and generation workers.
 9.  `disaggr_torch.slurm` generates server configuration using `gen_server_config.py` and starts the server with `start_server.sh`.

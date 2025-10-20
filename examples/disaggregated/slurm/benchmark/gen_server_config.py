@@ -27,6 +27,14 @@ if __name__ == "__main__":
                         type=int,
                         default=8333,
                         help="Server port")
+    parser.add_argument("--enable_time_breakdown",
+                        action='store_true',
+                        help="Enable request time breakdown")
+    parser.add_argument(
+        "--perf_metrics_max_requests",
+        type=int,
+        default=1000,
+        help="Maximum number of requests to store perf metrics for")
     args = parser.parse_args()
 
     # check if the work_dir exists
@@ -82,6 +90,11 @@ if __name__ == "__main__":
             'urls': [f'{host}:{args.worker_port}' for host in gen_hostnames]
         }
     }
+
+    if args.enable_time_breakdown:
+        server_config['return_perf_metrics'] = True
+        server_config[
+            'perf_metrics_max_requests'] = args.perf_metrics_max_requests
 
     with open(os.path.join(args.work_dir, "server_config.yaml"), "w") as f:
         yaml.dump(server_config, f)
