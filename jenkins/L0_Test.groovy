@@ -768,7 +768,6 @@ def getPytestBaseCommandLine(
     }
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
     }
     if (extraArgs) {
         testCmdLine += extraArgs
@@ -2052,6 +2051,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
+        if (stageName.contains("-Ray-")) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
+        }
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         }
