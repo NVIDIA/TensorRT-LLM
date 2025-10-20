@@ -875,7 +875,7 @@ class TestMoeFP8:
                               use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [16])
-    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (384, 1, 1, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -993,7 +993,7 @@ class TestMoeFp4:
 
     @pytest.mark.parametrize("num_tokens", [1, 1024])
     @pytest.mark.parametrize("hidden_size", [1024])
-    @pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
+    @pytest.mark.parametrize("intermediate_size", [1024, 768])
     @pytest.mark.parametrize(
         "routing_info",
         [
@@ -1047,16 +1047,16 @@ class TestMoeFp4:
                 id="RoutingRenormalize_topk_4"),
             pytest.param(
                 {
-                    "num_experts": 128,
-                    "top_k": 8,
+                    "num_experts": 512,
+                    "top_k": 10,
                     "padding": 8,
                     "n_groups": None,
                     "top_k_groups": None,
                     "routed_scaling": None,
                     "has_routing_bias": False,
-                    "routing_method_type": RoutingMethodType.RenormalizeNaive
+                    "routing_method_type": RoutingMethodType.Renormalize
                 },
-                id="RoutingRenormalizeNaive"),
+                id="RoutingRenormalize_qwen_next"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
@@ -1129,6 +1129,18 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_topk_4"),
+            pytest.param(
+                {
+                    "num_experts": 512,
+                    "top_k": 10,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_qwen_next"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1203,7 +1215,7 @@ class TestMoeFp4:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
-        assert top_k <= 8
+        assert top_k <= 10
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
@@ -1456,7 +1468,7 @@ class TestMoeFp4:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
-        assert top_k <= 8
+        assert top_k <= 10
         assert num_experts % 4 == 0
 
         if are_groups_valid(top_k_groups, n_groups):
@@ -1832,6 +1844,17 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     [
         pytest.param(
             {
+                "num_experts": 512,
+                "top_k": 10,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_qwen_next"),
+        pytest.param(
+            {
                 "num_experts": 128,
                 "top_k": 8,
                 "n_groups": None,
@@ -1897,10 +1920,12 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         if dtype_activation != "mxfp8":
             pytest.skip("TopK = 4 is tested only with mxfp8")
     if num_tokens == 1024:
-        if top_k != 4 or dtype_activation != "mxfp8" or act_type_str != "SwiGlu" or not use_autotune:
+        if dtype_activation != "mxfp8" or act_type_str != "SwiGlu":
+            pytest.skip("1024 tokens is tested only with mxfp8, SwiGlu")
+    if num_experts == 512:
+        if use_autotune or dtype_activation != "mxfp8" or act_type_str != "SwiGlu":
             pytest.skip(
-                "1024 tokens is tested only with topk=4, mxfp8, SwiGlu, and autotune"
-            )
+                "512 experts is tested only with no autotune, mxfp8, SwiGlu")
     if use_topk_as_input:
         if dtype_activation != "mxfp8" or top_k != 4 or act_type_str != "SwiGlu" or not use_autotune or num_tokens != 1:
             pytest.skip(
@@ -1908,7 +1933,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             )
 
     assert top_k <= num_experts
-    assert top_k <= 8
+    assert top_k <= 10
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
 

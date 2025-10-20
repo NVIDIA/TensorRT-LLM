@@ -67,7 +67,7 @@ def _segment_sum(input_tensor):
     return tensor_segsum
 
 
-def _torch_ssm_transform_prefill(
+def _torch_ssm_prefill(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -162,8 +162,8 @@ def _torch_ssm_transform_prefill(
     return y, ssm_state
 
 
-@torch.library.custom_op("auto_deploy::torch_ssm_transform", mutates_args={})
-def _torch_ssm_transform(
+@torch.library.custom_op("auto_deploy::torch_ssm", mutates_args={})
+def _torch_ssm(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -176,14 +176,12 @@ def _torch_ssm_transform(
     ],  # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
     chunk_size: int,
 ) -> torch.Tensor:
-    y, _ = _torch_ssm_transform_prefill(
-        hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size
-    )
+    y, _ = _torch_ssm_prefill(hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size)
     return y
 
 
-@_torch_ssm_transform.register_fake
-def _torch_ssm_transform_meta(
+@_torch_ssm.register_fake
+def _torch_ssm_meta(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,

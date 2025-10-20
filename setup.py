@@ -75,6 +75,17 @@ def get_version():
     return version
 
 
+def get_license():
+    import sysconfig
+    platform_tag = sysconfig.get_platform()
+    if "x86_64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+    elif "arm64" in platform_tag or "aarch64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+    else:
+        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
+
+
 class BinaryDistribution(Distribution):
     """Distribution which always forces a binary package with platform name"""
 
@@ -246,7 +257,7 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
-    license_files=["LICENSE", "ATTRIBUTIONS-CPP.md"],
+    license_files=get_license(),
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',

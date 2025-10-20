@@ -106,11 +106,12 @@ struct DataBase
     int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, bool isPow2_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
 struct KernelParamsBase
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
+    static constexpr int MaxNumExperts = MaxNumExperts_;
     static constexpr bool UsePdl = UsePdl_;
     static constexpr bool isPow2 = isPow2_;
 
@@ -183,8 +184,8 @@ struct Data : public DataBase
     bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename OutputT_, bool UseGroups_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
@@ -242,8 +243,8 @@ struct Data : public DataBase
     tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
@@ -281,10 +282,16 @@ struct Data : public DataBase
 
     bool mDoSoftmaxBeforeTopK{false};
     bool mNormTopkProb{true}; // Default value is true for Qwen3 model
+    // If true, applies softmax normalization after selecting top-K experts.
+    // Use this for models that require post-selection normalization (e.g., specific Qwen variants).
+    // Mutually exclusive with mDoSoftmaxBeforeTopK when both normalization paths are active.
+    // NOTE: Don't need to use this variable for now.
+    bool mApplySoftmaxAfterTopK{true};
 };
 
-template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool isPow2_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, isPow2_, UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_, bool isPow2_,
+    bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
@@ -296,6 +303,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, isPow2_, UsePdl
     int32_t mTopK = 0;
 
     bool mNormTopkProb = true;
+    bool mApplySoftmaxAfterTopK = false;
 
     static KernelParams setKernelParams(Data const& data)
     {
@@ -304,6 +312,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, isPow2_, UsePdl
 
         params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*) data.mPtrTopKPacked;
         params.mNormTopkProb = data.mNormTopkProb;
+        params.mApplySoftmaxAfterTopK = data.mApplySoftmaxAfterTopK;
         params.mTopK = data.mTopK;
         return params;
     }

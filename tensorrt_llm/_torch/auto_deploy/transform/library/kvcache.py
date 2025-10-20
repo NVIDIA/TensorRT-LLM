@@ -10,6 +10,7 @@ from torch.fx import GraphModule, Node
 
 from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry, Constant
 from ...distributed.common import all_gather_object, get_world_size
+from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
@@ -299,12 +300,15 @@ class ResizeKVCache(BaseTransform):
         per_page_bytes = max(1, current_kv_cache_size // max(1, current_num_pages))
         new_num_pages = int(new_kv_total_bytes // per_page_bytes)
 
-        # Need to sync all the GPUs
-        gathered_num_pages = [None] * get_world_size()
-        all_gather_object(gathered_num_pages, new_num_pages)
-        new_num_pages = min(gathered_num_pages)
-        self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
+        # Need to sync all the GPUs if distributed group is initialized
+        log_msg = f"Using local new_num_pages: {new_num_pages}"
+        if is_distributed_initialized():
+            gathered_num_pages = [None] * get_world_size()
+            all_gather_object(gathered_num_pages, new_num_pages)
+            new_num_pages = min(gathered_num_pages)
+            log_msg = f"After all_gather - new_num_pages: {new_num_pages}"
 
+        self._log_info(log_msg)
         cm.resize_cache(new_num_pages)
 
         # Log the final cache size for performance measurement, do not remove this log.
@@ -342,5 +346,4 @@ class InitializeCache(BaseTransform):
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
         )
-
         return mod, info

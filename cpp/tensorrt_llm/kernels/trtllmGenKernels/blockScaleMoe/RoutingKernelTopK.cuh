@@ -34,6 +34,8 @@ namespace cg = cooperative_groups;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static constexpr int WarpSize = 32;
+static constexpr int MaxNumExpertsUnit = 128;
+static constexpr int MaxNumTopK = 10;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -178,7 +180,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
 };
 
 template <int K, typename Type, int N>
-__forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K],
+__forceinline__ __device__ void reduceTopKFunc(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K],
     int32_t (&outIdx)[K], Type (&value)[N], int32_t (&idx)[N], Type const minValue, int actualK = K)
 {
     static_assert(K > 0, "Top K must have K > 0");
@@ -208,6 +210,67 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
         // get the next largest value
         packedMax = topK[0].reduce(warp);
         RedType::unpack(out[kk], outIdx[kk], packedMax);
+    }
+};
+
+template <int K, typename Type, int N>
+__forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp, Type (&out)[K],
+    int32_t (&outIdx)[K], Type (&value)[N], int32_t (&idx)[N], Type const minValue, int actualK = K)
+{
+    static_assert(K > 0, "Top K must have K > 0");
+    static_assert(K < WarpSize, "Top K must have K < WarpSize");
+    static_assert(N > 0, "Top K must have N > 0");
+    static_assert(N <= 16, "Only support candidates number less than or equal to 16*32=512");
+    static_assert(
+        N <= 4 || N % 4 == 0, "Only support candidates number is a multiple of 4*32=128 or less than or equal to 4");
+    using RedType = TopKRedType<Type>;
+
+    if constexpr (N <= 4)
+    {
+        reduceTopKFunc<K, Type, N>(warp, out, outIdx, value, idx, minValue, actualK);
+    }
+    else
+    {
+
+        constexpr int numLoops = (N - 1) / 4 + 1;
+        constexpr int numResults = (numLoops * K - 1) / WarpSize + 1;
+
+        Type topKBufferValue[numResults];
+        int32_t topKBufferIdx[numResults];
+        int32_t laneIdx = threadIdx.x % WarpSize;
+
+        for (int ii = 0; ii < numResults; ++ii)
+        {
+            topKBufferValue[ii] = minValue;
+            topKBufferIdx[ii] = ii * WarpSize - 1; //@todo: check if this is correct
+        }
+        for (int loop = 0; loop < numLoops; ++loop)
+        {
+            int start = loop * 4;
+            Type topKValue[K];
+            int32_t topKIdx[K];
+            Type inValue[4];
+            int32_t inIdx[4];
+            for (int i = 0; i < 4; ++i)
+            {
+                inValue[i] = value[start + i];
+                inIdx[i] = idx[start + i];
+            }
+            reduceTopKFunc<K, Type, 4>(warp, topKValue, topKIdx, inValue, inIdx, minValue, actualK);
+            int inOffset = laneIdx % K;
+            if (laneIdx >= loop * K && laneIdx < (loop + 1) * K)
+            {
+                topKBufferValue[0] = topKValue[inOffset];
+                topKBufferIdx[0] = topKIdx[inOffset];
+            }
+            if (loop == numLoops - 1 && (laneIdx < (numLoops * K - WarpSize)))
+            {
+                topKBufferValue[1] = topKValue[inOffset];
+                topKBufferIdx[1] = topKIdx[inOffset];
+            }
+        }
+
+        reduceTopKFunc<K, Type, numResults>(warp, out, outIdx, topKBufferValue, topKBufferIdx, minValue, actualK);
     }
 };
 
