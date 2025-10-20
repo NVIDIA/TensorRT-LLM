@@ -187,6 +187,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
         default: null
         status: prototype
+      worker_extension_cls:
+        annotation: Optional[str]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:
