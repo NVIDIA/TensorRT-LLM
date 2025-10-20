@@ -150,10 +150,11 @@ def get_model_from_config_patched(config, **kwargs):
 def _set_sharding_config_patched(self, *args, **kwargs):
     self._sharding_config["head_dim"] = 128
     self._sharding_config["tp_plan"] = {
-        "in_proj": "colwise_fused[21504,21504,512,512,32]",
-        "conv1d": "colwise_fused[21504,512,512]",
+        "in_proj": 'mamba("fused_weight_dims" = {"in_proj": [8192,8192,1024,1024,128], "conv1d": [8192, 1024, 1024]})',
         "out_proj": "rowwise",
-        "*": "gather",
+        "up_proj": "colwise",
+        "down_proj": "rowwise",
+        # "*": "gather",
     }
 
 

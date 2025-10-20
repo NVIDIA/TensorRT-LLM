@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import ast
 import operator
 import re
 from collections import defaultdict
@@ -38,6 +39,7 @@ from ...utils.node_utils import (
 from ...utils.sharding_utils import (
     BMMShardingInfo,
     EPShardingInfo,
+    LayerType,
     ShardingConfig,
     ShardingTransformInfo,
     SplitDimension,
@@ -260,6 +262,7 @@ def detect_sharding_from_factory_config(
     # 4. the allowed values are:
     #   - "colwise"
     #   - "rowwise"
+    #   - "mamba"
     #   - "sequence_parallel"
     #   - "local_colwise"
     #   - "local_rowwise"
@@ -313,6 +316,24 @@ def detect_sharding_from_factory_config(
                 num_shards += 1
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
+                # check if config has parameters.
+                if "(" in config:
+                    config, params_str = config.split("(", 1)
+                    params_str = params_str.rsplit(")", 1)[0]  # Remove trailing )
+
+                    try:
+                        # Convert "key" = value to "key": value format for dict parsing
+                        params_str = params_str.replace(" = ", ": ")
+                        # Wrap in braces to make it a dict and parse
+                        config_params = ast.literal_eval("{" + params_str + "}")
+                    except Exception as e:
+                        ad_logger.warning(
+                            f"Failed to parse config params: {params_str}, error: {e}. "
+                            "Using empty config."
+                        )
+                        config_params = {}
+                else:
+                    config_params = {}
                 if config == "colwise":
                     sharding_config.tp_transforms.append(
                         TPShardingInfo.from_node(
@@ -333,6 +354,20 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                        )
+                    )
+                    num_row_col_shards += 1
+                elif config == "mamba":
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            lin_node,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=None,
+                            min_local_shape=min_local_shape,
+                            layer_type=LayerType.MAMBA,
+                            fused_weight_dims=config_params.get("fused_weight_dims"),
                         )
                     )
                     num_row_col_shards += 1
