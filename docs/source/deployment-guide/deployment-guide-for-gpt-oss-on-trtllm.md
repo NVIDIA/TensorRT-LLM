@@ -67,12 +67,46 @@ TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
 EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-latency.yaml
 ```
 
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/gpt-oss-120b-latency.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
+
 For max-throughput with `CUTLASS` MOE backend:
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
 EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/gpt-oss-120b-throughput.yaml
 ```
+
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/gpt-oss-120b-throughput.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
 
 ### Launch the TensorRT LLM Server
 
