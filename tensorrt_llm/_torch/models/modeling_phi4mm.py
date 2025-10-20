@@ -988,14 +988,14 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = {k: v for k, v in weights.items() if '.lora_' not in k}
         # Rename base layer weights.
         updated_weights = {}
-        base_layers = [
+        base_layer_weight_names = [
             'weight', 'input_scale', 'weight_scale', 'weight_scale_2'
         ]
         for k in weights.keys():
             new_k = k
-            for layer in base_layers:
-                if f'base_layer.{layer}' in k:
-                    new_k = k.replace(f'base_layer.{layer}', layer)
+            for weight_name in base_layer_weight_names:
+                if f'base_layer.{weight_name}' in k:
+                    new_k = k.replace(f'base_layer.{weight_name}', weight_name)
                     break
             updated_weights[new_k] = weights[k]
         weights = updated_weights
