@@ -104,7 +104,7 @@ export TRTLLM_DIR="/app/tensorrt_llm" # path to the TensorRT LLM repo in your lo
 
 Disclaimer: the configs here are specifically optimized for a target ISL/OSL (Input/Output Sequence Length) of 1024/1024. If your traffic pattern is different, you may benefit from additional tuning. In the future, we plan to provide more configs for a wider range of traffic patterns.
 
-This table is designed to be simple; for detailed model-specific deployment guides, check out the [Model Recipes](deployment-guide/index.rst).
+This table is designed to provide a straightforward starting point; for detailed model-specific deployment guides, check out the [Model Recipes](deployment-guide/index.rst).
 
 | Model Name | GPU | Inference Scenario | Config | Command |
 |------|------|------|------|------|

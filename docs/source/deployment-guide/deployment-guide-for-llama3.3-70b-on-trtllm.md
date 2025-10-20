@@ -57,8 +57,26 @@ If you want to use latest main branch, you can choose to build from source to in
 We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
 
 ```shell
-EXTRA_LLM_API_FILE=/app/tensorrt_llm/examples/configs/llama-3.3-70b.yaml
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/llama-3.3-70b.yaml
 ```
+
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/llama-3.3-70b.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
 
 ### Launch the TensorRT LLM Server
 

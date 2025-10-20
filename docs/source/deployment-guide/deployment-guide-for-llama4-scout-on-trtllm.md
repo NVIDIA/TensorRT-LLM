@@ -60,6 +60,23 @@ TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
 EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/llama-4-scout.yaml
 ```
 
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/configs/llama-4-scout.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
+
 ### Launch the TensorRT LLM Server
 
 Below is an example command to launch the TensorRT LLM server with the Llama-4-Scout-17B-16E-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “LLM API Options (YAML Configuration)” section.
