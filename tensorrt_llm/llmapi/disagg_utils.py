@@ -49,6 +49,7 @@ class OtlpConfig():
         str] = None  # Target URL to which OpenTelemetry traces will be sent
 
 
+@dataclass
 class MinimalInstances:
     context_servers: int = 1  # the minimal number of context servers
     generation_servers: int = 1  # the minimal number of generation servers
