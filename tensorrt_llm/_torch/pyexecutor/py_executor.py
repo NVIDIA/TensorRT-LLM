@@ -1601,7 +1601,7 @@ class PyExecutor:
         if not self.kv_cache_transceiver:
             return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
-        if timeout_ms is None or timeout_ms <= 0:
+        if timeout_ms is None:
             return
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
