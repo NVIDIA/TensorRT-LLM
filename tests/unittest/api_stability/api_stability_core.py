@@ -79,6 +79,11 @@ class ParamSnapshot:
     default: Any = None
     status: Optional[str] = None
 
+    def __post_init__(self):
+        # Unify default value of None and inspect._empty
+        if self.default is inspect._empty:
+            self.default = None
+
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
         return cls(param.annotation, param.default)
