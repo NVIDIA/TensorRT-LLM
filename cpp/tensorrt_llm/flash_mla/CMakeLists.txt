@@ -184,6 +184,7 @@ target_compile_options(
     $<$<COMPILE_LANGUAGE:CXX>:-fPIC>
     $<$<COMPILE_LANGUAGE:CXX>:-DNDEBUG>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-c++11-narrowing>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-lto>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:-std=c++17>
