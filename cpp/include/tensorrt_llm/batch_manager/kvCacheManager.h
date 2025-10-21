@@ -200,6 +200,29 @@ struct BlockKey
         }
         return numMatched;
     }
+
+    //! \brief Deep copy, optionally reducing number of tokens
+    struct BlockKey clone(int newNumberOfTokens = 0) const
+    {
+        BlockKey blockKey;
+        blockKey.usesExtraIds = usesExtraIds;
+        blockKey.loraTaskId = loraTaskId;
+        if (newNumberOfTokens > 0)
+        {
+            // Reduce token length (for partial matching)
+            TLLM_CHECK_WITH_INFO(newNumberOfTokens < static_cast<int>(uniqueTokens.size()), "newNumberOfTokens must be less than uniqueTokens.size()");
+            blockKey.uniqueTokens.insert(blockKey.uniqueTokens.begin(), uniqueTokens.begin(), uniqueTokens.begin() + newNumberOfTokens);
+        }
+        else
+        {
+            // Copy all tokens
+            blockKey.uniqueTokens.insert(blockKey.uniqueTokens.begin(), uniqueTokens.begin(), uniqueTokens.end());
+        }
+        blockKey.extraKeys.insert(blockKey.extraKeys.begin(), extraKeys.begin(), extraKeys.end());
+        blockKey.cacheSaltID = cacheSaltID;
+        return blockKey;
+        // TODO: Add unit test verifying correct copy of both partial and full token Ids.
+    }
 };
 
 std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
@@ -329,6 +352,15 @@ public:
 
     [[nodiscard]] std::vector<BlockKey> getBlockKeys(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const;
 
+    //! \brief Find last valid block for prefix given in blockKey.
+    //! \details Seems like blockKey contains a full prefix, not just key for an individual block. This is very hacky and will lead to hilarious bugs.
+    //! \details Since all KV cache manager bugs eventually gets reassigned to me, THIS MUST BE FIXED AT ALL COSTS.
+    //! \details We should introduce a new data type for full prefix keys (maybe named FullPrefixKey?).
+    //! \details Alternatively, we can introduce a new field that tracks whether BlockKey object contains a full prefix or just key for one block.
+    std::unordered_map<SizeType32,std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+            std::vector<SizeType32> const& windowSizes,
+            BlockKey const& blockKey) const;
+
     //! \brief Find first new context block for each window block manager.
     //! \param llmRequest The new request.
     //! \param inputLength Number of useful prompt tokens. If zero, length of prompt minus 1 is used.
@@ -337,7 +369,8 @@ public:
     //! \return map of BlockKey vs windowSize. The block key is that of first new context block for that window size.
     [[nodiscard]] std::unordered_map<SizeType32,BlockKey> findNewContextBlock(LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock, std::vector<SizeType32> const& windowSizes) const;
 
-    //! \brief Find matching nodes for a given prompt prefix
+    //! \brief Find matching nodes for a given prompt prefix.
+    //! \details Nodes are created if not found.
     //! \param allowPartiallyFilledBlock Allow last block in prompt to have less than tokensPerBlock tokens.
     [[nodiscard]] LookupResults lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock);
 
@@ -346,10 +379,10 @@ public:
     std::unordered_map<SizeType32,std::vector<std::tuple<bool,SizeType32,BlockPtr,LookupNodePtr>>> lookupBlocks(
             std::map<SizeType32,WindowBlockManager> const& windowBlockManagers, 
             LlmRequest const& llmRequest, SizeType32 inputLength, 
-            bool allowPartiallyFilledBlock, bool enablePartialReuse);
+            bool allowPartiallyFilledBlock, bool enablePartialReuse) const;
 
     // Print methods used for debugging.
-    std::string printPrompt(LlmRequest const& llmRequest);
+    std::string printPrompt(LlmRequest const& llmRequest) const;
 
 private:
     // Root of search structure
@@ -729,9 +762,7 @@ public:
     void pinBlocks(GenerationRequest& sequence);
 
     //! \brief Release blocks of the sequence.
-    //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
-    std::optional<KVCacheBlock::IdType> releaseBlocks(
-        GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+    std::optional<KVCacheBlock::IdType> releaseBlocks(GenerationRequest& sequence);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -931,8 +962,6 @@ public:
         return mIsSWA;
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
-
     //! \brief Unpin blocks by starting from a block id and walking prev pointers.
     void unpinBlocksById(KVCacheBlock::IdType blockId);
 
@@ -953,7 +982,7 @@ private:
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
-    [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
+    [[nodiscard]] BlockPtr getFreeBlock(
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
@@ -1031,9 +1060,6 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
-
-    // Mutex for the cached blocks root
-    std::mutex mCachedBlocksRootMutex;
 };
 
 class BlockManager
@@ -1295,10 +1321,7 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
-    {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
-    }
+        BlockKey const& blockKey, SizeType32 windowSize) const;
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
@@ -1363,6 +1386,9 @@ private:
         return getWindowSizeMetadata(windowSize).absolutePoolsOffset;
     }
 
+    std::optional<KVCacheBlock::IdType> notThreadSafeStoreBlocksForReuse(
+            GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks);
+
 private:
     SizeType32 mNumLayers;
     SizeType32 mTokensPerBlock;
@@ -1381,6 +1407,8 @@ private:
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
 
     bool mEnablePartialReuse;
+    // Mutex for the cached blocks root
+    mutable std::mutex mCachedBlocksRootMutex;
     LookupPtr mLookup;
 };
 
