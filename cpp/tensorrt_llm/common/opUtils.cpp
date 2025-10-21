@@ -259,8 +259,30 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
     static PerCudaCtxPerThreadSingletonCreator<cublasHandle_t> creator(
         []() -> auto
         {
+            size_t free_mem = 0, total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+
+            CUcontext ctx;
+            cuCtxGetCurrent(&ctx);
+
+            TLLM_LOG_DEBUG("Creating cublas handle: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", ctx,
+                free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0, total_mem / (1024 * 1024));
+
             auto handle = std::unique_ptr<cublasHandle_t>(new cublasHandle_t);
-            TLLM_CUDA_CHECK(cublasCreate(handle.get()));
+
+            cublasStatus_t status = cublasCreate(handle.get());
+
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                cudaMemGetInfo(&free_mem, &total_mem);
+                TLLM_THROW(
+                    "Failed to create cublas handle. "
+                    "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+                    "Consider reducing kv_cache_config.max_tokens or free_gpu_memory_fraction.",
+                    status, ctx, free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0,
+                    total_mem / (1024 * 1024));
+            }
+
             return handle;
         },
         [](cublasHandle_t* handle)
@@ -277,8 +299,30 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
     static PerCudaCtxPerThreadSingletonCreator<cublasLtHandle_t> creator(
         []() -> auto
         {
+            size_t free_mem = 0, total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+
+            CUcontext ctx;
+            cuCtxGetCurrent(&ctx);
+
+            TLLM_LOG_DEBUG("Creating cublasLt handle: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", ctx,
+                free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0, total_mem / (1024 * 1024));
+
             auto handle = std::unique_ptr<cublasLtHandle_t>(new cublasLtHandle_t);
-            TLLM_CUDA_CHECK(cublasLtCreate(handle.get()));
+
+            cublasStatus_t status = cublasLtCreate(handle.get());
+
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                cudaMemGetInfo(&free_mem, &total_mem);
+                TLLM_THROW(
+                    "Failed to create cublasLt handle. "
+                    "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+                    "Consider reducing kv_cache_config.max_tokens or free_gpu_memory_fraction.",
+                    status, ctx, free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0,
+                    total_mem / (1024 * 1024));
+            }
+
             return handle;
         },
         [](cublasLtHandle_t* handle)
