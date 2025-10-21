@@ -535,6 +535,11 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
             dtype=torch.int32,
             device='cuda',
         )
+        self.host_kt_cache_block_offsets = torch.zeros_like(
+            self.kt_cache_block_offsets,
+            device='cpu',
+            pin_memory=True,
+        )
 
     def prepare(self) -> None:
         super().prepare()
@@ -552,8 +557,8 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
 
         if self.kv_cache_manager is not None:
             # for kt cache
-            self.host_kt_cache_block_offsets = self.kv_cache_manager.get_kt_block_offsets(
-                self.request_ids)
+            self.kv_cache_manager.copy_kt_block_offsets(
+                self.request_ids, self.host_kt_cache_block_offsets)
             self.kt_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_kt_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
@@ -937,10 +942,17 @@ class RocketKVCacheManager(KVCacheManager):
 
     def prepare_resources(self, scheduled_batch):
         super().prepare_resources(scheduled_batch)
-        for req in scheduled_batch.all_requests():
+        for req in scheduled_batch.context_requests:
             request_id = req.py_request_id
-            kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
+            num_tokens = req.prompt_len
+            kt_token_num = math.ceil(num_tokens / self.page_size)
             self.kt_cache_manager.add_tokens(request_id, kt_token_num)
+
+        for req in scheduled_batch.generation_requests:
+            request_id = req.py_request_id
+            num_tokens = req.max_beam_num_tokens + 1
+            if num_tokens % self.page_size == 1:
+                self.kt_cache_manager.add_tokens(request_id, 1)
 
     def update_resources(self,
                          scheduled_batch,
