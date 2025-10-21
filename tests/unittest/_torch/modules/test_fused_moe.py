@@ -1315,8 +1315,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 def test_fused_moe_nvfp4(dtype, moe_backend):
 
     if moe_backend == "TRTLLM" and dtype == torch.float16:
-        pytest.skip(
-            reason="TRTLLM NVFP4 MoE backend does not support float16 yet", )
+        pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()

@@ -181,7 +181,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
             args.num_tokens, top_k, num_experts, tile_tokens_dim);
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
-            max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+            max_num_padded_tokens, 2 * args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
     int32_t max_num_padded_tokens_gemm2
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
