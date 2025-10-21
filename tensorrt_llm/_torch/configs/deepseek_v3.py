@@ -6,6 +6,8 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
+# This is a temporary workaround for DeepSeek-V3.2 model as HF does not support it yet
+# TODO: Remove this once HF supports DeepSeek-V3.2
 class DeepseekV3Config(PretrainedConfig):
 
     model_type = "deepseek_v3"
