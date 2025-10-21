@@ -820,7 +820,7 @@ def create_py_executor_instance(
 def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
                               max_batch_size: int,
                               speculative_config: SpeculativeConfig,
-                              max_beam_width: int):
+                              max_beam_width: int, use_overlap_scheduler: bool):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
@@ -832,13 +832,12 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     else:
         max_total_draft_tokens = max_draft_len
 
-    return TorchSampler.Args(
-        max_seq_len=max_seq_len,
-        max_draft_len=max_draft_len,
-        max_total_draft_tokens=max_total_draft_tokens,
-        max_num_sequences=max_num_sequences,
-        max_beam_width=max_beam_width,
-    )
+    return TorchSampler.Args(max_seq_len=max_seq_len,
+                             max_draft_len=max_draft_len,
+                             max_total_draft_tokens=max_total_draft_tokens,
+                             max_num_sequences=max_num_sequences,
+                             max_beam_width=max_beam_width,
+                             use_overlap_scheduler=use_overlap_scheduler)
 
 
 def instantiate_sampler(engine: PyTorchModelEngine,
@@ -853,7 +852,9 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         max_seq_len=engine.max_seq_len,
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
-        max_beam_width=max_beam_width)
+        max_beam_width=max_beam_width,
+        use_overlap_scheduler=not pytorch_backend_config.
+        disable_overlap_scheduler)
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
     if mapping.cp_config.get('cp_type') == CpType.STAR:
