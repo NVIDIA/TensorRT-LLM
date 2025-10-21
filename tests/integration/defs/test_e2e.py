@@ -830,20 +830,6 @@ def get_tmp_file():
 
 
 @pytest.fixture
-def clear_flashinfer_cache():
-    """Clear flashinfer cache directory before test execution"""
-    flashinfer_cache_path = Path.home() / ".cache" / "flashinfer"
-    if flashinfer_cache_path.exists():
-        shutil.rmtree(flashinfer_cache_path)
-        print(f"Cleared flashinfer cache: {flashinfer_cache_path}")
-    yield
-    # Cleanup after test if needed
-    if flashinfer_cache_path.exists():
-        shutil.rmtree(flashinfer_cache_path)
-        print(f"Cleaned up flashinfer cache after test: {flashinfer_cache_path}")
-
-
-@pytest.fixture
 def temp_extra_llm_api_options_file(request):
     if request.node.callspec.params['use_extra_config']:
         temp_dir = tempfile.gettempdir()
@@ -3366,7 +3352,8 @@ def test_ptp_star_attention_example(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("model_name,model_path", [
     ("DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"),
 ])
-def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path, clear_flashinfer_cache):
+def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path,
+                         clear_flashinfer_cache):
     print(f"Testing scaffolding {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
