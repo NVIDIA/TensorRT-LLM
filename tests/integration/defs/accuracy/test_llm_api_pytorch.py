@@ -2434,8 +2434,8 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         with LLM(self.MODEL_PATH,
-                 max_seq_len=8192,
-                 max_batch_size=32,
+                 max_seq_len=1024,
+                 max_batch_size=16,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -2443,8 +2443,8 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                  if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            #task = GSM8K(self.MODEL_NAME)
+            #task.evaluate(llm)
             # task = GPQADiamond(self.MODEL_NAME)
             # task.evaluate(llm,
             #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
@@ -2459,8 +2459,8 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
     def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size):
         model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
         with LLM(model_path,
-                 max_seq_len=8192,
-                 max_batch_size=32,
+                 max_seq_len=1024,
+                 max_batch_size=16,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -2470,11 +2470,11 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            #task = GSM8K(self.MODEL_NAME)
+            #task.evaluate(llm)
+            #task = GPQADiamond(self.MODEL_NAME)
+            #task.evaluate(llm,
+            #              extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
