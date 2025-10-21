@@ -28,6 +28,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -35,10 +36,27 @@ from .kernel import triton_convert_req_index_to_global_index
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
+# Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
+try:
+    from fast_hadamard_transform import hadamard_transform
+    HAS_FAST_HADAMARD = True
+except ImportError:
+    hadamard_transform = None
+    HAS_FAST_HADAMARD = False
+
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
+
+    if not HAS_FAST_HADAMARD:
+        # Fallback: skip transformation (acceptable for test/dev)
+        logger.warning_once(
+            "fast-hadamard-transform not available. DSA sparse attention will skip "
+            "hadamard transformation. Install with: "
+            "pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git",
+            key="fast_hadamard_import_missing")
+        return x
+
     hidden_size = x.size(-1)
     assert (hidden_size & (hidden_size - 1)
             ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
