@@ -520,6 +520,11 @@ class MultimodalParams:
         return bool(self.multimodal_input or self.multimodal_data)
 
 
+@dataclass
+class MultimodalServerConfig():
+    media_io_kwargs: Optional[dict] = None
+
+
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
 def serialize_item(obj: object) -> bytes:
     # Simple cases

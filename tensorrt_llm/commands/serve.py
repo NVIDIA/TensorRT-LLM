@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import os
 import signal  # Added import
 import subprocess  # nosec B404
@@ -18,6 +19,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
@@ -138,12 +140,14 @@ def get_llm_args(model: str,
     return llm_args, llm_args_extra_dict
 
 
-def launch_server(host: str,
-                  port: int,
-                  llm_args: dict,
-                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  server_role: Optional[ServerRole] = None,
-                  disagg_cluster_config: Optional[DisaggClusterConfig] = None):
+def launch_server(
+        host: str,
+        port: int,
+        llm_args: dict,
+        metadata_server_cfg: Optional[MetadataServerConfig] = None,
+        server_role: Optional[ServerRole] = None,
+        disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+        multimodal_server_config: Optional[MultimodalServerConfig] = None):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -165,7 +169,8 @@ def launch_server(host: str,
                           model=model,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg,
-                          disagg_cluster_config=disagg_cluster_config)
+                          disagg_cluster_config=disagg_cluster_config,
+                          multimodal_server_config=multimodal_server_config)
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -325,6 +330,10 @@ class ChoiceWithAlias(click.Choice):
               is_flag=True,
               default=False,
               help="Enable chunked prefill")
+@click.option("--media-io-kwargs",
+              type=str,
+              default=None,
+              help="Keyword arguments for media I/O.")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -335,7 +344,7 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str]):
+        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -391,8 +400,20 @@ def serve(
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+
+    # Parse media_io_kwargs from JSON string to dict if provided
+    parsed_media_io_kwargs = None
+    if media_io_kwargs is not None:
+        try:
+            parsed_media_io_kwargs = json.loads(media_io_kwargs)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON for media_io_kwargs: {e}")
+
+    multimodal_server_config = MultimodalServerConfig(
+        media_io_kwargs=parsed_media_io_kwargs)
     launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  disagg_cluster_config)
+                  disagg_cluster_config,
+                  multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
