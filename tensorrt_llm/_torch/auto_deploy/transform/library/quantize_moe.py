@@ -16,11 +16,6 @@ from .quantization import (
     Quantization,
 )
 
-quantized_moe_op_map = {
-    "FP8": torch.ops.auto_deploy.torch_quant_fp8_moe,
-    "NVFP4": torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-}
-
 
 def _quantize_moe_node(
     gm: GraphModule,
@@ -166,7 +161,7 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
     """
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_moe
+        return torch.ops.auto_deploy.triton_quant_fp8_moe
 
     def _apply(
         self,
