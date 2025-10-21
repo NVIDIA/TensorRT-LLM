@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 
@@ -534,8 +535,6 @@ class AutoTuner:
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
 
-        self.profiling_debug = True
-
     @classmethod
     def get(cls):
         if cls._instance is None:
@@ -745,6 +744,10 @@ class AutoTuner:
             are used to ensure accurate timing.
         """
         stream = torch.cuda.current_stream()
+
+        if self._is_sync_op(runner):
+            mpi_barrier()
+
         # warm up, no timing
         for _ in range(self.warmup):
             runner(inputs, tactic=tactic, **kwargs)
@@ -756,6 +759,9 @@ class AutoTuner:
         delay_kernel(self.stream_delay_micro_secs, stream)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+
+        if self._is_sync_op(runner):
+            mpi_barrier()
 
         start.record(stream=stream)
         for _ in range(self.repeat):
@@ -938,6 +944,9 @@ class AutoTuner:
                 tensor = inputs[i]
             tensors.append(tensor)
         return tensors
+
+    def _is_sync_op(self, runner: TunableRunner) -> bool:
+        return runner.__class__.__name__ in ["AllReduceRunner"]
 
     def clear_cache(self) -> None:
         """Clear the profiling cache."""

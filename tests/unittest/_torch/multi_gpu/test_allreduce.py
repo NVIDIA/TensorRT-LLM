@@ -24,9 +24,10 @@ from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, MoEAllReduce,
-                                             MoEAllReduceParams)
+                                             AllReduceParams, AllReduceStrategy,
+                                             MoEAllReduce, MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -62,13 +63,21 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
     return y
 
 
-def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
-                    residual, weights, hidden_size, dtype, fusion_op):
+def run_single_rank(tensor_parallel_size,
+                    single_rank_forward_func,
+                    input,
+                    residual,
+                    weights,
+                    hidden_size,
+                    dtype,
+                    fusion_op,
+                    is_autotune: bool = False):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
         single_rank_forward_func(input, residual, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights, fusion_op)
+                                 tensor_parallel_size, rank, weights, fusion_op,
+                                 is_autotune)
     except Exception:
         traceback.print_exc()
         raise
@@ -91,10 +100,15 @@ def run_moe_single_rank(tensor_parallel_size, single_rank_forward_func,
 
 
 @torch.inference_mode()
-def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
-                     dtype: torch.dtype, tensor_parallel_size: int,
-                     tensor_parallel_rank: int, weights: torch.Tensor,
-                     fusion_op: AllReduceFusionOp):
+def run_allreduce_op(x: torch.Tensor,
+                     residual: torch.Tensor,
+                     hidden_size: int,
+                     dtype: torch.dtype,
+                     tensor_parallel_size: int,
+                     tensor_parallel_rank: int,
+                     weights: torch.Tensor,
+                     fusion_op: AllReduceFusionOp,
+                     is_autotune: bool = False):
 
     def e2m1_and_ufp8sf_scale_to_float_v2(e2m1_tensor,
                                           ufp8_scale_tensor,
@@ -126,15 +140,12 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
     ).cuda()
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
-    allreduce = AllReduce(mapping=mapping).cuda()
+    strategy = AllReduceStrategy.AUTOTUNE if is_autotune else AllReduceStrategy.NCCL
+    allreduce = AllReduce(mapping=mapping, strategy=strategy).cuda()
 
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
     linear.load_weights([dict(weight=weights[0])])
     norm.weight.data.copy_(norm_weight)
-
-    def calc_allreduce(x, res):
-        linear_out = linear(x)
-        return [linear_out]
 
     def calc_fused_allreduce(x, res):
         linear_out = linear(
@@ -150,7 +161,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
                 eps=eps,
             ),
         )
-        return output
+        return [output] if fusion_op == AllReduceFusionOp.NONE else output
 
     def calc_residual_rms_norm_quant_fp8(x, res):
         quant_fp8, residual_out = calc_fused_allreduce(x, res)
@@ -215,7 +226,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
         return norm_out, dequant_fp4, residual_out
 
     fusion_op_to_func = {
-        AllReduceFusionOp.NONE: (calc_allreduce, ref_allreduce),
+        AllReduceFusionOp.NONE: (calc_fused_allreduce, ref_allreduce),
         AllReduceFusionOp.RESIDUAL_RMS_NORM: (calc_fused_allreduce,
                                               ref_residual_rms_norm),
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
@@ -234,7 +245,11 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
 
     # common allreduce path
     xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
-    calc_output = calc_func(xs[tensor_parallel_rank], residual)
+
+    # trigger autotune
+    with autotune(tune_mode=is_autotune):
+        calc_output = calc_func(xs[tensor_parallel_rank], residual)
+
     ref_output = ref_func(xs[tensor_parallel_rank], residual)
 
     for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
@@ -293,6 +308,47 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
         run_single_rank,
         *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
                 [linear_weight], hidden_size, dtype, fusion_op)] *
+             tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("seq_len", [1, 1024], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [8192], ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize(
+    "fusion_op",
+    [
+        pytest.param(AllReduceFusionOp.NONE, id="none"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                     id="residual_rms_norm"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+                     id="residual_rms_norm_quant_fp8"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+                     id="residual_rms_norm_out_quant_fp8"),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                     id="residual_rms_norm_quant_nvfp4",
+                     marks=skip_pre_blackwell),
+        pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                     id="residual_rms_norm_out_quant_nvfp4",
+                     marks=skip_pre_blackwell),
+    ],
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_tunable_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
+                                           mpi_pool_executor):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    x = torch.randn((seq_len, hidden_size), dtype=dtype)
+    residual = torch.randn_like(x)
+    linear_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,
+                [linear_weight], hidden_size, dtype, fusion_op, True)] *
              tensor_parallel_size),
     )
     for r in results:
