@@ -357,7 +357,9 @@ def create_py_executor(
                     from tensorrt_llm._torch.speculative.drafting_loops import \
                         ChainDrafter
 
-                    return ChainDrafter(spec_config.max_draft_len, model)
+                    return ChainDrafter(spec_config.max_draft_len,
+                                        spec_config.max_total_draft_tokens,
+                                        model)
             else:
                 drafting_loop_wrapper = None
 
@@ -397,11 +399,11 @@ def create_py_executor(
     if not pytorch_backend_config.disable_overlap_scheduler:
         model_engine_max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_draft_len
+            model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
-        model_engine_max_seq_len += spec_config.max_draft_len
+        model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -471,7 +473,8 @@ def create_py_executor(
                     "vocab_size_padded": model_engine.model.vocab_size_padded
                 }
                 if spec_config is not None:
-                    kwargs["max_num_draft_tokens"] = spec_config.max_draft_len
+                    kwargs[
+                        "max_num_draft_tokens"] = spec_config.max_total_draft_tokens
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
