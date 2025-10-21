@@ -2334,8 +2334,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT"),
-            # TODO: Enable overlap scheduler for MTP when MTP hang issue is fixed
-            (8, 1, 8, 1, False, True, True, False, 24, "_DEFAULT"),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT"),
         ],
         ids=["baseline", "baseline_mtp1"])
     def test_baseline_fp8gemm_bf16_kv(self, tp_size, pp_size, ep_size,

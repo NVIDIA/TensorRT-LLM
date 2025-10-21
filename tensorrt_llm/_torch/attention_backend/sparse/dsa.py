@@ -385,11 +385,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             cache_name="cu_seqlen_ke",
             dtype=torch.int32,
         )
-        self.gen_kv_offsets = get_empty(
-            (self.max_num_tokens, 1),
-            cache_name="gen_kv_offsets",
-            dtype=torch.int32,
-        )
 
     def prepare(self):
         super().prepare()
@@ -400,7 +395,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
 
-        # Build req_idx_per_token for topk_indices conversion (same pattern as gen_kv_offsets)
+        # Build req_idx_per_token for topk_indices conversion
         host_req_idx_per_token = torch.repeat_interleave(torch.arange(
             self.num_seqs, dtype=torch.int32),
                                                          self.seq_lens,
@@ -490,33 +485,39 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
 
+    def on_update_kv_lens(self):
+        # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
+        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        if self.num_generations > 0:
+            tokens_per_block = self.kv_cache_manager.indexer_k_cache_tokens_per_block
+            torch.cumsum(
+                self.kv_lens_cuda[self.num_contexts:self.
+                                  num_seqs],  # num_contexts should be 0
+                dim=0,
+                dtype=torch.int64,
+                out=self.gen_kv_indptr[1:self.num_generations + 1])
+            torch.cumsum(
+                (self.kv_lens_cuda[self.num_contexts:self.num_seqs] -
+                 self.seq_lens_cuda[self.num_contexts:self.num_seqs]),
+                dim=0,
+                dtype=torch.int64,
+                out=self.gen_cached_token_indptr[1:self.num_generations + 1])
+            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                self.kv_lens_cuda[self.num_contexts:self.num_seqs],
+                tokens_per_block, self.num_sms)
+            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
+                                                 non_blocking=True)
+
     def update_for_spec_dec(self):
         super().update_for_spec_dec()
-        tokens_per_block = self.kv_cache_manager.indexer_k_cache_tokens_per_block
+        self.kv_cache_manager.indexer_k_cache_tokens_per_block
         # host
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
         self.max_gen_seq_len = 1
 
         # device
-        torch.cumsum(
-            self.kv_lens_cuda[0:self.num_seqs],  # num_contexts should be 0
-            dim=0,
-            dtype=torch.int64,
-            out=self.gen_kv_indptr[1:self.num_seqs + 1])
-        torch.cumsum(
-            self.kv_lens_cuda[0:self.num_seqs] -
-            1,  # -1 to get the cached_token_lens
-            dim=0,
-            dtype=torch.int64,
-            out=self.gen_cached_token_indptr[1:self.num_generations + 1])
-        scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-            self.kv_lens_cuda[:self.num_seqs], tokens_per_block, self.num_sms)
-        self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
-                                             non_blocking=True)
-        # all of the seq_lens are 1, so the gen_kv_offsets is the same as the gen_kv_indptr
-        self.gen_kv_offsets[:self.num_seqs].copy_(
-            self.gen_kv_indptr[:self.num_seqs].unsqueeze(1))
+        self.on_update_kv_lens()
 
 
 class Indexer(nn.Module):

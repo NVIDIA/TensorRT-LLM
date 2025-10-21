@@ -765,6 +765,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
 
+    def on_update_kv_lens(self):
+        # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
+        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        pass
+
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
