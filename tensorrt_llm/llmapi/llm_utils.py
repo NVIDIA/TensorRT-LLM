@@ -5,12 +5,13 @@ import shutil
 import tempfile
 import time
 import weakref
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import transformers
+from pydantic import BaseModel
 from tqdm import tqdm
 
 from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
@@ -727,8 +728,14 @@ class CachedModelLoader:
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
 
         def serialize(d) -> str:
-            dic = asdict(d) if not isinstance(
-                d, PretrainedConfig) else d.to_dict()
+            if hasattr(d, "to_dict"):
+                dic = d.to_dict()
+            elif is_dataclass(d):
+                dic = asdict(d)
+            elif isinstance(d, BaseModel):
+                dic = d.model_dump(mode="json")
+            else:
+                raise ValueError(f"Could not serialize type: {type(d)}")
             return json.dumps(dic, sort_keys=True)
 
         parallel_config = self.llm_args.parallel_config
