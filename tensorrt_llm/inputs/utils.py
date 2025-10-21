@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import math
 import tempfile
 from collections import defaultdict
 from io import BytesIO
@@ -17,7 +18,8 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
-from tensorrt_llm.inputs.multimodal import default_hasher
+from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
+                                            default_hasher)
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
@@ -127,9 +129,9 @@ async def async_load_image(
 def load_video(
         video: str,
         num_frames: int = 10,
+        fps: int = 30,
         format: str = "pt",
         device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
-
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
 
@@ -145,6 +147,8 @@ def load_video(
 
     # Find the last frame as frame count might not be accurate
     frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_fps = vidcap.get(cv2.CAP_PROP_FPS)
+
     while frame_count > 0:
         vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
         if vidcap.grab():
@@ -153,18 +157,36 @@ def load_video(
     else:
         raise ValueError(f"Video '{video}' has no frames.")
 
-    # Extract frames uniformly
-    indices = np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int)
+    duration = frame_count / original_fps if original_fps > 0 else 0
+    num_frames_to_sample = frame_count
+    if num_frames > 0:
+        num_frames_to_sample = min(num_frames, frame_count)
+    if fps > 0:
+        num_frames_to_sample = min(num_frames_to_sample,
+                                   math.floor(duration * fps))
+    num_frames_to_sample = max(1, num_frames_to_sample)  # at least one sample
+
+    if num_frames_to_sample == frame_count:
+        indices = list(range(0, num_frames_to_sample))
+    else:
+        uniform_sampled_frames = np.linspace(0,
+                                             frame_count - 1,
+                                             num_frames_to_sample,
+                                             dtype=int)
+        indices = uniform_sampled_frames.tolist()
+
     frames = {}
     for index in indices:
-        if index in frames:
-            continue
         vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
         success, frame = vidcap.read()
         if not success:
             continue
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frames[index] = Image.fromarray(frame)
+
+    assert len(
+        frames
+    ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
 
     return [
         ToTensor()(frames[index]).to(
@@ -176,6 +198,7 @@ def load_video(
 async def async_load_video(
         video: str,
         num_frames: int = 10,
+        fps: int = 30,
         format: str = "pt",
         device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
@@ -193,7 +216,7 @@ async def async_load_video(
     else:
         video_path = video
 
-    return load_video(video_path, num_frames, format, device)
+    return load_video(video_path, num_frames, fps, format, device)
 
 
 def load_audio(
@@ -225,7 +248,6 @@ async def async_load_audio(
     return audio
 
 
-# Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
@@ -310,10 +332,15 @@ class ConversationMessage(TypedDict):
 class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
-    def __init__(self, model_type: str):
+    def __init__(
+            self,
+            model_type: str,
+            multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self._model_type = model_type
         self._data = defaultdict[str](list)
         self._placeholder_counts = defaultdict[str](int)
+        self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
+        )
 
     async def retrieve_all_async(self) -> Optional[Dict[str, List[Any]]]:
         """Retrieve all collected multimodal data."""
