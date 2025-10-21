@@ -49,6 +49,10 @@ from tensorrt_llm.logger import logger
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
+# Cache for GPU integrated status to avoid repeated CUDA device queries
+# Integrated GPUs (e.g., DGX Spark) share physical memory with CPU
+_device_integrated = None
+
 
 def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
@@ -577,7 +581,7 @@ def local_mpi_barrier():
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
+    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
 
 
 def mpi_allgather(obj):
@@ -1141,17 +1145,6 @@ class KVCacheEventSerializer:
         }
 
 
-def is_multi_device_enable():
-    """
-    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
-    So we can avoid broadcast calls on single GPU.
-    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
-    ENABLE_MULTI_DEVICE is true by default when building TensorRT LLM so we need to also check
-    the number of devices
-    """
-    return local_mpi_size() > 1
-
-
 def set_prometheus_multiproc_dir() -> object:
     # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
     global prometheus_multiproc_dir
@@ -1174,3 +1167,23 @@ def torch_pybind11_abi() -> str:
     if TORCH_PYBIND11_ABI is None:
         TORCH_PYBIND11_ABI = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
     return TORCH_PYBIND11_ABI
+
+
+def is_device_integrated():
+    """Check if the current GPU device is integrated (shares physical memory with CPU).
+
+    Integrated GPU systems include DGX Spark and other unified memory architectures.
+    This function caches the result to avoid repeated CUDA device property queries.
+
+    Returns:
+        bool: True if the GPU is integrated, False otherwise. Returns False if CUDA
+              is not available.
+    """
+    global _device_integrated
+    if _device_integrated is None:
+        if not torch.cuda.is_available():
+            _device_integrated = False
+        else:
+            _device_integrated = torch.cuda.get_device_properties(
+            ).is_integrated
+    return _device_integrated
