@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import ast
 import operator
 import re
 from collections import defaultdict
@@ -38,6 +39,7 @@ from ...utils.node_utils import (
 from ...utils.sharding_utils import (
     BMMShardingInfo,
     EPShardingInfo,
+    LayerType,
     ShardingConfig,
     ShardingTransformInfo,
     SplitDimension,
@@ -165,6 +167,7 @@ class Sharding(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
+        # world_size = 2
 
         if world_size < 2:
             ad_logger.info("Skipping sharding for single device")
@@ -173,42 +176,35 @@ class Sharding(BaseTransform):
             )
 
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
-        shared_config.sharding_config.rank = local_rank
-        shared_config.sharding_config.world_size = world_size
-        shared_config.sharding_config.predefined_config = (
-            factory.get_sharding_config() if factory else {}
-        )
-        shared_config.sharding_config.factory_source = (
-            shared_config.sharding_config.predefined_config.get(
-                "source", ShardingConfigSource.UNKNOWN
-            )
+        sharding_config = shared_config.sharding_config
+        sharding_config.rank = local_rank
+        sharding_config.world_size = world_size
+        sharding_config.predefined_config = factory.get_sharding_config() if factory else {}
+        sharding_config.factory_source = (
+            sharding_config.predefined_config.get("source", ShardingConfigSource.UNKNOWN)
             if factory
             else ShardingConfigSource.UNKNOWN
         )
-        shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
-        shared_config.sharding_config.support_partial_config = self.config.support_partial_config
-        shared_config.sharding_config.sharding_dims = self.config.sharding_dims
+        sharding_config.simple_shard_only = self.config.simple_shard_only
+        sharding_config.support_partial_config = self.config.support_partial_config
+        sharding_config.sharding_dims = self.config.sharding_dims
 
-        shared_config.sharding_config.use_sharding_from_factory = (
-            self.config.use_sharding_from_factory
-        )
+        sharding_config.use_sharding_from_factory = self.config.use_sharding_from_factory
 
-        sharding_config = shared_config.sharding_config
         sharding_config.validate_config()
+        # sharding_config.predefined_config = predefined_config
 
         if (
-            shared_config.sharding_config.use_sharding_from_factory
-            and len(shared_config.sharding_config.get_predefined_config()) > 0
+            sharding_config.use_sharding_from_factory
+            and len(sharding_config.get_predefined_config()) > 0
         ):
             ad_logger.info("Applying sharding from config")
             factory_info = detect_sharding_from_factory_config(gm, sharding_config)
             return gm, factory_info
 
-        ad_logger.info(
-            f"Running autodeploy sharding heuristics: {shared_config.sharding_config.sharding_dims}"
-        )
+        ad_logger.info(f"Running autodeploy sharding heuristics: {sharding_config.sharding_dims}")
         # run TP sharding across ranks
-        if "tp" in shared_config.sharding_config.sharding_dims:
+        if "tp" in sharding_config.sharding_dims:
             tp_info = detect_column_row_shard(gm, sharding_config)
         else:
             tp_info = TransformInfo(
@@ -216,7 +212,7 @@ class Sharding(BaseTransform):
             )
 
         # run EP sharding across ranks
-        if "ep" in shared_config.sharding_config.sharding_dims:
+        if "ep" in sharding_config.sharding_dims:
             ep_info = detect_ep_shard(gm, sharding_config)
         else:
             ep_info = TransformInfo(
@@ -224,7 +220,7 @@ class Sharding(BaseTransform):
             )
 
         # run BMM sharding across ranks
-        if "bmm" in shared_config.sharding_config.sharding_dims:
+        if "bmm" in sharding_config.sharding_dims:
             dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
         else:
             dp_bmm_info = TransformInfo(
@@ -260,6 +256,7 @@ def detect_sharding_from_factory_config(
     # 4. the allowed values are:
     #   - "colwise"
     #   - "rowwise"
+    #   - "mamba"
     #   - "sequence_parallel"
     #   - "local_colwise"
     #   - "local_rowwise"
@@ -313,6 +310,24 @@ def detect_sharding_from_factory_config(
                 num_shards += 1
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
+                # check if config has parameters.
+                if "(" in config:
+                    config, params_str = config.split("(", 1)
+                    params_str = params_str.rsplit(")", 1)[0]  # Remove trailing )
+
+                    try:
+                        # Convert "key" = value to "key": value format for dict parsing
+                        params_str = params_str.replace(" = ", ": ")
+                        # Wrap in braces to make it a dict and parse
+                        config_params = ast.literal_eval("{" + params_str + "}")
+                    except Exception as e:
+                        ad_logger.warning(
+                            f"Failed to parse config params: {params_str}, error: {e}. "
+                            "Using empty config."
+                        )
+                        config_params = {}
+                else:
+                    config_params = {}
                 if config == "colwise":
                     sharding_config.tp_transforms.append(
                         TPShardingInfo.from_node(
@@ -324,6 +339,7 @@ def detect_sharding_from_factory_config(
                             min_local_shape=min_local_shape,
                         )
                     )
+                    num_row_col_shards += 1
                 elif config == "rowwise":
                     sharding_config.tp_transforms.append(
                         TPShardingInfo.from_node(
@@ -333,6 +349,20 @@ def detect_sharding_from_factory_config(
                             world_size=world_size,
                             dist_op="all_reduce",
                             min_local_shape=min_local_shape,
+                        )
+                    )
+                    num_row_col_shards += 1
+                elif config == "mamba":
+                    sharding_config.tp_transforms.append(
+                        TPShardingInfo.from_node(
+                            lin_node,
+                            split_dim=SplitDimension.COLUMN,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=None,
+                            min_local_shape=min_local_shape,
+                            layer_type=LayerType.MAMBA,
+                            fused_weight_dims=config_params.get("fused_weight_dims"),
                         )
                     )
                     num_row_col_shards += 1
