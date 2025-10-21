@@ -33,6 +33,8 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <sstream>
+#include <unordered_set>
 #include <algorithm>
 #include <map>
 #include <optional>
