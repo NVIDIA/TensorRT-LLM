@@ -157,7 +157,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if fp8kv:
             pytorch_config["kv_cache_config"] = KvCacheConfig(
                 dtype="fp8",
-                # max_tokens=100000,  # Limit tokens to prevent no room for CUBLAS handles
+                max_tokens=
+                100000,  # Limit tokens to prevent no room for cublas/cublasLt handles
             )
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
@@ -194,7 +195,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if fp8kv:
             pytorch_config["kv_cache_config"] = KvCacheConfig(
                 dtype="fp8",
-                # max_tokens=100000,  # Limit tokens to prevent no room for CUBLAS handles
+                max_tokens=
+                100000,  # Limit tokens to prevent no room for cublas/cublasLt handles
             )
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
