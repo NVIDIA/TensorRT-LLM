@@ -35,15 +35,50 @@ def get_yaml_config():
     return config
 
 
-@pytest.fixture
-def sample_yaml_config():
-    config = get_yaml_config()
+def get_yaml_config_with_disagg_cluster():
+    config = {
+        "hostname": "test_host",
+        "port": 9000,
+        "context_servers": {
+            "max_batch_size": 1,
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+        },
+        "generation_servers": {
+            "router": {
+                "type": "load_balancing",
+                "use_tokens": False,
+            },
+            "max_batch_size": 1,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+        },
+        "disagg_cluster": {
+            "cluster_uri": "http://test_host:9000",
+            "cluster_name": "test_cluster",
+            "minimal_instances": {
+                "context_servers": 2,
+                "generation_servers": 2,
+            },
+            "heartbeat_interval_sec": 1,
+            "inactive_timeout_sec": 2,
+        },
+    }
     return config
 
 
 @pytest.fixture
-def sample_yaml_file(tmp_path):
-    config = get_yaml_config()
+def sample_yaml_config(request):
+    if request.param == "disagg_cluster":
+        config = get_yaml_config_with_disagg_cluster()
+    else:
+        config = get_yaml_config()
+    return config
+
+
+@pytest.fixture
+def sample_yaml_file(sample_yaml_config, tmp_path):
+    config = sample_yaml_config
 
     yaml_file = tmp_path / "test_config.yaml"
     with open(yaml_file, "w") as f:
@@ -51,24 +86,30 @@ def sample_yaml_file(tmp_path):
     return yaml_file
 
 
-def verify_disagg_config(config: DisaggServerConfig):
+def verify_disagg_config(config: DisaggServerConfig,
+                         sample_yaml_config: str = ""):
     assert config.hostname == "test_host"
     assert config.port == 9000
     assert config.ctx_router_config.type == "round_robin"
     assert config.gen_router_config.type == "load_balancing"
-    assert len(config.server_configs) == 3
+    if sample_yaml_config == "":
+        assert len(config.server_configs) == 3
 
 
-def test_parse_disagg_config_file(sample_yaml_file):
+@pytest.mark.parametrize("sample_yaml_config", ["disagg_cluster", ""],
+                         indirect=True)
+def test_parse_disagg_config_file(sample_yaml_file, sample_yaml_config):
     config = parse_disagg_config_file(sample_yaml_file)
     assert isinstance(config, DisaggServerConfig)
-    verify_disagg_config(config)
+    verify_disagg_config(config, sample_yaml_config)
 
 
+@pytest.mark.parametrize("sample_yaml_config", ["disagg_cluster", ""],
+                         indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
-    verify_disagg_config(config)
+    verify_disagg_config(config, sample_yaml_config)
 
 
 def test_extract_ctx_gen_cfgs():
@@ -85,6 +126,7 @@ def test_extract_ctx_gen_cfgs():
     assert configs[0].instance_num_ranks == 2
 
 
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
 def test_extract_router_config(sample_yaml_config):
     ctx_server_config = sample_yaml_config["context_servers"]
     gen_server_config = sample_yaml_config["generation_servers"]
