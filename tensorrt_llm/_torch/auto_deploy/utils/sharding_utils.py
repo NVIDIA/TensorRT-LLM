@@ -22,75 +22,11 @@ from .node_utils import (
     is_op,
     num_users_of_weight_node,
     subgraph,
-    successors,
 )
 from .quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
-
-DEBUG = True
-
-
-def _initialize_debug_tensor(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """Initialize tensor along dim with sequential indices for debugging."""
-    # Create index tensor: t[:, i, :] = i for all i along dimension dim
-    shape = list(t.shape)
-    indices = torch.arange(shape[dim], dtype=t.dtype, device=t.device)
-    # Reshape indices to broadcast correctly
-    view_shape = [1] * len(shape)
-    view_shape[dim] = shape[dim]
-    indices = indices.view(view_shape)
-    # Broadcast to full shape
-    return indices.expand(shape).clone()
-
-
-def _validate_sharded_indices(
-    sharded_tensor: torch.Tensor,
-    dim: int,
-    rank: int,
-    world_size: int,
-    fused_weight_dims: Optional[list] = None,
-    param_key: str = "",
-):
-    """Validate that sharded tensor contains expected indices."""
-    if not DEBUG:
-        return
-
-    # Get unique values from the sharded tensor
-    unique_vals = torch.unique(sharded_tensor).cpu().numpy().astype(int)
-
-    if fused_weight_dims is None:
-        # Non-fused: expect contiguous chunk
-        total_size = sharded_tensor.shape[dim] * world_size
-        chunk_size = total_size // world_size
-        expected_start = rank * chunk_size
-        expected_end = expected_start + chunk_size
-        expected = set(range(expected_start, expected_end))
-    else:
-        # Fused: expect sharded chunks from each fused component
-        expected = set()
-        offset = 0
-        for fused_dim in fused_weight_dims:
-            chunk_size = fused_dim // world_size
-            chunk_start = offset + rank * chunk_size
-            chunk_end = chunk_start + chunk_size
-            expected.update(range(chunk_start, chunk_end))
-            offset += fused_dim
-
-    actual = set(unique_vals)
-
-    ad_logger.info(f"DEBUG [{param_key}] Rank {rank}: Expected indices: {sorted(expected)}")
-    ad_logger.info(f"DEBUG [{param_key}] Rank {rank}: Actual indices: {sorted(actual)}")
-
-    assert actual == expected, (
-        f"Rank {rank} sharding mismatch for {param_key}!\n"
-        f"Expected: {sorted(expected)}\n"
-        f"Actual: {sorted(actual)}\n"
-        f"Missing: {sorted(expected - actual)}\n"
-        f"Extra: {sorted(actual - expected)}"
-    )
-    ad_logger.info(f"DEBUG [{param_key}] Rank {rank}: ✓ Validation passed")
 
 
 def _load_hook(
@@ -100,10 +36,6 @@ def _load_hook(
     f_split: Callable[[torch.Tensor, int], torch.Tensor],
     param_key: str,
     param_shape: torch.Size,
-    dim: int,
-    rank: int,
-    world_size: int,
-    fused_weight_dims: Optional[list] = None,
 ):
     # TODO: we need to support loading either a sharded or unsharded checkpoint.
     # Otherwise, basic workflows like
@@ -116,23 +48,7 @@ def _load_hook(
         return
     p_to_load = state_dict[key]
 
-    # Debug: Initialize with sequential indices
-    if DEBUG and param_shape != p_to_load.shape:
-        ad_logger.info(f"DEBUG: Initializing tensor '{key}' with sequential indices")
-        p_to_load = _initialize_debug_tensor(p_to_load, dim)
-
     p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
-
-    # Debug: Validate sharded indices
-    if DEBUG and param_shape != state_dict[key].shape:
-        _validate_sharded_indices(
-            p_to_load,
-            dim=dim,
-            rank=rank,
-            world_size=world_size,
-            fused_weight_dims=fused_weight_dims,
-            param_key=key,
-        )
 
     state_dict[key] = p_to_load
 
@@ -165,22 +81,21 @@ def _validate_sharded_shapes(
 
     # get the subgraph of this module. Subgraph boundary is the next linear node.
     next_lin_node, depth = bfs(node, is_linear_op, include_root=False)
-    # split nodes can't have "-1" for split size.
-    nodes_to_validate = successors(
-        node,
-        depth=depth,
-        exclude=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
+    nodes_to_validate = subgraph(
+        [node],
+        [next_lin_node],
+        include=lambda n: is_op(n, [torch.ops.aten.view, torch.ops.aten.reshape]),
     )
     for view_node in nodes_to_validate:
-        # shard weight tensors for RMS norm and conv1d
         if len(view_node.args) < 2:
             continue
-        view_shape = view_node.args[1]
+        view_shape = list(view_node.args[1])
         if not isinstance(view_shape, list):
             continue
         if len(view_shape) >= 3 and isinstance(view_shape[2], int) and view_shape[2] != -1:
             args = list(view_node.args)
-            args[1] = [view_shape[0], view_shape[1], -1] + view_shape[3:]
+            view_shape[2] = view_shape[2] // world_size
+            args[1] = tuple(view_shape)
             view_node.args = tuple(args)
             ad_logger.debug(f"\nUpdated view node {view_node} arguments to {view_node.args}")
 
@@ -189,9 +104,9 @@ def _validate_sharded_shapes(
         assert world_size is not None, "World size is required to update the split node params"
         assert len(node.users) == 1, "Fused linear node should have only one user: a split node"
         # find all split nodes in the region between this linear node and the next
-        split_nodes = successors(
-            node,
-            depth=depth,
+        split_nodes = subgraph(
+            [node],
+            [next_lin_node],
             include=lambda n: is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes]),
         )
         for split_node in split_nodes:
@@ -235,13 +150,6 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
-    # Debug: Initialize tensor with sequential indices
-    if DEBUG:
-        weight_tensor = _initialize_debug_tensor(weight_tensor, dim)
-        ad_logger.info(
-            f"DEBUG: Initialized weight_tensor for '{param_key}' with sequential indices"
-        )
-
     # Use custom shard function if provided
     if custom_shard_fn is not None:
         sharded_weight = custom_shard_fn(weight_tensor)
@@ -253,12 +161,9 @@ def shard_weight_tensor(
                 f_split=custom_shard_fn,
                 param_key=param_key,
                 param_shape=sharded_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-                fused_weight_dims=fused_weight_dims,
             )
         )
+
     else:
 
         def split_tensor(
@@ -305,17 +210,6 @@ def shard_weight_tensor(
 
         sharded_shape = sharded_weight.shape
 
-        # Debug: Validate sharded indices
-        if DEBUG:
-            _validate_sharded_indices(
-                sharded_weight,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-                fused_weight_dims=fused_weight_dims,
-                param_key=param_key,
-            )
-
         # Register load hook
         gm._register_load_state_dict_pre_hook(
             partial(
@@ -323,10 +217,6 @@ def shard_weight_tensor(
                 f_split=f_split,
                 param_key=param_key,
                 param_shape=sharded_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-                fused_weight_dims=fused_weight_dims,
             )
         )
 
@@ -365,7 +255,7 @@ def _insert_sharded_mamba(
     quantization_cb: Optional[
         Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
     ] = None,
-) -> None:
+) -> bool:
     """
     To shard Mamba layer, first column-shard the first linear layer: entry_node,
     then shard all remaining weight tensors found in the subgraph defined between
@@ -391,24 +281,63 @@ def _insert_sharded_mamba(
         next_lin_node, depth = bfs(entry_node, is_linear_op, include_root=False)
     except RuntimeError:
         ad_logger.warning("Could not find next linear node after entry_node for Mamba sharding")
-        return
+        return False
 
     # Get subgraph between entry_node and next linear node
     subgraph_nodes = subgraph([entry_node], [next_lin_node])
 
-    # Validate this is a Mamba module by checking for torch_ssm_transform and conv1d
-    has_ssm = any(is_op(n, torch.ops.auto_deploy.torch_ssm_transform) for n in subgraph_nodes)
-    has_conv1d = any(
-        is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
+    ##############################################################
+    ########## validate if this is a valid Mamba module ##########
+    ##############################################################
+    # has_ssm = any(is_op(n, torch.ops.auto_deploy.mamba.torch_ssm_transform) for n in subgraph_nodes)
+    has_ssm = True
+    conv1d_nodes = [
+        n
         for n in subgraph_nodes
-    )
-
-    if not (has_ssm and has_conv1d):
+        if is_op(n, [torch.ops.aten.conv1d, torch.ops.auto_deploy.torch_causal_conv1d])
+    ]
+    if len(conv1d_nodes) != 1 or not has_ssm:
         ad_logger.warning(
-            f"Subgraph does not contain both torch_ssm_transform and conv1d nodes. "
-            f"Skipping Mamba sharding. has_ssm={has_ssm}, has_conv1d={has_conv1d}"
+            f"Subgraph does not contain exactly one conv1d node and torch_ssm_transform. "
+            f"Skipping Mamba sharding. conv1d_nodes={conv1d_nodes}, has_ssm={has_ssm}"
         )
-        return
+        return False
+
+    ##############################################################
+    ########## infer split sizes for in_proj and conv1d ##########
+    ##############################################################
+    # in_proj and conv1d are most likely fused, followed up by split nodes. Infer split sizes:
+    if fused_weight_dims is None:
+        split_nodes = [
+            n
+            for n in subgraph_nodes
+            if is_op(n, [torch.ops.aten.split, torch.ops.aten.split_with_sizes])
+        ]
+        if len(split_nodes) != 2:
+            ad_logger.warning(
+                f"Subgraph does not contain exactly two split nodes. "
+                f"Skipping Mamba sharding. split_nodes={split_nodes}"
+            )
+            return False
+        split_sizes_1 = split_nodes[0].args[1]
+        split_sizes_2 = split_nodes[1].args[1]
+        if split_sizes_1[1] != sum(split_sizes_2):
+            ad_logger.warning(
+                f"Split nodes have different sizes. "
+                f"Skipping Mamba sharding. split_sizes_1={split_sizes_1}, split_sizes_2={split_sizes_2}"
+            )
+            return False
+        fused_weight_dims = {
+            "in_proj": split_sizes_1[0:1] + split_sizes_2 + split_sizes_1[2:],
+            "conv1d": split_sizes_2,
+        }
+
+    conv1d_node = conv1d_nodes[0]
+    # conv1d_node last argument is the number of output channels.
+    # This one is also sharded, so we need to update this parameter
+    conv_args = list(conv1d_node.args)
+    conv_args[-1] = conv1d_node.args[-1] // world_size
+    conv1d_node.args = tuple(conv_args)
 
     # First, shard the entry_node (the first linear layer)
     # Extract entry node's fused_weight_dims by matching weight name against patterns
@@ -432,20 +361,20 @@ def _insert_sharded_mamba(
         quantization_cb=quantization_cb,
     )
 
-    # Get all weight nodes in the subgraph
+    # Get all weight nodes in the subgraph except for out_proj
     weight_nodes = [
         n
         for n in get_all_weights_in_subgraph([entry_node], [next_lin_node])
         if "out_proj" not in str(n)
     ]
 
-    # Shard remaining weights
+    # Shard remaining weights, such as conv1d or RMSNorm
     for weight_node in weight_nodes:
         weight_key = weight_node.target
 
         # Filter by regex patterns if provided
         if weights_to_shard is not None:
-            if not any(re.search(pattern, weight_key) for pattern in weights_to_shard):
+            if not any(pattern in weight_key for pattern in weights_to_shard):
                 continue
 
         # Determine shard dimension for this weight
@@ -459,7 +388,11 @@ def _insert_sharded_mamba(
             continue
 
         # Get fused dims for this weight if specified
-        fused_dims = fused_weight_dims.get(weight_key) if fused_weight_dims else None
+        fused_dims = None
+        for k, v in fused_weight_dims.items():
+            if k in weight_key:
+                fused_dims = v
+                break
 
         # Shard the weight tensor (also updates the parameter in the module)
         _, sharded_shape = shard_weight_tensor(
@@ -757,9 +690,6 @@ class QuantizationShardingMixin(ABC):
                 self.shard_load_hook,
                 weight_name=weight_key,
                 weight_shape=weight_new_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
             )
         )
 
