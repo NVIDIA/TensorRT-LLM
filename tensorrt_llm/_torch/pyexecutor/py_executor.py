@@ -8,7 +8,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -274,7 +274,7 @@ class PyExecutor:
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.num_micro_batches, self.dist)
+                self.dist, self._do_terminate_request)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -738,9 +738,6 @@ class PyExecutor:
             if h is not None:
                 h.wait()
 
-        if self._disagg_pp_termination_handler is not None:
-            self._disagg_pp_termination_handler.cleanup()
-
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
@@ -925,10 +922,8 @@ class PyExecutor:
                     self._terminate_ctx_finished_requests()
 
                 if self._disagg_pp_termination_handler is not None:
-                    requests_to_terminate = self._disagg_pp_termination_handler.sync(
-                        prev_microbatch_id)
-                    for req in requests_to_terminate:
-                        self._do_terminate_request(req)
+                    self._disagg_pp_termination_handler.terminate_pending_requests(
+                    )
 
                 # march forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -2093,94 +2088,30 @@ class DisaggPPTerminationHandler:
     resources to avoid a NCCL hang.
     """
 
-    def __init__(self, num_micro_batches: int, dist):
+    def __init__(self, dist, terminator_func: Callable[[LlmRequest], None]):
         self.dist = dist
-        # Request termination synchronization across PP ranks
-        # {request_id: {'ready_to_terminate': set{ranks}, 'terminated': {ranks}}}
+        self.terminator_func = terminator_func
         self.pending_termination = {}
-        self.termination_handles = [None] * num_micro_batches
-        # Local map from request_id -> local LlmRequest awaiting consensus termination
-        self.local_termination = {}
 
-    def terminate(self, request: LlmRequest) -> bool:
-        req_key = request.py_request_id
-        self.local_termination[req_key] = request
-        state = self.pending_termination.get(req_key, None)
-        if state is None:
-            state = {'ready_to_terminate': set(), 'terminated': set()}
-            self.pending_termination[req_key] = state
-        if self.dist.rank not in state['ready_to_terminate']:
-            state['ready_to_terminate'].add(self.dist.rank)
-        return False
+    def terminate(self, request: LlmRequest):
+        self.pending_termination[request.py_request_id] = request
 
-    def sync(self, microbatch_id: int) -> List[LlmRequest]:
-        """Ring-communicate pending termination state and apply local terminations upon consensus.
-
-        Each rank sends its current pending_termination snapshot to the next PP rank
-        and receives the previous rank's snapshot. After merging, apply any terminations
-        that have reached consensus (i.e., all PP ranks are ready).
-        """
-        snapshot = {
-            req_id: {
-                'ready_to_terminate': state.get('ready_to_terminate', set()),
-                'terminated': state.get('terminated', set()),
-            }
-            for req_id, state in self.pending_termination.items()
-        }
-
-        if self.termination_handles[microbatch_id] is not None:
-            self.termination_handles[microbatch_id].wait()
-
-        term_tag = TERMINATION_COMM_TAG_BASE + microbatch_id
-        self.termination_handles[microbatch_id] = self.dist.isend_object(
-            snapshot,
-            dest=self.dist.next_pp_rank,
-            tag=term_tag,
-        )
-        remote_state = self.dist.recv_object(
-            src=self.dist.prev_pp_rank,
-            tag=term_tag,
-        )
+    @nvtx_range("_disagg_pp_termination_handler_sync")
+    def terminate_pending_requests(self):
+        """Send pending terminaion request ids to lead rank then lead rank decides which requests to terminate."""
+        lead_rank = 0
+        req_ids = list(self.pending_termination.keys())
+        rank_req_ids = self.dist.pp_gather(req_ids, root=lead_rank)
+        consensus_req_ids = None
+        if self.dist.pp_rank == lead_rank:
+            consensus_req_ids = set.intersection(
+                *[set(r) for r in rank_req_ids])
+        consensus_req_ids = self.dist.broadcast(consensus_req_ids,
+                                                root=lead_rank)
+        assert consensus_req_ids is not None
         logger.debug(
-            f"received remote state for microbatch {microbatch_id}, prev pp rank: {self.dist.prev_pp_rank} state {remote_state}"
-        )
-
-        if remote_state:
-            for req_id, state in remote_state.items():
-                local = self.pending_termination.get(req_id)
-                if local is None:
-                    self.pending_termination[req_id] = {
-                        'ready_to_terminate': state.get('ready_to_terminate',
-                                                        set()),
-                        'terminated': state.get('terminated', set()),
-                    }
-                else:
-                    for key in ('ready_to_terminate', 'terminated'):
-                        for r in state.get(key, []):
-                            if r not in local[key]:
-                                local[key].add(r)
-
-        requests_to_terminate = []
-        to_delete = []
-        for req_id, state in self.pending_termination.items():
-            ready = state.get('ready_to_terminate', set())
-            done = state.get('terminated', set())
-            # If all PP ranks are ready to terminate the request, we can free the resources
-            if len(ready) >= self.dist.pp_size and self.dist.rank not in done:
-                local_req = self.local_termination.get(req_id)
-                if local_req is not None:
-                    requests_to_terminate.append(local_req)
-                done.add(self.dist.rank)
-            if len(done) >= self.dist.pp_size:
-                to_delete.append(req_id)
-                if req_id in self.local_termination:
-                    self.local_termination.pop(req_id, None)
-        for req_id in to_delete:
-            self.pending_termination.pop(req_id, None)
-
-        return requests_to_terminate
-
-    def cleanup(self):
-        for h in self.termination_handles:
-            if h is not None:
-                h.wait()
+            f'all pp ranks agree to terminate requests: {consensus_req_ids}')
+        for req_id in consensus_req_ids:
+            req = self.pending_termination.pop(req_id, None)
+            if req:
+                self.terminator_func(req)
