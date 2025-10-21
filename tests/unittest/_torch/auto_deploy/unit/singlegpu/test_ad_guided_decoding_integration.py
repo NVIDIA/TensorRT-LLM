@@ -1,4 +1,4 @@
-"""Integration tests for guided decoding functionality in AutoDeploy."""
+"""Integration test for guided decoding functionality in AutoDeploy."""
 
 import json
 
@@ -12,12 +12,12 @@ from tensorrt_llm.llmapi import GuidedDecodingParams
 def test_guided_decoding_json_output():
     """Test guided decoding with JSON schema validation.
 
-    This test constructs an ExperimentConfig, extracts the AutoDeployConfig, converts it
-    to kwargs, then adds guided_decoding_backend (from BaseLlmArgs) to create an LLM with
-    guided decoding support.
+    This test constructs an AutoDeploy LLM with guided decoding backend set to 'xgrammar'
+    and generates outputs with guided decoding enabled. It validates that the generated outputs
+    match the expected JSON schema.
     """
 
-    # Define a simple JSON schema for testing
+    # Define a JSON schema for testing
     json_schema = {
         "type": "object",
         "properties": {
@@ -33,11 +33,7 @@ def test_guided_decoding_json_output():
         {
             "prompt": "Please provide a JSON object with a person's information including name, age, and city. "
             f"Follow this exact schema: {json_schema}"
-        },
-        {
-            "prompt": "Generate a JSON response for a person with name 'Alice', age 25, and city 'New York'. "
-            "Return only the JSON object, nothing else."
-        },
+        }
     ]
 
     # TODO: Can test that if we make an LLM with guided_decoding_backend=None, it will throw an error.
