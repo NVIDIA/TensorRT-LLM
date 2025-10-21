@@ -424,13 +424,14 @@ def test_fp4_linear_cublaslt(dtype, mnk):
         alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
 
         # Use cuBLASLt FP4 GEMM with autotuning support
-        output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
-            act_fp4=x_fp4,
-            weight=w_fp4,
-            act_sf=x_sf_block,
-            weight_scale=w_sf_block,
-            alpha=alpha_tensor,
-            output_dtype=dtype)
+        with autotune():
+            output_cublaslt = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4=x_fp4,
+                weight=w_fp4,
+                act_sf=x_sf_block,
+                weight_scale=w_sf_block,
+                alpha=alpha_tensor,
+                output_dtype=dtype)
 
     # Reference implementation: use torch.ops.trtllm.nvfp4_gemm (CUTLASS)
     with torch.inference_mode():
