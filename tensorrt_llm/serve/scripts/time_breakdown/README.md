@@ -73,6 +73,11 @@ The tool aims to track detailed timing segments throughout the request lifecycle
    - **Time Period**: `gen_server_first_token_time` → `disagg_server_first_token_time`
    - **Description**: Routing overhead from generation server back through disagg server
    - **Includes**: Response forwarding, aggregation
+
+#### Visualization of Disaggregated Server Metrics
+The timepoints are recorded internally by TensorRT LLM per-request performance metrics (also available via LLM API) and OpenAI compatible server.
+![Visualization of Disaggregated Metrics](images/perf_metrics_timepoints.png)
+
 ## Input Format
 
 The tool expects a JSON file containing an array of request performance metrics (unit: seconds).
@@ -139,6 +144,7 @@ Set
  perf_metrics_max_requests: <INTEGER>
 ```
 in the `extra-llm-api-config.yaml`. If you are running disaggregated serving, you should add configs for all servers (disagg, context and generation server).
+The server keeps at most `perf_metrics_max_requests` entries.
 
 Step 2:
 Add `--save-request-time-breakdown` when running `benchmark_serving.py`
