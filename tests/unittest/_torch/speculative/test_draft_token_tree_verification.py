@@ -45,9 +45,11 @@ def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
             max_beam_width=beam_width,
         ))
 
+    input_new_tokens_list = input_new_tokens.tolist()
     num_accepted_draft_tokens = torch_sampler._process_draft_tokens_tree(
         request=input_request,
-        new_tokens=input_new_tokens,
+        new_tokens_tensor=input_new_tokens,
+        new_tokens_list=input_new_tokens_list,
         spec_tree_manager=spec_tree_manager)
 
     print(f"num_accepted_draft_tokens: {num_accepted_draft_tokens}")

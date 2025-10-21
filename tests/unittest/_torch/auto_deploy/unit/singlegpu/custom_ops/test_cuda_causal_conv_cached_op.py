@@ -59,7 +59,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     # Metadata (not used in generate-only op entry, but required by the interface)
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     seq_start = torch.zeros(batch, device=device, dtype=torch.int32)
-
+    use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     x_ref = x.clone()
@@ -73,6 +73,7 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
         seq_len,
         seq_start,
         slot_idx,
+        use_initial_states,
         # CACHES
         conv_state_cache,
         # CONSTANTS
@@ -194,7 +195,7 @@ def test_prepare_metadata_cuda(conv_env):
         slot_idx,
         page_size,
     )
-    assert len(out) == 3
-    seq_len_s, seq_start, slot_s = out
+    assert len(out) == 4
+    seq_len_s, seq_start, slot_s, use_initial_states = out
     assert seq_len_s.numel() == 2 and slot_s.numel() == 2
     assert torch.all(seq_start == torch.tensor([0, 2], device=device, dtype=seq_start.dtype))

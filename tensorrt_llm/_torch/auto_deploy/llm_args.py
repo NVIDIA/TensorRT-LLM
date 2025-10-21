@@ -12,6 +12,7 @@ from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, KvCacheConfig, _Paralle
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
+from .utils.logger import ad_logger
 
 PathLike = Union[str, Path]
 
@@ -247,6 +248,16 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
                 setattr(self, shortcut_key, self.transforms[t_key][config_key])
 
         return self
+
+    @field_validator("kv_cache_config", mode="after")
+    @classmethod
+    def validate_kv_cache_config(cls, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
+        if kv_cache_config.copy_on_partial_reuse:
+            kv_cache_config.copy_on_partial_reuse = False
+            ad_logger.warning(
+                "copy_on_partial_reuse is not supported by AutoDeploy. Setting it to False."
+            )
+        return kv_cache_config
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:

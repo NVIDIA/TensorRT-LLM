@@ -118,7 +118,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
                     "free_mem_ratio": 0.7
                 },
                 "compile_model": {
-                    "backend": "torch-opt",
+                    "backend": "torch-cudagraph",
                     "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                 },
             },
@@ -140,9 +140,6 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
     def test_auto_dtype(self, enable_chunked_prefill):
-        if enable_chunked_prefill:
-            pytest.skip(
-                "see https://github.com/NVIDIA/TensorRT-LLM/issues/8272")
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
