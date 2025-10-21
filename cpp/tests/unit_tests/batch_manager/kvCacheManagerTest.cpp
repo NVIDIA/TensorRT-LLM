@@ -2199,7 +2199,8 @@ TEST_F(KVCacheManagerTest, BlockManagerBlockPriorityTest)
     auto kvCacheRetentionconfig = llmRequest0->getKvCacheRetentionConfig();
     if (kvCacheRetentionconfig.has_value())
     {
-        TLLM_LOG_DEBUG("%s%d - KvCacheRetentionConfig = %s",__FILE__,__LINE__,kvCacheRetentionconfig.value().print().c_str());
+        TLLM_LOG_DEBUG(
+            "%s%d - KvCacheRetentionConfig = %s", __FILE__, __LINE__, kvCacheRetentionconfig.value().print().c_str());
     }
     GenerationRequest seq0{0, inputLength0, beamWidth, blockManager.getWindowSizesMetadata()};
     auto numContextBlocks0 = tc::ceilDiv(inputLength0, blockManager.getTokensPerBlock());
@@ -2809,7 +2810,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     // Since block 1 has higher priority, block 2 and 0 will be used first.
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 3);
 
-    // Write one generated token to seq1. This will cause block 1 to be evicted 
+    // Write one generated token to seq1. This will cause block 1 to be evicted
     // without offloading since priority is lower than minimum required for offloading.
     llmRequest1->addNewToken(104, beamIdx);
     kvCacheManager.addToken(requestId1);
@@ -3429,7 +3430,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     // Free queues
     // 35 : 7,6,5,4,3
     kvCacheManager.storeContextBlocks(*llmRequest0);
-    // Store full blocks 0,1 with tokens [0,1,2,3] [4,5,6,7] 
+    // Store full blocks 0,1 with tokens [0,1,2,3] [4,5,6,7]
 
     events = getEvents(kvCacheManager);
 
