@@ -2109,6 +2109,10 @@ class BaseLlmArgs(StrictBaseModel):
                 )
             values['orchestrator_type'] = ev
 
+        if 'orchestrator_type' in values:
+            logger.warning(
+                f"Setting orchestrator_type to: {values['orchestrator_type']}")
+
         return values
 
     def _update_plugin_config(self, key: str, value: Any):

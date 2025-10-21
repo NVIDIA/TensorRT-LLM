@@ -7,6 +7,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+import zmq
+
 from ...llmapi.utils import ManagedThread, logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
@@ -90,7 +92,8 @@ class RPCServer:
         self._client_socket = ZeroMqQueue(address=(address, self._hmac_key),
                                           is_server=True,
                                           is_async=True,
-                                          use_hmac_encryption=False)
+                                          use_hmac_encryption=False,
+                                          socket_type=zmq.ROUTER)
         logger.info(f"RPC Server bound to {self._address}")
 
     def shutdown(self, is_remote_call: bool = False):

@@ -5,6 +5,7 @@ import os
 import threading
 from typing import Optional
 
+from .._utils import nvtx_range_debug
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import (AsyncQueue, _SyncQueue, logger_debug,
@@ -150,7 +151,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 self.main_loop.close()
 
         self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
-                                                 daemon=True)
+                                                 daemon=True,
+                                                 name="rpc_proxy_main_loop")
         self.main_loop_thread.start()
         atexit.register(self.shutdown)
 
@@ -289,7 +291,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         logprob_params = self._get_logprob_params(request)
 
         # submit is a fire-and-forget operation, don't need to wait for response
-        self.rpc_client.submit(request).remote(need_response=False)
+        with nvtx_range_debug("GenerationExecutorRpcProxy.submit",
+                              color="green",
+                              category="Proxy"):
+            self.rpc_client.submit(request).remote(need_response=False)
 
         result = GenerationResult(
             request,
