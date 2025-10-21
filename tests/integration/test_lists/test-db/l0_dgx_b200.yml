@@ -14,8 +14,8 @@ l0_dgx_b200:
       stage: pre_merge
       backend: pytorch
   tests:
-  - accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8ep4-cuda_graph=True]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype
+  - accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized
 - condition:
     ranges:
       system_gpu_count:
