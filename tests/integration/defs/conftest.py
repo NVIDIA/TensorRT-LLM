@@ -2208,6 +2208,10 @@ def pytest_configure(config):
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
 
+        # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
+        # that may need to write to the same directory (e.g., pytest-split)
+        os.makedirs(output_dir, exist_ok=True)
+
         # Create the reporter with logger
         xmlpath = os.path.join(output_dir, "results.xml")
         reporter = PeriodicJUnitXML(
