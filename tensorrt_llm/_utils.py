@@ -918,6 +918,18 @@ def nvtx_range_debug(msg: str,
         return _null_context_manager()
 
 
+def nvtx_mark_debug(msg: str,
+                    color: str = "grey",
+                    domain: str = "TensorRT-LLM",
+                    category: Optional[str] = None) -> None:
+    """
+    Creates an NVTX marker for debugging purposes.
+    """
+    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        nvtx_mark(msg, color=color, domain=domain, category=category)
+
+
 def nvtx_mark(msg: str,
               color: str = "grey",
               domain: str = "TensorRT-LLM",
