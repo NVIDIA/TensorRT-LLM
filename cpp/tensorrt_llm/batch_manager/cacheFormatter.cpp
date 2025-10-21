@@ -389,7 +389,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             TLLM_CHECK(connections.size() > (processIdx / peerDuplicateHeadFactor));
             TLLM_CHECK(outputSplitCaches.size() > (processIdx / peerDuplicateHeadFactor));
-            auto startTime = llmRequest.getSteadyClockNow();
+            auto startTime = LlmRequest::getSteadyClockNow();
 
             size_t ppDomainSize = targetInfo.mDomainPPSize;
             size_t bufferTpRank = (processIdx / ppDomainSize) / peerDuplicateHeadFactor;
@@ -436,7 +436,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 }
             }
 
-            auto endTime = llmRequest.getSteadyClockNow();
+            auto endTime = LlmRequest::getSteadyClockNow();
             session.appendMeasure(startTime, endTime, size);
         };
 
@@ -746,7 +746,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
                 TLLM_CHECK(pickUpConnections.size() > processIdx);
                 TLLM_CHECK(recvSplitCaches.size() > processIdx);
-                auto startTime = llmRequest.getSteadyClockNow();
+                auto startTime = LlmRequest::getSteadyClockNow();
                 size_t size = 0;
 
                 if (processIdx >= remainNoCoverTargetNum)
@@ -787,7 +787,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     }
                 }
 
-                auto endTime = llmRequest.getSteadyClockNow();
+                auto endTime = LlmRequest::getSteadyClockNow();
                 session.appendMeasure(startTime, endTime, size);
             };
             if (pickUpConnections.size() > 1)

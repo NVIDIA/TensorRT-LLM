@@ -146,8 +146,6 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
-    std::vector<Measure> mMeasures;
-    bool mRecordMeasure{false};
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };

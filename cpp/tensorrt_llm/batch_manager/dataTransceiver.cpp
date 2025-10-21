@@ -183,12 +183,8 @@ int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 
 std::filesystem::path getTransferOutputPath(char const* tag)
 {
-<<<<<<< HEAD
     namespace fs = std::filesystem;
-    auto outputPath = common::getEnvKVCacheTransferOutputPath();
-=======
     auto outputPath = common::getEnvKVCacheTimeOutputPath();
->>>>>>> e76a32deb (detailed cache transfer breakdown)
     if (!outputPath.empty())
     {
         auto rank = mpi::MpiComm::world().getRank();

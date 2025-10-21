@@ -1865,7 +1865,7 @@ public:
         return mUseDraftModel;
     }
 
-    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // If sGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
     // time point
     [[nodiscard]] static TimePoint getSteadyClockNow()
     {
