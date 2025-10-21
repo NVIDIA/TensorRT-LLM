@@ -49,10 +49,6 @@ from tensorrt_llm.logger import logger
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
-# Cache for GPU integrated status to avoid repeated CUDA device queries
-# Integrated GPUs (e.g., DGX Spark) share physical memory with CPU
-_device_integrated = None
-
 
 def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
@@ -1169,7 +1165,8 @@ def torch_pybind11_abi() -> str:
     return TORCH_PYBIND11_ABI
 
 
-def is_device_integrated():
+@lru_cache(maxsize=1)
+def is_device_integrated() -> bool:
     """Check if the current GPU device is integrated (shares physical memory with CPU).
 
     Integrated GPU systems include DGX Spark and other unified memory architectures.
@@ -1179,11 +1176,6 @@ def is_device_integrated():
         bool: True if the GPU is integrated, False otherwise. Returns False if CUDA
               is not available.
     """
-    global _device_integrated
-    if _device_integrated is None:
-        if not torch.cuda.is_available():
-            _device_integrated = False
-        else:
-            _device_integrated = torch.cuda.get_device_properties(
-            ).is_integrated
-    return _device_integrated
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_properties().is_integrated
