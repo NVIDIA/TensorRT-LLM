@@ -11,7 +11,7 @@ CUDA_VER="13.0" # 13.0.2
 CUDNN_VER="9.14.0.64-1"
 # NCCL version 2.26.x used in the NGC PyTorch 25.05 image but has a performance regression issue.
 # Use NCCL version 2.27.5 which has the fixes.
-NCCL_VER="2.28.3-1+cuda13.0"
+NCCL_VER="2.27.7-1+cuda13.0"
 # Use cuBLAS version 13.1.0.3 instead.
 CUBLAS_VER="13.1.0.3-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
