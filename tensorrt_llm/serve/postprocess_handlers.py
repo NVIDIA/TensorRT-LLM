@@ -38,8 +38,8 @@ from .tool_parser.tool_parser_factory import ToolParserFactory
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
-    role: str = None
-    model: str = None
+    role: str
+    model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
