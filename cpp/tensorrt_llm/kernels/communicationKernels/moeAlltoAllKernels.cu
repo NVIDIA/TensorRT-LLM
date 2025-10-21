@@ -349,18 +349,18 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
     int* smem_topk_target_ranks;
-    int* sm_topk_send_indices;
+    int* smem_topk_send_indices;
     int warps_per_block = blockDim.x / warpSize;
     if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value)
     {
         int lane_id = threadIdx.x / warpSize;
         smem_topk_target_ranks = smem + lane_id * TOP_K;
-        sm_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
+        smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
     }
     else
     {
         smem_topk_target_ranks = smem;
-        sm_topk_send_indices = smem + TOP_K;
+        smem_topk_send_indices = smem + TOP_K;
     }
 
     uint64_t already_copied = 0;
@@ -378,7 +378,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
                 // Mirror to shared memory immediately
                 smem_topk_target_ranks[k] = -1;
-                sm_topk_send_indices[k] = -1;
+                smem_topk_send_indices[k] = -1;
             }
             continue;
         }
@@ -393,7 +393,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
             // Mirror to shared memory immediately
             smem_topk_target_ranks[k] = target_rank;
-            sm_topk_send_indices[k] = dst_token_idx;
+            smem_topk_send_indices[k] = dst_token_idx;
         }
         already_copied |= 1ULL << target_rank;
     }
@@ -407,7 +407,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     for (int k = 0; k < TOP_K; ++k)
     {
         topk_target_ranks[k] = smem_topk_target_ranks[k];
-        topk_send_indices[k] = sm_topk_send_indices[k];
+        topk_send_indices[k] = smem_topk_send_indices[k];
     }
 
     // Perform a single source load and TOP_K fanout per payload
