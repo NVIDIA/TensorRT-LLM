@@ -8,8 +8,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
 @pytest.mark.parametrize("num_experts, n_group, topk_group, top_k", [
     (256, 8, 4, 8),
     (72, 1, 1, 6),
-    (128, 16, 7, 9),
-    (1024, 32, 10, 23),
+    (384, 1, 1, 8),
 ])
 @pytest.mark.parametrize("dtype",
                          [torch.float16, torch.bfloat16, torch.float32])

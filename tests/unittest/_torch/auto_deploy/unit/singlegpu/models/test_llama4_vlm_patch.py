@@ -5,7 +5,7 @@ from PIL import Image
 
 from tensorrt_llm._torch.auto_deploy import LlmArgs
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 
 def test_build_run_llama4_vlm():
@@ -57,7 +57,7 @@ def test_build_run_llama4_vlm():
     pixel_values = inputs["pixel_values"]
 
     def _run_with_and_without_image(model, use_patch=True):
-        with apply_export_patches(patch_list=["hf_llama4_vision"] if use_patch else []):
+        with apply_export_patches(patch_configs={"hf_llama4_vision": {"enabled": use_patch}}):
             with torch.inference_mode():
                 out_no_images = model(
                     input_ids=input_ids,
@@ -86,15 +86,15 @@ def test_build_run_llama4_vlm():
             "position_ids": position_ids,
             "pixel_values": pixel_values,
         },
-        patch_list=[
-            "transformers_sdpa_mask",
-            "autocast_noop",
-            "torch_where",
-            "tensor_meta_device",
-            "sdpa_kernel_noop",
-            "sdpa",
-            "hf_llama4_vision",
-        ],
+        patch_configs={
+            "transformers_sdpa_mask": {},
+            "autocast_noop": {},
+            "torch_where": {},
+            "tensor_meta_device": {},
+            "sdpa_kernel_noop": {},
+            "sdpa": {},
+            "hf_llama4_vision": {"enabled": True},
+        },
     )
     move_to_device(gm, model.device)
 

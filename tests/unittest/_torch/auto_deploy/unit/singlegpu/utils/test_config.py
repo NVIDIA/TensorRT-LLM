@@ -414,23 +414,6 @@ def test_partial_env_override(basic_yaml_files):
         assert settings.option.option == "on"  # from env
 
 
-# Error handling tests
-def test_deprecated_yaml_configs_field_error(basic_yaml_files):
-    """Test that using deprecated yaml_configs field raises ValueError."""
-    with pytest.raises(
-        ValueError, match=r"The 'yaml_configs' field is deprecated.*Please use 'yaml_extra' instead"
-    ):
-        BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
-
-
-def test_empty_yaml_configs_allowed():
-    """Test that empty yaml_configs list doesn't raise error."""
-    # Empty yaml_configs should not raise error (but validation will still fail for missing fields)
-    with pytest.raises(ValidationError):
-        # Should fail validation for missing required fields, not for yaml_configs deprecation
-        BasicSettings(yaml_configs=[])
-
-
 def test_missing_yaml_file(temp_dir):
     """Test handling of missing yaml file."""
     missing_file = temp_dir / "missing.yaml"

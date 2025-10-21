@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-from ..custom_ops.attention_interface import DynamicShape, GetCacheCallable, SequenceInfo
+from ..custom_ops.attention_interface import GetCacheCallable, SequenceInfo
 
 
 @final
@@ -14,6 +14,11 @@ class CachedSequenceInterface:
     def __init__(
         self, sequence_info: SequenceInfo, device: Optional[DeviceLikeType] = None
     ) -> None:
+        # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
+        # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
+        # here to read the desired device across the inference optimizer pipeline. We should ideally
+        # think about a better way to handle this,
+        # see https://github.com/NVIDIA/TensorRT-LLM/issues/8371
         self.device = device or "cuda"
         self.info = sequence_info
         self._cache_initializers: Dict[str, GetCacheCallable] = {}
@@ -33,18 +38,6 @@ class CachedSequenceInterface:
     def all_future_arg_names(self) -> List[str]:
         """Return all the argument names owned by this interface including uninitialized caches."""
         return list(self.info.named_args.keys()) + list(self._cache_initializers.keys())
-
-    @property
-    def dynamic_shapes(self) -> Tuple[DynamicShape, ...]:
-        """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
-        return tuple(self.named_dynamic_shapes.values())
-
-    @property
-    def named_dynamic_shapes(self) -> Dict[str, DynamicShape]:
-        """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
-        named_dynamic_shapes = self.info.named_dynamic_shapes
-        named_dynamic_shapes.update({k: {} for k in self._caches})
-        return named_dynamic_shapes
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)

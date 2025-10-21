@@ -38,10 +38,10 @@ def create_kv_cache_transceiver(
 
     if cache_transceiver_config.backend == BackendTypeCpp.DEFAULT:
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # UCX is the default backend
-        cache_transceiver_config.backend = BackendTypeCpp.UCX
+        # NIXL is the default backend
+        cache_transceiver_config.backend = BackendTypeCpp.NIXL
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_NIXL_KVCACHE", BackendTypeCpp.NIXL),
+        env_vars = [("TRTLLM_USE_UCX_KVCACHE", BackendTypeCpp.UCX),
                     ("TRTLLM_USE_MPI_KVCACHE", BackendTypeCpp.MPI)]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
@@ -145,7 +145,8 @@ class CacheTransBufferManager:
                                                max_num_tokens)
 
     @staticmethod
-    def pre_alloc_buffer_size(kv_cache_size_per_token: int,
+    def pre_alloc_buffer_size(tokens_per_block: int,
+                              kv_cache_size_per_token: int,
                               cache_transceiver_config: CacheTransceiverConfig):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            kv_cache_size_per_token, cache_transceiver_config)
+            tokens_per_block, kv_cache_size_per_token, cache_transceiver_config)

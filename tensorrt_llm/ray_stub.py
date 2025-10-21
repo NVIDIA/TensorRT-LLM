@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
+from functools import wraps as _wraps
 
-from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm._utils import mpi_disabled as _mpi_disabled
 
-if mpi_disabled():
+if _mpi_disabled():
     raise RuntimeError(
         "Ray requested (TLLM_DISABLE_MPI=1), but not installed. Please install Ray."
     )
@@ -27,10 +27,11 @@ def remote(*args, **kwargs):
     def decorator(func):
         # Returns a function that always raises.
         # Decorated class depends on ray, but ray is not installed.
-        @functools.wraps(func)
+        @_wraps(func)
         def stub_checker(*_, **__):
             raise RuntimeError(
-                "Ray not installed, cannot use Ray based feature.")
+                f'Ray not installed, so the remote function / actor "{func.__name__}" is not available.'
+            )
 
         return stub_checker
 
@@ -38,3 +39,9 @@ def remote(*args, **kwargs):
         return decorator(args[0])
 
     return decorator
+
+
+def __getattr__(name):
+    raise RuntimeError(
+        f'Ray not installed, so "ray.{name}" is unavailable. Please install Ray.'
+    )

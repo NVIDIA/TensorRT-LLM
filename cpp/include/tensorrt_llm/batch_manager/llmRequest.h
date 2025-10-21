@@ -1828,9 +1828,10 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
+        auto const currentTokenTime = getSteadyClockNow();
+
         if (!mPerfMetrics.firstIter)
         {
-            auto const currentTokenTime = getSteadyClockNow();
             mPerfMetrics.firstIter = iter;
             mPerfMetrics.timingMetrics.firstTokenTime = currentTokenTime;
         }
@@ -1839,7 +1840,6 @@ public:
 
         if (isFinished())
         {
-            auto const currentTokenTime = getSteadyClockNow();
             mPerfMetrics.lastIter = iter;
             mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }

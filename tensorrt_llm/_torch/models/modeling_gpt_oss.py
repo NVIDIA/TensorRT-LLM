@@ -630,6 +630,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         else:
             self.load_hf_weights(weights)
 
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.block[:self.config.num_hidden_layers]):
             if idx == 0:

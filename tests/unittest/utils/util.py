@@ -19,7 +19,8 @@ except ImportError:
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm._utils import (mpi_disabled, torch_dtype_to_trt,
+                                 trt_dtype_to_torch)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -449,5 +450,4 @@ def check_accuracy(a, b, atol, rtol, percent):
 
 
 skip_ray = pytest.mark.skipif(
-    os.environ.get("TLLM_DISABLE_MPI") == "1",
-    reason="This test is skipped for Ray orchestrator.")
+    mpi_disabled(), reason="This test is skipped for Ray orchestrator.")

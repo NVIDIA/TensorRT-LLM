@@ -10,6 +10,14 @@ methods:
       request_perf_metrics:
         annotation: Optional[tensorrt_llm.bindings.executor.RequestPerfMetrics]
         default: null
+      additional_context_outputs:
+        annotation: Optional[Dict[str, torch.Tensor]]
+        default: null
+        status: prototype
+      additional_generation_outputs:
+        annotation: Optional[Dict[str, torch.Tensor]]
+        default: null
+        status: prototype
     return_annotation: None
 properties:
   length:

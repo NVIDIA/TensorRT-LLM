@@ -155,7 +155,6 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
@@ -174,7 +173,7 @@ def prepare_flashinfer_metadata(
     _GlobalFlashInferPlanner.reset()
 
     # retrieve sanitzed metadata
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     num_seq = len(seq_len)
 
     # prepare flashinfer-style metadata
@@ -214,9 +213,9 @@ def prepare_flashinfer_metadata(
 # As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
+    seq_len = SequenceInfo._get_sanitized_seq_len(position_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
     return (
         qo_indptr,  # qo_indptr

@@ -144,7 +144,7 @@ void AgentConnection::sendRequestAndBufferInfo(
     TLLM_CHECK(deviceId == mAgentConnectionManager->getDeviceId());
     MemoryDesc bufferDesc(
         reinterpret_cast<uintptr_t>(preAllocateBuffer->data()), preAllocateBuffer->getSize(), deviceId);
-    std::string address = mAgentConnectionManager->getAgent()->getConnectionInfo();
+    std::string address = mAgentConnectionManager->getAgent()->getLocalConnectionInfo();
     std::optional<std::string> metadataOpt = std::nullopt;
     if (mNeedSendMetadata)
     {
@@ -225,7 +225,7 @@ AgentConnectionManager::AgentConnectionManager(
     mRegMemDescs = MemoryDescs{MemoryType::kVRAM, MemDescs};
     m_Agent->registerMemory(mRegMemDescs);
 
-    AgentState localAgentState{mAgentName, m_Agent->getConnectionInfo()};
+    AgentState localAgentState{mAgentName, m_Agent->getLocalConnectionInfo()};
     std::vector<AgentState> agentStates(mpi::MpiComm::session().getSize());
     if (mpi::MpiComm::session().getSize() > 1)
     {
@@ -411,10 +411,10 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call connectRemoteAgent");
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with connectRemoteAgent",
+            TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call loadRemoteAgent");
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
                 mAgentName.c_str(), remoteAgentName.c_str());
-            m_Agent->connectRemoteAgent(remoteAgentName, connectionInfo);
+            m_Agent->loadRemoteAgent(remoteAgentName, connectionInfo);
         }
     }
     else

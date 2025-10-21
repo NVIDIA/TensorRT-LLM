@@ -1,14 +1,19 @@
-from typing import Optional
+from typing import List, Optional
 
 import pytest
 import torch
+import torch.nn as nn
 from _graph_test_helpers import SequenceEmbeddingInfo
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import (
+    FullModelExportInfo,
+    ModelFactory,
+    SubModuleExportInfo,
+)
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 
@@ -31,6 +36,9 @@ class DummyFactory(ModelFactory):
 
     def get_cache_config(self):
         return self.cache_config
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
@@ -163,6 +171,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
         {
             "build_model": {
                 "stage": "factory",
+                "run_per_gm": False,
                 "device": "cuda",
                 "run_graph_cleanup": False,
                 "requires_clean_graph": False,
@@ -170,6 +179,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             "export_to_gm": {
                 "stage": "export",
                 "strict": False,
+                "run_per_gm": False,
                 "clone_state_dict": True,
                 "run_graph_cleanup": False,
                 "requires_clean_graph": False,
@@ -182,7 +192,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "attn_backend": attn_backend,
+                "backend": attn_backend,
             },
         },
     )  # type: ignore

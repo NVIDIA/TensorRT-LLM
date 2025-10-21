@@ -262,6 +262,7 @@ class BaseLLM:
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
+        cache_salt: Optional[Union[str, Sequence[str]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -282,6 +283,7 @@ class BaseLLM:
                 Disaggregated parameters. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
+            cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -312,7 +314,9 @@ class BaseLLM:
                                                    i),
                 disaggregated_params=_item_at(disaggregated_params, i),
                 scheduling_params=_item_at(scheduling_params, i),
-                streaming=False)
+                cache_salt=_item_at(cache_salt, i),
+                streaming=False,
+            )
             futures.append(future)
 
         for future in tqdm(futures,
@@ -950,8 +954,7 @@ class _TrtLLM(BaseLLM):
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True,
-            lora_config=lora_config)
+            is_llm_executor=True)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -1053,9 +1056,6 @@ class _TorchLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config,
-            # Autodeploy does not support kv_connector_config
-            kv_connector_config=getattr(self.args, "kv_connector_config", None),
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)

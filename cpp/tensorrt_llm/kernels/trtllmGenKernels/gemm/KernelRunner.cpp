@@ -16,13 +16,16 @@
 
 #include <vector>
 
+// clang-format off
+#include "trtllmGen_gemm_export/GemmInterface.h"
+#include "trtllmGen_gemm_export/GemmOptions.h"
+#include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
+// clang-format on
+
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "trtllmGen_gemm_export/GemmInterface.h"
-#include "trtllmGen_gemm_export/GemmOptions.h"
-#include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
 {

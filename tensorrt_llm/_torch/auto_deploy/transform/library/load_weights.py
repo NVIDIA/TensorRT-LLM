@@ -2,12 +2,12 @@
 
 from typing import Optional, Tuple, Type
 
+import torch.nn as nn
 from pydantic import Field
-from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import move_to_device
+from ...utils._graph import move_to_device
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -20,9 +20,9 @@ from ..interface import (
 class MoveDeviceConfig(TransformConfig):
     """Configuration for the moving inputs/arguments to the device transform."""
 
-    device: str = Field(default="meta", description="The device to load the weights on.")
-    adconfig_checkpoint_device: Optional[str] = Field(
-        default=None, description="Optional checkpoint device argument from adconfig."
+    checkpoint_device: Optional[str] = Field(
+        default=None,
+        description="Optional device to init checkpoint before move to shared_config.local_device.",
     )
 
 
@@ -36,22 +36,22 @@ class LoadWeightsToDevice(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return MoveDeviceConfig
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
+    ) -> Tuple[nn.Module, TransformInfo]:
         factory.load_or_random_init(
-            gm,
-            device=self.config.adconfig_checkpoint_device or self.config.device,
+            mod,
+            device=self.config.checkpoint_device or cm.device,
         )
-        move_to_device(gm, self.config.device)
+        move_to_device(mod, cm.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
-        return gm, info
+        return mod, info
 
 
 @TransformRegistry.register("move_inputs_to_device")
@@ -64,15 +64,17 @@ class LoadFactoryModelWeights(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return MoveDeviceConfig
 
-    def _apply(
+    def _apply_to_full_model(
         self,
-        gm: GraphModule,
+        mod: nn.Module,
         cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        cm.to(self.config.device)
+    ) -> Tuple[nn.Module, TransformInfo]:
+        # TODO (hg) This is weird but equivalent to previous code.
+        # We does not seems to need this transform.
+        cm.to(cm.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
-        return gm, info
+        return mod, info

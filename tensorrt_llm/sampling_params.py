@@ -110,19 +110,6 @@ class BatchedLogitsProcessor(ABC):
 
 
 @dataclass(slots=True, kw_only=True)
-class AdditionalModelOutput:
-    """An additional output to gather from the model.
-
-    Args:
-        name (str): The name of the additional output to gather from the model.
-        gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.
-    """  # noqa: E501
-
-    name: str
-    gather_context: bool
-
-
-@dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
 
@@ -191,7 +178,7 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
-        additional_model_outputs (List[tensorrt_llm.sampling_params.AdditionalModelOutput], optional): The additional outputs to gather from the model. Defaults to None.
+        additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
@@ -259,7 +246,7 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
-    additional_model_outputs: Optional[List[AdditionalModelOutput]] = None
+    additional_model_outputs: Optional[List[str]] = None
 
     # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
     # Can be deprecated after migration to PyTorch backend.
@@ -510,6 +497,12 @@ class SamplingParams:
                 config_kwargs["return_context_logits"] = True
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
+
+        if config_kwargs.get("additional_model_outputs") is not None:
+            config_kwargs["additional_model_outputs"] = [
+                tllme.AdditionalModelOutput(name=output_name, gather_context=False)
+                for output_name in config_kwargs["additional_model_outputs"]
+            ]
 
         return tllme.OutputConfig(**config_kwargs)
 

@@ -12,6 +12,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
+                       RocketSparseAttentionConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
                        UserProvidedDecodingConfig)
@@ -61,4 +62,5 @@ __all__ = [
     'AttentionDpConfig',
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',
+    'RocketSparseAttentionConfig',
 ]
