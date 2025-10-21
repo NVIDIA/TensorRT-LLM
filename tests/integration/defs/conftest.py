@@ -2559,3 +2559,18 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture
+def clear_flashinfer_cache():
+    """Clear flashinfer cache directory before test execution"""
+    flashinfer_cache_path = Path.home() / ".cache" / "flashinfer"
+    if flashinfer_cache_path.exists():
+        shutil.rmtree(flashinfer_cache_path)
+        print(f"Cleared flashinfer cache: {flashinfer_cache_path}")
+    yield
+    # Cleanup after test if needed
+    if flashinfer_cache_path.exists():
+        shutil.rmtree(flashinfer_cache_path)
+        print(
+            f"Cleaned up flashinfer cache after test: {flashinfer_cache_path}")
