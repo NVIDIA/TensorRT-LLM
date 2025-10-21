@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import traceback
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -422,6 +423,14 @@ class ModelDrafter(Drafter):
         Returns:
             bool: True if draft model should be forwarded, False otherwise
         """
+        all_disable_speculative_decoding = True
+        for request in itertools.chain(scheduled_batch.context_requests,
+                                       scheduled_batch.generation_requests):
+            if not request.py_disable_speculative_decoding:
+                all_disable_speculative_decoding = False
+                break
+        if all_disable_speculative_decoding:
+            return False
         for request in scheduled_batch.context_requests:
             if request.is_first_context_chunk:
                 continue
