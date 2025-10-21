@@ -161,7 +161,7 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
     """
 
     def target_op(self):
-        return torch.ops.auto_deploy.triton_quant_fp8_moe
+        return torch.ops.auto_deploy.torch_quant_fp8_moe
 
     def _apply(
         self,

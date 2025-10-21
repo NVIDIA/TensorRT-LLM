@@ -4,7 +4,7 @@ Triton implementation of the Fused MOE ops. Inspired by vLLM's triton MOE implem
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
@@ -522,15 +522,15 @@ def triton_quant_fp8_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
-    w1_input_scale: List[torch.Tensor],
-    w2_input_scale: List[torch.Tensor],
-    w3_input_scale: List[torch.Tensor],
-    w1_weight_scale: List[torch.Tensor],
-    w2_weight_scale: List[torch.Tensor],
-    w3_weight_scale: List[torch.Tensor],
+    w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
+    w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
+    w3_weight: torch.Tensor,  # unused for mlp style
+    w1_input_scale: torch.Tensor,  # [E] stacked input scales
+    w2_input_scale: torch.Tensor,  # [E] stacked input scales
+    w3_input_scale: torch.Tensor,  # unused
+    w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
+    w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
+    w3_weight_scale: torch.Tensor,  # unused
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
@@ -543,18 +543,17 @@ def triton_quant_fp8_moe(
     topk_ids = selected_experts.to(torch.int32).contiguous()
     topk_weights = routing_weights.to(torch.float32).contiguous()
 
-    # Stack FP8 weights and scales
-    E = len(w1_weight)
-    w1_q = torch.stack(w1_weight, dim=0).contiguous()
-    w2_q = torch.stack(w2_weight, dim=0).contiguous()
+    # Weights are already stacked [E, ...] - just ensure contiguous and extract scales
+    w1_q = w1_weight.contiguous()
+    w2_q = w2_weight.contiguous()
     a1_scale = w1_input_scale[0].to(torch.float32).reshape(1).contiguous()
     a2_scale = w2_input_scale[0].to(torch.float32).reshape(1).contiguous()
-    b1_scale = torch.stack(w1_weight_scale, dim=0).to(torch.float32).contiguous()
-    b2_scale = torch.stack(w2_weight_scale, dim=0).to(torch.float32).contiguous()
+    b1_scale = w1_weight_scale.to(torch.float32).contiguous()
+    b2_scale = w2_weight_scale.to(torch.float32).contiguous()
 
     # Setup
     M, H = x2d.shape
-    _, inter_size, _ = w1_q.shape
+    E, inter_size, _ = w1_q.shape
     top_k = topk_ids.shape[1]
     config = _default_kernel_config(M, E, inter_size, H, top_k)
     sorted_token_ids, expert_ids, num_tokens_post_padded = _pack_routed_tokens(
@@ -613,15 +612,15 @@ def triton_quant_fp8_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    w1_weight: List[torch.Tensor],
-    w2_weight: List[torch.Tensor],
-    w3_weight: List[torch.Tensor],
-    w1_input_scale: List[torch.Tensor],
-    w2_input_scale: List[torch.Tensor],
-    w3_input_scale: List[torch.Tensor],
-    w1_weight_scale: List[torch.Tensor],
-    w2_weight_scale: List[torch.Tensor],
-    w3_weight_scale: List[torch.Tensor],
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: torch.Tensor,
+    w1_input_scale: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+    w3_input_scale: torch.Tensor,
+    w1_weight_scale: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    w3_weight_scale: torch.Tensor,
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
