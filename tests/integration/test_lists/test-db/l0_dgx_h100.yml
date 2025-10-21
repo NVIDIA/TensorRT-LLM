@@ -91,6 +91,12 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[round_robin]
+  - disaggregated/test_auto_scaling.py::test_service_discovery[load_balancing]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[round_robin]
+  - disaggregated/test_auto_scaling.py::test_worker_restart[load_balancing]
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[round_robin]
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[round_robin]
 - condition:
     ranges:
       system_gpu_count:

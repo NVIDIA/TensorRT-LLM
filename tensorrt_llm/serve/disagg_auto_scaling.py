@@ -46,9 +46,13 @@ class DisaggClusterManager:
         self._watch_handle = None
 
     def __del__(self):
-        if asyncio.get_event_loop():
-            asyncio.run_coroutine_threadsafe(self.stop(),
-                                             asyncio.get_event_loop())
+        try:
+            if asyncio.get_event_loop():
+                asyncio.run_coroutine_threadsafe(self.stop(),
+                                                 asyncio.get_event_loop())
+        except RuntimeError:
+            # the event loop may not be running when the cluster manager is destroyed
+            pass
 
     async def start(self) -> None:
         await self._cluster_storage.start()
@@ -208,9 +212,13 @@ class DisaggClusterWorker:
         self._worker_id = f"{role.name}-{host}:{port}-{int(time.time()*1000)}-{os.getpid()}-{random.randint(0, 1000):03}"
 
     def __del__(self):
-        if asyncio.get_event_loop():
-            asyncio.run_coroutine_threadsafe(self.deregister_worker(),
-                                             asyncio.get_event_loop())
+        try:
+            if asyncio.get_event_loop():
+                asyncio.run_coroutine_threadsafe(self.deregister_worker(),
+                                                 asyncio.get_event_loop())
+        except RuntimeError:
+            # the event loop may not be running when the worker is destroyed
+            pass
 
     @property
     def worker_id(self) -> str:
