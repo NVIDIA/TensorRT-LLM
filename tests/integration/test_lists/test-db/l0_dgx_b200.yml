@@ -3,6 +3,21 @@ l0_dgx_b200:
 - condition:
     ranges:
       system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
+- condition:
+    ranges:
+      system_gpu_count:
         gte: 8
         lte: 8
     wildcards:
