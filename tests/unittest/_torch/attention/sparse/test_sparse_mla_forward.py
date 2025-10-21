@@ -22,7 +22,7 @@ from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
-from tensorrt_llm.llmapi.llm_args import DSASparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 try:
@@ -378,7 +378,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype):
     max_tokens = 16384
 
     # Create sparse attention config (DSA - DeepSeek Sparse Attention)
-    sparse_config = DSASparseAttentionConfig(
+    sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=64,  # Number of heads for indexer
         index_head_dim=128,  # Dimension of indexer heads
         index_topk=topk_tokens,  # Top-k tokens to select (2048)

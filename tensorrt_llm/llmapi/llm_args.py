@@ -175,7 +175,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         # dispatch to the correct sparse attention config
         config_classes = {
             "rocket": RocketSparseAttentionConfig,
-            "dsa": DSASparseAttentionConfig,
+            "dsa": DeepSeekSparseAttentionConfig,
         }
 
         algorithm = data.get("algorithm", None)
@@ -225,7 +225,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
 
-class DSASparseAttentionConfig(BaseSparseAttentionConfig):
+class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for DeepSeek Sparse Attention.
     """
@@ -1239,7 +1239,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 
 SparseAttentionConfig: TypeAlias = Union[
     RocketSparseAttentionConfig,
-    DSASparseAttentionConfig,
+    DeepSeekSparseAttentionConfig,
 ]
 
 

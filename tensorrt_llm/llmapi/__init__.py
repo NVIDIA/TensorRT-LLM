@@ -7,8 +7,8 @@ from .llm import LLM, RequestOutput
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
-                       CudaGraphConfig, DraftTargetDecodingConfig,
-                       DSASparseAttentionConfig, DynamicBatchConfig,
+                       CudaGraphConfig, DeepSeekSparseAttentionConfig,
+                       DraftTargetDecodingConfig, DynamicBatchConfig,
                        EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
                        KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
                        MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
@@ -63,5 +63,5 @@ __all__ = [
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
-    'DSASparseAttentionConfig',
+    'DeepSeekSparseAttentionConfig',
 ]

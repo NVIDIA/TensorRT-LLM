@@ -99,6 +99,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp_trtllm] TIMEOUT (180)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_baseline_fp8gemm_bf16_kv[baseline] TIMEOUT (180)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_baseline_fp8gemm_bf16_kv[baseline_mtp1] TIMEOUT (180)
 - condition:
     ranges:
       system_gpu_count:

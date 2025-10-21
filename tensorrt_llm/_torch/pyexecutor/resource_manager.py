@@ -1202,8 +1202,7 @@ class SlotManager:
 
 class BlockManager:
 
-    def __init__(self, num_layers: int, num_blocks: int, tokens_per_block: int):
-        self.num_layers = num_layers
+    def __init__(self, num_blocks: int, tokens_per_block: int):
         self.num_blocks = num_blocks
         self.tokens_per_block = tokens_per_block
         self.max_blocks_per_seq = self.num_blocks

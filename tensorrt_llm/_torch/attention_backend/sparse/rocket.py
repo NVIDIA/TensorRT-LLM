@@ -898,7 +898,7 @@ class RocketKVCacheManager(KVCacheManager):
 
         # Block manager to manage the KT cache blocks for each request. Different layers share the
         # same block ids.
-        self.kt_cache_manager = BlockManager(num_layers, self.num_blocks,
+        self.kt_cache_manager = BlockManager(self.num_blocks,
                                              self.kt_tokens_per_block)
 
     def add_dummy_requests(

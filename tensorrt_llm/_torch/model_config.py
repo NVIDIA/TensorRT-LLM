@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import DSASparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -445,7 +445,7 @@ class ModelConfig(Generic[TConfig]):
                         sparse_attention_config = kwargs.get(
                             'sparse_attention_config')
                         kwargs[
-                            'sparse_attention_config'] = DSASparseAttentionConfig(
+                            'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                                 index_n_heads=(
                                     sparse_attention_config.index_n_heads
                                     if sparse_attention_config

@@ -16,7 +16,7 @@ import argparse
 import json
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, DSASparseAttentionConfig,
+from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
                                  KvCacheConfig, MoeConfig,
                                  RocketSparseAttentionConfig)
 
@@ -189,7 +189,7 @@ def run_RocketKV(args):
 
 
 def run_DSA(args):
-    sparse_attention_config = DSASparseAttentionConfig(
+    sparse_attention_config = DeepSeekSparseAttentionConfig(
         indexer_max_chunk_size=args.index_max_chunk_size, )
     run_llm(args, sparse_attention_config)
 

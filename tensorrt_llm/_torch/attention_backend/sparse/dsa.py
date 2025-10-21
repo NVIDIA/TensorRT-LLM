@@ -1280,8 +1280,7 @@ class DSACacheManager(KVCacheManager):
         # Block manager to manage the indexer k cache blocks for each request. Different layers share the
         # same block ids.
         self.indexer_k_cache_manager = BlockManager(
-            self.num_local_layers, self.num_blocks,
-            self.indexer_k_cache_tokens_per_block)
+            self.num_blocks, self.indexer_k_cache_tokens_per_block)
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.indexer_k_cache_tokens_per_block * (index_head_dim + scale_size)]
@@ -1341,7 +1340,8 @@ class DSACacheManager(KVCacheManager):
         """Get indexer k cache buffer from a specific layer pool."""
         block_size = self.indexer_k_cache_manager.tokens_per_block
         per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
-        return self.indexer_k_cache_pool_per_layer[layer_idx].view(
+        layer_offset = self.layer_offsets[layer_idx]
+        return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
 
     def prepare_resources(self, scheduled_batch):
