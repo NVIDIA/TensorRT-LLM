@@ -16,6 +16,7 @@ import torch
 from cuda.bindings import driver
 
 import tensorrt_llm
+from tensorrt_llm._utils import mpi_barrier, mpi_broadcast
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 
@@ -793,6 +794,13 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
+        """Profile runners and select the best tactic.
+
+        For multi-rank profiling, only rank 0 performs the actual profiling
+        to avoid sync issues when different ranks select different tactics.
+        The results are then broadcasted to all other ranks.
+        """
+
         min_time = float('inf')
         has_tuning_failure_occured = False
         best_runner_id, best_tactic = None, None
@@ -853,6 +861,13 @@ class AutoTuner:
                     min_time = time_measured
                     best_runner_id, best_tactic = runner_id, tac
 
+        if self._is_sync_op(runner):
+            profiling_results = (best_runner_id, best_tactic, min_time,
+                                 has_tuning_failure_occured)
+            # Broadcast profiling results from rank 0 to all other ranks
+            profiling_results = mpi_broadcast(profiling_results, root=0)
+            best_runner_id, best_tactic, min_time, has_tuning_failure_occured = profiling_results
+
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occured
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
@@ -904,6 +919,9 @@ class AutoTuner:
             end = torch.cuda.Event(enable_timing=True)
             graph = torch.cuda.CUDAGraph()
 
+            if self._is_sync_op(runner):
+                mpi_barrier()
+
             with torch.cuda.stream(stream):
                 if use_cuda_graph:
                     with torch.cuda.graph(graph):
@@ -925,6 +943,9 @@ class AutoTuner:
                 else:
                     delay_kernel(self.stream_delay_micro_secs, stream)
 
+                if self._is_sync_op(runner):
+                    mpi_barrier()
+
                 start.record()
 
                 if use_cuda_graph:
@@ -942,6 +963,7 @@ class AutoTuner:
 
                 return start.elapsed_time(end) / repeat
 
+        # warm up, no timing
         for _ in range(self.warmup):
             runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
@@ -1178,6 +1200,9 @@ class AutoTuner:
             f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
         )
         return inputs_list
+
+    def _is_sync_op(self, runner: TunableRunner) -> bool:
+        return runner.__class__.__name__ in ["AllReduceRunner"]
 
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
