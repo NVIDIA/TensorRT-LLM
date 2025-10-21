@@ -584,10 +584,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         []() -> int64_t { return static_cast<int64_t>(torch_ext::SEND_COUNTERS_OFFSET_INDEX); });
     module.def("MOE_A2A_RECV_COUNTERS_OFFSET_INDEX() -> int",
         []() -> int64_t { return static_cast<int64_t>(torch_ext::RECV_COUNTERS_OFFSET_INDEX); });
-    // Backward-compat: legacy COMPLETION_FLAGS returns dispatch flags
-    module.def("MOE_A2A_COMPLETION_FLAGS_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX); });
-    // New explicit exports
     module.def("MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX() -> int",
         []() -> int64_t { return static_cast<int64_t>(torch_ext::DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX); });
     module.def("MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX() -> int",

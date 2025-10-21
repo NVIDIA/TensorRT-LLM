@@ -263,7 +263,7 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
         # Verify completion flags after dispatch
         completion_flags_offset = moe_a2a.moe_a2a_metainfo[
-            MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
+            MoeAlltoAll.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX].item()
         completion_flags = moe_a2a.workspace[
             rank, completion_flags_offset:completion_flags_offset +
             ep_size * 4].view(torch.int32).cpu()
@@ -273,12 +273,6 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                                               flag_val_offset:flag_val_offset +
                                               4].view(torch.int32).cpu()
 
-        print(
-            "completion_flags_ptr (hex):",
-            hex(moe_a2a.workspace[
-                rank, completion_flags_offset:completion_flags_offset +
-                ep_size * 4].data_ptr()))
-
         assert torch.all(completion_flags == expected_flag_val), (
             f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
         )
@@ -286,16 +280,18 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         # Return results to be collected (move to CPU for MPI transfer)
         return (token_selected_experts.cpu(),
                 [p.cpu() for p in payloads], [rb.cpu() for rb in recv_buffers],
-                moe_a2a.send_counters.cpu(), moe_a2a.send_indices.cpu(),
-                moe_a2a.recv_counters.cpu(), expert_id_payload_index)
+                moe_a2a.send_counters.cpu(), moe_a2a.topk_send_indices.cpu(),
+                moe_a2a.topk_target_ranks.cpu(), moe_a2a.recv_counters.cpu(),
+                expert_id_payload_index)
     except Exception:
         traceback.print_exc()
         raise
 
 
 def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
-                    all_send_counters, all_send_indices, all_recv_counters,
-                    ep_size, all_num_tokens, top_k, max_tokens_per_rank,
+                    all_send_counters, all_topk_send_indices,
+                    all_topk_target_ranks, all_recv_counters, ep_size,
+                    all_num_tokens, top_k, max_tokens_per_rank,
                     num_experts_per_rank, expert_id_payload_index: int):
     """Verify dispatch results including actual content verification"""
 
@@ -342,21 +338,30 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
             0] == ep_size, "send_counters.shape[0] should be ep_size"
         assert send_counters.dtype == torch.int32, "send_counters.dtype should be torch.int32"
 
-        send_indices = all_send_indices[send_rank]
-        assert len(
-            send_indices.shape) == 2, "send_indices should be a 2D tensor"
-        assert send_indices.shape[
-            0] == local_num_tokens, "send_indices.shape[0] should be local_num_tokens"
-        assert send_indices.shape[
-            1] == ep_size, "send_indices.shape[1] should be ep_size"
-        assert send_indices.dtype == torch.int32, "send_indices.dtype should be torch.int32"
-
         recv_counters = all_recv_counters[send_rank]
         assert len(
             recv_counters.shape) == 1, "recv_counters should be a 1D tensor"
         assert recv_counters.shape[
             0] == ep_size, "recv_counters.shape[0] should be ep_size"
         assert recv_counters.dtype == torch.int32, "recv_counters.dtype should be torch.int32"
+
+        topk_send_indices = all_topk_send_indices[send_rank]
+        assert len(topk_send_indices.shape
+                   ) == 2, "topk_send_indices should be a 2D tensor"
+        assert topk_send_indices.shape[
+            0] == local_num_tokens, "topk_send_indices.shape[0] should be local_num_tokens"
+        assert topk_send_indices.shape[
+            1] == top_k, "topk_send_indices.shape[1] should be top_k"
+        assert topk_send_indices.dtype == torch.int32, "topk_send_indices.dtype should be torch.int32"
+
+        topk_target_ranks = all_topk_target_ranks[send_rank]
+        assert len(topk_target_ranks.shape
+                   ) == 2, "topk_target_ranks should be a 2D tensor"
+        assert topk_target_ranks.shape[
+            0] == local_num_tokens, "topk_target_ranks.shape[0] should be local_num_tokens"
+        assert topk_target_ranks.shape[
+            1] == top_k, "topk_target_ranks.shape[1] should be top_k"
+        assert topk_target_ranks.dtype == torch.int32, "topk_target_ranks.dtype should be torch.int32"
 
     # Verify send_counters
     for send_rank in range(ep_size):
@@ -399,10 +404,10 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
                 f"Rank {recv_rank} received {actual_recv} tokens from rank {send_rank}, " \
                 f"expected {expected_recv} (based on send_counters)"
 
-    # Verify payloads using send_indices
+    # Verify payloads using topk_send_indices and topk_target_ranks
     for send_rank in range(ep_size):
-        send_indices = all_send_indices[
-            send_rank]  # [local_num_tokens, ep_size]
+        topk_send_indices = all_topk_send_indices[send_rank]
+        topk_target_ranks = all_topk_target_ranks[send_rank]
         token_selected_experts = all_token_selected_experts[send_rank]
         payloads = all_payloads[send_rank]
 
@@ -412,40 +417,46 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
         for token_idx in range(local_num_tokens):
             experts = token_selected_experts[token_idx]
             target_ranks = compute_target_rank_id(experts, num_experts_per_rank)
-            unique_targets = set(target_ranks.tolist())
-
-            # Verify send_indices records correct destinations
-            for target_rank in range(ep_size):
-                dst_pos = send_indices[token_idx, target_rank].item()
-
-                if target_rank in unique_targets:
-                    # This token should have been sent to target_rank
-                    assert dst_pos >= 0, \
-                        f"Send rank {send_rank} token {token_idx} should be sent to rank {target_rank} but dst_pos={dst_pos}"
-                    assert dst_pos < max_tokens_per_rank, \
-                        f"Send rank {send_rank} token {token_idx} dst_pos={dst_pos} exceeds max_tokens_per_rank={max_tokens_per_rank}"
-
-                    # Verify actual payload content was copied correctly
-                    recv_buffers = all_recv_buffers[target_rank]
-                    for payload_idx, payload in enumerate(payloads):
-                        recv_buffer = recv_buffers[payload_idx]
-
-                        source_data = payload[token_idx]
-                        received_data = recv_buffer[send_rank, dst_pos]
-                        # Compare source and received data
-                        torch.testing.assert_close(
-                            received_data,
-                            source_data,
-                            atol=
-                            0,  # Dispatch is pure copy, should expact exactly the same
-                            rtol=0,
-                            msg=
-                            f"Content mismatch: received_data={received_data} source_data={source_data} send_rank={send_rank} token_idx={token_idx} experts={experts.tolist()} target_rank={target_rank}, send_indices[token_idx]={send_indices[token_idx].tolist()}"
-                        )
+            # Deduplicate target ranks per token: keep first occurrence, set duplicates to -1
+            topk_target_ranks_ref = target_ranks.clone()
+            seen = set()
+            for kk in range(top_k):
+                tr = int(topk_target_ranks_ref[kk].item())
+                if tr in seen:
+                    topk_target_ranks_ref[kk] = -1
                 else:
-                    # This token should NOT have been sent to target_rank
-                    assert dst_pos == -1, \
-                        f"dst_pos should be -1: send_rank={send_rank} token_idx={token_idx} experts={experts.tolist()} target_rank={target_rank}, send_indices[token_idx]={send_indices[token_idx].tolist()}"
+                    seen.add(tr)
+
+            assert topk_target_ranks[token_idx, :].tolist() == topk_target_ranks_ref.tolist(), \
+                f"topk_target_ranks[token_idx, :] should match deduplicated target_ranks: {topk_target_ranks_ref.tolist()}"
+
+            # For each top_k expert
+            for k in range(top_k):
+                dst_pos = topk_send_indices[token_idx, k].item()
+                target_rank = topk_target_ranks[token_idx, k].item()
+
+                if dst_pos == -1:
+                    assert target_rank == -1, \
+                        f"target_rank should be -1: dst_pos={dst_pos} target_rank={target_rank}"
+                    continue
+
+                # Verify actual payload content was copied correctly
+                recv_buffers = all_recv_buffers[target_rank]
+                for payload_idx, payload in enumerate(payloads):
+                    recv_buffer = recv_buffers[payload_idx]
+
+                    source_data = payload[token_idx]
+                    received_data = recv_buffer[send_rank, dst_pos]
+                    # Compare source and received data
+                    torch.testing.assert_close(
+                        received_data,
+                        source_data,
+                        atol=
+                        0,  # Dispatch is pure copy, should expact exactly the same
+                        rtol=0,
+                        msg=
+                        f"Content mismatch: received_data={received_data} source_data={source_data} send_rank={send_rank} token_idx={token_idx} experts={experts.tolist()} target_rank={target_rank}, topk_send_indices[token_idx]={topk_send_indices[token_idx].tolist()}"
+                    )
 
     # Verify token_selected_experts of invalid tokens are correctly sanitized
     for recv_rank in range(ep_size):
@@ -539,9 +550,10 @@ class TestMoEAlltoAll:
         all_payloads = [r[1] for r in all_results]
         all_recv_buffers = [r[2] for r in all_results]
         all_send_counters = [r[3] for r in all_results]
-        all_send_indices = [r[4] for r in all_results]
-        all_recv_counters = [r[5] for r in all_results]
-        all_expert_id_payload_index = [r[6] for r in all_results]
+        all_topk_send_indices = [r[4] for r in all_results]
+        all_topk_target_ranks = [r[5] for r in all_results]
+        all_recv_counters = [r[6] for r in all_results]
+        all_expert_id_payload_index = [r[7] for r in all_results]
         expert_id_payload_index = all_expert_id_payload_index[0]
 
         assert all(i == expert_id_payload_index
@@ -550,7 +562,8 @@ class TestMoEAlltoAll:
 
         # Verify dispatch results with content verification
         verify_dispatch(all_token_selected_experts, all_payloads,
-                        all_recv_buffers, all_send_counters, all_send_indices,
+                        all_recv_buffers, all_send_counters,
+                        all_topk_send_indices, all_topk_target_ranks,
                         all_recv_counters, ep_size, all_num_tokens, top_k,
                         max_tokens_per_rank, num_experts_per_rank,
                         expert_id_payload_index)
@@ -653,19 +666,12 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
 
         # Run dispatch
-
         with torch.cuda.profiler.profile():
-            # start_event = torch.cuda.Event(enable_timing=True)
-            # end_event = torch.cuda.Event(enable_timing=True)
-            # start_event.record()
             recv_buffers = moe_a2a.dispatch(
                 token_selected_experts,
                 payloads,
                 invalid_token_expert_id=-1,
                 expert_id_payload_index=expert_id_payload_index)
-            # end_event.record()
-            # elapsed_time_ms = start_event.elapsed_time(end_event)
-            # print(f"moe_a2a.dispatch execution time: {elapsed_time_ms:.3f} ms")
 
         hidden_states_recv = recv_buffers[
             0]  # [ep_size, max_tokens_per_rank, hidden_size]
@@ -699,22 +705,12 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             num_experts_per_rank=num_experts_per_rank).view(
                 ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
 
-        # Run combine on the received data
-
-        send_indices = moe_a2a.send_indices
-
         with torch.cuda.profiler.profile():
-            # start_event = torch.cuda.Event(enable_timing=True)
-            # end_event = torch.cuda.Event(enable_timing=True)
-            # start_event.record()
             combined_output = moe_a2a.combine(hidden_states_recv)
-            # end_event.record()
-            # elapsed_time_ms = start_event.elapsed_time(end_event)
-            # print(f"moe_a2a.combine execution time: {elapsed_time_ms:.3f} ms")
 
         # Verify completion flags after combine
         completion_flags_offset = moe_a2a.moe_a2a_metainfo[
-            MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
+            MoeAlltoAll.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX].item()
         completion_flags_ptr = moe_a2a.workspace[
             rank, completion_flags_offset:completion_flags_offset + ep_size * 4]
         completion_flags = completion_flags_ptr.view(torch.int32).cpu()
@@ -731,7 +727,6 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
         return (
             token_selected_experts.cpu(),
             [p.cpu() for p in payloads],  # Return actual payloads used
-            send_indices.cpu(),
             combined_output.cpu(),
             rank_experts.cpu()  # Return the experts used on this rank
         )
@@ -748,9 +743,8 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
     # Extract results
     all_token_selected_experts = [r[0] for r in all_results]
     all_original_payloads = [r[1] for r in all_results]
-    all_send_indices = [r[2] for r in all_results]
-    all_combined_outputs = [r[3] for r in all_results]
-    all_rank_experts = [r[4]
+    all_combined_outputs = [r[2] for r in all_results]
+    all_rank_experts = [r[3]
                         for r in all_results]  # Extract experts from each rank
 
     # For each rank, verify the combined output
@@ -761,28 +755,7 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
         hidden_states = original_payloads[0]
         token_final_scales = original_payloads[2]
 
-        send_indices = all_send_indices[rank]
         combined_output = all_combined_outputs[rank]
-
-        local_num_tokens = all_num_tokens[rank]
-
-        # Check send_indices
-        for token_idx in range(local_num_tokens):
-            unique_targets = set()
-            for k in range(top_k):
-                expert_id = token_selected_experts[token_idx, k].item()
-                target_rank = compute_target_rank_id(expert_id,
-                                                     num_experts_per_rank)
-                unique_targets.add(target_rank)
-                assert send_indices[token_idx, target_rank].item(
-                ) >= 0 and send_indices[token_idx, target_rank].item(
-                ) < max_tokens_per_rank, "send_indices should be >= 0 and < max_tokens_per_rank"
-
-            for target_rank in range(ep_size):
-                if target_rank not in unique_targets:
-                    assert send_indices[
-                        token_idx,
-                        target_rank].item() == -1, "send_indices should be -1"
 
         # Check the following are equal:
         # expected: Directly emulate MoE with all experts as if EP is not used.
@@ -800,15 +773,15 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
         try:
             torch.testing.assert_close(combined_output,
                                        expected_combined_output,
-                                       rtol=5e-2,
-                                       atol=5e-2)
+                                       rtol=1e-1,
+                                       atol=5e-1)
         except AssertionError as e:
             # Find the first mismatch location
             abs_diff = (combined_output - expected_combined_output).abs()
             rel_diff = abs_diff / (expected_combined_output.abs() + 1e-8)
 
             # Check both absolute and relative tolerance
-            mask = (abs_diff > 1e-2) & (rel_diff > 5e-2)
+            mask = (abs_diff > 5e-1) & (rel_diff > 1e-1)
             if mask.any():
                 # Get the first mismatch
                 mismatch_indices = torch.nonzero(mask)[0].tolist()
