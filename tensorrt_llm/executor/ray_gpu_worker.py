@@ -105,33 +105,32 @@ class RayWorkerWrapper:
                 f"The RayGPUWorker has no method called '{method_name}'.")
 
     def _inject_worker_extension(
-            self, worker_class: Type['GenerationExecutor'],
-            extension_cls_name: Optional[str]) -> Type['GenerationExecutor']:
+            self, worker_class: Type[BaseWorker],
+            extension_cls_name: Optional[str]) -> Type[BaseWorker]:
         """Inject worker extension into the worker class if specified."""
         if not extension_cls_name:
             return worker_class
 
         try:
             extension_cls = resolve_obj_by_qualname(extension_cls_name)
-            # Check for conflicts
-            for attr in dir(extension_cls):
-                if attr.startswith("__"):
-                    continue
-                if hasattr(worker_class, attr):
-                    raise ValueError(
-                        f"Worker class {worker_class.__name__} already has method called '{attr}', "
-                        f"which conflicts with extension {extension_cls.__name__}. "
-                    )
-
-            if extension_cls not in worker_class.__bases__:
-                worker_class.__bases__ = worker_class.__bases__ + (
-                    extension_cls, )
-
-            return worker_class
-
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load worker extension '{extension_cls_name}': {e}")
+
+        # Check for conflicts
+        for attr in dir(extension_cls):
+            if attr.startswith("__"):
+                continue
+            if hasattr(worker_class, attr):
+                raise ValueError(
+                    f"Worker class {worker_class.__name__} already has method called '{attr}', "
+                    f"which conflicts with extension {extension_cls.__name__}. "
+                )
+
+        if extension_cls not in worker_class.__bases__:
+            worker_class.__bases__ = worker_class.__bases__ + (extension_cls, )
+
+        return worker_class
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
