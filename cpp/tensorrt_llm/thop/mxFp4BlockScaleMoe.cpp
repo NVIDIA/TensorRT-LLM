@@ -126,8 +126,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(top_k <= 8 && top_k > 0,
-            "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(top_k <= 10 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=10 && top_k>0.");
     }
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");

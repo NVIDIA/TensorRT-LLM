@@ -88,7 +88,7 @@ class BaseMultimodalInputProcessor:
                                                   None) is not None:
             return int(self.tokenizer.vocab_size)
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
@@ -103,7 +103,7 @@ class BaseMultimodalInputProcessor:
                                              None) is not None:
             return processor.mm_token_ids
 
-        logger.warning(
+        logger.debug(
             f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
             "If needed, please override this method to return multimodal token ids. "
         )
@@ -503,45 +503,47 @@ def create_input_processor_with_hash(
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
+        mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+        prompt_token_ids, extra_processed_inputs = input_processor(
+            inputs, sampling_params)
+
         num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
         # TODO: here we assume there is only one modality for now
         num_mm_tokens = next(iter(num_mm_tokens.values()))
-        if len(num_mm_tokens) > 0:
-            mm_hashes = apply_mm_hashes(mm_data, hash_lib)
-            prompt_token_ids, extra_processed_inputs = input_processor(
-                inputs, sampling_params)
-            vocab_size = input_processor.get_vocab_size()
-            mm_ids = input_processor.get_mm_token_ids()
-            mm_special_token_ids = input_processor.get_mm_special_token_ids()
-            if vocab_size is None and mm_ids is None:
-                raise ValueError(
-                    "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
-                )
-            start_positions, start_special_token_positions = find_mm_token_positions(
-                input_ids=prompt_token_ids,  # token sequence
-                num_mm_tokens=
-                num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                vocab_size=vocab_size,
-                mm_token_ids=mm_ids,
-                mm_special_token_ids=mm_special_token_ids,
-            )
-            # Store special token offsets if available
-            if len(start_special_token_positions
-                   ) > 0 and mm_special_token_ids is not None:
-                extra_processed_inputs["multimodal_data"][
-                    "special_token_offsets"] = start_special_token_positions
-            # flatten the hashes from dict to a single list
-            mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-            validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
-                               num_mm_tokens)
-            mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
-                               ]  # nested list w/ multiple int32 per hash
+        if len(num_mm_tokens) <= 0:
+            return [], None
 
-            extra_processed_inputs[
-                "multimodal_input"] = MultimodalInput.from_components(
-                    mm_hashes_int32, start_positions, num_mm_tokens)
-            return prompt_token_ids, extra_processed_inputs
-        return [], None
+        vocab_size = input_processor.get_vocab_size()
+        mm_ids = input_processor.get_mm_token_ids()
+        mm_special_token_ids = input_processor.get_mm_special_token_ids()
+        if vocab_size is None and mm_ids is None:
+            raise ValueError(
+                "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
+            )
+        start_positions, start_special_token_positions = find_mm_token_positions(
+            input_ids=prompt_token_ids,  # token sequence
+            num_mm_tokens=
+            num_mm_tokens,  # list of lengths of each chunk of visual tokens
+            vocab_size=vocab_size,
+            mm_token_ids=mm_ids,
+            mm_special_token_ids=mm_special_token_ids,
+        )
+        # Store special token offsets if available
+        if len(start_special_token_positions
+               ) > 0 and mm_special_token_ids is not None:
+            extra_processed_inputs["multimodal_data"][
+                "special_token_offsets"] = start_special_token_positions
+        # flatten the hashes from dict to a single list
+        mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
+        validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+                           num_mm_tokens)
+        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+                           ]  # nested list w/ multiple int32 per hash
+
+        extra_processed_inputs[
+            "multimodal_input"] = MultimodalInput.from_components(
+                mm_hashes_int32, start_positions, num_mm_tokens)
+        return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams

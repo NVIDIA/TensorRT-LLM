@@ -3004,6 +3004,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }
+    bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
 
     TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
     allottedPrimaryMemBytes = allottedPrimaryMemBytes - extraCostMemory;
@@ -3014,11 +3015,15 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         TLLM_LOG_DEBUG("windowSizeShare: %f, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
         auto maxTokens = static_cast<uint64_t>(
             allottedPrimaryMemBytes * windowSizeShare / static_cast<double>(cacheSizeBytesPerToken));
-        if (config.getMaxTokens().has_value())
+        // kv_cache_config.max_tokens is not effective in VSWA scheme
+        if (config.getMaxTokens().has_value() && !isVSWA)
         {
             auto const maxTokensFromConfig = static_cast<uint64_t>(config.getMaxTokens().value());
-            TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
-            maxTokens = std::min(maxTokensFromConfig, maxTokens);
+            if (maxTokensFromConfig < maxTokens)
+            {
+                TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
+                maxTokens = std::min(maxTokensFromConfig, maxTokens);
+            }
         }
         TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
         SizeType32 const blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
