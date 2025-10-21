@@ -2434,6 +2434,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         with LLM(self.MODEL_PATH,
+                 max_seq_len=8192,
                  max_batch_size=32,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
@@ -2458,6 +2459,8 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
     def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size):
         model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
         with LLM(model_path,
+                 max_seq_len=8192,
+                 max_batch_size=32,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
