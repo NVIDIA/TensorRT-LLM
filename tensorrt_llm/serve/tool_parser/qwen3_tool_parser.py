@@ -31,8 +31,8 @@ class Qwen3ToolParser(BaseToolParser):
         Initializes the detector with necessary state variables.
         """
         super().__init__()
-        self.bot_token = "<tool_call>\n"
-        self.eot_token = "\n</tool_call>"
+        self.bot_token = "<tool_call>\n"  # nosec B105
+        self.eot_token = "\n</tool_call>"  # nosec B105
         self.tool_call_separator = "\n"
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
 
