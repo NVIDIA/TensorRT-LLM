@@ -50,7 +50,6 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
             fused_w_up_experts = torch.stack([gm.get_parameter(n.target) for n in w1_list], dim=0)
             new_key_w_up = f"fused_moe_w1_stacked_{fused_key_counter}"
             # Triton fused MoE op supports mlp only.
-
             replacement_op = torch.ops.auto_deploy.triton_moe_fused
 
         else:

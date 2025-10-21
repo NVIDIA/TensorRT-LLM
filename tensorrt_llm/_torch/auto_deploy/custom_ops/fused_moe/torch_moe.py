@@ -243,36 +243,68 @@ def torch_quant_fp8_moe(
         w1_input_scale, w2_input_scale, w3_input_scale: Lists of input scale tensors for the corresponding ops.
         w1_weight_scale, w2_weight_scale, w3_weight_scale: Lists of weight scale tensors for the corresponding ops.
 
+        Note:
+            If w3_weight (and corresponding scales) are empty lists, this operator treats the expert as a 2-layer MLP
+            and runs: y = W2( relu2( W1(x) ) ). Otherwise, it runs the gated-MLP style:
+            y = W2( SiLU(W1(x)) * W3(x) ).
     """
+    run_two_layer_mlp = w3_weight is None or len(w3_weight) == 0
 
-    def make_fp8_mlp(i):
-        def mlp(inp):
-            gate_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
-                inp,
-                w1_weight[i],
-                bias=None,
-                input_scale=w1_input_scale[i],
-                weight_scale=w1_weight_scale[i],
-            )
-            up_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
-                inp,
-                w3_weight[i],
-                bias=None,
-                input_scale=w3_input_scale[i],
-                weight_scale=w3_weight_scale[i],
-            )
-            prod = F.silu(gate_out) * up_out
-            return torch.ops.auto_deploy.torch_quant_fp8_linear(
-                prod,
-                w2_weight[i],
-                bias=None,
-                input_scale=w2_input_scale[i],
-                weight_scale=w2_weight_scale[i],
-            )
+    if not run_two_layer_mlp:
 
-        return mlp
+        def make_fp8_gated_mlp(i):
+            def mlp(inp):
+                gate_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+                    inp,
+                    w1_weight[i],
+                    bias=None,
+                    input_scale=w1_input_scale[i],
+                    weight_scale=w1_weight_scale[i],
+                )
+                up_out = torch.ops.auto_deploy.torch_quant_fp8_linear(
+                    inp,
+                    w3_weight[i],
+                    bias=None,
+                    input_scale=w3_input_scale[i],
+                    weight_scale=w3_weight_scale[i],
+                )
+                prod = F.silu(gate_out) * up_out
+                return torch.ops.auto_deploy.torch_quant_fp8_linear(
+                    prod,
+                    w2_weight[i],
+                    bias=None,
+                    input_scale=w2_input_scale[i],
+                    weight_scale=w2_weight_scale[i],
+                )
 
-    mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
+            return mlp
+
+        mlps = [make_fp8_gated_mlp(i) for i in range(len(w1_weight))]
+    else:
+
+        def make_fp8_mlp(i):
+            def mlp(inp):
+                hidden = torch.ops.auto_deploy.torch_quant_fp8_linear(
+                    inp,
+                    w1_weight[i],
+                    bias=None,
+                    input_scale=w1_input_scale[i],
+                    weight_scale=w1_weight_scale[i],
+                )
+                # relu2 activation: relu(x) ** 2
+                relu_hidden = F.relu(hidden)
+                relu2_hidden = relu_hidden * relu_hidden
+                return torch.ops.auto_deploy.torch_quant_fp8_linear(
+                    relu2_hidden,
+                    w2_weight[i],
+                    bias=None,
+                    input_scale=w2_input_scale[i],
+                    weight_scale=w2_weight_scale[i],
+                )
+
+            return mlp
+
+        mlps = [make_fp8_mlp(i) for i in range(len(w1_weight))]
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
 
