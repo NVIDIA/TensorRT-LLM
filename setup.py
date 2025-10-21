@@ -20,6 +20,8 @@ from typing import List
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
 
+from tensorrt_llm._packaging_utils import get_license_files
+
 
 def parse_requirements(filename: os.PathLike):
     with open(filename) as f:
@@ -73,17 +75,6 @@ def get_version():
         raise RuntimeError(f"Could not set version from {version_file}")
 
     return version
-
-
-def get_license():
-    import sysconfig
-    platform_tag = sysconfig.get_platform()
-    if "x86_64" in platform_tag:
-        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
-    elif "arm64" in platform_tag or "aarch64" in platform_tag:
-        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
-    else:
-        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
 
 
 class BinaryDistribution(Distribution):
@@ -255,7 +246,7 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
-    license_files=get_license(),
+    license_files=get_license_files(),
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',

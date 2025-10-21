@@ -2,25 +2,15 @@ import argparse
 import os
 import subprocess
 import sys
-import sysconfig
 
 import requests
 
 
-def get_expected_license_files():
-    """Get expected license files based on platform architecture."""
-    platform_tag = sysconfig.get_platform()
-    if "x86_64" in platform_tag:
-        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
-    elif "arm64" in platform_tag or "aarch64" in platform_tag:
-        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
-    else:
-        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
-
-
 def verify_license_files():
     """Verify that the correct platform-specific license files are packaged."""
-    expected_files = get_expected_license_files()
+    # Import after package is installed to ensure we're testing the installed version
+    from tensorrt_llm._packaging_utils import get_license_files
+    expected_files = get_license_files()
 
     result = subprocess.run(
         'python3 -c "from importlib.metadata import distribution; '
