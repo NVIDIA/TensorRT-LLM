@@ -95,7 +95,7 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
 
 
 def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                           streaming: bool) -> Tuple[bool, str, str]:
+                           streaming: bool) -> Tuple[str, str]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
@@ -104,17 +104,16 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
                     args.reasoning_parser)
         reasoning_parser = args.reasoning_parser_dict[output_index]
 
-    in_reasoning = False
     if reasoning_parser is not None:
         if not streaming:
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
-        in_reasoning, content, reasoning_content = result.in_reasoning, result.content, result.reasoning_content
+        content, reasoning_content = result.content, result.reasoning_content
     else:
-        in_reasoning, content, reasoning_content = False, text, None
+        content, reasoning_content = text, ""
 
-    return in_reasoning, content, reasoning_content
+    return content, reasoning_content
 
 
 @nvtx_range_debug("chat_stream_post_processor")
@@ -123,8 +122,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     def yield_first_chat(num_tokens: int,
                          idx: int,
-                         role: str = None,
-                         content: str = None):
+                         role: str | None = None,
+                         content: str | None = None):
         choice_data = ChatCompletionResponseStreamChoice(index=idx,
                                                          delta=DeltaMessage(
                                                              role=role,
@@ -171,7 +170,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         delta_text = output.text_diff
 
-        in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
+        delta_text, reasoning_delta_text = apply_reasoning_parser(
             args, i, delta_text, True)
 
         if args.tool_choice and type(
@@ -181,12 +180,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                     name=args.tool_choice.function.name, arguments=delta_text))
             ])
         else:
-            if in_reasoning:
-                delta_message = DeltaMessage(
-                    reasoning_content=reasoning_delta_text)
-            else:
-                delta_message = DeltaMessage(
-                    content=delta_text, reasoning_content=reasoning_delta_text)
+            delta_message = DeltaMessage(content=delta_text,
+                                         reasoning_content=reasoning_delta_text)
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,
@@ -239,8 +234,8 @@ def chat_response_post_processor(
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
     for output in rsp.outputs:
-        _, text, reasoning_text = apply_reasoning_parser(
-            args, output.index, output.text, False)
+        text, reasoning_text = apply_reasoning_parser(args, output.index,
+                                                      output.text, False)
 
         if args.tool_choice and isinstance(args.tool_choice,
                                            ChatCompletionNamedToolChoiceParam):
@@ -252,8 +247,6 @@ def chat_response_post_processor(
                         name=args.tool_choice.function.name, arguments=text))
                 ])
         else:
-            if text is None:
-                text = ""
             message = ChatMessage(role=role,
                                   content=text,
                                   reasoning_content=reasoning_text)
