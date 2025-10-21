@@ -894,6 +894,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil,
                     [
                       "--test-list=$testListPathNode",
+                      "--splitting-algorithm least_duration",
                       "--splits $splits",
                       "--group $splitId"
                     ]
