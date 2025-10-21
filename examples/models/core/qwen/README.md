@@ -886,3 +886,12 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
 
 ## Credits
 This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).
+
+### NVFP4 quantization
+
+TRTLLM supports NVFP4 precision with blocksize=16 for both activations and GEMM weights.
+To run the Qwen3-Next model on NVFP4 precision, use the following command
+```bash
+mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir /qwen3-next-80b-instruct-nvfp4-ptq-fp8kv --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 2 --trust_remote_code
+
+```

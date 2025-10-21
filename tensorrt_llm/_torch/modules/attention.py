@@ -413,9 +413,9 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        if self.has_quant_scale:
+        if self.has_quant_scale and not self.attn_output_gate:
             out_scale = self.o_proj.inv_input_scale
-        if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output and not self.attn_output_gate:
             out_scale_sf = self.o_proj.input_scale
 
         kv_scales_sf = None
