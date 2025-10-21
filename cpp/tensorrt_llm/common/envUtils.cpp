@@ -380,7 +380,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string const& getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTimeOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
