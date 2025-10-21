@@ -60,6 +60,7 @@ def _load_nemotron_moe_layer(model_name_or_path: str):
 @pytest.mark.parametrize("B,S", [(2, 6), (1, 8)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_nemotronh_moe_patch_forward(model_name, B, S, dtype):
+    pytest.skip("Skipping due to permission issue")
     device = "cuda"
 
     module = _load_nemotron_moe_layer(model_name)
