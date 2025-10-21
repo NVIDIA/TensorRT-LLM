@@ -48,9 +48,6 @@ def weight_only_quant_gemm_reference(a, b, b_scales):
 def test_weight_only_quant_gemm(a_dtype, b_dtype, m, k, n):
     import tensorrt_llm  # noqa: F401
 
-    if k == 512 and n == 32768:
-        pytest.skip("https://nvbugs/5576192")
-
     torch.random.manual_seed(0)
 
     # generate a, int4/int8 b, and scales
