@@ -121,7 +121,7 @@ endef
 	@echo "Pulling docker image: $(IMAGE_WITH_TAG)"
 	docker pull $(IMAGE_WITH_TAG)
 
-DOCKER_RUN_OPTS ?= --rm -it --ipc=host --ulimit stack=67108864 $(if $(filter 0,$(IS_ROOTLESS)),--ulimit memlock=-1)
+DOCKER_RUN_OPTS ?= --rm -it --ipc=host --ulimit stack=67108864 $(if $(filter 0,$(IS_ROOTLESS)),--ulimit memlock=-1) --privileged
 DOCKER_RUN_ARGS   ?=
 # Check if NVIDIA_VISIBLE_DEVICES is set and not empty
 NVIDIA_VISIBLE_DEVICES_VAL = $(shell echo $$NVIDIA_VISIBLE_DEVICES)
@@ -156,6 +156,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
+			--volume /home/scratch.trt_llm_data/:/scratch.trt_llm_data/ \
     		$(EXTRA_VOLUMES) \
     		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
