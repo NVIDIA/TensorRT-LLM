@@ -27,6 +27,27 @@ if(NOT EXISTS ${FLASH_MLA_SOURCE_DIR}/csrc/cutlass/include)
   )
 endif()
 
+# Compiler compatibility for SM100 inline assembly
+# =================================================
+# FlashMLA SM100 contains PTX inline assembly that Clang++ on ARM64 incorrectly
+# validates against host architecture. Use GCC for flash_mla on ARM64+Clang++.
+# This follows the same pattern as DeepEP (see deep_ep/CMakeLists.txt:125-132).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(STATUS "FlashMLA: ARM64 + Clang++ detected, switching to GCC for SM100 compatibility")
+  
+  # Find GCC (required on ARM64 when Clang++ is used)
+  find_program(GCC_EXECUTABLE NAMES g++ REQUIRED)
+  if(NOT GCC_EXECUTABLE)
+    message(FATAL_ERROR 
+      "FlashMLA: GCC (g++) is required on ARM64 with Clang++ but was not found. "
+      "Install GCC or use GCC as the primary compiler.")
+  endif()
+  
+  # Override CUDA host compiler for this target only
+  set(CMAKE_CUDA_HOST_COMPILER ${GCC_EXECUTABLE})
+  message(STATUS "FlashMLA: Using GCC at ${GCC_EXECUTABLE} for CUDA compilation")
+endif()
+
 # Check CUDA version and architecture support
 # ============================================
 
@@ -190,7 +211,6 @@ target_compile_options(
     $<$<COMPILE_LANGUAGE:CUDA>:-std=c++17>
     $<$<COMPILE_LANGUAGE:CUDA>:-DNDEBUG>
     $<$<COMPILE_LANGUAGE:CUDA>:-D_USE_MATH_DEFINES>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-declarations>
     $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__>
     $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_CONVERSIONS__>
     $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF2_OPERATORS__>
