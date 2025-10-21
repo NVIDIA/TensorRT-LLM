@@ -51,7 +51,8 @@ class ModelDrafter(Drafter):
         self,
         spec_config: "DecodingBaseConfig",
         draft_model_engine: "ModelEngine",
-        max_draft_tokens: int,
+        max_draft_len: int,
+        max_total_draft_tokens: int,
         draft_seq_slot_manager: SeqSlotManager,
         sampler: Sampler,
         spec_resource_manager: Optional[BaseResourceManager] = None,
@@ -62,8 +63,11 @@ class ModelDrafter(Drafter):
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
-        if max_draft_tokens < 0:
-            raise ValueError("max_draft_tokens must be >= 0")
+        if max_draft_len < 0:
+            raise ValueError("max_draft_len must be >= 0")
+        if max_total_draft_tokens < 0:
+            raise ValueError("max_total_draft_tokens must be >= 0")
+        assert max_draft_len <= max_total_draft_tokens
 
         # Model and resource management
         self.draft_model_engine = draft_model_engine
@@ -72,7 +76,8 @@ class ModelDrafter(Drafter):
 
         # Configuration
         self.spec_config = spec_config
-        self.max_draft_tokens = max_draft_tokens
+        self.max_draft_len = max_draft_len
+        self.max_total_draft_tokens = max_total_draft_tokens
         # Sampling
         self.sampler = sampler
         self.guided_decoder = guided_decoder
@@ -153,9 +158,11 @@ class ModelDrafter(Drafter):
         Create a chunked context request for accepted tokens.
         Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
         """
-        # Pad input_tokens to max_draft_tokens
+        # Pad input_tokens to max_draft_len
+        # We use max_draft_len instead of max_total_draft_tokens here,
+        # because at most max_draft_len draft tokens are accepted.
         input_tokens.extend(
-            0 for _ in range(self.max_draft_tokens - num_accepted_tokens))
+            0 for _ in range(self.max_draft_len - num_accepted_tokens))
         new_request = self._create_draft_request(request, input_tokens)
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
@@ -469,7 +476,7 @@ class ModelDrafter(Drafter):
             # We already updated the target state, so the new_tokens_lens should be all ones.
             new_tokens_lens = torch.ones(batch_size, device=device)
             next_draft_tokens = torch.zeros(batch_size,
-                                            self.max_draft_tokens,
+                                            self.max_draft_len,
                                             device=device)
 
         # Create a new SampleStateTensorsMTP object with the additional fields
@@ -563,7 +570,7 @@ class ModelDrafter(Drafter):
                 # Chunked prefill request in progress; no need to append draft tokens
                 continue
             py_draft_logits = []
-            for token_idx in range(self.max_draft_tokens):
+            for token_idx in range(self.max_draft_len):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])
@@ -646,7 +653,7 @@ class ModelDrafter(Drafter):
         previous_draft_state = initial_draft_state
 
         # Generate remaining draft tokens iteratively
-        for i in range(self.max_draft_tokens - 1):
+        for i in range(self.max_draft_len - 1):
             if len(draft_batch.generation_requests) == 0:
                 break
 
@@ -722,7 +729,7 @@ class ModelDrafter(Drafter):
                 target_inputs,
                 outputs["new_draft_tokens"],
                 draft_position=0,
-                draft_length=self.max_draft_tokens,
+                draft_length=self.max_draft_len,
                 draft_batch=draft_batch,
                 req_id_to_old_request=req_id_to_old_request)
 
