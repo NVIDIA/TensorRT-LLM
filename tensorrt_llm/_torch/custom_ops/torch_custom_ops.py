@@ -485,12 +485,6 @@ class CublasLtFP4GemmRunner(TunableRunner):
         )
         return result
 
-    def set_best_tactic(self, inputs: List[torch.Tensor], best_tactic: int):
-        """Update the best tactic after tuning."""
-        mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
-        self.cublaslt_runner.set_best_tactic(mat1, mat2, mat1_scale, mat2_scale,
-                                             best_tactic)
-
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
 def nvfp4_gemm_cublaslt(

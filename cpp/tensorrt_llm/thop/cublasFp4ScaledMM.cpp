@@ -240,33 +240,6 @@ public:
         return out;
     }
 
-    // Update best tactic after tuning
-    void setBestTactic(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
-        at::Tensor const& mat2_scale, int64_t best_tactic)
-    {
-        int m = mat1.size(0);
-        int k_compressed = mat1.size(1);
-        int k = k_compressed * 2;
-        int n = mat2.size(0);
-
-        auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);
-        if (best_tactic >= 0 && best_tactic < static_cast<int64_t>(cache.heuristics.size()))
-        {
-            int64_t old_tactic = cache.best_tactic;
-            cache.best_tactic = best_tactic;
-            TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Updated best tactic from %ld to %ld for shape (m=%d, k=%d, n=%d, device=%d)",
-                old_tactic, best_tactic, m, k, n, mat1.device().index());
-        }
-        else
-        {
-            TLLM_LOG_WARNING(
-                "CublasLtFP4GemmRunner: Invalid tactic %ld (available=%zu), ignoring setBestTactic for shape (m=%d, "
-                "k=%d, n=%d)",
-                best_tactic, cache.heuristics.size(), m, k, n);
-        }
-    }
-
 private:
     struct AlgoCache
     {
@@ -459,6 +432,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<torch_ext::CublasLtFP4GemmRunner>("CublasLtFP4GemmRunner")
         .def(torch::init<at::ScalarType>())
         .def("run_gemm", &torch_ext::CublasLtFP4GemmRunner::runGemm)
-        .def("get_num_heuristic_algos", &torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos)
-        .def("set_best_tactic", &torch_ext::CublasLtFP4GemmRunner::setBestTactic);
+        .def("get_num_heuristic_algos", &torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos);
 }
