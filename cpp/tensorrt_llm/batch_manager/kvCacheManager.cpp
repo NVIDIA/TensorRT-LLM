@@ -677,7 +677,7 @@ std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> KVCachePromptLooku
                     }
                     else
                     {
-                        // Enforce rule that all blocks must be preceeded by only valid blocks (no nullptrs allowed)
+                        // Enforce rule that all blocks must be preceded by only valid blocks (no nullptrs allowed)
                         stillLooking.erase(windowSize);
                     }
                 }
