@@ -228,4 +228,4 @@ def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
         return f"functions.{func_name}:{idx}"
     else:
         # by default return random
-        return f"chatcmpl-tool-{str(uuid.uuid4().hex)}"
+        return f"chatcmpl-tool-{uuid.uuid4().hex}"
