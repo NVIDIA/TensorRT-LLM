@@ -29,6 +29,69 @@ from .quantization_utils import (
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
 
+DEBUG = True
+
+
+def _initialize_debug_tensor(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """Initialize tensor along dim with sequential indices for debugging."""
+    # Create index tensor: t[:, i, :] = i for all i along dimension dim
+    shape = list(t.shape)
+    indices = torch.arange(shape[dim], dtype=t.dtype, device=t.device)
+    # Reshape indices to broadcast correctly
+    view_shape = [1] * len(shape)
+    view_shape[dim] = shape[dim]
+    indices = indices.view(view_shape)
+    # Broadcast to full shape
+    return indices.expand(shape).clone()
+
+
+def _validate_sharded_indices(
+    sharded_tensor: torch.Tensor,
+    dim: int,
+    rank: int,
+    world_size: int,
+    fused_weight_dims: Optional[list] = None,
+    param_key: str = "",
+):
+    """Validate that sharded tensor contains expected indices."""
+    if not DEBUG:
+        return
+
+    # Get unique values from the sharded tensor
+    unique_vals = torch.unique(sharded_tensor).cpu().numpy().astype(int)
+
+    if fused_weight_dims is None:
+        # Non-fused: expect contiguous chunk
+        total_size = sharded_tensor.shape[dim] * world_size
+        chunk_size = total_size // world_size
+        expected_start = rank * chunk_size
+        expected_end = expected_start + chunk_size
+        expected = set(range(expected_start, expected_end))
+    else:
+        # Fused: expect sharded chunks from each fused component
+        expected = set()
+        offset = 0
+        for fused_dim in fused_weight_dims:
+            chunk_size = fused_dim // world_size
+            chunk_start = offset + rank * chunk_size
+            chunk_end = chunk_start + chunk_size
+            expected.update(range(chunk_start, chunk_end))
+            offset += fused_dim
+
+    actual = set(unique_vals)
+
+    ad_logger.info(f"DEBUG [{param_key}] Rank {rank}: Expected indices: {sorted(expected)}")
+    ad_logger.info(f"DEBUG [{param_key}] Rank {rank}: Actual indices: {sorted(actual)}")
+
+    assert actual == expected, (
+        f"Rank {rank} sharding mismatch for {param_key}!\n"
+        f"Expected: {sorted(expected)}\n"
+        f"Actual: {sorted(actual)}\n"
+        f"Missing: {sorted(expected - actual)}\n"
+        f"Extra: {sorted(actual - expected)}"
+    )
+    ad_logger.info(f"DEBUG [{param_key}] Rank {rank}: ✓ Validation passed")
+
 
 def _load_hook(
     state_dict,
@@ -37,6 +100,10 @@ def _load_hook(
     f_split: Callable[[torch.Tensor, int], torch.Tensor],
     param_key: str,
     param_shape: torch.Size,
+    dim: int,
+    rank: int,
+    world_size: int,
+    fused_weight_dims: Optional[list] = None,
 ):
     # TODO: we need to support loading either a sharded or unsharded checkpoint.
     # Otherwise, basic workflows like
@@ -48,7 +115,25 @@ def _load_hook(
     if key not in state_dict:
         return
     p_to_load = state_dict[key]
+
+    # Debug: Initialize with sequential indices
+    if DEBUG and param_shape != p_to_load.shape:
+        ad_logger.info(f"DEBUG: Initializing tensor '{key}' with sequential indices")
+        p_to_load = _initialize_debug_tensor(p_to_load, dim)
+
     p_to_load = p_to_load if param_shape == p_to_load.shape else f_split(p_to_load)
+
+    # Debug: Validate sharded indices
+    if DEBUG and param_shape != state_dict[key].shape:
+        _validate_sharded_indices(
+            p_to_load,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            fused_weight_dims=fused_weight_dims,
+            param_key=key,
+        )
+
     state_dict[key] = p_to_load
 
 
@@ -150,6 +235,13 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
+    # Debug: Initialize tensor with sequential indices
+    if DEBUG:
+        weight_tensor = _initialize_debug_tensor(weight_tensor, dim)
+        ad_logger.info(
+            f"DEBUG: Initialized weight_tensor for '{param_key}' with sequential indices"
+        )
+
     # Use custom shard function if provided
     if custom_shard_fn is not None:
         sharded_weight = custom_shard_fn(weight_tensor)
@@ -157,7 +249,14 @@ def shard_weight_tensor(
         # Register load hook with custom function
         gm._register_load_state_dict_pre_hook(
             partial(
-                _load_hook, f_split=custom_shard_fn, param_key=param_key, param_shape=sharded_shape
+                _load_hook,
+                f_split=custom_shard_fn,
+                param_key=param_key,
+                param_shape=sharded_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+                fused_weight_dims=fused_weight_dims,
             )
         )
     else:
@@ -187,15 +286,47 @@ def shard_weight_tensor(
                 [split_tensor(w) for w in torch.split(weight_tensor, fused_weight_dims, dim=dim)],
                 dim=dim,
             )
+
+            # Create a function that applies the same logic for loading
+            def split_fused_tensor(
+                t: torch.Tensor,
+                fused_dims: list = fused_weight_dims,
+                d: int = dim,
+            ) -> torch.Tensor:
+                return torch.cat(
+                    [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
+                    dim=d,
+                )
+
+            f_split = split_fused_tensor
         else:
             sharded_weight = split_tensor(weight_tensor)
+            f_split = split_tensor
 
         sharded_shape = sharded_weight.shape
+
+        # Debug: Validate sharded indices
+        if DEBUG:
+            _validate_sharded_indices(
+                sharded_weight,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+                fused_weight_dims=fused_weight_dims,
+                param_key=param_key,
+            )
 
         # Register load hook
         gm._register_load_state_dict_pre_hook(
             partial(
-                _load_hook, f_split=split_tensor, param_key=param_key, param_shape=sharded_shape
+                _load_hook,
+                f_split=f_split,
+                param_key=param_key,
+                param_shape=sharded_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+                fused_weight_dims=fused_weight_dims,
             )
         )
 
