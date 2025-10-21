@@ -189,7 +189,7 @@ def test_should_use_spec_decode():
                                  resource_manager=None) -> None:
             return
 
-    drafter = _DummyDrafter(max_concurrency=6)
+    drafter = _DummyDrafter(max_draft_tokens=1, max_concurrency=6)
 
     # Compare min(len(requests), max_batch_size, token_cap) with max_concurrency
 
