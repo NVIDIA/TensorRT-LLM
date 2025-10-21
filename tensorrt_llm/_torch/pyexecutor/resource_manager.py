@@ -550,14 +550,16 @@ class KVCacheManager(BaseResourceManager):
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfigPython,
                                  mapping: Mapping, **kwargs):
-        # get kv cache dtype bytes
-        mem_per_token = 2
+        # get kv cache element size in bits
+        kv_cache_element_bits = 16
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
+        if quant_config is not None:
+            if quant_config.quant_mode.has_fp8_kv_cache(
+            ) or quant_config.quant_mode.has_int8_kv_cache():
+                kv_cache_element_bits = 8
+            elif quant_config.quant_mode.has_fp4_kv_cache():
+                kv_cache_element_bits = 4
 
-        # get num key value heads
         config = model_config.pretrained_config
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       config.num_attention_heads)
@@ -581,8 +583,14 @@ class KVCacheManager(BaseResourceManager):
         # provide at least 1 layer to prevent division by zero cache size
         num_attention_layers = max(
             len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
-        mem_per_token *= num_attention_layers * head_dim
-
+        mem_per_token = kv_cache_element_bits * num_attention_layers * head_dim // 8
+        # if 4-bit cache is used, add the size of scaling factors
+        if kv_cache_element_bits == 4:
+            # NVFP4 uses UE4M3 scaling factors
+            mem_per_token += KvCacheManager.calculate_scaling_factor_size_bytes(
+                num_attention_layers * head_dim,
+                quant_vector_size=16,
+                scaling_factor_dtype=DataType.FP8)
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token
