@@ -163,12 +163,6 @@ def get_test_config(test_desc, example_dir, test_root):
         "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
         "gen_only_trt_backend":
         (2, f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml"),
-        "gen_only_bs1":
-        (4, f"{test_configs_root}/disagg_config_gen_only_bs1.yaml"),
-        "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
-        "4_ranks_trt_backend":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp1_trt_backend.yaml"),
         "cuda_graph":
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
@@ -176,37 +170,9 @@ def get_test_config(test_desc, example_dir, test_root):
         "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
         (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
-        "load_balance":
-        (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
-        "cache_aware_balance":
-        (4, f"{test_configs_root}/disagg_config_cache_aware_balance.yaml"),
         "conditional": (2,
                         f"{test_configs_root}/disagg_config_conditional.yaml"),
         "ngram": (2, f"{test_configs_root}/disagg_config_ngram.yaml"),
-        "ctxpp2_genpp2":
-        (4, f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml"),
-        "ctxtp2_genpp2":
-        (4, f"{test_configs_root}/disagg_config_ctxtp2_genpp2.yaml"),
-        "ctxpp2_gentp2":
-        (4, f"{test_configs_root}/disagg_config_ctxpp2_gentp2.yaml"),
-        "ctxtp2pp2_gentp2pp2":
-        (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
-        "ctxpp4_genpp4":
-        (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
-        "ctxpp4_gentp4":
-        (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
-        "deepseek_v3_lite_fp8_mpi":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
-         ),
-        "deepseek_v3_lite_fp8_ucx":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml"
-         ),
-        "deepseek_v3_lite_fp8_nixl":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
-         ),
         "deepseek_v3_lite_fp8_tp1":
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml"
@@ -218,6 +184,44 @@ def get_test_config(test_desc, example_dir, test_root):
         "deepseek_v3_lite_fp_8_overlap_dp":
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_overlap_dp.yaml"
+         ),
+        "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml"
+         ),
+        "deepseek_v3_lite_bf16_conditional":
+        (2, f"{test_configs_root}/disagg_config_conditional_deepseek_v3.yaml"),
+        "deepseek_v3_lite_fp8_tp1_two_mtp":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
+         ),
+        "gen_only_bs1":
+        (4, f"{test_configs_root}/disagg_config_gen_only_bs1.yaml"),
+        "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
+        "4_ranks_trt_backend":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp1_trt_backend.yaml"),
+        "load_balance":
+        (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
+        "cache_aware_balance":
+        (4, f"{test_configs_root}/disagg_config_cache_aware_balance.yaml"),
+        "ctxpp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml"),
+        "ctxtp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxtp2_genpp2.yaml"),
+        "ctxpp2_gentp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_gentp2.yaml"),
+        "deepseek_v3_lite_fp8_mpi":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
+         ),
+        "deepseek_v3_lite_fp8_ucx":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml"
+         ),
+        "deepseek_v3_lite_fp8_nixl":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp":
         (4,
@@ -243,24 +247,20 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one_mtp.yaml"
          ),
-        "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml"
-         ),
         "deepseek_v3_lite_bf16_cache_aware_balance":
         (4,
          f"{test_configs_root}/disagg_config_cache_aware_balance_deepseek_v3.yaml"
-         ),
-        "deepseek_v3_lite_bf16_conditional":
-        (2, f"{test_configs_root}/disagg_config_conditional_deepseek_v3.yaml"),
-        "deepseek_v3_lite_fp8_tp1_two_mtp":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
          ),
         "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml"
          ),
+        "ctxtp2pp2_gentp2pp2":
+        (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
+        "ctxpp4_genpp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
+        "ctxpp4_gentp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
     }
 
     if test_desc not in config_map:
@@ -562,6 +562,7 @@ def run_disaggregated_test(example_dir,
             workers_proc.wait()
 
 
+# --------------------------------- 2 GPUs ---------------------------------------------
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
@@ -664,71 +665,6 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_trt_backend",
                            env=env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_genbs1(disaggregated_test_root,
-                              disaggregated_example_root, llm_venv,
-                              llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    env = llm_venv._new_env.copy()
-    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
-    run_disaggregated_test(disaggregated_example_root,
-                           "gen_only_bs1",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_multi_gpu_with_mpirun(disaggregated_test_root,
-                                             disaggregated_example_root,
-                                             llm_venv, llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "4_ranks",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_multi_gpu_with_mpirun_trt_backend(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "4_ranks_trt_backend",
-                           env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -892,46 +828,6 @@ def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root,
-                                    llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "load_balance",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "cache_aware_balance",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
                                    disaggregated_example_root,
                                    llama_model_root):
@@ -966,131 +862,6 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                            "ngram",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxpp2_genpp2",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxtp2_genpp2",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxpp2_gentp2",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
-
-
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxtp2pp2_gentp2pp2",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxpp4_genpp4",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-#tiny llama pp4 will have uneven layer per pp. pp4
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     llama_model_root):
-    src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxpp4_gentp4",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory(),
-                           model_path=llama_model_root)
 
 
 @skip_no_hopper
@@ -1157,6 +928,243 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
                            "deepseek_v3_lite_fp8_tp1_mtp",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@skip_arm
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib"
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tp1",
+                           env=env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_conditional(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_bf16_conditional",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tp1_two_mtp",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+# --------------------------------- 4 GPUs ---------------------------------------------
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_genbs1(disaggregated_test_root,
+                              disaggregated_example_root, llm_venv,
+                              llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    run_disaggregated_test(disaggregated_example_root,
+                           "gen_only_bs1",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_multi_gpu_with_mpirun(disaggregated_test_root,
+                                             disaggregated_example_root,
+                                             llm_venv, llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "4_ranks",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_multi_gpu_with_mpirun_trt_backend(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "4_ranks_trt_backend",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
+                                    disaggregated_example_root,
+                                    llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "load_balance",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
+                                           disaggregated_example_root,
+                                           llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "cache_aware_balance",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp2_genpp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxtp2_genpp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp2_gentp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
 
 
 @pytest.mark.skip_less_device(4)
@@ -1236,31 +1244,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                            env=env,
                            cwd=llm_venv.get_working_directory(),
                            model_path=deepseek_v3_model_root)
-
-
-@skip_no_hopper
-@skip_arm
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp1",
-                           env=env,
-                           cwd=llm_venv.get_working_directory())
 
 
 @skip_no_hopper
@@ -1448,47 +1431,67 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+# --------------------------------- 8 GPUs ---------------------------------------------
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_deepseek_v3_lite_bf16_conditional(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
+                                           disaggregated_example_root,
+                                           llama_model_root):
     src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
-
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_bf16_conditional",
+                           "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
     src_dst_dict = {
-        deepseek_v3_model_root:
-        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     }
-
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
-
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp1_two_mtp",
+                           "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
+
+
+#tiny llama pp4 will have uneven layer per pp. pp4
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_gentp4",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=llama_model_root)
 
 
 @pytest.fixture(scope="module")
