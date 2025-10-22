@@ -499,6 +499,8 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
+        self._wait_for_flexkv_manager()
+
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
             if self.kv_cache_transceiver is not None:
@@ -526,6 +528,12 @@ class PyExecutor:
                         self.kv_connector_manager.layer_pre_hook)
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
+    
+    def _wait_for_flexkv_manager(self):
+        if self.kv_connector_manager is not None and self.dist.rank == 0:
+            while not self.kv_connector_manager.scheduler.is_ready():
+                time.sleep(0.1)
+            logger.info("FlexKV manager is ready")
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.async_transfer_manager.end_transfer(request):
@@ -795,7 +803,7 @@ class PyExecutor:
                 if prev_device_step_time is None:
                     prev_device_step_time = "N/A"  # Handle first iteration
                 else:
-                    prev_device_step_time = f"{prev_device_step_time}ms"
+                    prev_device_step_time = f"{prev_device_step_time:.3f} ms"
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")

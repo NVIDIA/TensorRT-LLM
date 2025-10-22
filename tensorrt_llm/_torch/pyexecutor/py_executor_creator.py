@@ -178,6 +178,7 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
                           tp_size=tensorrt_llm.mpi_world_size(),
                           gpus_per_node=tensorrt_llm.default_gpus_per_node(),
                           rank=tensorrt_llm.mpi_rank())
+        executor_config.mapping = mapping
     else:
         mapping = copy.deepcopy(_mapping)
         mapping.rank = tensorrt_llm.mpi_rank()
