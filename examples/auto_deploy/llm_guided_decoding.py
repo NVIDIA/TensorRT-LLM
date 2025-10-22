@@ -1,22 +1,18 @@
-"""Integration test for guided decoding functionality in AutoDeploy."""
+"""Example demonstrating guided decoding with AutoDeploy.
+
+This example shows how to use guided decoding with JSON schema validation
+using AutoDeploy's LLM class with the xgrammar backend.
+"""
 
 import json
-
-import pytest
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM
 from tensorrt_llm.llmapi import GuidedDecodingParams
 
 
-def test_guided_decoding_json_output():
-    """Test guided decoding with JSON schema validation.
-
-    This test constructs an AutoDeploy LLM with guided decoding backend set to 'xgrammar'
-    and generates outputs with guided decoding enabled. It validates that the generated outputs
-    match the expected JSON schema.
-    """
-
+def main():
+    """Run guided decoding example with AutoDeploy."""
     # Define a JSON schema for testing
     json_schema = {
         "type": "object",
@@ -36,13 +32,14 @@ def test_guided_decoding_json_output():
         }
     ]
 
-    # TODO: Can test that if we make an LLM with guided_decoding_backend=None, it will throw an error.
-    # This should work if inference is deterministic here - but if it is not we can omit the test.
+    # Initialize AutoDeploy LLM with guided decoding backend
+    print("Initializing AutoDeploy LLM with guided decoding backend...")
     guided_decoding_backend = "xgrammar"
     llm = LLM(
-        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         guided_decoding_backend=guided_decoding_backend,
     )
+
     sampling_params = SamplingParams(
         max_tokens=100,
         top_k=None,
@@ -64,6 +61,7 @@ def test_guided_decoding_json_output():
         # Validate each output is valid JSON
         for i, output in enumerate(outputs):
             generated_text = output.outputs[0].text.strip()
+            print(f"\nOutput {i}:\n{generated_text}")
 
             # Test that the output is valid JSON
             try:
@@ -77,10 +75,20 @@ def test_guided_decoding_json_output():
                 for field in required_fields:
                     assert field in parsed_json, f"Output {i} missing required field '{field}'"
 
+                print(f"✓ Output {i} is valid JSON matching the schema")
+
             except json.JSONDecodeError as e:
-                pytest.fail(f"Output {i} is not valid JSON: {e}\nGenerated text: {generated_text}")
+                print(f"✗ Output {i} is not valid JSON: {e}")
+                raise
             except AssertionError as e:
-                pytest.fail(f"Output {i} schema validation failed: {e}")
+                print(f"✗ Output {i} schema validation failed: {e}")
+                raise
+
+        print("\n✓ All outputs passed validation!")
 
     finally:
         llm.shutdown()
+
+
+if __name__ == "__main__":
+    main()
