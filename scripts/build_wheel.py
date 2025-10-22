@@ -364,7 +364,8 @@ def check_missing_libs(lib_name: str) -> list[str]:
 
 
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
-                                deep_ep: bool, binding_lib_name: str):
+                                deep_ep: bool, flash_mla: bool,
+                                binding_lib_name: str):
     is_nanobind = binding_type == "nanobind"
     if is_nanobind:
         build_run(f"\"{venv_python}\" -m pip install nanobind")
@@ -397,9 +398,10 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
         build_run(
             f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
-        build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . flash_mla_cpp_tllm --exit-code",
-            env=env_stub_gen)
+        if flash_mla:
+            build_run(
+                f"\"{venv_python}\" -m pybind11_stubgen -o . flash_mla_cpp_tllm --exit-code",
+                env=env_stub_gen)
         if deep_ep:
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
@@ -904,12 +906,16 @@ def main(*,
                      deep_gemm_dir,
                      dirs_exist_ok=True)
 
-        install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
-                     pkg_dir)
-        install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                     "flash_mla",
-                     pkg_dir / "flash_mla",
-                     dirs_exist_ok=True)
+        with (build_dir / "tensorrt_llm" / "flash_mla" /
+              "cuda_architectures.txt").open() as f:
+            flash_mla_cuda_architectures = f.read().strip().strip(";")
+        if flash_mla_cuda_architectures:
+            install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
+                         pkg_dir)
+            install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
+                         "flash_mla",
+                         pkg_dir / "flash_mla",
+                         dirs_exist_ok=True)
 
         if not skip_stubs:
             with working_directory(pkg_dir):
@@ -919,7 +925,9 @@ def main(*,
                 else:  # on linux
                     generate_python_stubs_linux(
                         binding_type, venv_python,
-                        bool(deep_ep_cuda_architectures), binding_lib_file_name)
+                        bool(deep_ep_cuda_architectures),
+                        bool(flash_mla_cuda_architectures),
+                        binding_lib_file_name)
 
     if not skip_building_wheel:
         if dist_dir is None:

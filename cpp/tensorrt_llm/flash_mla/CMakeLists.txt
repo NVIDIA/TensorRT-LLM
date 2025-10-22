@@ -63,7 +63,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
   list(APPEND SUPPORT_ARCHS "90")
 endif()
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
-  list(APPEND SUPPORT_ARCHS "100")
+  list(APPEND SUPPORT_ARCHS "100" "103")
 endif()
 
 # Find intersection of supported and requested architectures
@@ -74,6 +74,9 @@ foreach(ARCH ${SUPPORT_ARCHS})
   endif()
 endforeach()
 
+message(STATUS "flash_mla FLASH_MLA_ARCHS: ${FLASH_MLA_ARCHS}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/cuda_architectures.txt
+     "${FLASH_MLA_ARCHS}")
 if(NOT FLASH_MLA_ARCHS)
   message(
     STATUS
