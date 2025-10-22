@@ -191,9 +191,9 @@ class TRTLLMGenFusedMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "MnnvlLatency" (default) or "MnnvlThroughput"
+        # "mnnvllatency" (default) or "mnnvlthroughput"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "MnnvlLatency").strip().lower()
+                              "mnnvllatency").strip().lower()
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales \
