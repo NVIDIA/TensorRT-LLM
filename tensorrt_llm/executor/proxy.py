@@ -16,8 +16,7 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, print_colored,
-                            print_colored_debug)
+                            enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
@@ -63,13 +62,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                print_colored_debug('create comm session ...\n', "yellow")
+                logger_debug('create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                print_colored_debug('create pool session ...\n', "yellow")
+                logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            print_colored_debug('using external mpi session ...\n', "yellow")
+            logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
@@ -353,7 +352,7 @@ class GenerationExecutorProxy(GenerationExecutor):
     def pre_shutdown(self):
         if not self.workers_started:
             return
-        print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
+        logger_debug('Proxy.pre_shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
@@ -373,7 +372,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.doing_shutdown:
             self.pre_shutdown()
 
-        print_colored_debug('Proxy.shutdown...\n', "yellow")
+        logger_debug('Proxy.shutdown...\n', "yellow")
 
         for f in self.mpi_futures:
             try:
