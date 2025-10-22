@@ -169,9 +169,14 @@ void launchMLA(cudaDeviceProp const& prop,
     uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
     float qScale, OutputHead* output, InputHead const* q,
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
-        kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+        kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
+                         // [batchSize][maxNbPagesPerSeq] (Layout 1)
 #else
     GMemKVCacheHead* kvCacheData,
 #endif
