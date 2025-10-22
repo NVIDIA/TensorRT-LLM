@@ -27,8 +27,6 @@ from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
 VIDEO_PRUNING_RATIO = float(os.getenv("TLLM_VIDEO_PRUNING_RATIO", "0"))
-IMAGE_START_TOKEN_ID = 131073
-IMAGE_END_TOKEN_ID = 131074
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
@@ -253,13 +251,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         self.img_start_token = model_config.img_start_token
         self.img_end_token = model_config.img_end_token
         self.dtype = model_config.torch_dtype
+        self.image_start_token_id = self.tokenizer.encode(self.img_start_token, add_special_tokens=False)[0]
+        self.image_end_token_id = self.tokenizer.encode(self.img_end_token, add_special_tokens=False)[0]
 
     def get_vocab_size(self):
         return self.model_config.llm_config.vocab_size
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         " Return multimodal special token ids for NanoV2VL. "
-        return torch.tensor([IMAGE_START_TOKEN_ID, IMAGE_END_TOKEN_ID])
+        return torch.tensor([self.image_start_token_id, self.image_end_token_id])
 
     def get_mm_token_ids(self):
         return torch.tensor([self.img_context_token_id], dtype=torch.int32)
@@ -389,6 +389,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             return input_ids[0].to(torch.int32).tolist(), {}
 
         modality_type = None
+        evs_query = []
         if images is not None:
             modality_type = "image"
             # Processing for multimodal data.
@@ -419,10 +420,32 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                     f"Number of {self.video_context_token} tokens ({len(parts) - 1}) doesn't match number of videos ({num_videos})"
                 )
             # Process videos one by one to get correct processed_query.
-            processed_query = ""
-            for video_index, video in enumerate(videos):
+            processed_query = []
+            for video_index, video_content in enumerate(videos):
                 # Processing for multimodal data.
+                if isinstance(video_content, dict):
+                    video = video_content["frames"]
+                    metadata = video_content["metadata"]
+                else:
+                    video = video_content
+                    metadata = None
                 num_frames = len(video)
+
+                if metadata is not None:
+                    metedata_fps = metadata["fps"]
+                    frame_duration_ms = int(1000.0 / metedata_fps)
+                    frames_indices = metadata["frames_indices"]
+                    timestamps = [int(frame_index) * frame_duration_ms / 1000.0 for frame_index in frames_indices]
+                    frame_separators = [
+                        f"Frame {i + 1} sampled at {timestamp:.2f} seconds: "
+                        for i, timestamp in enumerate(timestamps)
+                    ]
+                else:
+                    frame_separators = [
+                        f"Frame {i + 1}: " for i in range(num_frames)
+                    ]
+
+                # Process video frames.
                 processed_images = self.processor(images=video,
                                                   return_tensors='pt').to(
                                                       self.device)
@@ -432,7 +455,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                 video_size_list.append([num_frames, t // num_frames, h, w])
 
                 # Processing the text prompt.
-                processed_query += parts[video_index]
                 if self.video_pruning_ratio > 0:
                     desired_num_tokens = compute_retained_tokens_count(
                         video_size=(num_frames, t // num_frames * h, w),
@@ -450,23 +472,62 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                     ]
 
                 # Prepare video prompts.
-                # TODO: add metadata like FPS and frame_index when such metadata is available.
-                image_repl = "This is a video:\n"
-                for idx, num_tokens in enumerate(num_tokens_per_frame):
-                    image_repl += f"Frame {idx + 1}: "
-                    image_repl += self.img_start_token + self.img_context_token * num_tokens + self.img_end_token
-                    image_repl += "\n"
-                processed_query += image_repl
-            processed_query += parts[num_videos]
+                processed_query.append(parts[video_index])
+                processed_query.append("This is a video:\n")
+                for frame_sep, num_tokens in zip(frame_separators, num_tokens_per_frame):
+                    processed_query.append(frame_sep)
+                    processed_query.append(self.img_start_token)
+                    processed_query.append(self.img_context_token * num_tokens)
+                    processed_query.append(self.img_end_token)
+                    processed_query.append("\n")
+                # Prepare EVS query.
+                # Video_context_token as placeholder, and it will be combined with the real image_tokens_per_frames during model forward.
+                if self.video_pruning_ratio > 0:
+                    evs_query.append(parts[video_index])
+                    evs_query.append("This is a video:\n")
+                    for frame_sep in frame_separators:
+                        evs_query.append(frame_sep)
+                        evs_query.append(self.img_start_token)
+                        evs_query.append(self.video_context_token)
+                        evs_query.append(self.img_end_token)
+                        evs_query.append("\n")
+
+            # Append the last part of the text prompt.
+            processed_query.append(parts[num_videos])
+            if self.video_pruning_ratio > 0:
+                evs_query.append(parts[num_videos])
             processed_images['num_patches'] = torch.tensor(
                 [sum(num_patches) for num_patches in num_patches_list])
             processed_images['pixel_values'] = torch.cat(pixel_values_list,
                                                          dim=0)
             processed_images['video_size'] = video_size_list
 
-        input_ids = self.tokenizer.encode(processed_query,
-                                          add_special_tokens=False,
-                                          return_tensors="pt")
+        # Tokenize EVS query.
+        if len(evs_query) > 0:
+            evs_ids = [
+                self.tokenizer.encode(
+                    query,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )[0] for query in evs_query
+            ]
+        else:
+            evs_ids = None
+
+        # Tokenize processed query.
+        if isinstance(processed_query, list):
+            input_ids_lst = [
+                self.tokenizer.encode(
+                    query,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                ) for query in processed_query
+            ]
+            input_ids = torch.cat(input_ids_lst, dim=1)
+        else:
+            input_ids = self.tokenizer.encode(processed_query,
+                                            add_special_tokens=False,
+                                            return_tensors="pt")
 
         # Will package inputs for language model forward in AGGREGATE mode.
         multimodal_data = {}
@@ -477,6 +538,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         multimodal_data['modality_type'] = modality_type
         multimodal_data['video_size'] = processed_images[
             'video_size'] if modality_type == "video" else None
+        multimodal_data['evs_ids'] = evs_ids
         return input_ids[0].to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
@@ -545,48 +607,27 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
-    def update_input_ids(self, input_ids, num_tokens_in_videos):
-        """Update input_ids in videos if EVS is applied.
-
-        Note: it is not compatible with chunked_prefill for now.
-        """
-        image_start_token_id = IMAGE_START_TOKEN_ID
-        image_end_token_id = IMAGE_END_TOKEN_ID
-
-        # Find the positions of start and end image tokens in input_ids
-        image_start_token_mask = (input_ids == image_start_token_id)
-        image_start_token_indices = torch.nonzero(image_start_token_mask,
-                                                  as_tuple=False).flatten()
-        image_end_token_mask = (input_ids == image_end_token_id)
-        image_end_token_indices = torch.nonzero(image_end_token_mask,
-                                                as_tuple=False).flatten()
-
-        num_tokens_in_videos = torch.cat(num_tokens_in_videos, dim=0)
-        results_ids = input_ids.clone()
-        src_idx = 0
-        target_idx1, target_idx2 = 0, 0
-        for start_idx, end_idx, num_tokens in zip(
-                image_start_token_indices.tolist(),
-                image_end_token_indices.tolist(),
-                num_tokens_in_videos.tolist()):
-            if num_tokens == 0:
-                continue
-            target_idx1 = target_idx2
-            target_idx2 = target_idx1 + start_idx - src_idx
-            results_ids[target_idx1:target_idx2] = input_ids[src_idx:start_idx]
-
-            mm_tokens = torch.tensor([image_start_token_id] +
-                                     [self.img_context_token_id] * num_tokens +
-                                     [image_end_token_id],
-                                     dtype=input_ids.dtype,
-                                     device=input_ids.device)
-            target_idx1 = target_idx2
-            target_idx2 = target_idx2 + num_tokens + 2
-            results_ids[target_idx1:target_idx2] = mm_tokens
-
-            src_idx = end_idx + 1
-        results_ids[src_idx:] = input_ids[src_idx:]
-        return results_ids
+    def merge_evs_mm_embeds(self, num_tokens_in_videos, multimodal_params):
+        """Merge EVS and MM embeds."""
+        evs_ids_lst = [f.multimodal_data['evs_ids'] for f in multimodal_params]
+        # Iterate over batch.
+        full_ids = []
+        for evs_ids, num_tokens_in_video in zip(evs_ids_lst, num_tokens_in_videos):
+            image_idx = 0
+            for evs_id in evs_ids:
+                if len(evs_id) == 1 and evs_id[0] == self.video_context_token_id:
+                    image_mm = torch.full(
+                        (num_tokens_in_video[image_idx].item(), ),
+                        fill_value=self.img_context_token_id,
+                        dtype=evs_id.dtype,
+                        device=evs_id.device,
+                    )
+                    full_ids.append(image_mm)
+                    image_idx += 1
+                else:
+                    full_ids.append(evs_id)
+        full_ids = torch.cat(full_ids, dim=0)
+        return full_ids
 
     @torch.inference_mode()
     def forward(
@@ -620,8 +661,14 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 )
             # Adjust input_ids in videos if EVS is applied.
             if num_tokens_in_videos is not None:
-                input_ids = self.update_input_ids(input_ids,
-                                                  num_tokens_in_videos)
+                merged_context_ids = self.merge_evs_mm_embeds(
+                    num_tokens_in_videos,
+                    multimodal_params=multimodal_params[:num_context_requests]
+                )
+                # Special handling for inflight-batching.
+                # Assume input ids format is [context_ids, generation_ids].
+                context_length = merged_context_ids.shape[0]
+                input_ids[:context_length] = merged_context_ids
 
             mm_embedding = find_input_mm_embeds(
                 mm_embedding, multimodal_params[:num_context_requests])

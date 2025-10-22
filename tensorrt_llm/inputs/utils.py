@@ -188,11 +188,23 @@ def load_video(
         frames
     ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
 
-    return [
+    loaded_frames = [
         ToTensor()(frames[index]).to(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]
+    metadata = {
+            "total_num_frames": frame_count,
+            "fps": original_fps,
+            "duration": duration,
+            "video_backend": "opencv",
+            "frames_indices": list(indices),
+            # extra field used to control hf processor's video
+            # sampling behavior
+            "do_sample_frames": num_frames_to_sample == frame_count,
+    }
+
+    return {"frames": loaded_frames, "metadata": metadata}
 
 
 async def async_load_video(
@@ -484,6 +496,7 @@ def default_multimodal_input_loader(
         media: Optional[Union[List[str], List[List[str]]]] = None,
         image_data_format: str = "pt",
         num_frames: int = 8,
+        fps: int = 30,
         mm_embeddings: Optional[Union[List[torch.Tensor],
                                       List[List[torch.Tensor]]]] = None,
         device: str = "cpu") -> List[dict[str, Union[str, torch.Tensor]]]:
@@ -523,6 +536,7 @@ def default_multimodal_input_loader(
                 MultimodalData(modality=modality,
                                data=load_video(i,
                                                num_frames,
+                                               fps,
                                                format=image_data_format,
                                                device=device)) for i in media
             ]
