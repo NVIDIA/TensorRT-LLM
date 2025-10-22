@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple, Optional
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
 
 from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
@@ -14,6 +19,7 @@ from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+from tensorrt_llm.profiler import PyNVMLContext
 
 
 class PerfItemTuple(NamedTuple):
@@ -56,9 +62,7 @@ class StatsKeeper:
         record.start_timestamp = timestamp
 
     def register_request_perf_item(self, request_perf_item: PerfItemTuple):
-        """
-        Register request perf items, used exclusively with LLM API.
-        """
+        """Register request perf items, used exclusively with LLM API."""
         record = self.requests[request_perf_item.request_id]
         record.id = request_perf_item.request_id
         record.num_input_tokens = request_perf_item.num_input_tokens
@@ -116,7 +120,8 @@ class StatsKeeper:
             output_tokens.append(entry.num_total_output_tokens)
             total_input_tokens += entry.num_input_tokens
 
-            # For speculative decoding, we need to track the number of draft tokens per request and the number of accepted draft tokens per request
+            # For speculative decoding, track the number of draft tokens per request
+            # and the number of accepted draft tokens per request.
             if max_draft_tokens > 0:
                 num_draft_tokens.append(max_draft_tokens *
                                         (entry.decode_iteration + 1))
@@ -199,6 +204,65 @@ class ReportUtility:
         self.streaming = streaming
 
     @staticmethod
+    def _query_gpu_info(
+            gpu_indices: Optional[List[int]] = None) -> Dict[str, Any]:
+        """Best-effort GPU and link info via pynvml.
+
+        Args:
+            gpu_indices: List of GPU indices to query. If None, queries all GPUs.
+
+        Returns a dict with a list of GPUs and basic link/memory details.
+        """
+        if pynvml is None:
+            return {"gpus": [], "note": "pynvml not available"}
+
+        try:
+            with PyNVMLContext():
+                device_count = pynvml.nvmlDeviceGetCount()
+                gpus: List[Dict[str, Any]] = []
+
+                # Determine which GPUs to query
+                indices_to_query = gpu_indices or range(device_count)
+
+                for idx in indices_to_query:
+                    try:
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                        name = pynvml.nvmlDeviceGetName(handle)
+                        if isinstance(name, bytes):
+                            name = name.decode('utf-8')
+
+                        # Get total memory in GB
+                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        mem_total_gb = mem_info.total / (1024 * 1024 * 1024)
+
+                        # Get memory clock in GHz
+                        mem_clock_ghz = pynvml.nvmlDeviceGetMaxClockInfo(
+                            handle, pynvml.NVML_CLOCK_MEM) / 1000.0
+                        gpu_entry: Dict[str, Any] = {
+                            "index": idx,
+                            "name": name,
+                            "memory.total": mem_total_gb,
+                            "clocks.mem": mem_clock_ghz,
+                        }
+                        gpus.append(gpu_entry)
+
+                    except pynvml.NVMLError as exc:
+                        # Skip this GPU if we can't get its info, but continue with others
+                        gpu_entry = {
+                            "index": idx,
+                            "name": "Unknown",
+                            "memory.total": 0.0,
+                            "clocks.mem": None,
+                            "error": f"NVML error: {exc}"
+                        }
+                        gpus.append(gpu_entry)
+
+                return {"gpus": gpus, "note": None}
+
+        except Exception as exc:  # noqa: BLE001
+            return {"gpus": [], "note": f"pynvml query failed: {exc}"}
+
+    @staticmethod
     def convert_to_ms(ns: float) -> float:
         """Convert nanoseconds to milliseconds."""
         return ns * 1.0e-6
@@ -272,6 +336,10 @@ class ReportUtility:
                 "version": self.rt_cfg.sw_version,
             },
         }
+
+        # Machine / GPU details - only show GPUs used in this benchmark run
+        gpu_indices = list(range(self.rt_cfg.world_config.world_size))
+        stats_dict["machine"] = self._query_gpu_info(gpu_indices)
 
         # Retrieve KV cache information.
         kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
@@ -478,6 +546,7 @@ class ReportUtility:
         """
         stats_dict = self.get_statistics_dict()
         engine = stats_dict["engine"]
+        machine = stats_dict.get("machine", {"gpus": []})
         world_info = stats_dict["world_info"]
         requests = stats_dict["request_info"]
         perf = stats_dict["performance"]
@@ -525,6 +594,25 @@ class ReportUtility:
         kv_cache_percentage = world_info.get("kv_cache_percentage", None)
         if kv_cache_percentage is not None:
             kv_cache_percentage = f"{kv_cache_percentage * 100.0:.2f}%"
+
+        machine_info = (
+            "===========================================================\n"
+            "= MACHINE DETAILS \n"
+            "===========================================================\n")
+        gpus = machine.get("gpus", [])
+        if not gpus:
+            note = machine.get("note", "No GPU info available")
+            machine_info += f"{note}\n\n"
+        else:
+            for gpu in gpus:
+                name = gpu.get("name", "Unknown")
+                idx = gpu.get("index", 0)
+                mem_total_gb = gpu.get("memory.total")
+                mem_clock_ghz = gpu.get("clocks.mem")
+
+                machine_info += (
+                    f"GPU {idx}: {name}, memory {mem_total_gb or 'N/A':.2f} GiB, {mem_clock_ghz or 'N/A':.2f} GHz\n"
+                )
 
         world_info = (
             "===========================================================\n"
@@ -663,6 +751,7 @@ class ReportUtility:
                 )
 
         logging_info = (f"{backend_info}"
+                        f"{machine_info}"
                         f"{request_info}"
                         f"{world_info}"
                         f"{perf_header}"
