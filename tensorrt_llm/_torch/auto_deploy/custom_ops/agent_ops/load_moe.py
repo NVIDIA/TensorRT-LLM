@@ -4,6 +4,8 @@ import os
 import torch
 from torch.utils.cpp_extension import load
 
+from tensorrt_llm._utils import nvtx_range
+
 # Recommended so NVCC generates code for your GPUs. Example: Ada/Hopper.
 # You can also set this in your shell env.
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;8.9;9.0")
@@ -79,7 +81,9 @@ def cuda_moe(
     # Convert routing_weights to float32 to match Triton implementation
     routing_weights = routing_weights.to(torch.float32)
 
-    return moe_ext.moe_forward(x, selected_experts, routing_weights, w1_weight, w2_weight)
+    with nvtx_range("cuda_moe"):
+        output = moe_ext.moe_forward(x, selected_experts, routing_weights, w1_weight, w2_weight)
+    return output
 
 
 @cuda_moe.register_fake

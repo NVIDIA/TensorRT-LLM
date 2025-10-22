@@ -115,7 +115,7 @@ transforms:
     backend: trtllm
   fuse_moe:
     stage: post_load_fusion
-    backend: triton
+    backend: agent
     enabled: true
   fuse_fp8_moe:
     stage: post_load_fusion
