@@ -104,6 +104,7 @@ set +e
 trap - ERR
 
 eval $pytestCommand
+returnCode=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution"
 
 if [ "$perfMode" = "true" ]; then
@@ -123,3 +124,5 @@ if [ "$perfMode" = "true" ]; then
         --files $stageName/perf_script_test_results.csv \
         $basePerfPath
 fi
+
+exit $returnCode
