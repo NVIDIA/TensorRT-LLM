@@ -48,4 +48,6 @@ srun -N "$NODES" \
     --container-name "layer_wise_benchmarks" \
     --container-mounts "$CONTAINER_MOUNTS" \
     --container-workdir "$WORKDIR" \
-    pip install -e ../..
+bash -c "pip install -U packaging &&
+    pip install -r ../../requirements.txt --no-build-isolation &&
+    pip install -e ../.."

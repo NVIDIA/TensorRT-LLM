@@ -36,6 +36,10 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def round_up(a, b):
+    return ceil_div(a, b) * b
+
+
 class RoutingMethod(DeepseekV3Gate):
 
     def __init__(self, *args, **kwargs):
@@ -306,9 +310,11 @@ class DeepSeekV3Runner:
     @staticmethod
     def create_kv_cache_manager(pretrained_config, mapping, kv_cache_dtype,
                                 max_batch_size, max_seq_len, layer_indices):
+        tokens_per_block = 32
         kv_cache_manager = KVCacheManager(
             KvCacheConfig(
-                max_tokens=max_batch_size * max_seq_len,
+                max_tokens=max_batch_size *
+                round_up(max_seq_len, tokens_per_block),
                 enable_block_reuse=False,
             ),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -316,7 +322,7 @@ class DeepSeekV3Runner:
             num_kv_heads=1,
             head_dim=pretrained_config.kv_lora_rank +
             pretrained_config.qk_rope_head_dim,
-            tokens_per_block=32,
+            tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             mapping=mapping,

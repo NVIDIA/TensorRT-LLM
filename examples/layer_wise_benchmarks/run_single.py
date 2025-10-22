@@ -32,20 +32,18 @@ pretrained_config = DeepseekV3Config.from_json_file(
 layer_indices = [5, 6]
 
 # KV cache related args
-if args.test_case == "GEN":
+if args.test_case == "CTX":
     MAX_BATCH_SIZE = 1024
-    MAX_SEQ_LEN = 8192 + 1024 + 512
-    MAX_SEQ_LEN_Q = 4
-    MAX_NUM_TOKENS = MAX_SEQ_LEN_Q * MAX_BATCH_SIZE
-    enable_attention_dp = True
-    moe_backend = "WIDEEP"
-elif args.test_case == "CTX":
-    MAX_BATCH_SIZE = 4
-    MAX_SEQ_LEN = 8192 + 512
-    MAX_SEQ_LEN_Q = 8192 + 512
-    MAX_NUM_TOKENS = MAX_SEQ_LEN_Q * MAX_BATCH_SIZE
+    MAX_SEQ_LEN = 8192 + 1024 + 1
+    MAX_NUM_TOKENS = 40960
     enable_attention_dp = True
     moe_backend = "CUTLASS"
+elif args.test_case == "GEN":
+    MAX_BATCH_SIZE = 1024
+    MAX_SEQ_LEN = 8192 + 1024 + 1
+    MAX_NUM_TOKENS = 4 * MAX_BATCH_SIZE  # MTP3 as max
+    enable_attention_dp = True
+    moe_backend = "WIDEEP"
 else:
     raise NotImplementedError(f"Not support test case \"{args.test_case}\"")
 
@@ -78,14 +76,14 @@ runner = DeepSeekV3Runner(
 )
 
 # Warm up
-if args.test_case == "GEN":
-    batch_size = 128
-    seq_len_q = 1  # Set to (1 + MTP)
-    seq_len_kv_cache = 2000
-elif args.test_case == "CTX":
-    batch_size = 1
+if args.test_case == "CTX":
+    batch_size = 3
     seq_len_q = 8193
     seq_len_kv_cache = 0
+elif args.test_case == "GEN":
+    batch_size = 128
+    seq_len_q = 1  # Set to (1 + MTP)
+    seq_len_kv_cache = 8193
 else:
     raise NotImplementedError(f"Not support test case \"{args.test_case}\"")
 balance_method = BalanceMethod.Balanced
