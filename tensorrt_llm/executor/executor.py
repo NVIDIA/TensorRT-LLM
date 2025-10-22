@@ -26,8 +26,8 @@ from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
-                            enable_worker_single_process_for_tp1, print_colored,
-                            print_colored_debug)
+                            enable_worker_single_process_for_tp1, logger_debug,
+                            print_colored)
 from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
                                SamplingParams)
 from ..scheduling_params import SchedulingParams
@@ -448,7 +448,7 @@ class GenerationExecutor(ABC):
         )
 
         if postproc_worker_config.enabled:
-            print_colored_debug(
+            logger_debug(
                 f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
                 "green")
 

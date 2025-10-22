@@ -18,7 +18,7 @@ This article provides a general overview of the components used for device-to-de
 
 ## Workflow
 
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/media/kv_transfer.png?raw=true" alt="KV Cache Transfer Overview" width="500" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/media/kv_transfer.png?raw=true" alt="KV Cache Transfer Overview" width="500" height="auto">
 
 1. Context phase completes computation, KV cache stays in device memory awaiting transmission.
 2. Context returns its communicator handle to the user, who selects the generation executor for continued communication.

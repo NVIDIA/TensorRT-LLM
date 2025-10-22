@@ -37,7 +37,7 @@ def print_traceback_on_error(func):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            print_colored_debug(f"Exception in {func.__name__}: {e}\n", "red")
+            logger_debug(f"Exception in {func.__name__}: {e}\n", "red")
             traceback.print_exc()
             raise e
 
@@ -61,13 +61,6 @@ def print_colored(message,
         writer.write(colors[color] + message + reset)
     else:
         writer.write(message)
-
-
-def print_colored_debug(message,
-                        color: Optional[str] = None,
-                        writer: io.TextIOWrapper = sys.stderr):
-    if enable_llmapi_debug():
-        print_colored(message, color, writer)
 
 
 def get_current_location(skip_frames: int = 2) -> str:

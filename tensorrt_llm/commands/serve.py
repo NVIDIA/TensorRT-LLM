@@ -21,7 +21,9 @@ from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig, ServerRole,
+from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
+                                              MetadataServerConfig, ServerRole,
+                                              extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -140,7 +142,8 @@ def launch_server(host: str,
                   port: int,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  server_role: Optional[ServerRole] = None):
+                  server_role: Optional[ServerRole] = None,
+                  disagg_cluster_config: Optional[DisaggClusterConfig] = None):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -161,7 +164,8 @@ def launch_server(host: str,
     server = OpenAIServer(llm=llm,
                           model=model,
                           server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg)
+                          metadata_server_cfg=metadata_server_cfg,
+                          disagg_cluster_config=disagg_cluster_config)
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -313,6 +317,10 @@ class ChoiceWithAlias(click.Choice):
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
+@click.option("--disagg_cluster_uri",
+              type=str,
+              default=None,
+              help="URI of the disaggregated cluster.")
 @click.option("--enable_chunked_prefill",
               is_flag=True,
               default=False,
@@ -327,7 +335,7 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool):
+        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -364,14 +372,27 @@ def serve(
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    if metadata_server_cfg is not None:
-        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
+    # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
+    # but disagg_cluster_uri takes precedence over cluster uri in config file
+    disagg_cluster_config = llm_args.pop("disagg_cluster", None)
+    if disagg_cluster_config:
+        disagg_cluster_config = extract_disagg_cluster_config(
+            disagg_cluster_config, disagg_cluster_uri)
+    elif disagg_cluster_uri:
+        disagg_cluster_config = DisaggClusterConfig(
+            cluster_uri=disagg_cluster_uri)
+
+    if metadata_server_cfg is not None or disagg_cluster_config is not None:
+        assert (
+            server_role is not None
+        ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
         try:
             server_role = ServerRole[server_role.upper()]
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role)
+    launch_server(host, port, llm_args, metadata_server_cfg, server_role,
+                  disagg_cluster_config)
 
 
 @click.command("mm_embedding_serve")

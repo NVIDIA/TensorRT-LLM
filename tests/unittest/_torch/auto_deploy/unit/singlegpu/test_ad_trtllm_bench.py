@@ -11,20 +11,31 @@ from utils.cpp_paths import llm_root  # noqa: F401
 from tensorrt_llm.commands.bench import main
 
 
-def run_benchmark(model_name: str, dataset_path: str, extra_llm_api_options_path: str):
+def run_benchmark(
+    model_name: str, model_path: str, dataset_path: str, extra_llm_api_options_path: str
+):
     runner = CliRunner()
 
     args = [
         "--model",
         model_name,
-        "throughput",
-        "--backend",
-        "_autodeploy",
-        "--dataset",
-        dataset_path,
-        "--extra_llm_api_options",
-        f"{extra_llm_api_options_path}",
     ]
+
+    # Only pass --model_path if it's a local filesystem path
+    if model_path.startswith("/"):
+        args.extend(["--model_path", model_path])
+
+    args.extend(
+        [
+            "throughput",
+            "--backend",
+            "_autodeploy",
+            "--dataset",
+            dataset_path,
+            "--extra_llm_api_options",
+            f"{extra_llm_api_options_path}",
+        ]
+    )
     result = runner.invoke(main, args, catch_exceptions=False)
     assert result.exit_code == 0
 
@@ -88,4 +99,6 @@ def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
             )
 
         dataset_path = prepare_dataset(llm_root, temp_dir, config["args"]["model"])
-        run_benchmark(model_name, dataset_path, extra_llm_api_options_path)
+        run_benchmark(
+            model_name, str(config["args"]["model"]), dataset_path, extra_llm_api_options_path
+        )

@@ -42,8 +42,8 @@ from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (download_hf_model, download_hf_pretrained_config,
-                    enable_llm_debug, get_directory_size_in_gb, print_colored,
-                    print_colored_debug, print_traceback_on_error)
+                    enable_llm_debug, get_directory_size_in_gb, logger_debug,
+                    print_colored, print_traceback_on_error)
 
 
 @dataclass
@@ -540,8 +540,7 @@ class ModelLoader:
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
 
-        print_colored_debug(f"rank{mpi_rank()} begin to build engine...\n",
-                            "green")
+        logger_debug(f"rank{mpi_rank()} begin to build engine...\n", "green")
 
         # avoid the original build_config is modified, avoid the side effect
         copied_build_config = copy.deepcopy(self.build_config)
@@ -558,7 +557,7 @@ class ModelLoader:
 
         # delete the model explicitly to free all the build-time resources
         self.model = None
-        print_colored_debug(f"rank{mpi_rank()} build engine done\n", "green")
+        logger_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
         '''

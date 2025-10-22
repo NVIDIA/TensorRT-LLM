@@ -387,8 +387,9 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
 
     try:
         if is_nanobind:
-            build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
-                      env=env_stub_gen)
+            build_run(
+                f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
+                env=env_stub_gen)
         else:
             build_run(
                 f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
@@ -575,9 +576,9 @@ def main(*,
         nanobind_dir = build_dir / "tensorrt_llm" / "nanobind"
         if nanobind_dir.exists():
             rmtree(nanobind_dir)
-        nanobind_stub_file = project_dir / "tensorrt_llm" / "bindings.pyi"
-        if nanobind_stub_file.exists():
-            nanobind_stub_file.unlink()
+        nanobind_stub_dir = project_dir / "tensorrt_llm" / "bindings"
+        if nanobind_stub_dir.exists():
+            rmtree(nanobind_stub_dir)
 
         pybind_dir = build_dir / "tensorrt_llm" / "pybind"
         if pybind_dir.exists():

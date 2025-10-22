@@ -253,11 +253,19 @@ class ResizeKVCache(BaseTransform):
         free_mem, total_mem = _get_mem_info_in_mb()
         self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
         current_cache_size = cm.current_cache_size_bytes()
+        current_kv_cache_size = getattr(cm, "current_kv_cache_size_bytes", None)
+        current_kv_cache_size = (
+            current_kv_cache_size() if callable(current_kv_cache_size) else current_cache_size
+        )
         current_num_pages = cm.info.num_pages
         self._log_info(
             f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
-            f"Current num pages (MB): {current_num_pages}"
+            f"Current num pages: {current_num_pages}"
         )
+        if current_kv_cache_size != current_cache_size:
+            self._log_info(
+                f"Current KV-only cache size (MB): {current_kv_cache_size // 1024 // 1024}"
+            )
 
         if free_mem_ratio == 0.0:
             self._log_info(f"Skipping cache resize for {free_mem_ratio=}")
@@ -281,8 +289,16 @@ class ResizeKVCache(BaseTransform):
         memory_for_forward_pass = free_mem_pre - free_mem_post
         self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
-        new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
-        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+        # Compute new pages using KV-only bytes to avoid SSM/conv inflating per-page cost
+        # Reserve headroom to avoid OOM from other allocations (workspaces, cudagraph pools, etc.)
+        reserve_mb = max(1024, (total_mem * 5) // 100)  # at least 1 GiB or 5% of total
+        available_mb = max(0, free_mem_post - reserve_mb)
+
+        new_kv_total_bytes = int(
+            available_mb * 1024 * 1024 * free_mem_ratio + current_kv_cache_size
+        )
+        per_page_bytes = max(1, current_kv_cache_size // max(1, current_num_pages))
+        new_num_pages = int(new_kv_total_bytes // per_page_bytes)
 
         # Need to sync all the GPUs if distributed group is initialized
         log_msg = f"Using local new_num_pages: {new_num_pages}"

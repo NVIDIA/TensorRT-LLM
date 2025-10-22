@@ -309,6 +309,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         spec_metadata = MTPSpecMetadata(max_num_requests=32,
                                         spec_dec_mode=spec_config.spec_dec_mode,
                                         max_draft_len=mtp_num_modules,
+                                        max_total_draft_tokens=mtp_num_modules,
                                         mtp_num_modules=mtp_num_modules)
         spec_metadata.draft_tokens = draft_tokens
 
@@ -891,6 +892,7 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
             max_num_requests=32,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_draft_len=num_nextn_predict_layers,
+            max_total_draft_tokens=num_nextn_predict_layers,
             mtp_num_modules=num_nextn_predict_layers,
             mtp_hidden_states_manager=spec_manager)
         spec_metadata.request_ids = request_ids
@@ -1386,6 +1388,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             max_num_requests=32,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_draft_len=num_nextn_predict_layers,
+            max_total_draft_tokens=num_nextn_predict_layers,
             mtp_num_modules=num_nextn_predict_layers,
             mtp_hidden_states_manager=spec_manager)
         spec_metadata.request_ids = request_ids

@@ -13,7 +13,8 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
-                                          SamplerType, SparseAttentionConfig,
+                                          SamplerType, SchedulerConfig,
+                                          SparseAttentionConfig,
                                           SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -250,10 +251,10 @@ class KvCacheCreator:
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
-                num_extra_tokens_per_seq += spec_cfg.max_draft_len
+                num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_draft_len
+            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
 
         if self._dummy_reqs is None:
@@ -663,8 +664,8 @@ def create_py_executor_instance(
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
     max_num_tokens: Optional[int] = None,
-    peft_cache_config: Optional[trtllm.PeftCacheConfig] = None,
-    scheduler_config: Optional[trtllm.SchedulerConfig] = None,
+    peft_cache_config: Optional[PeftCacheConfig] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
@@ -728,16 +729,14 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        peft_cache_config_model = PeftCacheConfig.from_pybind(
-            peft_cache_config
-        ) if peft_cache_config is not None else PeftCacheConfig()
+        peft_cache_config_model = PeftCacheConfig(
+        ) if peft_cache_config is None else peft_cache_config
         if lora_config.max_loras is not None:
             peft_cache_config_model.num_device_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_loras
         if lora_config.max_cpu_loras is not None:
             peft_cache_config_model.num_host_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
-        peft_cache_config = peft_cache_config_model._to_pybind()
 
         from tensorrt_llm.bindings import WorldConfig
         world_config = WorldConfig(
@@ -748,7 +747,7 @@ def create_py_executor_instance(
             gpus_per_node=dist.mapping.gpus_per_node,
         )
         peft_cache_manager = PeftCacheManager(
-            peft_cache_config=peft_cache_config,
+            peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
@@ -808,6 +807,8 @@ def create_py_executor_instance(
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
+        max_total_draft_tokens=spec_config.max_total_draft_tokens
+        if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
@@ -824,13 +825,8 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
-    max_total_draft_tokens = 0
-    if speculative_config is None:
-        max_total_draft_tokens = 0
-    elif hasattr(speculative_config, 'max_total_draft_tokens'):
-        max_total_draft_tokens = speculative_config.max_total_draft_tokens
-    else:
-        max_total_draft_tokens = max_draft_len
+    max_total_draft_tokens = (0 if speculative_config is None else
+                              speculative_config.max_total_draft_tokens)
 
     return TorchSampler.Args(
         max_seq_len=max_seq_len,

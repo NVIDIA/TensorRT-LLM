@@ -48,7 +48,7 @@ def test_bamba_patches(model_dir: str, run_verify_generation: bool):
             **common_kwargs,
             "model_kwargs": {
                 "use_cache": use_cache,
-                "torch_dtype": "bfloat16",
+                "dtype": "bfloat16",
             },
         }
     llm_args = AutoDeployConfig(**llm_args)
