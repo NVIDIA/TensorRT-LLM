@@ -1120,7 +1120,6 @@ class MLA(nn.Module):
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-            all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
 
         Returns:
             torch.Tensor: The output tensor.
@@ -1253,11 +1252,9 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
         # TODO: implement other paths
         return self.forward_sparse_mla_kvcache_bf16(q,
-                                                    compressed_kv,
-                                                    k_pe,
+                                                    latent_cache,
                                                     attn_metadata,
                                                     output,
-                                                    latent_cache,
                                                     topk_indices,
                                                     is_generation=False)
 
@@ -1273,11 +1270,9 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
         # TODO: implement other paths
         return self.forward_sparse_mla_kvcache_bf16(q,
-                                                    compressed_kv,
-                                                    k_pe,
+                                                    latent_cache,
                                                     attn_metadata,
                                                     output,
-                                                    latent_cache,
                                                     topk_indices,
                                                     is_generation=True)
 
@@ -1636,12 +1631,10 @@ class MLA(nn.Module):
     def forward_sparse_mla_kvcache_bf16(
         self,
         q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        latent_cache: torch.Tensor,
+        attn_metadata: DSAtrtllmAttentionMetadata,
         output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
+        topk_indices: torch.Tensor,
         is_generation: bool = False,
     ) -> torch.Tensor:
         """
@@ -1703,13 +1696,17 @@ class MLA(nn.Module):
         q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
 
         sm_version = get_sm_version()
-        padding = 128 if sm_version >= 100 else 64
-        if self.num_heads % padding != 0:
-            # To use FlashMLA sparse_prefill_fwd kernel, the number of heads must be (padded to) 128 for SM100 and multiple of 64 for SM90
-            assert padding % self.num_heads == 0, (
-                f"Cannot pad num_heads={self.num_heads} to {padding}. "
-                f"Padding must be a multiple of num_heads.")
+        # FlashMLA sparse kernel (bf16) requires num_heads=128 on sm100 or multiple of 64 on sm90
+        if sm_version >= 100:
+            padding = 128
+            assert self.num_heads <= padding, (
+                f"SM100 FlashMLA sparse kernel requires exactly {padding} heads, "
+                f"got {self.num_heads}. Padding from values > {padding} is not supported."
+            )
+        else:  # SM90
+            padding = ((self.num_heads + 63) // 64) * 64  # multiple of 64
 
+        if self.num_heads != padding:
             logger.warning_once(
                 f"Padding num_heads from {self.num_heads} to {padding} "
                 f"due to FlashMLA sparse attention kernel requirement",
@@ -1740,7 +1737,7 @@ class MLA(nn.Module):
             raise RuntimeError(
                 "flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built."
             )
-        # output: [seq, num_heads, kv_lora_rank]
+
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent[:, :self.
                                           num_heads, :]  # account for padding

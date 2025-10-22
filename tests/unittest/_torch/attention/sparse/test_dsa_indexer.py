@@ -520,7 +520,13 @@ def test_fp8_k_cache_roundtrip():
                              device="cuda",
                              dtype=torch.bfloat16)
     k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k_original)
-    k_scale = k_scale.contiguous().transpose(0, 1)
+    # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
+    if k_scale.ndim == 1:
+        num_blocks = (k_original.shape[1] + 127) // 128
+        m_padded = (k_original.shape[0] + 3) // 4 * 4
+        k_scale = k_scale[:num_blocks * m_padded].view(
+            num_blocks, m_padded)[:, :k_original.shape[0]]
+    k_scale = k_scale.transpose(0, 1).contiguous()
 
     # Write to cache
     indexer._update_k_cache(k_fp8, k_scale, metadata)
@@ -654,7 +660,12 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
 
     k_context_fp8, k_context_scale = torch.ops.trtllm.fp8_quantize_1x128(
         k_context_bf16)
-    k_context_scale = k_context_scale.contiguous().transpose(0, 1)
+    if k_context_scale.ndim == 1:
+        num_blocks = (k_context_bf16.shape[1] + 127) // 128
+        m_padded = (k_context_bf16.shape[0] + 3) // 4 * 4
+        k_context_scale = k_context_scale[:num_blocks * m_padded].view(
+            num_blocks, m_padded)[:, :k_context_bf16.shape[0]]
+    k_context_scale = k_context_scale.transpose(0, 1).contiguous()
     indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
     print(f"✓ Wrote {total_context_tokens} FP8 context tokens to cache")
 
@@ -678,7 +689,12 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     Indexer.prepare(metadata_gen)
 
     k_gen_fp8, k_gen_scale = torch.ops.trtllm.fp8_quantize_1x128(k_gen_bf16)
-    k_gen_scale = k_gen_scale.contiguous().transpose(0, 1)
+    if k_gen_scale.ndim == 1:
+        num_blocks = (k_gen_bf16.shape[1] + 127) // 128
+        m_padded = (k_gen_bf16.shape[0] + 3) // 4 * 4
+        k_gen_scale = k_gen_scale[:num_blocks * m_padded].view(
+            num_blocks, m_padded)[:, :k_gen_bf16.shape[0]]
+    k_gen_scale = k_gen_scale.transpose(0, 1).contiguous()
     indexer._update_k_cache(k_gen_fp8, k_gen_scale, metadata_gen)
     print(
         f"✓ Wrote {batch_size * num_gen_tokens} FP8 generation tokens to cache")
@@ -966,7 +982,16 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     # Quantize inputs
     q_fp8 = q.to(torch.float8_e4m3fn)
     k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k)
-    k_scale = k_scale.contiguous().transpose(0, 1)
+    # Handle SM90/SM100 differences
+    if k_scale.ndim == 1:
+        head_dim = k.shape[1]
+        num_blocks = (head_dim + 127) // 128
+        num_tokens = k.shape[0]
+        m_padded = (num_tokens + 3) // 4 * 4
+        k_scale = (k_scale[:num_blocks * m_padded].view(
+            num_blocks, m_padded)[:, :num_tokens].transpose(0, 1).contiguous())
+    else:
+        k_scale = k_scale.transpose(0, 1).contiguous()
 
     # ========== Test Path 1: Chunked Prefill ==========
     print(f"\n=== Chunked Path ===")

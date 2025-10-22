@@ -1,5 +1,6 @@
 import math
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .kernel import triton_convert_req_index_to_global_index
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
 try:
@@ -247,27 +251,16 @@ def compute_cu_seqlen_kv_bounds_nocache(
     return cu_seqlen_ks, cu_seqlen_ke
 
 
+@dataclass
 class IndexerPrefillChunkMetadata:
     """Metadata for a single prefill chunk in the indexer"""
-
-    def __init__(
-            self,
-            cu_seqlen_ks: torch.Tensor,  # Attention window start for each token
-            cu_seqlen_ke: torch.Tensor,  # Attention window end for each token
-            token_start: int,  # Q token start index in batch
-            token_end: int,  # Q token end index in batch
-            k_token_start: int,  # K token start index in batch
-            k_token_end: int,  # K token end index in batch
-            ctx_kv_offsets: torch.
-        Tensor,  # Offsets for converting local to global topk indices
-    ):
-        self.cu_seqlen_ks = cu_seqlen_ks
-        self.cu_seqlen_ke = cu_seqlen_ke
-        self.token_start = token_start
-        self.token_end = token_end
-        self.k_token_start = k_token_start
-        self.k_token_end = k_token_end
-        self.ctx_kv_offsets = ctx_kv_offsets
+    cu_seqlen_ks: torch.Tensor  # Attention window start for each token
+    cu_seqlen_ke: torch.Tensor  # Attention window end for each token
+    token_start: int  # Q token start index in batch
+    token_end: int  # Q token end index in batch
+    k_token_start: int  # K token start index in batch
+    k_token_end: int  # K token end index in batch
+    ctx_kv_offsets: torch.Tensor  # Offsets for converting local to global topk indices
 
 
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
@@ -933,6 +926,12 @@ class Indexer(nn.Module):
 
         # Quantize k and store into indexer k cache
         k_fp8, k_scale = torch.ops.trtllm.fp8_quantize_1x128(k[:num_tokens])
+        # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
+        if k_scale.ndim == 1:
+            num_blocks = (k.shape[1] + 127) // 128
+            m_padded = (num_tokens + 3) // 4 * 4
+            k_scale = k_scale[:num_blocks * m_padded].view(
+                num_blocks, m_padded)[:, :num_tokens]
         k_scale = k_scale.contiguous().transpose(0, 1)
         self._update_k_cache(k_fp8, k_scale, metadata)
 

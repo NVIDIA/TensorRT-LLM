@@ -1473,6 +1473,7 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
@@ -1564,11 +1565,3 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-
-
-@register_auto_model("DeepseekV32ForCausalLM")
-class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
-
-    def load_weights(self, weights: Dict):
-        weight_loader = DeepseekV3WeightLoader(self)
-        weight_loader.load_weights(weights)
