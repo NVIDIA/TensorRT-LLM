@@ -65,8 +65,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                  LlmRequestState>(),
             py::arg("ctx_chunk_config") = std::nullopt, py::arg("max_context_length") = std::nullopt,
             py::arg_v("no_schedule_until_state", LlmRequestState::kCONTEXT_INIT, "LlmRequestState.CONTEXT_INIT"),
-            py::arg_v("no_schedule_after_state", LlmRequestState::kGENERATION_COMPLETE,
-                "LlmRequestState.GENERATION_COMPLETE"))
+            py::arg_v("no_schedule_after_state", LlmRequestState::kGENERATION_TO_COMPLETE,
+                "LlmRequestState.GENERATION_TO_COMPLETE"))
         .def("__call__", &MicroBatchScheduler::operator(), py::arg("active_requests"), py::arg("inflight_req_ids"),
             py::arg("max_batch_size_runtime"), py::arg("max_num_tokens_runtime"))
         .def("name", [](MicroBatchScheduler const&) { return MicroBatchScheduler::name; });
