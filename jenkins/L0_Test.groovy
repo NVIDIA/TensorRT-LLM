@@ -727,7 +727,7 @@ def getPytestBaseCommandLine(
     List<String> extraArgs = []
 ) {
     def extraInternalEnv = ""
-    def pytestTestTimeout = "3600"
+    def pytestTestTimeout = "600"
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
