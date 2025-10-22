@@ -787,7 +787,7 @@ TEST(SerializeUtilsTest, ExecutorConfig)
         texec::GuidedDecodingConfig(
             texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
         std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
-        texec::CacheTransceiverConfig(std::nullopt, 1024), true, true, true);
+        texec::CacheTransceiverConfig(std::nullopt, 1024, nvinfer1::DataType::kHALF), true, true, true);
     auto executorConfig2 = serializeDeserialize(executorConfig);
 
     EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());

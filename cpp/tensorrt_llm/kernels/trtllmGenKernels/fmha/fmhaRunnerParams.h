@@ -171,6 +171,12 @@ MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 #undef MULTI_CTAS_KV_MODE_FUNCTION
 
+// Helper function to check if using GmemReduction with a separate kernel.
+inline bool isGmemReductionWithSeparateKernel(MultiCtasKvMode multiCtasKvMode)
+{
+    return multiCtasKvMode == MultiCtasKvMode::GmemReduction;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct TllmGenFmhaRunnerParams

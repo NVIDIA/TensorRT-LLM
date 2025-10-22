@@ -57,8 +57,9 @@ private:
 class CacheTransBufferManager
 {
 public:
-    CacheTransBufferManager(
-        KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
+    CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+        std::optional<size_t> maxNumTokens = std::nullopt,
+        nvinfer1::DataType transmissionDataType = nvinfer1::DataType::kHALF);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
         std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
@@ -80,6 +81,10 @@ public:
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
     size_t getRecvBufferCount();
     size_t getSendBufferCount();
+    [[nodiscard]] nvinfer1::DataType getTransmissionDataType() const noexcept
+    {
+        return mTransmissionDataType;
+    }
 
 private:
     struct ConcurrenceResource
@@ -108,6 +113,7 @@ private:
     bool mUseFabricMemory;
     size_t mBufferEleSize;
     nvinfer1::DataType mDataType;
+    nvinfer1::DataType mTransmissionDataType;
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;
     KVCacheManager::BaseKVCacheManager* mCacheManager;

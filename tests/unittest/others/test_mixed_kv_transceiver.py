@@ -46,47 +46,94 @@ def fill_kv_cache_buffer(kv_cache_manager):
 
 
 @pytest.fixture(scope="function")
-def ctx_gen_kv_cache_dtype(request):
+def ctx_gen_kv_cache_dtype_and_transmission(request):
+    """
+    Fixture that returns (ctx_dtype, gen_dtype, transmission_dtype)
+    Format: ctx_<dtype>_gen_<dtype>_trans_<dtype>
+    """
     print(f"FIXTURE CALLED with param: {request.param}", flush=True)
-    if request.param == "ctx_fp8_gen_fp8": 
-        result = DataType.FP8, DataType.FP8
-    elif request.param == "ctx_bf16_gen_fp8": 
-        result = DataType.BF16, DataType.FP8
-    elif request.param == "ctx_fp16_gen_fp8":
-        result = DataType.HALF, DataType.FP8
+    
+    # Parse the parameter string
+    parts = request.param.split("_")
+    if len(parts) == 6 and parts[0] == "ctx" and parts[2] == "gen" and parts[4] == "trans":
+        ctx_dtype_str = parts[1]
+        gen_dtype_str = parts[3]
+        trans_dtype_str = parts[5]
+        
+        dtype_map = {
+            "fp8": DataType.FP8,
+            "fp16": DataType.HALF,
+            "bf16": DataType.BF16,
+            "fp32": DataType.FLOAT,
+        }
+        
+        ctx_dtype = dtype_map.get(ctx_dtype_str)
+        gen_dtype = dtype_map.get(gen_dtype_str)
+        trans_dtype = dtype_map.get(trans_dtype_str)
+        
+        if ctx_dtype is None or gen_dtype is None or trans_dtype is None:
+            raise ValueError(f"Invalid dtype in config: {request.param}")
+        
+        result = (ctx_dtype, gen_dtype, trans_dtype)
     else:
-        raise ValueError(f"Invalid config: {request.param}")
-    print(f"FIXTURE RETURNING: {result}", flush=True)
+        raise ValueError(f"Invalid config format: {request.param}. Expected: ctx_<dtype>_gen_<dtype>_trans_<dtype>")
+    
+    print(f"FIXTURE RETURNING: ctx={ctx_dtype}, gen={gen_dtype}, transmission={trans_dtype}", flush=True)
     return result
 
 
 # TODO: Test MLA TODO: Test MLA TODO: Test MLA 
 
 @pytest.mark.parametrize(
-    "ctx_gen_kv_cache_dtype",
-    ["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp8"],  # BF16->FP8 not supported yet
-    ids=["ctx_fp8_gen_fp8", "ctx_fp16_gen_fp8"],
+    "ctx_gen_kv_cache_dtype_and_transmission",
+    [
+        # Same storage types, various transmission formats
+        "ctx_fp8_gen_fp8_trans_fp16",   # FP8 storage, FP16 transmission (default)
+        "ctx_fp8_gen_fp8_trans_fp32",   # FP8 storage, FP32 transmission
+        "ctx_fp8_gen_fp8_trans_bf16",   # FP8 storage, BF16 transmission
+        
+        # Mixed storage types with FP16 transmission
+        "ctx_fp16_gen_fp8_trans_fp16",  # FP16 → FP16 → FP8
+        "ctx_fp8_gen_fp16_trans_fp16",  # FP8 → FP16 → FP16
+        
+        # Mixed storage types with FP32 transmission (higher precision)
+        "ctx_fp16_gen_fp8_trans_fp32",  # FP16 → FP32 → FP8 (better precision)
+        "ctx_fp8_gen_fp16_trans_fp32",  # FP8 → FP32 → FP16 (better precision)
+    ],
+    ids=[
+        "fp8_to_fp8_via_fp16",
+        "fp8_to_fp8_via_fp32",
+        "fp8_to_fp8_via_bf16",
+        "fp16_to_fp8_via_fp16",
+        "fp8_to_fp16_via_fp16",
+        "fp16_to_fp8_via_fp32",
+        "fp8_to_fp16_via_fp32",
+    ],
     indirect=True)
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT],
                          ids=["mha"])
-def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
+def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype_and_transmission,
                                              attention_type):
-    print(f"TEST FUNCTION ENTERED with ctx_gen={ctx_gen_kv_cache_dtype}, attention={attention_type}", flush=True)
+    ctx_kv_cache_dtype, gen_kv_cache_dtype, transmission_dtype = ctx_gen_kv_cache_dtype_and_transmission
+    print(f"TEST FUNCTION ENTERED with ctx={ctx_kv_cache_dtype}, gen={gen_kv_cache_dtype}, "
+          f"transmission={transmission_dtype}, attention={attention_type}", flush=True)
     # Init kv_cache manager and cache transceiver
     print("A", flush=True)
     
     mapping = Mapping(world_size=1, rank=0)
-    ctx_kv_cache_dtype, gen_kv_cache_dtype = ctx_gen_kv_cache_dtype
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, ctx_kv_cache_dtype)
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
     
     print("B", flush=True)
     
+    # Configure with explicit transmission data type
     cache_transceiver_config = trtllm.CacheTransceiverConfig(
         backend=trtllm.CacheTransceiverBackendType.DEFAULT,
-        max_tokens_in_buffer=256)
-
+        max_tokens_in_buffer=256,
+        transmission_data_type=transmission_dtype)
+    
+    print(f"Created CacheTransceiverConfig with transmission_data_type={transmission_dtype}", flush=True)
     print("C", flush=True)
     
     try:
@@ -155,19 +202,35 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
         gen_buf = kv_cache_manager_gen.get_buffers(0).to(torch.float32)
         
         print("================================================= FINAL VALUES OF THE CACHES =================================================")
-        print("ctx_buf: ", ctx_buf)
-        print("gen_buf: ", gen_buf)
+        print(f"ctx_buf (from {ctx_kv_cache_dtype}): shape={ctx_buf.shape}, dtype={ctx_buf.dtype}")
+        print(f"gen_buf (from {gen_kv_cache_dtype}): shape={gen_buf.shape}, dtype={gen_buf.dtype}")
+        print(f"Transmission format used: {transmission_dtype}")
+        print(f"ctx_buf sample: {ctx_buf.flatten()[:10]}")
+        print(f"gen_buf sample: {gen_buf.flatten()[:10]}")
         
-        # print("ctx_buf: ", ctx_buf.flatten().argsort())
-        # print("gen_buf: ", gen_buf.flatten().argsort())
+        # Adjust tolerance based on the precision path
+        # FP8 has ~1e-2 relative precision, FP16 has ~1e-3, FP32 has ~1e-7
+        # For FP8 conversions, we need higher tolerance
+        if ctx_kv_cache_dtype == DataType.FP8 or gen_kv_cache_dtype == DataType.FP8:
+            rtol = 5e-2  # 5% relative tolerance for FP8
+            atol = 1e-2  # Higher absolute tolerance
+        else:
+            rtol = 5e-3  # 0.5% for FP16/BF16
+            atol = 1e-3
+        
+        print(f"Using rtol={rtol}, atol={atol} for comparison", flush=True)
 
         torch.testing.assert_close(
             gen_buf,
             ctx_buf,
-            rtol=5e-3,
-            atol=1e-3,
-            msg="Different KV-cache values after transfer",
+            rtol=rtol,
+            atol=atol,
+            msg=f"Different KV-cache values after transfer (ctx={ctx_kv_cache_dtype}, "
+                f"gen={gen_kv_cache_dtype}, transmission={transmission_dtype})",
         )
+        
+        print(f"✓ Test passed: KV cache successfully transferred from {ctx_kv_cache_dtype} "
+              f"to {gen_kv_cache_dtype} via {transmission_dtype}", flush=True)
         
         # torch.testing.assert_close(
         #     gen_buf.flatten().argsort(),

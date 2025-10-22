@@ -55,6 +55,28 @@
 namespace tensorrt_llm::batch_manager
 {
 
+namespace
+{
+// Convert executor::DataType to nvinfer1::DataType
+nvinfer1::DataType toTrtDataType(executor::DataType dataType)
+{
+    switch (dataType)
+    {
+    case executor::DataType::kBOOL: return nvinfer1::DataType::kBOOL;
+    case executor::DataType::kUINT8: return nvinfer1::DataType::kUINT8;
+    case executor::DataType::kINT8: return nvinfer1::DataType::kINT8;
+    case executor::DataType::kINT32: return nvinfer1::DataType::kINT32;
+    case executor::DataType::kINT64: return nvinfer1::DataType::kINT64;
+    case executor::DataType::kBF16: return nvinfer1::DataType::kBF16;
+    case executor::DataType::kFP8: return nvinfer1::DataType::kFP8;
+    case executor::DataType::kFP16: return nvinfer1::DataType::kHALF;
+    case executor::DataType::kFP32: return nvinfer1::DataType::kFLOAT;
+    case executor::DataType::kUNKNOWN: break;
+    }
+    TLLM_THROW("Unsupported data type");
+}
+} // namespace
+
 std::mutex CacheTransceiver::mDllMutex;
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
@@ -153,8 +175,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         " CacheTransceiverConfig::BackendType is not set.");
 
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
+    nvinfer1::DataType transmissionDataType = toTrtDataType(mCacheTransceiverConfig.value().getTransmissionDataType());
 
-    mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
+    mCacheTransBufferManager = std::make_unique<kv_cache_manager::CacheTransBufferManager>(
+        cacheManager, maxNumTokens, transmissionDataType);
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);

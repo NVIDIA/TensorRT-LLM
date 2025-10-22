@@ -1270,13 +1270,15 @@ CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::ist
 {
     auto backendType = su::deserialize<std::optional<CacheTransceiverConfig::BackendType>>(is);
     auto maxTokensInBuffer = su::deserialize<std::optional<size_t>>(is);
-    return CacheTransceiverConfig{backendType, maxTokensInBuffer};
+    auto transmissionDataType = su::deserialize<DataType>(is);
+    return CacheTransceiverConfig{backendType, maxTokensInBuffer, transmissionDataType};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
 {
     su::serialize(cacheTransceiverConfig.getBackendType(), os);
     su::serialize(cacheTransceiverConfig.getMaxTokensInBuffer(), os);
+    su::serialize(cacheTransceiverConfig.getTransmissionDataType(), os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
@@ -1284,6 +1286,7 @@ size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTranscei
     size_t totalSize = 0;
     totalSize += su::serializedSize(cacheTransceiverConfig.getBackendType());
     totalSize += su::serializedSize(cacheTransceiverConfig.getMaxTokensInBuffer());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getTransmissionDataType());
     return totalSize;
 }
 

@@ -4,3 +4,4 @@ disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
+  # Optional: transmission_data_type: float16  # Defaults to float16, can also use float32, bfloat16, float8

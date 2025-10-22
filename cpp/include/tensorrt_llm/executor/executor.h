@@ -1454,15 +1454,18 @@ public:
         UCX = 2,
         NIXL = 3
     };
-    explicit CacheTransceiverConfig(
-        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
+    explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
+        std::optional<size_t> maxNumTokens = std::nullopt,
+        DataType transmissionDataType = DataType::kFP16);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
+    void setTransmissionDataType(DataType transmissionDataType);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
+    [[nodiscard]] DataType getTransmissionDataType() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1470,6 +1473,9 @@ private:
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
+    /// @brief The data type to use for KV cache transmission buffers. Defaults to kFP16 (FP16).
+    /// This allows mixed-precision disaggregation where context and generation executors use different data types.
+    DataType mTransmissionDataType;
 };
 
 /// @brief Configuration class for the model executor

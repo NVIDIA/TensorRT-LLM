@@ -415,15 +415,15 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
+    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getTransmissionDataType()); };
     auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 2)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(
-            state[0].cast<tle::CacheTransceiverConfig::BackendType>(), state[1].cast<std::optional<size_t>>());
+        return tle::CacheTransceiverConfig(state[0].cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(),
+            state[1].cast<std::optional<size_t>>(), state[2].cast<tle::DataType>());
     };
 
     py::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -446,12 +446,16 @@ void initConfigBindings(pybind11::module_& m)
             });
 
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
-            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt)
+        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
+                 tle::DataType>(),
+            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt,
+            py::arg("transmission_data_type") = tle::DataType::kFP16)
         .def_property(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_property("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
             &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
+        .def_property("transmission_data_type", &tle::CacheTransceiverConfig::getTransmissionDataType,
+            &tle::CacheTransceiverConfig::setTransmissionDataType)
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
 
     auto executorConfigGetState = [](py::object const& self)

@@ -433,15 +433,16 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", guidedDecodingConfigSetstate);
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
+    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getTransmissionDataType()); };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 2)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
         new (&self) tle::CacheTransceiverConfig(
-            nb::cast<tle::CacheTransceiverConfig::BackendType>(state[0]), nb::cast<std::optional<size_t>>(state[1]));
+            nb::cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(state[0]),
+            nb::cast<std::optional<size_t>>(state[1]), nb::cast<tle::DataType>(state[2]));
     };
 
     nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -464,12 +465,16 @@ void initConfigBindings(nb::module_& m)
             });
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
-            nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt)
+        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
+                 tle::DataType>(),
+            nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
+            nb::arg("transmission_data_type") = tle::DataType::kFP16)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
             &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
+        .def_prop_rw("transmission_data_type", &tle::CacheTransceiverConfig::getTransmissionDataType,
+            &tle::CacheTransceiverConfig::setTransmissionDataType)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 

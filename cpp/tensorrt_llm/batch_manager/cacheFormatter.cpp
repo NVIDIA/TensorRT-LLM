@@ -433,12 +433,10 @@ std::string dataTypeToString(nvinfer1::DataType type)
 
 void convertKVCachePrecisionVector( //TODO: Instead of iterating and calling kernal, concat into a single tensor and call the kernel once
     std::vector<runtime::ITensor::SharedPtr>& blocks,
-    BaseCacheFormatter::CacheState const& srcConfig,
-    BaseCacheFormatter::CacheState const& destConfig,
+    nvinfer1::DataType const& srcDataType,
+    nvinfer1::DataType const& destDataType,
     runtime::BufferManager const& bufferManager)
 {
-    auto const srcDataType = srcConfig.getDataType();
-    auto const destDataType = destConfig.getDataType();
     auto stream = bufferManager.getStream().get();
     
     TLLM_LOG_INFO("Converting %zu blocks from %s to %s", blocks.size(),
@@ -859,11 +857,11 @@ void CacheFormatter::unformat(TransferSession& session)
                 {
                     TLLM_LOG_INFO("WE ARE TAKING THIS PATH, NON LEGACY, NON LAYER WISE");
 
-                    if (destConfig.getDataType() != selfConfig.getDataType() && common::getEnvEnableKVCachePrecisionConversion())
+                    if (mCacheTransBufferManager->getTransmissionDataType() != selfConfig.getDataType() && common::getEnvEnableKVCachePrecisionConversion())
                     {
                         TLLM_LOG_INFO("WE ARE TAKING THIS PATH, CONVERSING.......");
                         NVTX3_SCOPED_RANGE(kvCacheRecvPrecisionConv);
-                        convertKVCachePrecisionVector(recvSplitCaches, destConfig, selfConfig, bufferManager);
+                        convertKVCachePrecisionVector(recvSplitCaches, mCacheTransBufferManager->getTransmissionDataType(), selfConfig.getDataType(), bufferManager);
                         TLLM_LOG_INFO("After conversion, recvSplitCaches[0] dtype: %s", 
                             dataTypeToString(recvSplitCaches[0]->getDataType()).c_str());
                     }

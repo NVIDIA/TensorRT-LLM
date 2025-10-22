@@ -16,6 +16,10 @@ cache_transceiver_config:
   backend: <str>
   # KV cache buffer size. Set it ≥ the maximum ISL (Input Sequence Length) for best performance.
   max_tokens_in_buffer: <int>
+  # Data type for KV cache transmission buffers. Defaults to 'float16' if not specified.
+  # Valid options: 'float16', 'float32', 'bfloat16', 'float8'
+  # Use this for mixed-precision disaggregation (e.g., FP8 context, FP16 generation)
+  transmission_data_type: <str>  # optional, defaults to 'float16'
 ```
 
 The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.
@@ -29,6 +33,8 @@ disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
+  # Optional: specify transmission data type for mixed-precision scenarios
+  # transmission_data_type: float16  # Default, can also use float32, bfloat16, float8
 ```
 
 ```yaml
@@ -37,6 +43,8 @@ cache_transceiver_config:
 cache_transceiver_config:
   backend: UCX
   max_tokens_in_buffer: 2048
+  # Optional: specify transmission data type (must match context config)
+  # transmission_data_type: float16  # Default, can also use float32, bfloat16, float8
 ```
 
 ### Basic Usage

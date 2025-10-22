@@ -1138,10 +1138,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
 
+    transmission_data_type: Optional[str] = Field(
+        default="float16",
+        description=
+        "The data type to use for KV cache transmission buffers. Defaults to 'float16'. "
+        "Supported values: 'float16', 'float32', 'bfloat16', 'float8', etc.")
+
     def _to_pybind(self):
+        from tensorrt_llm._utils import str_dtype_to_binding
+        # Always provide a value, defaulting to float16 if None
+        transmission_dtype = str_dtype_to_binding(self.transmission_data_type or "float16")
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
-            max_tokens_in_buffer=self.max_tokens_in_buffer)
+            max_tokens_in_buffer=self.max_tokens_in_buffer,
+            transmission_data_type=transmission_dtype)
 
 
 @dataclass
