@@ -38,6 +38,7 @@
 #endif          // __GNUC__
 
 #include "fp8_rowwise_gemm.h"
+#include "fp8_rowwise_gemm_kernel_template_sm100.h"
 #include "fp8_rowwise_gemm_kernel_template_sm89.h"
 #include "fp8_rowwise_gemm_kernel_template_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -46,6 +47,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include <algorithm>
+#include <unistd.h>
 #include <vector>
 
 namespace tensorrt_llm
@@ -483,6 +485,188 @@ size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void con
     }
 }
 
+template <typename Gemm>
+typename Gemm::Arguments prepareGemmArgsSm100(void* D, void const* A, void const* B, void const* C_bias,
+    tk::QuantMode quantOption, int m, int n, int k, float const* scale_d0, float const* scale_d1,
+    tkc::CutlassGemmConfig gemmConfig)
+{
+    using ElementT = typename Gemm::ElementA;
+    using ElementOutput = typename Gemm::ElementD;
+    using ElementComputeEpilogue = float;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    ElementT const* ptr_A = reinterpret_cast<ElementT const*>(A);
+    ElementT const* ptr_B = reinterpret_cast<ElementT const*>(B);
+
+    StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
+    StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
+    StrideC stride_C;
+    StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
+    typename Gemm::Arguments args
+        = {cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, {ptr_A, stride_A, ptr_B, stride_B},
+            {{},                 // epilogue.thread
+                nullptr, stride_C, reinterpret_cast<ElementOutput*>(D), stride_D}};
+    args.epilogue.thread = {{{}, // bias
+        {{reinterpret_cast<ElementComputeEpilogue*>(const_cast<float*>(scale_d0))},
+            {{reinterpret_cast<ElementComputeEpilogue*>(const_cast<float*>(scale_d1))}}}}};
+    return args;
+}
+
+template <typename T, typename CTAShape, typename ClusterShape>
+size_t genericFp8RowwiseGemmKernelLauncherSm100(void* D, void const* A, void const* B, void const* C_bias,
+    tk::QuantMode quantOption, int m, int n, int k, float const* scale_d0, float const* scale_d1,
+    tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
+    int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    using ElementInput = cutlass::float_e4m3_t;
+    using ElementOutput_ =
+        typename cutlass::platform::conditional<cutlass::platform::is_same<T, half>::value, cutlass::half_t, T>::type;
+#ifdef ENABLE_BF16
+    using ElementOutput =
+        typename cutlass::platform::conditional<cutlass::platform::is_same<ElementOutput_, __nv_bfloat16>::value,
+            cutlass::bfloat16_t, ElementOutput_>::type;
+#else
+    using ElementOutput = ElementOutput_;
+#endif
+
+    using AccumElementType = float;
+    using MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto;
+    using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
+    using TileSchedulerType = void;
+    using Gemm = typename DeviceGemmFp8RowwiseSm100<ElementInput, ElementOutput, AccumElementType, CTAShape,
+        ClusterShape, MainloopScheduleType, EpilogueScheduleType, TileSchedulerType>::Gemm;
+    auto args = prepareGemmArgsSm100<Gemm>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig);
+    return typedFp8RowwiseGemmKernelLauncher(
+        Gemm{}, args, D, A, B, C_bias, workspace, workspaceBytes, stream, occupancy);
+}
+
+template <typename T, typename CTAShape>
+size_t dispatchGemmConfigSm100(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    switch (gemmConfig.cluster_shape)
+    {
+    case tkc::ClusterShape::ClusterShape_1x1x1:
+        return genericFp8RowwiseGemmKernelLauncherSm100<T, CTAShape, Shape<_1, _1, _1>>(D, A, B, C_bias, quantOption, m,
+            n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+#if 0
+        case tkc::ClusterShape::ClusterShape_2x1x1:
+            return genericFp8RowwiseGemmKernelLauncherSm100<T, CTAShape, Shape<_2, _1, _1>>(D, A, B, C_bias, quantOption, m,
+                n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::ClusterShape::ClusterShape_1x2x1:
+            return genericFp8RowwiseGemmKernelLauncherSm100<T, CTAShape, Shape<_1, _2, _1>>(D, A, B, C_bias, quantOption, m,
+                n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::ClusterShape::ClusterShape_2x2x1:
+            return genericFp8RowwiseGemmKernelLauncherSm100<T, CTAShape, Shape<_2, _2, _1>>(D, A, B, C_bias, quantOption, m,
+                n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::ClusterShape::ClusterShape_1x8x1:
+            return genericFp8RowwiseGemmKernelLauncherSm100<T, CTAShape, Shape<_1, _8, _1>>(D, A, B, C_bias, quantOption, m,
+                n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::ClusterShape::ClusterShape_8x1x1:
+            return genericFp8RowwiseGemmKernelLauncherSm100<T, CTAShape, Shape<_8, _1, _1>>(D, A, B, C_bias, quantOption, m,
+                n, k, scale_d0, scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+#endif
+    default:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][CutlassFp8RowwiseGemmRunner][dispatchGemmConfigSm100] Config is invalid for "
+            "Fp8 Rowwise GEMM.");
+        break;
+    }
+}
+
+template <typename T>
+size_t dispatchGemmToCutlassSm100(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float const* scale_d0, float const* scale_d1, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    constexpr int Ktile = 128 / sizeof(T);
+    using _Ktile = Int<Ktile>;
+    constexpr int Ktile256 = 256 / sizeof(T);
+    using _Ktile256 = Int<Ktile256>;
+    switch (gemmConfig.tile_config_sm100)
+    {
+#if 0
+        case tkc::CutlassTileConfigSM100::CtaShape64x32x128B:
+            return dispatchGemmConfigSm100<T, Shape<_64, _32, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape64x64x128B:
+            return dispatchGemmConfigSm100<T, Shape<_64, _64, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape64x128x128B:
+            return dispatchGemmConfigSm100<T, Shape<_64, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape64x256x128B:
+            return dispatchGemmConfigSm100<T, Shape<_64, _256, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape128x8x256B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _8, _Ktile256>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape128x16x128B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _16, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape128x32x128B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _32, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape128x64x128B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _64, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+#endif
+    case tkc::CutlassTileConfigSM100::CtaShape128x128x128B:
+        return dispatchGemmConfigSm100<T, Shape<_128, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+            scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+#if 0
+        case tkc::CutlassTileConfigSM100::CtaShape128x256x128B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _256, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape128x128x256B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _128, _Ktile256>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+        case tkc::CutlassTileConfigSM100::CtaShape128x256x256B:
+            return dispatchGemmConfigSm100<T, Shape<_128, _256, _Ktile256>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+                scale_d1, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            break;
+#endif
+    case tkc::CutlassTileConfigSM100::Undefined:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][CutlassFp8RowwiseGemmRunner][dispatchGemmToCutlassSm100] Gemm config undefined.");
+        break;
+    case tkc::CutlassTileConfigSM100::ChooseWithHeuristic:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][CutlassFp8RowwiseGemmRunner][dispatchGemmToCutlassSm100] Gemm config should have "
+            "already been set by heuristic.");
+        break;
+    default:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][CutlassFp8RowwiseGemmRunner][dispatchGemmToCutlassSm100] Config is invalid for "
+            "Fp8 Rowwise GEMM.");
+        break;
+    }
+}
+
 template <typename T>
 CutlassFp8RowwiseGemmRunner<T>::CutlassFp8RowwiseGemmRunner()
 {
@@ -502,10 +686,18 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_WARNING("CutlassFp8RowwiseGemmRunner<T>::dispatchToArch mSm (outside ifndef): %d", mSm);
 #ifndef PLACEHOLDER_KERNELS
+    TLLM_LOG_WARNING("CutlassFp8RowwiseGemmRunner<T>::dispatchToArch mSm (inside ifndef): %d", mSm);
+#endif
     if (mSm == 90)
     {
         return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
+            workspace, workspaceBytes, stream, occupancy);
+    }
+    else if (mSm == 100)
+    {
+        return dispatchGemmToCutlassSm100<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, gemmConfig,
             workspace, workspaceBytes, stream, occupancy);
     }
     else if (mSm == 89 || mSm >= 120)
@@ -514,7 +706,6 @@ size_t CutlassFp8RowwiseGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
             workspace, workspaceBytes, stream, occupancy);
     }
     else
-#endif
     {
         throw std::runtime_error(
             "[TensorRT LLM Error][CutlassFp8RowwiseGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS "
@@ -541,6 +732,8 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
     using tkc::SplitKStyle;
 
     std::vector<CutlassGemmConfig> candidateConfigs;
+    TLLM_LOG_WARNING("CutlassFp8RowwiseGemmRunner<T>::getConfigs() mSm = %d", mSm);
+
     if (mSm == 90)
     {
         tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
@@ -574,6 +767,26 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp8RowwiseGemmRunner<T>::getConfigs()
                 candidateConfigs.push_back(config);
             }
         }
+    }
+    else if (mSm == 100)
+    {
+#if 0
+        auto config_type_param
+            = static_cast<tkc::CutlassGemmConfig::CandidateConfigTypeParam>(tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP8_ONLY | tkc::CutlassGemmConfig::CandidateConfigTypeParam::GROUPED_GEMM | tkc::CutlassGemmConfig::CandidateConfigTypeParam::BLACKWELL);
+        std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 2, config_type_param);
+        candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
+#endif
+
+        std::vector<tkc::CutlassTileConfigSM100> tilesSm100 = {tkc::CutlassTileConfigSM100::CtaShape128x128x128B};
+        for (auto const& tile_config : tilesSm100)
+        {
+            {
+                CutlassGemmConfig config(tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+                    tkc::ClusterShape::ClusterShape_1x1x1);
+                candidateConfigs.push_back(config);
+            }
+        }
+        TLLM_LOG_WARNING("candidateConfigs.size() = %d", candidateConfigs.size());
     }
     else if (mSm == 89 || mSm >= 120)
     {
