@@ -143,13 +143,13 @@ class CutlassFusedMoE(MoE):
         self.alltoall_workspace = None
         self.alltoall_prepare_workspace = None
         if self.enable_alltoall:
-            if self.moe_alltoall_backend == "MnnvlLatency":
+            if self.moe_alltoall_backend == "mnnvllatency":
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
                 self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                     model_config.mapping)
-            elif self.moe_alltoall_backend == "MnnvlThroughput":
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
                 workspace_mb = int(
                     os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB", "512"))
                 self.moe_a2a = MoeAlltoAll(
@@ -214,9 +214,9 @@ class CutlassFusedMoE(MoE):
 
     @cached_property
     def moe_alltoall_backend(self):
-        # "MnnvlLatency" (default) or "MnnvlThroughput"
+        # "mnnvllatency" (default) or "mnnvlthroughput"
         return os.environ.get("TRTLLM_MOE_ALLTOALL_BACKEND",
-                              "MnnvlLatency").strip().lower()
+                              "mnnvllatency").strip().lower()
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -374,7 +374,7 @@ class CutlassFusedMoE(MoE):
                 token_final_scales = torch.ones_like(token_selected_experts,
                                                      dtype=torch.float32)
 
-            if self.moe_alltoall_backend == "MnnvlLatency":
+            if self.moe_alltoall_backend == "mnnvllatency":
                 assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
                 alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts, None,
@@ -397,7 +397,7 @@ class CutlassFusedMoE(MoE):
                     token_selected_experts,
                     alltoall_info.recv_rank_count_cumsum, max_num_token, top_k,
                     self.num_experts, self.ep_size)
-            elif self.moe_alltoall_backend == "MnnvlThroughput":
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
                 # Python MoeAlltoAll path
                 if x_sf is not None:
                     x_sf = x_sf.view(x_row,
@@ -455,7 +455,7 @@ class CutlassFusedMoE(MoE):
 
         # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output: Optional[torch.Tensor] = None
-        if self.enable_alltoall and self.moe_alltoall_backend == "MnnvlThroughput":
+        if self.enable_alltoall and self.moe_alltoall_backend == "mnnvlthroughput":
             # Retrieve a workspace-backed output tensor
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 self.unpadded_hidden_size, output_dtype)
@@ -500,7 +500,7 @@ class CutlassFusedMoE(MoE):
 
         # Combine results if using alltoall
         if self.enable_alltoall:
-            if self.moe_alltoall_backend == "MnnvlLatency":
+            if self.moe_alltoall_backend == "mnnvllatency":
                 if alltoall_info is not None:
                     top_k = self.routing_method.experts_per_token
                     final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
@@ -511,7 +511,7 @@ class CutlassFusedMoE(MoE):
                         ep_size=self.ep_size,
                         top_k=top_k,
                         token_count=token_count)
-            elif self.moe_alltoall_backend == "MnnvlThroughput":
+            elif self.moe_alltoall_backend == "mnnvlthroughput":
                 hidden = final_hidden_states.shape[-1]
                 final_hidden_states = self.moe_a2a.combine(
                     final_hidden_states.view(
