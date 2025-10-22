@@ -131,8 +131,7 @@ class BaseLLM:
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
 
-        # Enable GC NVTX profiling if environment variable is set
-        self.gc_nvtx_watcher_handle = gc_nvtx_watcher()
+        self._gc_nvtx_watcher_handle = gc_nvtx_watcher()
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend

@@ -6,9 +6,9 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import zmq
 
-from tensorrt_llm._utils import nvtx_mark_debug
+from tensorrt_llm._utils import (customized_gc_thresholds, nvtx_mark_debug,
+                                 nvtx_range_debug)
 
-from ..._utils import nvtx_range_debug
 from ...llmapi.utils import (AsyncQueue, _SyncQueue, enable_llmapi_debug,
                              logger_debug)
 from ...logger import logger
@@ -110,6 +110,7 @@ class RPCClient:
         self._stop_event = None
         self._loop = None
         self._loop_thread = None
+        self._pending_get_task = None  # Track pending socket read to avoid cancellation
 
         logger_debug(f"RPC Client initialized. Connected to {self._address}")
 
@@ -196,21 +197,34 @@ class RPCClient:
             future, target_loop = future_info
 
             if not future.done():
-                if response.error is None:
-                    if enable_llmapi_debug() or logger.level == 'debug':
+
+                def safe_set_result():
+                    """Safely set result on future, handling race conditions."""
+                    try:
+                        if not future.done():
+                            if response.error is None:
+                                future.set_result(response.result)
+                            else:
+                                future.set_exception(response.error)
+                    except asyncio.InvalidStateError:
+                        # Future was cancelled or completed between the check and set
+                        # This is expected in high-load scenarios, just log and continue
+                        if enable_llmapi_debug() or logger.level == 'debug':
+                            logger_debug(
+                                f"Future already done for request_id: {response.request_id}, skipping"
+                            )
+
+                if enable_llmapi_debug() or logger.level == 'debug':
+                    if response.error is None:
                         logger_debug(
                             f"Setting result for request_id: {response.request_id}"
                         )
-                    target_loop.call_soon_threadsafe(future.set_result,
-                                                     response.result)
-                else:
-                    # Use the original RPCError from the response
-                    if enable_llmapi_debug() or logger.level == 'debug':
+                    else:
                         logger_debug(
                             f"Setting exception for request_id: {response.request_id}, error: {response.error}"
                         )
-                    target_loop.call_soon_threadsafe(future.set_exception,
-                                                     response.error)
+
+                target_loop.call_soon_threadsafe(safe_set_result)
         else:
             if enable_llmapi_debug() or logger.level == 'debug':
                 logger_debug(
@@ -229,8 +243,17 @@ class RPCClient:
         # Propagate exception to all pending futures
         for (future, target_loop) in self._pending_futures.values():
             if not future.done():
-                target_loop.call_soon_threadsafe(future.set_exception,
-                                                 exception)
+
+                def safe_set_exception(f=future, exc=exception):
+                    """Safely set exception on future, handling race conditions."""
+                    try:
+                        if not f.done():
+                            f.set_exception(exc)
+                    except asyncio.InvalidStateError:
+                        # Future was cancelled or completed, this is fine
+                        pass
+
+                target_loop.call_soon_threadsafe(safe_set_exception)
 
         # Also signal error to streaming queues
         for queue in self._streaming_queues.values():
@@ -242,58 +265,84 @@ class RPCClient:
         Returns:
             RPCResponse if available, None if timeout
         """
+        # Reuse pending task or create new one to avoid cancelling ZMQ operations
+        if self._pending_get_task is None or self._pending_get_task.done():
+            self._pending_get_task = asyncio.create_task(
+                self._client_socket.get_async())
+
         try:
-            response: RPCResponse = await asyncio.wait_for(
-                self._client_socket.get_async(),
-                timeout=0.1  # Check stop event every 100ms
-            )
-            return response
-        except asyncio.TimeoutError:
-            # Timeout is expected - just check stop event and continue
-            return None
+            # Use wait with a done callback instead of wait_for to avoid cancellation
+            done, pending = await asyncio.wait(
+                [self._pending_get_task],
+                timeout=0.1,  # Check stop event every 100ms
+                return_when=asyncio.FIRST_COMPLETED)
+
+            if done:
+                # Task completed, get the result
+                response = await self._pending_get_task
+                self._pending_get_task = None  # Clear so we create a new one next time
+                return response
+            else:
+                # Timeout - task is still pending, will be reused next iteration
+                return None
+
+        except Exception as e:
+            # If there's an error, clear the task
+            self._pending_get_task = None
+            raise e
 
     async def _response_reader(self):
         """Task to read responses from the socket and set results on futures."""
         logger_debug("Response reader started")
 
-        while not self._stop_event.is_set():
-            with nvtx_range_debug("response_reader",
-                                  color="cyan",
-                                  category="RPC"):
-                try:
-                    response = await self._wait_for_response()
+        with customized_gc_thresholds(10000):
+            while not self._stop_event.is_set():
+                with nvtx_range_debug("response_reader",
+                                      color="cyan",
+                                      category="RPC"):
+                    try:
+                        response = await self._wait_for_response()
 
-                    if response is None:
-                        continue
+                        if response is None:
+                            continue
 
-                    nvtx_mark_debug(
-                        f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
-                        color="black",
-                        category="RPC")
+                        nvtx_mark_debug(
+                            f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
+                            color="black",
+                            category="RPC")
 
-                    # Optimize: Check debug flag before expensive string operations
-                    # This avoids holding GIL for f-string evaluation when debug is disabled
-                    if enable_llmapi_debug() or logger.level == 'debug':
-                        logger_debug(
-                            f"RPC Client received response: request_id={response.request_id}, "
-                            f"is_streaming={response.is_streaming}, "
-                            f"pending_futures={len(self._pending_futures)}")
+                        # Optimize: Check debug flag before expensive string operations
+                        # This avoids holding GIL for f-string evaluation when debug is disabled
+                        if enable_llmapi_debug() or logger.level == 'debug':
+                            logger_debug(
+                                f"RPC Client received response: request_id={response.request_id}, "
+                                f"is_streaming={response.is_streaming}, "
+                                f"pending_futures={len(self._pending_futures)}")
 
-                    with nvtx_range_debug("handle_response",
-                                          color="purple",
-                                          category="RPC"):
-                        if response.is_streaming:
-                            self._handle_streaming_response(response)
-                        else:
-                            self._handle_regular_response(response)
+                        with nvtx_range_debug("handle_response",
+                                              color="purple",
+                                              category="RPC"):
+                            if response.is_streaming:
+                                self._handle_streaming_response(response)
+                            else:
+                                self._handle_regular_response(response)
 
-                except asyncio.CancelledError:
-                    # Still handle cancellation for backward compatibility
-                    logger_debug("Response reader cancelled")
-                    break
-                except Exception as e:
-                    await self._handle_reader_exception(e)
-                    break
+                    except asyncio.CancelledError:
+                        # Still handle cancellation for backward compatibility
+                        logger_debug("Response reader cancelled")
+                        break
+                    except Exception as e:
+                        await self._handle_reader_exception(e)
+                        break
+
+        # Clean up any pending get task
+        if self._pending_get_task and not self._pending_get_task.done():
+            self._pending_get_task.cancel()
+            try:
+                await self._pending_get_task
+            except asyncio.CancelledError:
+                pass  # Expected
+        self._pending_get_task = None
 
         logger_debug("Response reader exiting gracefully")
         self._reader_task = None
