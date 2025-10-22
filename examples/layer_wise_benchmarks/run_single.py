@@ -34,8 +34,8 @@ layer_indices = [5, 6]
 # KV cache related args
 if args.test_case == "GEN":
     MAX_BATCH_SIZE = 1024
-    MAX_SEQ_LEN = 8192 + 512
-    MAX_SEQ_LEN_Q = 2
+    MAX_SEQ_LEN = 8192 + 1024 + 512
+    MAX_SEQ_LEN_Q = 4
     MAX_NUM_TOKENS = MAX_SEQ_LEN_Q * MAX_BATCH_SIZE
     enable_attention_dp = True
     moe_backend = "WIDEEP"
@@ -80,7 +80,7 @@ runner = DeepSeekV3Runner(
 # Warm up
 if args.test_case == "GEN":
     batch_size = 128
-    seq_len_q = 2  # MTP1
+    seq_len_q = 1  # Set to (1 + MTP)
     seq_len_kv_cache = 2000
 elif args.test_case == "CTX":
     batch_size = 1

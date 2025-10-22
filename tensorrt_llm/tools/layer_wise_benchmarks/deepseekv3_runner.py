@@ -176,7 +176,7 @@ class DeepSeekV3Runner:
             attn_backend="TRTLLM",
             moe_backend=moe_backend,
             use_low_precision_moe_combine=False,
-            allreduce_strategy=AllReduceStrategy.MNNVL,  # TODO: AUTO?
+            allreduce_strategy=AllReduceStrategy.AUTO,
             enable_min_latency=False,
             use_cuda_graph=use_cuda_graph,
             force_dynamic_quantization=False,
@@ -214,6 +214,10 @@ class DeepSeekV3Runner:
                 if callable(getattr(module, "create_weights", None)):
                     module.create_weights()
             layer.cuda()
+            for name, module in layer.named_modules():
+                if hasattr(module, 'post_load_weights') and not getattr(
+                        module, '_weights_removed', False):
+                    module.post_load_weights()
         next_layer_layernorm.cuda()
         for layer, next_layer in zip(layers[:-1], layers[1:]):
             layer.next_layer_layernorm = next_layer.input_layernorm
@@ -248,7 +252,7 @@ class DeepSeekV3Runner:
                 "CTX": seq_len_q,
                 "GEN": seq_len_kv_cache
             }[test_case]] * batch_size,
-            max_num_tokens=kv_cache_manager.max_seq_len,
+            max_num_tokens=batch_size * seq_len_q,
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -267,7 +271,8 @@ class DeepSeekV3Runner:
             list(range(seq_len_kv_cache, seq_len_kv_cache + seq_len_q)) *
             batch_size
         ],
-                                    dtype=torch.int32)
+                                    dtype=torch.int32,
+                                    device="cuda")
         hidden_states = torch.rand(
             (batch_size * seq_len_q, self.pretrained_config.hidden_size),
             dtype=torch.bfloat16,
@@ -290,7 +295,7 @@ class DeepSeekV3Runner:
 
     def replace_routing_method(self, balance_method: BalanceMethod,
                                balance_ratio: float):
-        if self.moe_backend not in ["CUTLASS", "WIDEEP"]:
+        if self.moe_backend not in ["CUTLASS", "DEEPGEMM", "WIDEEP"]:
             raise NotImplementedError(
                 f"Not support replace routing method for moe_backend \"{self.moe_backend}\""
             )

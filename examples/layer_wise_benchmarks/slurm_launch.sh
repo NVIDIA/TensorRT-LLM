@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+CONTAINER_NAME=${CONTAINER_NAME:-layer_wise_benchmarks}
 CONTAINER_MOUNTS=$(realpath "$(pwd)/../.."):$(realpath "$(pwd)/../..")
 
 if [ "${SLURM_JOB_ID:-}" == "" ]; then
@@ -15,7 +16,7 @@ set -x
 srun --mpi=pmix \
     -N "$NODES" \
     --ntasks-per-node $(($NP / $NODES)) \
-    --container-name "layer_wise_benchmarks" \
+    --container-name "$CONTAINER_NAME" \
     --container-mounts "$CONTAINER_MOUNTS" \
     --container-workdir "$WORKDIR" \
     "$@"

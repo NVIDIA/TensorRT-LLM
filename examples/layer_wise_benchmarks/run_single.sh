@@ -11,11 +11,15 @@ fi
 
 export TRTLLM_FORCE_ALLTOALL_METHOD=${TRTLLM_FORCE_ALLTOALL_METHOD:-MNNVL}
 
+if [ "$RANK" -eq 0 ]; then
+    export TLLM_LOG_LEVEL=INFO
+fi
+
 PROFILE=${PROFILE:-1}
 if [ "$PROFILE" -eq 1 ]; then
     PROFILE_FOLDER=profiles/run_single
     mkdir -p ${PROFILE_FOLDER}
-    PROFILE_CMD="nsys profile --wait primary \
+    PROFILE_CMD="nsys profile \
         -t cuda,nvtx -s none \
         --cpuctxsw none --cuda-event-trace false \
         --cuda-graph-trace node \

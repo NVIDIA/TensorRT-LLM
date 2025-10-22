@@ -42,8 +42,7 @@ fi
 WORKDIR=$(realpath "$(pwd)")
 
 set -x
-srun --mpi=pmix \
-    -N "$NODES" \
+srun -N "$NODES" \
     --ntasks-per-node 1 \
     --container-image "$CONTAINER_IMAGE" \
     --container-name "layer_wise_benchmarks" \
