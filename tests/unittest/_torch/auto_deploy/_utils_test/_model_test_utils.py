@@ -2,7 +2,6 @@ import copy
 import os
 from typing import Any, Dict, Optional
 
-import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -444,7 +443,6 @@ _SMALL_MODEL_CONFIGS = {
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
         "llm_models_subdir": "Mistral-Small-3.1-24B-Instruct-2503",
         "model_factory": "AutoModelForImageTextToText",
-        "compile_backend": "torch-simple",
         "model_kwargs": {
             "text_config": {
                 "num_hidden_layers": 2,
@@ -467,7 +465,7 @@ _SMALL_MODEL_CONFIGS = {
     "ibm-ai-platform/Bamba-9B-v2": {
         "llm_models_subdir": "Bamba-9B-v2",
         "model_kwargs": {
-            "torch_dtype": "bfloat16",
+            "dtype": "bfloat16",
             "hidden_size": 64,
             "intermediate_size": 128,
             "mamba_chunk_size": 64,
@@ -486,7 +484,7 @@ _SMALL_MODEL_CONFIGS = {
     "nvidia/NVIDIA-Nemotron-Nano-12B-v2": {
         "llm_models_subdir": "NVIDIA-Nemotron-Nano-12B-v2",
         "model_kwargs": {
-            "torch_dtype": "bfloat16",
+            "dtype": "bfloat16",
             "hidden_size": 32,
             "intermediate_size": 64,
             "mamba_head_dim": 40,
@@ -531,10 +529,8 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
     # add some defaults to llm_args
     llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
-    llm_args["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
     llm_args["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
-
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
 
@@ -549,13 +545,3 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
     }
 
     return experiment_config
-
-
-def get_small_model_config_pytest_param(
-    model_hub_id: str, pytest_param_kwargs=None, **llm_args_kwargs
-):
-    return pytest.param(
-        get_small_model_config(model_hub_id, **llm_args_kwargs),
-        id=model_hub_id,
-        **(pytest_param_kwargs or {}),
-    )

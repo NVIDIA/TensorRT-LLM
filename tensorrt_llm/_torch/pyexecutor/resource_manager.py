@@ -11,13 +11,15 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PybindMirror
+from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
+                                          PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_to_str_dtype, get_size_in_bytes, nvtx_range
+from ..._utils import (binding_to_str_dtype, get_size_in_bytes, mpi_rank,
+                       nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .kv_cache_connector import KvCacheConnectorManager
@@ -38,7 +40,6 @@ DataType = tensorrt_llm.bindings.DataType
 KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
-PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
 BlocksPerWindow = Dict[int, Tuple[
@@ -338,6 +339,7 @@ class KVCacheManager(BaseResourceManager):
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
         }
+
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
@@ -347,7 +349,7 @@ class KVCacheManager(BaseResourceManager):
                     attention_dp_events_gather_period_ms=self.
                     attention_dp_events_gather_period_ms,
                 )
-            else:
+            elif mpi_rank() == 0:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size)
 
@@ -1161,6 +1163,8 @@ class PeftCacheManager(BaseResourceManager):
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
+
+        peft_cache_config = peft_cache_config._to_pybind()
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
             num_host_module_layer=peft_cache_config.num_host_module_layer,

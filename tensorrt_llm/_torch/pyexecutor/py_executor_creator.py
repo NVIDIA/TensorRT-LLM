@@ -6,24 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
-from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
-                                            ContextChunkingPolicy,
-                                            GuidedDecodingConfig)
-from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig, LoadFormat,
+from tensorrt_llm.bindings.executor import GuidedDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          ContextChunkingPolicy, LoadFormat,
                                           PybindMirror, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -205,22 +203,22 @@ def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: str = None,
     tokenizer: Optional[TokenizerBase] = None,
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+    lora_config = llm_args.lora_config
+    kv_connector_config = llm_args.kv_connector_config
 
     pytorch_backend_config = llm_args.get_pytorch_backend_config()
     if pytorch_backend_config is None:
         pytorch_backend_config = PyTorchConfig()
 
-    scheduler_config = PybindMirror.maybe_to_pybind(llm_args.scheduler_config)
+    scheduler_config = llm_args.scheduler_config
 
-    peft_cache_config = None
-    if llm_args.peft_cache_config is not None:
-        peft_cache_config = PybindMirror.maybe_to_pybind(
-            llm_args.peft_cache_config)
+    # Since peft_cache_config may be subject to change, avoid these changes propagate back
+    # to llm_args.peft_cache_config
+    peft_cache_config = copy.deepcopy(llm_args.peft_cache_config)
 
     assert llm_args.kv_cache_config, "Expect llm_args.kv_cache_config is not None"
     kv_cache_config = llm_args.kv_cache_config
@@ -358,7 +356,9 @@ def create_py_executor(
                     from tensorrt_llm._torch.speculative.drafting_loops import \
                         ChainDrafter
 
-                    return ChainDrafter(spec_config.max_draft_len, model)
+                    return ChainDrafter(spec_config.max_draft_len,
+                                        spec_config.max_total_draft_tokens,
+                                        model)
             else:
                 drafting_loop_wrapper = None
 
@@ -398,11 +398,11 @@ def create_py_executor(
     if not pytorch_backend_config.disable_overlap_scheduler:
         model_engine_max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_draft_len
+            model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
-        model_engine_max_seq_len += spec_config.max_draft_len
+        model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
@@ -456,8 +456,8 @@ def create_py_executor(
                            scheduler_config.context_chunking_policy is not None
                            else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
         assert chunk_unit_size is not None, "chunk_unit_size must be set"
-        ctx_chunk_config = ContextChunkingConfig(chunking_policy,
-                                                 chunk_unit_size)
+        ctx_chunk_config: Tuple[StrEnum,
+                                int] = (chunking_policy, chunk_unit_size)
     else:
         ctx_chunk_config = None
 
@@ -472,7 +472,8 @@ def create_py_executor(
                     "vocab_size_padded": model_engine.model.vocab_size_padded
                 }
                 if spec_config is not None:
-                    kwargs["max_num_draft_tokens"] = spec_config.max_draft_len
+                    kwargs[
+                        "max_num_draft_tokens"] = spec_config.max_total_draft_tokens
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
@@ -509,10 +510,6 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if pytorch_backend_config.use_cuda_graph:
-            raise NotImplementedError(
-                "CUDA graphs are not supported with KV connector hooks.")
-
         if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
@@ -542,6 +539,12 @@ def create_py_executor(
 
                 connector_worker = connector_worker_task.result()
 
+            forward_pass_callable = connector_worker.register_forward_pass_callable(
+            )
+            if forward_pass_callable:
+                model_engine.register_forward_pass_callable(
+                    forward_pass_callable)
+
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)
 
@@ -570,6 +573,7 @@ def create_py_executor(
             kv_cache_config=kv_cache_config,
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
+            profiling_stage_data=profiling_stage_data,
             sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()

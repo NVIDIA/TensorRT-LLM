@@ -187,6 +187,10 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
     accuracy: 89.23
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 81.19
+  - quant_algo: FP8
+    accuracy: 80.82
+  - quant_algo: NVFP4
+    accuracy: 69.33
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
@@ -221,3 +225,5 @@ GPT-OSS/MXFP4:
     accuracy: 90.3
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36
+ByteDance-Seed/Seed-OSS-36B-Instruct:
+  - accuracy: 90.8
