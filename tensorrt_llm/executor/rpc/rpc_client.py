@@ -107,10 +107,9 @@ class RPCClient:
 
         self._server_stopped = False
         self._closed = False
-        self._stop_event = None
         self._loop = None
         self._loop_thread = None
-        self._pending_get_task = None  # Track pending socket read to avoid cancellation
+        self._reader_asyncio_task = None  # Track the asyncio task for proper cancellation
 
         logger_debug(f"RPC Client initialized. Connected to {self._address}")
 
@@ -128,38 +127,50 @@ class RPCClient:
 
         if self._closed:
             return
-        # stop the main loop
         self._closed = True
 
         logger_debug("RPC Client closing")
 
-        if self._stop_event and self._loop:
-            # Use call_soon_threadsafe since set() is not a coroutine
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+        # Cancel the reader task first to avoid socket closure errors
+        if self._reader_task and not self._reader_task.done():
+            if self._loop and self._loop.is_running(
+            ) and self._reader_asyncio_task:
+                try:
+                    # Cancel the asyncio task in its event loop
+                    async def cancel_reader_task():
+                        if self._reader_asyncio_task and not self._reader_asyncio_task.done(
+                        ):
+                            self._reader_asyncio_task.cancel()
+                            try:
+                                await self._reader_asyncio_task
+                            except asyncio.CancelledError:
+                                pass  # Expected
 
-        if self._reader_task:
-            try:
-                self._reader_task.result(timeout=1.0)
-            except concurrent.futures.TimeoutError:
-                logger.warning(
-                    "Reader task did not exit gracefully, cancelling")
-                self._reader_task.cancel()
-            except Exception as e:
-                # Task might have already finished or been cancelled
-                logger_debug(f"Reader task cleanup: {e}")
+                    cancel_future = asyncio.run_coroutine_threadsafe(
+                        cancel_reader_task(), self._loop)
+                    cancel_future.result(timeout=2.0)
+                    logger_debug("Reader task cancelled successfully")
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Reader task did not exit gracefully")
+                except Exception as e:
+                    logger_debug(f"Reader task cleanup: {e}")
             self._reader_task = None
+            self._reader_asyncio_task = None
 
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._loop_thread:
-            self._loop_thread.join()
-            self._loop_thread = None
-        if self._executor:
-            self._executor.shutdown(wait=True)
-
+        # Now close the socket after reader has stopped
         if self._client_socket:
             self._client_socket.close()
             self._client_socket = None
+
+        # Stop the event loop
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop_thread:
+            self._loop_thread.join(timeout=2.0)
+            self._loop_thread = None
+
+        if self._executor:
+            self._executor.shutdown(wait=True)
 
         logger_debug("RPC Client closed")
 
@@ -259,101 +270,73 @@ class RPCClient:
         for queue in self._streaming_queues.values():
             await queue.put(RPCResponse("", None, exception, False, 0, 'error'))
 
-    async def _wait_for_response(self) -> Optional[RPCResponse]:
-        """Wait for a response from the socket with timeout.
+    async def _wait_for_response(self) -> RPCResponse:
+        """Wait for a response from the socket.
 
         Returns:
-            RPCResponse if available, None if timeout
+            RPCResponse from the server
         """
-        # Reuse pending task or create new one to avoid cancelling ZMQ operations
-        if self._pending_get_task is None or self._pending_get_task.done():
-            self._pending_get_task = asyncio.create_task(
-                self._client_socket.get_async())
-
-        try:
-            # Use wait with a done callback instead of wait_for to avoid cancellation
-            done, pending = await asyncio.wait(
-                [self._pending_get_task],
-                timeout=0.1,  # Check stop event every 100ms
-                return_when=asyncio.FIRST_COMPLETED)
-
-            if done:
-                # Task completed, get the result
-                response = await self._pending_get_task
-                self._pending_get_task = None  # Clear so we create a new one next time
-                return response
-            else:
-                # Timeout - task is still pending, will be reused next iteration
-                return None
-
-        except Exception as e:
-            # If there's an error, clear the task
-            self._pending_get_task = None
-            raise e
+        # Directly await the socket - cancellation will be handled by task cancellation
+        return await self._client_socket.get_async()
 
     async def _response_reader(self):
         """Task to read responses from the socket and set results on futures."""
         logger_debug("Response reader started")
 
-        with customized_gc_thresholds(10000):
-            while not self._stop_event.is_set():
-                with nvtx_range_debug("response_reader",
-                                      color="cyan",
-                                      category="RPC"):
-                    try:
-                        response = await self._wait_for_response()
+        try:
+            with customized_gc_thresholds(10000):
+                while True:
+                    with nvtx_range_debug("response_reader",
+                                          color="cyan",
+                                          category="RPC"):
+                        try:
+                            response = await self._wait_for_response()
 
-                        if response is None:
-                            continue
+                            nvtx_mark_debug(
+                                f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
+                                color="black",
+                                category="RPC")
 
-                        nvtx_mark_debug(
-                            f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
-                            color="black",
-                            category="RPC")
+                            # Optimize: Check debug flag before expensive string operations
+                            # This avoids holding GIL for f-string evaluation when debug is disabled
+                            if enable_llmapi_debug() or logger.level == 'debug':
+                                logger_debug(
+                                    f"RPC Client received response: request_id={response.request_id}, "
+                                    f"is_streaming={response.is_streaming}, "
+                                    f"pending_futures={len(self._pending_futures)}"
+                                )
 
-                        # Optimize: Check debug flag before expensive string operations
-                        # This avoids holding GIL for f-string evaluation when debug is disabled
-                        if enable_llmapi_debug() or logger.level == 'debug':
-                            logger_debug(
-                                f"RPC Client received response: request_id={response.request_id}, "
-                                f"is_streaming={response.is_streaming}, "
-                                f"pending_futures={len(self._pending_futures)}")
+                            with nvtx_range_debug("handle_response",
+                                                  color="purple",
+                                                  category="RPC"):
+                                if response.is_streaming:
+                                    self._handle_streaming_response(response)
+                                else:
+                                    self._handle_regular_response(response)
 
-                        with nvtx_range_debug("handle_response",
-                                              color="purple",
-                                              category="RPC"):
-                            if response.is_streaming:
-                                self._handle_streaming_response(response)
-                            else:
-                                self._handle_regular_response(response)
+                        except Exception as e:
+                            await self._handle_reader_exception(e)
+                            break
 
-                    except asyncio.CancelledError:
-                        # Still handle cancellation for backward compatibility
-                        logger_debug("Response reader cancelled")
-                        break
-                    except Exception as e:
-                        await self._handle_reader_exception(e)
-                        break
-
-        # Clean up any pending get task
-        if self._pending_get_task and not self._pending_get_task.done():
-            self._pending_get_task.cancel()
-            try:
-                await self._pending_get_task
-            except asyncio.CancelledError:
-                pass  # Expected
-        self._pending_get_task = None
-
-        logger_debug("Response reader exiting gracefully")
-        self._reader_task = None
+        except asyncio.CancelledError:
+            logger_debug("Response reader cancelled")
+        finally:
+            logger_debug("Response reader exiting gracefully")
+            self._reader_task = None
+            self._reader_asyncio_task = None
 
     def _start_response_reader_lazily(self):
         if self._reader_task is None or self._reader_task.done():
             # Ensure we have a persistent background loop
             self._ensure_event_loop()
-            # Always create the reader task on the persistent loop
-            future = asyncio.run_coroutine_threadsafe(self._response_reader(),
-                                                      self._loop)
+
+            # Wrapper to track the asyncio task
+            async def run_reader():
+                self._reader_asyncio_task = asyncio.current_task()
+                await self._response_reader()
+
+            # Start the reader task on the persistent loop
+            future = asyncio.run_coroutine_threadsafe(run_reader(), self._loop)
             # Store the concurrent.futures.Future
             self._reader_task = future
 
@@ -425,7 +408,6 @@ class RPCClient:
 
             def run_loop():
                 asyncio.set_event_loop(self._loop)
-                self._stop_event = asyncio.Event()
                 self._loop.run_forever()
 
             self._loop_thread = threading.Thread(target=run_loop,
