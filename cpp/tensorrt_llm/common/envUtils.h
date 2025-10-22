@@ -136,4 +136,7 @@ bool getEnvDisaggBenchmarkGenOnly();
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
 
+// Whether to enable KV cache precision conversion during transfers.
+bool getEnvEnableKVCachePrecisionConversion();
+
 } // namespace tensorrt_llm::common
