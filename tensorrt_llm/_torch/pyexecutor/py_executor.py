@@ -2089,29 +2089,72 @@ class DisaggPPTerminationHandler:
     """
 
     def __init__(self, dist, terminator_func: Callable[[LlmRequest], None]):
-        self.dist = dist
-        self.terminator_func = terminator_func
-        self.pending_termination = {}
+        self._dist = dist
+        self._terminator_func = terminator_func
+        self._pending_termination = {}
+        self._terminating_iteration = 0
+        self._send_handle = None
+        self._comm_tag = TERMINATION_COMM_TAG_BASE
 
     def terminate(self, request: LlmRequest):
-        self.pending_termination[request.py_request_id] = request
+        self._pending_termination[request.py_request_id] = request
 
     @nvtx_range("_disagg_pp_termination_handler_sync")
     def terminate_pending_requests(self):
-        """Send pending terminaion request ids to lead rank then lead rank decides which requests to terminate."""
-        lead_rank = 0
-        req_ids = list(self.pending_termination.keys())
-        rank_req_ids = self.dist.pp_gather(req_ids, root=lead_rank)
-        consensus_req_ids = None
-        if self.dist.pp_rank == lead_rank:
-            consensus_req_ids = set.intersection(
-                *[set(r) for r in rank_req_ids])
-        consensus_req_ids = self.dist.broadcast(consensus_req_ids,
-                                                root=lead_rank)
-        assert consensus_req_ids is not None
-        logger.debug(
-            f'all pp ranks agree to terminate requests: {consensus_req_ids}')
-        for req_id in consensus_req_ids:
-            req = self.pending_termination.pop(req_id, None)
+        """
+        Ring-style communicating to decide which requests to be terminated and avoid bubbles.
+        This ensures that one request is terminated from rank_0 to rank_(pp_size-1) in order.
+        """
+        terminate_req_ids = []
+        term_state = None
+        if self._send_handle:
+            self._send_handle.wait()
+
+        if not (self._dist.is_first_pp_rank
+                and self._terminating_iteration == 0):
+            term_state = self._dist.recv_object(src=self._dist.prev_pp_rank,
+                                                tag=self._comm_tag)
+
+        ready_req_map = term_state["ready"] if term_state else {
+        }  # {req_id: num_ranks} ranks vote in the ready dict
+        terminate_req_ids = term_state["term"] if term_state else [
+        ]  # request ids to be terminated in the current iteration
+
+        reqs_to_terminate = {
+            req_id: self._pending_termination.pop(req_id, None)
+            for req_id in terminate_req_ids
+            if req_id in self._pending_termination
+        }
+
+        if self._dist.is_first_pp_rank:
+            # rank0 proposes the requests to be terminated
+            ready_req_map = {req_id: 1 for req_id in self._pending_termination}
+        else:
+            # if a rank agrees to terminate a request, increase the vote count for the request id
+            for req_id in ready_req_map.keys():
+                if req_id in self._pending_termination:
+                    ready_req_map[req_id] += 1
+
+        if self._dist.is_last_pp_rank:
+            new_terminate_req_ids = [
+                req_id for req_id, num_ranks in ready_req_map.items()
+                if num_ranks == self._dist.pp_size
+            ]
+            # by determining the terminate ids in the last rank, we can save the overhead of sending the ready dict back to rank0
+            new_term_state = {"ready": {}, "term": new_terminate_req_ids}
+        else:
+            # other pp ranks pass the updated ready dict and terminate request ids to the next rank, and the
+            # terminate_req_ids will not change in a given iteration, so we can terminate the requests synchronously
+            new_term_state = {"ready": ready_req_map, "term": terminate_req_ids}
+
+        self._send_handle = self._dist.isend_object(
+            new_term_state, dest=self._dist.next_pp_rank, tag=self._comm_tag)
+
+        if reqs_to_terminate:
+            logger.debug(
+                f'rank {self._dist.pp_rank} terminates {list(reqs_to_terminate.keys())} in iter {self._terminating_iteration}'
+            )
+        for req_id, req in reqs_to_terminate.items():
             if req:
-                self.terminator_func(req)
+                self._terminator_func(req)
+        self._terminating_iteration += 1
