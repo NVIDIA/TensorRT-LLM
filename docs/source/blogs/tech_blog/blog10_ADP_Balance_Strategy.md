@@ -232,7 +232,7 @@ Figure 3 provides comprehensive insight into baseline system behavior, displayin
 
 **Critical Insights**:
 - **Imbalance window**: Most severe imbalances occur within the first 12,000 iterations, as evidenced by the average token distribution showing that all context processing phases occur within this critical interval
-- **Performance gap**: SOL TPS of 39,552 vs. actual TPS of 25,664 reveals a **35% efficiency loss**
+- **Performance gap**: SOL TPS of 39,552 vs. actual TPS of 25,664 reveals a **54% relative performance gap**
 - **System behavior**: After iteration 12,000, all requests transition to generation phase, naturally reducing imbalances
 
 Figure 4 zooms into the critical imbalance period [100-12,000], revealing the dramatic instability in load distribution:
@@ -286,16 +286,6 @@ The complete ADP Balance strategy combines both context synchronization and batc
 - **Near-theoretical efficiency**: Actual TPS (34,140) approaches SOL TPS (37,912)
 - **System stability**: Dramatically reduced load variance across iterations
 
-**Production Configuration**:
-Users can enable the full ADP Balance strategy by adding the following configuration:
-
-```yaml
-attention_dp_config:
-    enable_balance: true
-    batching_wait_iters: 10
-    timeout_iters: 50
-```
-
 The effectiveness of our complete ADP Balance implementation is clearly demonstrated in Figure 6. The visualization reveals how the combination of context synchronization and batch equilibration mechanisms achieves near-optimal load balancing throughout the critical execution window.
 
 <div align="center">
@@ -315,6 +305,16 @@ The effectiveness of our complete ADP Balance implementation is clearly demonstr
 - ✅ **Near-optimal load balancing**: 87.70% average balance ratio
 - ⚠️ **Iteration overhead**: Waiting mechanisms increase total iteration count
 - ⚠️ **TTFT impact**: Strategic delays affect time-to-first-token metrics
+
+**Production Configuration**:
+Users can enable the full ADP Balance strategy by adding the following configuration:
+
+```yaml
+attention_dp_config:
+    enable_balance: true
+    batching_wait_iters: 10
+    timeout_iters: 50
+```
 
 ### Pareto Analysis: Throughput-Latency Trade-off Optimization
 
