@@ -15,6 +15,7 @@
 # -*- coding: utf-8 -*-
 
 import datetime
+import gc
 import os
 import platform
 import re
@@ -2558,6 +2559,15 @@ def torch_empty_cache() -> None:
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
     if torch.cuda.is_available():
+        print("Empty torch CUDA cache before test")
+        torch.cuda.empty_cache()
+
+    yield
+
+    # Clean up after test
+    if torch.cuda.is_available():
+        print("Empty torch CUDA cache after test")
+        gc.collect()
         torch.cuda.empty_cache()
 
 
