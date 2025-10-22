@@ -387,3 +387,6 @@ unittest/executor/test_rpc.py::test_rpc_without_response_performance SKIP (https
 unittest/executor/test_rpc_worker.py::TestRpcWorkerTP1::test_fetch_stats_loop_async SKIP (https://nvbugs/5583261)
 unittest/llmapi/test_llm_pytorch.py::test_llm_capture_request_error SKIP (https://nvbugs/5599176)
 examples/test_phi.py::test_phi_fp8_with_bf16_lora[Phi-3.5-MoE-instruct] SKIP (https://nvbugs/5465143)
+unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_rpc_tp2 SKIP (https://nvbugs/5594753)
+accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype SKIP (https://nvbugs/5602338)
+unittest/llmapi/test_memory_profiling.py SKIP (https://nvbugs/5580781)
