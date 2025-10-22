@@ -252,6 +252,18 @@ private:
     std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>>* mObservers;
 };
 
+// Helper function to log memory usage - returns the memory values for potential error handling
+static std::pair<size_t, size_t> logMemoryUsage(char const* operation, CUcontext ctx)
+{
+    size_t free_mem = 0, total_mem = 0;
+    TLLM_CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+
+    TLLM_LOG_DEBUG("%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx,
+        free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0, total_mem / (1024 * 1024));
+
+    return {free_mem, total_mem};
+}
+
 } // namespace
 
 std::shared_ptr<cublasHandle_t> getCublasHandle()
@@ -259,21 +271,16 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
     static PerCudaCtxPerThreadSingletonCreator<cublasHandle_t> creator(
         []() -> auto
         {
-            size_t free_mem = 0, total_mem = 0;
-            cudaMemGetInfo(&free_mem, &total_mem);
+            CUcontext ctx = getCurrentCudaCtx();
+            auto [free_mem, total_mem] = logMemoryUsage("Creating cublas handle", ctx);
 
-            CUcontext ctx;
-            cuCtxGetCurrent(&ctx);
-
-            TLLM_LOG_DEBUG("Creating cublas handle: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", ctx,
-                free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0, total_mem / (1024 * 1024));
-
-            auto handle = std::unique_ptr<cublasHandle_t>(new cublasHandle_t);
+            auto handle = std::make_unique<cublasHandle_t>();
 
             cublasStatus_t status = cublasCreate(handle.get());
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
+                // Re-fetch memory info for error message (memory state might have changed)
                 cudaMemGetInfo(&free_mem, &total_mem);
                 TLLM_THROW(
                     "Failed to create cublas handle. "
@@ -287,7 +294,11 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
         },
         [](cublasHandle_t* handle)
         {
-            TLLM_CUDA_CHECK(cublasDestroy(*handle));
+            cublasStatus_t status = cublasDestroy(*handle);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: %d", status);
+            }
             delete handle;
             handle = nullptr;
         });
@@ -299,21 +310,16 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
     static PerCudaCtxPerThreadSingletonCreator<cublasLtHandle_t> creator(
         []() -> auto
         {
-            size_t free_mem = 0, total_mem = 0;
-            cudaMemGetInfo(&free_mem, &total_mem);
+            CUcontext ctx = getCurrentCudaCtx();
+            auto [free_mem, total_mem] = logMemoryUsage("Creating cublasLt handle", ctx);
 
-            CUcontext ctx;
-            cuCtxGetCurrent(&ctx);
-
-            TLLM_LOG_DEBUG("Creating cublasLt handle: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", ctx,
-                free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0, total_mem / (1024 * 1024));
-
-            auto handle = std::unique_ptr<cublasLtHandle_t>(new cublasLtHandle_t);
+            auto handle = std::make_unique<cublasLtHandle_t>();
 
             cublasStatus_t status = cublasLtCreate(handle.get());
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
+                // Re-fetch memory info for error message (memory state might have changed)
                 cudaMemGetInfo(&free_mem, &total_mem);
                 TLLM_THROW(
                     "Failed to create cublasLt handle. "
@@ -327,7 +333,11 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         },
         [](cublasLtHandle_t* handle)
         {
-            TLLM_CUDA_CHECK(cublasLtDestroy(*handle));
+            cublasStatus_t status = cublasLtDestroy(*handle);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: %d", status);
+            }
             delete handle;
             handle = nullptr;
         });
