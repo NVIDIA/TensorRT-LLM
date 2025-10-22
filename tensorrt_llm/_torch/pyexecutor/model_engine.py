@@ -93,11 +93,11 @@ class ModelEngine(ABC):
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
-                                   max_draft_len: int,
+                                   max_total_draft_tokens: int,
                                    enable_padding: bool) -> list[int]:
     # This is the largest possible batch size for a pure decoding batch.
     max_cuda_graph_bs = min(max_batch_size,
-                            int(max_num_tokens / (1 + max_draft_len)))
+                            int(max_num_tokens / (1 + max_total_draft_tokens)))
 
     result = []
     # This function assumes cuda_graph_batch_sizes is sorted
@@ -162,11 +162,13 @@ class PyTorchModelEngine(ModelEngine):
             ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+        self.original_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         # The draft model won't have any draft tokens attached to
         # generation requests when we invoke it autoregressively
         if spec_config is not None and is_draft_model:
             spec_config.max_draft_len = 0
+            spec_config.max_total_draft_tokens = 0
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
         self.sparse_attention_config = sparse_attention_config
@@ -277,7 +279,7 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
-            max_num_draft_tokens = self.original_max_draft_len * batch_size
+            max_num_draft_tokens = self.original_max_total_draft_tokens * batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -297,9 +299,11 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_draft_len = spec_config.max_draft_len
+            self.max_total_draft_tokens = spec_config.max_total_draft_tokens
         else:
             self.without_logits = False
             self.max_draft_len = 0
+            self.max_total_draft_tokens = 0
 
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
@@ -320,7 +324,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
-            self.max_num_tokens, self.original_max_draft_len,
+            self.max_num_tokens, self.original_max_total_draft_tokens,
             self._cuda_graph_padding_enabled
         ) if pytorch_backend_config.cuda_graph_batch_sizes else []
 
@@ -364,7 +368,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def runtime_draft_len(self):
-        return self.max_draft_len if self.enable_spec_decode else 0
+        return self.max_total_draft_tokens if self.enable_spec_decode else 0
 
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
@@ -585,20 +589,20 @@ class PyTorchModelEngine(ModelEngine):
             if self.model_is_wrapped and self.is_spec_decode and spec_resource_manager is not None and isinstance(
                     spec_resource_manager, Eagle3ResourceManager):
                 # The CDL path uses draft_len > 0 for the number of iterations in the drafting loop.
-                draft_lengths.append(self.original_max_draft_len)
+                draft_lengths.append(self.original_max_total_draft_tokens)
             else:
-                draft_lengths.append(self.max_draft_len)
+                draft_lengths.append(self.max_total_draft_tokens)
         else:
             # For non-draft model, we also capture the CUDA graph instance for draft length 0,
             # so that when we disable spec decode at runtime, we can still run the captured graph.
             # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-            if (self.max_draft_len > 0
+            if (self.max_total_draft_tokens > 0
                     and not self.spec_config.spec_dec_mode.use_one_engine()
                     # Assume that speculation is always on if the user didn't give us a max_concurrency
                     # value. This will save on memory.
                     and self.spec_config.max_concurrency is not None):
                 draft_lengths.append(0)
-            draft_lengths = [self.max_draft_len]
+            draft_lengths = [self.max_total_draft_tokens]
 
         for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
@@ -757,7 +761,7 @@ class PyTorchModelEngine(ModelEngine):
                            num_ctx_requests + num_gen_tokens)),
                 token_nums=[1] * num_gen_tokens,
                 is_gen=True,
-                max_num_draft_tokens=self.max_draft_len,
+                max_num_draft_tokens=self.max_total_draft_tokens,
                 use_mrope=self.use_mrope)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(request_ids=list(
@@ -830,7 +834,7 @@ class PyTorchModelEngine(ModelEngine):
     def _get_cuda_graph_draft_lengths(
             self, resource_manager: ResourceManager) -> List[int]:
         """Determines the draft lengths for which to capture CUDA graphs."""
-        draft_lengths = [self.max_draft_len]
+        draft_lengths = [self.max_total_draft_tokens]
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
@@ -1027,7 +1031,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
-            # be prepared in advance by using the max_draft_len. But we need to use
+            # be prepared in advance by using the max_total_draft_tokens. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
             # correct position ids. And to avoid blocking the async data transfer,
             # we need to preprocess the inputs in forward to update the position_ids and
@@ -2252,7 +2256,7 @@ class PyTorchModelEngine(ModelEngine):
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped)
+                self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
             attn_metadata.update_spec_dec_param(
                 is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,

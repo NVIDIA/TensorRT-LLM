@@ -894,6 +894,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil,
                     [
                       "--test-list=$testListPathNode",
+                      "--splitting-algorithm least_duration",
                       "--splits $splits",
                       "--group $splitId"
                     ]
@@ -2559,14 +2560,13 @@ def launchTestJobs(pipeline, testFilter)
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
-        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
-        "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
+        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 4],
+        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 4],
+        "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 4],
+        "H100_PCIe-PyTorch-4": ["h100-cr", "l0_h100", 4, 4],
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
-        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
+        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 1],
         "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
         "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
@@ -2655,6 +2655,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
+        // Perf sanity post merge test
+        "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 

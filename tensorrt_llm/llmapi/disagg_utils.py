@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
@@ -75,6 +75,7 @@ class DisaggServerConfig():
     otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
+    disagg_cluster_config: Optional[DisaggClusterConfig] = None
 
 
 @dataclass
@@ -119,6 +120,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
                        otlp_config: Optional[dict] = None,
+                       disagg_cluster: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -139,15 +141,18 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 # Inherit the value from the top-level
                 servers[key] = value
 
+    server_configs = []
+    disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
-
-    server_configs = extract_ctx_gen_cfgs(
-        type="ctx", **context_servers) + extract_ctx_gen_cfgs(
-            type="gen", **generation_servers)
-
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
+    if disagg_cluster:
+        disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
+    else:
+        server_configs = extract_ctx_gen_cfgs(
+            type="ctx", **context_servers) + extract_ctx_gen_cfgs(
+                type="gen", **generation_servers)
 
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
@@ -157,7 +162,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
                                 conditional_disagg_config, otlp_config,
-                                max_retries, perf_metrics_max_requests)
+                                max_retries, perf_metrics_max_requests,
+                                disagg_cluster_config)
 
     return config
 
@@ -243,6 +249,33 @@ def get_server_configs_dict(
             num_workers += cfg.instance_num_ranks
 
     return num_workers, server_dict
+
+
+def extract_disagg_cluster_config(
+        cluster_config_dict: Dict[str, Any],
+        cluster_uri: Optional[str] = None) -> DisaggClusterConfig:
+    """
+    Build the DisaggClusterConfig from the cluster_config_dict.
+    Use the default value of DisaggClusterConfig and MinimalInstances if the corresponding fields are not provided.
+    If cluster_uri is provided, it will override the cluster_uri in the cluster_config_dict.
+    """
+
+    def update_dataclass(obj, data_dict: Dict[str, Any]):
+        for key, value in data_dict.items():
+            if key not in obj.__dataclass_fields__:
+                raise KeyError(
+                    f"Key {key} not found in {obj.__class__.__name__}")
+            if value is not None:
+                setattr(obj, key, value)
+        return obj
+
+    cluster_config_dict["minimal_instances"] = update_dataclass(
+        MinimalInstances(), cluster_config_dict.get("minimal_instances", {}))
+    cluster_config = update_dataclass(
+        DisaggClusterConfig(cluster_uri or cluster_config_dict["cluster_uri"]),
+        cluster_config_dict,
+    )
+    return cluster_config
 
 
 def split_world_comm(
