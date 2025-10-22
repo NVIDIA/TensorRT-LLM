@@ -75,7 +75,7 @@ The tool aims to track detailed timing segments throughout the request lifecycle
    - **Includes**: Response forwarding, aggregation
 
 #### Visualization of Disaggregated Server Metrics
-The timepoints are recorded internally by TensorRT LLM per-request performance metrics (also available via LLM API) and OpenAI compatible server.
+The timepoints are recorded internally by TensorRT LLM per-request performance metrics (also available via LLM API) and OpenAI-compatible server.
 ![Visualization of Disaggregated Metrics](images/perf_metrics_timepoints.png)
 
 ## Input Format
