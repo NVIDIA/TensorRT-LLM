@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.load_moe_align import moe_align_block_size
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.load_moe_align import moe_align_block_size
 
 
 def _pack_routed_tokens_reference(
@@ -215,3 +215,146 @@ def test_moe_align_kernel_groups_tokens_by_expert_and_block_padding():
 
     ref_counts_all = torch.bincount(ref_sorted_used.cpu().to(torch.int64), minlength=T + 1)
     assert torch.all(ref_counts_all == counts_all)
+
+
+def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe():
+    """Test triton_quant_fp8_moe against torch_quant_fp8_moe reference."""
+    torch.manual_seed(0)
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for triton_quant_fp8_moe test")
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    M = 32  # tokens
+    HIDDEN_SIZE = 16  # Must be multiple of 16 for FP8 linear
+    INTERMEDIATE_SIZE = 32  # Must be multiple of 16 for FP8 linear
+    E = 4  # experts
+    top_k = 2
+
+    # Use small normalized values to avoid FP8 range issues
+    x = torch.randn(M, HIDDEN_SIZE, device=device, dtype=dtype) * 0.1
+
+    # Create BF16 weights for each expert (normalized to small values)
+    w_up_list = [
+        torch.randn(INTERMEDIATE_SIZE, HIDDEN_SIZE, device=device, dtype=dtype) * 0.1
+        for _ in range(E)
+    ]
+    w_down_list = [
+        torch.randn(HIDDEN_SIZE, INTERMEDIATE_SIZE, device=device, dtype=dtype) * 0.1
+        for _ in range(E)
+    ]
+
+    # Stack weights [E, ...]
+    w_up_stacked = torch.stack(w_up_list, dim=0).contiguous()  # [E, I, H]
+    w_down_stacked = torch.stack(w_down_list, dim=0).contiguous()  # [E, H, I]
+
+    # Quantize weights to FP8 with per-expert scales
+    FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+    # Per-expert weight scales (use max absolute value per expert)
+    w1_weight_scale = torch.tensor(
+        [w_up_stacked[e].abs().max().item() / FP8_MAX for e in range(E)],
+        device=device,
+        dtype=torch.float32,
+    )
+    w2_weight_scale = torch.tensor(
+        [w_down_stacked[e].abs().max().item() / FP8_MAX for e in range(E)],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    # Quantize weights and stack
+    w1_fp8_list = [
+        (w_up_stacked[e] / w1_weight_scale[e]).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+        for e in range(E)
+    ]
+    w2_fp8_list = [
+        (w_down_stacked[e] / w2_weight_scale[e]).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+        for e in range(E)
+    ]
+    w1_fp8_stacked = torch.stack(w1_fp8_list).contiguous()
+    w2_fp8_stacked = torch.stack(w2_fp8_list).contiguous()
+
+    # Input scales (tensor-wise, replicated per expert for interface compatibility)
+    x_scale = x.abs().max().item() / FP8_MAX
+    w1_input_scale_tensor = torch.full((E,), x_scale, device=device, dtype=torch.float32)
+
+    # Compute intermediate activation scale by simulating first GEMM + ReLU^2
+    # This ensures w2_input_scale matches the actual activation magnitude
+    with torch.no_grad():
+        # Simulate the first GEMM: quantize input, do FP8 matmul, apply ReLU^2
+        x_q = (x / w1_input_scale_tensor[0]).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+        # Dequantize and compute output for a sample
+        x_dq = x_q[:8].to(torch.float32) * w1_input_scale_tensor[0].item()
+        w1_dq = w1_fp8_stacked[0].to(torch.float32) * w1_weight_scale[0].item()
+        sample_out = torch.nn.functional.linear(x_dq.to(dtype), w1_dq.to(dtype))
+        sample_act = torch.square(torch.nn.functional.relu(sample_out))
+        intermediate_scale = sample_act.abs().max().item() / FP8_MAX
+        # Ensure scale is not too small
+        intermediate_scale = max(intermediate_scale, 1e-6)
+
+    w2_input_scale_tensor = torch.full((E,), intermediate_scale, device=device, dtype=torch.float32)
+
+    # Convert scales to lists for torch_quant_fp8_moe reference
+    w1_input_scale_list = [w1_input_scale_tensor[0].clone() for _ in range(E)]
+    w2_input_scale_list = [w2_input_scale_tensor[0].clone() for _ in range(E)]
+    w1_weight_scale_list = [w1_weight_scale[e].clone() for e in range(E)]
+    w2_weight_scale_list = [w2_weight_scale[e].clone() for e in range(E)]
+
+    # Dummy w3 tensors (unused for mlp style)
+    w3_fp8_list = [torch.empty((1, 1), device=device, dtype=torch.float8_e4m3fn) for _ in range(E)]
+    w3_fp8_stacked = torch.stack(w3_fp8_list).contiguous()
+    w3_input_scale_list = [torch.ones((), device=device, dtype=torch.float32) for _ in range(E)]
+    w3_input_scale_tensor = torch.ones((E,), device=device, dtype=torch.float32)
+    w3_weight_scale_list = [torch.ones((), device=device, dtype=torch.float32) for _ in range(E)]
+    w3_weight_scale_tensor = torch.ones((E,), device=device, dtype=torch.float32)
+
+    # Create controlled routing to ensure even token distribution across experts
+    selected_experts = torch.zeros((M, top_k), dtype=torch.int64, device=device)
+    for i in range(M):
+        # Distribute tokens evenly: token i goes to experts (i % E) and ((i+1) % E)
+        selected_experts[i, 0] = i % E
+        selected_experts[i, 1] = (i + 1) % E
+
+    # Create equal routing weights
+    routing_weights = torch.ones((M, top_k), device=device, dtype=torch.float32) / top_k
+
+    # Triton FP8 quantized MoE (uses stacked tensors)
+    out_triton = torch.ops.auto_deploy.triton_quant_fp8_moe(
+        x,
+        selected_experts.to(torch.int32),
+        routing_weights,
+        w1_fp8_stacked,
+        w2_fp8_stacked,
+        w3_fp8_stacked,
+        w1_input_scale_tensor,
+        w2_input_scale_tensor,
+        w3_input_scale_tensor,
+        w1_weight_scale,
+        w2_weight_scale,
+        w3_weight_scale_tensor,
+        mlp_style="mlp",
+        act_fn="relu2",
+    )
+
+    # Reference: Torch quantized FP8 MoE (uses lists of tensors and scales)
+    out_torch = torch.ops.auto_deploy.torch_quant_fp8_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_weight=w1_fp8_list,
+        w2_weight=w2_fp8_list,
+        w3_weight=w3_fp8_list,
+        w1_input_scale=w1_input_scale_list,
+        w2_input_scale=w2_input_scale_list,
+        w3_input_scale=w3_input_scale_list,
+        w1_weight_scale=w1_weight_scale_list,
+        w2_weight_scale=w2_weight_scale_list,
+        w3_weight_scale=w3_weight_scale_list,
+        mlp_style="mlp",
+        act_fn="relu2",
+    )
+
+    torch.testing.assert_close(out_triton, out_torch, rtol=1e-2, atol=1e-2)
