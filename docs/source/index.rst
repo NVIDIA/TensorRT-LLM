@@ -85,6 +85,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
    developer-guide/api-change.md
+   developer-guide/kv-transfer.md
 
 
 .. toctree::

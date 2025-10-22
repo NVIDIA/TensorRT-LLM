@@ -5,11 +5,12 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 # Triton kernels
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chunk_indices_offsets
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
@@ -23,8 +24,8 @@ from .attention_interface import (
 )
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_ssm_transform", mutates_args={})
-def _triton_cached_ssm_transform(
+@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args={})
+def _triton_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
     A: torch.Tensor,  # [num_heads]
@@ -37,6 +38,7 @@ def _triton_cached_ssm_transform(
     seq_len: torch.Tensor,  # [num_seq]
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -51,7 +53,6 @@ def _triton_cached_ssm_transform(
     """
     b, s = hidden_states.shape[:2]
     num_seq = seq_len.shape[0]
-
     # Flatten tokens for indexing/scatter
     bs = b * s
     device = hidden_states.device
@@ -96,6 +97,16 @@ def _triton_cached_ssm_transform(
         seq_ids = torch.arange(num_prefill, device=device, dtype=torch.int32)
         seq_idx_prefill = torch.repeat_interleave(seq_ids, seq_len_prefill).view(1, -1)
 
+        initial_states = chunk_indices = chunk_offsets = None
+        if torch.any(use_initial_states[:num_prefill]):
+            initial_states = torch.where(
+                use_initial_states[:num_prefill, None, None, None],
+                ssm_state_cache[slot_idx[:num_prefill]],
+                0,
+            )
+            chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+                cu_seqlens, chunk_size
+            )
         y_prefill, varlen_states = mamba_chunk_scan_combined(
             hs_prefill,
             dt_prefill,
@@ -106,10 +117,10 @@ def _triton_cached_ssm_transform(
             D=D,
             z=None,
             dt_bias=dt_bias,
-            initial_states=None,
+            initial_states=initial_states,
             seq_idx=seq_idx_prefill,
-            chunk_indices=None,
-            chunk_offsets=None,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
             cu_seqlens=cu_seqlens,
             dt_softplus=True,
             dt_limit=(time_step_limit[0], time_step_limit[1]),
@@ -159,8 +170,8 @@ def _triton_cached_ssm_transform(
     return y
 
 
-@_triton_cached_ssm_transform.register_fake
-def _triton_cached_ssm_transform_fake(
+@_triton_cached_ssm.register_fake
+def _triton_cached_ssm_fake(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
     A: torch.Tensor,  # [num_heads]
@@ -173,6 +184,7 @@ def _triton_cached_ssm_transform_fake(
     seq_len: torch.Tensor,  # [num_seq]
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -209,16 +221,16 @@ class TritonBackendSSM(AttentionDescriptor):
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
         # Keep source op unchanged (used for uncached pre-export)
-        return torch.ops.auto_deploy.torch_ssm_transform
+        return torch.ops.auto_deploy.torch_ssm
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.triton_cached_ssm_transform
+        return torch.ops.auto_deploy.triton_cached_ssm
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 3
+        # Returns (seq_len, seq_start, slot_idx, use_initial_states)
+        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
 
     @classmethod
     def get_cache_initializers(

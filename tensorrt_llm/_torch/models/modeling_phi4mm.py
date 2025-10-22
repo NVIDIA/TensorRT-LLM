@@ -88,10 +88,10 @@ def _load_phi4mm_classes(local_path):
     # Add parent folder to sys.path to enable relative import.
     original_sys_path = sys.path.copy()
     package_folder = Path(local_path)
+    package_name = package_folder.name
     parent_folder = str(package_folder.parent)
     if parent_folder not in sys.path:
         sys.path.insert(0, parent_folder)
-
     try:
         # Import Phi4MMConfig from configuration_phi4mm.py.
         config_path = os.path.join(local_path, 'configuration_phi4mm.py')
@@ -111,8 +111,7 @@ def _load_phi4mm_classes(local_path):
         # `Phi-4-multimodal-instruct` as the package name to avoid relative import errors.
         # `hf_modeling_phi4mm` as the module name to avoid name conflicts.
         spec = importlib.util.spec_from_file_location(
-            "Phi-4-multimodal-instruct.hf_modeling_phi4mm",
-            modeling_phi4mm_path)
+            f"{package_name}.hf_modeling_phi4mm", modeling_phi4mm_path)
         hf_modeling_phi4mm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hf_modeling_phi4mm)
         Phi4MMAudioEmbedding = hf_modeling_phi4mm.Phi4MMAudioEmbedding
@@ -989,12 +988,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = {k: v for k, v in weights.items() if '.lora_' not in k}
         # Rename base layer weights.
         updated_weights = {}
+        base_layer_weight_names = [
+            'weight', 'input_scale', 'weight_scale', 'weight_scale_2'
+        ]
         for k in weights.keys():
-            if 'base_layer.weight' in k:
-                new_k = k.replace('base_layer.weight', 'weight')
-                updated_weights[new_k] = weights[k]
-            else:
-                updated_weights[k] = weights[k]
+            new_k = k
+            for weight_name in base_layer_weight_names:
+                if f'base_layer.{weight_name}' in k:
+                    new_k = k.replace(f'base_layer.{weight_name}', weight_name)
+                    break
+            updated_weights[new_k] = weights[k]
         weights = updated_weights
         self.llm.load_weights(weights)
 

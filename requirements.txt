@@ -67,7 +67,7 @@ nvtx
 matplotlib # FIXME: this is added to make nvtx happy
 meson
 ninja
-etcd3
+etcd3 @ git+https://github.com/kragniz/python-etcd3.git@e58a899579ba416449c4e225b61f039457c8072a
 blake3
 soundfile
 triton==3.3.1; platform_machine == "x86_64"

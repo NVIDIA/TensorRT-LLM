@@ -20,9 +20,13 @@ from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
-                                              MetadataServerConfig,
+                                              MetadataServerConfig, ServerRole,
                                               get_ctx_gen_server_urls)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.cluster_storage import (WatchEventType,
+                                                create_cluster_storage)
+from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
+                                                    WorkerInfo)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -53,7 +57,6 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(
             config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = config.conditional_disagg_config
-
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
             # record corresponding keys of context and generation servers for perf metrics
@@ -82,17 +85,26 @@ class OpenAIDisaggServer:
         self._metrics_task = None
         self.metrics_interval_secs = metrics_interval_secs
 
+        self.disagg_cluster_config = config.disagg_cluster_config
+        self.disagg_cluster_storage = None
+        self.disagg_cluster_manager = None
+        self._update_worker_task = None
+
         logger.info(f"Server max retries: {self.max_retries}")
 
-        if (len(self.gen_servers) == 0):
-            raise ValueError("At least one generation server must be provided")
+        if self.disagg_cluster_config is None:
+            if (len(self.gen_servers) == 0):
+                raise ValueError("At least one generation server must be provided")
 
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(self.ctx_servers) == 0:
-            raise ValueError("At least one context server must be provided")
+            if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(self.ctx_servers) == 0:
+                raise ValueError("At least one context server must be provided")
 
         if self.conditional_disagg_config is not None and \
                 not isinstance(self.gen_router, KvCacheAwareRouter):
             raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
+
+        if self.disagg_cluster_config and self.metadata_server:
+            raise ValueError("Cluster manager and metadata server cannot be used together")
 
         # Session will be initialized in lifespan
         self.session: Optional[aiohttp.ClientSession] = None
@@ -103,6 +115,11 @@ class OpenAIDisaggServer:
             self.session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
+
+            if self.disagg_cluster_manager:
+                await self.disagg_cluster_manager.start()
+                await self.disagg_cluster_manager.watch_workers()
+                self._update_worker_task = asyncio.create_task(self._update_router_by_watch_events())
 
             logger.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
@@ -135,6 +152,9 @@ class OpenAIDisaggServer:
                     pass
 
             await self.session.close()  # Ensure session cleanup
+            if self.disagg_cluster_manager:
+                self._update_worker_task.cancel()
+                await self.disagg_cluster_manager.stop()
 
         self.app = FastAPI(lifespan=lifespan)
 
@@ -145,6 +165,10 @@ class OpenAIDisaggServer:
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
+        if self.disagg_cluster_config:
+            self.disagg_cluster_storage = create_cluster_storage(self.disagg_cluster_config.cluster_uri, self.disagg_cluster_config.cluster_name, server=self.app)
+            self.disagg_cluster_manager = DisaggClusterManager(self.disagg_cluster_config, self.disagg_cluster_storage)
+
 
     async def _increment_metric(self, key: str, amount: int = 1):
         if self.metrics_interval_secs > 0:
@@ -185,13 +209,23 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat_completion,
                                methods=["POST"])
+        self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
 
     async def health(self) -> Response:
+        if not await self.is_ready():
+            return Response(status_code=500)
         return Response(status_code=200)
 
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
+
+    async def cluster_info(self) -> JSONResponse:
+        if self.disagg_cluster_manager:
+            cluster_info = await self.disagg_cluster_manager.cluster_info()
+            cluster_info["is_ready"] = await self.is_ready()
+            return JSONResponse(content=cluster_info)
+        return JSONResponse(content={})
 
     async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int, raw_request: Request):
         async with self.perf_metrics_keys_lock:
@@ -252,6 +286,8 @@ class OpenAIDisaggServer:
 
 
     async def openai_completion(self, req: CompletionRequest, raw_request: Request) -> Response:
+        if not await self.is_ready():
+            raise HTTPException(status_code=400, detail="Cluster is not ready")
         try:
             if not isinstance(req.prompt, str):
                 # Check if it's a list and contains integers
@@ -266,7 +302,8 @@ class OpenAIDisaggServer:
             await self._handle_exception(e)
 
     async def openai_chat_completion(self, req: ChatCompletionRequest, raw_request: Request) -> Response:
-
+        if not await self.is_ready():
+            raise HTTPException(status_code=400, detail="Cluster is not ready")
         try:
             return await self._send_disagg_request(req, raw_request)
         except Exception as e:
@@ -574,5 +611,31 @@ class OpenAIDisaggServer:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
         logger.info("Context and generation servers are ready")
 
+    async def is_ready(self) -> bool:
+        if self.disagg_cluster_manager:
+            return await self.disagg_cluster_manager.is_ready_with_router(len(self.ctx_router.servers), len(self.gen_router.servers))
+        return True
+
     async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
         await self.wait_for_all_servers_ready(self.session, self.ctx_servers, self.gen_servers, server_start_timeout_secs)
+
+    async def _update_router_by_watch_events(self):
+        def worker_repr(worker_info: WorkerInfo):
+            return f"http://{worker_info.host}:{worker_info.port}"
+        router_map = {
+            ServerRole.CONTEXT: self.ctx_router,
+            ServerRole.GENERATION: self.gen_router
+        }
+        logger.info("Start updating routers by worker events")
+        while True:
+            try:
+                worker_events = await self.disagg_cluster_manager.get_worker_events()
+                for worker_info, event_type in worker_events:
+                    if event_type == WatchEventType.SET:
+                        await router_map[worker_info.role].add_server(worker_repr(worker_info))
+                    elif event_type == WatchEventType.DELETE:
+                        await router_map[worker_info.role].remove_server(worker_repr(worker_info))
+                    logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}")
+            except Exception as e:
+                logger.error(f"Error updating routers by worker events: {e}")
+                await asyncio.sleep(1)

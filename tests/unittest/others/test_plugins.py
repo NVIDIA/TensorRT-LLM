@@ -25,14 +25,11 @@ def test_load_library():
 
 @pytest.mark.parametrize('dtype', ['float16', 'bfloat16', 'float32'])
 def test_plugin_config(dtype):
-    plugin_config = _tlp.PluginConfig.from_dict({'dtype': dtype})
+    plugin_config = _tlp.PluginConfig(**{'dtype': dtype})
     assert plugin_config.dtype == dtype
 
-    assert plugin_config._gpt_attention_plugin == 'auto'
     assert plugin_config.gpt_attention_plugin == dtype
-    assert plugin_config._nccl_plugin == 'auto'
     assert plugin_config.nccl_plugin == dtype
-    assert plugin_config._gemm_plugin is None
     assert plugin_config.gemm_plugin is None
 
     new_dtype_options = ['float16', 'bfloat16', 'float32']
@@ -43,11 +40,8 @@ def test_plugin_config(dtype):
     plugin_config.gpt_attention_plugin = dtype
     plugin_config.gemm_plugin = 'auto'
 
-    assert plugin_config._gpt_attention_plugin == dtype
     assert plugin_config.gpt_attention_plugin == dtype
-    assert plugin_config._nccl_plugin == 'auto'
     assert plugin_config.nccl_plugin == new_dtype
-    assert plugin_config._gemm_plugin == 'auto'
     assert plugin_config.gemm_plugin == new_dtype
 
     with pytest.raises(Exception):
@@ -63,8 +57,8 @@ def test_plugin_config(dtype):
     with pytest.raises(Exception):
         plugin_config.a_new_xxx_plugin = 'float16'
 
-    config_dict = plugin_config.to_dict()
-    new_plugin_config = _tlp.PluginConfig.from_dict(config_dict)
-    assert config_dict == new_plugin_config.to_dict()
+    config_dict = plugin_config.model_dump(mode="python")
+    new_plugin_config = _tlp.PluginConfig(**config_dict)
+    assert config_dict == new_plugin_config.model_dump(mode="python")
 
     plugin_config.to_legacy_setting()

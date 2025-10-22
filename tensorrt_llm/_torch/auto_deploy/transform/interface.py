@@ -16,7 +16,7 @@ from torch.fx import GraphModule
 
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
-from ..transformations._graph import (
+from ..utils._graph import (
     canonicalize_graph,
     lift_to_meta,
     named_graphmodules,
@@ -48,6 +48,7 @@ class Stages(Enum):
     WEIGHT_LOAD = "weight_load"  # loading of the model weights
     POST_LOAD_FUSION = "post_load_fusion"  # post-loading fusion and perf optimizations of the graph
     CACHE_INIT = "cache_init"  # initialization of cached attention + (KV) cache initialization
+    VISUALIZE = "visualize"  # visualization of the graph
     COMPILE = "compile"  # graph compilation stage using low-level compilers like torch.compile
 
     def __lt__(self, other):
@@ -63,7 +64,6 @@ class SharedConfig(BaseModel):
     sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    attn_backend: str = Field(default="flashinfer", description="The attention backend to use.")
 
 
 class TransformConfig(BaseModel):

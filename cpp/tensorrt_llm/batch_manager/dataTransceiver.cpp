@@ -145,16 +145,18 @@ using runtime::SizeType32;
 using AgentConnectionManager = tensorrt_llm::executor::kv_cache::AgentConnectionManager;
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 
-static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
+namespace
+{
+
+int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 {
     constexpr int32_t kDATA_TAG{43};
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
-namespace fs = std::filesystem;
-
-static fs::path getTransferOutputPath(char const* tag)
+std::filesystem::path getTransferOutputPath(char const* tag)
 {
+    namespace fs = std::filesystem;
     auto outputPath = common::getEnvKVCacheTransferOutputPath();
     if (!outputPath.empty())
     {
@@ -166,13 +168,15 @@ static fs::path getTransferOutputPath(char const* tag)
     return {};
 }
 
+} // namespace
+
 struct ReceiveCacheResource
 {
     runtime::BufferManager mBufferManager;
     runtime::CudaEvent mCudaEvent;
 
-    ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent&& cudaEvent)
-        : mBufferManager(bufferManager)
+    ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent cudaEvent)
+        : mBufferManager(std::move(bufferManager))
         , mCudaEvent(std::move(cudaEvent))
     {
     }
@@ -343,8 +347,7 @@ public:
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(
                                  mSelfState.getCacheState().value(), info.getTransState().getCacheState().value()),
             "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
-            "gen "
-            "executors");
+            "gen executors");
         auto peerRelativeRanks = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
                                      .mIRanks;
@@ -1024,7 +1027,6 @@ private:
 
     void request(AsyncResource& resource)
     {
-
         tensorrt_llm::common::setThreadName("dataTransRequest");
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
 

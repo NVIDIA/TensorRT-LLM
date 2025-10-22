@@ -2,8 +2,71 @@ import argparse
 import os
 import subprocess
 import sys
+import sysconfig
 
 import requests
+
+
+def get_expected_license_files():
+    """Get expected license files based on platform architecture."""
+    platform_tag = sysconfig.get_platform()
+    if "x86_64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+    elif "arm64" in platform_tag or "aarch64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+    else:
+        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
+
+
+def verify_license_files():
+    """Verify that the correct platform-specific license files are packaged."""
+    expected_files = get_expected_license_files()
+
+    result = subprocess.run(
+        'python3 -c "from importlib.metadata import distribution; '
+        'import os; '
+        'dist_path = distribution(\'tensorrt_llm\')._path; '
+        'print(dist_path); '
+        'license_dir = os.path.join(dist_path, \'licenses\'); '
+        'print(license_dir); '
+        'files = os.listdir(license_dir) if os.path.exists(license_dir) else []; '
+        'print(f\'Found: {files}\'); '
+        'import json; print(json.dumps(files))"',
+        shell=True,
+        capture_output=True,
+        text=True)
+
+    if result.returncode != 0:
+        print(f"ERROR: License files check failed!")
+        print(result.stdout)
+        print(result.stderr)
+        exit(1)
+
+    # Parse the output to get the list of files
+    output_lines = result.stdout.strip().split('\n')
+    try:
+        import json
+        found_files = json.loads(output_lines[-1])
+    except (json.JSONDecodeError, IndexError):
+        print(f"ERROR: Could not parse license files from output!")
+        print(result.stdout)
+        exit(1)
+
+    # Check for missing or unexpected files
+    missing = [f for f in expected_files if f not in found_files]
+    unexpected = [f for f in found_files if f not in expected_files]
+
+    if missing or unexpected:
+        print(f"ERROR: License files mismatch!")
+        print(f"Expected: {expected_files}")
+        print(f"Found: {found_files}")
+        if missing:
+            print(f"Missing: {missing}")
+        if unexpected:
+            print(f"Unexpected: {unexpected}")
+        exit(1)
+
+    print(f"✓ License files verified: {', '.join(expected_files)}")
 
 
 def get_cpython_version():
@@ -68,6 +131,8 @@ def test_pip_install():
     subprocess.check_call(
         'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
         shell=True)
+    print("##########  Verify license files  ##########")
+    verify_license_files()
     print("##########  Test quickstart example  ##########")
     subprocess.check_call(
         "python3 ../../examples/llm-api/quickstart_example.py", shell=True)

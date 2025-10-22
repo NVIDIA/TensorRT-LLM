@@ -192,7 +192,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "attn_backend": attn_backend,
+                "backend": attn_backend,
             },
         },
     )  # type: ignore

@@ -21,7 +21,7 @@ transforms:
     run_per_gm: false
   transformers_replace_cached_attn:
     stage: cache_init
-    attn_backend: flashinfer
+    backend: flashinfer
     run_per_gm: false
   initialize_cache:
     stage: cache_init
@@ -29,6 +29,7 @@ transforms:
   resize_kv_cache:
     stage: cache_init
     run_per_gm: false
+    free_mem_ratio: 0.0
   ############################################################################################
   # COMPILE MODEL
   ############################################################################################

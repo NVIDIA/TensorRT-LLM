@@ -13,7 +13,7 @@ from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.multimodal import MultimodalParams
 from ....sampling_params import SamplingParams
-from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
+from ...pyexecutor.sampling_utils import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine

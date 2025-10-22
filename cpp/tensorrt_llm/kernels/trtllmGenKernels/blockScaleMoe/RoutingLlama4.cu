@@ -26,7 +26,8 @@ namespace routingLlama4
 static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int MaxNumTopExperts = 1;
-static constexpr int MaxNumExperts = 128;
+// static constexpr int MaxNumExperts = 128;
+static constexpr int NumExpertsLimit = 128;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 static constexpr int WarpKernelSmemStride = 33;
@@ -88,7 +89,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     __shared__ int32_t __attribute((aligned(128)))
     smemExpertTokenCountFull[WarpKernelMaxNumTokens][WarpKernelSmemStride];
     static_assert(WarpKernelSmemStride == WarpSize + 1);
-    static_assert(MaxNumExperts / sizeof(int32_t) <= WarpSize);
+    static_assert(KernelParams::MaxNumExperts / sizeof(int32_t) <= WarpSize);
 
     // values needed for the top-1 reduction, if required
     InputT minScore = InputT{-INFINITY};
@@ -405,7 +406,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
 
         if (validToken)
         {
-            routingTopKExperts<InputT, MaxNumExperts / WarpSize>(
+            routingTopKExperts<InputT, KernelParams::MaxNumExperts / WarpSize>(
                 warp, warpMaxScore, warpMaxExpertIdx, laneIdx, params.mNumExperts, params.mPtrScores + scoreOffset);
             if (cute::elect_one_sync())
             {
@@ -449,27 +450,27 @@ __global__ void routingIndicesClusterKernel(KernelParams params)
 
 // this kernel is needed in case we have scores as input for the histogram kernel
 template <typename KernelParams>
-__global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresKernel(KernelParams params)
+__global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesHistogramScoresKernel(KernelParams params)
 {
     using OutputT = typename KernelParams::OutputT;
     using InputT = typename KernelParams::InputT;
     using TypePacked = PackedScoreIdx<OutputT>;
-    static constexpr int VecSize = MaxNumExperts / WarpSize;
+    static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
     //  we assume that #experts is a multiple of 4, so VecSize must be 4.
     static_assert(VecSize == 4);
 
     int32_t const laneIdx = cutlass::arch::LaneId();
     int32_t const warpIdx = threadIdx.x / WarpSize;
-    int32_t const globalWarpIdx = blockIdx.x * NumWarpsHist + warpIdx;
-    int32_t const globalWarpStride = gridDim.x * NumWarpsHist;
+    int32_t const globalWarpIdx = blockIdx.x * KernelParams::MaxNumExperts / WarpSize + warpIdx;
+    int32_t const globalWarpStride = gridDim.x * KernelParams::MaxNumExperts / WarpSize;
     InputT minScore = InputT{-INFINITY};
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
 
     // initialize the mPtrExpertCounts
     int32_t expertCountsNum = 2 * params.mNumExperts;
-    int32_t globalThreadIdx = blockIdx.x * NumThreadsHist + threadIdx.x;
-    int32_t globalThreadStride = gridDim.x * NumThreadsHist;
+    int32_t globalThreadIdx = blockIdx.x * KernelParams::MaxNumExperts + threadIdx.x;
+    int32_t globalThreadStride = gridDim.x * KernelParams::MaxNumExperts;
     initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -499,7 +500,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         }
         else if (params.mPtrScores != nullptr)
         {
-            routingTopKExperts<InputT, MaxNumExperts / WarpSize>(
+            routingTopKExperts<InputT, KernelParams::MaxNumExperts / WarpSize>(
                 warp, warpMaxScore, warpMaxExpertIdx, laneIdx, params.mNumExperts, params.mPtrScores + scoreOffset);
         }
         else
@@ -521,6 +522,20 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+int constexpr getMaxNumExperts(int32_t numExperts)
+{
+    if (numExperts <= topk::MaxNumExpertsUnit)
+    {
+        return topk::MaxNumExpertsUnit;
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Unsupported numExperts");
+        return 0;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void run(Data const& data, void* stream)
 {
@@ -536,10 +551,10 @@ void run(Data const& data, void* stream)
         "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
     TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
         MaxNumTopExperts, data.mTopK);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxNumExperts, "Routing kernel expects #experts %d to be no more than %d",
-        data.mNumExperts, MaxNumExperts);
-    static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
-    static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumExpertsLimit,
+        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, NumExpertsLimit);
+    // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
+    // static_assert(MaxNumExperts <= numThreadsHist, "#experts must be bounded by #threads");
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
@@ -556,16 +571,17 @@ void run(Data const& data, void* stream)
             data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
     }
 
+    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
     if (useSingleWarp)
     {
-        LAUNCH_ROUTING(data,
+        LAUNCH_ROUTING_LLAMA4(data,
             /*coopLaunch=*/false, routingIndicesWarpKernel, 1, WarpSize,
             /*smemSize=*/0, // No dynamic smem
             stream);
     }
     else if (useSingleCluster)
     {
-        LAUNCH_ROUTING(data,
+        LAUNCH_ROUTING_LLAMA4(data,
             /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
             /*smemSize=*/0, // No dynamic smem
             stream);
@@ -574,8 +590,8 @@ void run(Data const& data, void* stream)
     {
         const uint32_t expandedIdxSize = data.mNumTokens * data.mTopK;
 
-        const uint32_t histogramEltsPerBlock = 8 * NumThreadsHist;
-        const uint32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * NumThreadsHist;
+        const uint32_t histogramEltsPerBlock = 8 * numThreadsHist;
+        const uint32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
 
         // Limit grid size (all kernels use a grid-stride loop).
         const uint32_t maxNumBlocks = 1024;
@@ -587,25 +603,25 @@ void run(Data const& data, void* stream)
 
         if (data.mPtrScores != nullptr && data.mPtrTopKIds == nullptr)
         {
-            LAUNCH_ROUTING(data,
-                /*coopLaunch=*/false, routingIndicesHistogramScoresKernel, maxNumBlocks, NumThreadsHist,
+            LAUNCH_ROUTING_LLAMA4(data,
+                /*coopLaunch=*/false, routingIndicesHistogramScoresKernel, maxNumBlocks, numThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
         else
         {
             // Reset the global histograms.
-            LAUNCH_ROUTING(data, false, routingInitExpertCounts, (2 * data.mNumExperts - 1) / NumThreadsHist + 1,
-                NumThreadsHist,
+            LAUNCH_ROUTING_LLAMA4(data, false, routingInitExpertCounts, (2 * data.mNumExperts - 1) / numThreadsHist + 1,
+                numThreadsHist,
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
-        LAUNCH_ROUTING(data,
-            /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
+        LAUNCH_ROUTING_LLAMA4(data,
+            /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, numThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
-        LAUNCH_ROUTING(data,
-            /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
+        LAUNCH_ROUTING_LLAMA4(data,
+            /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, numThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
     }

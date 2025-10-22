@@ -281,9 +281,10 @@ class HttpClusterStorageServer(ClusterStorage):
                         self._storage.pop(k)
                 for k, v in kv_to_delete.items():
                     await self._notify_watch_event(k, v, WatchEventType.DELETE)
-                logger.debug(
-                    f"Checked expired, {before_len} -> {len(self._storage)}, keys to delete: {kv_to_delete.keys()}"
-                )
+                if len(kv_to_delete) > 0:
+                    logger.debug(
+                        f"Checked expired, {before_len} -> {len(self._storage)}, keys to delete: {kv_to_delete.keys()}"
+                    )
             except Exception as e:
                 logger.error(f"Error checking expired: {e}")
 
@@ -298,9 +299,12 @@ class HttpClusterStorageClient(ClusterStorage):
         self._cluster_name = cluster_name
 
     def __del__(self):
-        if asyncio.get_event_loop():
-            asyncio.run_coroutine_threadsafe(self._session.close(),
-                                             asyncio.get_event_loop())
+        try:
+            if asyncio.get_event_loop():
+                asyncio.run_coroutine_threadsafe(self._session.close(),
+                                                 asyncio.get_event_loop())
+        except RuntimeError:
+            pass
 
     def _url_for(self, endpoint: str) -> str:
         return f"{self._cluster_uri}/{endpoint}"
