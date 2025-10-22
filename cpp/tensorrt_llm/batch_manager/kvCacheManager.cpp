@@ -1457,6 +1457,7 @@ SizeType32 WindowBlockManager::addSequence(
     if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
     {
         numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
+        llmRequest.setNumConnectorMatchedTokens(numConnectorMatchedTokens);
     }
 
     // Return the total prepopulated length for this window (do not set on llmRequest here -
