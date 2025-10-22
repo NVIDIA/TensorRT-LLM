@@ -96,7 +96,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string const& getEnvKVCacheTimeOutputPath();
+std::string const& getEnvKVCacheTransferOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -136,17 +136,7 @@ bool getEnvDisaggBenchmarkGenOnly();
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
 
-// Whether to use one block per token for MoE A2A kernels (default true).
-bool getEnvMoeA2AOneBlockPerToken();
-
-// TODO: For DEV purpose temporarily.
-// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
-int getEnvMoeA2ADispatchBlockSize();
-// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
-int getEnvMoeA2ACombineBlockSize();
-
-bool getEnvKVCacheTransferAllBlocksForWindow();
-
-bool getEnvEplbForceGdrcopy();
+// Whether to enable KV cache precision conversion during transfers.
+bool getEnvEnableKVCachePrecisionConversion();
 
 } // namespace tensorrt_llm::common
