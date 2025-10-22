@@ -663,10 +663,6 @@ class PyTorchModelEngine(ModelEngine):
                 (curr_max_num_tokens, 0),  # max_num_tokens, pure context
             ])
 
-            # Up to 20 warmup requests.
-            step = max(128, curr_max_num_tokens // 20)
-            ids = curr_max_num_tokens // step
-            warmup_requests |= set([(id * step, 0) for id in range(1, ids)])
             warmup_requests = sorted(list(warmup_requests), reverse=reverse)
 
             for warmup_num_tokens, warmup_num_gen_tokens in warmup_requests:

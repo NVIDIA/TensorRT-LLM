@@ -343,7 +343,7 @@ torch::Tensor fp8_block_scaling_bmm(torch::Tensor const& mat1, torch::Tensor con
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("fp8_block_scaling_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
+    m.def("fp8_block_scaling_gemm_impl(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
     m.def(
         "fp8_block_scaling_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, ScalarType? "
         "out_dtype=None) -> Tensor");
@@ -357,7 +357,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_block_scaling_gemm", &torch_ext::fp8_block_scaling_gemm);
+    m.impl("fp8_block_scaling_gemm_impl", &torch_ext::fp8_block_scaling_gemm);
     m.impl("fp8_block_scaling_bmm", &torch_ext::fp8_block_scaling_bmm);
     m.impl("fp8_block_scaling_bmm_out", &torch_ext::fp8_block_scaling_bmm_out);
     m.impl("fp8_block_scaling_moe_gemm", &torch_ext::fp8_block_scaling_moe_gemm);
