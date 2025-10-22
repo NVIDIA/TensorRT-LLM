@@ -25,7 +25,7 @@ TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalo
 You can launch the container using the following command:
 
 ```bash
-docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --ulimit stack=67108864 nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc0
+docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --ulimit stack=67108864 nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc1
 ```
 
 
@@ -151,16 +151,44 @@ P99 E2EL (ms):                           1643.44
 
 ### Key Metrics
 
-* Median Time to First Token (TTFT)
+#### Time to First Token (TTFT)
   * The typical time elapsed from when a request is sent until the first output token is generated.
-* Median Time Per Output Token (TPOT)
-  * The typical time required to generate each token *after* the first one.
-* Median Inter-Token Latency (ITL)
-  * The typical time delay between the completion of one token and the completion of the next.
-* Median End-to-End Latency (E2EL)
+
+#### Time Per Output Token (TPOT) and Inter-Token Latency (ITL)
+  * TPOT is the typical time required to generate each token *after* the first one.
+  * ITL is the typical time delay between the completion of one token and the completion of the next.
+  * Both TPOT and ITL ignore TTFT.
+
+For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
+
+```math
+\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+```
+
+Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
+
+```math
+\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+```
+
+```math
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+```
+
+#### End-to-End (E2E) Latency
   * The typical total time from when a request is submitted until the final token of the response is received.
-* Total Token Throughput
+
+#### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
+```math
+\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+```
+
+#### Tokens Per Second (TPS) or Output Token Throughput
+  * how many output tokens the system generates each second.
+```math
+\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+```
 
 ## About `extra_llm_api_options`
    trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.
@@ -267,28 +295,28 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.
 ```
 ============ Serving Benchmark Result ============
-Successful requests:                     1         
-Benchmark duration (s):                  0.83      
-Total input tokens:                      128       
-Total generated tokens:                  128       
-Request throughput (req/s):              1.20      
-Output token throughput (tok/s):         153.92    
-Total Token throughput (tok/s):          307.85    
-User throughput (tok/s):                 154.15    
-Mean Request AR:                         0.9845    
-Median Request AR:                       0.9845    
+Successful requests:                     1
+Benchmark duration (s):                  0.83
+Total input tokens:                      128
+Total generated tokens:                  128
+Request throughput (req/s):              1.20
+Output token throughput (tok/s):         153.92
+Total Token throughput (tok/s):          307.85
+User throughput (tok/s):                 154.15
+Mean Request AR:                         0.9845
+Median Request AR:                       0.9845
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          84.03     
-Median TTFT (ms):                        84.03     
-P99 TTFT (ms):                           84.03     
+Mean TTFT (ms):                          84.03
+Median TTFT (ms):                        84.03
+P99 TTFT (ms):                           84.03
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          5.88      
-Median TPOT (ms):                        5.88      
-P99 TPOT (ms):                           5.88      
+Mean TPOT (ms):                          5.88
+Median TPOT (ms):                        5.88
+P99 TPOT (ms):                           5.88
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           5.83      
-Median ITL (ms):                         5.88      
-P99 ITL (ms):                            6.14      
+Mean ITL (ms):                           5.83
+Median ITL (ms):                         5.88
+P99 ITL (ms):                            6.14
 ==================================================
 ```
 

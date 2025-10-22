@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -69,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -335,6 +335,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -365,6 +366,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -407,6 +409,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -423,6 +426,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -506,7 +510,7 @@ to create graph representations of deep neural networks in TensorRT. To become
 familiar with the core concepts of the TensorRT API, refer to the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/coreConcepts.html">Core Concepts</a>
 section of the TensorRT documentation before proceeding further.</p>
-<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
+<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
 contains a
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
 object. That instance is used in the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.create_network</span></code>
@@ -514,7 +518,7 @@ method to create an instance of the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>
 class. The <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> object can then be populated using the free
 functions defined in the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
 <p>A simple example of such a free function is <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.activation</span></code> that inserts a
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Layers.html#tensorrt.IActivationLayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.IActivationLayer</span></code></a>
 node in the graph of the model:</p>
@@ -649,14 +653,14 @@ limitation, TensorRT offers a powerful mechanism known as
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Plugin/pyPlugin.html">plugins</a>.</p>
 <p>The plugins are nodes inserted in the network graph definition that map to user-defined
 GPU kernels. TensorRT-LLM uses a number of such plugins. They can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
 <p>Plugins are written in C++ and follow a well-defined interface described in the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/extending-custom-layers.html">Extending TensorRT with Custom Layers</a>
 section of the TensorRT
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/index.html">Developer Guide</a>.
 When executed within a TensorRT engine, plugins trigger the execution of
 their encapsulated GPU kernels. A fairly simple example of plugins is the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
 triggers a CUDA kernel in the <code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin::enqueue</span></code> member function:</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// In cpp/tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.cpp:</span>
 
@@ -700,7 +704,7 @@ using TensorRT plugins that wrap communication primitives from the
 plugin that optimize the All-Reduce primitive in the presence of All-to-all
 connections between GPUs (through NVSwitch in DGX systems).</p>
 <p>The communication plugins can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
 and the multi-GPU functions are exposed in the TensorRT-LLM Model Definition API
 as:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm/functional.py:</span>
@@ -990,9 +994,9 @@ srun<span class="w"> </span><span class="se">\</span>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

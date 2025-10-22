@@ -1,6 +1,6 @@
 Speculative Decoding
 ====================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/560ded5450b79efde720162fc397d7efa59aae6d/examples/llm-api/llm_speculative_decoding.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/796891ba2a6959bad58c0da9645416c7264349e9/examples/llm-api/llm_speculative_decoding.py.
 
 .. literalinclude:: ../../../examples/llm-api/llm_speculative_decoding.py
     :lines: 4-95

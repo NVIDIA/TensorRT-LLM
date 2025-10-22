@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -330,6 +330,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -360,6 +361,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -402,6 +404,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -418,6 +421,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -610,19 +614,6 @@
         <span class="k">pass</span>  <span class="c1"># noqa</span>
 
 
-<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">AdditionalModelOutput</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;An additional output to gather from the model.</span>
-
-<span class="sd">    Args:</span>
-<span class="sd">        name (str): The name of the additional output to gather from the model.</span>
-<span class="sd">        gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.</span>
-<span class="sd">    &quot;&quot;&quot;</span>  <span class="c1"># noqa: E501</span>
-
-    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">gather_context</span><span class="p">:</span> <span class="nb">bool</span>
-
-
 <div class="viewcode-block" id="SamplingParams">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -657,13 +648,25 @@
 <span class="sd">        best_of (int, optional): Number of sequences to consider for best output. Defaults to None.</span>
 <span class="sd">        use_beam_search (bool): Whether to use beam search. Defaults to False.</span>
 
-<span class="sd">        top_k (int, optional): Controls number of logits to sample from. None means using C++ runtime default 0, i.e., all logits. Defaults to None.</span>
-<span class="sd">        top_p (float, optional): Controls the top-P probability to sample from. None means using C++ runtime default 0.f. Defaults to None.</span>
+<span class="sd">        top_k (int, optional): Controls number of logits to sample from. Can assume non-negative values, where 0 means &#39;all logits&#39;. Defaults to None.</span>
+<span class="sd">            The value None is treated as &quot;not specified&quot; in the following.</span>
+<span class="sd">            If neither temperature, top_p, nor top_k are specified, sampling is greedy.</span>
+<span class="sd">            If temperature &gt; 0 and/or top_p &lt; 1 are specified, sampling will proceed accordingly and top_k will default to top_k = 0.</span>
+<span class="sd">            Setting top_k = 1 results in greedy sampling.</span>
+<span class="sd">        top_p (float, optional): Controls the top-P probability to sample from. Can have values between 0 and 1. Defaults to None.</span>
+<span class="sd">            The value None is treated as &quot;not specified&quot; in the following.</span>
+<span class="sd">            If neither temperature, top_p, nor top_k are specified, sampling is greedy.</span>
+<span class="sd">            If temperature &gt; 0 and/or top_k &gt; 1 are specified, sampling will proceed accordingly and top_p will default to top_p = 1.</span>
+<span class="sd">            Setting top_p = 0 should result in greedy sampling, but is currently disallowed in the backend.</span>
 <span class="sd">        top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.</span>
 <span class="sd">        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.</span>
 <span class="sd">        top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.</span>
 <span class="sd">        seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.</span>
-<span class="sd">        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values &gt; 0.f. None means using C++ runtime default 1.0f. Defaults to None.</span>
+<span class="sd">        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values &gt;= 0.f. Defaults to None.</span>
+<span class="sd">            The value None is treated as &quot;not specified&quot; in the following.</span>
+<span class="sd">            If neither temperature, top_p, nor top_k are specified, sampling is greedy.</span>
+<span class="sd">            If top_p &lt; 1 and/or top_k &gt; 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.</span>
+<span class="sd">            Setting temperature = 0 results in greedy sampling.</span>
 <span class="sd">        min_tokens (int, optional): Lower bound on the number of tokens to generate. Values &lt; 1 have no effect. None means using C++ runtime default 1. Defaults to None.</span>
 <span class="sd">        beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value &gt; 0.f. Values &lt; 1.f encourages repetition, values &gt; 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.</span>
 <span class="sd">        repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value &gt; 0.f. Values &lt; 1.f encourages repetition, values &gt; 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.</span>
@@ -682,7 +685,7 @@
 <span class="sd">        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.</span>
 <span class="sd">        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.</span>
 <span class="sd">        return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.</span>
-<span class="sd">        additional_model_outputs (List[tensorrt_llm.sampling_params.AdditionalModelOutput], optional): The additional outputs to gather from the model. Defaults to None.</span>
+<span class="sd">        additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.</span>
 
 <span class="sd">        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.</span>
 <span class="sd">        guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.</span>
@@ -750,7 +753,7 @@
     <span class="n">exclude_input_from_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">return_encoder_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">return_perf_metrics</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="n">additional_model_outputs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">AdditionalModelOutput</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">additional_model_outputs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.</span>
     <span class="c1"># Can be deprecated after migration to PyTorch backend.</span>
@@ -799,11 +802,19 @@
 <span class="sd">        For instance, while the greedy decoding with n &gt; 1 is capable in the</span>
 <span class="sd">        Executor class of C++ runtime, the LLM API disallows such combination.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">best_of</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require 0 &lt;= top_p &lt;= 1, got top_p=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require top_k &gt;= 0, got top_k=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require temperature &gt;= 0, got temperature=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">temperature</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">best_of</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">best_of</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;best_of (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">best_of</span><span class="si">}</span><span class="s2">) cannot be less than n (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">best_of</span> <span class="o">&gt;</span> <span class="mi">1</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">best_of</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">best_of</span> <span class="o">&gt;</span> <span class="mi">1</span>
             <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_greedy_decoding</span>
             <span class="ow">and</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;TLLM_ALLOW_N_GREEDY_DECODING&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="p">):</span>
@@ -827,12 +838,28 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="p">)</span>
 
+    <span class="c1"># NB: Static, because downstream code only holds instances of</span>
+    <span class="c1">#     bindings.SamplingConfig (not SamplingParams).</span>
+<div class="viewcode-block" id="SamplingParams.params_imply_greedy_decoding">
+<a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.params_imply_greedy_decoding">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">params_imply_greedy_decoding</span><span class="p">(</span>
+        <span class="o">*</span><span class="p">,</span> <span class="n">temperature</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span> <span class="n">top_p</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span> <span class="n">top_k</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="p">):</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="p">(</span><span class="n">temperature</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">top_p</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">top_k</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="ow">or</span> <span class="n">top_k</span> <span class="o">==</span> <span class="mi">1</span>
+            <span class="ow">or</span> <span class="n">top_p</span> <span class="o">==</span> <span class="mf">0.0</span>
+            <span class="ow">or</span> <span class="n">temperature</span> <span class="o">==</span> <span class="mi">0</span>
+        <span class="p">)</span></div>
+
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_greedy_decoding</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="p">(</span>
-            <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_beam_search</span>
-            <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">top_k</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span> <span class="o">==</span> <span class="mi">1</span><span class="p">)</span>
-            <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="o">==</span> <span class="mf">0.0</span><span class="p">)</span>
+        <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_beam_search</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">params_imply_greedy_decoding</span><span class="p">(</span>
+            <span class="n">temperature</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">temperature</span><span class="p">,</span>
+            <span class="n">top_p</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span><span class="p">,</span>
+            <span class="n">top_k</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span>
         <span class="p">)</span>
 
     <span class="nd">@property</span>
@@ -981,6 +1008,12 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">config_kwargs</span><span class="p">[</span><span class="s2">&quot;return_log_probs&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_return_log_probs</span>
 
+        <span class="k">if</span> <span class="n">config_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;additional_model_outputs&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">config_kwargs</span><span class="p">[</span><span class="s2">&quot;additional_model_outputs&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">tllme</span><span class="o">.</span><span class="n">AdditionalModelOutput</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="n">output_name</span><span class="p">,</span> <span class="n">gather_context</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">output_name</span> <span class="ow">in</span> <span class="n">config_kwargs</span><span class="p">[</span><span class="s2">&quot;additional_model_outputs&quot;</span><span class="p">]</span>
+            <span class="p">]</span>
+
         <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">OutputConfig</span><span class="p">(</span><span class="o">**</span><span class="n">config_kwargs</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_get_guided_decoding_params</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="p">:</span>
@@ -1125,9 +1158,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

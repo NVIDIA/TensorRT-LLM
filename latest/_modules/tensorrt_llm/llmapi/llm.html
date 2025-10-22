@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -330,6 +330,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -360,6 +361,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -402,6 +404,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -418,6 +421,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -511,6 +515,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">tqdm</span><span class="w"> </span><span class="kn">import</span> <span class="n">tqdm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_disabled</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">MultimodalInput</span><span class="p">,</span> <span class="n">MultimodalParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">DefaultInputProcessor</span>
@@ -628,6 +633,7 @@
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;executor_cls&quot;</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_orchestrator_type</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;orchestrator_type&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="n">log_level</span> <span class="o">=</span> <span class="n">logger</span><span class="o">.</span><span class="n">level</span>
@@ -638,6 +644,12 @@
             <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Using LLM with PyTorch backend&quot;</span><span class="p">)</span>
                 <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TorchLlmArgs</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_orchestrator_type</span> <span class="o">==</span> <span class="s2">&quot;ray&quot;</span> <span class="ow">or</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_orchestrator_type</span> <span class="o">=</span> <span class="s2">&quot;ray&quot;</span>
+                    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;TLLM_DISABLE_MPI&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;1&quot;</span>
+                    <span class="c1"># Propagate to args construction</span>
+                    <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;orchestrator_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;ray&quot;</span>
+
             <span class="k">elif</span> <span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;_autodeploy&#39;</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Using LLM with AutoDeploy backend&quot;</span><span class="p">)</span>
                 <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch.auto_deploy.llm_args</span><span class="w"> </span><span class="kn">import</span> \
@@ -758,6 +770,7 @@
             <span class="n">DisaggregatedParams</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">scheduling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">,</span>
                                           <span class="n">List</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompts in the synchronous mode.</span>
 <span class="sd">        Synchronous generation accepts either single prompt or batched prompts.</span>
@@ -778,6 +791,7 @@
 <span class="sd">                Disaggregated parameters. Defaults to None.</span>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):</span>
 <span class="sd">                Scheduling parameters. Defaults to None.</span>
+<span class="sd">            cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -808,7 +822,9 @@
                                                    <span class="n">i</span><span class="p">),</span>
                 <span class="n">disaggregated_params</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">disaggregated_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">scheduling_params</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">scheduling_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
-                <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                <span class="n">cache_salt</span><span class="o">=</span><span class="n">_item_at</span><span class="p">(</span><span class="n">cache_salt</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
+                <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="p">)</span>
             <span class="n">futures</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
 
         <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">futures</span><span class="p">,</span>
@@ -1102,10 +1118,6 @@
                          <span class="n">is_gen_only</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]:</span>
-            <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">and</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;PyTorch backend currently only supports `logprobs=1`. Received `logprobs=</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">` (Top</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2"> logprobs). Please set `logprobs=1` in `sampling_params` instead.&quot;</span>
-                <span class="p">)</span>
             <span class="c1"># Check prompt length and query length against max_num_tokens to filter illegal requests.</span>
             <span class="c1"># Skip check for gen-only requests</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_gen_only</span><span class="p">:</span>
@@ -1450,8 +1462,7 @@
                 <span class="n">num_postprocess_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_postprocess_workers</span><span class="p">,</span>
                 <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
             <span class="p">),</span>
-            <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">lora_config</span><span class="o">=</span><span class="n">lora_config</span><span class="p">)</span>
+            <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
 
 <span class="nd">@append_docstring</span><span class="p">(</span><span class="n">TORCH_LLM_DOCSTRING</span><span class="p">)</span>
@@ -1492,6 +1503,34 @@
                          <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
                          <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_collective_rpc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                        <span class="n">method</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                        <span class="n">args</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+                        <span class="n">kwargs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                        <span class="n">non_block</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                        <span class="n">unique_reply_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Any</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            method (str): The name of the worker method to execute.</span>
+<span class="sd">            args (tuple[Any, ...]): Positional arguments to pass to the worker method. Defaults to ().</span>
+<span class="sd">            kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.</span>
+<span class="sd">            non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.</span>
+<span class="sd">            unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            list[Any]: A list of results from each worker.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">,</span> <span class="s1">&#39;collective_rpc&#39;</span><span class="p">):</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="n">method</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">,</span>
+                                                 <span class="n">non_block</span><span class="p">,</span> <span class="n">unique_reply_rank</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Executor type </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">)</span><span class="si">}</span><span class="s2"> does not support collective RPC.&quot;</span>
+            <span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="kc">None</span>
@@ -1525,9 +1564,6 @@
                 <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
             <span class="p">),</span>
             <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">lora_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="p">,</span>
-            <span class="c1"># Autodeploy does not support kv_connector_config</span>
-            <span class="n">kv_connector_config</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;kv_connector_config&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
             <span class="n">hf_model_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
             <span class="n">tokenizer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
             <span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
@@ -1697,9 +1733,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

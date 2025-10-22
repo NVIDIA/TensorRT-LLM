@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -330,6 +330,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -360,6 +361,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -402,6 +404,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -418,6 +421,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -538,7 +542,8 @@
     <span class="n">PoolsKVCacheManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.runtime.redrafter_utils</span><span class="w"> </span><span class="kn">import</span> <span class="o">*</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">torch_to_numpy</span><span class="p">,</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">binding_layer_type_to_str</span><span class="p">,</span> <span class="n">binding_to_str_dtype</span><span class="p">,</span>
+                      <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">torch_to_numpy</span><span class="p">,</span>
                       <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span><span class="p">,</span> <span class="n">ipc_nvls_allocate</span><span class="p">,</span> <span class="n">ipc_nvls_free</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..layers</span><span class="w"> </span><span class="kn">import</span> <span class="n">LanguageAdapterConfig</span>
@@ -1154,7 +1159,45 @@
     <span class="n">num_kv_heads_per_cross_attn_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">skip_cross_attn_blocks</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># language adapter</span>
-    <span class="n">language_adapter_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LanguageAdapterConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">language_adapter_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LanguageAdapterConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="ModelConfig.from_model_config_cpp">
+<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.from_model_config_cpp">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_model_config_cpp</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">model_config_cpp</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelConfig&#39;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Create a partially initialized ModelConfig instance from a given ModelConfig CPP binding instance.</span>
+
+<span class="sd">        Note that each of these classes have fields that don&#39;t exist in the other, so the created ModelConfigPython</span>
+<span class="sd">        won&#39;t have all of its fields initialized.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
+            <span class="n">vocab_size</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">num_layers</span><span class="p">(),</span>
+            <span class="n">num_heads</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">use_packed_input</span><span class="p">,</span>
+            <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">kv_cache_type</span><span class="p">,</span>
+            <span class="n">cross_attention</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">use_cross_attention</span><span class="p">,</span>
+            <span class="n">head_size</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
+            <span class="n">max_prompt_embedding_table_size</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span>
+            <span class="n">max_prompt_embedding_table_size</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">value</span><span class="p">),</span>
+            <span class="n">gather_context_logits</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">compute_context_logits</span><span class="p">,</span>
+            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">compute_generation_logits</span><span class="p">,</span>
+            <span class="n">gpt_attention_plugin</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">binding_to_str_dtype</span><span class="p">(</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">data_type</span><span class="p">),</span>
+            <span class="n">num_kv_heads_per_layer</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">num_kv_heads_per_layer</span><span class="p">,</span>
+            <span class="n">tokens_per_block</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+            <span class="n">lora_plugin</span><span class="o">=</span><span class="n">model_config_cpp</span><span class="o">.</span><span class="n">use_lora_plugin</span><span class="p">,</span>
+            <span class="n">layer_types</span><span class="o">=</span><span class="p">[</span>
+                <span class="n">binding_layer_type_to_str</span><span class="p">(</span><span class="n">lt</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">lt</span> <span class="ow">in</span> <span class="n">model_config_cpp</span><span class="o">.</span><span class="n">layer_types</span>
+            <span class="p">],</span>
+        <span class="p">)</span></div>
+</div>
 
 
 
@@ -5445,9 +5488,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

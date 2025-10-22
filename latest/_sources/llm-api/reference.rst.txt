@@ -288,7 +288,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: json,validate,model_dump_json,parse_obj,model_extra,model_post_init,model_dump,copy,model_fields_set,model_copy,model_computed_fields,model_parametrized_name,model_validate_json,dict,model_construct,model_fields,model_config,parse_file,construct,schema,model_validate_strings,model_validate,schema_json,model_rebuild,from_orm,update_forward_refs,parse_raw,model_json_schema
+    :exclude-members: model_config,model_rebuild,parse_raw,model_copy,parse_file,json,validate,model_validate,model_json_schema,copy,model_construct,model_fields,schema,update_forward_refs,model_computed_fields,model_validate_json,parse_obj,model_dump_json,model_validate_strings,model_extra,model_dump,from_orm,dict,model_fields_set,model_parametrized_name,model_post_init,schema_json,construct
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -297,7 +297,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: json,validate,model_dump_json,parse_obj,model_extra,model_post_init,model_dump,copy,model_fields_set,model_copy,model_computed_fields,model_parametrized_name,model_validate_json,dict,model_construct,model_fields,model_config,parse_file,construct,schema,model_validate_strings,model_validate,schema_json,model_rebuild,from_orm,update_forward_refs,parse_raw,model_json_schema
+    :exclude-members: model_config,model_rebuild,parse_raw,model_copy,parse_file,json,validate,model_validate,model_json_schema,copy,model_construct,model_fields,schema,update_forward_refs,model_computed_fields,model_validate_json,parse_obj,model_dump_json,model_validate_strings,model_extra,model_dump,from_orm,dict,model_fields_set,model_parametrized_name,model_post_init,schema_json,construct
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
@@ -316,6 +316,22 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.LoRARequest
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.RocketSparseAttentionConfig
     :members:
     :undoc-members:
     :show-inheritance:

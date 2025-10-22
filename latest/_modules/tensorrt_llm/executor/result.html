@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -330,6 +330,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -360,6 +361,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -402,6 +404,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -418,6 +421,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -498,6 +502,7 @@
   <h1>Source code for tensorrt_llm.executor.result</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">queue</span><span class="w"> </span><span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
@@ -508,11 +513,17 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
+<span class="k">try</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">ray</span>
+<span class="k">except</span> <span class="ne">ModuleNotFoundError</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">ray_stub</span> <span class="k">as</span> <span class="n">ray</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._ray_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">unwrap_ray_errors</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_disabled</span><span class="p">,</span> <span class="n">nvtx_range_debug</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_tracer</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncQueue</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncQueue</span><span class="p">,</span> <span class="n">print_traceback_on_error</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span><span class="p">,</span> <span class="n">MetricsCollector</span><span class="p">,</span> <span class="n">RequestEventTiming</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogprobParams</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">ErrorResponse</span><span class="p">,</span> <span class="n">has_event_loop</span><span class="p">,</span> <span class="n">is_llm_response</span>
@@ -596,6 +607,8 @@
 <span class="sd">        finish_reason (Literal[&#39;stop&#39;, &#39;length&#39;, &#39;timeout&#39;, &#39;cancelled&#39;], optional): The reason why the sequence is finished. Defaults to None.</span>
 <span class="sd">        stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.</span>
 <span class="sd">        generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.</span>
+<span class="sd">        additional_context_outputs (Dict[str, torch.Tensor], optional): The additional context outputs. Defaults to None.</span>
+<span class="sd">        additional_generation_outputs (Dict[str, torch.Tensor], optional): The additional generation outputs. Defaults to None.</span>
 <span class="sd">        disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.</span>
 <span class="sd">        request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.</span>
 
@@ -616,6 +629,8 @@
                                     <span class="s1">&#39;cancelled&#39;</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">stop_reason</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">generation_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">additional_context_outputs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">additional_generation_outputs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">request_perf_metrics</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">tllm</span><span class="o">.</span><span class="n">RequestPerfMetrics</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -647,12 +662,104 @@
 
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">warmup_tensorrt_llm</span><span class="p">():</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Warmup by importing tensorrt_llm with version&quot;</span><span class="p">,</span>
+          <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">__version__</span><span class="p">)</span>
+
+
+<span class="nd">@ray</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="n">max_concurrency</span><span class="o">=</span><span class="mi">1000000</span><span class="p">,</span> <span class="n">num_cpus</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RayAsyncQueue</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Ray actor for async response handling.&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">data</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">warmup_done</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Key </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> already registered&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">unregister</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">:</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">warmup</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">warmup_done</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">warmup_tensorrt_llm</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">warmup_done</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">put_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">item</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Key </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> not registered&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">item</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">get_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Key </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> not registered&quot;</span>
+        <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">wait</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="n">ret</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+        <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">ret</span>
+
+
+<span class="n">SYNC_QUEUE_MAX_CONCURRENCY</span> <span class="o">=</span> <span class="mi">2</span>
+
+
+<span class="nd">@ray</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="n">max_concurrency</span><span class="o">=</span><span class="n">SYNC_QUEUE_MAX_CONCURRENCY</span><span class="p">,</span>
+            <span class="n">num_cpus</span><span class="o">=</span><span class="n">SYNC_QUEUE_MAX_CONCURRENCY</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaySyncQueue</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Ray actor for sync response handling.&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">data</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">semaphore</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Semaphore</span><span class="p">(</span><span class="n">SYNC_QUEUE_MAX_CONCURRENCY</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">warmup_done</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Key </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> already registered&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">unregister</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">:</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">warmup</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">warmup_done</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">warmup_tensorrt_llm</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">warmup_done</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">put_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">item</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">item</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">semaphore</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">wait</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="n">ret</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+            <span class="k">return</span> <span class="n">ret</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">GenerationResultBase</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; This holds the core logic of the GenerationResult class. &#39;&#39;&#39;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="nb">id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">,</span>
+                 <span class="n">ray_queue</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">RayAsyncQueue</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">background_error_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">postproc_params</span><span class="p">:</span> <span class="s2">&quot;Optional[PostprocParams]&quot;</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">id</span> <span class="o">=</span> <span class="nb">id</span>
@@ -660,18 +767,29 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">postproc_params</span> <span class="o">=</span> <span class="n">postproc_params</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="c1"># Average decoded tokens per runtime iteration; set when the first LLM response arrives.</span>
         <span class="c1"># None indicates not yet available (e.g., before first step/stream).</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="p">{}</span>
 
-        <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">AsyncQueue</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">sync_q</span>
+        <span class="k">if</span> <span class="n">ray_queue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">ray_queue</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">ray_queue</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">with</span> <span class="n">unwrap_ray_errors</span><span class="p">():</span>
+                <span class="n">ray</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">register</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="nb">id</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">Queue</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">AsyncQueue</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">sync_q</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">Queue</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="c1"># In Sampling mode, the Executor runtime will return best_of sequences</span>
         <span class="c1"># in total, which the LLM API will select the n-best sequences among</span>
@@ -780,6 +898,14 @@
             <span class="n">output</span><span class="o">.</span><span class="n">generation_logits</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">generation_logits</span><span class="p">[</span>
                 <span class="n">src_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">output</span><span class="o">.</span><span class="n">length</span><span class="p">]</span>
 
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">&#39;additional_context_outputs&#39;</span><span class="p">,</span>
+                   <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">additional_context_outputs</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">additional_context_outputs</span>
+
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">&#39;additional_generation_outputs&#39;</span><span class="p">,</span>
+                   <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">additional_generation_outputs</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">additional_generation_outputs</span>
+
         <span class="c1"># when sampling_params.n &gt; 1 and is cancelled, make sure all the outputs</span>
         <span class="c1"># be marked as cancelled.</span>
         <span class="k">if</span> <span class="n">finish_reasons</span> <span class="ow">and</span> <span class="n">finish_reasons</span><span class="p">[</span>
@@ -816,6 +942,7 @@
                     <span class="sa">f</span><span class="s2">&quot;Unknown finish reason: </span><span class="si">{</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">record_stats</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
 
+    <span class="nd">@print_traceback_on_error</span>
     <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;handle_response&quot;</span><span class="p">,</span>
                       <span class="n">color</span><span class="o">=</span><span class="s2">&quot;red&quot;</span><span class="p">,</span>
                       <span class="n">category</span><span class="o">=</span><span class="s2">&quot;GenerationResultBase&quot;</span><span class="p">)</span>
@@ -837,6 +964,18 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">_postprocess_result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
+
+            <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span>
+                <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">request_perf_metrics</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">disaggregated_params</span><span class="p">:</span>
+                <span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">disaggregated_params</span>
+
+                <span class="c1"># Generation only response has no disaggregated_params attached</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">disaggregated_params</span><span class="p">:</span>
+                    <span class="n">disaggregated_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span>
+
+                <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">disaggregated_params</span>
+
             <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span>
 
@@ -858,6 +997,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">is_final</span>
             <span class="n">context_phase_params</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_phase_params</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">decoding_iter</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;cached_tokens&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span>
             <span class="k">if</span> <span class="n">context_phase_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="n">DisaggregatedParams</span><span class="p">(</span>
@@ -907,6 +1047,12 @@
                 <span class="n">handler</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error_msg</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown response type: </span><span class="si">{</span><span class="n">response</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="ow">and</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+            <span class="k">assert</span> <span class="nb">hasattr</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="p">,</span> <span class="s2">&quot;unregister&quot;</span>
+            <span class="p">),</span> <span class="s2">&quot;Ray path should be activated for unregistering the Ray queue.&quot;</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">unregister</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">record_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                      <span class="n">output</span><span class="p">:</span> <span class="n">CompletionOutput</span><span class="p">,</span>
@@ -1030,9 +1176,15 @@
         <span class="n">disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">logprob_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LogprobParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">use_async_queue</span> <span class="o">=</span> <span class="n">has_event_loop</span><span class="p">()</span>
+        <span class="n">shared_queue</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">executor</span> <span class="ow">and</span> <span class="n">executor</span><span class="o">.</span><span class="n">use_ray_queue</span><span class="p">():</span>
+            <span class="n">shared_queue</span> <span class="o">=</span> <span class="n">executor</span><span class="o">.</span><span class="n">async_response_queue_weakref</span> <span class="k">if</span> <span class="n">use_async_queue</span> <span class="k">else</span> <span class="n">executor</span><span class="o">.</span><span class="n">sync_response_queue_weakref</span>
+
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
             <span class="n">generation_request</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
             <span class="n">generation_request</span><span class="o">.</span><span class="n">sampling_params</span><span class="p">,</span>
+            <span class="n">shared_queue</span><span class="p">,</span>
             <span class="n">background_error_handler</span><span class="p">,</span>
             <span class="n">postproc_params</span><span class="o">=</span><span class="n">generation_request</span><span class="o">.</span><span class="n">postproc_params</span><span class="p">,</span>
         <span class="p">)</span>
@@ -1086,13 +1238,26 @@
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_logprob_params&quot;</span><span class="p">):</span>
             <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_logprob_params</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_handle_ray_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">response</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_result_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+            <span class="k">with</span> <span class="n">unwrap_ray_errors</span><span class="p">():</span>
+                <span class="n">response</span> <span class="o">=</span> <span class="n">ray</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">))</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_ray_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">_handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 
     <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_aresult_step</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;The asyncio event loop was not present during initialization, so async operations are not available.&quot;</span>
-        <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">mpi_disabled</span><span class="p">():</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get_async</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_ray_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
         <span class="n">global_tracer</span><span class="p">()</span><span class="o">.</span><span class="n">log_instant</span><span class="p">(</span><span class="s2">&quot;result_step.get&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 
@@ -1426,9 +1591,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

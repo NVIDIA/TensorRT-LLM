@@ -2,7 +2,7 @@ Genai Perf Client For Multimodal
 ================================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/560ded5450b79efde720162fc397d7efa59aae6d/examples/serve/genai_perf_client_for_multimodal.sh.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/796891ba2a6959bad58c0da9645416c7264349e9/examples/serve/genai_perf_client_for_multimodal.sh.
 
 .. literalinclude:: ../../../examples/serve/genai_perf_client_for_multimodal.sh
     :lines: 1-19

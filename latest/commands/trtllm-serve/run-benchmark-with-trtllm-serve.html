@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -337,6 +337,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -367,6 +368,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -409,6 +411,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -425,6 +428,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -526,7 +530,7 @@ A complete reference for the API is available in the <a class="reference externa
 <h2>Launch the NGC container<a class="headerlink" href="#launch-the-ngc-container" title="Link to this heading">#</a></h2>
 <p>TensorRT LLM distributes the pre-built container on <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>.</p>
 <p>You can launch the container using the following command:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc0
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc1
 </pre></div>
 </div>
 </section>
@@ -648,33 +652,55 @@ INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span cla
 </div>
 <section id="key-metrics">
 <h3>Key Metrics<a class="headerlink" href="#key-metrics" title="Link to this heading">#</a></h3>
+<section id="time-to-first-token-ttft">
+<h4>Time to First Token (TTFT)<a class="headerlink" href="#time-to-first-token-ttft" title="Link to this heading">#</a></h4>
 <ul class="simple">
-<li><p>Median Time to First Token (TTFT)</p>
-<ul>
 <li><p>The typical time elapsed from when a request is sent until the first output token is generated.</p></li>
 </ul>
-</li>
-<li><p>Median Time Per Output Token (TPOT)</p>
-<ul>
-<li><p>The typical time required to generate each token <em>after</em> the first one.</p></li>
+</section>
+<section id="time-per-output-token-tpot-and-inter-token-latency-itl">
+<h4>Time Per Output Token (TPOT) and Inter-Token Latency (ITL)<a class="headerlink" href="#time-per-output-token-tpot-and-inter-token-latency-itl" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>TPOT is the typical time required to generate each token <em>after</em> the first one.</p></li>
+<li><p>ITL is the typical time delay between the completion of one token and the completion of the next.</p></li>
+<li><p>Both TPOT and ITL ignore TTFT.</p></li>
 </ul>
-</li>
-<li><p>Median Inter-Token Latency (ITL)</p>
-<ul>
-<li><p>The typical time delay between the completion of one token and the completion of the next.</p></li>
-</ul>
-</li>
-<li><p>Median End-to-End Latency (E2EL)</p>
-<ul>
+<p>For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+</pre></div>
+</div>
+<p>Across different requests, <strong>average TPOT</strong> is the mean of each request’s TPOT (all requests weighted equally), while <strong>average ITL</strong> is token-weighted (all tokens weighted equally):</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+</pre></div>
+</div>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+</pre></div>
+</div>
+</section>
+<section id="end-to-end-e2e-latency">
+<h4>End-to-End (E2E) Latency<a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
+<ul class="simple">
 <li><p>The typical total time from when a request is submitted until the final token of the response is received.</p></li>
 </ul>
-</li>
-<li><p>Total Token Throughput</p>
-<ul>
+</section>
+<section id="total-token-throughput">
+<h4>Total Token Throughput<a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
+<ul class="simple">
 <li><p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p></li>
 </ul>
-</li>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+</pre></div>
+</div>
+</section>
+<section id="tokens-per-second-tps-or-output-token-throughput">
+<h4>Tokens Per Second (TPS) or Output Token Throughput<a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>how many output tokens the system generates each second.</p></li>
 </ul>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+</pre></div>
+</div>
+</section>
 </section>
 </section>
 <section id="about-extra-llm-api-options">
@@ -762,28 +788,28 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 </div>
 <p>Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">============</span> <span class="n">Serving</span> <span class="n">Benchmark</span> <span class="n">Result</span> <span class="o">============</span>
-<span class="n">Successful</span> <span class="n">requests</span><span class="p">:</span>                     <span class="mi">1</span>         
-<span class="n">Benchmark</span> <span class="n">duration</span> <span class="p">(</span><span class="n">s</span><span class="p">):</span>                  <span class="mf">0.83</span>      
-<span class="n">Total</span> <span class="nb">input</span> <span class="n">tokens</span><span class="p">:</span>                      <span class="mi">128</span>       
-<span class="n">Total</span> <span class="n">generated</span> <span class="n">tokens</span><span class="p">:</span>                  <span class="mi">128</span>       
-<span class="n">Request</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">req</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>              <span class="mf">1.20</span>      
-<span class="n">Output</span> <span class="n">token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>         <span class="mf">153.92</span>    
-<span class="n">Total</span> <span class="n">Token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>          <span class="mf">307.85</span>    
-<span class="n">User</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>                 <span class="mf">154.15</span>    
-<span class="n">Mean</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                         <span class="mf">0.9845</span>    
-<span class="n">Median</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                       <span class="mf">0.9845</span>    
+<span class="n">Successful</span> <span class="n">requests</span><span class="p">:</span>                     <span class="mi">1</span>
+<span class="n">Benchmark</span> <span class="n">duration</span> <span class="p">(</span><span class="n">s</span><span class="p">):</span>                  <span class="mf">0.83</span>
+<span class="n">Total</span> <span class="nb">input</span> <span class="n">tokens</span><span class="p">:</span>                      <span class="mi">128</span>
+<span class="n">Total</span> <span class="n">generated</span> <span class="n">tokens</span><span class="p">:</span>                  <span class="mi">128</span>
+<span class="n">Request</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">req</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>              <span class="mf">1.20</span>
+<span class="n">Output</span> <span class="n">token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>         <span class="mf">153.92</span>
+<span class="n">Total</span> <span class="n">Token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>          <span class="mf">307.85</span>
+<span class="n">User</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>                 <span class="mf">154.15</span>
+<span class="n">Mean</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                         <span class="mf">0.9845</span>
+<span class="n">Median</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                       <span class="mf">0.9845</span>
 <span class="o">---------------</span><span class="n">Time</span> <span class="n">to</span> <span class="n">First</span> <span class="n">Token</span><span class="o">----------------</span>
-<span class="n">Mean</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">84.03</span>     
-<span class="n">Median</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">84.03</span>     
-<span class="n">P99</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">84.03</span>     
+<span class="n">Mean</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">84.03</span>
+<span class="n">Median</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">84.03</span>
+<span class="n">P99</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">84.03</span>
 <span class="o">-----</span><span class="n">Time</span> <span class="n">per</span> <span class="n">Output</span> <span class="n">Token</span> <span class="p">(</span><span class="n">excl</span><span class="o">.</span> <span class="mi">1</span><span class="n">st</span> <span class="n">token</span><span class="p">)</span><span class="o">------</span>
-<span class="n">Mean</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">5.88</span>      
-<span class="n">Median</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">5.88</span>      
-<span class="n">P99</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.88</span>      
+<span class="n">Mean</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">5.88</span>
+<span class="n">Median</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">5.88</span>
+<span class="n">P99</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.88</span>
 <span class="o">---------------</span><span class="n">Inter</span><span class="o">-</span><span class="n">token</span> <span class="n">Latency</span><span class="o">----------------</span>
-<span class="n">Mean</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.83</span>      
-<span class="n">Median</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="mf">5.88</span>      
-<span class="n">P99</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="mf">6.14</span>      
+<span class="n">Mean</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.83</span>
+<span class="n">Median</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="mf">5.88</span>
+<span class="n">P99</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="mf">6.14</span>
 <span class="o">==================================================</span>
 </pre></div>
 </div>
@@ -851,7 +877,14 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-ngc-container">Launch the NGC container</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#start-the-trtllm-serve-service">Start the trtllm-serve service</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-benchmark">Run the benchmark</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-to-first-token-ttft">Time to First Token (TTFT)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-per-output-token-tpot-and-inter-token-latency-itl">Time Per Output Token (TPOT) and Inter-Token Latency (ITL)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-e2e-latency">End-to-End (E2E) Latency</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#total-token-throughput">Total Token Throughput</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tokens-per-second-tps-or-output-token-throughput">Tokens Per Second (TPS) or Output Token Throughput</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about-extra-llm-api-options">About <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code></a><ul class="nav section-nav flex-column">
@@ -960,9 +993,9 @@ trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">m
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       
