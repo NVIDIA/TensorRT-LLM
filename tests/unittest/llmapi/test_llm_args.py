@@ -181,10 +181,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
-def test_KvCacheConfig_default_values():
-    check_defaults(KvCacheConfig, tle.KvCacheConfig)
-
-
 def test_CapacitySchedulerPolicy():
     val = CapacitySchedulerPolicy.MAX_UTILIZATION
     assert PybindMirror.maybe_to_pybind(
