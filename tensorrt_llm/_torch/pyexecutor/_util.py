@@ -101,12 +101,6 @@ class KvCacheCreator:
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
 
-    def _get_free_gpu_memory_fraction(self) -> float:
-        fraction = self._kv_cache_config.free_gpu_memory_fraction
-        if fraction is None:
-            fraction = 0.9
-        return fraction
-
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
@@ -299,7 +293,7 @@ class KvCacheCreator:
         # TODO: support CP by generating dummy requests for it.
         assert 'cp_type' not in mapping.cp_config
 
-        fraction = self._get_free_gpu_memory_fraction()
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
