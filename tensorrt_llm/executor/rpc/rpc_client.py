@@ -8,7 +8,9 @@ import zmq
 
 from tensorrt_llm._utils import nvtx_mark_debug
 
-from ...llmapi.utils import AsyncQueue, _SyncQueue, logger_debug
+from ..._utils import nvtx_range_debug
+from ...llmapi.utils import (AsyncQueue, _SyncQueue, enable_llmapi_debug,
+                             logger_debug)
 from ...logger import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
@@ -175,8 +177,10 @@ class RPCClient:
             # put to the sync queue, as the current event loop is
             # different from the one in call_async or call_streaming
             assert isinstance(queue, AsyncQueue)
-            logger_debug(
-                f"RPC Client putting response to AsyncQueue: {response}")
+            if enable_llmapi_debug() or logger.level == 'debug':
+                logger_debug(
+                    f"RPC Client putting response to AsyncQueue: status={response.stream_status}, request_id={response.request_id}"
+                )
             queue.sync_q.put(response)
             # Clean up if stream ended
             if response.stream_status in ['end', 'error']:
@@ -188,32 +192,29 @@ class RPCClient:
         Args:
             response: The response to handle
         """
-        logger_debug(
-            f"Handling regular response for request_id: {response.request_id}")
-
         if future_info := self._pending_futures.get(response.request_id):
             future, target_loop = future_info
-            logger_debug(
-                f"Found future for request_id: {response.request_id}, future done: {future.done()}"
-            )
 
             if not future.done():
                 if response.error is None:
-                    logger_debug(
-                        f"Setting result for request_id: {response.request_id}, result: {response.result}"
-                    )
+                    if enable_llmapi_debug() or logger.level == 'debug':
+                        logger_debug(
+                            f"Setting result for request_id: {response.request_id}"
+                        )
                     target_loop.call_soon_threadsafe(future.set_result,
                                                      response.result)
                 else:
                     # Use the original RPCError from the response
-                    logger_debug(
-                        f"Setting exception for request_id: {response.request_id}, error: {response.error}"
-                    )
+                    if enable_llmapi_debug() or logger.level == 'debug':
+                        logger_debug(
+                            f"Setting exception for request_id: {response.request_id}, error: {response.error}"
+                        )
                     target_loop.call_soon_threadsafe(future.set_exception,
                                                      response.error)
         else:
-            logger_debug(
-                f"No future found for request_id: {response.request_id}")
+            if enable_llmapi_debug() or logger.level == 'debug':
+                logger_debug(
+                    f"No future found for request_id: {response.request_id}")
 
         self._pending_futures.pop(response.request_id, None)
 
@@ -256,35 +257,43 @@ class RPCClient:
         logger_debug("Response reader started")
 
         while not self._stop_event.is_set():
-            try:
-                response = await self._wait_for_response()
-                if response is None:
-                    continue
+            with nvtx_range_debug("response_reader",
+                                  color="cyan",
+                                  category="RPC"):
+                try:
+                    response = await self._wait_for_response()
 
-                nvtx_mark_debug(
-                    f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
-                    color="black",
-                    category="RPC")
+                    if response is None:
+                        continue
 
-                logger_debug(f"RPC Client received response: {response}")
-                logger_debug(
-                    f"Response request_id: {response.request_id}, is_streaming: {response.is_streaming}"
-                )
-                logger_debug(
-                    f"Pending futures: {list(self._pending_futures.keys())}")
+                    nvtx_mark_debug(
+                        f"RPC.response.{'streaming' if response.is_streaming else 'sync'}",
+                        color="black",
+                        category="RPC")
 
-                if response.is_streaming:
-                    self._handle_streaming_response(response)
-                else:
-                    self._handle_regular_response(response)
+                    # Optimize: Check debug flag before expensive string operations
+                    # This avoids holding GIL for f-string evaluation when debug is disabled
+                    if enable_llmapi_debug() or logger.level == 'debug':
+                        logger_debug(
+                            f"RPC Client received response: request_id={response.request_id}, "
+                            f"is_streaming={response.is_streaming}, "
+                            f"pending_futures={len(self._pending_futures)}")
 
-            except asyncio.CancelledError:
-                # Still handle cancellation for backward compatibility
-                logger_debug("Response reader cancelled")
-                break
-            except Exception as e:
-                await self._handle_reader_exception(e)
-                break
+                    with nvtx_range_debug("handle_response",
+                                          color="purple",
+                                          category="RPC"):
+                        if response.is_streaming:
+                            self._handle_streaming_response(response)
+                        else:
+                            self._handle_regular_response(response)
+
+                except asyncio.CancelledError:
+                    # Still handle cancellation for backward compatibility
+                    logger_debug("Response reader cancelled")
+                    break
+                except Exception as e:
+                    await self._handle_reader_exception(e)
+                    break
 
         logger_debug("Response reader exiting gracefully")
         self._reader_task = None
@@ -310,9 +319,8 @@ class RPCClient:
         Returns:
             The result of the remote method call
         """
-        logger_debug(
-            f"RPC client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
-        )
+        if enable_llmapi_debug() or logger.level == 'debug':
+            logger_debug(f"RPC client calling method: {method_name}")
         nvtx_mark_debug(f"RPC.async.{method_name}",
                         color="yellow",
                         category="RPC")
@@ -331,7 +339,6 @@ class RPCClient:
                              kwargs,
                              need_response,
                              timeout=timeout)
-        logger_debug(f"RPC client sending request: {request}")
         await self._client_socket.put_async(request)
 
         if not need_response:
@@ -339,28 +346,17 @@ class RPCClient:
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        logger_debug(
-            f"RPC Client _call_async: Created future for request_id: {request_id} in loop: {id(loop)}"
-        )
         self._pending_futures[request_id] = (future, loop)
-        logger_debug(
-            f"RPC Client _call_async: Stored future in pending_futures")
 
         try:
             # If timeout, the remote call should return a timeout error timely,
             # so we add 1 second to the timeout to ensure the client can get
             # that result.
-            logger_debug(
-                f"RPC Client _call_async: Awaiting future for request_id: {request_id}"
-            )
             if timeout is None:
                 res = await future
             else:
                 # Add 1 second to the timeout to ensure the client can get
                 res = await asyncio.wait_for(future, timeout)
-            logger_debug(
-                f"RPC Client _call_async: Got result for request_id: {request_id}: {res}"
-            )
             return res
         except RPCCancelled:
             self._server_stopped = True
@@ -394,22 +390,15 @@ class RPCClient:
 
     def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
-        logger_debug(
-            f"RPC Client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
-        )
+        if enable_llmapi_debug() or logger.level == 'debug':
+            logger_debug(f"RPC Client calling method: {method_name}")
         nvtx_mark_debug(f"RPC.sync.{method_name}",
                         color="green",
                         category="RPC")
         self._ensure_event_loop()
-        logger_debug(
-            f"RPC Client _call_sync: Creating future for {method_name}")
         future = asyncio.run_coroutine_threadsafe(
             self._call_async(method_name, *args, **kwargs), self._loop)
-        logger_debug(
-            f"RPC Client _call_sync: Waiting for result of {method_name}")
         result = future.result()
-        logger_debug(
-            f"RPC Client _call_sync: Got result for {method_name}: {result}")
         return result
 
     def _call_future(self, name: str, *args,
@@ -478,24 +467,21 @@ class RPCClient:
 
             # Read streaming responses
             while True:
-                logger_debug(f"RPC Client _call_streaming waiting for response",
-                             color="green")
                 if timeout is None:
                     response = await queue.get()
                 else:
                     response = await asyncio.wait_for(queue.get(),
                                                       timeout=timeout)
 
-                logger_debug(
-                    f"RPC Client _call_streaming received [{response.stream_status}] response: {response}",
-                    color="green")
+                if enable_llmapi_debug() or logger.level == 'debug':
+                    logger_debug(
+                        f"RPC Client _call_streaming received [{response.stream_status}] response",
+                        color="green")
+
                 if response.stream_status == 'start':
                     # Start of stream
                     continue
                 elif response.stream_status == 'data':
-                    logger_debug(
-                        f"RPC Client _call_streaming received data: {response.result}",
-                        color="green")
                     yield response.result
                 elif response.stream_status == 'end':
                     # End of stream

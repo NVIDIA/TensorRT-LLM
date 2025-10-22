@@ -18,7 +18,7 @@ from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
-from .._utils import nvtx_range_debug
+from .._utils import gc_nvtx_watcher, nvtx_range_debug
 from ..bindings import executor as tllm
 from ..bindings import steady_clock_now
 from ..builder import EngineConfig
@@ -127,6 +127,9 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
+
+        # Enable GC NVTX profiling if environment variable is set
+        self.gc_nvtx_watcher_handle = gc_nvtx_watcher()
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
