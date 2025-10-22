@@ -468,6 +468,8 @@ __device__ RegRowWiseVec computeWarpRowSum(Gemm0Acc& src);
 __device__ void storeGemm0AccToShm(
     uint32_t warpRank, uint32_t lane, SharedMem::XBuffer& smemX, CtaBarrier& barConsumed, Gemm0Acc const& acc);
 __device__ RegRowWiseVec loadShmRowWiseVecWithDup(uint32_t warpRank, ShmQWiseVec const& smemVec);
+__device__ RegRowWiseVec loadGmemRowWiseVecCyclically(
+    uint32_t warpRank, ShmQWiseVec const& gmemVec, uint32_t cyclicSize);
 __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec, RegRowWiseVec const& regVec);
 #endif
 
@@ -495,8 +497,10 @@ __device__ void rescaleGemm1AccForNewRowMax_sync(uint32_t warpRank, ShmQWiseVec 
     ShmQWiseVec const(&shmXRowSum), ShmQWiseVec& shmAccRowMax, Gemm1Acc& acc, ShmQWiseVec& shmAccRowSum);
 template <typename DstHead>
 __device__ void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst, SharedMem::OutSwizzleBuf& swizzleBuf,
-    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accColSum,
-    uint32_t nbKHeads /* only for final result in spec dec. set to 1 for workspace*/, uint32_t ctaNbValidTokens);
+    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accColSum, ShmQWiseVec const& accColMax,
+    ShmQWiseVec const* attentionSinksVec,
+    uint32_t nbKHeads /* only for final result in spec dec and attention sinks. set to 1 for workspace*/,
+    uint32_t ctaNbValidTokens);
 #endif
 
 inline constexpr uint32_t ropeNbPairsPerThrdImpl(uint32_t nbThrds)
@@ -1404,7 +1408,7 @@ CUBIN_EXPORT __global__
                         smem.gemm1WarpGrpBar, smem.gemm1AccColSum, smem.gemm1AccColMax, nullptr);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
-                        smem.gemm1AccColSum, 1, ctaNbValidTokens);
+                        smem.gemm1AccColSum, smem.gemm1AccColMax, nullptr, 1, ctaNbValidTokens);
 #endif
                 }
                 else
@@ -1423,7 +1427,7 @@ CUBIN_EXPORT __global__
                         nbKHeads);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
-                        smem.gemm1AccColSum, nbKHeads, ctaNbValidTokens);
+                        smem.gemm1AccColSum, smem.gemm1AccColMax, attentionSinksVec, nbKHeads, ctaNbValidTokens);
 #endif
                 }
             }
@@ -1778,8 +1782,7 @@ CUBIN_EXPORT __global__
                 for (uint32_t i = 0; i < headsPerWarp; i++)
                 {
                     uint32_t const idxHead = wid + nbMathWarps * i;
-                    float sink = expf(
-                        attentionSinks[mha::min(idxHead, headGrpSize - 1) + idxHeadGrp * headGrpSize] - states[i].max);
+                    float sink = expf(attentionSinks[idxHead % headGrpSize + idxHeadGrp * headGrpSize] - states[i].max);
                     states[i].sum += sink;
                 }
             }
@@ -2704,6 +2707,23 @@ __device__ inline RegRowWiseVec loadShmRowWiseVecWithDup(uint32_t warpRank, ShmQ
     return vec;
 }
 
+__device__ inline RegRowWiseVec loadGmemRowWiseVecCyclically(
+    uint32_t warpRank, ShmQWiseVec const& gmemVec, uint32_t cyclicSize)
+{
+    RegRowWiseVec vec;
+    uint32_t const idxQuad = laneId() / 4;
+#pragma unroll
+    for (uint32_t m = 0; m < RegRowWiseVec::size; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < RegRowWiseVec::Elem::size; i++)
+        {
+            vec[m][i] = gmemVec[(gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad) % cyclicSize];
+        }
+    }
+    return vec;
+}
+
 __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec, RegRowWiseVec const& regVec)
 {
     uint32_t const lane = laneId();
@@ -3218,10 +3238,18 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t wa
 #else
 template <typename DstHead>
 __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst, SharedMem::OutSwizzleBuf& swizzleBuf,
-    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accRowSum,
-    uint32_t nbKHeads /* for spec dec. set to 1 for workspace*/, uint32_t ctaNbValidTokens)
+    Gemm1Acc& acc, float xvoScale, ShmQWiseVec const& accRowSum, ShmQWiseVec const& accRowMax,
+    ShmQWiseVec const* attentionSinksVec,
+    uint32_t nbKHeads /* for spec dec and attention sinks. set to 1 for workspace*/, uint32_t ctaNbValidTokens)
 {
-    auto const regRowSum = loadShmRowWiseVecWithDup(warpRank, accRowSum);
+    auto regRowSum = loadShmRowWiseVecWithDup(warpRank, accRowSum);
+    if (attentionSinksVec != nullptr)
+    {
+        auto const regRowMax = loadShmRowWiseVecWithDup(warpRank, accRowMax);
+        auto const regAttentionSinks = loadGmemRowWiseVecCyclically(warpRank, attentionSinksVec[0], headGrpSize);
+        auto const regRowSinks = expf(regAttentionSinks - regRowMax);
+        regRowSum = regRowSum + regRowSinks;
+    }
     auto const regOutScale = __frcp_rn(regRowSum) * xvoScale;
     rescaleAcc(acc, regOutScale);
 

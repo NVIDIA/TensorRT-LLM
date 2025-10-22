@@ -1055,6 +1055,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 
         constexpr float kE4M3_MAX = 448.F;
         float const xScale = useQGMMA ? 1 / kE4M3_MAX : 1.f;
+        uint32_t nbTotalElements = 0;
         for (uint32_t req = 0; req < batchSize; req++)
         {
             for (uint32_t b = 0; b < beamWidth; b++)
@@ -1121,10 +1122,12 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 #endif
 #if SPEC_DEC
+                        auto const refAttentionSinks
+                            = hasAttentionSinks ? attentionSinksPtr + runtimeHeadGrpSize * idxKHead : nullptr;
                         Eigen::Matrix<float, runtimeHeadGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                         refOutput = refAttention<InputElem>(&qHeads[req][b][q_len][runtimeHeadGrpSize * idxKHead],
                             kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
-                            hostMask, qSeqLen, q_len);
+                            refAttentionSinks, hostMask, qSeqLen, q_len);
 #else
                     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                     auto const refAttentionSinks
@@ -1172,6 +1175,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
                                 float const ref = refOutput(i, j);
                                 checkClose(OutputElem{}, val, ref, allowedErr * rcpOutScale[0]);
+                                nbTotalElements++;
                             }
                         }
                     }
@@ -1198,7 +1202,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             printf("max absolute error: %f\n", maxAbsErr);
             printf("max relative error: %f\n", maxRelErr);
         }
-        EXPECT_EQ(nbErrors, 0) << "number of wrong elements: " << nbErrors;
+        EXPECT_EQ(nbErrors, 0) << "number of wrong elements: " << nbErrors
+                               << ", number of total elements: " << nbTotalElements;
     }
 #if SPEC_DEC
     free(hostMask);
