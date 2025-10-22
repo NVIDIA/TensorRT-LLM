@@ -3,11 +3,10 @@ from typing import List
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
-
-from .test_llm import llama_model_path
 
 
 class HFModel:
@@ -164,6 +163,8 @@ def run_generate(llm, hf_model, prompts, sampling_params):
 
 
 def test_llm_update_weights():
+    llama_model_path = str(llm_models_root() /
+                           "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     kv_cache_config = KvCacheConfig(enable_block_reuse=True,
                                     free_gpu_memory_fraction=0.1)
 

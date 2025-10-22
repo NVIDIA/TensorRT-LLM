@@ -1,13 +1,14 @@
+from utils.llm_data import llm_models_root
 from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.py_executor import ExecutorMemoryType
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
-from .test_llm import llama_model_path
-
 
 def test_llm_sleep(process_gpu_memory_info_available):
+    llama_model_path = str(llm_models_root() /
+                           "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
 
     llm = LLM(
