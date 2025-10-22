@@ -11,7 +11,8 @@ from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig, KvCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          EagleDecodingConfig, KvCacheConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           SamplerType, SchedulerConfig,
                                           SparseAttentionConfig,
@@ -666,7 +667,7 @@ def create_py_executor_instance(
     max_num_tokens: Optional[int] = None,
     peft_cache_config: Optional[PeftCacheConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
-    cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
