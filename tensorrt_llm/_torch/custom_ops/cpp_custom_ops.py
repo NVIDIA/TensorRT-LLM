@@ -150,7 +150,7 @@ def _register_fake():
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
 
-    @torch.library.register_fake("trtllm::fp8_block_scaling_gemm")
+    @torch.library.register_fake("trtllm::fp8_block_scaling_gemm_impl")
     def _(a, b, a_scale, b_scale):
         m = a.shape[0]
         n = b.shape[0]
