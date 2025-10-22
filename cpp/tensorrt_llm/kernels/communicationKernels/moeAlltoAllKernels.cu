@@ -489,10 +489,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
-    constexpr int kBlockSize = 256;
-    int n = params.local_num_tokens * params.ep_size;
-    int grid = ceilDiv(n, kBlockSize);
-    moeA2APrepareDispatchKernel<<<grid, kBlockSize, 0, params.stream>>>(
+    moeA2APrepareDispatchKernel<<<1, params.ep_size, 0, params.stream>>>(
         params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
 }
 
