@@ -1,7 +1,7 @@
 #!/bin/bash
 set -ex
 
-MOONCAKE_VERSION="v0.3.5"
+MOONCAKE_VERSION="v0.3.6.post1"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local"
 
