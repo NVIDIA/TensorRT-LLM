@@ -84,7 +84,7 @@ def add_llm_args(parser):
     parser.add_argument('--disable_kv_cache_reuse',
                         default=False,
                         action='store_true')
-    parser.add_argument("--kv_cache_fraction", type=float, default=None)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
