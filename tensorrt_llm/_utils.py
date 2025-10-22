@@ -1207,3 +1207,50 @@ def is_device_integrated() -> bool:
     if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_properties().is_integrated
+
+
+# Environment variable to enable garbage collection profiling.
+# Set to "1" to enable recording of garbage collection events during profiling.
+PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
+
+
+class _GCNvtxHandle:
+    """Handle object for GC NVTX watcher to keep it alive."""
+
+
+def gc_nvtx_watcher() -> Optional[_GCNvtxHandle]:
+    """
+    Set up NVTX range markers for Python garbage collection events.
+    This helps in profiling to visualize when GC occurs during execution.
+
+    Returns:
+        _GCNvtxHandle or None: A handle object that keeps the GC callback alive,
+                               or None if GC profiling is not enabled.
+    """
+    enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
+    if not enabled:
+        return None
+
+    range_id: Optional[int] = None
+
+    def gc_callback(phase, _):
+        nonlocal range_id
+        if phase == "start":
+            assert range_id is None, "Unexpected state in GC callback: another GC while last GC not finished?"
+            range_id = torch.cuda.nvtx.range_start("Python GC")
+        elif phase == "stop":
+            assert range_id is not None, "Unexpected state in GC callback: no active GC but got GC finished?"
+            torch.cuda.nvtx.range_end(range_id)
+            range_id = None
+
+    gc.callbacks.append(gc_callback)
+
+    def gc_cleanup(callback):
+        try:
+            gc.callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    handle = _GCNvtxHandle()
+    weakref.finalize(handle, gc_cleanup, gc_callback)
+    return handle
