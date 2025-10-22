@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
 from torch import nn
@@ -48,8 +48,10 @@ class Eagle3ResourceManager(BaseResourceManager):
             self.max_total_draft_tokens = self.max_draft_len
 
         # empty hidden states tensor
-        max_num_tokens = min(max_num_tokens,
-                             max_num_requests * self.max_seq_len)
+        max_num_tokens = min(
+            max_num_tokens, max_num_requests *
+            (self.max_total_draft_tokens + 1)) + (self.max_total_draft_tokens +
+                                                  1)
         self.hidden_states = torch.empty(
             (max_num_tokens, self.hidden_size * config.num_capture_layers),
             dtype=self.dtype,
@@ -122,6 +124,10 @@ class Eagle3SpecMetadata(SpecMetadata):
 
     eagle_choices: Optional[List[List[int]]] = None
     max_total_draft_tokens: int = 0
+    # This is to store the request type and accepted path for each request.
+    # For each request, {key: request_ids, value: accepted_path}
+    # 'accepted_path' is a list of accepted tokens indices.
+    request_accepted_path: Optional[Dict[int, List[int]]] = None
 
     def __post_init__(self):
         if self.is_draft_model:
@@ -169,20 +175,51 @@ class Eagle3SpecMetadata(SpecMetadata):
                 slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
                     req_id)
                 self.eagle3_resource_manager.start_indices[slot_id] = start_idx
-                start_idx += seq_len
+                # Make sure that the space between two requests is at least max_total_draft_tokens + 1.
+                start_idx += max(seq_len, self.max_total_draft_tokens + 1)
+                assert start_idx < self.eagle3_resource_manager.hidden_states.shape[
+                    0], f"start_idx {start_idx} is greater than hidden_states.shape[0] {self.eagle3_resource_manager.hidden_states.shape[0]}"
+
         # Prepare hidden states gather ids
         hidden_states_read_indices = []
         hidden_states_write_indices = []
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
+            # 1) target model
             # If this is the first draft or the target model forward, we need to
-            # read/write all of the hidden states, otherwise, only read the last token
-            if is_first_draft or not self.is_draft_model:
+            # read/write all of the hidden states
+            if not self.is_draft_model:
                 hidden_states_read_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
                 hidden_states_write_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
+            # 2）is_first_draft
+            # After target model forward, some draft tokens will be accepted.
+            # These draft tokens' hidden states will be used for draft model's first drafter layer.
+            elif is_first_draft:
+                assert req_id in self.request_accepted_path.keys(
+                ), f"Request {req_id} not found in request_accepted_path"
+                accepted_path = self.request_accepted_path[req_id]
+
+                if accepted_path == []:
+                    # This is a context request. We need to read all the hidden states.
+                    hidden_states_read_indices.extend(
+                        list(range(start_idx, start_idx + seq_len)))
+                else:
+                    # This is a generation request. We only read the accepted tokens' hidden states.
+                    assert len(
+                        accepted_path
+                    ) + 1 == seq_len, f"Accepted path length + 1 ({len(accepted_path) + 1}) is not equal to sequence length ({seq_len})"
+                    accepted_path = [0] + accepted_path  # add the root node
+                    hidden_states_read_indices.extend([
+                        start_idx + accepted_draft_token_offset
+                        for accepted_draft_token_offset in accepted_path
+                    ])
+                # For the write indices, we just write all the hidden states.
+                hidden_states_write_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+            # otherwise: only read the last token
             else:
                 old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
                 hidden_states_read_indices.append(start_idx + old_seq_len - 1)

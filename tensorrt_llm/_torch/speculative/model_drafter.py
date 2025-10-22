@@ -184,6 +184,9 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
         new_request.py_is_first_draft = True
+        # For tree decoding, we need to store the accepted tokens indices for these requests,
+        # which will be used to update the hidden_states_read_indices.
+        new_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
         return new_request
 
     def _create_draft_request_for_request(
@@ -516,7 +519,7 @@ class ModelDrafter(Drafter):
             new_tokens_lens = torch.ones(batch_size, device=device)
             new_tokens_lens += num_accepted_tokens_device
             next_draft_tokens = torch.zeros(batch_size,
-                                            self.max_draft_len,
+                                            self.max_draft_tokens,
                                             device=device)
         target_inputs.new_tokens_lens = new_tokens_lens
         target_inputs.next_draft_tokens = next_draft_tokens
@@ -607,7 +610,7 @@ class ModelDrafter(Drafter):
                 continue
             target_model_req.py_draft_tokens = []
             py_draft_logits = []
-            for token_idx in range(self.max_draft_len):
+            for token_idx in range(self.max_total_draft_tokens):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])

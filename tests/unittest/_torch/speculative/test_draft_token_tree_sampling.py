@@ -5,23 +5,30 @@ import unittest
 import torch
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                        SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.speculative.drafting_loops import ChainDrafter
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.llmapi import EagleDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+class DummyModel(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.model_config = None
+        self.config = None
+        self.model = {}
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        pass
+
+
 def test_draft_token_static_tree_sampling():
     # Fix parameters
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"  # It will not actually be used.
-    beam_width = 1
     use_dynamic_tree = False
-    max_new_tokens = 128
 
     # Create related object and run test
     def run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
@@ -43,57 +50,28 @@ def test_draft_token_static_tree_sampling():
             eagle_choices=spec_config.eagle_choices,
             dynamic_tree_max_topK=spec_config.dynamic_tree_max_topK,
         )
-        spec_tree_manager.cur_draft_layer_idx = draft_layer_id
-        torch_sampler = TorchSampler(
-            TorchSampler.Args(
-                max_draft_len=spec_config.max_draft_len,
-                max_seq_len=1024,
-                max_total_draft_tokens=spec_config.max_total_draft_tokens,
-                max_num_sequences=max_batch_size,
-                max_beam_width=beam_width))
 
-        # Prepare tree sampling inputs
-        scheduled_requests = []
-        for req_id in range(max_batch_size):
-            req = LlmRequest(
-                request_id=req_id,
-                max_new_tokens=max_new_tokens,
-                input_tokens=range(req_id * 10, (req_id + 1) * 10),
-                sampling_config=SamplingConfig(
-                    SamplingParams()._get_sampling_config()),
-                is_streaming=False,
-            )
-            scheduled_requests.append(req)
-        seq_slots = torch.tensor(range(max_batch_size),
-                                 dtype=torch.int64,
-                                 device='cuda')
-        new_tokens = torch.zeros((spec_config.max_total_draft_tokens + 1,
-                                  max_batch_size, beam_width),
-                                 dtype=torch.int,
-                                 device='cuda')
-
-        model_outputs = {
-            "logits": logits,
-        }
-
-        new_tokens_host = torch_sampler._tree_sampling_batch(
-            requests=scheduled_requests,
-            max_num_sequences=max_batch_size,
-            seq_slots=seq_slots,
-            model_outputs=model_outputs,
-            spec_tree_manager=spec_tree_manager)
-        new_tokens_host = new_tokens_host.squeeze(dim=-1).transpose(
-            0, 1)  # shape: [max_batch_size, max_total_draft_tokens + 1]
-
-        print(
-            f"new_tokens_host.shape: {new_tokens_host.shape}, new_tokens_host: {new_tokens_host}"
+        # Create the chain drafter
+        chain_drafter = ChainDrafter(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            draft_model=DummyModel(),
         )
+
+        output_tokens = chain_drafter.sample(
+            draft_layer_idx=draft_layer_id,
+            batch_size=max_batch_size,
+            logits=logits,
+            spec_tree_manager=spec_tree_manager,
+        )
+
         print(
             f"ref_new_tokens.shape: {ref_new_tokens.shape}, ref_new_tokens: {ref_new_tokens}"
         )
-
-        assert torch.all(new_tokens_host[:, :num_new_draft_tokens] ==
-                         ref_new_tokens[:, :num_new_draft_tokens])
+        print(
+            f"output_tokens.shape: {output_tokens.shape}, output_tokens: {output_tokens}"
+        )
+        assert torch.all(output_tokens == ref_new_tokens)
 
     ################## CASE 1 static tree, batch size = 1, draft_layer_id = 0 ##########################
     max_batch_size = 1
@@ -109,10 +87,9 @@ def test_draft_token_static_tree_sampling():
              ],  # top3 indices = [4, 1, 9]
         ],
         device='cuda')
-    ref_new_tokens = torch.tensor(
-        [
-            [4, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ], device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+    ref_new_tokens = torch.tensor([
+        [4, 1, 9],
+    ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 3
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -136,10 +113,9 @@ def test_draft_token_static_tree_sampling():
              ],  # top1 indices = [9]
         ],
         device='cuda')
-    ref_new_tokens = torch.tensor(
-        [
-            [4, 1, 9, 7, 1, 9, 0, 0, 0, 0, 0, 0, 0],
-        ], device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+    ref_new_tokens = torch.tensor([
+        [4, 1, 9, 7, 1, 9],
+    ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 6
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -162,10 +138,9 @@ def test_draft_token_static_tree_sampling():
              ],  # top1 indices = [9]
         ],
         device='cuda')
-    ref_new_tokens = torch.tensor(
-        [
-            [4, 7, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ], device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+    ref_new_tokens = torch.tensor([
+        [4, 7, 9],
+    ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 3
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -186,12 +161,10 @@ def test_draft_token_static_tree_sampling():
              ],  # top3 indices = [4, 2, 9]
         ],
         device='cuda')
-    ref_new_tokens = torch.tensor(
-        [
-            [4, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [4, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+    ref_new_tokens = torch.tensor([
+        [4, 1, 9],
+        [4, 2, 9],
+    ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 3
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -222,10 +195,9 @@ def test_draft_token_static_tree_sampling():
         device='cuda')
     ref_new_tokens = torch.tensor(
         [
-            [4, 1, 9, 7, 1, 9, 0, 0, 0, 0, 0, 0, 0],
-            [5, 1, 8, 6, 1, 8, 0, 0, 0, 0, 0, 0, 0],
-        ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+            [4, 1, 9, 7, 1, 9],
+            [5, 1, 8, 6, 1, 8],
+        ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 6
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -254,12 +226,10 @@ def test_draft_token_static_tree_sampling():
              ],  # top1 indices = [0]
         ],
         device='cuda')
-    ref_new_tokens = torch.tensor(
-        [
-            [4, 7, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [5, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+    ref_new_tokens = torch.tensor([
+        [4, 7, 9],
+        [5, 8, 0],
+    ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 3
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -288,14 +258,8 @@ def test_draft_token_static_tree_sampling():
                           device='cuda')
     ref_new_tokens = torch.tensor(
         [
-            [
-                6, 9, 4, 5, 18, 8, 12, 15, 11, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0
-            ],
-        ],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+            [6, 9, 4, 5, 18, 8, 12, 15, 11, 17],
+        ], device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 10
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
@@ -390,44 +354,8 @@ def test_draft_token_static_tree_sampling():
             11,  # top-1
             14,  # top-1
             10,  # top-1
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
         ]],
-        device='cpu')  # shape: [max_batch_size, max_total_draft_tokens + 1]
+        device='cuda')  # shape: [max_batch_size, num_new_draft_tokens]
     num_new_draft_tokens = 28
     run_test(max_batch_size, draft_layer_id, max_total_draft_tokens,
              max_draft_len, eagle_choices, logits, ref_new_tokens,
