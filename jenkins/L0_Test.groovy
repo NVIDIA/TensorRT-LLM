@@ -967,7 +967,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
-    if (gpuType.contains("6000d") {
+    if (gpuType.contains("6000d")) {
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
