@@ -113,9 +113,10 @@ class RayWorkerWrapper:
 
         try:
             extension_cls = resolve_obj_by_qualname(extension_cls_name)
-        except Exception as e:
+        except (ImportError, AttributeError, ValueError) as e:
             raise RuntimeError(
-                f"Failed to load worker extension '{extension_cls_name}': {e}")
+                f"Failed to load worker extension '{extension_cls_name}'"
+            ) from e
 
         # Check for conflicts
         for attr in dir(extension_cls):
@@ -123,14 +124,13 @@ class RayWorkerWrapper:
                 continue
             if hasattr(worker_class, attr):
                 raise ValueError(
-                    f"Worker class {worker_class.__name__} already has method called '{attr}', "
-                    f"which conflicts with extension {extension_cls.__name__}. "
-                )
+                    f"Worker class {worker_class.__name__} already defines '{attr}', "
+                    f"which conflicts with extension {extension_cls.__name__}.")
 
-        if extension_cls not in worker_class.__bases__:
-            worker_class.__bases__ = worker_class.__bases__ + (extension_cls, )
-
-        return worker_class
+        derived_name = f"{worker_class.__name__}With{extension_cls.__name__}"
+        ExtendedWorker = type(derived_name, (worker_class, extension_cls),
+                              {'__module__': worker_class.__module__})
+        return ExtendedWorker
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
