@@ -64,6 +64,7 @@ class Drafter(ABC):
         """
         for req in scheduled_requests.generation_requests:
             max_draft_tokens = self.max_draft_len
+            self.max_total_draft_tokens
             num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))

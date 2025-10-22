@@ -167,6 +167,9 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
         new_request.py_is_first_draft = True
+        # For tree decoding, we need to store the accepted tokens indices for these requests,
+        # which will be used to update the hidden_states_read_indices.
+        new_request.py_num_accepted_draft_tokens_indices = request.py_num_accepted_draft_tokens_indices
         return new_request
 
     def _create_draft_request_for_request(
@@ -476,7 +479,7 @@ class ModelDrafter(Drafter):
             # We already updated the target state, so the new_tokens_lens should be all ones.
             new_tokens_lens = torch.ones(batch_size, device=device)
             next_draft_tokens = torch.zeros(batch_size,
-                                            self.max_draft_len,
+                                            self.max_draft_tokens,
                                             device=device)
 
         # Create a new SampleStateTensorsMTP object with the additional fields
@@ -570,7 +573,7 @@ class ModelDrafter(Drafter):
                 # Chunked prefill request in progress; no need to append draft tokens
                 continue
             py_draft_logits = []
-            for token_idx in range(self.max_draft_len):
+            for token_idx in range(self.max_total_draft_tokens):
                 target_model_req.py_draft_tokens.append(
                     draft_tokens_host[token_idx][req_idx])
                 py_draft_logits.append(draft_logits[token_idx][req_idx])
