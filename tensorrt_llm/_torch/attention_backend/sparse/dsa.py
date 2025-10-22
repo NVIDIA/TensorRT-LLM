@@ -809,9 +809,9 @@ class Indexer(nn.Module):
         if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
             return
 
+        # [num_blocks, block_size, 1, per_token_size ]
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
-        k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
 
         num_tokens = k_fp8.shape[0]
         head_dim = k_fp8.shape[1]
@@ -837,14 +837,16 @@ class Indexer(nn.Module):
             0)  # [1, head_dim]
         scatter_indices_fp8 = flat_indices_fp8.unsqueeze(
             1) + byte_offsets  # [num_tokens, head_dim]
-        k_cache_flat[scatter_indices_fp8] = k_fp8_bytes
+        scatter_indices_fp8 = torch.unravel_index(scatter_indices_fp8, k_cache.shape)
+        k_cache[scatter_indices_fp8] = k_fp8_bytes
 
         flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
         byte_offsets = torch.arange(
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, scale_size]
         scatter_indices_scale = flat_indices_scale.unsqueeze(
             1) + byte_offsets  # [num_tokens, scale_size]
-        k_cache_flat[scatter_indices_scale] = k_scale_bytes
+        scatter_indices_scale = torch.unravel_index(scatter_indices_scale, k_cache.shape)
+        k_cache[scatter_indices_scale] = k_scale_bytes
 
     def _gather_k_cache_for_chunk(
         self,
@@ -867,7 +869,6 @@ class Indexer(nn.Module):
         """
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
-        k_cache_flat = k_cache.view(-1)  # Flatten to 1D for byte-level indexing
 
         head_dim = self.head_dim
         scale_size = 4  # float32 = 4 bytes
@@ -888,7 +889,8 @@ class Indexer(nn.Module):
             head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
         gather_indices_fp8 = slot_mapping_fp8_chunk.unsqueeze(
             1) + byte_offsets_fp8  # [num_k_tokens, head_dim]
-        k_fp8_bytes = k_cache_flat[gather_indices_fp8]
+        gather_indices_fp8 = torch.unravel_index(gather_indices_fp8, k_cache.shape)
+        k_fp8_bytes = k_cache[gather_indices_fp8]
         k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
             num_k_tokens, head_dim)
 
@@ -897,7 +899,8 @@ class Indexer(nn.Module):
             scale_size, device=k_cache.device).unsqueeze(0)  # [1, 4]
         gather_indices_scale = slot_mapping_scale_chunk.unsqueeze(
             1) + byte_offsets_scale  # [num_k_tokens, 4]
-        k_scale_bytes = k_cache_flat[gather_indices_scale]
+        gather_indices_scale = torch.unravel_index(gather_indices_scale, k_cache.shape)
+        k_scale_bytes = k_cache[gather_indices_scale]
         k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
 
         return k_fp8, k_scale
