@@ -2,7 +2,7 @@ OpenAI Completion Client with JSON Schema
 =========================================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/560ded5450b79efde720162fc397d7efa59aae6d/examples/serve/openai_completion_client_json_schema.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/796891ba2a6959bad58c0da9645416c7264349e9/examples/serve/openai_completion_client_json_schema.py.
 
 .. literalinclude:: ../../../examples/serve/openai_completion_client_json_schema.py
     :lines: 2-52

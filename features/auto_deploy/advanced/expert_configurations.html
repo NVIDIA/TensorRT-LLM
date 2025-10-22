@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -69,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -335,6 +335,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -365,6 +366,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -407,6 +409,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -423,6 +426,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -558,15 +562,15 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <span class="w">    </span><span class="nt">num_hidden_layers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">12</span>
 <span class="w">    </span><span class="nt">hidden_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
 <span class="w">  </span><span class="nt">world_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
-<span class="w">  </span><span class="nt">compile_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">torch-compile</span>
-<span class="w">  </span><span class="nt">attn_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">triton</span>
 <span class="w">  </span><span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
 <span class="w">  </span><span class="nt">transforms</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">sharding</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">strategy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">auto</span>
-<span class="w">    </span><span class="nt">quantization</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">    </span><span class="nt">detect_sharding</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">support_partial_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">insert_cached_attention</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">triton</span>
+<span class="w">    </span><span class="nt">compile_model</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">torch-compile</span>
 
 <span class="nt">prompt</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
@@ -574,42 +578,34 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <span class="w">    </span><span class="nt">max_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">150</span>
 <span class="w">    </span><span class="nt">temperature</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.8</span>
 <span class="w">    </span><span class="nt">top_k</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">50</span>
-
-<span class="nt">benchmark</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">  </span><span class="nt">num</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20</span>
-<span class="w">  </span><span class="nt">bs</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
-<span class="w">  </span><span class="nt">isl</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
-<span class="w">  </span><span class="nt">osl</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
 </pre></div>
 </div>
 <p>Create an additional override file (e.g., <code class="docutils literal notranslate"><span class="pre">production.yaml</span></code>):</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># production.yaml</span>
 <span class="nt">args</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">world_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
-<span class="w">  </span><span class="nt">compile_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">torch-opt</span>
 <span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32</span>
-
-<span class="nt">benchmark</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">transforms</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">compile_model</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">torch-opt</span>
 </pre></div>
 </div>
 <p>Then use these configurations:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using single YAML config</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--yaml-configs<span class="w"> </span>my_config.yaml
+<span class="w">  </span>--yaml-extra<span class="w"> </span>my_config.yaml
 
 <span class="c1"># Using multiple YAML configs (deep merged in order, later files have higher priority)</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--yaml-configs<span class="w"> </span>my_config.yaml<span class="w"> </span>production.yaml
+<span class="w">  </span>--yaml-extra<span class="w"> </span>my_config.yaml<span class="w"> </span>production.yaml
 
 <span class="c1"># Targeting nested AutoDeployConfig with separate YAML</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--yaml-configs<span class="w"> </span>my_config.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--args.yaml-configs<span class="w"> </span>autodeploy_overrides.yaml
+<span class="w">  </span>--yaml-extra<span class="w"> </span>my_config.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--args.yaml-extra<span class="w"> </span>autodeploy_overrides.yaml
 </pre></div>
 </div>
 </section>
@@ -618,7 +614,7 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 <p>The configuration system follows a precedence order in which higher priority sources override lower priority ones:</p>
 <ol class="arabic simple">
 <li><p><strong>CLI Arguments</strong> (highest priority) - Direct command line arguments</p></li>
-<li><p><strong>YAML Configs</strong> - Files specified via <code class="docutils literal notranslate"><span class="pre">--yaml-configs</span></code> and <code class="docutils literal notranslate"><span class="pre">--args.yaml-configs</span></code></p></li>
+<li><p><strong>YAML Configs</strong> - Files specified via <code class="docutils literal notranslate"><span class="pre">--yaml-extra</span></code> and <code class="docutils literal notranslate"><span class="pre">--args.yaml-extra</span></code></p></li>
 <li><p><strong>Default Settings</strong> (lowest priority) - Built-in defaults from the config classes</p></li>
 </ol>
 <p><strong>Deep Merging</strong>: Unlike simple overwriting, deep merging recursively combines nested dictionaries. For example:</p>
@@ -639,12 +635,12 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
 </pre></div>
 </div>
 <p><strong>Nested Config Behavior</strong>: When using nested configurations, outer YAML configuration files become initialization settings for inner objects, giving them higher precedence:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># The outer yaml-configs affects the entire ExperimentConfig</span>
-<span class="c1"># The inner args.yaml-configs affects only the AutoDeployConfig</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># The outer yaml-extra affects the entire ExperimentConfig</span>
+<span class="c1"># The inner args.yaml-extra affects only the AutoDeployConfig</span>
 python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model<span class="w"> </span><span class="s2">&quot;meta-llama/Meta-Llama-3.1-8B-Instruct&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--yaml-configs<span class="w"> </span>experiment_config.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--args.yaml-configs<span class="w"> </span>autodeploy_config.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--yaml-extra<span class="w"> </span>experiment_config.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--args.yaml-extra<span class="w"> </span>autodeploy_config.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--args.world-size<span class="o">=</span><span class="m">8</span><span class="w">  </span><span class="c1"># CLI override beats both YAML configs</span>
 </pre></div>
 </div>
@@ -799,9 +795,9 @@ python<span class="w"> </span>build_and_run_ad.py<span class="w"> </span><span c
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -337,6 +337,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -367,6 +368,7 @@
 <li class="toctree-l2 current active"><a class="current reference internal" href="#">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -409,6 +411,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -425,6 +428,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -515,10 +519,10 @@
 </section>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
-<p>GPU: NVIDIA Blackwell or Hopper Architecture<br />
-OS: Linux<br />
-Drivers: CUDA Driver 575 or Later<br />
-Docker with NVIDIA Container Toolkit installed<br />
+<p>GPU: NVIDIA Blackwell or Hopper Architecture
+OS: Linux
+Drivers: CUDA Driver 575 or Later
+Docker with NVIDIA Container Toolkit installed
 Python3 and python3-pip (Optional, for accuracy evaluation only)</p>
 </section>
 <section id="models">
@@ -553,8 +557,8 @@ nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6<span class="w"> </span><span class=
 </ul>
 <p>If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html">https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html</a></p>
 </section>
-<section id="creating-the-trt-llm-server-config">
-<h3>Creating the TRT-LLM Server config<a class="headerlink" href="#creating-the-trt-llm-server-config" title="Link to this heading">#</a></h3>
+<section id="creating-the-tensorrt-llm-server-config">
+<h3>Creating the TensorRT LLM Server config<a class="headerlink" href="#creating-the-tensorrt-llm-server-config" title="Link to this heading">#</a></h3>
 <p>We create a YAML configuration file /tmp/config.yml for the TensorRT LLM Server and populate it with the following recommended performance settings.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span>/tmp/config.yml
 
@@ -563,19 +567,18 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <span class="s">cuda_graph_config:</span>
 <span class="s">  enable_padding: true</span>
 <span class="s">  max_batch_size: 1024</span>
-<span class="s">kv_cache_config:     </span>
+<span class="s">kv_cache_config:</span>
 <span class="s">  dtype: fp8</span>
 <span class="s">EOF</span>
 </pre></div>
 </div>
 </section>
-<section id="launch-the-trt-llm-server">
-<h3>Launch the TRT-LLM Server<a class="headerlink" href="#launch-the-trt-llm-server" title="Link to this heading">#</a></h3>
-<p>Below is an example command to launch the TRT-LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.</p>
+<section id="launch-the-tensorrt-llm-server">
+<h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
+<p>Below is an example command to launch the TensorRT LLM server with the Llama-3.3-70B-Instruct-FP8 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>nvidia/Llama-3.3-70B-Instruct-FP8<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
@@ -603,10 +606,6 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <h4><code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code><a class="headerlink" href="#kv-cache-free-gpu-memory-fraction" title="Link to this heading">#</a></h4>
 <p> <strong>Description:</strong> A value between 0.0 and 1.0 that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.</p>
 <p> <strong>Recommendation:</strong> If you experience OOM errors, try reducing this value to <strong>0.8</strong> or lower.</p>
-</section>
-<section id="backend-pytorch">
-<h4><code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">pytorch</span></code><a class="headerlink" href="#backend-pytorch" title="Link to this heading">#</a></h4>
-<p> <strong>Description:</strong> Tells TensorRT LLM to use the <strong>pytorch</strong> backend.</p>
 </section>
 <section id="max-batch-size">
 <h4><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading">#</a></h4>
@@ -672,7 +671,7 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 </pre></div>
 </div>
 <p>When the <code class="docutils literal notranslate"><span class="pre">Status:</span> <span class="pre">200</span></code> code is returned, the server is ready for queries. Note that the very first query may take longer due to initialization and compilation.</p>
-<p>After the TRT-LLM server is set up and shows Application startup complete, you can send requests to the server.</p>
+<p>After the TensorRT LLM server is set up and shows Application startup complete, you can send requests to the server.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/completions<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
 <span class="s1">      &quot;model&quot;: &quot;nvidia/Llama-3.3-70B-Instruct-FP8&quot;,</span>
 <span class="s1">      &quot;prompt&quot;: &quot;Where is New York?&quot;,</span>
@@ -681,7 +680,7 @@ cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FIL
 <span class="s1">}&#39;</span>
 </pre></div>
 </div>
-<p>Here is an example response, showing that the TRT-LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.</p>
+<p>Here is an example response, showing that the TensorRT LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;cmpl-bc1393d529ce485c961d9ffee5b25d72&quot;</span><span class="p">,</span><span class="nt">&quot;object&quot;</span><span class="p">:</span><span class="s2">&quot;text_completion&quot;</span><span class="p">,</span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="mi">1753843963</span><span class="p">,</span><span class="nt">&quot;model&quot;</span><span class="p">:</span><span class="s2">&quot;nvidia/Llama-3.3-70B-Instruct-FP8&quot;</span><span class="p">,</span><span class="nt">&quot;choices&quot;</span><span class="p">:[{</span><span class="nt">&quot;index&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="s2">&quot; New York is a state located in the northeastern United States. It is bordered by&quot;</span><span class="p">,</span><span class="nt">&quot;token_ids&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;logprobs&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;context_logits&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;finish_reason&quot;</span><span class="p">:</span><span class="s2">&quot;length&quot;</span><span class="p">,</span><span class="nt">&quot;stop_reason&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">,</span><span class="nt">&quot;disaggregated_params&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">}],</span><span class="nt">&quot;usage&quot;</span><span class="p">:{</span><span class="nt">&quot;prompt_tokens&quot;</span><span class="p">:</span><span class="mi">6</span><span class="p">,</span><span class="nt">&quot;total_tokens&quot;</span><span class="p">:</span><span class="mi">22</span><span class="p">,</span><span class="nt">&quot;completion_tokens&quot;</span><span class="p">:</span><span class="mi">16</span><span class="p">},</span><span class="nt">&quot;prompt_token_ids&quot;</span><span class="p">:</span><span class="kc">null</span><span class="p">}</span>
 </pre></div>
 </div>
@@ -741,7 +740,7 @@ lm_eval<span class="w"> </span>--model<span class="w"> </span>local-completions<
 </section>
 <section id="benchmarking-performance">
 <h2>Benchmarking Performance<a class="headerlink" href="#benchmarking-performance" title="Link to this heading">#</a></h2>
-<p>To benchmark the performance of your TensorRT LLM server you can leverage the built-in “benchmark_serving.py” script. To do this first creating a wrapper <a class="reference external" href="http://bench.sh">bench.sh</a> script.</p>
+<p>To benchmark the performance of your TensorRT LLM server you can leverage the built-in <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script. To do this first creating a wrapper <code class="docutils literal notranslate"><span class="pre">bench.sh</span></code> script.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;EOF &gt;  bench.sh</span>
 <span class="s">concurrency_list=&quot;1 2 4 8 16 32 64 128 256&quot;</span>
 <span class="s">multi_round=5</span>
@@ -776,7 +775,7 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 --result-filename<span class="w"> </span><span class="s2">&quot;concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json&quot;</span>
 </pre></div>
 </div>
-<p>For more benchmarking options see. <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py">NVIDIA/TensorRT-LLM</a></p>
+<p>For more benchmarking options see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py">benchmark_serving.py</a></p>
 <p>Run bench.sh to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above bench.sh script.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>./bench.sh
 </pre></div>
@@ -812,33 +811,55 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 </div>
 <section id="key-metrics">
 <h3>Key Metrics<a class="headerlink" href="#key-metrics" title="Link to this heading">#</a></h3>
+<section id="time-to-first-token-ttft">
+<h4>Time to First Token (TTFT)<a class="headerlink" href="#time-to-first-token-ttft" title="Link to this heading">#</a></h4>
 <ul class="simple">
-<li><p>Median Time to First Token (TTFT)</p>
-<ul>
 <li><p>The typical time elapsed from when a request is sent until the first output token is generated.</p></li>
 </ul>
-</li>
-<li><p>Median Time Per Output Token (TPOT)</p>
-<ul>
-<li><p>The typical time required to generate each token <em>after</em> the first one.</p></li>
+</section>
+<section id="time-per-output-token-tpot-and-inter-token-latency-itl">
+<h4>Time Per Output Token (TPOT) and Inter-Token Latency (ITL)<a class="headerlink" href="#time-per-output-token-tpot-and-inter-token-latency-itl" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>TPOT is the typical time required to generate each token <em>after</em> the first one.</p></li>
+<li><p>ITL is the typical time delay between the completion of one token and the completion of the next.</p></li>
+<li><p>Both TPOT and ITL ignore TTFT.</p></li>
 </ul>
-</li>
-<li><p>Median Inter-Token Latency (ITL)</p>
-<ul>
-<li><p>The typical time delay between the completion of one token and the completion of the next.</p></li>
-</ul>
-</li>
-<li><p>Median End-to-End Latency (E2EL)</p>
-<ul>
+<p>For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+</pre></div>
+</div>
+<p>Across different requests, <strong>average TPOT</strong> is the mean of each request’s TPOT (all requests weighted equally), while <strong>average ITL</strong> is token-weighted (all tokens weighted equally):</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+</pre></div>
+</div>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+</pre></div>
+</div>
+</section>
+<section id="end-to-end-e2e-latency">
+<h4>End-to-End (E2E) Latency<a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
+<ul class="simple">
 <li><p>The typical total time from when a request is submitted until the final token of the response is received.</p></li>
 </ul>
-</li>
-<li><p>Total Token Throughput</p>
-<ul>
+</section>
+<section id="total-token-throughput">
+<h4>Total Token Throughput<a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
+<ul class="simple">
 <li><p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p></li>
 </ul>
-</li>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+</pre></div>
+</div>
+</section>
+<section id="tokens-per-second-tps-or-output-token-throughput">
+<h4>Tokens Per Second (TPS) or Output Token Throughput<a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p>how many output tokens the system generates each second.</p></li>
 </ul>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+</pre></div>
+</div>
+</section>
 </section>
 </section>
 </section>
@@ -898,13 +919,12 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deployment-steps">Deployment Steps</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-docker-container">Run Docker Container</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#creating-the-trt-llm-server-config">Creating the TRT-LLM Server config</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-trt-llm-server">Launch the TRT-LLM Server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#creating-the-tensorrt-llm-server-config">Creating the TensorRT LLM Server config</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configs-and-parameters">Configs and Parameters</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tp-size"><code class="docutils literal notranslate"><span class="pre">--tp_size</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#ep-size"><code class="docutils literal notranslate"><span class="pre">--ep_size</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-free-gpu-memory-fraction"><code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#backend-pytorch"><code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">pytorch</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">--max_seq_len</span></code></a></li>
@@ -925,7 +945,14 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-performance">Benchmarking Performance</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-to-first-token-ttft">Time to First Token (TTFT)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#time-per-output-token-tpot-and-inter-token-latency-itl">Time Per Output Token (TPOT) and Inter-Token Latency (ITL)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-e2e-latency">End-to-End (E2E) Latency</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#total-token-throughput">Total Token Throughput</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tokens-per-second-tps-or-output-token-throughput">Tokens Per Second (TPS) or Output Token Throughput</a></li>
+</ul>
+</li>
 </ul>
 </li>
 </ul>
@@ -1022,9 +1049,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       

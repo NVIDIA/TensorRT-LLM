@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.2.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.2.0rc0" />
+  <meta name="docsearch:version" content="1.2.0rc1" />
 
 
   </head>
@@ -337,6 +337,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
@@ -367,6 +368,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-qwen3-next-on-trtllm.html">Quick Start Recipe for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 </ul>
 </details></li>
 </ul>
@@ -409,6 +411,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
@@ -425,6 +428,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -507,7 +511,7 @@
 <p>To use the feature:</p>
 <ol class="arabic simple">
 <li><p>Enable the <code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code> option in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class</p></li>
-<li><p>Pass a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></a> object with the desired options to the <code class="docutils literal notranslate"><span class="pre">generate()</span></code> function</p></li>
+<li><p>Pass a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></a> object with the desired options to the <code class="docutils literal notranslate"><span class="pre">generate()</span></code> function</p></li>
 </ol>
 <p>The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
@@ -572,7 +576,7 @@
 <p>To enable guided decoding, you must:</p>
 <ol class="arabic simple">
 <li><p>Set the <code class="docutils literal notranslate"><span class="pre">guided_decoding_backend</span></code> parameter to <code class="docutils literal notranslate"><span class="pre">'xgrammar'</span></code> or <code class="docutils literal notranslate"><span class="pre">'llguidance'</span></code> in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class</p></li>
-<li><p>Create a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code></a> object with the desired format specification</p>
+<li><p>Create a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code></a> object with the desired format specification</p>
 <ul class="simple">
 <li><p>Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (<code class="docutils literal notranslate"><span class="pre">json</span></code>, <code class="docutils literal notranslate"><span class="pre">regex</span></code>, <code class="docutils literal notranslate"><span class="pre">grammar</span></code>, <code class="docutils literal notranslate"><span class="pre">structural_tag</span></code>).</p></li>
 </ul>
@@ -593,14 +597,14 @@
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="s2">&quot;Generate a JSON response&quot;</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>You can find a more detailed example on guided decoding <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/examples/llm-api/llm_guided_decoding.py">here</a>.</p>
+<p>You can find a more detailed example on guided decoding <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/examples/llm-api/llm_guided_decoding.py">here</a>.</p>
 </section>
 <section id="logits-processor">
 <h2>Logits processor<a class="headerlink" href="#logits-processor" title="Link to this heading">#</a></h2>
 <p>Logits processors allow you to modify the logits produced by the network before sampling, enabling custom generation behavior and constraints.</p>
 <p>To use a custom logits processor:</p>
 <ol class="arabic simple">
-<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
+<li><p>Create a custom class that inherits from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/tensorrt_llm/sampling_params.py"><code class="docutils literal notranslate"><span class="pre">LogitsProcessor</span></code></a> and implements the <code class="docutils literal notranslate"><span class="pre">__call__</span></code> method</p></li>
 <li><p>Pass an instance of this class to the <code class="docutils literal notranslate"><span class="pre">logits_processor</span></code> parameter of <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code></p></li>
 </ol>
 <p>The following example demonstrates logits processing:</p>
@@ -628,7 +632,7 @@
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5/examples/llm-api/llm_logits_processor.py">here</a>.</p>
+<p>You can find a more detailed example on logits processors <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b/examples/llm-api/llm_logits_processor.py">here</a>.</p>
 </section>
 </section>
 
@@ -779,9 +783,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 29, 2025.</p>
+  <p>Last updated on October 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/560ded5">560ded5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/796891b">796891b</a>.</p>
   
 </div></div>
       
