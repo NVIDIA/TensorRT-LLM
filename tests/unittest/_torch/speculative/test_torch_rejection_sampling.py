@@ -1,4 +1,5 @@
 import unittest
+from typing import cast
 
 import numpy as np
 import torch
@@ -24,8 +25,11 @@ def test_get_rejected_indices():
     sampled_regular = []
     for _ in range(num_iter):
         draft_tokens = [
-            torch.multinomial(draft_probs, num_samples=1,
-                              generator=generator).item()
+            cast(
+                int,
+                torch.multinomial(draft_probs,
+                                  num_samples=1,
+                                  generator=generator).item())
         ]
         rejected_indices = get_rejected_indices(draft_probs, target_probs,
                                                 generator, draft_tokens)

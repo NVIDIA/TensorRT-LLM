@@ -12,8 +12,8 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from ..utils.node_utils import extract_op_args
-from .attention_interface import (
+from ...utils.node_utils import extract_op_args
+from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
@@ -25,10 +25,10 @@ from .attention_interface import (
     PrepareMetadataCallable,
     SequenceInfo,
 )
-from .torch_mamba import _torch_ssm_transform_prefill
+from .torch_mamba import _torch_ssm_prefill
 
 
-def _torch_cached_ssm_transform_decode(
+def _torch_cached_ssm_decode(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -135,8 +135,10 @@ def _torch_ssm_prepare_metadata(
 
     # Truncate slot indices to match active sequences
     slot_idx_sanitized = slot_idx[:num_seq].clone().to(torch.long)
-
-    return (seq_len_sanitized, seq_start, slot_idx_sanitized)
+    # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+    # reference implementation to support chunked prefill.
+    use_initial_states = input_pos > 0
+    return (seq_len_sanitized, seq_start, slot_idx_sanitized, use_initial_states)
 
 
 @_torch_ssm_prepare_metadata.register_fake
@@ -150,11 +152,12 @@ def _torch_ssm_prepare_metadata_fake(
         torch.empty_like(seq_len_sanitized),
         torch.empty_like(seq_len_sanitized),
         torch.empty(num_seq, dtype=torch.long, device=slot_idx.device),
+        torch.empty(num_seq, dtype=torch.bool, device=slot_idx.device),
     )
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_ssm_transform", mutates_args={})
-def _torch_cached_ssm_transform(
+@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args={})
+def _torch_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
     A: torch.Tensor,  # [num_heads]
@@ -167,6 +170,7 @@ def _torch_cached_ssm_transform(
     seq_len: torch.Tensor,  # [num_seq]
     seq_start: torch.Tensor,  # [num_seq]
     slot_idx: torch.Tensor,  # [num_seq]
+    use_initial_states: torch.Tensor,  # [num_seq]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
@@ -188,7 +192,7 @@ def _torch_cached_ssm_transform(
         slot_idx_long = slot_idx.to(torch.long)
         ssm_batch = ssm_state_cache.index_select(dim=0, index=slot_idx_long)
 
-        y, updated_state = _torch_cached_ssm_transform_decode(
+        y, updated_state = _torch_cached_ssm_decode(
             hidden_states,
             A,
             B,
@@ -207,6 +211,14 @@ def _torch_cached_ssm_transform(
         # return in the same dtype as the input
         return y.to(hidden_states.dtype)
 
+    # Prefill
+    if any(use_initial_states):
+        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
+        # reference implementation to support chunked prefill.
+        raise ValueError(
+            "torch mamba backend does not yet support chunked prefill "
+            "and can not correctly handle initial states."
+        )
     # Context/mixed phase (flattened sequences). Expect b == 1, but handle general b robustly.
     # We'll iterate over sequences defined by (seq_len, seq_start) and update state per slot.
     # Process across the flattened second dimension.
@@ -244,7 +256,7 @@ def _torch_cached_ssm_transform(
         dt_seq = dt_flat.index_select(0, idx_i).unsqueeze(0)
 
         # Run prefill and obtain final SSM state for this sequence
-        y_seq, ssm_state_i = _torch_ssm_transform_prefill(
+        y_seq, ssm_state_i = _torch_ssm_prefill(
             hs_seq, A, B_seq, C_seq, D, dt_seq, dt_bias, time_step_limit, chunk_size
         )
 
@@ -258,8 +270,8 @@ def _torch_cached_ssm_transform(
     return y
 
 
-@_torch_cached_ssm_transform.register_fake
-def _torch_cached_ssm_transform_fake(
+@_torch_cached_ssm.register_fake
+def _torch_cached_ssm_fake(
     # INPUTS
     hidden_states: torch.Tensor,
     A: torch.Tensor,
@@ -272,6 +284,7 @@ def _torch_cached_ssm_transform_fake(
     seq_len: torch.Tensor,
     seq_start: torch.Tensor,
     slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
     # CACHES
     ssm_state_cache: torch.Tensor,
     # CONSTANTS
@@ -304,16 +317,16 @@ class TorchBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_ssm_transform
+        return torch.ops.auto_deploy.torch_ssm
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_cached_ssm_transform
+        return torch.ops.auto_deploy.torch_cached_ssm
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
         # Returns (seq_len, seq_start, slot_idx)
-        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 3
+        return torch.ops.auto_deploy.torch_ssm_prepare_metadata, 4
 
     @classmethod
     def get_cache_initializers(

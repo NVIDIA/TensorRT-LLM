@@ -50,8 +50,7 @@ def parse_requirements(filename: os.PathLike):
 
 def sanity_check():
     tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
-    if not ((tensorrt_llm_path / "bindings").exists() or
-            (tensorrt_llm_path / "bindings.pyi").exists()):
+    if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -73,6 +72,17 @@ def get_version():
         raise RuntimeError(f"Could not set version from {version_file}")
 
     return version
+
+
+def get_license():
+    import sysconfig
+    platform_tag = sysconfig.get_platform()
+    if "x86_64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+    elif "arm64" in platform_tag or "aarch64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+    else:
+        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
 
 
 class BinaryDistribution(Distribution):
@@ -120,6 +130,8 @@ package_data += [
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
+    # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
+    '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
 ]
 
 
@@ -244,7 +256,7 @@ setup(
     package_data={
         'tensorrt_llm': package_data,
     },
-    license_files=["LICENSE", "ATTRIBUTIONS-CPP.md"],
+    license_files=get_license(),
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',

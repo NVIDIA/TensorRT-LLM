@@ -413,7 +413,14 @@ class _ModelFormatKind(Enum):
 
 
 class DecodingBaseConfig(StrictBaseModel):
+    # The number of the drafter layers.
     max_draft_len: Optional[int] = None
+    # The number of draft tokens in the draft tokens tree.
+    # If it's a linear tree, each draft layer will only generate one draft token.
+    # In this case, max_draft_len == max_total_draft_tokens.
+    # If it's a static or dynamic tree, each draft layer may generate more than one draft token.
+    # In this case, max_total_draft_tokens >= max_draft_len.
+    max_total_draft_tokens: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
     # PyTorch only.
@@ -526,6 +533,10 @@ class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -544,8 +555,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     use_dynamic_tree: Optional[bool] = False
     # The topK value for each layer when enable dynamic tree.
     dynamic_tree_max_topK: Optional[int] = None
-    # The number of draft tokens in the draft tokens tree.
-    max_total_draft_tokens: Optional[int] = None
     # The number of eagle layer. will not be used in pytorch flow, just for compatibility with TRT flow
     num_eagle_layers: Optional[int] = None
     # The number of non-leaves in each layer.
@@ -580,7 +589,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
         # Checks whether the input eagle choices is valid
         # and reset the max_draft_len and num_eagle_layers if necessary
         if self.eagle_choices is not None:
-            # If eagle_choices is provided, use_dynamic_tree will not be used
+            # If eagle_choices is provided, use_dynamic_tree should not be used
             assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
 
             # Get num_eagle_layers from eagle_choices
@@ -651,6 +660,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
             return len(self.eagle3_layers_to_capture)
         return 3
 
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        if self.eagle_choices is None and self.use_dynamic_tree is False:
+            return True
+        return False
+
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     output_directory: str
@@ -703,6 +718,10 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
     drafter: object  # Type is Drafter
     resource_manager: object = None  # Type is Optional[ResourceManager]
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -735,6 +754,10 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_use_oldest: bool = True
     is_public_pool: bool = True
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -746,6 +769,10 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -776,10 +803,18 @@ class MTPDecodingConfig(DecodingBaseConfig):
     BEGIN_THINKING_PHASE_TOKEN: int = 128798
     END_THINKING_PHASE_TOKEN: int = 128799
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if 'num_nextn_predict_layers' in kwargs:
+            self.max_draft_len = kwargs['num_nextn_predict_layers']
+            self.max_total_draft_tokens = kwargs[
+                'num_nextn_predict_layers']  # Current MTP only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         out = cls(**data)
         out.max_draft_len = out.num_nextn_predict_layers
+        out.max_total_draft_tokens = out.num_nextn_predict_layers  # Current MTP only support linear tree
         return out
 
     decoding_type: ClassVar[str] = "MTP"
@@ -813,6 +848,10 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
     Attributes that are inherited from the base class are ignored.
     """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Auto only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1156,6 +1195,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 
     def __init__(self, **data):
         super().__init__(**data)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only support linear tree
         self._check_fields()
 
     def calculate_speculative_resource(self):
@@ -1379,10 +1419,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
 
+    kv_transfer_timeout_ms: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=
+        "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
+    )
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
-            max_tokens_in_buffer=self.max_tokens_in_buffer)
+            max_tokens_in_buffer=self.max_tokens_in_buffer,
+            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms)
 
 
 @dataclass

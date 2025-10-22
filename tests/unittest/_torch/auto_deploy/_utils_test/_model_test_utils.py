@@ -465,7 +465,7 @@ _SMALL_MODEL_CONFIGS = {
     "ibm-ai-platform/Bamba-9B-v2": {
         "llm_models_subdir": "Bamba-9B-v2",
         "model_kwargs": {
-            "torch_dtype": "bfloat16",
+            "dtype": "bfloat16",
             "hidden_size": 64,
             "intermediate_size": 128,
             "mamba_chunk_size": 64,
@@ -484,7 +484,7 @@ _SMALL_MODEL_CONFIGS = {
     "nvidia/NVIDIA-Nemotron-Nano-12B-v2": {
         "llm_models_subdir": "NVIDIA-Nemotron-Nano-12B-v2",
         "model_kwargs": {
-            "torch_dtype": "bfloat16",
+            "dtype": "bfloat16",
             "hidden_size": 32,
             "intermediate_size": 64,
             "mamba_head_dim": 40,

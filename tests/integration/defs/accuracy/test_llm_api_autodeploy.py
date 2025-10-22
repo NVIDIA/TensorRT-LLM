@@ -118,7 +118,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
                     "free_mem_ratio": 0.7
                 },
                 "compile_model": {
-                    "backend": "torch-opt",
+                    "backend": "torch-cudagraph",
                     "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
                 },
             },

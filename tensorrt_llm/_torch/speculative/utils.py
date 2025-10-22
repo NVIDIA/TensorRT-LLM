@@ -23,6 +23,7 @@ def get_spec_metadata(spec_config,
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
@@ -31,6 +32,7 @@ def get_spec_metadata(spec_config,
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
@@ -45,6 +47,7 @@ def get_spec_metadata(spec_config,
     if spec_config.spec_dec_mode.is_eagle3():
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
@@ -55,14 +58,15 @@ def get_spec_metadata(spec_config,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             is_mtp_eagle=False,
-            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             eagle_choices=spec_config.eagle_choices,
-            is_spec_dec_tree=spec_config.eagle_choices is not None,
+            is_spec_dec_tree=spec_config.eagle_choices is not None
+            or spec_config.use_dynamic_tree,
             is_spec_dec_dynamic_tree=spec_config.use_dynamic_tree,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
@@ -78,6 +82,7 @@ def get_spec_metadata(spec_config,
             }
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             num_layers=model_config.num_hidden_layers,
@@ -87,13 +92,13 @@ def get_spec_metadata(spec_config,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
-            max_total_draft_tokens=1,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
         spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
         )
@@ -186,6 +191,7 @@ def get_spec_drafter(model_engine,
         return ModelDrafter(spec_config,
                             draft_model_engine,
                             spec_config.max_draft_len,
+                            spec_config.max_total_draft_tokens,
                             SeqSlotManager(max_num_requests),
                             sampler,
                             spec_resource_manager=spec_resource_manager,
