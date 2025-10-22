@@ -209,8 +209,9 @@ struct BlockKey
         if (newNumberOfTokens > 0)
         {
             // Reduce token length (for partial matching)
-            TLLM_CHECK_WITH_INFO(newNumberOfTokens < static_cast<int>(uniqueTokens.size()),
-                "newNumberOfTokens must be less than uniqueTokens.size()");
+            TLLM_CHECK_WITH_INFO(newNumberOfTokens <= static_cast<int>(uniqueTokens.size()),
+                "newNumberOfTokens = %d must be <= uniqueTokens.size() = %d",
+		newNumberOfTokens, static_cast<int>(uniqueTokens.size()));
             blockKey.uniqueTokens.insert(
                 blockKey.uniqueTokens.begin(), uniqueTokens.begin(), uniqueTokens.begin() + newNumberOfTokens);
         }
@@ -348,6 +349,21 @@ std::string streamPrint(T v)
     return out.str();
 }
 
+//
+// Basic building block of KV cache.
+//
+// Implements a radix tree that is used to search for blocks containing reusable state for a common prefix.
+// There is only one instance of the search tree, it is owned by BlockManager.
+// Each node in the search tree corresponds to a particular prefix.
+// Each node has a map from window size to KVCacheBlock, if reusable state exists for a given window size,
+// the map will have a pointer to the block containing it.
+// KVCacheBlocks have a pointer back to the node that is refering to them. This makes it easier to remove
+// blocks from the search tree and also allows searches like getPrevBlock().
+//
+// Notes:
+// None of these methods are thread safe. It is up to the caller to ensure thread safety.
+// These methods return values for all window sizes with a single pass through the search tree.
+//
 class KVCachePromptLookup
 {
 public:
@@ -387,7 +403,8 @@ public:
         std::map<SizeType32, WindowBlockManager> const& windowBlockManagers, LlmRequest const& llmRequest,
         SizeType32 inputLength, bool allowPartiallyFilledBlock, bool enablePartialReuse) const;
 
-    // Print methods used for debugging.
+    //! \brief Print input prompt given by llmRequest.
+    //! \details Uses some member variables for formatting, hence cannot be made static.
     std::string printPrompt(LlmRequest const& llmRequest) const;
 
 private:

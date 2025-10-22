@@ -675,7 +675,7 @@ std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> KVCachePromptLooku
                     auto block = exactMatchingNode->getBlock(windowSize);
                     if (block != nullptr)
                     {
-                        results.insert(std::make_pair(windowSize, block));
+                        results.insert_or_assign(windowSize, block);
                     }
                     else
                     {
@@ -683,6 +683,7 @@ std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> KVCachePromptLooku
                         stillLooking.erase(windowSize);
                     }
                 }
+                searchRoot = exactMatchingNode;
             }
         }
         if (stillLooking.empty())
@@ -2215,7 +2216,7 @@ std::optional<KVCacheBlock::IdType> BlockManager::notThreadSafeStoreBlocksForReu
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
             auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
-            [[maybe_unused]] std::tie(numBlocksStoredForReuse, lastStoredId)
+            std::tie(numBlocksStoredForReuse, lastStoredId)
                 = manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx]);
         }
     }
@@ -2326,7 +2327,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
-        manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx]);
+        [[maybe_unused]] auto const& [dummy1, dummy2] = manager.storeBlocks(matchedPromptNodes, cacheBlockIds[beamIdx]);
     }
 }
 
