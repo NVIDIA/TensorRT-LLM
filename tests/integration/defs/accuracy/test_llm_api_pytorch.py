@@ -3602,6 +3602,7 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
 
+    @pytest.mark.skip(reason="https://nvbugs/5601909")
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH,
                  max_num_tokens=16384,
