@@ -1,6 +1,5 @@
 import dataclasses
 import datetime
-import enum
 import functools
 import gc
 import os
@@ -14,6 +13,7 @@ from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+from strenum import StrEnum
 
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
@@ -150,7 +150,7 @@ class BatchStatePP(BatchState):
     scheduled_ctx_reqs: list[LlmRequest] = None
 
 
-class ExecutorMemoryType(enum.StrEnum):
+class ExecutorMemoryType(StrEnum):
     SAMPLER = "sampler"
     DRAFTER = "drafter"
     GUIDED_DECODER = "guided_decoder"
