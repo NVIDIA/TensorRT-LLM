@@ -58,7 +58,7 @@ def test_create_autodeploy_executor_with_guided_decoding(
     guided_decoding_backend, max_batch_size, vocab_size_padded
 ):
     """Test create_autodeploy_executor with guided_decoding_backend."""
-    mock_tokenizer = MockTokenizer
+    mock_tokenizer = MockTokenizer()
 
     ad_config = LlmArgs(
         model="test-model",
