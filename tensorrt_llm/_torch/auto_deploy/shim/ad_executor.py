@@ -3,14 +3,15 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
 
 from ...._utils import mpi_rank, mpi_world_size
-from ....bindings.executor import ContextChunkingPolicy
-from ....bindings.internal.batch_manager import CacheType, ContextChunkingConfig
+from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine
@@ -376,7 +377,7 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     if ad_config.enable_chunked_prefill:
         chunk_unit_size = ad_config.attn_page_size
         chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
-        ctx_chunk_config = ContextChunkingConfig(chunking_policy, chunk_unit_size)
+        ctx_chunk_config: Tuple[StrEnum, int] = (chunking_policy, chunk_unit_size)
     else:
         ctx_chunk_config = None
 
