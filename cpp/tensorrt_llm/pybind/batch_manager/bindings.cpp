@@ -164,9 +164,11 @@ void initBindings(pybind11::module_& m)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
+        .def_property_readonly("is_finished_normal", &GenLlmReq::isFinishedNormal)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def_property_readonly("num_connector_matched_tokens", &GenLlmReq::getNumConnectorMatchedTokens)
         .def_property(
             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)

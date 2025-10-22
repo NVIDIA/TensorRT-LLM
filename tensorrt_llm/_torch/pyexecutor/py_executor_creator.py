@@ -1,6 +1,7 @@
 import copy
 import enum
 import importlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -202,6 +203,7 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
                           tp_size=tensorrt_llm.mpi_world_size(),
                           gpus_per_node=tensorrt_llm.default_gpus_per_node(),
                           rank=tensorrt_llm.mpi_rank())
+        executor_config.mapping = mapping
     else:
         mapping = copy.deepcopy(executor_config.mapping)
         mapping.rank = tensorrt_llm.mpi_rank()
@@ -388,8 +390,12 @@ def create_py_executor(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         if pytorch_backend_config.use_cuda_graph:
-            raise NotImplementedError(
-                "CUDA graphs are not supported with KV connector hooks.")
+            use_flexkv = os.getenv("TENSORRT_LLM_USE_FLEXKV", "0")
+            if use_flexkv == "0":
+                raise NotImplementedError(
+                    "CUDA graphs are not supported with KV connector hooks.")
+            else:
+                logger.info("Using FlexKV for KV connector")
 
         if executor_config.scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
