@@ -90,9 +90,20 @@ class PerfMetricType(str, Enum):
     set up special threshold criteria for each type of metrics (like >50MB for engine size increase, etc.).
     """
     INFERENCE_TIME = "INFERENCE_TIME"
+    MEDIAN_INFERENCE_TIME = "MEDIAN_INFERENCE_TIME"
+    P99_INFERENCE_TIME = "P99_INFERENCE_TIME"
+    INTER_TOKEN_TIME = "INTER_TOKEN_TIME"
+    MEDIAN_INTER_TOKEN_TIME = "MEDIAN_INTER_TOKEN_TIME"
+    P99_INTER_TOKEN_TIME = "P99_INTER_TOKEN_TIME"
     FIRST_TOKEN_TIME = "FIRST_TOKEN_TIME"
+    MEDIAN_FIRST_TOKEN_TIME = "MEDIAN_FIRST_TOKEN_TIME"
+    P99_FIRST_TOKEN_TIME = "P99_FIRST_TOKEN_TIME"
     OUTPUT_TOKEN_TIME = "OUTPUT_TOKEN_TIME"
+    MEDIAN_OUTPUT_TOKEN_TIME = "MEDIAN_OUTPUT_TOKEN_TIME"
+    P99_OUTPUT_TOKEN_TIME = "P99_OUTPUT_TOKEN_TIME"
     TOKEN_THROUGHPUT = "TOKEN_THROUGHPUT"
+    TOTAL_TOKEN_THROUGHPUT = "TOTAL_TOKEN_THROUGHPUT"
+    USER_THROUGHPUT = "USER_THROUGHPUT"
     BUILD_TIME = "BUILD_TIME"
     BUILD_PEAK_CPU_MEMORY = "BUILD_PEAK_CPU_MEMORY"
     BUILD_PEAK_GPU_MEMORY = "BUILD_PEAK_GPU_MEMORY"
@@ -309,6 +320,53 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
         return cmd_str
+
+
+class PerfServerClientBenchmarkCmds(NamedTuple):
+    server_cmds: List[str]
+    client_cmds: List[List[str]]
+    names: List[str]
+    working_dir: str
+
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(10)
+                if requests.get(url).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        output = ""
+        server_file_path = os.path.join(
+            self.working_dir, f"trtllm-serve.{self.names[cmd_idx]}.log")
+        client_file_path = os.path.join(
+            self.working_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
+        try:
+            with (  # Start server process
+                    open(server_file_path, 'w') as server_ctx,
+                    popen(self.server_cmds[cmd_idx],
+                          stdout=server_ctx,
+                          stderr=subprocess.STDOUT,
+                          env=venv._new_env,
+                          shell=True) as server_proc):
+                self.wait_for_endpoint_ready(
+                    "http://localhost:8000/v1/models",
+                    timeout=5400)  # 90 minutes for large models
+                output += subprocess.check_output(self.client_cmds[cmd_idx],
+                                                  env=venv._new_env).decode()
+        finally:
+            server_proc.terminate()
+            server_proc.wait()
+        return output
+
+    def get_cmd_str(self, cmd_idx) -> List[str]:
+        return ["server-benchmark tests, please check config files"]
 
 
 class PerfDisaggScriptTestCmds(NamedTuple):

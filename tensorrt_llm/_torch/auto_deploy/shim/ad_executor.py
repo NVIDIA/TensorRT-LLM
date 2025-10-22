@@ -3,14 +3,15 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
 
 from ...._utils import mpi_rank, mpi_world_size
-from ....bindings.executor import ContextChunkingPolicy
-from ....bindings.internal.batch_manager import CacheType, ContextChunkingConfig
+from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine
@@ -320,13 +321,11 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     max_draft_len = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
     )
-    max_total_draft_tokens = 0
-    if ad_config.speculative_config is None:
-        max_total_draft_tokens = 0
-    elif hasattr(ad_config.speculative_config, "max_total_draft_tokens"):
-        max_total_draft_tokens = ad_config.speculative_config.max_total_draft_tokens
-    else:
-        max_total_draft_tokens = max_draft_len
+    max_total_draft_tokens = (
+        0
+        if ad_config.speculative_config is None
+        else ad_config.speculative_config.max_total_draft_tokens
+    )
 
     # initialize model engine
     engine = ADEngine.build_from_config(ad_config=ad_config)
@@ -378,7 +377,7 @@ def create_autodeploy_executor(ad_config: LlmArgs):
     if ad_config.enable_chunked_prefill:
         chunk_unit_size = ad_config.attn_page_size
         chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
-        ctx_chunk_config = ContextChunkingConfig(chunking_policy, chunk_unit_size)
+        ctx_chunk_config: Tuple[StrEnum, int] = (chunking_policy, chunk_unit_size)
     else:
         ctx_chunk_config = None
 
@@ -417,6 +416,7 @@ def create_autodeploy_executor(ad_config: LlmArgs):
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         max_beam_width=ad_config.max_beam_width,
     )
     return py_executor
