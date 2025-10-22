@@ -198,9 +198,11 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (Exception e) {
             def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
             if (isRerunFailed) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
+                }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
-                echo "Isolated test ${i} (${isolateTestName}) failed after rerun attempt, continuing with remaining tests"
             }
         } finally {
             // Clean up the temporary test file
@@ -894,6 +896,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil,
                     [
                       "--test-list=$testListPathNode",
+                      "--splitting-algorithm least_duration",
                       "--splits $splits",
                       "--group $splitId"
                     ]
@@ -1775,9 +1778,11 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+// Return true means the test rerun also fails. Return false otherwise.
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        error "There is not ${resultFileName} file, skip the rerun step"
+        echo "There is no ${resultFileName} file, skip the rerun step"
+        return true
     }
 
     // Create rerun directory structure to avoid conflicts
@@ -1799,7 +1804,8 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
     def rerunTestList = "${rerunDir}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
-        error "There are some failed tests that cannot be rerun, skip the rerun step."
+        echo "There are some failed tests that cannot be rerun, skip the rerun step."
+        return true
     }
 
     // If the stage has more than 5 failed tests, skip the rerun step
@@ -1816,9 +1822,11 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         }
     }
     if (validLineCount > 5) {
-        error "There are more than 5 failed ${testType} tests, skip the rerun step."
+        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
+        return true
     } else if (validLineCount == 0) {
-        error "No failed ${testType} tests need to be rerun, skip the rerun step."
+        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
+        return true
     }
 
     // Rerun tests
@@ -2226,22 +2234,23 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         rerunFailed = true
                     }
                 }
-            }
-        }
 
-        // Run the isolated tests if exists
-        if (preprocessedLists.isolateCount > 0) {
-            stage ("[${stageName}] Run Pytest (Isolated)") {
-                echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
-            }
-        } else {
-            echo "No isolated tests to run for stage ${stageName}"
-            noIsolateTests = true
-        }
+                // Run the isolated tests if exists
+                if (preprocessedLists.isolateCount > 0) {
+                    stage ("[${stageName}] Run Pytest (Isolated)") {
+                        echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
+                        rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
+                    }
+                } else {
+                    echo "No isolated tests to run for stage ${stageName}"
+                    noIsolateTests = true
+                }
 
-        if (noRegularTests && noIsolateTests) {
-            error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                if (noRegularTests && noIsolateTests) {
+                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                }
+
+            }
         }
 
         // Generate comprehensive rerun report if any reruns occurred
@@ -2559,14 +2568,13 @@ def launchTestJobs(pipeline, testFilter)
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
-        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
-        "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
+        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 4],
+        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 4],
+        "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 4],
+        "H100_PCIe-PyTorch-4": ["h100-cr", "l0_h100", 4, 4],
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
-        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
-        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
+        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 1],
         "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
         "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
@@ -2655,6 +2663,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-trtllm", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
+        // Perf sanity post merge test
+        "DGX_B200-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b200-x4", "perf_sanity_l0_dgx_b200", 1, 1, 4],
+        "DGX_B300-4_GPUs-PyTorch-Perf-Sanity-Post-Merge-1": ["b300-x4", "perf_sanity_l0_dgx_b300", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
