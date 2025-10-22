@@ -967,6 +967,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    if (gpuType.contains("6000d") {
+        pvcVolume = """
+                - name: sw-tensorrt-pvc
+                  nfs:
+                    server: aus-cdot04-corp01
+                    path: /vol/scratch26/scratch.trt_llm_data
+        """
+    }
 
     def podConfig = [
         cloud: targetCould,
@@ -1532,6 +1540,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "cat ${MODEL_CACHE_DIR}/README"
         sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
         sh "df -h"
+        sh "ping aus-cdot04-corp01"
+        sh "lookup aus-cdot04-corp01"
+        sh "ls -ll /mnt/sw-tensorrt-pvc"
 
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
