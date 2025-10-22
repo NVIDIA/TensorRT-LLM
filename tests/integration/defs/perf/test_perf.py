@@ -898,7 +898,8 @@ class PerfTestConfig:
                   custom_client_name: str = None,
                   custom_bs: int = None,
                   custom_input_len: int = None,
-                  custom_output_len: int = None) -> str:
+                  custom_output_len: int = None,
+                  device_subtype: str = None) -> str:
 
         # Used for perf sanity test
         if self.config_file is not None:
@@ -911,6 +912,10 @@ class PerfTestConfig:
 
         # First, add the model name.
         entries = [self.model_name]
+
+        # Add device subtype if provided (for autodeploy tests)
+        if device_subtype:
+            entries.append(f"subtype:{device_subtype}")
 
         if self.runtime == "cpp":  # bertBenchmark runtime
             entries.append(f"cpp")
@@ -1082,6 +1087,11 @@ class PerfTestConfig:
             return
 
         self.model_name = labels.pop(0)
+
+        # Check if device subtype is present (for autodeploy tests)
+        self.device_subtype = None
+        if len(labels) > 0 and labels[0].startswith("subtype:"):
+            self.device_subtype = labels.pop(0).replace("subtype:", "")
 
         assert labels[0] in ["cpp", "cppmanager", "bench", "disagg_server"], \
             f"Invalid runtime {labels[0]}!"
@@ -1392,8 +1402,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_test_name(self) -> str:
         return str(self._config)
 
-    def set_runtime_configs(self, llm_root, working_dir,
-                            perf_cache_fpath) -> None:
+    def set_runtime_configs(self,
+                            llm_root,
+                            working_dir,
+                            perf_cache_fpath,
+                            gpu_clock_lock=None) -> None:
         if self._config.runtime == "cpp":
             if not self._config.is_bert_like():
                 raise ValueError(
@@ -1432,6 +1445,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._working_dir = working_dir
         self._perf_cache_fpath = perf_cache_fpath
         self._llm_root = llm_root
+        self._gpu_clock_lock = gpu_clock_lock
 
     def get_convert_weights_command(self, model_dir, engine_dir) -> str:
         """
@@ -2400,9 +2414,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Construct the metric name for given metric_type, bs, input_len, and output_len.
         """
 
+        # Get device subtype for autodeploy tests
+        device_subtype = None
+        if (hasattr(self, '_gpu_clock_lock') and self._gpu_clock_lock
+                and self._config.backend == "_autodeploy"):
+            device_subtype = self._gpu_clock_lock.get_device_subtype()
+
         if metric_type in BUILDER_METRICS:
             # We build one engine for all benchmark runs, so add all bs and seq lens to the metric name.
-            metric_label = self._config.to_string()
+            metric_label = self._config.to_string(device_subtype=device_subtype)
         elif self._config.runtime == "server-benchmark":
             metric_label = self._config.to_string(
                 custom_server_name=server_name,
@@ -2414,6 +2434,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 custom_bs=bs,
                 custom_input_len=input_len,
                 custom_output_len=output_len,
+                device_subtype=device_subtype,
             )
         metric_name = f"test_perf_metric_{metric_type.lower()}"
         return self._test_domain_name + "::" + metric_name + "[" + metric_label + "]"
@@ -2618,7 +2639,8 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     working_dir = llm_venv.get_working_directory()
     test_runner = MultiMetricPerfTest(perf_case_name)
     test_runner.set_runtime_configs(llm_root, working_dir,
-                                    trt_performance_cache_fpath)
+                                    trt_performance_cache_fpath,
+                                    trt_gpu_clock_lock)
     test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
                             llm_session_data_writer, output_dir)
 
