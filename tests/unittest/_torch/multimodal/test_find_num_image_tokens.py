@@ -225,7 +225,9 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         for video_idx, test_video in enumerate(example_videos):
 
             # Get test video dimensions
-            test_video = load_video(test_video, num_frames=8, format="pil")
+            test_video, video_metadata = load_video(test_video,
+                                                    num_frames=8,
+                                                    format="pil")
             # load_video returns a list of frames, we only have one video
             video_width, video_height = test_video[0].size
 

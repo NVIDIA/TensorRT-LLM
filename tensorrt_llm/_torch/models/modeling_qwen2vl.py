@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ..._utils import nvtx_range, nvtx_range_debug
+from ..._utils import nvtx_range
 from ...inputs import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
                        ExtraProcessedInputs, InputProcessor,
                        MultimodalPlaceholderMetadata,
@@ -362,7 +362,7 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
-        videos = mm_data.get("video")
+        videos, video_metadata = mm_data.get("video", (None, None))
         do_rescale = True
         if images and isinstance(images[0], torch.Tensor):
             do_rescale = False
@@ -412,9 +412,8 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
-        with nvtx_range_debug("transformers input preprocess"):
-            processed_inputs = self._preprocess(text_prompt, mm_data,
-                                                mm_processor_kwargs)
+        processed_inputs = self._preprocess(text_prompt, mm_data,
+                                            mm_processor_kwargs)
 
         multimodal_data = {}
         pixel_values = processed_inputs.get('pixel_values', None)

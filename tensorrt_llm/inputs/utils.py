@@ -127,11 +127,12 @@ async def async_load_image(
 
 
 def _load_video_by_cv2(
-        video: str,
-        num_frames: int = 10,
-        fps: int = 30,
-        format: str = "pt",
-        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
+    video: str,
+    num_frames: int = 10,
+    fps: int = 30,
+    format: str = "pt",
+    device: str = "cpu"
+) -> Tuple[Union[List[Image.Image], List[torch.Tensor]], Dict[str, Any]]:
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
 
@@ -188,11 +189,20 @@ def _load_video_by_cv2(
         frames
     ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
 
-    return [
+    loaded_frames = [
         ToTensor()(frames[index]).to(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]
+
+    metadata = {
+        "total_num_frames": frame_count,
+        "fps": original_fps,
+        "duration": duration,
+        "frames_indices": list(indices),
+    }
+
+    return loaded_frames, metadata
 
 
 def load_base64_video(video: str) -> BytesIO:
@@ -234,11 +244,12 @@ def load_video(
 
 
 async def async_load_video(
-        video: str,
-        num_frames: int = 10,
-        fps: int = 30,
-        format: str = "pt",
-        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
+    video: str,
+    num_frames: int = 10,
+    fps: int = 30,
+    format: str = "pt",
+    device: str = "cpu"
+) -> Tuple[Union[List[Image.Image], List[torch.Tensor]], Dict[str, Any]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)

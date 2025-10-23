@@ -911,7 +911,7 @@ class VilaInputProcessor(InputProcessor):
                                   device='cuda',
                                   dtype=self.vision_tower.dtype)
         elif "video" in mm_data and len(mm_data["video"]) > 0:
-            videos = mm_data["video"]
+            videos, video_metadata = mm_data["video"]
             mm_tensors = []
             block_sizes = []
             for video in videos:
