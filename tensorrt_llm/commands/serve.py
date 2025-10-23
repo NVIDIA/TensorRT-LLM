@@ -344,7 +344,8 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str]):
+        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str],
+        media_io_kwargs: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -412,8 +413,7 @@ def serve(
     multimodal_server_config = MultimodalServerConfig(
         media_io_kwargs=parsed_media_io_kwargs)
     launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  disagg_cluster_config,
-                  multimodal_server_config)
+                  disagg_cluster_config, multimodal_server_config)
 
 
 @click.command("mm_embedding_serve")
