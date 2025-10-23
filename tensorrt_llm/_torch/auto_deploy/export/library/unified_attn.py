@@ -1,4 +1,4 @@
-"""Patch for F.scaled_dot_product_attention to use custom op."""
+"""Patch for torch.export.export to detect and replace hf attention_interface with unified attention."""
 
 from typing import Optional
 
@@ -70,13 +70,7 @@ class UnifiedAttnPatch(BaseExportPatch):
             # torch_export_to_gm is called at both export stage and attn matching stage
             # we only patch attn implementation for export stage
             if hasattr(model, "config") and hasattr(model.config, "_attn_implementation"):
-                original_imple = model.config._attn_implementation
-                try:
-                    model.config._attn_implementation = "ad_unified_attn"
-                    return self.original_values["te.export"](model, *args, **kwargs)
-                finally:
-                    model.config._attn_implementation = original_imple
-
+                model.config._attn_implementation = "ad_unified_attn"
             return self.original_values["te.export"](model, *args, **kwargs)
 
         # Apply patch
@@ -85,4 +79,3 @@ class UnifiedAttnPatch(BaseExportPatch):
     def _revert_patch(self):
         """Revert the te.export patch."""
         te.export = self.original_values["te.export"]
-        del ALL_ATTENTION_FUNCTIONS._global_mapping["ad_unified_attn"]
