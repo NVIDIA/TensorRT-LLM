@@ -80,13 +80,17 @@ class DummyModelEngine(PyTorchModelEngine):
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
         model = DummyModel(self.dtype)
-        super().__init__(model_path="",
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        model_path = "dummy"
+        llm_args = TorchLlmArgs(model=model_path,
+                                max_batch_size=batch_size,
+                                max_seq_len=max_seq_len)
+        super().__init__(model_path=model_path,
                          pytorch_backend_config=pytorch_backend_config,
-                         checkpoint_loader=None,
-                         batch_size=batch_size,
-                         max_seq_len=max_seq_len,
                          mapping=mapping,
-                         model=model)
+                         model=model,
+                         llm_args=llm_args)
 
 
 def _create_request(num_tokens, req_id: int):
