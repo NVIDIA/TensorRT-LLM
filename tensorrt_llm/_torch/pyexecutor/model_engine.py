@@ -14,6 +14,7 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
@@ -181,6 +182,12 @@ class PyTorchModelEngine(ModelEngine):
         self.sparse_attention_config = None if is_draft_model else llm_args.sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
+
+        self.is_advanced_spec_dec_sampler = (self.is_spec_decode and (
+            (self.spec_config.spec_dec_mode.is_mtp_one_model()
+             and self.spec_config.use_advanced_spec_dec_sampling) or
+            (self.spec_config.spec_dec_mode.is_eagle3_one_model()
+             and self.spec_config.use_advanced_spec_dec_sampling)))
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -1222,10 +1229,78 @@ class PyTorchModelEngine(ModelEngine):
         num_cached_tokens_per_seq = []  # per sequence
         draft_tokens = []
         draft_lens = []
+
         gen_request_seq_slots = []  # per generation request
         multimodal_params_list = []
         mrope_position_ids = []
         num_accepted_draft_tokens = []  # per request
+
+        if self.is_advanced_spec_dec_sampler:
+            temperatures = []
+            top_k = []
+            top_p = []
+            min_p = []
+
+        # advanced mtp sampling's request preprocessing helper functions
+        def collect_req_spec_dec_sampling_params(request: LlmRequest,
+                                                 draft_len: int = 0):
+
+            def get_request_temperature(request: LlmRequest,
+                                        is_greedy: bool) -> float:
+                if is_greedy:
+                    return 0.01  # avoid numerical errors and keep the same behavior as greedy sampling
+                if not request.sampling_config.temperature:
+                    return 1.0
+                temperature = request.sampling_config.temperature[0]
+                if 0 <= temperature < 1e-2:
+                    # temperature less than 0.01 may cause numerical errors
+                    temperature = 0.01
+                return temperature
+
+            def get_request_top_k(request: LlmRequest, is_greedy: bool) -> int:
+                if is_greedy:
+                    return 1
+                if not request.sampling_config.top_k:
+                    top_k = 0
+                else:
+                    top_k = request.sampling_config.top_k[0]
+
+                # set k to a very large value (larger than vocab size) to disable top_k sampling
+                TOP_K_DISABLED = torch.iinfo(torch.int32).max
+                if top_k <= 0:
+                    top_k = TOP_K_DISABLED
+                return top_k
+
+            def get_request_top_p(request: LlmRequest) -> float:
+                if not request.sampling_config.top_p:
+                    top_p = 1.0
+                else:
+                    top_p = request.sampling_config.top_p[0]
+                return top_p
+
+            def get_request_min_p(request: LlmRequest) -> float:
+                if not request.sampling_config.min_p:
+                    min_p = 0.0
+                else:
+                    min_p = request.sampling_config.min_p[0]
+                return min_p
+
+            def is_greedy_sampling(request: LlmRequest) -> bool:
+                if (request.sampling_config.temperature is None
+                        and request.sampling_config.top_p is None
+                        and request.sampling_config.top_k is None):
+                    return True
+                return False
+
+            is_greedy_req = is_greedy_sampling(request)
+
+            temperatures.extend(
+                [get_request_temperature(request, is_greedy_req)] *
+                (draft_len + 1))
+            top_k.extend([get_request_top_k(request, is_greedy_req)] *
+                         (draft_len + 1))
+            top_p.extend([get_request_top_p(request)] * (draft_len + 1))
+            min_p.extend([get_request_min_p(request)] * (draft_len + 1))
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -1244,7 +1319,6 @@ class PyTorchModelEngine(ModelEngine):
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
-
             # Multimodal
             py_multimodal_runtime = MultimodalRuntimeData(
                 mm_token_lengths=request.multimodal_lengths,
@@ -1279,6 +1353,9 @@ class PyTorchModelEngine(ModelEngine):
                 #re-assign the multimodal_data to the request after to_device for generation requests
                 request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
+
+            if self.is_advanced_spec_dec_sampler:
+                collect_req_spec_dec_sampling_params(request)
 
             request.py_batch_idx = request.py_seq_slot
 
@@ -1355,6 +1432,11 @@ class PyTorchModelEngine(ModelEngine):
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
+
+                if self.is_advanced_spec_dec_sampler:
+                    collect_req_spec_dec_sampling_params(
+                        request, num_draft_tokens)
+
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -1389,6 +1471,9 @@ class PyTorchModelEngine(ModelEngine):
                     num_cached_tokens_per_seq.append(past_seen_token_num +
                                                      self.runtime_draft_len + 1)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
+                if self.is_advanced_spec_dec_sampler:
+                    collect_req_spec_dec_sampling_params(
+                        request, self.runtime_draft_len)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     prompt_lengths.append(1 + self.runtime_draft_len)
@@ -1418,6 +1503,10 @@ class PyTorchModelEngine(ModelEngine):
 
             # update batch index
             request.py_batch_idx = request.py_seq_slot
+
+            if self.is_advanced_spec_dec_sampler:
+                collect_req_spec_dec_sampling_params(
+                    request, self.original_max_draft_len)
 
         for request in generation_requests:
             request_ids.append(request.py_request_id)
@@ -1477,6 +1566,10 @@ class PyTorchModelEngine(ModelEngine):
                                 "mrope_config.mrope_position_deltas"
                             ])
                         multimodal_params_list.append(multimodal_params)
+
+            if self.is_advanced_spec_dec_sampler:
+                collect_req_spec_dec_sampling_params(request,
+                                                     self.runtime_draft_len)
 
             request.py_batch_idx = request.py_seq_slot
             # Do not add a gen_request_seq_slot for CUDA graph dummy requests
@@ -1712,6 +1805,11 @@ class PyTorchModelEngine(ModelEngine):
                                                                 total_draft_lens]
             spec_metadata.request_ids = request_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
+
+            if self.is_advanced_spec_dec_sampler:
+                spec_metadata.update_advanced_sampling_params(
+                    temperatures, top_k, top_p, min_p)
+
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
@@ -2268,6 +2366,10 @@ class PyTorchModelEngine(ModelEngine):
                 is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,
                 self.original_max_draft_len)
+
+            if self.is_advanced_spec_dec_sampler:
+                spec_metadata._set_up_advanced_sampling(
+                    self.batch_size, self.original_max_draft_len)
         else:
             spec_resource_manager = None
             spec_metadata = None

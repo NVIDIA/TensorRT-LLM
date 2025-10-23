@@ -235,6 +235,113 @@ class EarlyStopWithMMResult(Sampler):
         return False
 
 
+def forward_native(
+    logits: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    PyTorch-native implementation of top-k and top-p sampling.
+
+    The logits tensor may be updated in-place.
+    """
+    logits = apply_top_k_top_p(logits, k, p)
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
+    return random_sample(probs)
+
+
+def random_sample(
+    probs: torch.Tensor,
+) -> torch.Tensor:
+    """Randomly sample from the probabilities.
+
+    We use this function instead of torch.multinomial because torch.multinomial
+    causes CPU-GPU synchronization.
+    """
+    q = torch.empty_like(probs)
+    q.exponential_()
+    return probs.div_(q).argmax(dim=-1).view(-1)
+
+
+def apply_min_p(
+    logits: torch.Tensor,
+    min_p: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Filters logits using adaptive probability thresholding.
+    """
+    # Convert logits to probability distribution
+    probability_values = torch.nn.functional.softmax(logits, dim=-1)
+    # Calculate maximum probabilities per sequence
+    max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
+    # Reshape min_p for broadcasting
+    adjusted_min_p = min_p.unsqueeze(1) * max_probabilities
+    # Identify valid tokens using threshold comparison
+    valid_token_mask = probability_values >= adjusted_min_p
+    # Apply mask using boolean indexing
+    logits[~valid_token_mask] = -float("inf")
+    return logits
+
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Apply top-k and top-p masks to the logits.
+
+    If a top-p is used, this function will sort the logits tensor,
+    which can be slow for large batches.
+
+    The logits tensor may be updated in-place.
+    """
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    if k is not None:
+        # Apply top-k.
+        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
+        top_k_mask = top_k_mask.clamp(min=0)
+        # Get all the top_k values.
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+        top_k_mask = logits_sort < top_k_mask
+        logits_sort.masked_fill_(top_k_mask, -float("inf"))
+    if p is not None:
+        # Apply top-p.
+        probs_sort = logits_sort.softmax(dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        # at least one
+        top_p_mask[:, -1] = False
+        logits_sort.masked_fill_(top_p_mask, -float("inf"))
+    # Re-sort the probabilities.
+    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+    return logits
+
+
+def apply_temperature(
+    logits: torch.Tensor,
+    temp: torch.Tensor,
+) -> torch.Tensor:
+    # Use in-place division to avoid creating a new tensor.
+    return logits.div_(temp.unsqueeze(dim=1))
+
+
+@torch.compile(options={"max-autotune": True})
+def sampling_batch_spec_dec_one_model(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raw_probs = torch.softmax(logits, dim=-1)
+    logits = apply_temperature(logits, temperatures)
+    logits = apply_min_p(logits, min_p)
+    random_sampled = forward_native(logits, top_k, top_p)
+    token_probs = torch.gather(raw_probs, dim=1, index=random_sampled.unsqueeze(1)).squeeze(-1)
+    log_probs = torch.log(token_probs)
+    return random_sampled, log_probs
+
+
 # Due to tensorrt_llm::runtime::SamplingConfig using vectors, params
 # in LlmRequest.sampling_params are either None or single-element lists.
 # This helper method simplifies code using such params.

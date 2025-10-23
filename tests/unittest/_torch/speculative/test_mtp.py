@@ -331,6 +331,76 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
                     accepted_tokens[i][0:ref_num_accepted_tokens[i]],
                     ref_accepted_tokens[i][0:ref_num_accepted_tokens[i]])
 
+    @parameterized.expand(load_sample_and_accept_draft_tokens_test_cases,
+                          name_func=unittest_name_func)
+    def test_sample_and_accept_draft_tokens_adv_torch_sampler_greedy_mode(
+            self, test_case_name, mtp_num_modules, logits, draft_tokens,
+            draft_len, num_context_requests, ref_accepted_tokens,
+            ref_num_accepted_tokens):
+        # Set deterministic seed for consistent multi-GPU sampling for advanced pytorch sampler
+        torch.manual_seed(0)
+
+        batch_size = len(draft_len)
+        # enable advanced pytorch sampler
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=mtp_num_modules,
+            use_advanced_spec_dec_sampling=True)
+
+        # attention metedata
+        attn_metadata = TrtllmAttentionMetadata(max_num_requests=batch_size,
+                                                max_num_tokens=1024,
+                                                kv_cache_manager=None)
+        attn_metadata.seq_lens = torch.tensor(
+            [1] * batch_size, dtype=torch.int)  # dummy sequence length
+        attn_metadata.num_contexts = num_context_requests
+
+        # speculative decoding metadata
+        spec_metadata = MTPSpecMetadata(max_num_requests=32,
+                                        spec_dec_mode=spec_config.spec_dec_mode,
+                                        max_draft_len=mtp_num_modules,
+                                        mtp_num_modules=mtp_num_modules)
+        spec_metadata.draft_tokens = draft_tokens
+
+        temperatures = []
+        top_k = []
+        top_p = []
+        min_p = []
+        for i in range(batch_size):
+            num_draft_tokens = draft_len[i]
+            # set to greedy sampling mode (temperature <= 0.01 boundary) for advanced pytorch sampler
+            # sampling default config vals set in
+            # [tensorrt_llm/_torch/pyexecutor/model_engine.py:get_request_[param_name]]
+            temperatures.extend([0.01] * (num_draft_tokens + 1))
+            top_k.extend([1] * (num_draft_tokens + 1))
+            top_p.extend([1.0] * (num_draft_tokens + 1))
+            min_p.extend([0.0] * (num_draft_tokens + 1))
+        spec_metadata.temperatures = torch.tensor(temperatures,
+                                                  dtype=torch.float,
+                                                  device="cuda")
+        spec_metadata.top_k = torch.tensor(top_k,
+                                           dtype=torch.int,
+                                           device="cuda")
+        spec_metadata.top_p = torch.tensor(top_p,
+                                           dtype=torch.float,
+                                           device="cuda")
+        spec_metadata.min_p = torch.tensor(min_p,
+                                           dtype=torch.float,
+                                           device="cuda")
+
+        # mtp worker
+        # is_thop default to False for advanced pytorch sampler testing only
+        mtpworker = MTPWorker(spec_config)
+
+        # Test advanced torch sampler
+        accepted_tokens, num_accepted_tokens = mtpworker.sample_and_accept_draft_tokens(
+            None, logits, spec_metadata, attn_metadata)
+
+        torch.testing.assert_close(num_accepted_tokens, ref_num_accepted_tokens)
+        for i in range(len(draft_len)):
+            torch.testing.assert_close(
+                accepted_tokens[i][0:ref_num_accepted_tokens[i]],
+                ref_accepted_tokens[i][0:ref_num_accepted_tokens[i]])
+
 
 class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
 

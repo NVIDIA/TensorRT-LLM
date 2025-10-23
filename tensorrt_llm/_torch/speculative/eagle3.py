@@ -10,7 +10,7 @@ from ..attention_backend import AttentionMetadata
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
+from ..pyexecutor.sampler import TorchSampler, sampling_batch_spec_dec_one_model
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 from .mtp import MTPSampler
@@ -244,6 +244,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
 
+    temperatures_cuda: Optional[torch.Tensor] = None
+    top_k_cuda: Optional[torch.Tensor] = None
+    top_p_cuda: Optional[torch.Tensor] = None
+    min_p_cuda: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         if self.layers_to_capture is None:
             if self.num_layers == 1:
@@ -303,6 +308,51 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                    self.hidden_size].copy_(to_save,
                                                            non_blocking=True)
                 break
+
+    def _set_up_advanced_sampling(self, batch_size: int, max_draft_len: int):
+        # create once and reuse
+        if self.temperatures_cuda is None:
+            # Set deterministic seed (one time) for consistent multi-GPU sampling using PyTorch RNG
+            # operations that avoid torch.multinomial's CPU-GPU sync overhead
+            torch.manual_seed(0)
+
+            max_total_sampling_size = batch_size * (max_draft_len + 1)
+            self.temperatures_cuda = torch.empty((max_total_sampling_size, ),
+                                                 dtype=torch.float,
+                                                 device='cuda')
+            self.top_k_cuda = torch.empty((max_total_sampling_size, ),
+                                          dtype=torch.int,
+                                          device='cuda')
+            self.top_p_cuda = torch.empty((max_total_sampling_size, ),
+                                          dtype=torch.float,
+                                          device='cuda')
+            self.min_p_cuda = torch.empty((max_total_sampling_size, ),
+                                          dtype=torch.float,
+                                          device='cuda')
+
+    def update_advanced_sampling_params(self, temperatures: list[float],
+                                        top_k: list[int], top_p: list[float],
+                                        min_p: list[float]):
+        self.temperatures_cuda[:len(temperatures)].copy_(torch.tensor(
+            temperatures, dtype=torch.float, pin_memory=True),
+                                                         non_blocking=True)
+        self.top_k_cuda[:len(top_k)].copy_(torch.tensor(top_k,
+                                                        dtype=torch.int,
+                                                        pin_memory=True),
+                                           non_blocking=True)
+        self.top_p_cuda[:len(top_p)].copy_(torch.tensor(top_p,
+                                                        dtype=torch.float,
+                                                        pin_memory=True),
+                                           non_blocking=True)
+        self.min_p_cuda[:len(min_p)].copy_(torch.tensor(min_p,
+                                                        dtype=torch.float,
+                                                        pin_memory=True),
+                                           non_blocking=True)
+
+        self.temperatures = self.temperatures_cuda[:len(temperatures)]
+        self.top_k = self.top_k_cuda[:len(top_k)]
+        self.top_p = self.top_p_cuda[:len(top_p)]
+        self.min_p = self.min_p_cuda[:len(min_p)]
 
 
 class Eagle3OneModelSampler(MTPSampler):
@@ -467,8 +517,13 @@ class Eagle3OneModelWorker(nn.Module):
                                          dtype=torch.int,
                                          device=logits.device)
 
-        # Do greedy sampling for the input logits
-        target_tokens = torch.argmax(logits, dim=-1)
+        if self.spec_config.use_advanced_spec_dec_sampling:
+            target_tokens, _ = sampling_batch_spec_dec_one_model(
+                logits, spec_metadata.temperatures, spec_metadata.top_k,
+                spec_metadata.top_p, spec_metadata.min_p)
+        else:
+            # Do greedy sampling for the input logits
+            target_tokens = torch.argmax(logits, dim=-1)
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
