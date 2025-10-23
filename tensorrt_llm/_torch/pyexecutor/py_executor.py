@@ -1263,7 +1263,6 @@ class PyExecutor:
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_total_draft_tokens = self.model_engine.spec_config.max_total_draft_tokens
 
-
                 if max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * max_total_draft_tokens
                     req.py_draft_pages_allocated = max_total_draft_tokens
@@ -2351,6 +2350,10 @@ class PyExecutor:
                 self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
             else:
                 self.has_previous_draft_tokens = False
+                # We are not running the draft model. Remove the draft tokens and turn off spec
+                # decode so that the requests get handled correctly.
+                for request in scheduled_batch.generation_requests:
+                    request.py_draft_tokens = []
                 target_inputs, draft_outputs, draft_batch = None, None, None
 
         return target_inputs, draft_outputs, draft_batch
