@@ -129,13 +129,7 @@ class ADEngine(ModelEngine):
         build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
 
         # construct engine
-        return cls(
-            build_and_optimize,
-            seq_info,
-            device,
-            max_beam_width,
-            vocab_size_padded=getattr(factory, "vocab_size_padded", None),
-        )
+        return cls(build_and_optimize, seq_info, device, max_beam_width)
 
     @torch.inference_mode()
     def __init__(
@@ -144,7 +138,6 @@ class ADEngine(ModelEngine):
         seq_info: SequenceInfo,
         device: DeviceLikeType,
         max_beam_width: int = 1,
-        vocab_size_padded: Optional[int] = None,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -178,12 +171,6 @@ class ADEngine(ModelEngine):
 
         # start fresh with fixed seed
         torch.manual_seed(42)
-
-        self._vocab_size_padded = vocab_size_padded
-
-    @property
-    def vocab_size_padded(self) -> Optional[int]:
-        return self._vocab_size_padded
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
@@ -437,7 +424,8 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
     ) and dist_mapping.is_last_pp_rank():
-        vocab_size_padded = engine.vocab_size_padded
+        factory = ad_config.create_factory()
+        vocab_size_padded = getattr(factory, "vocab_size_padded", None)
         if vocab_size_padded is None:
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
