@@ -5,8 +5,11 @@ import torch
 import torch.distributed as dist
 from _dist_test_utils import get_device_counts
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.mxfp4_moe import IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.auto_deploy.distributed.common import spawn_multiprocess_job
+
+# FIXME: https://nvbugspro.nvidia.com/bug/5604136.
+# from tensorrt_llm._torch.auto_deploy.custom_ops.mxfp4_moe import IS_TRITON_KERNELS_AVAILABLE
+IS_TRITON_KERNELS_AVAILABLE = False
 
 
 def _split_range_last_remainder(n: int, world_size: int, rank: int):
