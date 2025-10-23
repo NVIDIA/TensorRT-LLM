@@ -891,14 +891,16 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     module_weights.append(fw)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
-                    module.load_weights(weights=module_weights)
+                    module.load_weights(weights=module_weights,
+                                        already_sharded=False)
 
             else:
                 module_weights = filter_weights(name, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
                     if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
+                        module.load_weights(weights=[module_weights],
+                                            already_sharded=False)
                     else:
                         for n, p in module.named_parameters(recurse=False):
                             p.data.copy_(module_weights[n][:])
@@ -949,6 +951,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     if params_map is not None:
         weights = weight_mapper.rename_by_params_map(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
+    already_sharded = getattr(weight_mapper, 'already_sharded', False)
 
     def load_single_module(name, module):
         if len(module._parameters) > 0:
@@ -963,7 +966,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     module, module_name, module_names_breakdown, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
-                    module.load_weights(weights=module_weights)
+                    module.load_weights(weights=module_weights,
+                                        already_sharded=already_sharded)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
@@ -976,7 +980,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             if "linear_attn.conv1d" in name:
                                 module_weights['weight'] = module_weights[
                                     'weight'].squeeze(dim=1)
-                            module.load_weights(weights=[module_weights])
+                            module.load_weights(weights=[module_weights],
+                                                already_sharded=already_sharded)
                     else:
                         for n, p in module.named_parameters(recurse=False):
                             weight_mapper.handle_manual_copy(
