@@ -250,6 +250,21 @@ static std::pair<size_t, size_t> logMemoryUsage(char const* operation, CUcontext
     return {free_mem, total_mem};
 }
 
+// Helper function to handle memory-related errors for cublas handle creation.
+static void throwCublasMemoryError(char const* handleType, cublasStatus_t status, CUcontext ctx)
+{
+    // Re-fetch and log current memory state for debugging
+    auto [free_mem, total_mem] = logMemoryUsage(
+        (std::string("Failed to create ") + handleType + " - logging current memory state").c_str(), ctx);
+
+    TLLM_THROW(
+        "Failed to create %s. "
+        "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+        "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
+        handleType, status, ctx, free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0,
+        total_mem / (1024 * 1024));
+}
+
 } // namespace
 
 std::shared_ptr<cublasHandle_t> getCublasHandle()
@@ -266,14 +281,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                // Re-fetch memory info for error message (memory state might have changed)
-                cudaMemGetInfo(&free_mem, &total_mem);
-                TLLM_THROW(
-                    "Failed to create cublas handle. "
-                    "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
-                    "Consider reducing kv_cache_config.max_tokens or free_gpu_memory_fraction.",
-                    status, ctx, free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0,
-                    total_mem / (1024 * 1024));
+                throwCublasMemoryError("cublas handle", status, ctx);
             }
 
             return handle;
@@ -304,14 +312,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                // Re-fetch memory info for error message (memory state might have changed)
-                cudaMemGetInfo(&free_mem, &total_mem);
-                TLLM_THROW(
-                    "Failed to create cublasLt handle. "
-                    "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
-                    "Consider reducing kv_cache_config.max_tokens or free_gpu_memory_fraction.",
-                    status, ctx, free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0,
-                    total_mem / (1024 * 1024));
+                throwCublasMemoryError("cublasLt handle", status, ctx);
             }
 
             return handle;
