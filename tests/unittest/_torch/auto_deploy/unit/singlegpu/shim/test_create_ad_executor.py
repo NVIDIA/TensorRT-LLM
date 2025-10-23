@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import Mock, patch
 
 import pytest
@@ -62,6 +62,13 @@ class MockPyExecutor:
     max_total_draft_tokens: int
     max_beam_width: int
     guided_decoder: Any
+
+
+@dataclass
+class MockFactory:
+    """Mock Factory that stores initialization arguments."""
+
+    vocab_size_padded: Optional[int] = None
 
 
 """Unit tests for create_autodeploy_executor function."""
@@ -113,6 +120,10 @@ def test_create_autodeploy_executor_with_guided_decoding(
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
         ) as mock_ad_engine,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=vocab_size_padded),
+        ),
     ):
         mock_ad_engine.return_value = mock_engine
 

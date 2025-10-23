@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 
@@ -7,29 +22,7 @@ from defs.conftest import llm_models_root
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
-def autodeploy_example_root(llm_root):
-    example_root = os.path.join(llm_root, "examples", "auto_deploy")
-    return example_root
-
-
-def prepare_model_symlinks(llm_venv):
-    """Create local symlinks for models to avoid re-downloading in examples."""
-    src_dst_dict = {
-        # TinyLlama-1.1B-Chat-v1.0 used by the guided decoding example
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    }
-
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            try:
-                os.symlink(src, dst, target_is_directory=True)
-            except FileExistsError:
-                pass
-
-
-def test_autodeploy_guided_decoding_main_json(llm_root, llm_venv):
+def test_autodeploy_guided_decoding_main_json():
     schema = (
         "{"
         '"title": "WirelessAccessPoint", "type": "object", "properties": {'
