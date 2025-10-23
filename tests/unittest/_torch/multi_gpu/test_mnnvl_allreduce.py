@@ -194,6 +194,9 @@ def row_linear_residual_norm_fusion_forward(
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
                                          fusion):
 
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC and 2048 in seq_len:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5573856")
+
     torch.manual_seed(42)
     tensor_parallel_size = 2
 
