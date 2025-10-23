@@ -307,7 +307,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_
 full:L40S/accuracy/test_cli_flow.py::TestGpt2::test_variable_beam_width_search SKIP (https://nvbugs/5481075)
 full:L40S/accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_plugin SKIP (https://nvbugs/5568052)
 full:L40S/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2] SKIP (https://nvbugs/5596337)
-full:L40S/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/5596337)
 accuracy/test_llm_api.py::TestMixtral8x7BInstruct::test_awq_tp2 SKIP (https://nvbugs/5598847)
 test_e2e.py::test_ptp_quickstart_multimodal_multiturn[gemma-3-27b-it-gemma/gemma-3-27b-it] SKIP (https://nvbugs/5568836)
 unittest/executor/test_rpc.py SKIP (https://nvbugs/5596365)
