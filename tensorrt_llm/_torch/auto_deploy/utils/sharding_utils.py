@@ -150,75 +150,59 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
-    # Use custom shard function if provided
-    if custom_shard_fn is not None:
-        sharded_weight = custom_shard_fn(weight_tensor)
-        sharded_shape = sharded_weight.shape
-        # Register load hook with custom function
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                _load_hook,
-                f_split=custom_shard_fn,
-                param_key=param_key,
-                param_shape=sharded_shape,
+    def split_tensor(
+        t: torch.Tensor,
+        d: int = dim,
+        r: int = rank,
+        ws: int = world_size,
+        min_d_shape: int = min_local_shape,
+    ) -> torch.Tensor:
+        # The local tensor shape has to be divisible by min_d_shape
+        max_split_size = t.shape[d] // min_d_shape
+        if ws > max_split_size:
+            num_groups = math.ceil(ws / max_split_size)
+            ad_logger.debug(
+                f"World size {ws} is greater than the max split size {max_split_size}. "
+                + f"Splitting tensor to {num_groups} chunks"
             )
+            return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
+        return torch.tensor_split(t, ws, dim=d)[r]
+
+    # Handle fused weights
+    if fused_weight_dims is not None:
+        # Split fused weights, apply TP sharding to each, then concatenate back
+        sharded_weight = torch.cat(
+            [split_tensor(w) for w in torch.split(weight_tensor, fused_weight_dims, dim=dim)],
+            dim=dim,
         )
 
-    else:
-
-        def split_tensor(
+        # Create a function that applies the same logic for loading
+        def split_fused_tensor(
             t: torch.Tensor,
+            fused_dims: list = fused_weight_dims,
             d: int = dim,
-            r: int = rank,
-            ws: int = world_size,
-            min_d_shape: int = min_local_shape,
         ) -> torch.Tensor:
-            # The local tensor shape has to be divisible by min_d_shape
-            max_split_size = t.shape[d] // min_d_shape
-            if ws > max_split_size:
-                num_groups = math.ceil(ws / max_split_size)
-                ad_logger.debug(
-                    f"World size {ws} is greater than the max split size {max_split_size}. "
-                    + f"Splitting tensor to {num_groups} chunks"
-                )
-                return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
-            return torch.tensor_split(t, ws, dim=d)[r]
-
-        # Handle fused weights
-        if fused_weight_dims is not None:
-            # Split fused weights, apply TP sharding to each, then concatenate back
-            sharded_weight = torch.cat(
-                [split_tensor(w) for w in torch.split(weight_tensor, fused_weight_dims, dim=dim)],
-                dim=dim,
+            return torch.cat(
+                [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
+                dim=d,
             )
 
-            # Create a function that applies the same logic for loading
-            def split_fused_tensor(
-                t: torch.Tensor,
-                fused_dims: list = fused_weight_dims,
-                d: int = dim,
-            ) -> torch.Tensor:
-                return torch.cat(
-                    [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
-                    dim=d,
-                )
+        f_split = split_fused_tensor
+    else:
+        sharded_weight = split_tensor(weight_tensor)
+        f_split = split_tensor
 
-            f_split = split_fused_tensor
-        else:
-            sharded_weight = split_tensor(weight_tensor)
-            f_split = split_tensor
+    sharded_shape = sharded_weight.shape
 
-        sharded_shape = sharded_weight.shape
-
-        # Register load hook
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                _load_hook,
-                f_split=f_split,
-                param_key=param_key,
-                param_shape=sharded_shape,
-            )
+    # Register load hook
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=f_split,
+            param_key=param_key,
+            param_shape=sharded_shape,
         )
+    )
 
     # Update the parameter in the module
     if update_param:
@@ -332,6 +316,9 @@ def _insert_sharded_mamba(
             "conv1d": split_sizes_2,
         }
 
+    ##############################################################
+    ############# update conv1d num output channels ##############
+    ##############################################################
     conv1d_node = conv1d_nodes[0]
     # conv1d_node last argument is the number of output channels.
     # This one is also sharded, so we need to update this parameter
@@ -349,6 +336,9 @@ def _insert_sharded_mamba(
                 entry_fused_dims = dims
                 break
 
+    ##############################################################
+    ####### shard the entry_node (the first linear layer) ########
+    ##############################################################
     _insert_sharded_matmul(
         gm=gm,
         node=entry_node,
@@ -361,6 +351,9 @@ def _insert_sharded_mamba(
         quantization_cb=quantization_cb,
     )
 
+    ##############################################################
+    ############## shard the remaining weights ###################
+    ##############################################################
     # Get all weight nodes in the subgraph except for out_proj
     weight_nodes = [
         n
