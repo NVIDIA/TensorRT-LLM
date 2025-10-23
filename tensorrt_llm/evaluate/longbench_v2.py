@@ -709,7 +709,7 @@ class LongBenchV2(Evaluator):
                                     "longbench_v2_results.jsonl")
         with open(results_file, 'w', encoding='utf-8') as f:
             for result in results:
-                json.dump(results, f, ensure_ascii=False)
+                json.dump(result, f, ensure_ascii=False)
                 f.write('\n')
 
         # Save predictions
@@ -786,7 +786,7 @@ class LongBenchV2(Evaluator):
     @click.option(
         "--max_len",
         type=int,
-        default=1280000,
+        default=128000,
         help=
         "Maximum prompt length in tokens for truncation when building prompts.")
     @click.option("--output_dir",
@@ -807,7 +807,7 @@ class LongBenchV2(Evaluator):
                   help="System prompt.")
     @click.option("--max_input_length",
                   type=int,
-                  default=1280000,
+                  default=128000,
                   help="Maximum prompt length in sampling parameters.")
     @click.option("--max_output_length",
                   type=int,
