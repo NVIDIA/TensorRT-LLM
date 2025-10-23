@@ -48,7 +48,7 @@ def _bamba_mixer_torch_forward(
             0, batch_size * seq_len, seq_len, device=input_states.device, dtype=torch.int
         )
         slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
-
+        use_initial_states_t = torch.zeros(batch_size, device=input_states.device, dtype=torch.bool)
     if use_caching:
         hidden_states_B_C = self.act(
             torch.ops.auto_deploy.torch_cached_causal_conv1d(
@@ -60,6 +60,7 @@ def _bamba_mixer_torch_forward(
                 seq_len_t,
                 seq_start_t,
                 slot_idx_t,
+                use_initial_states_t,
                 # CACHES
                 cache_params.conv_states[self.layer_idx],
                 # CONSTANTS
@@ -100,7 +101,7 @@ def _bamba_mixer_torch_forward(
 
     if use_caching:
         # Use new flattened cached op for both cache updates and outputs
-        y = torch.ops.auto_deploy.torch_cached_ssm_transform(
+        y = torch.ops.auto_deploy.torch_cached_ssm(
             # INPUTS
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
@@ -113,6 +114,7 @@ def _bamba_mixer_torch_forward(
             seq_len=seq_len_t,
             seq_start=seq_start_t,
             slot_idx=slot_idx_t,
+            use_initial_states=use_initial_states_t,
             # CACHES
             ssm_state_cache=cache_params.ssm_states[self.layer_idx],
             # CONSTANTS
@@ -120,7 +122,7 @@ def _bamba_mixer_torch_forward(
             chunk_size=self.chunk_size,
         )
     else:
-        y = torch.ops.auto_deploy.torch_ssm_transform(
+        y = torch.ops.auto_deploy.torch_ssm(
             hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             A=A,
             B=B.view(batch_size, seq_len, -1, self.ssm_state_size),

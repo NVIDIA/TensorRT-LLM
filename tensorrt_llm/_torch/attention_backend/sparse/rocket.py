@@ -8,6 +8,7 @@ from triton import next_power_of_2
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
@@ -949,7 +950,10 @@ class RocketKVCacheManager(KVCacheManager):
             kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
             self.add_kt_tokens(request_id, kt_token_num)
 
-    def update_resources(self, scheduled_batch):
+    def update_resources(self,
+                         scheduled_batch,
+                         attn_metadata: AttentionMetadata = None,
+                         kv_cache_dtype_byte_size: float = None):
         for request in scheduled_batch.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 seq_len = request.get_num_tokens(0)

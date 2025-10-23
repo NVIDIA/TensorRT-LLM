@@ -53,7 +53,6 @@ def build_engine(model_name, request):
 
     llm = LLM(model_path,
               tensor_parallel_size=tp_size,
-              auto_parallel_world_size=tp_size,
               build_config=build_config)
 
     engine_dir = TemporaryDirectory(suffix="-engine_dir")

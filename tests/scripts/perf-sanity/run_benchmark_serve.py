@@ -1,753 +1,771 @@
 #!/usr/bin/env python3
 import argparse
+import ast
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Dict, List, NamedTuple
 
 import requests
 import yaml
 
 
-class BenchmarkRunner:
-
-    def __init__(self,
-                 output_folder: str,
-                 config_file: str,
-                 skip_pattern: str = None,
-                 select_pattern: str = None):
-        self.output_folder = Path(output_folder)
-        self.config_file = Path(config_file)
-
-        # Treat empty or "default" values as None (default behavior)
-        self.skip_pattern = None if not skip_pattern or skip_pattern.lower(
-        ) == "default" else skip_pattern
-        self.select_pattern = None if not select_pattern or select_pattern.lower(
-        ) == "default" else select_pattern
-
-        self.skip_test_cases: Set[int] = set()
-        self.skip_concurrencies: Dict[int, Set[int]] = {}
-        self.select_test_cases: Set[int] = set()
-        self.select_concurrencies: Dict[int, Set[int]] = {}
-
-        if self.skip_pattern:
-            self.parse_skip_pattern(self.skip_pattern)
-
-        if self.select_pattern:
-            self.parse_select_pattern(self.select_pattern)
-
-        # Execution plan: {test_case_id: [concurrency_indices]}
-        self.execution_plan: Dict[int, List[int]] = {}
-
-        # Model path mapping
-        self.model_paths = {
-            "70B-FP4":
-            "/home/scratch.trt_llm_data/llm-models/llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-            "70B-FP8":
-            "/home/scratch.trt_llm_data/llm-models/llama-3.3-models/Llama-3.3-70B-Instruct-FP8",
-            "Scout-FP4":
-            "/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
-            "Scout-FP8":
-            "/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
-            "R1-FP8":
-            "/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1/",
-            "R1-FP4":
-            "/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-0528-FP4"
-        }
-
-        # Set environment variables
-        os.environ['TQDM_MININTERVAL'] = '1000'
-        os.environ['PRINT_ITER_LOG'] = 'false'
-
-        # Capture system information
-        self.node_name = self.get_node_name()
-        self.gpu_info = self.get_gpu_info()
-
-        # Change to output directory
-        os.chdir(self.output_folder)
-
-    def get_node_name(self) -> str:
-        """Get the current node name"""
-        try:
-            result = subprocess.run("hostname",
-                                    shell=True,
-                                    capture_output=True,
-                                    text=True,
-                                    check=True)
-            return result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return "unknown"
-
-    def get_gpu_info(self) -> str:
-        """Get GPU information from nvidia-smi"""
-        try:
-            result = subprocess.run("nvidia-smi",
-                                    shell=True,
-                                    capture_output=True,
-                                    text=True,
-                                    check=True)
-            return result.stdout
-        except subprocess.CalledProcessError as e:
-            return f"nvidia-smi failed with error code {e.returncode}\nError output: {e.stderr}"
-        except FileNotFoundError:
-            return "nvidia-smi not found"
-
-    def parse_skip_pattern(self, skip_pattern: str) -> None:
-        """Parse skip pattern like '2,4-1' to determine what to skip"""
-        if not skip_pattern:
-            return
-
-        parts = skip_pattern.split(',')
-        for part in parts:
-            part = part.strip()
-            if not part:  # Skip empty parts
-                continue
-
-            if '-' in part:
-                # Format: "test_case-concurrency_index" (1-based)
-                try:
-                    test_case_str, concurrency_str = part.split('-')
-                    test_case_id = int(test_case_str)
-                    concurrency_index = int(
-                        concurrency_str) - 1  # Convert to 0-based
-
-                    if test_case_id not in self.skip_concurrencies:
-                        self.skip_concurrencies[test_case_id] = set()
-                    self.skip_concurrencies[test_case_id].add(concurrency_index)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid skip pattern '{part}'. Expected format: 'test_case-concurrency_index' (e.g., '2-1')"
-                    )
-            else:
-                # Format: "test_case" - skip entire test case
-                try:
-                    test_case_id = int(part)
-                    self.skip_test_cases.add(test_case_id)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid test case ID '{part}' in skip pattern. Must be a valid integer."
-                    )
-
-        print(f"Skipping test cases: {sorted(self.skip_test_cases)}")
-        print(f"Skipping concurrencies: {self.skip_concurrencies}")
-
-    def parse_select_pattern(self, select_pattern: str) -> None:
-        """Parse select pattern like '1,3,5' or '1-1,2-3' to determine which test cases/concurrencies to run"""
-        if not select_pattern:
-            return
-
-        self.select_concurrencies: Dict[int, Set[int]] = {}
-
-        parts = select_pattern.split(',')
-        for part in parts:
-            part = part.strip()
-            if not part:  # Skip empty parts
-                continue
-
-            if '-' in part:
-                # Format: "test_case-concurrency_index" (1-based)
-                try:
-                    test_case_str, concurrency_str = part.split('-')
-                    test_case_id = int(test_case_str)
-                    concurrency_index = int(
-                        concurrency_str) - 1  # Convert to 0-based
-
-                    if test_case_id not in self.select_concurrencies:
-                        self.select_concurrencies[test_case_id] = set()
-                    self.select_concurrencies[test_case_id].add(
-                        concurrency_index)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid select pattern '{part}'. Expected format: 'test_case-concurrency_index' (e.g., '2-1')"
-                    )
-            else:
-                # Format: "test_case" - select entire test case
-                try:
-                    test_case_id = int(part)
-                    self.select_test_cases.add(test_case_id)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid test case ID '{part}' in select pattern. Must be a valid integer."
-                    )
-
-        print(f"Selected test cases: {sorted(self.select_test_cases)}")
-        print(f"Selected concurrencies: {self.select_concurrencies}")
-
-    def build_execution_plan(self, test_cases: List[Dict[str, Any]]) -> None:
-        """Build execution plan by analyzing config file, skip_pattern, and select_pattern"""
-        self.execution_plan.clear()
-
-        # Step 1: Initialize execution plan based on select_pattern
-        if not self.select_pattern:
-            # If select_pattern is empty or default, include all test cases with all concurrencies
-            for test_case in test_cases:
-                test_case_id = test_case['id']
-                all_concurrencies = list(
-                    range(len(test_case['concurrency_iterations'])))
-                self.execution_plan[test_case_id] = all_concurrencies
-        else:
-            # If select_pattern is specified, only include selected test cases and concurrencies
-            for test_case in test_cases:
-                test_case_id = test_case['id']
-
-                # Check if this test case is selected
-                if test_case_id in self.select_test_cases:
-                    # Test case is selected - include all concurrencies
-                    all_concurrencies = list(
-                        range(len(test_case['concurrency_iterations'])))
-                    self.execution_plan[test_case_id] = all_concurrencies
-                elif test_case_id in self.select_concurrencies:
-                    # Specific concurrencies are selected for this test case
-                    selected_concurrencies = list(
-                        self.select_concurrencies[test_case_id])
-                    # Validate that selected concurrencies exist in config
-                    max_concurrency_index = len(
-                        test_case['concurrency_iterations']) - 1
-                    valid_concurrencies = [
-                        c for c in selected_concurrencies
-                        if 0 <= c <= max_concurrency_index
-                    ]
-                    if valid_concurrencies:
-                        self.execution_plan[test_case_id] = valid_concurrencies
-
-        # Step 2: Apply skip_pattern to remove test cases and concurrencies
-        # Remove entire test cases that are in skip_test_cases
-        for test_case_id in self.skip_test_cases:
-            if test_case_id in self.execution_plan:
-                del self.execution_plan[test_case_id]
-
-        # Remove specific concurrencies that are in skip_concurrencies
-        for test_case_id, skip_concurrency_indices in self.skip_concurrencies.items(
-        ):
-            if test_case_id in self.execution_plan:
-                # Remove skipped concurrencies from the list
-                remaining_concurrencies = [
-                    c for c in self.execution_plan[test_case_id]
-                    if c not in skip_concurrency_indices
-                ]
-                if remaining_concurrencies:
-                    self.execution_plan[test_case_id] = remaining_concurrencies
-                else:
-                    # If no concurrencies remain, remove the entire test case
-                    del self.execution_plan[test_case_id]
-
-        # Step 3: Clean up - remove test cases with empty concurrency lists
-        # (This should not happen with the above logic, but just to be safe)
-        test_cases_to_remove = []
-        for test_case_id, concurrencies in self.execution_plan.items():
-            if not concurrencies:
-                test_cases_to_remove.append(test_case_id)
-
-        for test_case_id in test_cases_to_remove:
-            del self.execution_plan[test_case_id]
-
-    def print_execution_plan(self, test_cases: List[Dict[str, Any]]) -> None:
-        """Print which test cases and concurrencies will be executed"""
-        print("\n" + "=" * 80)
-        print("EXECUTION PLAN")
-        print("=" * 80)
-
-        total_test_cases = 0
-        total_concurrencies = 0
-
-        for test_case in test_cases:
-            test_case_id = test_case['id']
-            model_label = test_case['model']
-
-            # Check if this test case is in execution plan
-            if test_case_id not in self.execution_plan:
-                print(f"Test Case {test_case_id}: {model_label} - SKIPPED")
-                continue
-
-            total_test_cases += 1
-            print(f"\nTest Case {test_case_id}: {model_label}")
-            print(
-                f"  Config: GPUs={test_case['gpus']}, TP={test_case['tp']}, EP={test_case['ep']}, attn_backend={test_case['attn_backend']}, moe_backend={test_case['moe_backend']}"
-            )
-
-            # Get concurrencies from execution plan
-            concurrencies_to_run = []
-            for concurrency_index in self.execution_plan[test_case_id]:
-                concurrency, iteration = test_case['concurrency_iterations'][
-                    concurrency_index]
-                concurrencies_to_run.append(
-                    (concurrency_index + 1, concurrency,
-                     iteration))  # +1 for 1-based display
-                total_concurrencies += 1
-
-            print(
-                f"  Concurrencies to run ({len(concurrencies_to_run)}/{len(test_case['concurrency_iterations'])}):"
-            )
-            for concurrency_num, concurrency, iteration in concurrencies_to_run:
-                print(
-                    f"    {concurrency_num}. Concurrency={concurrency}, Iteration={iteration}"
-                )
-
-        print("\n" + "=" * 80)
-        print(
-            f"SUMMARY: {total_test_cases} test cases, {total_concurrencies} concurrencies will be executed"
-        )
-        print("=" * 80 + "\n")
-
-    def generate_extra_llm_api_config(self, test_case: Dict[str, Any]) -> str:
-        """Generate extra-llm-api-config.yml content"""
-        config_lines = [
-            "print_iter_log: true",
-            f"enable_attention_dp: {str(test_case['enable_attention_dp']).lower()}",
-            "disable_overlap_scheduler: false",
-            "stream_interval: 10",
-            f"attn_backend: {test_case['attn_backend']}",
-            "cuda_graph_config:",
-            "  enable_padding: true",
-            f"  max_batch_size: {test_case['max_batch_size']}",
-            "kv_cache_config:",
-            "  dtype: fp8",
-            f"  free_gpu_memory_fraction: {test_case['free_gpu_mem_fraction']}",
-            "  enable_block_reuse: false",
-        ]
-
-        # Add moe_config if moe_backend is specified
-        if test_case['moe_backend']:
-            config_lines.append("moe_config:")
-            config_lines.append(f"  backend: {test_case['moe_backend']}")
-
-            if test_case['moe_max_num_tokens']:
-                config_lines.append(
-                    f"  max_num_tokens: {test_case['moe_max_num_tokens']}")
-
-        return "\n".join(config_lines)
-
-    def wait_for_server(self,
-                        server_pid: int,
-                        server_log_filename: str,
-                        max_attempts: int = 360) -> bool:
-        """Wait for server to be ready"""
-        print("Waiting for trtllm-serve to be ready...")
-
-        for attempt in range(1, max_attempts + 1):
-            # Check if server is still running
-            try:
-                os.kill(server_pid, 0)  # Check if process exists
-            except OSError:
-                print("Error: Server process has died")
-                return False
-
-            # Check server log for runtime errors
-            if self.check_for_runtime_error(server_log_filename):
-                print(
-                    f"RuntimeError detected in server log: {server_log_filename}"
-                )
-                print("Killing server process due to runtime error")
-                try:
-                    subprocess.run(f"kill -9 {server_pid}",
-                                   shell=True,
-                                   check=False)
-                    subprocess.run(f"wait {server_pid} 2>/dev/null || true",
-                                   shell=True,
-                                   check=False)
-                except Exception as e:
-                    print(f"Warning: Error killing server process: {e}")
-                return False
-
-            # Try to connect to server
-            try:
-                response = requests.get("http://localhost:8000/v1/models",
-                                        timeout=5)
-                if response.status_code == 200:
-                    print(
-                        f"Server is ready! HTTP status: {response.status_code}")
-                    return True
-            except requests.RequestException:
-                pass
-
-            print(
-                f"Attempt {attempt}/{max_attempts}: Server not ready yet, waiting..."
-            )
-            time.sleep(10)
-
-        print(
-            f"Error: Server did not become ready after {max_attempts} attempts")
-        return False
-
-    def check_for_runtime_error(self, log_file_path: str) -> bool:
-        """Check if RuntimeError exists in log file"""
-        try:
-            if os.path.exists(log_file_path):
-                with open(log_file_path, 'r') as f:
-                    content = f.read()
-                    if "RuntimeError" in content or "runtime error" in content or "illegal memory access" in content or "terminate called" in content:
-                        return True
-        except Exception as e:
-            print(f"Warning: Could not read log file {log_file_path}: {e}")
-        return False
-
-    def run_benchmark(self, test_case: Dict[str, Any], concurrency: int,
-                      iteration: int, model_path: str,
-                      server_log_filename: str) -> bool:
-        """Run a single benchmark with monitoring. Returns True if successful, False if should skip test case"""
-        num_prompts = concurrency * iteration
-
-        print(
-            f'Running benchmark with concurrency: {concurrency}, iteration: {iteration}, num-prompts: {num_prompts}'
-        )
-
-        # Build benchmark command
-        benchmark_cmd = [
-            "python", "-m", "tensorrt_llm.serve.scripts.benchmark_serving",
-            "--model", model_path, "--dataset-name", "random", "--random-ids",
-            "--num-prompts",
-            str(num_prompts), "--random-input-len",
-            str(test_case['isl']), "--random-output-len",
-            str(test_case['osl']), "--random-range-ratio", "0.0",
-            "--ignore-eos", "--percentile-metrics", "ttft,tpot,itl,e2el",
-            "--max-concurrency",
-            str(concurrency)
-        ]
-
-        print(f'Running benchmark with command:')
-        print(' '.join(benchmark_cmd))
-        print()
-
-        # Prepare log filename
-        benchmark_log_filename = (
-            f"serve.{test_case['model']}.tp{test_case['tp']}.ep{test_case['ep']}."
-            f"attn{test_case['attn_backend']}.moe{test_case['moe_backend']}."
-            f"gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}."
-            f"isl{test_case['isl']}.osl{test_case['osl']}."
-            f"tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}."
-            f"concurrency{concurrency}.iter{iteration}.log")
-
-        try:
-            with open(benchmark_log_filename, 'w') as f:
-                f.write(f"GPU Info: {self.gpu_info}\n")
-
-            # Start benchmark as subprocess
-            with open(benchmark_log_filename, 'a') as log_file:
-                benchmark_process = subprocess.Popen(benchmark_cmd,
-                                                     stdout=log_file,
-                                                     stderr=subprocess.STDOUT)
-
-            # Monitor logs every 60 seconds with timeout
-            print(
-                f"Starting log monitoring for benchmark process (PID: {benchmark_process.pid})"
-            )
-
-            start_time = time.time()
-            timeout_seconds = 3600  # 1 hour timeout
-
-            while benchmark_process.poll() is None:  # Process is still running
-                time.sleep(60)  # Wait 60 seconds
-
-                # Check if benchmark has been running for more than 1 hour
-                elapsed_time = time.time() - start_time
-                if elapsed_time > timeout_seconds:
-                    print(
-                        f"Benchmark timeout after {elapsed_time:.0f} seconds (>{timeout_seconds} seconds)"
-                    )
-                    print("Killing benchmark process due to timeout")
-                    try:
-                        subprocess.run(f"kill -9 {benchmark_process.pid}",
-                                       shell=True,
-                                       check=False)
-                        benchmark_process.wait(timeout=10)
-                    except Exception as e:
-                        print(f"Warning: Error killing benchmark process: {e}")
-                    return False  # Signal to skip test case
-
-                print(
-                    f"Checking logs for RuntimeError... (benchmark PID: {benchmark_process.pid}, elapsed: {elapsed_time:.0f}s)"
-                )
-
-                # Check server log for RuntimeError
-                if self.check_for_runtime_error(server_log_filename):
-                    print(
-                        f"RuntimeError found in server log: {server_log_filename}"
-                    )
-                    print(
-                        "Killing benchmark process and skipping this test case")
-                    try:
-                        subprocess.run(f"kill -9 {benchmark_process.pid}",
-                                       shell=True,
-                                       check=False)
-                        benchmark_process.wait(timeout=10)
-                    except Exception as e:
-                        print(f"Warning: Error killing benchmark process: {e}")
-                    return False  # Signal to skip test case
-
-                # Check benchmark log for RuntimeError
-                if self.check_for_runtime_error(benchmark_log_filename):
-                    print(
-                        f"RuntimeError found in benchmark log: {benchmark_log_filename}"
-                    )
-                    print(
-                        "Killing benchmark process and skipping this test case")
-                    try:
-                        subprocess.run(f"kill -9 {benchmark_process.pid}",
-                                       shell=True,
-                                       check=False)
-                        benchmark_process.wait(timeout=10)
-                    except Exception as e:
-                        print(f"Warning: Error killing benchmark process: {e}")
-                    return False  # Signal to skip test case
-
-            # Process completed, check final return code
-            return_code = benchmark_process.returncode
-            if return_code != 0:
-                print(
-                    f"Benchmark process completed with error code: {return_code}"
-                )
-
-                # Read and display error output
-                try:
-                    with open(benchmark_log_filename, 'r') as f:
-                        error_content = f.read()
-                        print(
-                            f"Benchmark error output:\n{error_content[-1000:]}"
-                        )  # Last 1000 chars
-                except Exception as e:
-                    print(f"Could not read benchmark log: {e}")
-
-                print(
-                    f"Skipping this concurrency level and continuing with next one..."
-                )
-                print("-----------------------------------------")
-                return True  # Continue with next concurrency, don't skip test case
-
-            # Success case
-            print(
-                f"Benchmark completed successfully (PID: {benchmark_process.pid})"
-            )
-
-            # Add configuration summary to log file
-            config_summary = (
-                f"Completed benchmark with Configuration: "
-                f"model_label={test_case['model']}, GPUs={test_case['gpus']}, "
-                f"TP={test_case['tp']}, EP={test_case['ep']}, "
-                f"attn_backend={test_case['attn_backend']}, "
-                f"moe_backend={test_case['moe_backend']}, "
-                f"enable_attention_dp={test_case['enable_attention_dp']}, "
-                f"free_gpu_mem_fraction={test_case['free_gpu_mem_fraction']}, "
-                f"max_batch_size={test_case['max_batch_size']}, "
-                f"ISL={test_case['isl']}, OSL={test_case['osl']}, "
-                f"max_num_tokens={test_case['max_num_tokens']}, "
-                f"moe_max_num_tokens={test_case['moe_max_num_tokens']}, "
-                f"Concurrency={concurrency}")
-            with open(benchmark_log_filename, 'a') as f:
-                f.write(f"\n{config_summary}\n")
-
-            print("-----------------------------------------")
-            return True  # Continue with next concurrency
-
-        except Exception as e:
-            print(
-                f"Error running benchmark with concurrency {concurrency}: {e}")
-            print(
-                f"Skipping this concurrency level and continuing with next one..."
-            )
-            print("-----------------------------------------")
-            return True  # Continue with next concurrency, don't skip test case
-
-    def run_test_case(self, test_case: Dict[str, Any]) -> None:
-        """Run a test case using the execution plan"""
-        model_label = test_case['model']
-        test_case_id = test_case['id']
-
-        # Get model path
-        model_path = self.model_paths.get(model_label)
-        if not model_path:
-            print(f"Error: No model path found for {model_label}")
-            return
-
-        # Use local path if it exists, otherwise use model name
-        if os.path.exists(model_path):
-            MODEL = model_path
-        else:
-            MODEL = model_label
-
-        # Generate extra-llm-api-config.yml
-        config_content = self.generate_extra_llm_api_config(test_case)
-        config_path = "/tmp/extra-llm-api-config.yml"
-
-        with open(config_path, 'w') as f:
-            f.write(config_content)
-
-        print("extra-llm-api-config.yml:")
-        print(config_content)
-
-        # Build trtllm-serve command
-        serve_cmd = [
-            "trtllm-serve", MODEL, "--backend", "pytorch", "--tp_size",
-            str(test_case['tp']), "--ep_size",
-            str(test_case['ep']), "--max_batch_size",
-            str(test_case['max_batch_size']), "--max_num_tokens",
-            str(test_case['max_num_tokens']),
-            "--kv_cache_free_gpu_memory_fraction",
-            str(test_case['free_gpu_mem_fraction']), "--extra_llm_api_options",
+def get_node_name() -> str:
+    """Get the current node name"""
+    try:
+        result = subprocess.run("hostname",
+                                shell=True,
+                                capture_output=True,
+                                text=True,
+                                check=True)
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
+def get_gpu_info() -> str:
+    """Get GPU information from nvidia-smi"""
+    try:
+        result = subprocess.run("nvidia-smi",
+                                shell=True,
+                                capture_output=True,
+                                text=True,
+                                check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        return f"nvidia-smi failed with error code {e.returncode}\nError output: {e.stderr}"
+    except FileNotFoundError:
+        return "nvidia-smi not found"
+    except Exception as e:
+        return f"Failed to get GPU information: {e}"
+
+
+# Model PATH of local dir synced from internal LLM models repo
+MODEL_PATH_DICT = {
+    "llama_v2_7b": "llama-models-v2/llama-v2-7b-hf",  # not safetensors repo
+    "llama_v2_13b": "llama-models-v2/llama-v2-13b-hf",  # not safetensors repo
+    "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",  # not safetensors repo
+    "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
+    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+    "llama_v3.1_8b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
+    "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
+    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
+    "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
+    "llama_v3.3_70b_instruct_fp8":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+    "llama_v3.3_70b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
+    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
+    "llama_v3.1_405b_instruct_fp8":
+    "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
+    "llama_v3.1_405b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
+    "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
+    "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
+    "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.1_nemotron_nano_8b_fp8": "Llama-3.1-Nemotron-Nano-8B-v1-FP8",
+    "llama_v3.3_nemotron_super_49b":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "llama_v3.1_nemotron_ultra_253b_fp8":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
+    "llama_v4_scout_17b_16e_instruct":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct",
+    "llama_v4_scout_17b_16e_instruct_fp8":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
+    "llama_v4_scout_17b_16e_instruct_fp4":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
+    "llama_v4_maverick_17b_128e_instruct":
+    "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
+    "llama_v4_maverick_17b_128e_instruct_fp8":
+    "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
+    "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
+    "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
+    "mixtral_8x7b_v0.1_instruct_fp4":
+    "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
+    "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
+    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
+    "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
+    "mistral_7b_v0.1": "mistral-7b-v0.1",
+    "ministral_8b": "Ministral-8B-Instruct-2410",
+    "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
+    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
+    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
+    "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
+    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
+    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
+    "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
+    "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
+    "qwen2_7b_instruct": "Qwen2-7B-Instruct",
+    "qwen_14b_chat": "Qwen-14B-Chat",
+    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
+    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+    "starcoder2_3b": "starcoder2-3b",
+    "starcoder_15b": "starcoder2-15b",
+    "t5": "t5-small",  # not supported for trtllm-bench build config
+    "flan_t5_base":
+    "flan-t5-small",  # not supported for trtllm-bench build config
+    "flan_t5_large":
+    "flan-t5-xl",  # not supported for trtllm-bench build config
+    "whisper_large_v3":
+    "whisper-models/large-v3",  # not supported for trtllm-bench tokenizer
+    "bart_large_cnn": "bart-large-cnn",  # not safetensors repo
+    "mbart_large_50_many_to_one_mmt": "mbart-large-50-many-to-one-mmt",
+    "mamba_130m": "mamba/mamba-130m-hf",
+    "mamba_370m": "mamba/mamba-370m-hf",
+    "mamba_2.8b": "mamba/mamba-2.8b-hf",
+    "gpt_20b": "gpt-neox-20b",
+    "gpt_350m_moe": "gpt2-medium",
+    "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
+    "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
+    "phi_4_mini_instruct": "Phi-4-mini-instruct",
+    "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
+    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
+    "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
+    "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
+    "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
+}
+# Model PATH of HuggingFace
+HF_MODEL_PATH = {
+    "llama_v2_7b_hf": "meta-llama/Llama-2-7b-hf",
+    "llama_v2_70b_hf": "meta-llama/Llama-2-70b-hf",
+    "falcon_180b_hf": "tiiuae/falcon-180B",
+    "gptj_6b_hf": "EleutherAI/gpt-j-6b",
+    "llama_v3_8b_hf": "meta-llama/Meta-Llama-3-8B",
+    "llama_v3.1_8b_hf": "meta-llama/Llama-3.1-8B",
+    "llama_v3.1_8b_instruct_hf": "nvidia/Llama-3.1-8B-Instruct-FP8",
+    "llama_v3.1_70b_instruct_hf": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+    "llama_v3_70b_hf": "meta-llama/Meta-Llama-3-70B",
+    "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
+    "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
+    "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.1_nemotron_nano_8b_fp8_hf":
+    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
+    "llama_v3.3_nemotron_super_49b_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b_fp8_hf":
+    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
+    "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
+    "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
+    "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
+    "flan_t5_base_hf": "google/flan-t5-small",
+    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
+    "gemma_3_1b_it_hf": "google/gemma-3-1b-it",
+}
+
+LLM_MODELS_ROOT = os.environ.get('LLM_MODELS_ROOT',
+                                 '/home/scratch.trt_llm_data/llm-models')
+
+
+# Model path mapping
+def llm_models_root():
+    return LLM_MODELS_ROOT
+
+
+def get_model_dir(model_name: str) -> str:
+    model_dir = ""
+    if model_name in MODEL_PATH_DICT.keys():
+        model_dir = os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
+    elif model_name in HF_MODEL_PATH.keys():
+        model_dir = os.path.join(llm_models_root(),
+                                 MODEL_PATH_DICT[model_name.split('_hf')[0]])
+    return model_dir
+
+
+def str_to_bool(value: str) -> bool:
+    return ast.literal_eval(value)
+
+
+# {metric_name: (is_optional, type)}
+SERVER_CONFIG_METRICS = {
+    "model_name": (False, str),
+    "tp": (False, int),
+    "ep": (False, int),
+    "pp": (True, int),
+    "isl": (False, int),
+    "osl": (False, int),
+    "max_num_tokens": (False, int),
+    "enable_chunked_prefill": (True, str_to_bool),
+    "disable_overlap_scheduler": (True, str_to_bool),
+    "attention_backend": (False, str),
+    "moe_backend": (True, str),
+    "moe_max_num_tokens": (True, str),
+    "stream_interval": (True, int),
+    "enable_attention_dp": (True, str_to_bool),
+    "attention_dp_balance": (True, str_to_bool),
+    "batching_wait_iters": (True, int),
+    "timeout_iters": (True, int),
+    "kv_cache_dtype": (True, str),
+    "enable_block_reuse": (True, str_to_bool),
+    "free_gpu_memory_fraction": (True, float),
+    "max_batch_size": (False, int),
+    "enable_padding": (True, str_to_bool),
+}
+
+CLIENT_CONFIG_METRICS = {
+    "concurrency": (False, int),
+    "iterations": (False, int),
+    "random_range_ratio": (True, float),
+}
+
+
+class ServerConfig:
+    """
+    Configurations of trtllm-server.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        model_name: str,
+        tp: int,
+        ep: int,
+        max_num_tokens: int,
+        attention_backend: str,
+        max_batch_size: int,
+        pp: int = 1,
+        enable_chunked_prefill: bool = False,
+        disable_overlap_scheduler: bool = False,
+        moe_backend: str = "",
+        moe_max_num_tokens: str = "",
+        stream_interval: int = 10,
+        enable_attention_dp: bool = False,
+        attention_dp_balance: bool = False,
+        batching_wait_iters: int = 10,
+        timeout_iters: int = 50,
+        kv_cache_dtype: str = "fp8",
+        enable_block_reuse: bool = False,
+        free_gpu_memory_fraction: float = 0.8,
+        enable_padding: bool = True,
+    ):
+        self.name = name
+        self.model_name = model_name
+        self.tp = tp
+        self.ep = ep
+        self.pp = pp
+        self.max_num_tokens = max_num_tokens
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.attention_backend = attention_backend
+        self.moe_backend = moe_backend
+        self.moe_max_num_tokens = moe_max_num_tokens
+        self.stream_interval = stream_interval
+        self.enable_attention_dp = enable_attention_dp
+        self.attention_dp_balance = attention_dp_balance
+        self.batching_wait_iters = batching_wait_iters
+        self.timeout_iters = timeout_iters
+        self.kv_cache_dtype = kv_cache_dtype
+        self.enable_block_reuse = enable_block_reuse
+        self.free_gpu_memory_fraction = free_gpu_memory_fraction
+        self.max_batch_size = max_batch_size
+        self.enable_padding = enable_padding
+
+        self.model_path = ""
+
+    def to_cmd(self, working_dir: str) -> List[str]:
+        model_dir = get_model_dir(self.model_name)
+        self.model_path = model_dir if os.path.exists(
+            model_dir) else self.model_name
+        config_path = os.path.join(working_dir,
+                                   f"extra-llm-api-config.{self.name}.yml")
+        return [
+            "trtllm-serve", self.model_path, "--host", "localhost", "--port",
+            "8000", "--backend", "pytorch", "--extra_llm_api_options",
             config_path
         ]
 
-        print("Starting trtllm-serve with command:")
-        print(' '.join(serve_cmd))
-        print()
+    def generate_extra_llm_api_config(self) -> str:
+        """Generate extra-llm-api-config.yml content"""
+        config_lines = [
+            f"tensor_parallel_size: {self.tp}",
+            f"moe_expert_parallel_size: {self.ep}",
+            f"pipeline_parallel_size: {self.pp}",
+            f"max_num_tokens: {self.max_num_tokens}",
+            f"enable_attention_dp: {str(self.enable_attention_dp).lower()}",
+            f"disable_overlap_scheduler: {str(self.disable_overlap_scheduler).lower()}",
+            f"stream_interval: {self.stream_interval}",
+            f"attn_backend: {self.attention_backend}",
+            f"enable_chunked_prefill: {str(self.enable_chunked_prefill).lower()}",
+            "cuda_graph_config:",
+            f"  enable_padding: {str(self.enable_padding).lower()}",
+            f"  max_batch_size: {self.max_batch_size}",
+            "kv_cache_config:",
+            f"  dtype: {self.kv_cache_dtype}",
+            f"  free_gpu_memory_fraction: {self.free_gpu_memory_fraction}",
+            f"  enable_block_reuse: {str(self.enable_block_reuse).lower()}",
+            "print_iter_log: false",
+        ]
 
-        # Start server
-        server_log_filename = (
-            f"trtllm-serve.{model_label}.tp{test_case['tp']}.ep{test_case['ep']}."
-            f"attn{test_case['attn_backend']}.moe{test_case['moe_backend']}."
-            f"gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}."
-            f"isl{test_case['isl']}.osl{test_case['osl']}."
-            f"tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}.log"
-        )
+        # Add moe_config if moe_backend is specified
+        if self.moe_backend:
+            config_lines.append("moe_config:")
+            config_lines.append(f"  backend: {self.moe_backend}")
+            if self.moe_max_num_tokens:
+                config_lines.append(
+                    f"  max_num_tokens: {self.moe_max_num_tokens}")
 
+        if self.attention_dp_balance:
+            config_lines.append("attention_dp_balance:")
+            config_lines.append("  enable_balance: true")
+            config_lines.append(
+                f"  batching_wait_iters: {self.batching_wait_iters}")
+            config_lines.append(f"  timeout_iters: {self.timeout_iters}")
+
+        return "\n".join(config_lines)
+
+
+class ClientConfig:
+    """
+    Configurations of benchmark client.
+    """
+
+    def __init__(self,
+                 name: str,
+                 model_name: str,
+                 concurrency: int,
+                 iterations: int,
+                 isl: int,
+                 osl: int,
+                 random_range_ratio: float = 0.0):
+        self.name = name
+        self.model_name = model_name
+        self.concurrency = concurrency
+        self.iterations = iterations
+        self.isl = isl
+        self.osl = osl
+        self.random_range_ratio = random_range_ratio
+
+        self.model_path = ""
+
+    def to_cmd(self, working_dir: str) -> List[str]:
+        model_dir = get_model_dir(self.model_name)
+        self.model_path = model_dir if os.path.exists(
+            model_dir) else self.model_name
+        return [
+            "python", "-m", "tensorrt_llm.serve.scripts.benchmark_serving",
+            "--model", self.model_path, "--dataset-name", "random",
+            "--random-ids", "--num-prompts",
+            str(self.concurrency * self.iterations), "--random-input-len",
+            str(self.isl), "--random-output-len",
+            str(self.osl), "--random-range-ratio",
+            str(self.random_range_ratio), "--ignore-eos",
+            "--percentile-metrics", "ttft,tpot,itl,e2el", "--max-concurrency",
+            str(self.concurrency)
+        ]
+
+
+def parse_select_pattern(select_pattern: str):
+    """Parse select pattern like 'r1_fp4_dep4,r1_fp4_tep4:con1_iter1_1024_1024,r1_fp4_tep4:con8_iter1_1024_1024'
+
+    Format:
+    - ',' splits different server configs
+    - ':' means for this server, we choose specific clients
+    - If no ':', all clients are chosen for that server
+
+    Returns:
+    - Dict with server name as key and either None (all clients) or set of client names as value
+    """
+    execution_plan = {}
+
+    parts = select_pattern.split(',')
+    for part in parts:
+        part = part.strip()
+        if not part:  # Skip empty parts
+            continue
+
+        if ':' in part:
+            # Format: "server_name:client_name"
+            server_name, client_name = part.split(':', 1)
+            server_name = server_name.strip()
+            client_name = client_name.strip()
+
+            # Only add if not already set to None (all clients)
+            if server_name not in execution_plan:
+                execution_plan[server_name] = set()
+
+            if execution_plan[server_name] is not None:
+                execution_plan[server_name].add(client_name)
+        else:
+            # Format: "server_name" - select all clients for this server
+            server_name = part.strip()
+            execution_plan[server_name] = None
+
+    return execution_plan
+
+
+def parse_config_file(config_file_path: str, select_pattern: str = None):
+    """Parse YAML configuration file and create ServerConfig and ClientConfig objects
+
+    Args:
+        config_file_path: Path to YAML configuration file
+        select_pattern: Selection pattern string (e.g., "r1_fp4_dep4,r1_fp4_tep4:con1_iter1_1024_1024")
+
+    Returns:
+        execution_plan: None (all servers/clients) or dict with server names as keys
+        server_configs: List of ServerConfig objects
+        server_client_configs: Dict with server id as key and list of ClientConfig as value
+    """
+    # Parse selection pattern
+    if select_pattern:
+        execution_plan = parse_select_pattern(select_pattern)
+    else:
+        execution_plan = None
+
+    # Read YAML config file
+    with open(config_file_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    server_configs = []
+    server_client_configs = {}
+
+    for server_config_data in config['server_configs']:
+        server_name = server_config_data['name']
+
+        # Check if this server should be included based on execution_plan
+        if execution_plan is not None and server_name not in execution_plan:
+            continue
+
+        # Create ServerConfig object
+        server_config = ServerConfig(
+            name=server_config_data['name'],
+            model_name=server_config_data['model_name'],
+            tp=server_config_data['tp'],
+            ep=server_config_data['ep'],
+            pp=server_config_data.get('pp', 1),
+            attention_backend=server_config_data.get('attention_backend',
+                                                     'TRTLLM'),
+            moe_backend=server_config_data.get('moe_backend', ''),
+            moe_max_num_tokens=server_config_data.get('moe_max_num_tokens', ''),
+            enable_attention_dp=server_config_data.get('enable_attention_dp',
+                                                       False),
+            attention_dp_balance=server_config_data.get('attention_dp_balance',
+                                                        False),
+            batching_wait_iters=server_config_data.get('batching_wait_iters',
+                                                       10),
+            timeout_iters=server_config_data.get('timeout_iters', 50),
+            enable_chunked_prefill=server_config_data.get(
+                'enable_chunked_prefill', False),
+            max_num_tokens=server_config_data.get('max_num_tokens', 2048),
+            disable_overlap_scheduler=server_config_data.get(
+                'disable_overlap_scheduler', False),
+            kv_cache_dtype=server_config_data.get('kv_cache_dtype', 'fp8'),
+            enable_block_reuse=server_config_data.get('enable_block_reuse',
+                                                      False),
+            free_gpu_memory_fraction=server_config_data.get(
+                'free_gpu_memory_fraction', 0.8),
+            max_batch_size=server_config_data.get('max_batch_size', 256),
+            enable_padding=server_config_data.get('enable_padding', True))
+
+        server_id = len(server_configs)
+        server_configs.append(server_config)
+
+        # Create ClientConfig objects
+        client_configs = []
+        selected_client_names = execution_plan.get(
+            server_name) if execution_plan else None
+
+        for client_config_data in server_config_data['client_configs']:
+            client_name = client_config_data['name']
+
+            # Check if this client should be included
+            # Include if: execution_plan is None OR selected_client_names is None OR client_name in selected_client_names
+            if execution_plan is not None and selected_client_names is not None:
+                if client_name not in selected_client_names:
+                    continue
+
+            client_config = ClientConfig(
+                name=client_config_data['name'],
+                model_name=server_config_data['model_name'],
+                concurrency=client_config_data['concurrency'],
+                iterations=client_config_data.get('iterations', 1),
+                isl=client_config_data.get('isl', 1024),
+                osl=client_config_data.get('osl', 1024),
+                random_range_ratio=client_config_data.get(
+                    'random_range_ratio', 0.0))
+            client_configs.append(client_config)
+
+        server_client_configs[server_id] = client_configs
+
+    return execution_plan, server_configs, server_client_configs
+
+
+def get_trtllm_server_client_commands(
+        server_configs: List[ServerConfig],
+        server_client_configs: Dict[int, List[ClientConfig]], working_dir: str):
+    server_cmds = []
+    client_cmds = []
+    names = []
+    for server_idx, client_configs in server_client_configs.items():
+        server_config = server_configs[server_idx]
+        server_cmd = server_config.to_cmd(working_dir)
+        # Generate extra-llm-api-config.yml
+        config_content = server_config.generate_extra_llm_api_config()
+        config_filename = f"extra-llm-api-config.{server_config.name}.yml"
+        config_path = os.path.join(working_dir, config_filename)
+        with open(config_path, 'w') as f:
+            f.write(config_content)
+        for client_config in client_configs:
+            server_cmds.append(server_cmd)
+            client_cmd = client_config.to_cmd(working_dir)
+            client_cmds.append(client_cmd)
+            names.append(f"{server_config.name}-{client_config.name}")
+    return server_cmds, client_cmds, names
+
+
+class PerfServerBenchmarkCmds(NamedTuple):
+    server_cmds: List[List[str]]
+    client_cmds: List[List[str]]
+    names: List[str]
+    working_dir: str
+
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 5400):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(10)
+                if requests.get(url, timeout=5).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def run_cmd(self,
+                cmd_idx: int,
+                node_name: str,
+                gpu_info: str,
+                max_timeout: int = 5400) -> str:
+        output = ""
+        server_file_path = os.path.join(
+            self.working_dir, f"trtllm-serve.{self.names[cmd_idx]}.log")
+        client_file_path = os.path.join(
+            self.working_dir, f"trtllm-benchmark.{self.names[cmd_idx]}.log")
+
+        server_proc = None
         try:
-            with open(server_log_filename, 'w') as log_file:
-                log_file.write(f"extra-llm-api-config.yml:\n")
-                log_file.write(config_content)
-                log_file.write("\n")
-
-            with open(server_log_filename, 'a') as log_file:
-                server_process = subprocess.Popen(serve_cmd,
-                                                  stdout=log_file,
-                                                  stderr=subprocess.STDOUT)
+            # Run server command
+            with open(server_file_path, 'w') as server_ctx:
+                server_proc = subprocess.Popen(self.server_cmds[cmd_idx],
+                                               stdout=server_ctx,
+                                               stderr=subprocess.STDOUT)
 
             # Wait for server to be ready
-            if not self.wait_for_server(server_process.pid,
-                                        server_log_filename):
-                print(
-                    "Failed to start server, killing process and skipping this test case"
-                )
-                try:
-                    subprocess.run(f"kill -9 {server_process.pid}",
-                                   shell=True,
-                                   check=False)
-                    subprocess.run(
-                        f"wait {server_process.pid} 2>/dev/null || true",
-                        shell=True,
-                        check=False)
-                except Exception as e:
-                    print(f"Warning: Error during server cleanup: {e}")
-                return
+            self.wait_for_endpoint_ready("http://localhost:8000/v1/models",
+                                         timeout=max_timeout)
 
-            # Run benchmarks based on execution plan
-            for concurrency_index in self.execution_plan[test_case_id]:
-                concurrency, iteration = test_case['concurrency_iterations'][
-                    concurrency_index]
-                should_continue = self.run_benchmark(test_case, concurrency,
-                                                     iteration, MODEL,
-                                                     server_log_filename)
-
-                # If run_benchmark returns False, skip the entire test case
-                if not should_continue:
-                    print(
-                        f"RuntimeError detected - skipping remaining concurrencies for test case {test_case_id}"
-                    )
-                    break
-
+            # Save node name, gpu info, server config, client config output to server file path
+            with open(client_file_path, 'w') as client_ctx:
+                client_ctx.write(f"Node: {node_name}\n")
+                client_ctx.write(f"GPU Info: {gpu_info}\n")
+                client_ctx.write(f"Server-Config: {self.names[cmd_idx]}\n")
+                # Run client command
+                subprocess.run(self.client_cmds[cmd_idx],
+                               stdout=client_ctx,
+                               stderr=subprocess.STDOUT,
+                               check=True)
         finally:
-            # Cleanup: Kill server process using shell commands like in the original bash script
-            print(f"Stopping server for {model_label}")
-            try:
-                # Use shell commands for more reliable process killing
-                subprocess.run(f"kill -9 {server_process.pid}",
-                               shell=True,
-                               check=False)
-                subprocess.run(f"wait {server_process.pid} 2>/dev/null || true",
-                               shell=True,
-                               check=False)
-            except Exception as e:
-                print(f"Warning: Error during server cleanup: {e}")
+            server_proc.terminate()
+            server_proc.wait()
 
-            time.sleep(5)  # Give it time to clean up resources
-            print(f"Benchmark completed for {model_label}")
-            print()
+        return output
 
-    def run_benchmarks(self) -> None:
-        """Main function to run all benchmarks from config file"""
-        script_start_time = time.time()
+    def get_cmd_str(self, cmd_idx) -> List[str]:
+        return ["server-benchmark tests, please check config files"]
 
-        print(f"Using config file: {self.config_file}")
-        if self.select_pattern:
-            print(f"Select pattern: {self.select_pattern}")
-        else:
-            print("Select pattern: default (all test cases)")
-        if self.skip_pattern:
-            print(f"Skip pattern: {self.skip_pattern}")
-        else:
-            print("Skip pattern: default (no skipping)")
 
-        # Load configuration
-        with open(self.config_file, 'r') as f:
-            config = yaml.safe_load(f)
+def run_perf_tests(server_configs: List[ServerConfig],
+                   server_client_configs: Dict[int, List[ClientConfig]],
+                   max_timeout: int, working_dir: str, node_name: str,
+                   gpu_info: str) -> None:
+    """Main function to run all benchmarks from config file"""
 
-        test_cases = config['test_cases']
+    server_cmds, client_cmds, names = get_trtllm_server_client_commands(
+        server_configs, server_client_configs, working_dir)
+    commands = PerfServerBenchmarkCmds(server_cmds=server_cmds,
+                                       client_cmds=client_cmds,
+                                       names=names,
+                                       working_dir=working_dir)
 
-        # Build execution plan
-        self.build_execution_plan(test_cases)
+    # Run each server config based on execution plan
+    for cmd_idx in range(len(client_cmds)):
+        print(f"Server cmd: {server_cmds[cmd_idx]}")
+        print(f"Client cmd: {client_cmds[cmd_idx]}")
+        commands.run_cmd(cmd_idx, node_name, gpu_info, max_timeout)
 
-        # Print execution plan before starting benchmarks
-        self.print_execution_plan(test_cases)
 
-        # Run each test case based on execution plan
-        for i, test_case in enumerate(test_cases, 1):
-            test_case_id = test_case['id']
+def generate_repro_scripts(server_configs: List[ServerConfig],
+                           server_client_configs: Dict[int, List[ClientConfig]],
+                           node_name: str, max_timeout: int):
+    """Generate reproduction scripts for all server configs"""
+    for server_id, server_config in enumerate(server_configs):
+        script_content = generate_repro_script(server_config,
+                                               server_client_configs[server_id],
+                                               node_name, max_timeout)
+        script_filename = f"reproduce.server-{server_config.name}.sh"
 
-            if test_case_id not in self.execution_plan:
-                print("=" * 57)
-                print(
-                    f"Test case {i}/{len(test_cases)} (ID: {test_case_id}): {test_case['model']} - SKIPPED"
-                )
-                print("=" * 57)
-                continue
+        with open(script_filename, 'w') as f:
+            f.write(script_content)
 
-            print("=" * 57)
-            print(
-                f"Test case {i}/{len(test_cases)} (ID: {test_case_id}): {test_case['model']}"
-            )
-            print(
-                f"Config: GPUs={test_case['gpus']}, TP={test_case['tp']}, EP={test_case['ep']}, attn_backend={test_case['attn_backend']}, moe_backend={test_case['moe_backend']}"
-            )
-            print("=" * 57)
+        # Make script executable
+        os.chmod(script_filename, 0o755)
 
-            self.run_test_case(test_case)
 
-        # Calculate and display total script runtime
-        script_total_time = time.time() - script_start_time
-        hours = int(script_total_time // 3600)
-        minutes = int((script_total_time % 3600) // 60)
-        seconds = int(script_total_time % 60)
+def generate_repro_script(server_config: ServerConfig,
+                          client_configs: List[ClientConfig], node_name: str,
+                          max_timeout: int) -> str:
+    """Generate a shell script to reproduce a server config"""
+    model_path = server_config.model_path
+    script_content = f"""#!/bin/bash
+# Reproduction script for server: {server_config.name})
+# Node: {node_name}
 
-        print("=" * 80)
-        print("SCRIPT COMPLETION SUMMARY")
-        print("=" * 80)
-        print(
-            f"Total script runtime: {hours:02d}:{minutes:02d}:{seconds:02d} (HH:MM:SS)"
-        )
-        print(f"Total runtime in seconds: {script_total_time:.2f}")
-        print("=" * 80)
-        print("All benchmarks completed!")
+set -e
+
+# Function to wait for server to be ready
+wait_for_server() {{
+    local timeout={max_timeout}
+    local attempt=0
+
+    echo "Waiting for trtllm-serve to be ready..."
+
+    while [ $((attempt * 60)) -le $timeout ]; do
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "Error: Server process has died"
+            return 1
+        fi
+
+        # Check for runtime errors in server log
+        if grep -q "RuntimeError\\|runtime error\\|CUDA error\\|illegal memory access\\|terminate called" "$SERVER_LOG" 2>/dev/null; then
+            echo "RuntimeError detected in server log: $SERVER_LOG"
+            echo "Killing server process due to runtime error"
+            kill -9 $SERVER_PID 2>/dev/null || true
+            wait $SERVER_PID 2>/dev/null || true
+            return 1
+        fi
+
+        # Try to connect to server
+        if curl -s "http://localhost:8000/v1/models" > /dev/null 2>&1; then
+            echo "Server is ready! HTTP status: 200"
+            return 0
+        fi
+
+        echo "Elapsed time: $((attempt * 60)) / $timeout seconds: Server not ready yet, waiting..."
+        sleep 60
+        attempt=$((attempt + 1))
+    done
+
+    echo "Error: Server did not become ready after $timeout seconds"
+    return 1
+}}
+
+# Function to cleanup server process
+cleanup_server() {{
+    if [ -n "$SERVER_PID" ]; then
+        echo "Stopping server"
+        kill -9 $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        sleep 5  # Give it time to clean up resources
+        echo "Server cleanup completed"
+    fi
+}}
+
+# Set trap to cleanup server on script exit
+trap cleanup_server EXIT
+
+# Generate extra-llm-api-config.yml
+CONFIG_FILENAME="extra-llm-api-config.{server_config.name}.yml"
+
+cat > "$CONFIG_FILENAME" << 'EOF'
+{server_config.generate_extra_llm_api_config()}
+EOF
+
+# Start trtllm-serve in background
+SERVER_LOG="trtllm-serve.{server_config.name}.log"
+
+echo "Starting trtllm-serve with command:"
+echo "trtllm-serve {model_path} --host localhost --port 8000 --backend pytorch --extra_llm_api_options $CONFIG_FILENAME"
+
+trtllm-serve {model_path} --host localhost --port 8000 --backend pytorch --extra_llm_api_options "$CONFIG_FILENAME" > "$SERVER_LOG" 2>&1 &
+
+SERVER_PID=$!
+echo "Server started with PID: $SERVER_PID"
+
+# Wait for server to be ready
+if ! wait_for_server; then
+    echo "Failed to start server, exiting"
+    exit 1
+fi
+
+echo "Server is ready, starting benchmarks..."
+
+# Run benchmarks for each concurrency level
+"""
+    # Add benchmark commands for each client config
+    for client_config in client_configs:
+        num_prompts = client_config.concurrency * client_config.iterations
+        script_content += f"""
+echo "Running benchmark with concurrency: {client_config.concurrency}, iterations: {client_config.iterations}, num-prompts: {num_prompts}"
+
+BENCHMARK_LOG="trtllm-benchmark.{server_config.name}.{client_config.name}.log"
+
+echo "Running benchmark with command:"
+echo "python -m tensorrt_llm.serve.scripts.benchmark_serving --model {model_path} --dataset-name random --random-ids --num-prompts {num_prompts} --random-input-len {client_config.isl} --random-output-len {client_config.osl} --random-range-ratio {client_config.random_range_ratio} --ignore-eos --percentile-metrics ttft,tpot,itl,e2el --max-concurrency {client_config.concurrency}"
+
+python -m tensorrt_llm.serve.scripts.benchmark_serving \\
+    --model {model_path} \\
+    --dataset-name random \\
+    --random-ids \\
+    --num-prompts {num_prompts} \\
+    --random-input-len {client_config.isl} \\
+    --random-output-len {client_config.osl} \\
+    --random-range-ratio {client_config.random_range_ratio} \\
+    --ignore-eos \\
+    --percentile-metrics ttft,tpot,itl,e2el \\
+    --max-concurrency {client_config.concurrency} > "$BENCHMARK_LOG" 2>&1
+
+if [ $? -eq 0 ]; then
+    echo "Benchmark completed successfully"
+else
+    echo "Benchmark failed with error code $?"
+fi
+
+echo "-----------------------------------------"
+"""
+
+    script_content += f"""
+
+echo "All benchmarks completed successfully!"
+echo "Server will be automatically cleaned up on script exit"
+"""
+    return script_content
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Run benchmarks from YAML configuration file')
-    parser.add_argument('--output_folder',
+    parser.add_argument('--log_folder',
                         required=True,
                         help='Output folder for benchmark results')
     parser.add_argument('--config_file',
                         required=True,
                         help='Path to YAML configuration file')
     parser.add_argument(
-        '--skip',
-        help=
-        'Skip pattern: "2,4-1" means skip test case 2 and test case 4\'s 1st concurrency'
-    )
-    parser.add_argument(
-        '--select',
-        help=
-        'Select pattern: "1,3,5" means only run test cases 1, 3, and 5; "1-1,2-3" means only run test case 1\'s 1st concurrency and test case 2\'s 3rd concurrency'
-    )
+        '--select', help='Select pattern: "r1_fp4_dep4:con1_iter1_1024_1024"')
+    parser.add_argument('--timeout', help='Timeout in seconds', default=5400)
 
     args = parser.parse_args()
 
@@ -762,17 +780,35 @@ def main():
         print(f"Error: Config file '{args.config_file}' does not exist")
         sys.exit(1)
 
-    if not os.path.exists(args.output_folder):
-        print(f"Error: Output folder '{args.output_folder}' does not exist")
+    if not os.path.exists(args.log_folder):
+        print(f"Error: Output folder '{args.log_folder}' does not exist")
         sys.exit(1)
 
-    try:
-        runner = BenchmarkRunner(args.output_folder, args.config_file,
-                                 args.skip, args.select)
-        runner.run_benchmarks()
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    # Capture system information
+    node_name = get_node_name()
+    gpu_info = get_gpu_info()
+
+    log_folder = Path(args.log_folder)
+    config_file = Path(args.config_file)
+
+    default_max_timeout = 5400
+    max_timeout = int(args.timeout) if args.timeout else default_max_timeout
+
+    # Change to output directory
+    os.chdir(log_folder)
+
+    # Treat empty or "default" values as None (default behavior)
+    select_pattern = None if not args.select or args.select.lower(
+    ) == "default" else args.select
+
+    execution_plan, server_configs, server_client_configs = parse_config_file(
+        config_file, select_pattern)
+
+    generate_repro_scripts(server_configs, server_client_configs, node_name,
+                           max_timeout)
+
+    run_perf_tests(server_configs, server_client_configs, max_timeout,
+                   log_folder, node_name, gpu_info)
 
 
 if __name__ == "__main__":

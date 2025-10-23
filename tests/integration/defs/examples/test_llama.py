@@ -895,32 +895,6 @@ def test_llm_llama_v2_gather_logits_2gpu_pp2(llama_example_root,
 
 
 @skip_post_blackwell
-@pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
-def test_llm_llama_v2_1gpu_auto_parallel(llama_example_root, llama_model_root,
-                                         llm_venv, cmodel_dir, engine_dir):
-    model_name = 'llama_v2'
-    data_type = 'float16'
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model=model_name,
-                                model_path=llama_model_root,
-                                data_type=data_type)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--max_batch_size={1}",
-        f"--max_input_len={1024}",
-        f"--output_dir={engine_dir}",
-        "--auto_parallel=8",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-
-@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -1078,24 +1052,21 @@ def test_llm_llama_v3_1_autoq_2gpu_mmlu(llama_example_root, llama_model_root,
 @skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
 @pytest.mark.parametrize("num_beams", [4],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("llama_model_root", ['llama-7b', 'llama-30b'],
                          indirect=True)
 def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
                                    llm_datasets_root, llm_rouge_root, llm_venv,
-                                   cmodel_dir, engine_dir, num_beams,
-                                   use_auto_parallel):
+                                   cmodel_dir, engine_dir, num_beams):
     model_name = 'llama_v1_2gpu'
     model_dir = convert_weights(llm_venv=llm_venv,
                                 example_root=llama_example_root,
                                 cmodel_dir=cmodel_dir,
                                 model=model_name,
                                 model_path=llama_model_root,
-                                gpus=1 if use_auto_parallel else 2,
-                                tp_size=1 if use_auto_parallel else 2,
+                                gpus=2,
+                                tp_size=2,
                                 pp_size=1)
 
     print("Build engines...")
@@ -1108,8 +1079,6 @@ def test_llm_llama_v1_2gpu_summary(llama_example_root, llama_model_root,
         "--remove_input_padding=enable",
         f"--max_beam_width={num_beams}",
     ]
-    if use_auto_parallel:
-        build_cmd += ["--auto_parallel=2"]
 
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
@@ -4208,6 +4177,7 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
 ])

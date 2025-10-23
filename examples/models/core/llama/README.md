@@ -132,16 +132,6 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
             --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
             --gemm_plugin auto
 
-# Build LLaMA 7B using 2-way auto parallelism (deprecated).
-python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
-                            --output_dir ./tllm_checkpoint_1gpu_fp16 \
-                            --dtype float16
-
-trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
-            --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
-            --gemm_plugin auto \
-            --auto_parallel 2
-
 # Build LLaMA 7B using 2-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                             --output_dir ./tllm_checkpoint_2gpu_tp2 \

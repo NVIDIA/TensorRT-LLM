@@ -5,6 +5,7 @@ import pytest
 
 from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
                                        RPCServer, RPCStreamingError, RPCTimeout)
+from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 
 
 class RpcServerWrapper(RPCServer):
@@ -31,7 +32,8 @@ class TestRpcBasics:
             def hello(self):
                 print("hello")
 
-        with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
             pass
 
     def test_remote_call_without_arg(self):
@@ -42,8 +44,9 @@ class TestRpcBasics:
                 print("hello")
                 return "world"
 
-        with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            with RPCClient("ipc:///tmp/rpc_test") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 ret = client.hello().remote()  # sync call
                 assert ret == "world"
 
@@ -55,8 +58,9 @@ class TestRpcBasics:
                 print("hello")
                 return f"hello {name} from {location}"
 
-        with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            with RPCClient("ipc:///tmp/rpc_test") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 ret = client.hello("app", "Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -68,8 +72,9 @@ class TestRpcBasics:
                 print("hello")
                 return f"hello {name} from {location}"
 
-        with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            with RPCClient("ipc:///tmp/rpc_test") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 ret = client.hello(name="app", location="Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -81,8 +86,9 @@ class TestRpcBasics:
                 print("hello")
                 return f"hello {name} from {location}"
 
-        with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            with RPCClient("ipc:///tmp/rpc_test") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 ret = client.hello(name="app", location="Marvel").remote()
                 assert ret == "hello app from Marvel"
 
@@ -91,8 +97,9 @@ class TestRpcBasics:
         class App:
             pass
 
-        with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            assert server.address == "ipc:///tmp/rpc_test"
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            assert server.address == addr
 
     def test_rpc_with_error(self):
 
@@ -101,9 +108,9 @@ class TestRpcBasics:
             def hello(self):
                 raise ValueError("hello")
 
-        with RpcServerWrapper(App(),
-                              addr="ipc:///tmp/rpc_test_error") as server:
-            with RPCClient("ipc:///tmp/rpc_test_error") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 with pytest.raises(RPCError):
                     client.hello().remote()
 
@@ -123,9 +130,9 @@ class TestRpcBasics:
             def get_task_submitted(self) -> bool:
                 return self.task_submitted
 
-        with RpcServerWrapper(App(),
-                              addr="ipc:///tmp/rpc_test_no_wait") as server:
-            with RPCClient("ipc:///tmp/rpc_test_no_wait") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 client.send_task().remote(need_response=False)
                 time.sleep(
                     0.1
@@ -152,11 +159,12 @@ class TestRpcError:
             def custom_exception(self):
                 raise TestRpcError.CustomError("Custom error occurred")
 
+        addr = get_unique_ipc_addr()
         with RPCServer(App()) as server:
-            server.bind("ipc:///tmp/rpc_test_error")
+            server.bind(addr)
             server.start()
             time.sleep(0.1)
-            with RPCClient("ipc:///tmp/rpc_test_error") as client:
+            with RPCClient(addr) as client:
                 # Test ValueError handling
                 with pytest.raises(RPCError) as exc_info:
                     client.hello().remote()
@@ -196,7 +204,7 @@ class TestRpcError:
                 time.sleep(10)
                 return True
 
-        addr = "ipc:///tmp/rpc_test_cancelled"
+        addr = get_unique_ipc_addr()
 
         server = RPCServer(
             App(),
@@ -218,7 +226,6 @@ class TestRpcError:
 
         client.close()
 
-    @pytest.mark.skip(reason="https://nvbugs/5579234")
     def test_timeout_error(self):
         """Test that requests that exceed timeout are handled with proper error."""
 
@@ -229,13 +236,12 @@ class TestRpcError:
                 time.sleep(2.0)
                 return "completed"
 
-        with RpcServerWrapper(App(),
-                              addr="ipc:///tmp/rpc_test_timeout") as server:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
             time.sleep(0.1)
 
             # Create client with short timeout
-            with RPCClient("ipc:///tmp/rpc_test_timeout",
-                           timeout=0.5) as client:
+            with RPCClient(addr, timeout=0.5) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.slow_method().remote(timeout=0.5)
 
@@ -252,11 +258,11 @@ class TestRpcError:
             def existing_method(self):
                 return "exists"
 
-        with RpcServerWrapper(App(),
-                              addr="ipc:///tmp/rpc_test_not_found") as server:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
             time.sleep(0.1)
 
-            with RPCClient("ipc:///tmp/rpc_test_not_found") as client:
+            with RPCClient(addr) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.non_existent_method().remote()
 
@@ -272,11 +278,12 @@ def test_rpc_shutdown_server():
         def hello(self):
             return "world"
 
+    addr = get_unique_ipc_addr()
     with RPCServer(App()) as server:
-        server.bind("ipc:///tmp/rpc_test_shutdown")
+        server.bind(addr)
         server.start()
         time.sleep(0.1)
-        with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
+        with RPCClient(addr) as client:
             ret = client.hello().remote()
             assert ret == "world"
 
@@ -298,11 +305,12 @@ def test_rpc_without_response_performance():
             time.sleep(0.001)
             return None
 
+    addr = get_unique_ipc_addr()
     with RPCServer(App(), num_workers=10) as server:
-        server.bind("ipc:///tmp/rpc_test_no_wait")
+        server.bind(addr)
         server.start()
         time.sleep(0.1)
-        with RPCClient("ipc:///tmp/rpc_test_no_wait") as client:
+        with RPCClient(addr) as client:
             time_start = time.time()
             for i in range(100):
                 client.send_task().remote(need_response=False)
@@ -329,7 +337,7 @@ def test_rpc_benchmark(async_run_task: bool, use_ipc_addr: bool):
             return n * 2
 
     with RPCServer(App(), async_run_task=async_run_task) as server:
-        address = "ipc:///tmp/rpc_test" if use_ipc_addr else "tcp://127.0.0.1:*"
+        address = get_unique_ipc_addr() if use_ipc_addr else "tcp://127.0.0.1:*"
 
         server.bind(address)
         server.start()
@@ -428,10 +436,10 @@ class TestRpcShutdown:
             def quick_task(self, task_id: int):
                 return f"quick_task_{task_id}"
 
-        with RpcServerWrapper(App(),
-                              addr="ipc:///tmp/rpc_test_shutdown") as server:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(App(), addr=addr) as server:
             time.sleep(0.1)
-            with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
+            with RPCClient(addr) as client:
                 client.quick_task(1).remote()
 
                 # repeated shutdown should not raise an error
@@ -446,12 +454,13 @@ class TestRpcShutdown:
                 time.sleep(delay)
                 return "foo"
 
+        addr = get_unique_ipc_addr()
         server = RPCServer(App())
-        server.bind("ipc:///tmp/rpc_test_shutdown")
+        server.bind(addr)
         server.start()
 
         time.sleep(0.1)
-        with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
+        with RPCClient(addr) as client:
             # This task should be continued after server shutdown
             res = client.foo(10).remote_future(timeout=12)
 
@@ -639,9 +648,9 @@ class TestResponsePickleError:
             yield nested_function
 
     def test_unpickleable_error(self):
-        with RpcServerWrapper(
-                self.App(), addr="ipc:///tmp/rpc_test_pickle_error") as server:
-            with RPCClient("ipc:///tmp/rpc_test_pickle_error") as client:
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(self.App(), addr=addr) as server:
+            with RPCClient(addr) as client:
                 with pytest.raises(RPCError) as exc_info:
                     client.unpickleable_return().remote()
 
@@ -649,11 +658,10 @@ class TestResponsePickleError:
 
     @pytest.mark.asyncio
     async def test_unpickleable_streaming_error(self):
-        with RpcServerWrapper(self.App(),
-                              addr="ipc:///tmp/rpc_test_pickle_error_streaming",
+        addr = get_unique_ipc_addr()
+        with RpcServerWrapper(self.App(), addr=addr,
                               async_run_task=True) as server:
-            with RPCClient(
-                    "ipc:///tmp/rpc_test_pickle_error_streaming") as client:
+            with RPCClient(addr) as client:
                 with pytest.raises(RPCStreamingError) as exc_info:
                     async for _ in client.unpickleable_streaming_return(
                     ).remote_streaming():

@@ -25,6 +25,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
@@ -794,10 +795,15 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
+        elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
+            output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4, module.weight, act_sf, module.weight_scale,
+                module.alpha, module.dtype)
         else:
             output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
                                                  module.weight_scale,
                                                  module.alpha, module.dtype)
+
         if bias is not None:
             output = output + bias
         return output
@@ -1027,15 +1033,12 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                        tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
-                # The kernel we use will convert nvfp4 to e4m3 before matmul,
-                # so the range of the scale factor can only be [0,448/6].
-                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
                 weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
                 if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
+                    weight_scale_2 = w["weight_scale_2"][...]
                 else:
-                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
+                    assert weight_scale_2 == w["weight_scale_2"][...], (
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
                     )
 
@@ -1825,6 +1828,7 @@ class Linear(nn.Module):
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
+        use_cublaslt_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
@@ -1844,6 +1848,7 @@ class Linear(nn.Module):
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
+        self.use_cublaslt_nvfp4_blockscaling_mm = use_cublaslt_nvfp4_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features

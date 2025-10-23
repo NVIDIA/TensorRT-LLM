@@ -76,7 +76,7 @@ class BuildAndLoadFactoryModel(BuildModel):
         assert isinstance(factory, hf.AutoModelFactory), "Only HF models are supported."
 
         # build and load the model
-        model = factory.build_and_load_model(self.config.device)
+        model = factory.build_and_load_model(cm.device)
 
         # we set the standard example sequence WITHOUT extra_args to set them to None so that
         # only the text portion of the model gets called.

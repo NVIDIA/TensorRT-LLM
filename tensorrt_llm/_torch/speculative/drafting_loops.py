@@ -107,12 +107,14 @@ def prepare_for_generation(attn_metadata: AttentionMetadata,
 
 class ChainDrafter(torch.nn.Module):
 
-    def __init__(self, max_draft_len: int, draft_model: torch.nn.Module):
+    def __init__(self, max_draft_len: int, max_total_draft_tokens: int,
+                 draft_model: torch.nn.Module):
         super().__init__()
         self.draft_model = draft_model
         self.config = self.draft_model.config
         self.model_config = self.draft_model.model_config
         self.max_draft_len = max_draft_len
+        self.max_total_draft_tokens = max_total_draft_tokens
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,

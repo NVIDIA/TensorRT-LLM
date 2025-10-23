@@ -299,7 +299,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py) 
+For more benchmarking options see [benchmark_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
 
 Run bench.sh to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above bench.sh script.
 
@@ -340,13 +340,41 @@ P99 E2EL (ms):                            [result]
 
 ### Key Metrics
 
-* Median Time to First Token (TTFT)
+#### Time to First Token (TTFT)
   * The typical time elapsed from when a request is sent until the first output token is generated.
-* Median Time Per Output Token (TPOT)
-  * The typical time required to generate each token *after* the first one.
-* Median Inter-Token Latency (ITL)
-  * The typical time delay between the completion of one token and the completion of the next.
-* Median End-to-End Latency (E2EL)
+
+#### Time Per Output Token (TPOT) and Inter-Token Latency (ITL)
+  * TPOT is the typical time required to generate each token *after* the first one.
+  * ITL is the typical time delay between the completion of one token and the completion of the next.
+  * Both TPOT and ITL ignore TTFT.
+
+For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:
+
+```math
+\text{TPOT (1\ request)} = \text{Avg(ITL)} = \frac{\text{E2E\ latency} - \text{TTFT}}{\text{\#Output\ Tokens} - 1}
+```
+
+Across different requests, **average TPOT** is the mean of each request's TPOT (all requests weighted equally), while **average ITL** is token-weighted (all tokens weighted equally):
+
+```math
+\text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
+```
+
+```math
+\text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{\#Output Tokens across requests}}
+```
+
+#### End-to-End (E2E) Latency
   * The typical total time from when a request is submitted until the final token of the response is received.
-* Total Token Throughput
+
+#### Total Token Throughput
   * The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.
+```math
+\text{Total\ TPS} = \frac{\text{\#Input\ Tokens}+\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+```
+
+#### Tokens Per Second (TPS) or Output Token Throughput
+  * how many output tokens the system generates each second.
+```math
+\text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
+```

@@ -8,9 +8,8 @@ import torch
 
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
-from ..lora_helper import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
@@ -116,8 +115,6 @@ class RayGPUWorker(BaseWorker):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -131,8 +128,6 @@ class RayGPUWorker(BaseWorker):
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args,

@@ -14,7 +14,9 @@ def rms_norm_kernel(
     N_COLS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Rms norm kernel."""
+    """Rms norm kernel.
+    Forces weights to be in float32 for the kernel.
+    """
     prog_id = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_N)
 
@@ -26,7 +28,7 @@ def rms_norm_kernel(
 
     var = tl.sum(xf * xf, 0) * float(1.0 / N_COLS)
     out = xf / tl.sqrt(var + eps)
-    out = (w * out).to(x.dtype)
+    out = (w.to(tl.float32) * out).to(x.dtype)
 
     out_ptr = output + prog_id * input_row_stride
     tl.store(out_ptr + offsets, out, mask=offsets < N_COLS)

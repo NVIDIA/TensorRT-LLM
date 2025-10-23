@@ -54,7 +54,6 @@ class MappingBase:
             moe_ep_size=-1,  # -1 means no moe
             attn_tp_size=-1,
             attn_cp_size=-1,
-            auto_parallel=False,
             enable_attention_dp=False,
             enable_lm_head_tp_in_adp=False):
         # set default values for non-moe cases
@@ -97,17 +96,10 @@ class MappingBase:
                 f"attn_cp_size must be 1 for now for ulysses, but got {attn_tp_size}, {attn_cp_size}."
             )
 
-        if auto_parallel:
-            if tp_size != 1 or pp_size != 1 or cp_size != 1:
-                raise ValueError(
-                    "When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, "
-                    f"but got {tp_size}, {pp_size}, {cp_size}.")
-        else:
-            if tp_size * pp_size * cp_size != world_size:
-                raise ValueError(
-                    "world_size must equal to tp_size * pp_size * cp_size, "
-                    f"but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
-                )
+        if tp_size * pp_size * cp_size != world_size:
+            raise ValueError(
+                "world_size must equal to tp_size * pp_size * cp_size, "
+                f"but got {world_size} != {tp_size} * {pp_size} * {cp_size}.")
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         self.moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
@@ -139,7 +131,6 @@ class MappingBase:
         self.moe_cluster_size = moe_cluster_size
         self.attn_tp_size = attn_tp_size
         self.attn_cp_size = attn_cp_size
-        self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.enable_attention_dp = enable_attention_dp
         if enable_lm_head_tp_in_adp:
@@ -169,8 +160,7 @@ class MappingBase:
                 and self.moe_ep_size == other.moe_ep_size
                 and self.attn_tp_size == other.attn_tp_size
                 and self.attn_cp_size == other.attn_cp_size
-                and self.cp_config == other.cp_config
-                and self.auto_parallel == other.auto_parallel)
+                and self.cp_config == other.cp_config)
 
     def __hash__(self):
         return hash((
@@ -187,7 +177,6 @@ class MappingBase:
             self.attn_cp_size,
             # note: we do not allow updating cp_config after initialization
             tuple(sorted(self.cp_config.items())),
-            self.auto_parallel,
         ))
 
     @property
@@ -339,7 +328,6 @@ class MappingBase:
             'attn_tp_size': self.attn_tp_size,
             'attn_cp_size': self.attn_cp_size,
             'cp_config': self.cp_config,
-            'auto_parallel': self.auto_parallel,
             'enable_attention_dp': self.enable_attention_dp,
             'enable_lm_head_tp_in_adp': self.enable_lm_head_tp_in_adp,
         }
@@ -463,7 +451,6 @@ class Mapping(MappingBase):
             moe_ep_size=-1,  # -1 means no moe
             attn_tp_size=-1,
             attn_cp_size=-1,
-            auto_parallel=False,
             enable_attention_dp=False,
             enable_lm_head_tp_in_adp=False):
         super().__init__(world_size=world_size,
@@ -478,7 +465,6 @@ class Mapping(MappingBase):
                          moe_ep_size=moe_ep_size,
                          attn_tp_size=attn_tp_size,
                          attn_cp_size=attn_cp_size,
-                         auto_parallel=auto_parallel,
                          enable_attention_dp=enable_attention_dp,
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp)
 
@@ -516,17 +502,15 @@ class MpiTopology(Mapping):
 
     @property
     def tp_rank(self) -> int:
-        return 0 if self.auto_parallel else self.rank % self.tp_size
+        return self.rank % self.tp_size
 
     @property
     def pp_rank(self) -> int:
-        return 0 if self.auto_parallel else self.rank // (self.tp_size *
-                                                          self.cp_size)
+        return self.rank // (self.tp_size * self.cp_size)
 
     @property
     def cp_rank(self) -> int:
-        return 0 if self.auto_parallel else self.rank % (
-            self.tp_size * self.cp_size) // self.tp_size
+        return self.rank % (self.tp_size * self.cp_size) // self.tp_size
 
     @property
     def tp_group(self) -> List[int]:

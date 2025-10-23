@@ -44,7 +44,7 @@ from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
-                    print_colored_debug, set_api_status)
+                    logger_debug, set_api_status)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -181,8 +181,8 @@ class BaseLLM:
         finally:
             logger.set_level(log_level)  # restore the log level
 
-        print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
-                            "yellow")
+        logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
+                     "yellow")
         self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
@@ -198,13 +198,11 @@ class BaseLLM:
             if not self.mpi_session:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
-                    print_colored_debug(f"LLM create MpiPoolSession\n",
-                                        "yellow")
+                    logger_debug(f"LLM create MpiPoolSession\n", "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
                 else:
-                    print_colored_debug(f"LLM create MpiCommSession\n",
-                                        "yellow")
+                    logger_debug(f"LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
 
@@ -262,6 +260,7 @@ class BaseLLM:
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
+        cache_salt: Optional[Union[str, Sequence[str]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -282,6 +281,7 @@ class BaseLLM:
                 Disaggregated parameters. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
+            cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -312,7 +312,9 @@ class BaseLLM:
                                                    i),
                 disaggregated_params=_item_at(disaggregated_params, i),
                 scheduling_params=_item_at(scheduling_params, i),
-                streaming=False)
+                cache_salt=_item_at(cache_salt, i),
+                streaming=False,
+            )
             futures.append(future)
 
         for future in tqdm(futures,
@@ -819,7 +821,7 @@ class _TrtLLM(BaseLLM):
             target_engine_dir.mkdir(parents=True, exist_ok=True)
             # copy files one by one
             for file in self._engine_dir.iterdir():
-                print_colored_debug(
+                logger_debug(
                     f"Copying {file} to {target_engine_dir / file.name}\n")
                 shutil.copy(file, target_engine_dir / file.name)
 
@@ -950,8 +952,7 @@ class _TrtLLM(BaseLLM):
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True,
-            lora_config=lora_config)
+            is_llm_executor=True)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -1033,8 +1034,10 @@ class _TorchLLM(BaseLLM):
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+        checkpoint_format = getattr(self.args, "checkpoint_format", None)
         self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer)
+                                                      self.tokenizer,
+                                                      checkpoint_format)
         self._tokenizer = self.input_processor.tokenizer
 
         # TODO: revisit gather_context_logits
@@ -1053,9 +1056,6 @@ class _TorchLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config,
-            # Autodeploy does not support kv_connector_config
-            kv_connector_config=getattr(self.args, "kv_connector_config", None),
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)

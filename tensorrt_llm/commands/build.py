@@ -26,8 +26,6 @@ import torch
 
 from tensorrt_llm._utils import (local_mpi_rank, local_mpi_size, mpi_barrier,
                                  mpi_comm, mpi_rank, mpi_world_size)
-from tensorrt_llm.auto_parallel import infer_cluster_config
-from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
 from tensorrt_llm.logger import logger, severity_map
@@ -305,29 +303,6 @@ def parse_arguments():
         "Maximum lengths of draft tokens for speculative decoding target model."
     )
 
-    autopp_parser = parser.add_argument_group("Auto parallel arguments")
-    autopp_parser.add_argument('--auto_parallel',
-                               type=int,
-                               default=1,
-                               help="MPI world size for auto parallel.")
-    autopp_parser.add_argument(
-        '--gpus_per_node',
-        type=int,
-        default=8,
-        help=
-        "Number of GPUs each node has in a multi-node setup. This is a cluster spec and can be greater/smaller than world size. "
-        "This option is only used for auto parallel specified with ``--auto_parallel``."
-    )
-    autopp_parser.add_argument(
-        '--cluster_key',
-        type=str,
-        default=None,
-        choices=cluster_infos.keys(),
-        help=
-        "Unique name for target GPU type. Inferred from current GPU type if not specified. "
-        "This option is only used for auto parallel specified with ``--auto_parallel``."
-    )
-
     plugin_config_parser = parser.add_argument_group("Plugin config arguments")
     add_plugin_argument(plugin_config_parser)
     return parser
@@ -355,16 +330,7 @@ def build_model(
     assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
         "PP reduce scatter is only supported in the mixtral model."
 
-    model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
-    if build_config.auto_parallel_config.enabled:
-        assert rank < build_config.auto_parallel_config.world_size
-        assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
-            "You must convert to full model with TP=1&&PP=1 to use auto parallel planner"
-        model_config.mapping.auto_parallel = True
-        model_config.mapping.world_size = build_config.auto_parallel_config.world_size
-        model_config.mapping.rank = rank
-    else:
-        assert rank < model_config.mapping.world_size
+    assert rank < model_config.mapping.world_size
 
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
@@ -419,17 +385,7 @@ def parallel_build(model_config: PretrainedConfig,
                    model_cls=None,
                    **kwargs):
 
-    if build_config.auto_parallel_config.enabled:
-        if model_config.mapping.world_size > 1:
-            raise RuntimeError(
-                "manually TP and PP are not supported in auto parallel mode.")
-        if build_config.auto_parallel_config.debug_mode:
-            world_size = 1
-        else:
-            world_size = build_config.auto_parallel_config.world_size
-    else:
-        world_size = model_config.mapping.world_size
-
+    world_size = model_config.mapping.world_size
     use_mpi = mpi_world_size() > 1
 
     if not use_mpi and workers == 1:
@@ -550,10 +506,6 @@ def main():
             raise RuntimeError(
                 "multiple_profiles is enabled, while opt_num_tokens is set. "
                 "They are not supposed to be working in the same time for now.")
-        if args.cluster_key is not None:
-            cluster_config = dict(cluster_key=args.cluster_key)
-        else:
-            cluster_config = infer_cluster_config()
 
         # This should only be used for debugging.
         # The env var BUILDER_FORCE_NUM_PROFILES should override the number of
@@ -605,20 +557,6 @@ def main():
                 args.input_timing_cache,
                 'output_timing_cache':
                 args.output_timing_cache,
-                'auto_parallel_config': {
-                    'world_size':
-                    args.auto_parallel,
-                    'gpus_per_node':
-                    args.gpus_per_node,
-                    'sharded_io_allowlist': [
-                        'past_key_value_\\d+',
-                        'present_key_value_\\d*',
-                    ],
-                    'same_buffer_io': {
-                        'past_key_value_(\\d+)': 'present_key_value_\\1',
-                    },
-                    **cluster_config,
-                },
                 'dry_run':
                 args.dry_run,
                 'visualize_network':

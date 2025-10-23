@@ -12,6 +12,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -67,11 +68,7 @@ def ctx_gen_kv_cache_dtype(request):
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
                          ids=["mha", "mla"])
-@pytest.mark.parametrize("backend", [
-    trtllm.CacheTransceiverBackendType.NIXL,
-    trtllm.CacheTransceiverBackendType.UCX
-],
-                         ids=["NIXL", "UCX"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
 def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                                              attention_type, backend):
     # Init kv_cache manager and cache transceiver
@@ -80,8 +77,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, ctx_kv_cache_dtype)
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
-    cache_transceiver_config = trtllm.CacheTransceiverConfig(
-        backend=backend, max_tokens_in_buffer=512)
+    cache_transceiver_config = CacheTransceiverConfig(backend=backend,
+                                                      max_tokens_in_buffer=512)
     dist = MPIDist(mapping=mapping)
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_ctx, attention_type,
@@ -147,9 +144,8 @@ def test_cancel_request_in_transmission(attention_type):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, ctx_kv_cache_dtype)
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
-    cache_transceiver_config = trtllm.CacheTransceiverConfig(
-        backend=trtllm.CacheTransceiverBackendType.DEFAULT,
-        max_tokens_in_buffer=512)
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
 
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_ctx, attention_type,

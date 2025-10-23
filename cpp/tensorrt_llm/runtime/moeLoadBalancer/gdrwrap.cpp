@@ -201,13 +201,13 @@ void driver_get_version(gdr_t g, int* major, int* minor)
 int copy_to_mapping(gdr_mh_t handle, void* map_d_ptr, void const* h_ptr, size_t size)
 {
     CHECK_INITIALIZED();
-    return GDRLOCKCALL(gdr_internal_copy_to_mapping(handle, map_d_ptr, h_ptr, size));
+    return gdr_internal_copy_to_mapping(handle, map_d_ptr, h_ptr, size);
 }
 
 int copy_from_mapping(gdr_mh_t handle, void* h_ptr, void const* map_d_ptr, size_t size)
 {
     CHECK_INITIALIZED();
-    return GDRLOCKCALL(gdr_internal_copy_from_mapping(handle, h_ptr, map_d_ptr, size));
+    return gdr_internal_copy_from_mapping(handle, h_ptr, map_d_ptr, size);
 }
 
 void gdrCudaMalloc(void** ptr, void** devPtr, size_t mapSize, GdrMemDesc** memDesc, gdr_t handle)

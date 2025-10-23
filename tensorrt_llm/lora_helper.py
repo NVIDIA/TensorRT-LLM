@@ -13,10 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
-from ._utils import DictConversion
+from pydantic import BaseModel, Field
 
 
 def get_missing_qkv_modules_from_lora_modules(
@@ -80,22 +79,15 @@ def use_lora(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
 
 
-@dataclass
-class LoraConfig(DictConversion):
-    lora_dir: List[str] = field(default_factory=list)
-    lora_ckpt_source: str = "hf"
+class LoraConfig(BaseModel):
+    lora_dir: List[str] = Field(default_factory=list)
+    lora_ckpt_source: Literal["hf", "nemo"] = "hf"
     max_lora_rank: int = 64
-    lora_target_modules: List[str] = field(default_factory=list)
-    trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
+    lora_target_modules: List[str] = Field(default_factory=list)
+    trtllm_modules_to_hf_modules: Dict[str, str] = Field(default_factory=dict)
     max_loras: Optional[int] = None
     max_cpu_loras: Optional[int] = None
     swap_gate_up_proj_lora_b_weight: bool = True
-
-    def __post_init__(self):
-        assert self.lora_ckpt_source in [
-            "hf", "nemo"
-        ], (f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
-            )
 
     @property
     def missing_qkv_modules(self) -> List[str]:

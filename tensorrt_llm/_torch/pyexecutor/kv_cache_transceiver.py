@@ -5,7 +5,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
-from tensorrt_llm.bindings.executor import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
@@ -36,13 +36,13 @@ def create_kv_cache_transceiver(
         logger.info("cache_transceiver is disabled")
         return None
 
-    if cache_transceiver_config.backend == BackendTypeCpp.DEFAULT:
+    if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # UCX is the default backend
-        cache_transceiver_config.backend = BackendTypeCpp.UCX
+        # NIXL is the default backend
+        cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_NIXL_KVCACHE", BackendTypeCpp.NIXL),
-                    ("TRTLLM_USE_MPI_KVCACHE", BackendTypeCpp.MPI)]
+        env_vars = [("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+                    ("TRTLLM_USE_MPI_KVCACHE", "MPI")]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
                 logger.warning(
@@ -51,10 +51,10 @@ def create_kv_cache_transceiver(
                 cache_transceiver_config.backend = be_type
                 break
 
-    if cache_transceiver_config.backend == BackendTypeCpp.MPI:
+    if cache_transceiver_config.backend == "MPI":
         logger.warning(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
-    elif cache_transceiver_config.backend == BackendTypeCpp.UCX:
+    elif cache_transceiver_config.backend == "UCX":
         logger.info(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
@@ -109,12 +109,14 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         # get the layer num per pp rank, which is required by cache transceiver.
         pp_layer_num = len(kv_cache_manager.pp_layers)
         pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
+
+        self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
                                         total_num_kv_heads_per_layer, head_dim,
                                         tokens_per_block, world_config,
                                         pp_layer_num_per_pp_rank, dtype,
                                         attention_type,
-                                        cache_transceiver_config)
+                                        cache_transceiver_config._to_pybind())
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)
@@ -145,7 +147,8 @@ class CacheTransBufferManager:
                                                max_num_tokens)
 
     @staticmethod
-    def pre_alloc_buffer_size(kv_cache_size_per_token: int,
+    def pre_alloc_buffer_size(tokens_per_block: int,
+                              kv_cache_size_per_token: int,
                               cache_transceiver_config: CacheTransceiverConfig):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            kv_cache_size_per_token, cache_transceiver_config)
+            tokens_per_block, kv_cache_size_per_token, cache_transceiver_config)

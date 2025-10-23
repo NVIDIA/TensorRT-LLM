@@ -20,6 +20,10 @@ def calculate_tile_tokens_dim(
     imbalance_factor: float = 1.0,
     max_tile_tokens_dim: int = 128,
 ) -> int:
+    # We use the num_tokens after round mapping to generate tile tokens dim.
+    # This is to keep the tuning tokens aligned with the tokens used for inference.
+    num_tokens = min(next_positive_power_of_2(num_tokens), 4096)
+
     # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = num_tokens * top_k // num_experts
     num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
@@ -97,31 +101,22 @@ class FP4BlockScaleMoERunner(TunableRunner):
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts)
 
-    def get_runner(
-        self,
-        num_tokens: int,
-    ):
-        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
-                                                    self.num_experts,
-                                                    self.top_k,
-                                                    max_tile_tokens_dim=128)
-        instance_key = (tile_tokens_dim, )
+    def get_runner(self):
+        instance_key = ()
         if instance_key not in FP4BlockScaleMoERunner.runner_dict:
             FP4BlockScaleMoERunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner(
-                    tile_tokens_dim)
+                instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner()
         return FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: List[int] = [-1, -1],
     ) -> torch.Tensor:
+        assert isinstance(tactic, list)
 
         args = FP4BlockScaleMoEInputs(*inputs)
-
-        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        kernel_runner = self.get_runner()
 
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
@@ -136,7 +131,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile, **kwargs) -> List[int]:
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
 
         args = FP4BlockScaleMoEInputs(*inputs)
 
@@ -146,7 +142,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         # into 1 byte.
         hidden_size = args.hidden_states.shape[1] * 2
 
-        kernel_runner = self.get_runner(num_tokens)
+        kernel_runner = self.get_runner()
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
@@ -259,7 +255,6 @@ def fp4_block_scale_moe_runner(
         topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-
     kernel_runner = FP4BlockScaleMoERunner(
         num_experts,
         top_k,
@@ -296,17 +291,18 @@ def fp4_block_scale_moe_runner(
         output2_scale_scalar,
     ]
 
-    _, best_tactic = tuner.choose_one(
+    kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::fp4_block_scale_moe_runner",
         [kernel_runner],
-        kernel_runner.tuning_config,
+        FP4BlockScaleMoERunner.get_tuning_config(),
         input_tensors_for_tuner,
     )
 
     input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
-    return kernel_runner(input_tensors, tactic=best_tactic)
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
 
 
 def fp4_block_scale_fake_output_without_finalize(
@@ -319,10 +315,8 @@ def fp4_block_scale_fake_output_without_finalize(
     hidden_size = hidden_states.shape[1] * (2 if isinstance(
         hidden_states, Fp4QuantizedTensor) else 1)
 
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
-                                                num_experts,
-                                                top_k,
-                                                max_tile_tokens_dim=128)
+    # Use the max possible tile tokens dimension
+    tile_tokens_dim = 128
 
     expanded_row_count = num_tokens * top_k
     max_padding_required = (tile_tokens_dim - 1) * num_experts
@@ -408,6 +402,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
+        tile_tokens_dim: int,
     ):
 
         self.num_experts = num_experts
@@ -419,6 +414,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
+        self.tile_tokens_dim = tile_tokens_dim
 
         FP8BlockScaleMoERunner.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
         )
@@ -442,20 +438,12 @@ class FP8BlockScaleMoERunner(TunableRunner):
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts)
 
-    def get_runner(
-        self,
-        num_tokens: int,
-    ):
-        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
-                                                    self.num_experts,
-                                                    self.top_k,
-                                                    max_tile_tokens_dim=64)
-        instance_key = (tile_tokens_dim, )
+    def get_runner(self):
+        instance_key = (self.tile_tokens_dim, )
         if instance_key not in FP8BlockScaleMoERunner.runner_dict:
             FP8BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP8BlockScaleMoERunner(
-                    tile_tokens_dim)
+                    self.tile_tokens_dim)
         return FP8BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
@@ -466,7 +454,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         args = FP8BlockScaleMoEInputs(*inputs)
 
-        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        kernel_runner = self.get_runner()
 
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
@@ -486,7 +474,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         num_tokens = args.hidden_states.shape[0]
         hidden_size = args.hidden_states.shape[1]
 
-        kernel_runner = self.get_runner(num_tokens)
+        kernel_runner = self.get_runner()
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
@@ -578,18 +566,26 @@ def fp8_block_scale_moe_runner(
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
-
-    kernel_runner = FP8BlockScaleMoERunner(
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        routing_method_type,
-    )
+    # FIXME: temporarily disable tuning multiple runners due to kernel failure in test:
+    # python3 -m pytest tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp_trtllm]
+    tile_tokens_dim = calculate_tile_tokens_dim(hidden_states.shape[0],
+                                                num_experts,
+                                                top_k,
+                                                max_tile_tokens_dim=64)
+    kernel_runners = [
+        FP8BlockScaleMoERunner(
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            tile_tokens_dim,
+        )
+    ]
 
     # Use dummy routing logits for autotuner
     if routing_logits is None:
@@ -611,10 +607,10 @@ def fp8_block_scale_moe_runner(
         gemm2_weights_scale,
     ]
 
-    _, best_tactic = tuner.choose_one(
+    kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::fp8_block_scale_moe_runner",
-        [kernel_runner],
-        kernel_runner.tuning_config,
+        kernel_runners,
+        FP8BlockScaleMoERunner.get_tuning_config(),
         input_tensors_for_tuner,
     )
 
@@ -679,8 +675,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  hidden_size_output: int, local_expert_offset: int,
                  local_num_experts: int, routed_scaling_factor: Optional[float],
-                 routing_method_type: int, act_type: int,
-                 imbalance_factor: float):
+                 routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -693,7 +688,6 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
         self.act_type = act_type
-        self.imbalance_factor = imbalance_factor
 
         MxE4m3MxE2m1BlockScaleMoERunner.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
@@ -721,35 +715,24 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
-    def get_runner(
-        self,
-        num_tokens: int,
-    ):
-        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        # We use the num_tokens after round mapping to generate tile tokens dim.
-        # This is to keep the tuning tokens aligned with the tokens used for inference.
-        tile_tokens_dim = calculate_tile_tokens_dim(
-            num_tokens,
-            self.num_experts,
-            self.top_k,
-            imbalance_factor=self.imbalance_factor,
-            max_tile_tokens_dim=128)
-        instance_key = (tile_tokens_dim, self.act_type, True)
+    def get_runner(self):
+        instance_key = (self.act_type, True)
         if instance_key not in MxE4m3MxE2m1BlockScaleMoERunner.runner_dict:
             MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
-                    tile_tokens_dim, self.act_type, True)
+                    self.act_type, True)
         return MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: List[int] = [-1, -1],
     ) -> torch.Tensor:
+        assert isinstance(tactic, list)
 
         args = MxE4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
-        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        kernel_runner = self.get_runner()
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.hidden_states_scale, args.gemm1_weights,
@@ -763,14 +746,15 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile, **kwargs) -> List[int]:
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
 
         args = MxE4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
         num_tokens = args.hidden_states.shape[0]
         hidden_size = args.hidden_states.shape[1]
 
-        kernel_runner = self.get_runner(num_tokens)
+        kernel_runner = self.get_runner()
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
@@ -875,16 +859,23 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         act_type: int,
-        imbalance_factor: float,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
-
     kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
-        num_experts, top_k, n_group, topk_group, intermediate_size,
-        hidden_size_output, local_expert_offset, local_num_experts,
-        routed_scaling_factor, routing_method_type, act_type, imbalance_factor)
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        hidden_size_output,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        act_type,
+    )
 
     # Use dummy routing logits for autotuner
     if routing_logits is None:
@@ -911,17 +902,18 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         gemm2_bias,
     ]
 
-    _, best_tactic = tuner.choose_one(
+    kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
         [kernel_runner],
-        kernel_runner.tuning_config,
+        MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(),
         input_tensors_for_tuner,
     )
 
     input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
-    return kernel_runner(input_tensors, tactic=best_tactic)
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
 
 
 @dataclass(frozen=True)
@@ -954,8 +946,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
-                 routing_method_type: int, act_type: int,
-                 imbalance_factor: float):
+                 routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -967,7 +958,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
         self.act_type = act_type
-        self.imbalance_factor = imbalance_factor
 
         E4m3MxE2m1BlockScaleMoERunner.tuning_config = E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
@@ -993,32 +983,24 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
-    def get_runner(
-        self,
-        num_tokens: int,
-    ):
-        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
-                                                    self.num_experts,
-                                                    self.top_k,
-                                                    self.imbalance_factor,
-                                                    max_tile_tokens_dim=64)
-        instance_key = (tile_tokens_dim, self.act_type, False)
+    def get_runner(self):
+        instance_key = (self.act_type, False)
         if instance_key not in E4m3MxE2m1BlockScaleMoERunner.runner_dict:
             E4m3MxE2m1BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
-                    tile_tokens_dim, self.act_type, False)
+                    self.act_type, False)
         return E4m3MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: List[int] = [-1, -1],
     ) -> torch.Tensor:
+        assert isinstance(tactic, list)
 
         args = E4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
-        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        kernel_runner = self.get_runner()
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states, None,
             args.gemm1_weights, args.gemm1_weights_scale, args.gemm1_bias,
@@ -1032,14 +1014,15 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile, **kwargs) -> List[int]:
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
 
         args = E4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
         num_tokens = args.hidden_states.shape[0]
         hidden_size = args.hidden_states.shape[1]
 
-        kernel_runner = self.get_runner(num_tokens)
+        kernel_runner = self.get_runner()
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
@@ -1125,12 +1108,10 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         act_type: int,
-        imbalance_factor: float,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
-
     kernel_runner = E4m3MxE2m1BlockScaleMoERunner(
         num_experts,
         top_k,
@@ -1142,7 +1123,6 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         routed_scaling_factor,
         routing_method_type,
         act_type,
-        imbalance_factor,
     )
 
     # Use dummy routing logits for autotuner
@@ -1172,10 +1152,10 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         output2_scale_scalar,
     ]
 
-    _, best_tactic = tuner.choose_one(
+    kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::e4m3_mxe2m1_block_scale_moe_runner",
         [kernel_runner],
-        kernel_runner.tuning_config,
+        E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(),
         input_tensors_for_tuner,
     )
 
@@ -1183,7 +1163,8 @@ def e4m3_mxe2m1_block_scale_moe_runner(
     input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
-    return kernel_runner(input_tensors, tactic=best_tactic)
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
 
 
 @dataclass(frozen=True)
@@ -1213,8 +1194,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float],
-                 routing_method_type: int, act_type: int,
-                 imbalance_factor: float):
+                 routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -1226,7 +1206,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
         self.act_type = act_type
-        self.imbalance_factor = imbalance_factor
 
         Bf16MxE2m1BlockScaleMoERunner.tuning_config = Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
@@ -1252,32 +1231,25 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
-    def get_runner(
-        self,
-        num_tokens: int,
-    ):
-        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
-                                                    self.num_experts,
-                                                    self.top_k,
-                                                    self.imbalance_factor,
-                                                    max_tile_tokens_dim=64)
-        instance_key = (tile_tokens_dim, self.act_type)
+    def get_runner(self):
+        instance_key = (self.act_type, )
         if instance_key not in Bf16MxE2m1BlockScaleMoERunner.runner_dict:
             Bf16MxE2m1BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.Bf16MxE2m1BlockScaleMoERunner(
-                    tile_tokens_dim, self.act_type)
+                    self.act_type)
         return Bf16MxE2m1BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: List[int] = [-1, -1],
     ) -> torch.Tensor:
+        assert isinstance(tactic, list)
 
         args = Bf16MxE2m1BlockScaleMoEInputs(*inputs)
 
-        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        kernel_runner = self.get_runner()
+
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.gemm1_weights, args.gemm1_weights_scale, args.gemm1_bias,
@@ -1289,14 +1261,15 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.routing_method_type, tactic, args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile, **kwargs) -> List[int]:
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
 
         args = Bf16MxE2m1BlockScaleMoEInputs(*inputs)
 
         num_tokens = args.hidden_states.shape[0]
         hidden_size = args.hidden_states.shape[1]
 
-        kernel_runner = self.get_runner(num_tokens)
+        kernel_runner = self.get_runner()
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
@@ -1379,12 +1352,10 @@ def bf16_mxe2m1_block_scale_moe_runner(
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         act_type: int,
-        imbalance_factor: float,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
-
     kernel_runner = Bf16MxE2m1BlockScaleMoERunner(
         num_experts,
         top_k,
@@ -1396,7 +1367,6 @@ def bf16_mxe2m1_block_scale_moe_runner(
         routed_scaling_factor,
         routing_method_type,
         act_type,
-        imbalance_factor,
     )
 
     # Use dummy routing logits for autotuner
@@ -1424,10 +1394,10 @@ def bf16_mxe2m1_block_scale_moe_runner(
     ]
 
     # Choose best tactic using autotuner
-    _, best_tactic = tuner.choose_one(
+    kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::bf16_mxe2m1_block_scale_moe_runner",
         [kernel_runner],
-        kernel_runner.tuning_config,
+        Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(),
         input_tensors_for_tuner,
     )
 
@@ -1435,7 +1405,8 @@ def bf16_mxe2m1_block_scale_moe_runner(
     input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
-    return kernel_runner(input_tensors, tactic=best_tactic)
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
 
 
 @dataclass(frozen=True)
@@ -1502,30 +1473,23 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
                 and self.local_num_experts == other.local_num_experts
                 and self.act_type == other.act_type)
 
-    def get_runner(
-        self,
-        num_tokens: int,
-    ):
-        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
-        tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
-                                                    self.num_experts,
-                                                    self.top_k,
-                                                    max_tile_tokens_dim=64)
-        instance_key = (tile_tokens_dim, self.act_type)
+    def get_runner(self):
+        instance_key = (self.act_type, )
         if instance_key not in FP8FP4BlockScaleMoERunner.runner_dict:
             FP8FP4BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP8FP4BlockScaleMoERunner(
-                    tile_tokens_dim, self.act_type)
+                    self.act_type)
         return FP8FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
-        tactic: int = -1,
+        tactic: List[int] = [-1, -1],
     ) -> torch.Tensor:
+        assert isinstance(tactic, list)
 
         args = FP8FP4BlockScaleMoEInputs(*inputs)
-        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        kernel_runner = self.get_runner()
 
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
@@ -1539,7 +1503,8 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             args.topk_weights, args.topk_ids)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile, **kwargs) -> List[int]:
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
 
         args = FP8FP4BlockScaleMoEInputs(*inputs)
 
@@ -1547,7 +1512,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
         hidden_size = args.hidden_states.shape[1]
 
-        kernel_runner = self.get_runner(num_tokens)
+        kernel_runner = self.get_runner()
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
@@ -1637,7 +1602,6 @@ def fp8_fp4_block_scale_moe_runner(
         topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-
     kernel_runner = FP8FP4BlockScaleMoERunner(
         num_experts,
         top_k,
@@ -1674,17 +1638,18 @@ def fp8_fp4_block_scale_moe_runner(
         output2_scale_scalar,
     ]
 
-    _, best_tactic = tuner.choose_one(
+    kernel_runner, best_tactic = tuner.choose_one(
         "trtllm::fp8_fp4_block_scale_moe_runner",
         [kernel_runner],
-        kernel_runner.tuning_config,
+        FP8FP4BlockScaleMoERunner.get_tuning_config(),
         input_tensors_for_tuner,
     )
 
     input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
     # replace dummy routing logits with actual routing logits
     input_tensors[0] = routing_logits
-    return kernel_runner(input_tensors, tactic=best_tactic)
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
 
 
 @fp8_fp4_block_scale_moe_runner.register_fake

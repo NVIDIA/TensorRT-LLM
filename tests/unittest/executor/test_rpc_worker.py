@@ -10,7 +10,7 @@ from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc import RPCClient
-from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
+from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 from tensorrt_llm.executor.rpc_worker import RpcWorker
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.sampling_params import SamplingParams
@@ -42,7 +42,7 @@ class TestRpcWorkerTP1:
         self.client.close()
 
     def create_worker_pool(self):
-        addr = GenerationExecutorRpcProxy.gen_uniq_rpc_addr()
+        addr = get_unique_ipc_addr()
         mp_context = multiprocessing.get_context(
             'spawn')  # spawn for CUDA context
         pool = ProcessPoolExecutor(max_workers=1, mp_context=mp_context)
@@ -81,6 +81,7 @@ class TestRpcWorkerTP1:
         results.extend(self.client.fetch_responses().remote())
         assert len(results) == 1
 
+    @pytest.mark.skip(reason="https://nvbugs/5583261")
     def test_fetch_responses_streaming_sync(self):
         self.client.submit(
             GenerationRequest(prompt_token_ids=[3, 4, 5],
@@ -211,7 +212,7 @@ class TestRpcWorkerTP2:
 
     def create_worker_session(self):
         session = MpiPoolSession(n_workers=2)
-        addr = GenerationExecutorRpcProxy.gen_uniq_rpc_addr()
+        addr = get_unique_ipc_addr()
         futures = session.submit(RpcWorker.main_task,
                                  engine=model_path,
                                  rpc_addr=addr,

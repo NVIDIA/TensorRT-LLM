@@ -116,7 +116,7 @@ fi
 
 if [ $polygraphy -eq 1 ]; then
     echo "Installing Polygraphy..."
-    bash $SCRIPT_DIR/install_polygraphy.sh
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_polygraphy.sh
 fi
 
 if [ $mpi4py -eq 1 ]; then

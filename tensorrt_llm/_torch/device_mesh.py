@@ -74,18 +74,15 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     # Access rank
     @property
     def tp_rank(self) -> int:
-        assert not self.auto_parallel, "Auto parallel is not currently supported in Ray mode."
         return self.tp_group_pg.rank()
 
     @property
     def pp_rank(self) -> int:
-        assert not self.auto_parallel, "Auto parallel is not currently supported in Ray mode."
         return self.pp_group_pg.rank()
 
     @property
     def cp_rank(self) -> int:
         # TODO: WIP
-        assert not self.auto_parallel, "Auto parallel is not currently supported in Ray mode."
         return self.cp_group_pg.rank()
 
     # Access group ranks

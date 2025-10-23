@@ -12,10 +12,13 @@ The `trtllm-serve` command supports the `extra-llm-config.yaml` parameter. In th
 
 ```yaml
 cache_transceiver_config:
-  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., UCX), `UCX`, `NIXL`.
+  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., NIXL), `UCX`, `NIXL`.
   backend: <str>
   # KV cache buffer size. Set it ≥ the maximum ISL (Input Sequence Length) for best performance.
   max_tokens_in_buffer: <int>
+  # KV cache transfer timeout in milliseconds
+  # For requests, if they do not send/receive the KV cache in time they are cancelled and cleaned up
+  kv_transfer_timeout_ms: <int>
 ```
 
 The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.

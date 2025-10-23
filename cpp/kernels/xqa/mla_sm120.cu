@@ -112,7 +112,11 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(
     , tensorMap{tensorMap}
 #if USE_PAGED_KV_CACHE
     , nbPages{nbPages}
+#if PAGED_KV_CACHE_LAYOUT == 1
+    , baseOffset{idxReq * cacheList.maxNbPagesPerSeq}
+#else
     , baseOffset{((idxReq * beamWidth) * 2) * cacheList.maxNbPagesPerSeq}
+#endif
 #else
     , baseOffset{(idxReq * beamWidth) * 2}
 #endif
@@ -139,7 +143,11 @@ __device__ inline void KVTilePartLoader::loadData(Array2D<LdGrain, nbTokens, gra
         uint32_t const offset = nbTokens * (idxTile % exactDiv(tokensPerPage, nbTokens));
         if (warpElectSync())
         {
+#if PAGED_KV_CACHE_LAYOUT == 1
+            tma::loadAsync(&dst, tensorMap, DimsLE<4>{idxElemBeg, idxHeadGrp, offset, (uint32_t) pages[0]}, bar);
+#else
             tma::loadAsync(&dst, tensorMap, DimsLE<4>{idxElemBeg, offset, idxHeadGrp, (uint32_t) pages[0]}, bar);
+#endif
         }
     }
     else
@@ -149,8 +157,13 @@ __device__ inline void KVTilePartLoader::loadData(Array2D<LdGrain, nbTokens, gra
         {
             if (warpElectSync())
             {
+#if PAGED_KV_CACHE_LAYOUT == 1
+                tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
+                    DimsLE<4>{idxElemBeg, idxHeadGrp, 0, (uint32_t) pages[i]}, bar);
+#else
                 tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
                     DimsLE<4>{idxElemBeg, 0, idxHeadGrp, (uint32_t) pages[i]}, bar);
+#endif
             }
         }
     }
@@ -1859,13 +1872,18 @@ CUtensorMap makeTensorMapForQ(
 #endif // IS_MLA
 
 void launchMLA(cudaDeviceProp const& prop,
-    uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
+    uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
     float qScale, OutputHead* output, InputHead const* q,
-    float* attentionSinks, // [headGrpSize], not supported.
 #if USE_PAGED_KV_CACHE
-    GMemCacheHead* pool,   // global pool of pages
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, // K cache pool for VLLM layout
+    GMemCacheHead* vCacheVLLM, // V cache pool for VLLM layout
+#else
+    GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
-        kvCachePageList,   // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+        kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
+                         // [batchSize][maxNbPagesPerSeq] (Layout 1)
 #else
     GMemKVCacheHead* kvCacheData,
 #endif
@@ -1916,7 +1934,11 @@ void launchMLA(cudaDeviceProp const& prop,
     auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
+#if PAGED_KV_CACHE_LAYOUT == 1
+    KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#else
     KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#endif
     auto const dtype = []
     {
         if (std::is_same_v<CacheElem, half>)
@@ -1936,10 +1958,17 @@ void launchMLA(cudaDeviceProp const& prop,
 
     auto const tensorMapQ
         = makeTensorMapForQ(q, dtype, validElemsPerHead, headGrpSize * inputSeqLen * batchSize, partElemsK);
+#if PAGED_KV_CACHE_LAYOUT == 1
+    auto const tensorMapK = makeTensorMapForPagedKVCache(
+        kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, partElemsK, tokensPerTile);
+    auto const tensorMapV = makeTensorMapForPagedKVCache(
+        vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, partElemsV, tokensPerTile);
+#else
     auto const tensorMapK = makeTensorMapForPagedKVCache(
         pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, partElemsK, tokensPerTile);
     auto const tensorMapV = makeTensorMapForPagedKVCache(
         pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, partElemsV, tokensPerTile);
+#endif
 
     uint32_t const nbCgas = exactDiv(dimGrid.x, 4) * dimGrid.y * dimGrid.z;
     auto const cgaXBuf = static_cast<Vec<CgaXBuffer, nbProducerCtasPerCga>*>(scratch);

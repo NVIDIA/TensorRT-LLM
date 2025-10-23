@@ -1,6 +1,19 @@
+import os
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Optional
+
+
+def get_unique_ipc_addr() -> str:
+    """Generate a cryptographically unique IPC address using UUID."""
+    # uuid.uuid4() generates a random, unique identifier
+    unique_id = uuid.uuid4()
+    temp_dir = tempfile.gettempdir()
+    file_name = f"rpc_test_{unique_id}"
+    full_path = os.path.join(temp_dir, file_name)
+    return f"ipc://{full_path}"
 
 
 class RPCParams(NamedTuple):
