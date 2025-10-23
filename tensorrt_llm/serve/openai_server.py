@@ -25,6 +25,7 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder
@@ -79,11 +80,13 @@ class OpenAIServer:
                  model: str,
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
-                 disagg_cluster_config: Optional[DisaggClusterConfig] = None):
+                 disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+                 multimodal_server_config: Optional[MultimodalServerConfig] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
+        self.multimodal_server_config = multimodal_server_config
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -489,7 +492,7 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
