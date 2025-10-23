@@ -270,9 +270,6 @@ inline void logMemoryUsage(char const* operation, CUcontext ctx)
 // Helper function to throw
 inline void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasStatus_t status)
 {
-
-    logMemoryUsage(operation, ctx);
-
     auto const mem = getMemoryInfo();
     TLLM_THROW(
         "Failed to create %s. "
