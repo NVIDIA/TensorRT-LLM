@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from PIL import Image
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
@@ -30,7 +29,6 @@ from ...inputs import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
                        ExtraProcessedInputs, InputProcessor,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
-                       default_multimodal_input_loader,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -94,6 +92,8 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
                  model_config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True):
+
+        super().__init__()
         self.model_config = model_config
         self.tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path)
@@ -282,37 +282,6 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
         mrope_position_deltas = torch.tensor(
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
-
-    def get_dummy_image(self, max_width: int, max_height: int):
-        image = Image.new("RGB", (max_width, max_height), color=255)
-        return image
-
-    def get_dummy_prompt(self, input_seq_len: int):
-        # we use the max resolution as starting point
-        img_max_dim = input_seq_len  # TODO: Find better starting resolution
-
-        while img_max_dim > 0:
-            image = self.get_dummy_image(max_width=img_max_dim,
-                                         max_height=img_max_dim)
-
-            test_mm_prompt = default_multimodal_input_loader(
-                tokenizer=self.tokenizer,
-                model_dir=self.model_path,
-                model_type=self.model_config.model_type,
-                modality="image",
-                prompts=[""],
-                media=[[image]],
-                image_data_format="pt")[0]
-
-            prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
-
-            if len(prompt_token_ids_single_img) <= input_seq_len:
-                return test_mm_prompt
-
-            # reduce img resolution
-            img_max_dim = img_max_dim >> 1
-
-        return None
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
@@ -973,7 +942,13 @@ class Qwen2VLModelBase(PreTrainedModel):
 
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
-
+            print(
+                f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
+            )
+            print(f"len(input_ids): {input_ids.shape}")
+            print(
+                f"mm_embeds length: {[mm_embed.shape for mm_embed in mm_embeds]}"
+            )
             if not self.model_config.pretrained_config.disable_fuse_rope:
                 mrope_config = self.prepare_mrope_config(
                     multimodal_params, num_context_requests)
