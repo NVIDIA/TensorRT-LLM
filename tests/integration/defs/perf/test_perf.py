@@ -141,7 +141,8 @@ MODEL_PATH_DICT = {
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
-    "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2"
+    "nemotron_nano_9b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "starcoder2_7b": "starcoder2-7b",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
