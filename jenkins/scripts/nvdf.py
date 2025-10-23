@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 
 import requests
@@ -9,6 +10,7 @@ PROJECT_ROOT = "swdl-trtllm-infra"
 MODE = "prod"
 VERSION = "v1"
 
+# CI monitor indexes, now only support query online and post offline.
 JOB_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-job_info"
 STAGE_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-stage_info"
 TEST_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-test_info"
@@ -16,9 +18,14 @@ JOB_MACHINE_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-job_machine_info"
 FAILED_STEP_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-failed_step_info"
 PR_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-pr_info"
 
+# post online indexes
+# XXXX
+
 DISABLE_NVDF_FOR_LOCAL_TEST = False
 
-NVDF_BASE_URL = "http://gpuwa.nvidia.com"
+NVDF_BASE_URL = os.getenv("NVDF_BASE_URL", None)
+if not NVDF_BASE_URL:
+    raise Exception("NVDF_BASE_URL is not set")
 
 
 class NVDF:

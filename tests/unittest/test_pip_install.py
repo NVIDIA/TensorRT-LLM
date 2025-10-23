@@ -5,6 +5,8 @@ import sys
 
 import requests
 
+from jenkins.scripts.nvdf import NVDF_BASE_URL
+
 
 def get_cpython_version():
     python_version = sys.version_info[:]
@@ -52,6 +54,7 @@ def test_pip_install():
     args = parser.parse_args()
 
     print("##########  Install required system libs  ##########")
+    print(f"NVDF_BASE_URL: {NVDF_BASE_URL}")
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
         subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
 

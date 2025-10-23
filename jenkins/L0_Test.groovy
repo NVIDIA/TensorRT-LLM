@@ -3126,6 +3126,7 @@ pipeline {
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
         CMAKE_POLICY_VERSION_MINIMUM="3.5"
+        NVDF_BASE_URL=credentials("nvdataflow_base_url")
     }
     stages {
         stage("Setup environment")
