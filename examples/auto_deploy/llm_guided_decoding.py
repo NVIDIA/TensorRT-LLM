@@ -1,10 +1,8 @@
-"""Example demonstrating guided decoding with AutoDeploy.
+"""Generate text with guided decoding using AutoDeploy LLM.
 
-This example shows how to use guided decoding with JSON schema validation
-using AutoDeploy's LLM class with the xgrammar backend.
+This example mirrors the LLM API guided decoding example schema and prints the
+guided decoding output using the AutoDeploy backend.
 """
-
-import json
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM
@@ -12,80 +10,42 @@ from tensorrt_llm.llmapi import GuidedDecodingParams
 
 
 def main():
-    """Run guided decoding example with AutoDeploy."""
-    # Define a JSON schema for testing
-    json_schema = {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "age": {"type": "integer"},
-            "city": {"type": "string"},
-        },
-        "required": ["name", "age", "city"],
-    }
+    # Specify the guided decoding backend; xgrammar and llguidance are supported currently.
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", guided_decoding_backend="xgrammar")
 
-    # Create guided decoding prompts that request JSON output
-    json_prompts = [
+    schema = (
+        "{"
+        '"title": "WirelessAccessPoint", "type": "object", "properties": {'
+        '"ssid": {"title": "SSID", "type": "string"}, '
+        '"securityProtocol": {"title": "SecurityProtocol", "type": "string"}, '
+        '"bandwidth": {"title": "Bandwidth", "type": "string"}}, '
+        '"required": ["ssid", "securityProtocol", "bandwidth"]}'
+    )
+
+    prompts = [
         {
-            "prompt": "Please provide a JSON object with a person's information including name, age, and city. "
-            f"Follow this exact schema: {json_schema}"
+            "prompt": (
+                "Please provide a JSON object representing a wireless access point. "
+                "Follow this exact schema: " + schema
+            )
         }
     ]
 
-    # Initialize AutoDeploy LLM with guided decoding backend
-    print("Initializing AutoDeploy LLM with guided decoding backend...")
-    guided_decoding_backend = "xgrammar"
-    llm = LLM(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        guided_decoding_backend=guided_decoding_backend,
-    )
-
-    sampling_params = SamplingParams(
-        max_tokens=100,
-        top_k=None,
-        temperature=0.1,
-        guided_decoding=GuidedDecodingParams(json=json_schema),
-    )
-
     try:
-        # Generate outputs with guided decoding
-        print("Running guided decoding with JSON schema...")
+        # Unguided
+        unguided = llm.generate(prompts, sampling_params=SamplingParams(max_tokens=50))
+        print(f"Generated text (unguided): {unguided[0].outputs[0].text!r}")
 
-        outputs = llm.generate(
-            json_prompts,
-            sampling_params=sampling_params,
+        # Guided via JSON schema
+        guided = llm.generate(
+            prompts,
+            sampling_params=SamplingParams(
+                max_tokens=50, guided_decoding=GuidedDecodingParams(json=schema)
+            ),
         )
-
-        print(f"Generated {len(outputs)} outputs")
-
-        # Validate each output is valid JSON
-        for i, output in enumerate(outputs):
-            generated_text = output.outputs[0].text.strip()
-            print(f"\nOutput {i}:\n{generated_text}")
-
-            # Test that the output is valid JSON
-            try:
-                parsed_json = json.loads(generated_text)
-
-                # Validate it matches our schema structure (basic check)
-                assert isinstance(parsed_json, dict), f"Output {i} should be a JSON object"
-
-                # Check required fields exist (basic schema validation)
-                required_fields = json_schema.get("required", [])
-                for field in required_fields:
-                    assert field in parsed_json, f"Output {i} missing required field '{field}'"
-
-                print(f"✓ Output {i} is valid JSON matching the schema")
-
-            except json.JSONDecodeError as e:
-                print(f"✗ Output {i} is not valid JSON: {e}")
-                raise
-            except AssertionError as e:
-                print(f"✗ Output {i} schema validation failed: {e}")
-                raise
-
-        print("\n✓ All outputs passed validation!")
-
+        guided_text = guided[0].outputs[0].text
+        print(f"Generated text (guided): {guided_text!r}")
+        return guided_text
     finally:
         llm.shutdown()
 
