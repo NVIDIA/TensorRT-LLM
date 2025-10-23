@@ -101,7 +101,7 @@ TEST_P(TransferAgentTest, Basic)
     RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, xferAgent1.get());
 
     // xferAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = xferAgent1->getConnectionInfo();
+    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
     xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
@@ -137,7 +137,7 @@ TEST_P(TransferAgentTest, Basic2)
     RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, xferAgent1.get());
 
     // xferAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = xferAgent1->getConnectionInfo();
+    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
     xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
@@ -180,7 +180,7 @@ TEST_P(TransferAgentTest, DeviceMemory)
         MemoryDescs{MemoryType::kVRAM, {MemoryDesc{dev_ptr1, size, deviceId}}}, xferAgent1.get());
 
     // xferAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = xferAgent1->getConnectionInfo();
+    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
     xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
@@ -222,7 +222,7 @@ TEST_P(TransferAgentTest, Connect)
     xferAgent2->registerMemory(memDescs0);
 
     // xferAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = xferAgent1->getConnectionInfo();
+    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
     xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
@@ -272,7 +272,7 @@ TEST_P(TransferAgentTest, SyncMessage)
     RegisteredHostMemory regMem3(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, xferAgent1.get());
 
     // xferAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = xferAgent1->getConnectionInfo();
+    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
     xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
@@ -309,7 +309,7 @@ TEST_P(TransferAgentTest, SyncMessage)
     TLLM_CHECK(notif2[agent0][0] == syncMessage2);
 
     // xferAgent1->loadRemoteAgent(agent0);
-    auto connectionInfo2 = xferAgent0->getConnectionInfo();
+    auto connectionInfo2 = xferAgent0->getLocalConnectionInfo();
     xferAgent1->loadRemoteAgent(agent0, connectionInfo2);
     std::string syncMessage3 = "three_agent_sync_message";
     xferAgent1->notifySyncMessage(agent0, syncMessage3);
