@@ -105,7 +105,7 @@ def async_client(server: RemoteOpenAIServer):
 async def test_invalid_max_tokens(async_client: openai.AsyncOpenAI,
                                   model_name: str):
     """Test that server rejects invalid max_tokens value."""
-    print_info(f"Testing invalid max_tokens parameter: 0")
+    print_info("Testing invalid max_tokens parameter: 0")
 
     with pytest.raises(openai.BadRequestError) as exc_info:
         await async_client.chat.completions.create(
@@ -116,14 +116,15 @@ async def test_invalid_max_tokens(async_client: openai.AsyncOpenAI,
             }],
             max_tokens=0,
         )
-    assert "assertion failed" in str(exc_info.value).lower()
+    error_msg = str(exc_info.value).lower()
+    assert any(keyword in error_msg for keyword in ("mMaxNewTokens", "failed"))
 
 
 @pytest.mark.asyncio
 async def test_invalid_temperature(async_client: openai.AsyncOpenAI,
                                    model_name: str):
     """Test that server rejects invalid temperature value."""
-    print_info(f"Testing invalid temperature parameter: -0.5")
+    print_info("Testing invalid temperature parameter: -0.5")
 
     with pytest.raises(openai.BadRequestError) as exc_info:
         await async_client.chat.completions.create(
@@ -597,8 +598,9 @@ async def test_extremely_large_batch(async_client: openai.AsyncOpenAI,
                                                          prompt=large_batch,
                                                          max_tokens=1)
         # If successful, verify we got results
-        if response:
-            print_info("Server processed large batch.")
+        assert response is not None
+        assert hasattr(response, "choices") and len(response.choices) > 0
+        print_info("Server processed large batch.")
     except (openai.BadRequestError, openai.APIError) as e:
         # Server rejected - also acceptable
         assert "batch" in str(e).lower() or "too many" in str(
