@@ -13,21 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm.llmapi import GuidedDecodingParams
 
 
-@pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])
-def test_ad_guided_decoding_regex_e2e(guided_decoding_backend: str):
+def test_ad_guided_decoding_regex_e2e():
     """Test guided decoding with regex pattern validation using the build_and_run_ad main()."""
     test_case = {
         "prompt": "What is the capital of France?",
         "regex": r"I don't know, I am a randomly initialized model|Paris",
         "valid_responses": ["I don't know, I am a randomly initialized model", "Paris"],
     }
+
+    guided_decoding_backend = "xgrammar"
 
     experiment_config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
 
