@@ -1,7 +1,9 @@
 import asyncio
 import os
+import shutil
 import subprocess
 import tempfile
+import uuid
 
 import openai
 import pytest
@@ -23,11 +25,28 @@ def model_name():
     return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
+@pytest.fixture(scope="function")
+def service_discovery(request):
+    if request.param == "etcd":
+        data_dir = f"{tempfile.gettempdir()}/disagg_test-etcd-{uuid.uuid4()}"
+        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        yield etcd, f"etcd://localhost:2379"
+        try:
+            etcd.kill()
+            etcd.wait(timeout=10)
+            shutil.rmtree(data_dir)
+        except Exception:
+            pass
+    else:
+        return None, f"http://localhost:{TEST_PORT}"
+
+
 @pytest.fixture
-def disagg_cluster_config():
+def disagg_cluster_config(service_discovery):
     # same cluster config for workers and proxy server
+    _, uri = service_discovery
     return {
-        "cluster_uri": f"http://localhost:{TEST_PORT}",
+        "cluster_uri": uri,
         "cluster_name": "test_cluster",
         "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
         "inactive_timeout_sec": INACTIVE_TIMEOUT,
@@ -95,7 +114,8 @@ def _run_worker(model_name, worker_config, role, port=8000, device=-1):
         env = os.environ.copy()
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        return subprocess.Popen(cmd, env=env)
+        f = open(f"output_{role}.log", "w+")
+        return subprocess.Popen(cmd, env=env, stdout=f, stderr=f)
 
 
 def run_ctx_worker(model_name,
@@ -195,8 +215,9 @@ def request_completion(model_name, prompt, port=TEST_PORT):
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 async def test_service_discovery(model_name, disagg_server_config,
-                                 worker_config, router):
+                                 worker_config, router, service_discovery):
     ctx_worker1 = None
     gen_worker1 = None
     disagg_server = None
@@ -219,10 +240,11 @@ async def test_service_discovery(model_name, disagg_server_config,
 @pytest.mark.parametrize(
     "router", ["round_robin"], indirect=True
 )  # use only round_robin to reduce the test time, this router type doesn't matter for this test
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
 async def test_minimal_instances(model_name, disagg_server_config,
-                                 worker_config, router):
+                                 worker_config, router, service_discovery):
     # the cluster should have at least 2 ctx and 2 gen workers
     minimal_instances = {
         "context_servers": 2,
@@ -266,10 +288,11 @@ async def test_minimal_instances(model_name, disagg_server_config,
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ROUTER_TYPES, indirect=True)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
 async def test_worker_restart(model_name, disagg_server_config, worker_config,
-                              router):
+                              router, service_discovery):
     ctx_worker1 = None
     ctx_worker2 = None
     gen_worker1 = None
@@ -357,10 +380,11 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("router", ["round_robin"], indirect=True)
+@pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(300)
 async def test_disagg_server_restart(model_name, disagg_server_config,
-                                     worker_config, router):
+                                     worker_config, router, service_discovery):
     ctx_worker1 = None
     gen_worker1 = None
     disagg_server = None

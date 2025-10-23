@@ -107,7 +107,7 @@ def create_cluster_storage(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageServer(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
+        return Etcd3ClusterStorage(cluster_uri, cluster_name)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -115,7 +115,7 @@ def create_cluster_storage_client(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageClient(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
+        return Etcd3ClusterStorage(cluster_uri, cluster_name)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 

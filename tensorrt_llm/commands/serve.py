@@ -529,10 +529,14 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     help=
     "The interval of logging metrics in seconds. Set to 0 to disable metrics logging."
 )
-def disaggregated(config_file: Optional[str],
-                  metadata_server_config_file: Optional[str],
-                  server_start_timeout: int, request_timeout: int,
-                  log_level: str, metrics_log_interval: int):
+def disaggregated(
+    config_file: Optional[str],
+    metadata_server_config_file: Optional[str],
+    server_start_timeout: int,
+    request_timeout: int,
+    log_level: str,
+    metrics_log_interval: int,
+):
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)

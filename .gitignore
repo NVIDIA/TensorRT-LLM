@@ -83,3 +83,5 @@ compile_commands.json
 
 # Enroot sqsh files
 enroot/tensorrt_llm.devel.sqsh
+.gitignore
+docker/Makefile
