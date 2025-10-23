@@ -290,13 +290,10 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
             logMemoryAndHandleError("Creating cublas handle", ctx);
 
             auto handle = std::make_unique<cublasHandle_t>();
-
             cublasStatus_t status = cublasCreate(handle.get());
 
-            if (status != CUBLAS_STATUS_SUCCESS)
-            {
-                logMemoryAndHandleError("cublas handle", ctx, status);
-            }
+            // This will log memory state and throw if status != SUCCESS
+            logMemoryAndHandleError("cublas handle", ctx, status);
 
             return handle;
         },
@@ -322,13 +319,10 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
             logMemoryAndHandleError("Creating cublasLt handle", ctx);
 
             auto handle = std::make_unique<cublasLtHandle_t>();
-
             cublasStatus_t status = cublasLtCreate(handle.get());
 
-            if (status != CUBLAS_STATUS_SUCCESS)
-            {
-                logMemoryAndHandleError("cublasLt handle", ctx, status);
-            }
+            // This will log memory state and throw if status != SUCCESS
+            logMemoryAndHandleError("cublasLt handle", ctx, status);
 
             return handle;
         },
