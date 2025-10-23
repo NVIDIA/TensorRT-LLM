@@ -238,31 +238,47 @@ private:
     std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>> mObservers;
 };
 
-// Unified helper function for memory logging and error handling
-// If status is CUBLAS_STATUS_SUCCESS, it just logs memory usage
-// Otherwise, it logs and throws an error with memory diagnostics
-static void logMemoryAndHandleError(char const* operation, CUcontext ctx, cublasStatus_t status = CUBLAS_STATUS_SUCCESS)
+// Structure to hold memory information
+struct MemoryInfo
+{
+    size_t free_mb;
+    size_t total_mb;
+    float free_percent;
+};
+
+// Helper function to get current memory information
+inline MemoryInfo getMemoryInfo()
 {
     size_t free_mem = 0, total_mem = 0;
     TLLM_CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
 
-    size_t free_mb = free_mem / (1024 * 1024);
-    size_t total_mb = total_mem / (1024 * 1024);
-    float free_percent = (total_mem > 0) ? ((float) free_mem / total_mem * 100.0f) : 0.0f;
+    const size_t free_mb = free_mem / (1024 * 1024);
+    const size_t total_mb = total_mem / (1024 * 1024);
+    float const free_percent = (total_mem > 0) ? (static_cast<float>(free_mem) / total_mem * 100.0f) : 0.0f;
 
-    // Always log the memory state
-    TLLM_LOG_DEBUG(
-        "%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx, free_mb, free_percent, total_mb);
+    return {free_mb, total_mb, free_percent};
+}
 
-    // If there's an error, throw with details
-    if (status != CUBLAS_STATUS_SUCCESS)
-    {
-        TLLM_THROW(
-            "Failed to create %s. "
-            "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
-            "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
-            operation, status, ctx, free_mb, free_percent, total_mb);
-    }
+// Helper function to log current memory usage
+inline void logMemoryUsage(char const* operation, CUcontext ctx)
+{
+    auto const mem = getMemoryInfo();
+    TLLM_LOG_DEBUG("%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx, mem.free_mb,
+        mem.free_percent, mem.total_mb);
+}
+
+// Helper function to throw
+inline void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasStatus_t status)
+{
+
+    logMemoryUsage(operation, ctx);
+
+    auto const mem = getMemoryInfo();
+    TLLM_THROW(
+        "Failed to create %s. "
+        "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+        "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
+        operation, status, ctx, mem.free_mb, mem.free_percent, mem.total_mb);
 }
 
 } // namespace
@@ -273,13 +289,15 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
         []() -> auto
         {
             CUcontext ctx = getCurrentCudaCtx();
-            logMemoryAndHandleError("Creating cublas handle", ctx);
+            logMemoryUsage("Creating cublas handle", ctx);
 
             auto handle = std::make_unique<cublasHandle_t>();
             cublasStatus_t status = cublasCreate(handle.get());
 
-            // This will log memory state and throw if status != SUCCESS
-            logMemoryAndHandleError("cublas handle", ctx, status);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                throwCublasErrorWithMemInfo("cublas handle", ctx, status);
+            }
 
             return handle;
         },
@@ -301,13 +319,15 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         []() -> auto
         {
             CUcontext ctx = getCurrentCudaCtx();
-            logMemoryAndHandleError("Creating cublasLt handle", ctx);
+            logMemoryUsage("Creating cublasLt handle", ctx);
 
             auto handle = std::make_unique<cublasLtHandle_t>();
             cublasStatus_t status = cublasLtCreate(handle.get());
 
-            // This will log memory state and throw if status != SUCCESS
-            logMemoryAndHandleError("cublasLt handle", ctx, status);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                throwCublasErrorWithMemInfo("cublasLt handle", ctx, status);
+            }
 
             return handle;
         },
