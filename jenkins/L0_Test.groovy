@@ -1540,17 +1540,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "cat ${MODEL_CACHE_DIR}/README"
         sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
         sh "df -h"
-        sh "ping aus-cdot04-corp01"
-        sh "lookup aus-cdot04-corp01"
-        sh "ls -ll /mnt/sw-tensorrt-pvc"
 
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y dnsutils rsync iputils-ping")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
+        sh "ping aus-cdot04-corp01"
+        sh "nslookup aus-cdot04-corp01"
+        sh "ls -ll /mnt/sw-tensorrt-pvc"
 
         // install package
         sh "env | sort"
