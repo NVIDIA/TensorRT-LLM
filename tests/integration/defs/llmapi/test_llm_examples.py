@@ -39,10 +39,11 @@ def test_llmapi_server_example(llm_root, llm_venv):
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_llm_server.py")])
 
 
-def _run_example_helper(llm_root, engine_dir, example_subdir, llm_venv,
-                        script_name: str, *args):
-    example_root = Path(llm_root) / "examples" / example_subdir
-    engine_dir = Path(engine_dir) / example_subdir
+### LLMAPI examples
+def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
+                        *args):
+    example_root = Path(llm_root) / "examples" / "llm-api"
+    engine_dir = Path(engine_dir) / "llmapi"
     if not engine_dir.exists():
         engine_dir.mkdir(parents=True)
     examples_script = example_root / script_name
@@ -71,7 +72,7 @@ def _run_example_helper(llm_root, engine_dir, example_subdir, llm_venv,
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16",
         # EAGLE3-LLaMA3.1-Instruct-8B
         f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B":
-        f"{llm_venv.get_working_directory()}/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+        f"{llm_venv.get_working_directory()}/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
     }
 
     for src, dst in src_dst_dict.items():
@@ -87,19 +88,6 @@ def _run_example_helper(llm_root, engine_dir, example_subdir, llm_venv,
                    target_is_directory=True)
 
     venv_check_call(llm_venv, run_command)
-
-
-### LLMAPI examples
-def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
-                        *args):
-    _run_example_helper(llm_root, engine_dir, "llm-api", llm_venv, script_name,
-                        *args)
-
-
-def _run_autodeploy_example(llm_root, engine_dir, llm_venv, script_name: str,
-                            *args):
-    _run_example_helper(llm_root, engine_dir, "auto_deploy", llm_venv,
-                        script_name, *args)
 
 
 def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
@@ -128,7 +116,7 @@ def test_llmapi_example_multilora(llm_root, engine_dir, llm_venv):
         "--mental_health_lora_dir",
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0-mental-health-conversational",
         "--tarot_lora_dir",
-        f"{llm_models_root()}/llama-models-v2/tinyllama-tarot-v1",
+        f"{llm_models_root()}/llama-models-v2/tinyllama-tarot-v1"
     ]
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py",
                         *cmd_line_args)
@@ -159,15 +147,9 @@ def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_mtp(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(
-        llm_root,
-        engine_dir,
-        llm_venv,
-        "llm_speculative_decoding.py",
-        "MTP",
-        "--model",
-        f"{llm_models_root()}/DeepSeek-V3-Lite/bf16",
-    )
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "llm_speculative_decoding.py", "MTP", "--model",
+                        f"{llm_models_root()}/DeepSeek-V3-Lite/bf16")
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -206,8 +188,3 @@ def test_llmapi_kv_cache_connector(llm_root, llm_venv, model):
 def test_llmapi_tensorrt_engine(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "_tensorrt_engine/quickstart_example.py")
-
-
-def test_autodeploy_example_guided_decoding(llm_root, engine_dir, llm_venv):
-    _run_autodeploy_example(llm_root, engine_dir, llm_venv,
-                            "llm_guided_decoding.py")

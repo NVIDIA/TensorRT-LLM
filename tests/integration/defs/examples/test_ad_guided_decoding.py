@@ -14,7 +14,8 @@ def prepare_model_symlinks(llm_venv):
     """Create local symlinks for models to avoid re-downloading in examples."""
     src_dst_dict = {
         # TinyLlama-1.1B-Chat-v1.0 used by the guided decoding example
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0": f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     }
 
     for src, dst in src_dst_dict.items():
@@ -31,7 +32,8 @@ def test_autodeploy_guided_decoding_main_json(llm_root, llm_venv):
     prepare_model_symlinks(llm_venv)
 
     module_path = os.path.join(example_root, "llm_guided_decoding.py")
-    spec = importlib.util.spec_from_file_location("llm_guided_decoding", module_path)
+    spec = importlib.util.spec_from_file_location("llm_guided_decoding",
+                                                  module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
