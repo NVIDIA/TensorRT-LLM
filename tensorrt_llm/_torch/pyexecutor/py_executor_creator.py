@@ -553,7 +553,7 @@ def create_py_executor(
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
-            sparse_attention_config=llm_args.sparse_attention_config,
+            sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(

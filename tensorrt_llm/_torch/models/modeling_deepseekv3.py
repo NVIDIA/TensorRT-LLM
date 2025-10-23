@@ -383,12 +383,9 @@ class DeepseekV3WeightLoader:
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
-                elif names[-1] == "indexer":
+                elif names[-1] == "indexer" or 'mqa.indexer' in name:
                     continue
                 else:
-                    if "indexer" in names and "mqa" in names:
-                        names.remove("mqa")
-                        name = '.'.join(names)
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
@@ -1491,15 +1488,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
-
-        # Append mqa prefix to indexer modules.
-        if hasattr(model_config, 'quant_config'):
-            exclude_modules = model_config.quant_config.exclude_modules
-            if exclude_modules:
-                for idx, exclude_layers in enumerate(exclude_modules):
-                    if 'indexer' in exclude_layers:
-                        exclude_modules[idx] = exclude_layers.replace(
-                            'indexer', 'mqa.indexer')
 
         super().__init__(model=DeepseekV3Model(model_config),
                          model_config=model_config)

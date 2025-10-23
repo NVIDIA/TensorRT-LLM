@@ -922,6 +922,8 @@ class MLA(nn.Module):
         if not config.skip_create_weights_in_init:
             self.create_weights()
 
+        self.indexer = self.mqa.indexer if self.is_dsa else None
+
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to quant_config,
         # which could be modified after __init__
@@ -1160,8 +1162,8 @@ class MLA(nn.Module):
         assert output is not None, "output must be provided"
 
         # Indexer
-        topk_indices = self.mqa.indexer(qr, hidden_states, attn_metadata,
-                                        position_ids)
+        topk_indices = self.indexer(qr, hidden_states, attn_metadata,
+                                    position_ids)
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]

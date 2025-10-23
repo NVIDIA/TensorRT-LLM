@@ -1389,8 +1389,12 @@ class DSACacheManager(KVCacheManager):
 
         # TODO: Support beam search, current assume beam_width=1
 
-    def update_resources(self, scheduled_batch):
-        super().update_resources(scheduled_batch)
+    def update_resources(self,
+                         scheduled_batch,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
+        super().update_resources(scheduled_batch, attn_metadata,
+                                 kv_cache_dtype_byte_size)
         # rewind indexer k cache
         for req in scheduled_batch.generation_requests:
             if req.state != LlmRequestState.GENERATION_COMPLETE and req.py_rewind_len > 0:
