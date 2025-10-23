@@ -633,13 +633,19 @@ class AbstractPerfScriptTestClass(abc.ABC):
             gpu_idx = gpu_prop.get("index", self._gpu_clock_lock.get_gpu_id())
         # Remove the prefix, which includes the platform info, for network_hash.
         short_test_name = full_test_name.split("::")[-1]
+        # Get device subtype for autodeploy tests
+        device_subtype = None
+        if self._gpu_clock_lock:
+            device_subtype = self._gpu_clock_lock.get_device_subtype()
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
             short_test_name,  # This is used by the PerfDB to identify a test.
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
-            "gpu_idx": gpu_idx
+            "gpu_idx": gpu_idx,
+            "device_subtype": device_subtype
         }
 
         # Serialize the commands.
