@@ -104,7 +104,6 @@ class DummyModel(torch.nn.Module):
         num_generation_requests = (last_tokens.shape[0] - num_context_requests
                                    ) // attn_metadata.beam_width
         num_requests = num_generation_requests + num_context_requests
-        num_generation_beams = num_generation_requests * attn_metadata.beam_width
 
         # return cache indirection, as additional model output.
         # each sequence should only return a 1D cache indirection tensor
@@ -114,8 +113,7 @@ class DummyModel(torch.nn.Module):
         generation_cache_indirection = attn_metadata.cache_indirection[
             num_context_requests:num_requests].view(
                 num_generation_requests * attn_metadata.beam_width,
-                attn_metadata.cache_indirection.shape[-1]
-            )[:num_generation_beams]
+                attn_metadata.cache_indirection.shape[-1])
         return {
             "logits":
             logits,
@@ -173,11 +171,9 @@ class BeamSearchTestOutput:
         self.cache_indirection = cache_indirection
 
 
-def get_expected_outputs(
-        start_token: int,
-        num_iterations: int = 4,
-        vocab_size: int = 1000,
-        use_overlap_scheduler: bool = False) -> list[list[int]]:
+def get_expected_outputs(start_token: int,
+                         num_iterations: int = 4,
+                         vocab_size: int = 1000) -> BeamSearchTestOutput:
     """Get the expected outputs for the given start token, number of iterations, vocabulary size
        This function only works for a beam width of 2.
 
@@ -185,7 +181,6 @@ def get_expected_outputs(
        - start_token: the token to start the generation from. This is the last token of the input prompt.
        - num_iterations: the number of iterations to generate
        - vocab_size: the size of the vocabulary
-       - use_overlap_scheduler: whether to use the overlap scheduler
        returns:
        - BeamSearchTestOutput: a named tuple containing the expected outputs and cache indirection
            - expected_outputs: the expected outputs for the given start token, number of iterations, vocabulary size
@@ -207,7 +202,7 @@ def get_expected_outputs(
     top_offset, second_best_offset = torch.topk(softmax_score, k=2,
                                                 dim=-1).indices
 
-    # iteration 1
+    # First iteration
     expected_outputs = [[start_token + top_offset],
                         [start_token + second_best_offset]]
     expected_cache_indirection = [[0], [1]]
@@ -235,27 +230,27 @@ def get_expected_outputs(
         # If beam 1 selects the highest scoring token of beam 1, we update the beam scores and cache indirection
         if score_13 >= score_02:
             expected_outputs[1].append(expected_outputs[1][-1] + top_offset)
-            expected_outputs[0].append(expected_outputs[0][-1] + top_offset)
-            beam_scores[0] = score_03
             beam_scores[1] = score_13
-            expected_cache_indirection[1].append(1)
-            expected_cache_indirection[0].append(0)
         else:
             # Beam 1 drops its old beam and changes to beam 0 and selects the second highest scoring token of beam 0.
             for j in range(i):
                 expected_outputs[1][j] = expected_outputs[0][j]
-                if use_overlap_scheduler or i < num_iterations - 1:
-                    # Avoid swapping in the last iteration, as the cache indirection provided by the model does not reflect this change
-                    # in case of overlap scheduler one additional model forward is performed, so we do not need to skip the last swap
+                if i < num_iterations - 1:
+                    # Avoid swapping in the last iteration, as the cache indirection provided by the model is returned before this change.
                     expected_cache_indirection[1][
                         j] = expected_cache_indirection[0][j]
             expected_outputs[1].append(expected_outputs[0][-1] +
                                        second_best_offset)
-            expected_outputs[0].append(expected_outputs[0][-1] + top_offset)
-            beam_scores[0] = score_03
             beam_scores[1] = score_02
-            expected_cache_indirection[1].append(1)
+
+        # Update Beam 0
+        beam_scores[0] = score_03
+        expected_outputs[0].append(expected_outputs[0][-1] + top_offset)
+
+        # Update cache indirection if necessary
+        if i < num_iterations - 1:
             expected_cache_indirection[0].append(0)
+            expected_cache_indirection[1].append(1)
 
     return BeamSearchTestOutput(
         outputs=torch.tensor(expected_outputs),
@@ -337,13 +332,15 @@ def check_cache_indirection(beam: CompletionOutput,
     assert cache_indirection is not None, "cache indirection should not be None"
     assert cache_indirection.shape[
         1] == sampling_params.best_of, f"expected {sampling_params.best_of} entries in dim 1 of cache indirection, but got {cache_indirection.shape[1]}"
-    # check if the cache indirection is correct for the given deterministic input prompt
-    # Check only the last cache indirection
-    last_cache_indirection = cache_indirection[-1, beam_idx]
 
     num_generated_tokens = sampling_params.max_tokens
     # We return the cache indirection before the sampling step, therefore cache indirection does not reflect changes during the sampling of the last token
     num_valid_cache_indirection = num_generated_tokens - 1
+
+    # check if the cache indirection is correct for the given deterministic input prompt
+    # Check only the last cache indirection
+    last_cache_indirection = cache_indirection[num_valid_cache_indirection,
+                                               beam_idx]
 
     assert all(last_cache_indirection[:prompt_length] ==
                0), "prompt tokens should have a cache indirection of 0"
@@ -382,10 +379,8 @@ def check_context_logits(output: GenerationResult,
         assert output.context_logits is None, "context logits should be None"
 
 
-def validate_output(output: GenerationResult,
-                    input_prompt: list[int],
-                    sampling_params: SamplingParams,
-                    use_overlap_scheduler: bool = False) -> None:
+def validate_output(output: GenerationResult, input_prompt: list[int],
+                    sampling_params: SamplingParams) -> None:
     """Perform several checks on the output of a single prompt"""
     check_context_logits(output, sampling_params)
 
@@ -396,18 +391,14 @@ def validate_output(output: GenerationResult,
     ) == num_output_beams, f"expected {num_output_beams} outputs, but got {len(output.outputs)}"
     # check each beam
     expected_outputs = get_expected_outputs(
-        input_prompt[-1],
-        num_iterations=sampling_params.max_tokens,
-        use_overlap_scheduler=use_overlap_scheduler)
+        input_prompt[-1], num_iterations=sampling_params.max_tokens)
     for beam_idx, beam in enumerate(output.outputs):
         validate_output_beam(beam, expected_outputs, sampling_params,
                              len(input_prompt), beam_idx)
 
 
-def validate_outputs(llm: LLM,
-                     input_prompts: list[list[int]],
-                     sampling_params: SamplingParams,
-                     use_overlap_scheduler: bool = False) -> None:
+def validate_outputs(llm: LLM, input_prompts: list[list[int]],
+                     sampling_params: SamplingParams) -> None:
     """Generate outputs for a list of prompts and validate the outputs"""
     outputs = llm.generate(input_prompts, sampling_params=sampling_params)
     num_prompts = len(input_prompts)
@@ -416,10 +407,7 @@ def validate_outputs(llm: LLM,
         outputs
     ) == num_prompts, f"expected {num_prompts} outputs, but got {len(outputs)}"
     for output_idx, output in enumerate(outputs):
-        validate_output(output,
-                        input_prompts[output_idx],
-                        sampling_params,
-                        use_overlap_scheduler=use_overlap_scheduler)
+        validate_output(output, input_prompts[output_idx], sampling_params)
 
 
 @pytest.mark.parametrize("return_log_probs", [True, False])
@@ -481,11 +469,8 @@ def test_beam_search_output_shapes_cuda_graph_and_overlap(
         end_id=-1,
         additional_model_outputs=["cache_indirection"],
     )
-    # use_overlap_scheduler=True is used to adjust the expected cache indirection for the test
-    validate_outputs(llm_cuda_graph,
-                     input_prompts[:num_prompts],
-                     sampling_params,
-                     use_overlap_scheduler=True)
+    validate_outputs(llm_cuda_graph, input_prompts[:num_prompts],
+                     sampling_params)
 
 
 if __name__ == "__main__":
