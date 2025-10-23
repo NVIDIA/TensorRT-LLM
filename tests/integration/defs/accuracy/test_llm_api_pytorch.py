@@ -3412,7 +3412,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "apply_chat_template": True,
     }
 
-    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    MODEL_PATH = f"openai/gpt-oss-120b"
 
     @pytest.mark.skip(reason="https://nvbugs/5596343")
     @pytest.mark.parametrize(
@@ -3485,9 +3485,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
                       mocker):
+        MAX_OUTPUT_LEN = 128179
+        MAX_INPUT_LEN = 32768
+
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
+
+        mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
+        mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -3496,14 +3503,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype)
 
+        max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
                   kv_cache_config=kv_cache_config,
+                  max_seq_len=max_seq_len,
+                  max_batch_size=720,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
                   moe_config=MoeConfig(backend=moe_backend))
@@ -3551,9 +3561,30 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
+
+            # GSM8K
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+            # GPQA Medium Reasoning
+            task = GPQADiamond(model_name)
+
+            chat_template_kwargs = dict(reasoning_effort="medium")
+            extra_evaluator_kwargs = {
+                **self.extra_evaluator_kwargs, "chat_template_kwargs":
+                chat_template_kwargs
+            }
+
+            sampling_params = SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=MAX_INPUT_LEN)
+
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(

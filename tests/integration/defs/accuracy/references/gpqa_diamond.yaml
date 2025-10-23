@@ -50,3 +50,23 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 57.07
+GPT-OSS/MXFP4:
+  - accuracy: 65.0
+  - spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    kv_cache_quant_algo: FP8
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 65.0
