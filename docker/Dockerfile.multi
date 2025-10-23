@@ -106,7 +106,7 @@ RUN bash ./install_etcd.sh && rm install_etcd.sh
 # Install Mooncake
 COPY docker/common/install_mooncake.sh install_mooncake.sh
 RUN if [ -f /etc/redhat-release ]; then \
-        echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+        echo "Rocky8 detected, skipping mooncake installation"; \
     else \
         bash ./install_mooncake.sh && rm install_mooncake.sh \
     fi
