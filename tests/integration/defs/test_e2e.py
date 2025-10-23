@@ -3494,6 +3494,8 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Instruct',
                  marks=(skip_pre_hopper, skip_post_blackwell)),
+    pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 marks=skip_pre_hopper),
 ])
 def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
                           eval_task):
@@ -3512,6 +3514,8 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
         "--max_batch_size=32",
         eval_task,
     ]
+
+    llm_venv._new_env["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
     output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
     if os.environ.get("SLURM_PROCID", '0') == '0':
