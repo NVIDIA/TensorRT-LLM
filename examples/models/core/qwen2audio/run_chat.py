@@ -14,9 +14,9 @@
 # limitations under the License.
 
 import torch
-from run import QWenInfer, parse_arguments
 
 import tensorrt_llm
+from run import QWenInfer, parse_arguments
 
 if __name__ == '__main__':
     args = parse_arguments()
