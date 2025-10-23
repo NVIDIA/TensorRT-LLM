@@ -36,3 +36,7 @@ add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(common_src PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
+endif()
