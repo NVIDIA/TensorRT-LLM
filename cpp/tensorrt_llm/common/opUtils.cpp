@@ -247,20 +247,20 @@ struct MemoryInfo
 };
 
 // Helper function to get current memory information
-inline MemoryInfo getMemoryInfo()
+MemoryInfo getMemoryInfo()
 {
     size_t free_mem = 0, total_mem = 0;
     TLLM_CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
 
-    const size_t free_mb = free_mem / (1024 * 1024);
-    const size_t total_mb = total_mem / (1024 * 1024);
+    size_t const free_mb = free_mem / (1024 * 1024);
+    size_t const total_mb = total_mem / (1024 * 1024);
     float const free_percent = (total_mem > 0) ? (static_cast<float>(free_mem) / total_mem * 100.0f) : 0.0f;
 
     return {free_mb, total_mb, free_percent};
 }
 
 // Helper function to log current memory usage
-inline void logMemoryUsage(char const* operation, CUcontext ctx)
+void logMemoryUsage(char const* operation, CUcontext ctx)
 {
     auto const mem = getMemoryInfo();
     TLLM_LOG_DEBUG("%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx, mem.free_mb,
@@ -268,7 +268,7 @@ inline void logMemoryUsage(char const* operation, CUcontext ctx)
 }
 
 // Helper function to throw
-inline void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasStatus_t status)
+void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasStatus_t status)
 {
     auto const mem = getMemoryInfo();
     TLLM_THROW(
