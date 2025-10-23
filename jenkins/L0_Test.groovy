@@ -967,14 +967,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
-    if (type.contains("6000d")) {
+    /* if (type.contains("6000d")) {
         pvcVolume = """
                 - name: sw-tensorrt-pvc
                   nfs:
                     server: aus-cdot04-corp01
                     path: /vol/scratch26/scratch.trt_llm_data
         """
-    }
+    }*/
 
     def podConfig = [
         cloud: targetCould,
