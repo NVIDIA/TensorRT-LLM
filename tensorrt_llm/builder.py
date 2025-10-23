@@ -30,8 +30,6 @@ import tensorrt as trt
 from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
                      to_json_file, trt_gte)
-from .auto_parallel import auto_parallel
-from .auto_parallel.config import AutoParallelConfig
 from .bindings import KVCacheType
 from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
@@ -84,24 +82,17 @@ class BuilderConfig(object):
             "plugin_config": {
                 # the network plugin_config (if any) attached to this BuilderConfig object
                 # inside the Builder.build_engine
-            },
-            "auto_parallel_config": {
-                # the network auto_parallel_config (if any) attached to this BuilderConfig object
-                # inside the Builder.build_engine
             }
         }
         '''
         config = {'builder_config': {}}
         for k in self.__dict__.keys():
-            if k not in [
-                    '_trt_builder_config', 'plugin_config',
-                    'auto_parallel_config'
-            ]:
+            if k not in ['_trt_builder_config', 'plugin_config']:
                 config['builder_config'][k] = self.__getattribute__(k)
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
-            config['plugin_config'] = self.plugin_config.to_dict()
+            config['plugin_config'] = self.plugin_config.model_dump(mode="json")
         return config
 
 
@@ -270,17 +261,6 @@ class Builder():
                 min_shape = [*shape_profile.min]
                 opt_shape = [*shape_profile.opt]
                 max_shape = [*shape_profile.max]
-                if network._auto_parallel_config is not None:
-                    io_shards = network._auto_parallel_config["io_shards"]
-                    if input_name in io_shards:
-                        shards = io_shards[input_name]
-                        for dim, shard_num in shards.items():
-                            min_shape[dim] = int(
-                                math.floor(min_shape[dim] / shard_num))
-                            opt_shape[dim] = int(
-                                round(opt_shape[dim] / shard_num))
-                            max_shape[dim] = int(
-                                math.ceil(max_shape[dim] / shard_num))
                 profile.set_shape(input_name, min_shape, opt_shape, max_shape)
                 logger.debug(
                     f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
@@ -389,7 +369,6 @@ class Builder():
         '''
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
-        builder_config.auto_parallel_config = network.auto_parallel_config
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         logger.info(
@@ -506,7 +485,6 @@ class BuildConfig:
         input_timing_cache (str, optional): Path to input timing cache file. If None, no input cache used. Defaults to None.
         output_timing_cache (str): Path to output timing cache file. Defaults to 'model.cache'.
         lora_config (LoraConfig): Configuration for LoRA (Low-Rank Adaptation) fine-tuning. Defaults to default LoraConfig.
-        auto_parallel_config (AutoParallelConfig): Configuration for automatic parallelization. Defaults to default AutoParallelConfig.
         weight_sparsity (bool): Whether to enable weight sparsity optimization. Defaults to False.
         weight_streaming (bool): Whether to enable weight streaming for large models. Defaults to False.
         plugin_config (PluginConfig): Configuration for TensorRT LLM plugins. Defaults to default PluginConfig.
@@ -538,8 +516,6 @@ class BuildConfig:
     input_timing_cache: str = None
     output_timing_cache: str = 'model.cache'
     lora_config: LoraConfig = field(default_factory=LoraConfig)
-    auto_parallel_config: AutoParallelConfig = field(
-        default_factory=AutoParallelConfig)
     weight_sparsity: bool = False
     weight_streaming: bool = False
     plugin_config: PluginConfig = field(default_factory=PluginConfig)
@@ -659,9 +635,7 @@ class BuildConfig:
                                         defaults.get('input_timing_cache'))
         output_timing_cache = config.pop('output_timing_cache',
                                          defaults.get('output_timing_cache'))
-        lora_config = LoraConfig.from_dict(config.get('lora_config', {}))
-        auto_parallel_config = AutoParallelConfig.from_dict(
-            config.get('auto_parallel_config', {}))
+        lora_config = LoraConfig(**config.get('lora_config', {}))
         max_encoder_input_len = config.pop(
             'max_encoder_input_len', defaults.get('max_encoder_input_len'))
         weight_streaming = config.pop('weight_streaming',
@@ -672,7 +646,8 @@ class BuildConfig:
         if plugin_config is None:
             plugin_config = PluginConfig()
         if "plugin_config" in config.keys():
-            plugin_config.update_from_dict(config["plugin_config"])
+            plugin_config = plugin_config.model_copy(
+                update=config["plugin_config"], deep=True)
 
         dry_run = config.pop('dry_run', defaults.get('dry_run'))
         visualize_network = config.pop('visualize_network',
@@ -703,7 +678,6 @@ class BuildConfig:
             input_timing_cache=input_timing_cache,
             output_timing_cache=output_timing_cache,
             lora_config=lora_config,
-            auto_parallel_config=auto_parallel_config,
             use_strip_plan=use_strip_plan,
             max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
@@ -725,10 +699,8 @@ class BuildConfig:
         # the enum KVCacheType cannot be converted automatically
         if output.get('kv_cache_type', None) is not None:
             output['kv_cache_type'] = str(output['kv_cache_type'].name)
-        output['plugin_config'] = output['plugin_config'].to_dict()
-        output['lora_config'] = output['lora_config'].to_dict()
-        output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
-        )
+        output['plugin_config'] = output['plugin_config'].model_dump()
+        output['lora_config'] = output['lora_config'].model_dump()
         return output
 
     def update_from_dict(self, config: dict):
@@ -891,7 +863,6 @@ def get_engine_version(engine_dir: str) -> Union[None, str]:
 
 def optimize_model_with_config(model: PretrainedModel,
                                build_config: BuildConfig):
-    use_auto_parallel = build_config.auto_parallel_config.enabled
     gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
     low_latency_gemm_swiglu_plugin = build_config.plugin_config.low_latency_gemm_swiglu_plugin
     if gemm_swiglu_plugin or low_latency_gemm_swiglu_plugin:
@@ -921,12 +892,11 @@ def optimize_model_with_config(model: PretrainedModel,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.plugin_config.use_fused_mlp
                        and not is_enc_dec
-                       and not (is_recurrent_gemma and is_fp8)
-                       and not use_auto_parallel),
+                       and not (is_recurrent_gemma and is_fp8)),
         gemm_swiglu_plugin_dtype=gemm_swiglu_plugin,
         low_latency_gemm_swiglu_plugin_dtype=low_latency_gemm_swiglu_plugin,
         use_fused_rg_lru=is_recurrent_gemma,
-        use_unfused_qkv_gemm=use_auto_parallel,
+        use_unfused_qkv_gemm=False,
         use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0),
         use_lora=build_config.plugin_config.lora_plugin is not None,
         max_lora_rank=build_config.lora_config.max_lora_rank,
@@ -1280,7 +1250,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     network = builder.create_network()
     network.plugin_config = build_config.plugin_config
 
-    use_auto_parallel = build_config.auto_parallel_config.enabled
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
@@ -1389,15 +1358,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if model.config.architecture != "DecoderModel":
         optimize(network)
-
-    if use_auto_parallel:
-        config = build_config.auto_parallel_config
-        config.builder_flags = builder_config.trt_builder_config.flags
-        sharded_networks = auto_parallel(network, config)
-        network = sharded_networks[model.config.mapping.rank]
-        if not build_config.auto_parallel_config.debug_mode:
-            mapping = network.auto_parallel_config["mapping"]
-            model.config.mapping = mapping
 
     if build_config.visualize_network is not None:
         with net_guard(network):

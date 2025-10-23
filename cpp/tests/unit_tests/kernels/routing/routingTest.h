@@ -72,6 +72,27 @@ constexpr T divUpMulLog2(T a, T bLog2)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
+__host__ __device__ constexpr T mulTileN(T a, T tileN)
+{
+    return a * tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T divUpTileN(T a, T tileN)
+{
+    return (a + tileN - 1) / tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
+__host__ __device__ constexpr T divUpMulTileN(T a, T tileN)
+{
+    return divUpTileN(a, tileN) * tileN;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename T>
 constexpr void initData(T* data, int num, int rngSeed)
 {
     std::default_random_engine rng(rngSeed);
@@ -214,6 +235,7 @@ struct RoutingKernelTestParam
     // we don't use any special striding, and we always test the GPU at logical idx 0
     int32_t numLocalExperts{128};
     int32_t paddingLog2{3};
+    int32_t tileTokensDim{1};
 
     int32_t singleClusterTokenNum{1024};
     bool usePdl{true};
@@ -246,13 +268,15 @@ struct RoutingKernelTestParam
 
     // Constructor with all parameters
     RoutingKernelTestParam(RoutingMethodType routingMethod, int32_t numTokens, int32_t numExperts, uint32_t topK,
-        int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t paddingLog2 = 3,
-        int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true, bool useTopKAsInput = false,
-        int32_t nGroup = 1, int32_t topkGroup = 1, float routedScalingFactor = 1.0f, int requiredComputeCapability = 9)
+        int32_t expertParallelization = 1, int32_t expertParallelizationId = 0, int32_t tileTokensDim = 1,
+        int32_t paddingLog2 = 3, int32_t localExpertsStrideLog2 = 0, bool usePdl = true, bool getExpWeights = true,
+        bool useTopKAsInput = false, int32_t nGroup = 1, int32_t topkGroup = 1, float routedScalingFactor = 1.0f,
+        int requiredComputeCapability = 9)
         : routingMethod(routingMethod)
         , numTokens(numTokens)
         , numExperts(numExperts)
         , topK(topK)
+        , tileTokensDim(tileTokensDim)
         , paddingLog2(paddingLog2)
         , localExpertsStrideLog2(localExpertsStrideLog2)
         , usePdl(usePdl)
@@ -380,6 +404,21 @@ protected:
 
     virtual void setupBuffers(RoutingKernelTestParam const& param);
 
+    inline int32_t computeLog2(int32_t val, std::string const& name = "")
+    {
+        int32_t n = val;
+        int32_t out = 0;
+        while (n >>= 1)
+        {
+            ++out;
+        }
+        if ((1 << out) != val)
+        {
+            out = -1;
+        }
+        return out;
+    }
+
     template <typename RoutingData>
     inline void setCommonParams(RoutingKernelTestParam const& param, RoutingData& routingData)
     {
@@ -387,7 +426,8 @@ protected:
         routingData.mNumTokens = param.numTokens;
         routingData.mNumExperts = param.numExperts;
         routingData.mTopK = param.topK;
-        routingData.mPaddingLog2 = param.paddingLog2;
+        routingData.mTileTokensDim = param.tileTokensDim;
+        routingData.mPaddingLog2 = computeLog2(param.tileTokensDim);
         routingData.mLocalExpertsStartIdx = param.localExpertsStartIdx;
         routingData.mLocalExpertsStrideLog2 = param.localExpertsStrideLog2;
         routingData.mNumLocalExperts = param.numLocalExperts;

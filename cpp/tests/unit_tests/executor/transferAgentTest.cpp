@@ -102,7 +102,7 @@ TEST_P(TransferAgentTest, Basic)
 
     // xferAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = xferAgent1->getConnectionInfo();
-    xferAgent0->connectRemoteAgent(agent1, connectionInfo);
+    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -138,7 +138,7 @@ TEST_P(TransferAgentTest, Basic2)
 
     // xferAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = xferAgent1->getConnectionInfo();
-    xferAgent0->connectRemoteAgent(agent1, connectionInfo);
+    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -181,7 +181,7 @@ TEST_P(TransferAgentTest, DeviceMemory)
 
     // xferAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = xferAgent1->getConnectionInfo();
-    xferAgent0->connectRemoteAgent(agent1, connectionInfo);
+    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -223,7 +223,7 @@ TEST_P(TransferAgentTest, Connect)
 
     // xferAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = xferAgent1->getConnectionInfo();
-    xferAgent0->connectRemoteAgent(agent1, connectionInfo);
+    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -234,7 +234,7 @@ TEST_P(TransferAgentTest, Connect)
     status->wait();
 
     TLLM_CHECK(memory0 == memory1);
-    xferAgent2->connectRemoteAgent(agent1, connectionInfo);
+    xferAgent2->loadRemoteAgent(agent1, connectionInfo);
     checked = false;
     do
     {
@@ -273,7 +273,7 @@ TEST_P(TransferAgentTest, SyncMessage)
 
     // xferAgent0->loadRemoteAgent(agent1);
     auto connectionInfo = xferAgent1->getConnectionInfo();
-    xferAgent0->connectRemoteAgent(agent1, connectionInfo);
+    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
     bool checked = false;
     do
     {
@@ -310,7 +310,7 @@ TEST_P(TransferAgentTest, SyncMessage)
 
     // xferAgent1->loadRemoteAgent(agent0);
     auto connectionInfo2 = xferAgent0->getConnectionInfo();
-    xferAgent1->connectRemoteAgent(agent0, connectionInfo2);
+    xferAgent1->loadRemoteAgent(agent0, connectionInfo2);
     std::string syncMessage3 = "three_agent_sync_message";
     xferAgent1->notifySyncMessage(agent0, syncMessage3);
     auto notif3 = xferAgent0->getNotifiedSyncMessages();

@@ -115,7 +115,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(top_k <= 8 && top_k > 0,
+        TORCH_CHECK(top_k <= 10 && top_k > 0,
             "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
@@ -179,6 +179,12 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
             args.num_tokens, top_k, num_experts, tile_tokens_dim);
+    int32_t max_num_padded_tokens_gemm1
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, 2 * args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+    int32_t max_num_padded_tokens_gemm2
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx
@@ -194,16 +200,16 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         = at::detail::empty_cuda({size_of_expert_count_histogram}, at::ScalarType::Int, routing_device, std::nullopt);
 
     // allocate workspace for activation/gemm/finalize kernels
-    at::Tensor gemm1_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, 2 * intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor gemm1_output_scale = at::detail::empty_cuda(
-        {2 * intermediate_size / 128, max_num_padded_tokens}, at::ScalarType::Float, routing_device, std::nullopt);
+    at::Tensor gemm1_output = at::detail::empty_cuda({max_num_padded_tokens_gemm1, 2 * intermediate_size},
+        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
+        at::ScalarType::Float, routing_device, std::nullopt);
     at::Tensor activation_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+        {max_num_padded_tokens_gemm1, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
     at::Tensor activation_output_scale = at::detail::empty_cuda(
-        {intermediate_size / 128, max_num_padded_tokens}, at::ScalarType::Float, routing_device, std::nullopt);
+        {intermediate_size / 128, max_num_padded_tokens_gemm1}, at::ScalarType::Float, routing_device, std::nullopt);
     at::Tensor gemm2_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
+        {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -266,7 +272,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
-    workspace.total_max_padded_tokens = max_num_padded_tokens;
+    workspace.total_max_padded_tokens = std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
     workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
     workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();

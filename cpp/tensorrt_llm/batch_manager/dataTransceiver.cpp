@@ -145,16 +145,18 @@ using runtime::SizeType32;
 using AgentConnectionManager = tensorrt_llm::executor::kv_cache::AgentConnectionManager;
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 
-static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
+namespace
+{
+
+int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 {
     constexpr int32_t kDATA_TAG{43};
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
-namespace fs = std::filesystem;
-
-static fs::path getTransferOutputPath(char const* tag)
+std::filesystem::path getTransferOutputPath(char const* tag)
 {
+    namespace fs = std::filesystem;
     auto outputPath = common::getEnvKVCacheTransferOutputPath();
     if (!outputPath.empty())
     {
@@ -166,13 +168,15 @@ static fs::path getTransferOutputPath(char const* tag)
     return {};
 }
 
+} // namespace
+
 struct ReceiveCacheResource
 {
     runtime::BufferManager mBufferManager;
     runtime::CudaEvent mCudaEvent;
 
-    ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent&& cudaEvent)
-        : mBufferManager(bufferManager)
+    ReceiveCacheResource(runtime::BufferManager&& bufferManager, runtime::CudaEvent cudaEvent)
+        : mBufferManager(std::move(bufferManager))
         , mCudaEvent(std::move(cudaEvent))
     {
     }
@@ -343,8 +347,7 @@ public:
         TLLM_CHECK_WITH_INFO(mFormatter->inquireSupport(
                                  mSelfState.getCacheState().value(), info.getTransState().getCacheState().value()),
             "Disagg server does not currently support these cacheState, please check the cacheState of the context and "
-            "gen "
-            "executors");
+            "gen executors");
         auto peerRelativeRanks = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
                                      .mIRanks;
@@ -401,10 +404,14 @@ public:
 
     void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
     {
-        auto it = mRequestToSession.find(requestId);
-        TLLM_CHECK(it != mRequestToSession.end());
-        auto& session = it->second;
-        auto const& connections = session.getConnections();
+        TransferSession* session = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mMtxForMap);
+            auto it = mRequestToSession.find(requestId);
+            TLLM_CHECK(it != mRequestToSession.end());
+            session = std::addressof(it->second);
+        }
+        auto const& connections = session->getConnections();
         for (size_t i = 0; i < connections.size(); i++)
         {
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -520,7 +527,18 @@ private:
 
             if (isReady)
             {
-                asyncSendAndRemoveResponse(it->first, std::move(it->second));
+                if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+                {
+                    // our nixl impl seems only support recv and send in the same thread
+                    //  if we use zmq as control path, we may avoid this issue
+                    sendAndRemoveResponse(it->first, std::move(it->second));
+                }
+                else
+                {
+                    // if we send data in another thread, multiple rank may send data for different requests at the same
+                    // time with gen DP case.
+                    asyncSendAndRemoveResponse(it->first, std::move(it->second));
+                }
                 removeResponse(it);
             }
             else
@@ -1009,7 +1027,6 @@ private:
 
     void request(AsyncResource& resource)
     {
-
         tensorrt_llm::common::setThreadName("dataTransRequest");
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
 

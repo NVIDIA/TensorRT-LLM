@@ -2,6 +2,7 @@ import os
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
 import pytest
@@ -107,20 +108,24 @@ class Scenario:
 class TestQwen2_5_VL(unittest.TestCase):
 
     def get_test_inputs(self, modality: str):
+
+        test_data_root = Path(
+            os.path.join(llm_models_root(), "multimodals", "test_data"))
+
         if modality == "image":
             return ["Describe the natural environment in the image."], \
-                ["https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"]
+                [str(test_data_root / "seashore.png")]
         elif modality == "multiple_image":
             return ["Describe the difference between the two images."], \
-                ["https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-                 "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg"]
+                [str(test_data_root / "inpaint.png"),
+                 str(test_data_root / "61.jpg")]
         elif modality == "video":
             return ["Tell me what you see in the video briefly."], \
-                ["https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"]
+                [str(test_data_root / "OAI-sora-tokyo-walk.mp4")]
         elif modality == "mixture_text_image":
             return ["Describe the scene in the image briefly.",
                     "Who invented the internet?"], \
-                ["https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+                [str(test_data_root / "inpaint.png"),
                  ""]
         elif modality == "text":
             return ["Who invented the internet?"], []

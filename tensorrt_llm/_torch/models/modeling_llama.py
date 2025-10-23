@@ -561,13 +561,13 @@ class Llama4DecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
-                if self.next_attn is not None and (self.is_nvfp4
-                                                   or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
-                        self.next_attn.qkv_proj, 'input_scale') else None
-                else:
-                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                if not (self.next_attn is not None and (self.is_nvfp4
+                                                   or self.is_fp8_quant)) \
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
+                    self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                else:
+                    scale = self.next_attn.qkv_proj.input_scale
 
                 # TODO: MIN_LATENCY_MODE is hardcoded to False
                 if cutlass_min_latency_mode:
@@ -771,13 +771,14 @@ class LlamaDecoderLayer(DecoderLayer):
             else:
                 # The next layernorm exists but it could be the last decoder layer.
                 # Adjust the scale and fusion pattern.
-                if self.next_attn is not None and (self.is_nvfp4
-                                                   or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
-                        self.next_attn.qkv_proj, 'input_scale') else None
-                else:
-                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+                if not (self.next_attn is not None and (self.is_nvfp4
+                                                   or self.is_fp8_quant)) \
+                or not hasattr(self.next_attn.qkv_proj, 'input_scale'):
                     scale = None
+                    self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                else:
+                    scale = self.next_attn.qkv_proj.input_scale
 
                 all_reduce_output = self.all_reduce(
                     hidden_states,
@@ -979,9 +980,7 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def load_weights(self, weights: Dict):
-        super().load_weights(weights)
-
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1003,16 +1002,28 @@ class Llama4VisionEncoder(nn.Module):
 
         self.dtype = self.pretrained_config.text_config.torch_dtype
 
-    def load_weights(self):
+    def load_weights(self, weights: Dict):
         module_dict = nn.ModuleDict({
             "vision_model":
             Llama4VisionModel(self.pretrained_config.vision_config),
             "multi_modal_projector":
             Llama4MultiModalProjector(self.pretrained_config),
         })
-        load_sharded_checkpoint(module_dict,
-                                self.pretrained_config._name_or_path,
-                                strict=False)
+
+        # If the named params are present in the weights, load them directly.
+        param_names = [name for name, _ in module_dict.named_parameters()]
+        if all(name in weights for name in param_names):
+            vision_encoder_weights = {
+                name: weights[name]
+                for name in param_names
+            }
+            module_dict.load_state_dict(vision_encoder_weights)
+
+        # Otherwise, load the weights from the checkpoint.
+        else:
+            load_sharded_checkpoint(module_dict,
+                                    self.pretrained_config._name_or_path,
+                                    strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
@@ -1295,7 +1306,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         if not DISAGG:
-            self.mm_encoder.load_weights()
+            self.mm_encoder.load_weights(weights)
 
         # Temporarily detach mm_encoder so the TRT-LLM loader doesn't try to load it
         had_mm_encoder = hasattr(self, "mm_encoder")
@@ -1308,6 +1319,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             if had_mm_encoder:
                 self.mm_encoder = saved_mm_encoder
 
+    def post_load_weights(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

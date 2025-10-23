@@ -12,11 +12,11 @@ from ray.util.placement_group import (PlacementGroup,
                                       get_current_placement_group,
                                       placement_group)
 
+from tensorrt_llm._ray_utils import unwrap_ray_errors
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_range_debug
-from ..llmapi.llm_args import KvCacheConnectorConfig
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
@@ -35,8 +35,7 @@ class RayExecutor(GenerationExecutor):
                  model_world_size: int,
                  postproc_worker_config: PostprocWorkerConfig,
                  is_llm_executor: bool,
-                 tp_size=1,
-                 kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+                 tp_size=1):
         os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
         os.environ["RAY_DEDUP_LOGS"] = "0"  # for debug
 
@@ -57,48 +56,53 @@ class RayExecutor(GenerationExecutor):
             "runtime_env": runtime_env
         }
 
-        if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
-            try:
-                ray.init(address="auto", **ray_init_args)
-                logger.info(f"Attached to an existing Ray cluster.")
-            except ConnectionError:
-                logger.info(f"Ray cluster not found, starting a new one.")
+        try:
+            if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
+                try:
+                    ray.init(address="auto", **ray_init_args)
+                    logger.info(f"Attached to an existing Ray cluster.")
+                except ConnectionError:
+                    logger.info(f"Ray cluster not found, starting a new one.")
 
-            if not ray.is_initialized():
-                ray.init(**ray_init_args)
+                if not ray.is_initialized():
+                    ray.init(**ray_init_args)
+                    self.has_start_local_cluser = True
+            else:
+                ray.init(address="local", **ray_init_args)
                 self.has_start_local_cluser = True
-        else:
-            ray.init(address="local", **ray_init_args)
-            self.has_start_local_cluser = True
 
-        self.world_size = model_world_size
-        self.tp_size = tp_size
-        self.master_address = ray.util.get_node_ip_address()
-        self.master_port = get_free_port()
+            self.world_size = model_world_size
+            self.tp_size = tp_size
+            self.master_address = ray.util.get_node_ip_address()
+            self.master_port = get_free_port()
 
-        self.response_queue = RayAsyncQueue.options(runtime_env={
-            "env_vars": {
-                "TLLM_DISABLE_MPI": "1"
-            }
-        }).remote()
-        self.response_sync_queue = RaySyncQueue.options(runtime_env={
-            "env_vars": {
-                "TLLM_DISABLE_MPI": "1"
-            }
-        }).remote()
-        self.async_response_queue_weakref = self.create_actor_weak_ref(
-            self.response_queue)
-        self.sync_response_queue_weakref = self.create_actor_weak_ref(
-            self.response_sync_queue)
-        self.response_queue.warmup.remote()
-        self.response_sync_queue.warmup.remote()
+            self.response_queue = RayAsyncQueue.options(runtime_env={
+                "env_vars": {
+                    "TLLM_DISABLE_MPI": "1"
+                }
+            }).remote()
+            self.response_sync_queue = RaySyncQueue.options(runtime_env={
+                "env_vars": {
+                    "TLLM_DISABLE_MPI": "1"
+                }
+            }).remote()
+            self.async_response_queue_weakref = self.create_actor_weak_ref(
+                self.response_queue)
+            self.sync_response_queue_weakref = self.create_actor_weak_ref(
+                self.response_sync_queue)
+            self.response_queue.warmup.remote()
+            self.response_sync_queue.warmup.remote()
 
-        worker_kwargs = dict(**worker_kwargs,
-                             postproc_worker_config=postproc_worker_config,
-                             is_llm_executor=is_llm_executor,
-                             kv_connector_config=kv_connector_config)
+            worker_kwargs = dict(**worker_kwargs,
+                                 postproc_worker_config=postproc_worker_config,
+                                 is_llm_executor=is_llm_executor)
 
-        self.create_workers(RayGPUWorker, worker_kwargs)
+            self.create_workers(RayGPUWorker, worker_kwargs)
+        except Exception as e:
+            # Clean up the Ray resources early during exception
+            self.shutdown()
+            logger.error(f"Failed to initialize RayExecutor: {e}")
+            raise e
 
     @staticmethod
     def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
@@ -137,12 +141,19 @@ class RayExecutor(GenerationExecutor):
             for rank in range(self.world_size)
         ]
 
-        ray.get([worker.__ray_ready__.remote() for worker in self.workers])
+        try:
+            ray.get([worker.__ray_ready__.remote() for worker in self.workers])
+        except ray.exceptions.ActorDiedError as e:
+            if "The actor died because of an error raised in its creation task" in str(
+                    e):
+                raise RuntimeError(
+                    "RayGPUWorker died during initialization") from e
+            raise
 
+    @unwrap_ray_errors()
     def call_all_ray_workers(self, func: str, leader_only: bool,
                              async_call: bool, *args, **kwargs):
         workers = (self.workers[0], ) if leader_only else self.workers
-
         if async_call:
             return [
                 getattr(worker, func).remote(*args, **kwargs)
@@ -154,6 +165,7 @@ class RayExecutor(GenerationExecutor):
                 for worker in workers
             ])
 
+    @unwrap_ray_errors()
     def collective_rpc(self,
                        method: str,
                        args: tuple = (),
@@ -174,7 +186,6 @@ class RayExecutor(GenerationExecutor):
                 # Ray actor doesn't work with __getattr__ delegation.
                 refs.append(w.call_worker_method.remote(method, *args,
                                                         **kwargs))
-
         return refs if non_block else ray.get(refs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -224,11 +235,14 @@ class RayExecutor(GenerationExecutor):
         self.workers = None
         if hasattr(self,
                    "placement_group") and self.placement_group is not None:
-            ray.util.remove_placement_group(self.placement_group)
+            # Only remove placement group if Ray is still initialized
+            # to avoid triggering auto_init_ray() during program exit
+            if ray.is_initialized():
+                ray.util.remove_placement_group(self.placement_group)
             self.placement_group = None
         self.bundle_indices = None
 
-        if self.has_start_local_cluser:
+        if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
 

@@ -18,7 +18,7 @@ from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
-storage_types = ["http"]
+storage_types = ["http", "etcd"]
 
 
 def get_uri(storage_type):
@@ -77,7 +77,9 @@ async def cluster_manager(config, storage_server):
 
 
 @pytest.mark.parametrize("config", storage_types, indirect=True)
-@pytest.mark.threadleak(enabled=False)
+@pytest.mark.threadleak(
+    enabled=False
+)  # ignore thread leak for python-etcd3 watch thread, there is no way to stop it
 @pytest.mark.asyncio(scope="module")
 async def test_init_workers_first(config, storage_server):
     try:

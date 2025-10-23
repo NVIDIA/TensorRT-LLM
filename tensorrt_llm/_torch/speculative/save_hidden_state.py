@@ -21,6 +21,7 @@ class SaveHiddenStatesDrafter(Drafter):
         super().__init__(spec_config.max_concurrency)
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
+        self.max_total_draft_tokens = spec_config.max_total_draft_tokens
         self._iter = 1
         self._output_directory = spec_config.output_directory
         self._file_prefix = spec_config.file_prefix

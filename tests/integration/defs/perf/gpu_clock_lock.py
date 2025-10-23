@@ -29,9 +29,9 @@ import time
 import psutil  # type: ignore
 # Nvidia
 import pynvml  # type: ignore
-from defs.trt_test_alternative import print_info, print_warning
+from defs.trt_test_alternative import print_error, print_info, print_warning
 
-from .misc import clean_device_product_name
+from .misc import clean_device_product_name, get_device_subtype
 
 
 class InvalidGPUMonitoringResultError(RuntimeError):
@@ -123,6 +123,12 @@ class GPUClockLock:
 
     def get_gpu_properties(self):
         return self._gpu_properties
+
+    def get_device_subtype(self):
+        """Get the device subtype for the primary GPU."""
+        if self._gpu_properties and "device_subtype" in self._gpu_properties:
+            return self._gpu_properties["device_subtype"]
+        return None
 
     def get_gpu_id(self):
         return self._gpu_id
@@ -499,6 +505,10 @@ class GPUClockLock:
             self._gpu_properties[
                 "device_product_name"] = clean_device_product_name(
                     self._gpu_properties["device_product_name"])
+
+            # Add device subtype based on cleaned product name
+            self._gpu_properties["device_subtype"] = get_device_subtype(
+                self._gpu_properties["device_product_name"])
 
             if "jetson" in self._gpu_properties[
                     "device_product_name"] or "p3710" in self._gpu_properties[
