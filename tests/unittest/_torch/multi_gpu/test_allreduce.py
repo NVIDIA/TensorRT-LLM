@@ -21,7 +21,7 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from utils.util import skip_pre_blackwell
+from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.autotuner import autotune
@@ -253,22 +253,11 @@ def run_allreduce_op(x: torch.Tensor,
     ref_output = ref_func(xs[tensor_parallel_rank], residual)
 
     for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
-        rtol, atol = 0.05, 0.15
-        try:
-            torch.testing.assert_close(
-                calc_output_tensor,
-                ref_output_tensor,
-                rtol=rtol,
-                atol=atol,
-            )
-        except AssertionError:
-            # Calculate percentage of mismatched elements
-            mismatched = torch.abs(calc_output_tensor - ref_output_tensor) > (
-                rtol * torch.abs(ref_output_tensor) + atol)
-            mismatch_percentage = (mismatched.sum() / mismatched.numel())
-
-            # If more than 1% elements mismatch, raise the error
-            assert mismatch_percentage < 0.01, f"Large mismatched elements encountered"
+        check_accuracy(calc_output_tensor,
+                       ref_output_tensor,
+                       atol=0.05,
+                       rtol=0.15,
+                       percent=0.99)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
