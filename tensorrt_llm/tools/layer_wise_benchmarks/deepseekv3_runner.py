@@ -1,12 +1,11 @@
 import functools
 import os
+import pathlib
 import weakref
 from enum import IntEnum
 from typing import List, Optional
 
 import torch
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import \
-    DeepseekV3Config
 
 import tensorrt_llm._torch.models.modeling_deepseekv3
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -14,16 +13,18 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import (
     DeepseekV3DecoderLayer, DeepseekV3Gate)
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import (AuxStreamType, get_model_extra_attrs,
                                        model_extra_attrs)
 from tensorrt_llm._utils import (local_mpi_size, mpi_rank, mpi_world_size,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
 class BalanceMethod(IntEnum):
@@ -135,17 +136,10 @@ class RoutingMethod(DeepseekV3Gate):
 
 class DeepSeekV3Runner:
 
-    def __init__(self,
-                 pretrained_config: DeepseekV3Config,
-                 mapping: Mapping,
-                 *,
-                 moe_backend: str,
-                 layer_indices: List[int],
-                 kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
-                 max_num_tokens: int,
-                 use_cuda_graph: bool):
+    def __init__(self, model_dir: pathlib.PosixPath, mapping: Mapping, *,
+                 moe_backend: str, layer_indices: List[int], max_seq_len: int,
+                 max_num_tokens: int, use_cuda_graph: bool):
 
-        self.pretrained_config = pretrained_config
         self.mapping = mapping
         self.moe_backend = moe_backend
 
@@ -153,38 +147,30 @@ class DeepSeekV3Runner:
         gate_cls_orig = tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate
         tensorrt_llm._torch.models.modeling_deepseekv3.DeepseekV3Gate = RoutingMethod
 
-        if kv_cache_dtype == torch.float8_e4m3fn:
-            kv_cache_quant_algo = QuantAlgo.FP8.value
-        else:
-            kv_cache_quant_algo = None
-
-        model_config = ModelConfig(
-            pretrained_config=pretrained_config,
+        self.model_config = ModelConfig.from_pretrained(
+            model_dir,
             mapping=self.mapping,
-            quant_config=QuantConfig(quant_algo="NVFP4",
-                                     kv_cache_quant_algo=kv_cache_quant_algo,
-                                     group_size=16,
-                                     smoothquant_val=0.5,
-                                     clamp_val=None,
-                                     use_meta_recipe=False,
-                                     has_zero_point=False,
-                                     pre_quant_scale=False),
-            quant_config_dict=None,
-            skip_create_weights_in_init=True,
-            spec_config=None,
-            lora_config=None,
-            is_generation=True,
-            max_num_tokens=max_num_tokens,
-            moe_max_num_tokens=None,
-            moe_load_balancer=None,
-            attn_backend="TRTLLM",
-            moe_backend=moe_backend,
-            use_low_precision_moe_combine=False,
-            allreduce_strategy=AllReduceStrategy.AUTO,
             enable_min_latency=False,
             use_cuda_graph=use_cuda_graph,
             force_dynamic_quantization=False,
+            spec_config=None,
+            sparse_attention_config=None,  # To be loaded from model_dir
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            moe_max_num_tokens=None,
+            moe_load_balancer=None,
+            lora_config=None,
+            allreduce_strategy=AllReduceStrategy.AUTO,
+            mm_encoder_only=False,
+            attn_backend="TRTLLM",
+            moe_backend=moe_backend,
+            moe_disable_finalize_fusion=False,
+            use_low_precision_moe_combine=False,
+            skip_create_weights_in_init=True,
         )
+
+        pretrained_config = self.model_config.pretrained_config
+        quant_config = self.model_config.quant_config
 
         aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
         aux_stream_dict = {
@@ -195,7 +181,7 @@ class DeepSeekV3Runner:
 
         layers = [
             DeepseekV3DecoderLayer(
-                model_config=model_config,
+                model_config=self.model_config,
                 layer_idx=layer_idx,
                 aux_stream_dict=aux_stream_dict,
             ) for layer_idx in layer_indices
@@ -207,13 +193,35 @@ class DeepSeekV3Runner:
 
         # apply_quant_config_exclude_modules
         #   Please refer to tensorrt_llm/_torch/models/modeling_utils.py
-        new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+        new_quant_config = QuantConfig(
+            kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for layer in layers:
             for name, module in layer.named_modules():
-                if name.startswith("self_attn.") and not name.startswith(
-                        "self_attn.o_proj") and getattr(module, "quant_config",
-                                                        None) is not None:
-                    module.quant_config = new_config
+                name = f"model.layers.{layer.layer_idx}.{name}"
+                candidates = [name]
+                if isinstance(module, Linear):
+                    weight_mode = module.weights_loading_config.weight_mode
+                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                        # sometimes gate and up proj are not packed in the checkpoint,
+                        # but they still share the same exclusion rule
+                        candidates += [
+                            name.replace('gate_up_proj', 'gate_proj'),
+                            name.replace('gate_up_proj', 'up_proj')
+                        ]
+                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                        # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
+                        # but they still share the same exclusion rule
+                        candidates += [
+                            name.replace('qkv_proj', 'q_proj'),
+                            name.replace('qkv_proj', 'k_proj'),
+                            name.replace('qkv_proj', 'v_proj')
+                        ]
+                is_excluded = any(
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in candidates)
+                if is_excluded and getattr(module, "quant_config",
+                                           None) is not None:
+                    module.quant_config = new_quant_config
             for name, module in layer.named_modules():
                 if callable(getattr(module, "create_weights", None)):
                     module.create_weights()
@@ -243,7 +251,8 @@ class DeepSeekV3Runner:
                 "Suggest to set TRTLLM_ENABLE_PDL=1 when moe_backend is TRTLLM")
         world_size = mpi_world_size()
         AttentionCls = get_attention_backend(
-            self.layers[0].model_config.attn_backend)
+            self.model_config.attn_backend,
+            self.model_config.sparse_attention_config)
         attn_metadata = AttentionCls.Metadata(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(batch_size)),
@@ -264,31 +273,31 @@ class DeepSeekV3Runner:
             ),
             workspace=attn_workspace,
             mapping=self.mapping,
+            sparse_attention_config=self.model_config.sparse_attention_config,
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q
                                              ] * world_size
         attn_metadata.prepare()
-        with model_extra_attrs(self.layers[0].model_config.extra_attrs):
+        with model_extra_attrs(self.model_config.extra_attrs):
             get_model_extra_attrs()["attention_metadata"] = weakref.ref(
                 attn_metadata)
+        hidden_size = self.model_config.pretrained_config.hidden_size
         position_ids = torch.tensor([
             list(range(seq_len_kv_cache, seq_len_kv_cache + seq_len_q)) *
             batch_size
         ],
                                     dtype=torch.int32,
                                     device="cuda")
-        hidden_states = torch.rand(
-            (batch_size * seq_len_q, self.pretrained_config.hidden_size),
-            dtype=torch.bfloat16,
-            device="cuda")
-        residual = torch.rand(
-            (batch_size * seq_len_q, self.pretrained_config.hidden_size),
-            dtype=torch.bfloat16,
-            device="cuda")
+        hidden_states = torch.rand((batch_size * seq_len_q, hidden_size),
+                                   dtype=torch.bfloat16,
+                                   device="cuda")
+        residual = torch.rand((batch_size * seq_len_q, hidden_size),
+                              dtype=torch.bfloat16,
+                              device="cuda")
 
         def run_pack():
             output = hidden_states, residual
-            with model_extra_attrs(self.layers[0].model_config.extra_attrs):
+            with model_extra_attrs(self.model_config.extra_attrs):
                 with torch.inference_mode():
                     for layer in self.layers:
                         output = layer(position_ids, output[0], attn_metadata,
@@ -308,10 +317,17 @@ class DeepSeekV3Runner:
             layer.mlp.gate.balance_ratio = balance_ratio
 
     @staticmethod
-    def create_kv_cache_manager(pretrained_config, mapping, kv_cache_dtype,
-                                max_batch_size, max_seq_len, layer_indices):
+    def create_kv_cache_manager(model_dir, mapping, max_batch_size, max_seq_len,
+                                layer_indices):
+        # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
+        model_config = ModelConfig.from_pretrained(model_dir)
         tokens_per_block = 32
-        kv_cache_manager = KVCacheManager(
+        if model_config.enable_flash_mla:
+            tokens_per_block = 64
+
+        # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
+        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config)
+        kv_cache_manager = kv_cache_manager_cls(
             KvCacheConfig(
                 max_tokens=max_batch_size *
                 round_up(max_seq_len, tokens_per_block),
@@ -320,13 +336,17 @@ class DeepSeekV3Runner:
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=len(layer_indices),
             num_kv_heads=1,
-            head_dim=pretrained_config.kv_lora_rank +
-            pretrained_config.qk_rope_head_dim,
+            head_dim=model_config.pretrained_config.kv_lora_rank +
+            model_config.pretrained_config.qk_rope_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             mapping=mapping,
-            dtype=str_dtype_to_binding(torch_dtype_to_str(kv_cache_dtype)),
+            dtype=torch_dtype_to_binding({
+                None: torch.bfloat16,
+                "FP8": torch.float8_e4m3fn
+            }[model_config.quant_config.kv_cache_quant_algo]),
+            sparse_attn_config=model_config.sparse_attention_config,
         )
         kv_cache_manager.layer_offsets = {
             layer_idx: i

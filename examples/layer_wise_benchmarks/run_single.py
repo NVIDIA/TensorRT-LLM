@@ -4,8 +4,6 @@ import pathlib
 import numpy as np
 import nvtx
 import torch
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import \
-    DeepseekV3Config
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -27,20 +25,19 @@ local_rank = local_mpi_rank()
 torch.cuda.set_device(local_rank)
 
 # Model definition
-pretrained_config = DeepseekV3Config.from_json_file(
-    pathlib.Path(__file__).parent / "config_DeepSeek-R1-0528-FP4-v2.json")
+model_dir = pathlib.Path(__file__).parent / "DeepSeek-R1-0528-FP4-v2"
 layer_indices = [5, 6]
 
 # KV cache related args
 if args.test_case == "CTX":
     MAX_BATCH_SIZE = 1024
-    MAX_SEQ_LEN = 8192 + 1024 + 1
+    MAX_SEQ_LEN = 8192 + 1024 + 4
     MAX_NUM_TOKENS = 40960
     enable_attention_dp = True
     moe_backend = "CUTLASS"
 elif args.test_case == "GEN":
     MAX_BATCH_SIZE = 1024
-    MAX_SEQ_LEN = 8192 + 1024 + 1
+    MAX_SEQ_LEN = 8192 + 1024 + 4
     MAX_NUM_TOKENS = 4 * MAX_BATCH_SIZE  # MTP3 as max
     enable_attention_dp = True
     moe_backend = "WIDEEP"
@@ -51,9 +48,8 @@ else:
 mapping = DeepSeekV3Runner.create_mapping(
     enable_attention_dp=enable_attention_dp)
 kv_cache_manager = DeepSeekV3Runner.create_kv_cache_manager(
-    pretrained_config,
+    model_dir,
     mapping,
-    kv_cache_dtype=torch.float8_e4m3fn,
     max_batch_size=MAX_BATCH_SIZE,
     max_seq_len=MAX_SEQ_LEN,
     layer_indices=layer_indices)
@@ -65,15 +61,13 @@ AutoTuner.get().clear_cache()
 capture_stream = torch.cuda.Stream()
 
 # Create Runner
-runner = DeepSeekV3Runner(
-    pretrained_config,
-    mapping,
-    moe_backend=moe_backend,
-    layer_indices=layer_indices,
-    kv_cache_dtype=torch.float8_e4m3fn,
-    max_num_tokens=MAX_NUM_TOKENS,
-    use_cuda_graph=use_cuda_graph,
-)
+runner = DeepSeekV3Runner(model_dir,
+                          mapping,
+                          moe_backend=moe_backend,
+                          layer_indices=layer_indices,
+                          max_seq_len=MAX_SEQ_LEN,
+                          max_num_tokens=MAX_NUM_TOKENS,
+                          use_cuda_graph=use_cuda_graph)
 
 # Warm up
 if args.test_case == "CTX":
