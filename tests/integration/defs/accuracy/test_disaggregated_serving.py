@@ -953,12 +953,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
+            "max_batch_size":
+            1,  # max_batch_size=1 will stabilize the accuracy test result at a cost of speed
         }
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            }
+            },
+            "max_batch_size": 1,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
