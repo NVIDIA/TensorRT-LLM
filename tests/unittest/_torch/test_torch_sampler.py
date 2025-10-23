@@ -56,10 +56,10 @@ class RequestCase:
         sampler_args = TorchSampler.Args(
             max_seq_len=20,
             max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_draft_len,
             # Fill with many more max requests than below, so we can test that write_finish_reasons uses seq_slots correctly
             max_num_sequences=MAX_NUM_SEQUENCES,
-            max_beam_width=1,
-            enable_mixed_sampler=False)
+            max_beam_width=1)
         sampler = TorchSampler(args=sampler_args)
 
         # fill with garbage value so we can observe that finish reasons are filled with NOT_FINISHED before we write to them.

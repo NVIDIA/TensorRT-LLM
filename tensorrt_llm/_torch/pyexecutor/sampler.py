@@ -577,6 +577,7 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 
     def finish_reasons_list(self) -> FinishReasonsList:
         """`(num_seq_slots, num_steps)`"""
+        print(self.finish_reasons)
         return self.finish_reasons[:, :, BEAM].T.tolist()
 
 
@@ -620,8 +621,10 @@ class TorchSampler(Sampler):
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self.Store(
-                new_tokens=int_tensor(self.max_tokens, self.max_num_sequences, MAX_BEAM_WIDTH),
-                finish_reasons=int_tensor(self.max_tokens, self.max_num_sequences, MAX_BEAM_WIDTH),
+                new_tokens=int_tensor((self.max_tokens, self.max_num_sequences, MAX_BEAM_WIDTH)),
+                finish_reasons=int_tensor(
+                    (self.max_tokens, self.max_num_sequences, MAX_BEAM_WIDTH)
+                ),
             )
             # Helper tensors for finish_reasons:
             self._finish_reasons_nonzero_static_buffer = torch.empty(
@@ -630,7 +633,9 @@ class TorchSampler(Sampler):
             """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer).
             See `def _write_reason`."""
             self._reason_tensors = {
-                reason: torch.tensor(reason.value, dtype=self.finish_reasons.dtype, device="cuda")
+                reason: torch.tensor(
+                    reason.value, dtype=self.store.finish_reasons.dtype, device="cuda"
+                )
                 for reason in [
                     FinishReason.NOT_FINISHED,
                     FinishReason.END_ID,
@@ -1054,6 +1059,8 @@ class TorchSampler(Sampler):
         assert state.host is not None
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
+
+        print(finish_reasons)
         new_tokens_list = new_tokens.tolist()
 
         for req in state.scheduled_requests.context_requests:
@@ -1125,11 +1132,11 @@ class TorchSampler(Sampler):
         )
 
         finish_reasons = self.store.finish_reasons
-        finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
         self._write_finish_reasons(
             requests, finish_reasons=finish_reasons, seq_slots=seq_slots, new_tokens=new_tokens
         )
+        finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
 
         sampler_event = torch.cuda.Event()
         sampler_event.record()
