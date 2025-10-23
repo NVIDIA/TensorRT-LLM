@@ -28,7 +28,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     expected_parallel_config = _ParallelConfig(
         tp_size=world_size, gpus_per_node=expected_llm_args.gpus_per_node
     )
-    expected_parallel_config.world_size = world_size
     assert llm_args._parallel_config == expected_parallel_config, (
         f"Expected parallel_config {expected_parallel_config}, got {llm_args._parallel_config}"
     )
