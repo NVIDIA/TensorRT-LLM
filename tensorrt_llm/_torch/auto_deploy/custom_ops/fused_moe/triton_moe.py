@@ -372,6 +372,12 @@ def _invoke_kernel(
     EM = sorted_token_ids.numel()
     if EM == 0:
         return
+    if A.size(0) < config["BLOCK_SIZE_M"]:
+        # optimize for small batch_size.
+        # We assume that top_ids of each token is unique,
+        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
+        # and we can skip some invalid blocks.
+        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
 
     def _grid(META):
         return (

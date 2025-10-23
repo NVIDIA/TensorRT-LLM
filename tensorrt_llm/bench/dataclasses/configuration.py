@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -29,7 +28,9 @@ class RuntimeConfig(BaseModel):
     engine_dir: Optional[Path] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
-    world_config: ExecutorWorldConfig
+    # TODO: this is a dict corresponding to the Mapping class, the type should be
+    # changed to Mapping after the Mapping class is migrated to a Pydantic model.
+    mapping: Dict[str, Any]
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
     backend: Literal["pytorch", "_autodeploy", None] = None
@@ -47,15 +48,15 @@ class RuntimeConfig(BaseModel):
             "skip_tokenizer_init":
             True,
             "pipeline_parallel_size":
-            self.world_config.pp_size,
+            self.mapping["pp_size"],
             "tensor_parallel_size":
-            self.world_config.tp_size,
+            self.mapping["tp_size"],
             "gpus_per_node":
-            self.world_config.gpus_per_node,
+            self.mapping["gpus_per_node"],
             "moe_expert_parallel_size":
-            self.world_config.ep_size,
+            self.mapping["moe_ep_size"],
             "moe_cluster_parallel_size":
-            self.world_config.cluster_size,
+            self.mapping["moe_cluster_size"],
             "trust_remote_code":
             True,
             "enable_chunked_prefill":
@@ -162,57 +163,6 @@ class DecodingConfig(BaseModel):
             kwargs["medusa_choices"] = self.medusa_choices
 
         return trtllm.DecodingConfig(**kwargs)
-
-
-class ExecutorWorldConfig(BaseModel):
-    pp_size: int = 1
-    tp_size: int = 1
-    # None to make LLM-API deduce it with a rule.
-    gpus_per_node: Optional[int] = None
-    leader_mode: bool = False
-    ep_size: Optional[int] = None
-    cluster_size: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_world_size(self) -> ExecutorWorldConfig:
-        if self.gpus_per_node is None:
-            return self
-
-        parallel_world = self.pp_size * self.tp_size
-        num_gpus = self.world_size * self.gpus_per_node
-        valid_world = bool(num_gpus >= parallel_world)
-
-        if not valid_world:
-            raise ValueError(
-                f"World configuration is invalid, TP * PP ({parallel_world})"
-                "does not equal the total number of available GPUs"
-                f"({num_gpus}).")
-
-        return self
-
-    @property
-    def world_size(self) -> int:
-        return self.pp_size * self.tp_size
-
-    def _get_tensorrt_llm_executor_worker_path(self) -> Path:
-        module_path = find_spec("tensorrt_llm").loader.get_filename()
-        exec_path = Path(module_path).parent / 'bin' / 'executorWorker'
-        return exec_path.absolute()
-
-    def get_parallel_config(self) -> trtllm.ParallelConfig:
-        if self.leader_mode:
-            comm_mode = trtllm.CommunicationMode.LEADER
-            orchestrator_config = None
-        else:
-            comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
-            orchestrator_config = trtllm.OrchestratorConfig(
-                True, str(self._get_tensorrt_llm_executor_worker_path()))
-
-        return trtllm.ParallelConfig(
-            trtllm.CommunicationType.MPI,
-            comm_mode,
-            orchestrator_config=orchestrator_config,
-        )
 
 
 class ExecutorSettingsConfig(BaseModel):
