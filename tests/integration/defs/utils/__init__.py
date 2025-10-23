@@ -19,9 +19,13 @@ This package provides various utilities to simplify test development and reduce
 boilerplate code.
 """
 
+from .periodic_junit import PeriodicJUnitXML
 from .timeout_manager import (TimeoutManager, create_timeout_manager,
                               with_timeout_management)
 
 __all__ = [
-    'TimeoutManager', 'with_timeout_management', 'create_timeout_manager'
+    'PeriodicJUnitXML',
+    'TimeoutManager',
+    'with_timeout_management',
+    'create_timeout_manager',
 ]

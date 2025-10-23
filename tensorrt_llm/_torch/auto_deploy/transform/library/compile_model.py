@@ -24,8 +24,8 @@ class CompileModelConfig(TransformConfig):
     num_batched_inputs: int = Field(
         default=2, description="The number of batched inputs to use for CUDA graphs."
     )
-    compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
-        Field(description="The backend to use for compiling the model.")
+    backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = Field(
+        description="The backend to use for compiling the model."
     )
 
 
@@ -48,7 +48,7 @@ class CompileModel(BaseTransform):
     ) -> Tuple[nn.Module, TransformInfo]:
         cm.info.set_generate_only_batch()
 
-        compiler_cls = CompileBackendRegistry.get(self.config.compile_backend)
+        compiler_cls = CompileBackendRegistry.get(self.config.backend)
         mod_compiled = compiler_cls(
             mod,
             args=(),

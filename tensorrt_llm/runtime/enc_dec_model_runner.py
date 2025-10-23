@@ -27,13 +27,12 @@ def read_config(config_path: Path):
     plugin_config = builder_config['plugin_config']
     pretrained_config = config['pretrained_config']
     lora_config = builder_config['lora_config']
-    auto_parallel_config = builder_config['auto_parallel_config']
     use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
     remove_input_padding = plugin_config["remove_input_padding"]
     use_lora_plugin = plugin_config["lora_plugin"]
     tp_size = pretrained_config['mapping']['tp_size']
     pp_size = pretrained_config['mapping']['pp_size']
-    gpus_per_node = auto_parallel_config['gpus_per_node']
+    gpus_per_node = pretrained_config['mapping']['gpus_per_node']
     world_size = tp_size * pp_size
     assert world_size == mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({mpi_world_size()})'

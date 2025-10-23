@@ -452,7 +452,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(reason="https://nvbugs/5556020")
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])

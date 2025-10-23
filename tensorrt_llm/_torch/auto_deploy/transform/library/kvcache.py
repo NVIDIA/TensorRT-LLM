@@ -10,9 +10,10 @@ from torch.fx import GraphModule, Node
 
 from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry, Constant
 from ...distributed.common import all_gather_object, get_world_size
+from ...distributed.common import is_initialized as is_distributed_initialized
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...transformations._graph import add_graph_input
+from ...utils._graph import add_graph_input
 from ...utils.node_utils import get_all_input_output_nodes, is_op
 from ..interface import (
     BaseTransform,
@@ -64,16 +65,13 @@ class UpdateInOutNodes(BaseTransform):
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
-    attn_backend: Optional[str] = Field(default=None, description="The attention backend to use.")
+    backend: Optional[str] = Field(default=None, description="The attention backend to use.")
 
 
 @TransformRegistry.register("insert_cached_attention")
 class InsertCachedAttention(BaseTransform):
     """
-    A transform to insert cached attention into the graph module.
-
-    If attn_backend is not provided in transform config, will find from shared config.
-    """
+    A transform to insert cached attention into the graph module."""
 
     config: InsertCachedAttentionConfig
 
@@ -83,7 +81,7 @@ class InsertCachedAttention(BaseTransform):
 
     @property
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
-        return AttentionRegistry.get(self.config.attn_backend)
+        return AttentionRegistry.get(self.config.backend)
 
     def _process_get_metadata(
         self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
@@ -222,7 +220,7 @@ class ResizeKVCacheConfig(TransformConfig):
     """Configuration for the resize kv cache transform."""
 
     free_mem_ratio: float = Field(
-        description="The fraction of available memory to occupy.", default=0.8
+        default=0.0, ge=0.0, le=1.0, description="The fraction of available memory to occupy."
     )
 
 
@@ -255,11 +253,19 @@ class ResizeKVCache(BaseTransform):
         free_mem, total_mem = _get_mem_info_in_mb()
         self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
         current_cache_size = cm.current_cache_size_bytes()
+        current_kv_cache_size = getattr(cm, "current_kv_cache_size_bytes", None)
+        current_kv_cache_size = (
+            current_kv_cache_size() if callable(current_kv_cache_size) else current_cache_size
+        )
         current_num_pages = cm.info.num_pages
         self._log_info(
             f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
-            f"Current num pages (MB): {current_num_pages}"
+            f"Current num pages: {current_num_pages}"
         )
+        if current_kv_cache_size != current_cache_size:
+            self._log_info(
+                f"Current KV-only cache size (MB): {current_kv_cache_size // 1024 // 1024}"
+            )
 
         if free_mem_ratio == 0.0:
             self._log_info(f"Skipping cache resize for {free_mem_ratio=}")
@@ -283,15 +289,26 @@ class ResizeKVCache(BaseTransform):
         memory_for_forward_pass = free_mem_pre - free_mem_post
         self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
-        new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
-        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+        # Compute new pages using KV-only bytes to avoid SSM/conv inflating per-page cost
+        # Reserve headroom to avoid OOM from other allocations (workspaces, cudagraph pools, etc.)
+        reserve_mb = max(1024, (total_mem * 5) // 100)  # at least 1 GiB or 5% of total
+        available_mb = max(0, free_mem_post - reserve_mb)
 
-        # Need to sync all the GPUs
-        gathered_num_pages = [None] * get_world_size()
-        all_gather_object(gathered_num_pages, new_num_pages)
-        new_num_pages = min(gathered_num_pages)
-        self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
+        new_kv_total_bytes = int(
+            available_mb * 1024 * 1024 * free_mem_ratio + current_kv_cache_size
+        )
+        per_page_bytes = max(1, current_kv_cache_size // max(1, current_num_pages))
+        new_num_pages = int(new_kv_total_bytes // per_page_bytes)
 
+        # Need to sync all the GPUs if distributed group is initialized
+        log_msg = f"Using local new_num_pages: {new_num_pages}"
+        if is_distributed_initialized():
+            gathered_num_pages = [None] * get_world_size()
+            all_gather_object(gathered_num_pages, new_num_pages)
+            new_num_pages = min(gathered_num_pages)
+            log_msg = f"After all_gather - new_num_pages: {new_num_pages}"
+
+        self._log_info(log_msg)
         cm.resize_cache(new_num_pages)
 
         # Log the final cache size for performance measurement, do not remove this log.
@@ -329,5 +346,4 @@ class InitializeCache(BaseTransform):
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
         )
-
         return mod, info

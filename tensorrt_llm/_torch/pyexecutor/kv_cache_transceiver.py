@@ -38,10 +38,10 @@ def create_kv_cache_transceiver(
 
     if cache_transceiver_config.backend == BackendTypeCpp.DEFAULT:
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
-        # UCX is the default backend
-        cache_transceiver_config.backend = BackendTypeCpp.UCX
+        # NIXL is the default backend
+        cache_transceiver_config.backend = BackendTypeCpp.NIXL
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_NIXL_KVCACHE", BackendTypeCpp.NIXL),
+        env_vars = [("TRTLLM_USE_UCX_KVCACHE", BackendTypeCpp.UCX),
                     ("TRTLLM_USE_MPI_KVCACHE", BackendTypeCpp.MPI)]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
@@ -109,6 +109,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         # get the layer num per pp rank, which is required by cache transceiver.
         pp_layer_num = len(kv_cache_manager.pp_layers)
         pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
+
+        self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
                                         total_num_kv_heads_per_layer, head_dim,
                                         tokens_per_block, world_config,

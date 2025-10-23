@@ -1,21 +1,19 @@
 import asyncio
 import atexit
 import json
-import os
 import threading
 from typing import Optional
 
-from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import (AsyncQueue, _SyncQueue, logger_debug,
-                            print_colored_debug)
+from ..llmapi.utils import AsyncQueue, _SyncQueue, logger_debug
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
+from .rpc.rpc_common import get_unique_ipc_addr
 from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
@@ -33,7 +31,6 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         *,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ):
         """
         Args:
@@ -42,10 +39,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             mpi_session: the mpi session to use
             postproc_worker_config: the postproc worker config
             is_llm_executor: whether this is an llm executor
-            kv_connector_config: the kv cache connector config
         """
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
-        self.rpc_addr = self.gen_uniq_rpc_addr()
+        self.rpc_addr = get_unique_ipc_addr()
         self.rpc_client = RPCClient(self.rpc_addr)
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -360,16 +356,11 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
             if mpi_process_pre_spawned:
-                print_colored_debug('create comm session ...\n', "yellow")
+                logger_debug('create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
-                print_colored_debug('create pool session ...\n', "yellow")
+                logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
-            print_colored_debug('using external mpi session ...\n', "yellow")
+            logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
-
-    @staticmethod
-    def gen_uniq_rpc_addr() -> str:
-        process_id = os.getpid()
-        return f"ipc:///tmp/rpc-proxy-{process_id}-{GenerationExecutorRpcProxy.INSTANCE_COUNTER}"
