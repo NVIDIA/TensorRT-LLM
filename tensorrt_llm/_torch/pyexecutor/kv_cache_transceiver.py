@@ -53,7 +53,7 @@ def create_kv_cache_transceiver(
 
     if cache_transceiver_config.backend == BackendTypeCpp.MPI:
         logger.warning(
-            "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
+            "MPI CacheTransceiver is deprecated, NIXL or UCX is recommended")
     elif cache_transceiver_config.backend == BackendTypeCpp.UCX:
         logger.info(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
