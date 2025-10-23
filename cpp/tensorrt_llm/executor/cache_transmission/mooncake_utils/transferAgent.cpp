@@ -332,8 +332,28 @@ void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc c
 {
     TLLM_LOG_DEBUG("MooncakeTransferAgent::loadRemoteAgent");
 
-    // Do the same thing as connectRemoteAgent
-    connectRemoteAgent(name, std::move(agentDesc.getBackendAgentDesc()));
+    // Do the same thing as loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
+    loadRemoteAgent(name, std::move(agentDesc.getBackendAgentDesc()));
+}
+
+void MooncakeTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
+{
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "MooncakeTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
+        name.c_str());
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto segmentId = openSegment(mEngine, connectionInfo.c_str());
+
+    TLLM_CHECK_WITH_INFO(
+        segmentId >= 0, "loadRemoteAgent openSegment failed, connectionInfo: %s", connectionInfo.c_str());
+
+    mConnectedAgents[name].segmentId = segmentId;
+}
+
+void MooncakeTransferAgent::invalidateRemoteAgent(std::string const& name)
+{
+    TLLM_LOG_DEBUG("MooncakeTransferAgent::invalidateRemoteAgent");
 }
 
 AgentDesc MooncakeTransferAgent::getLocalAgentDesc()
@@ -351,9 +371,18 @@ AgentDesc MooncakeTransferAgent::getLocalAgentDesc()
     return AgentDesc{std::string(connectionInfo)};
 }
 
-void MooncakeTransferAgent::invalidateRemoteAgent(std::string const& name)
+ConnectionInfoType MooncakeTransferAgent::getLocalConnectionInfo()
 {
-    TLLM_LOG_DEBUG("MooncakeTransferAgent::invalidateRemoteAgent");
+    TLLM_LOG_DEBUG("MooncakeTransferAgent::getLocalConnectionInfo");
+
+    const static size_t kBufLen = 64;
+    char connectionInfo[kBufLen];
+
+    int ret = getLocalIpAndPort(mEngine, connectionInfo, kBufLen);
+
+    TLLM_CHECK_WITH_INFO(ret == 0, "MooncakeTransferAgent::getLocalAgentDesc::getLocalConnectionInfo failed");
+
+    return std::string(connectionInfo);
 }
 
 [[nodiscard]] std::unique_ptr<TransferStatus> MooncakeTransferAgent::submitTransferRequests(
@@ -486,35 +515,6 @@ void MooncakeTransferAgent::notifySyncMessage(std::string const& name, SyncMessa
 
     freeNotifsMsgBuf(notifyMsgs, size);
     return notifs;
-}
-
-ConnectionInfoType MooncakeTransferAgent::getConnectionInfo()
-{
-    TLLM_LOG_DEBUG("MooncakeTransferAgent::getConnectionInfo");
-
-    const static size_t kBufLen = 64;
-    char connectionInfo[kBufLen];
-
-    int ret = getLocalIpAndPort(mEngine, connectionInfo, kBufLen);
-
-    TLLM_CHECK_WITH_INFO(ret == 0, "MooncakeTransferAgent::getLocalAgentDesc::getConnectionInfo failed");
-
-    return std::string(connectionInfo);
-}
-
-void MooncakeTransferAgent::connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
-{
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "MooncakeTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s",
-        connectionInfo.c_str(), name.c_str());
-
-    std::lock_guard<std::mutex> lock(mMutex);
-    auto segmentId = openSegment(mEngine, connectionInfo.c_str());
-
-    TLLM_CHECK_WITH_INFO(
-        segmentId >= 0, "connectRemoteAgent openSegment failed, connectionInfo: %s", connectionInfo.c_str());
-
-    mConnectedAgents[name].segmentId = segmentId;
 }
 
 bool MooncakeTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs)

@@ -119,19 +119,19 @@ public:
 
     void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) override;
 
-    AgentDesc getLocalAgentDesc() override;
+    void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
 
     void invalidateRemoteAgent(std::string const& name) override;
+
+    AgentDesc getLocalAgentDesc() override;
+
+    ConnectionInfoType getLocalConnectionInfo() override;
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 
     void notifySyncMessage(std::string const& name, SyncMessage const& syncMessage) override;
 
     [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
-
-    ConnectionInfoType getConnectionInfo() override;
-
-    void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
