@@ -144,7 +144,7 @@ inline __device__ T warpReduceSumPartial(T val)
 template <typename T, bool SYNC = false>
 inline __device__ T blockReduceSumPartial(T val)
 {
-    __shared__ T smem[kWARP_SIZE + 1];
+    __shared__ T smem[kWARP_SIZE];
     int laneId = threadIdx.x & kLANE_ID_MASK;
     int warpId = threadIdx.x >> kLOG2_WARP_SIZE;
     int warpNum = (blockDim.x + kWARP_SIZE - 1) >> kLOG2_WARP_SIZE; // Ceiling division to include partial warps
@@ -178,6 +178,29 @@ inline __device__ T blockReduceSumPartial(T val)
     return val;
 }
 
+// blockReduceSum in reduceKernelUtils.cuh returns result only on warp0
+// So we need a duplicate implementation here where all threads get the result
+template <typename T>
+inline __device__ T blockReduceSumFull(T val)
+{
+    __shared__ T smem[kWARP_SIZE];
+    int lane_id = threadIdx.x & kLANE_ID_MASK;
+    int warp_id = threadIdx.x >> kLOG2_WARP_SIZE;
+    int warp_num = blockDim.x >> kLOG2_WARP_SIZE;
+
+    val = tensorrt_llm::common::warpReduceSum(val);
+    if (lane_id == 0)
+    {
+        smem[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = (lane_id < warp_num) ? smem[lane_id] : (T) 0.f;
+    val = tensorrt_llm::common::warpReduceSum(val);
+
+    return val;
+}
+
 template <typename T, bool SYNC = false>
 inline __device__ T blockReduceSum(T val)
 {
@@ -188,7 +211,7 @@ inline __device__ T blockReduceSum(T val)
     }
     else
     {
-        return tensorrt_llm::common::blockReduceSum<T>(val);
+        return blockReduceSumFull<T>(val);
     }
 }
 
