@@ -205,6 +205,12 @@ def fused_mlp_moe_kernel_w8a8(
     )
     token_mask = offs_token < num_valid_tokens
 
+    # Clamp offs_token to valid range to avoid out-of-bounds pointer arithmetic
+    # Padding tokens have value >= num_valid_tokens and will be masked out
+    # Clamp to last valid token instead of 0 to avoid cache/memory issues
+    max_valid_token = num_valid_tokens - 1
+    offs_token_clamped = tl.where(token_mask, offs_token, max_valid_token)
+
     # Expert id for this block (one expert per M-tile)
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
@@ -214,7 +220,7 @@ def fused_mlp_moe_kernel_w8a8(
             stride_cn,
             pid_n,
             N,
-            offs_token,
+            offs_token_clamped,
             token_mask,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
@@ -224,7 +230,9 @@ def fused_mlp_moe_kernel_w8a8(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    a_ptrs = a_ptr + (
+        offs_token_clamped[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
     b_ptrs = (
         b_ptr
         + off_experts * stride_be
@@ -260,7 +268,7 @@ def fused_mlp_moe_kernel_w8a8(
         accumulator = accumulator * moe_weight[:, None]
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + stride_cm * offs_token_clamped[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
