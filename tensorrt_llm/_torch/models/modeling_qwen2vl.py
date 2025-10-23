@@ -942,13 +942,6 @@ class Qwen2VLModelBase(PreTrainedModel):
 
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
-            print(
-                f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
-            )
-            print(f"len(input_ids): {input_ids.shape}")
-            print(
-                f"mm_embeds length: {[mm_embed.shape for mm_embed in mm_embeds]}"
-            )
             if not self.model_config.pretrained_config.disable_fuse_rope:
                 mrope_config = self.prepare_mrope_config(
                     multimodal_params, num_context_requests)
