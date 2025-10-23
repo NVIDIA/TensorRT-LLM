@@ -183,7 +183,6 @@ def row_linear_residual_norm_fusion_forward(
 )
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
                                          fusion):
-    pytest.skip("https://nvbugs/5597647")
     torch.manual_seed(42)
     tensor_parallel_size = 2
 
