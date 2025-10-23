@@ -96,11 +96,27 @@ class OpenAIServer:
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
-        try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
-        except Exception:
-            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
-            self.model_config = None
+        # Temporary workaround for DSv3.2 config.
+        import transformers
+
+        from tensorrt_llm._torch.model_config import _CONFIG_REGISTRY
+        config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+                hf_tokenizer_path,
+                trust_remote_code=trust_remote_code
+            )
+        model_type = config_dict.get("model_type")
+        if model_type in _CONFIG_REGISTRY:
+            config_class = _CONFIG_REGISTRY[model_type]
+            self.model_config = config_class.from_pretrained(
+                hf_tokenizer_path,
+                trust_remote_code=trust_remote_code
+            )
+        else:
+            try:
+                self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            except Exception:
+                logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
+                self.model_config = None
 
         # Enable response storage for Responses API
         self.enable_store = True
