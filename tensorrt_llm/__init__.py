@@ -77,7 +77,6 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
                      torch_dtype_to_trt)
-from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
@@ -130,8 +129,6 @@ __all__ = [
     'Module',
     'functional',
     'models',
-    'auto_parallel',
-    'AutoParallelConfig',
     'quantization',
     'tools',
     'LLM',
