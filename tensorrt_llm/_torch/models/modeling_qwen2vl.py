@@ -362,7 +362,11 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
-        videos, video_metadata = mm_data.get("video", (None, None))
+        video_datas = mm_data.get("video")
+        if video_datas is not None:
+            videos = [video_data.frames for video_data in video_datas]
+        else:
+            videos = None
         do_rescale = True
         if images and isinstance(images[0], torch.Tensor):
             do_rescale = False

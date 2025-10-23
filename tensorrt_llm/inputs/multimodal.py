@@ -9,6 +9,7 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+import tensorrt_llm
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -563,6 +564,13 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
+        elif isinstance(image, tensorrt_llm.inputs.utils.VideoData):
+            frames = image.frames
+            for frame in frames:
+                hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
+                hasher.update(serialize_item(frame))
         else:
             hasher.update(serialize_item(image))
 
@@ -627,6 +635,8 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                     image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
+                if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                    item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 if isinstance(item[0], torch.Tensor):
                     item = [ToPILImage()(frame) for frame in item]

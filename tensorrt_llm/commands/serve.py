@@ -330,7 +330,7 @@ class ChoiceWithAlias(click.Choice):
               is_flag=True,
               default=False,
               help="Enable chunked prefill")
-@click.option("--media-io-kwargs",
+@click.option("--media_io_kwargs",
               type=str,
               default=None,
               help="Keyword arguments for media I/O.")

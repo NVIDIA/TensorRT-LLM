@@ -3,6 +3,7 @@ import base64
 import math
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
@@ -26,6 +27,43 @@ from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class BaseModalityData:
+    """Base class for modality-specific data.
+
+    This class serves as the foundation for all modality data types (image, video, audio, etc.),
+    providing a common interface for modality-specific data structures.
+
+    Subclasses should define their own attributes based on the specific needs of each modality.
+    """
+
+
+@dataclass
+class VideoData(BaseModalityData):
+    """Data class for video loading results.
+
+    Attributes:
+        frames: List of video frames, either as PIL Images or PyTorch tensors.
+        metadata: Dictionary containing video metadata including:
+            - total_num_frames: Total number of frames in the video
+            - fps: Original frames per second of the video
+            - duration: Duration of the video in seconds
+            - frames_indices: List of indices of the sampled frames
+    """
+    frames: Union[List[Image.Image], List[torch.Tensor]]
+    """The loaded video frames, either as PIL Images or PyTorch tensors."""
+
+    metadata: Dict[str, Any]
+    """Metadata associated with the video (e.g., fps, duration, frame indices)."""
+
+    def __post_init__(self):
+        """Validate that frames list is not empty."""
+        if not self.frames:
+            raise ValueError("frames list cannot be empty")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("metadata must be a dictionary")
 
 
 def rgba_to_rgb(
@@ -126,13 +164,11 @@ async def async_load_image(
         return image
 
 
-def _load_video_by_cv2(
-    video: str,
-    num_frames: int = 10,
-    fps: int = 30,
-    format: str = "pt",
-    device: str = "cpu"
-) -> Tuple[Union[List[Image.Image], List[torch.Tensor]], Dict[str, Any]]:
+def _load_video_by_cv2(video: str,
+               num_frames: int = 10,
+               fps: int = 30,
+               format: str = "pt",
+               device: str = "cpu") -> VideoData:
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
 
@@ -202,7 +238,7 @@ def _load_video_by_cv2(
         "frames_indices": list(indices),
     }
 
-    return loaded_frames, metadata
+    return VideoData(frames=loaded_frames, metadata=metadata)
 
 
 def load_base64_video(video: str) -> BytesIO:
@@ -249,7 +285,7 @@ async def async_load_video(
     fps: int = 30,
     format: str = "pt",
     device: str = "cpu"
-) -> Tuple[Union[List[Image.Image], List[torch.Tensor]], Dict[str, Any]]:
+) -> VideoData:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
