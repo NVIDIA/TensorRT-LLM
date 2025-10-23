@@ -99,8 +99,8 @@ echo "Full Command: $pytestCommand"
     done
  fi
 
-
 eval $pytestCommand
+echo "Rank${SLURM_PROCID} Pytest finished execution"
 
 if [ "$perfMode" = "true" ]; then
     if [[ "$stageName" == *PyTorch* ]]; then
