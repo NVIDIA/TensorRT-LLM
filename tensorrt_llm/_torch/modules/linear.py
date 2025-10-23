@@ -745,6 +745,27 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
 
 class NVFP4LinearMethod(LinearMethodBase):
+    def weight_and_scale_maybe_pad(self,
+                                   module: Linear,
+                                   weight_scale: torch.Tensor,
+                                   row_alignment: int = 32,
+                                   col_alignment: int = 16) -> torch.Tensor:
+        # Weight may need padding because of the alignment requirement from torch.ops.trtllm.nvfp4_gemm
+        # Weight_scale should also need padding together with weight, and this padding should happen 
+        # before itself's padding.
+        row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
+        col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
+        module.weight = Parameter(F.pad(module.weight, (0, col_pad_size, 0, row_pad_size), 
+                                  mode='constant', value=0),
+                                  requires_grad=False)
+        weight_col_size = module.weight.size(1)
+        assert (weight_col_size * 2) % module.scaling_vector_size == 0, f"weight column size after padding {weight_col_size} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        if row_pad_size != 0 or col_pad_size != 0:
+            weight_scale = F.pad(weight_scale, (0, (col_pad_size * 2) // module.scaling_vector_size, 0, row_pad_size),
+                                 mode='constant', value=0)
+
+        return weight_scale
+
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -824,6 +845,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                                                      act_sf,
                                                      module.weight_scale,
                                                      module.alpha, module.dtype)
+        # Take the dim of out_features if padded.
+        if output.shape[-1] > module.out_features:
+            output = output[..., :module.out_features]
 
         if bias is not None:
             output = output + bias
@@ -891,6 +915,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         assert len(weights) == 1
         weight_scale = weight_scale[0]
+        weight_scale = self.weight_and_scale_maybe_pad(module, weight_scale)
         # Swizzle weight scale
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
 
@@ -905,6 +930,8 @@ class NVFP4LinearMethod(LinearMethodBase):
                                       weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
+        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        copy_weight(module.weight, fused_weight)
 
         input_scale, weight_scales, alpha = self.load_weight_scales(
             weights,
@@ -913,13 +940,12 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
+        weight_scale = self.weight_and_scale_maybe_pad(module, weight_scale)
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
         module.scalar_alpha = alpha.item()
-        fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        copy_weight(module.weight, fused_weight)
 
         # Load k and v scales, used for NVFP4 KV cache
         k_scale, v_scale = self.load_kv_scales(weights)
@@ -951,6 +977,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
+        weight_scale = self.weight_and_scale_maybe_pad(module, weight_scale)
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
