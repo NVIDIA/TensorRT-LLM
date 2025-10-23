@@ -1153,6 +1153,10 @@ class KVCacheManager(BaseResourceManager):
         else:
             return None
 
+    def reset_reuse_state(self):
+        """Reset the reuse state of the KV cache manager."""
+        self.impl.reset_reuse_state()
+
 
 class SlotManager:
 

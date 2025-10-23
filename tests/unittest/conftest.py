@@ -16,6 +16,7 @@
 import os
 import sys
 import traceback
+import warnings
 from functools import partial
 from typing import Any
 
@@ -24,6 +25,7 @@ import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import get_current_process_gpu_memory
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
@@ -316,3 +318,28 @@ def _maybe_force_ray(request, monkeypatch, ray_mode):
                             raising=False)
     except Exception:
         pass
+
+
+@pytest.fixture(scope="module")
+def process_gpu_memory_info_available():
+    """
+    Checks if NVML can get per-process memory information.
+    """
+
+    # Allocate a small tensor to test memory tracking
+    tensor = torch.zeros(4096, dtype=torch.int32, device='cuda')
+    torch.cuda.synchronize()
+
+    # Try to get memory usage
+    usage = get_current_process_gpu_memory()
+
+    # Clean up
+    del tensor
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    if usage == 0:
+        warnings.warn("Per process memory information unavailable.")
+        return False
+
+    return True
