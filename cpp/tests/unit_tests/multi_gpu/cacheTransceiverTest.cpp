@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
@@ -650,6 +651,9 @@ protected:
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
             bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
             bool isMooncake = tensorrt_llm::common::getEnvUseMooncakeKvCache();
+            // Skip tests for MOONCAKE when on Rocky8
+            bool isRocky8 = std::filesystem::exists("/etc/redhat-release");
+            isMooncake = isMooncake && !isRocky8;
             TLLM_LOG_INFO("Enable %s KV cache transport.",
                 isUcx            ? "UCX"
                     : isNixl     ? "NIXL"
