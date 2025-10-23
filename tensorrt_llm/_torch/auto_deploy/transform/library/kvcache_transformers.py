@@ -12,6 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...custom_ops.attention_interface import AttentionDescriptor, Constant
+from ...export.library.unified_attn import HF_ATTN_KWARGS_MAPPING
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -39,16 +40,8 @@ def fake_profiler_mha(
 
     # construct kwargs for bsnd_grouped_sdpa
     node_kwargs = {"attn_mask": attention_mask, "is_causal": is_causal}
-    kwargs_to_op = {
-        "dropout": "dropout_p",
-        "scaling": "scale",
-        "scale": "scale",
-        "s_aux": "sinks",
-        "sinks": "sinks",
-        "sliding_window": "sliding_window",
-        "logit_cap": "logit_cap",
-    }
-    for k_kwargs, k_op_kwargs in kwargs_to_op.items():
+
+    for k_kwargs, k_op_kwargs in HF_ATTN_KWARGS_MAPPING.items():
         if k_kwargs in kwargs:
             node_kwargs[k_op_kwargs] = kwargs[k_kwargs]
 
