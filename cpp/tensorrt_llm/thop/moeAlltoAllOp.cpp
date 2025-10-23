@@ -592,18 +592,23 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         []() -> int64_t { return static_cast<int64_t>(torch_ext::PAYLOAD_DATA_OFFSET_INDEX); });
 
     module.def(
-        "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor workspace, int "
+        "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor(a!) workspace, int "
         "max_tokens_per_rank, "
-        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor[], Tensor, Tensor, Tensor, Tensor, int)");
+        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor(a)[], Tensor(a), Tensor(a), Tensor, Tensor, "
+        "int)");
     module.def(
-        "moe_a2a_combine(Tensor topk_target_ranks, Tensor topk_send_indices, Tensor recv_counters, Tensor payload, "
-        "Tensor workspace, int max_tokens_per_rank, int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
+        "moe_a2a_combine(Tensor topk_target_ranks, Tensor topk_send_indices, Tensor(a) recv_counters, Tensor(a) "
+        "payload, "
+        "Tensor(a!) workspace, int max_tokens_per_rank, int ep_rank, int ep_size, int top_k, int "
+        "combine_payload_offset, "
         "bool payload_in_workspace) -> Tensor");
-    module.def("moe_a2a_initialize(Tensor workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
-    module.def("moe_a2a_sanitize_expert_ids(Tensor expert_ids, Tensor recv_counters, int invalid_expert_id) -> ()");
     module.def(
-        "moe_a2a_get_combine_payload_tensor(Tensor workspace, int ep_rank, int ep_size, int max_tokens_per_rank, int "
-        "combine_payload_offset, ScalarType out_dtype, int hidden) -> Tensor");
+        "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
+    module.def("moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor recv_counters, int invalid_expert_id) -> ()");
+    module.def(
+        "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int max_tokens_per_rank, "
+        "int "
+        "combine_payload_offset, ScalarType out_dtype, int hidden) -> Tensor(a)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
