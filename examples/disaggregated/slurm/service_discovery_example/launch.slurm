@@ -1,15 +1,16 @@
-#!/bin/bash
+bin/bash
 #SBATCH --partition=${partition}
 #SBATCH --account=${account}
 #SBATCH --job-name=${job_name}
 #SBATCH --time=02:00:00
 
-container_image=""
-mount_paths=""
-work_path=""
-disagg_port=8000
-ctx_port=8001
-gen_port=8002
+container_image="${container_image:-}"
+mount_paths="${mount_paths:-}"
+work_path="${work_path:-}"
+enable_etcd="${enable_etcd:-0}"
+disagg_port="8000"
+ctx_port="8001"
+gen_port="8002"
 
 # use the first node as the disaggregated server node
 disagg_server_node=$(head -n 1 <(scontrol show hostnames $SLURM_JOB_NODELIST))
@@ -55,7 +56,7 @@ srun --container-image=${container_image} \
      --container-mounts=${mount_paths} \
      -w $disagg_server_node -N 1 --ntasks-per-node=1 \
      --mpi=pmix \
-     bash -c "trtllm-llmapi-launch trtllm-serve disaggregated -c ${work_path}/disagg_config.yaml"
+     bash -c "trtllm-llmapi-launch trtllm-serve disaggregated -c ${work_path}/disagg_config.yaml" &
 
 # Launch a context with `tp_size=8` using two 4-GPU nodes, and register itself through disagg_cluster_uri
 srun --container-image=${container_image} \
@@ -69,4 +70,4 @@ srun --container-image=${container_image} \
      --container-mounts=${mount_paths} \
      -N 1 --ntasks-per-node=4 \
      --mpi=pmix \
-     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 8 --host 0.0.0.0 --port ${gen_port} --extra_llm_api_options ${work_path}/gen_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role generation" &
+     bash -c "trtllm-llmapi-launch trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp_size 4 --host 0.0.0.0 --port ${gen_port} --extra_llm_api_options ${work_path}/gen_extra-llm-api-config.yaml --disagg_cluster_uri ${disagg_cluster_uri} --server-role generation" &
