@@ -32,7 +32,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config import PyTorchConfig, _construct_checkpoint_loader
+from .config import PyTorchConfig
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -234,11 +234,6 @@ def create_py_executor(
     mm_encoder_only = llm_args.mm_encoder_only
     enable_chunked_context = llm_args.enable_chunked_prefill
 
-    assert llm_args.backend == "pytorch", "_construct_checkpoint_loader expects different parameters for autodeploy"
-    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
-                                                     llm_args.checkpoint_loader,
-                                                     llm_args.checkpoint_format)
-
     (
         max_beam_width,
         max_num_tokens,
@@ -302,8 +297,6 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-    sparse_attention_config = llm_args.sparse_attention_config
-
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
@@ -319,17 +312,11 @@ def create_py_executor(
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
             pytorch_backend_config=pytorch_backend_config,
-            batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
-            sparse_attention_config=sparse_attention_config,
-            lora_config=lora_config,
-            checkpoint_loader=checkpoint_loader,
+            llm_args=llm_args,
         )
 
     validate_feature_combination(llm_args, model_engine,
@@ -366,19 +353,13 @@ def create_py_executor(
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
                 pytorch_backend_config=draft_pytorch_backend_config,
-                batch_size=max_batch_size,
-                max_beam_width=max_beam_width,
-                max_num_tokens=max_num_tokens,
-                # Note: The draft model engine will infer its own max_seq_len.
-                # We'll stop drafting when we hit the max.
-                max_seq_len=max_seq_len,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
-                checkpoint_loader=checkpoint_loader,
                 is_draft_model=True,
                 drafting_loop_wrapper=drafting_loop_wrapper,
+                llm_args=llm_args,
             )
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
             if spec_config.spec_dec_mode.is_mtp_eagle():
@@ -571,7 +552,7 @@ def create_py_executor(
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
-            sparse_attention_config=sparse_attention_config,
+            sparse_attention_config=llm_args.sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(

@@ -1,0 +1,37 @@
+version: 0.0.1
+perf_sanity_l0_dgx_b200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - perf/test_perf.py::test_perf[perf_sanity-l0_dgx_b200-r1_fp4_dep4:con1_iter1_1024_1024]
+  - perf/test_perf.py::test_perf[perf_sanity-l0_dgx_b300-r1_fp4_dep4:con1_iter1_1024_1024]
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - perf/test_perf.py::test_perf[perf_sanity-l0_dgx_b200-r1_fp4_dep4:con1_iter1_1024_1024]
+  - perf/test_perf.py::test_perf[perf_sanity-l0_dgx_b300-r1_fp4_dep4:con1_iter1_1024_1024]
