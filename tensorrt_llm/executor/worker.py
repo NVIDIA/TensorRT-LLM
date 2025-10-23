@@ -19,7 +19,7 @@ from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, print_colored_debug,
+                            clear_sched_affinity, logger_debug,
                             print_traceback_on_error)
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
@@ -175,7 +175,7 @@ class GenerationExecutorWorker(BaseWorker):
         else:
             self.doing_shutdown = True
 
-        print_colored_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+        logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
@@ -210,7 +210,7 @@ class GenerationExecutorWorker(BaseWorker):
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
-        print_colored_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
+        logger_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
 
     def block_subordinates(self):
         if self.rank != 0:
@@ -243,8 +243,7 @@ def worker_main(
     llm_args: Optional[BaseLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
-    print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
-                        "green")
+    logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
     pid = os.getpid()
     cpus = os.sched_getaffinity(pid)
@@ -326,7 +325,7 @@ def worker_main(
 
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
-        print_colored_debug(f"initiate postprocess workers...", "yellow")
+        logger_debug(f"initiate postprocess workers...", "yellow")
 
         proxy_result_queue: tuple[
             str, Optional[bytes]] = worker_queues.result_queue_addr
@@ -357,8 +356,7 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
-    print_colored_debug(f"Worker {mpi_rank()} ready to setup backend...\n",
-                        "green")
+    logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
         worker: GenerationExecutorWorker = worker_cls(
@@ -373,7 +371,7 @@ def worker_main(
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
-        print_colored_debug(f"error: {traceback.format_exc()}", "red")
+        logger_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
             # Send error message with confirmation
             error_msg = (e, traceback.format_exc())

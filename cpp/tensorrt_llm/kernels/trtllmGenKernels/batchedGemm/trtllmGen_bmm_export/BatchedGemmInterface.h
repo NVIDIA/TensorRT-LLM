@@ -530,6 +530,9 @@ public:
         return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
     }
 
+    // Creates GemmOptions from kernel and data.
+    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
+
     // Returns the number of CTAs of the current kernel.
     int32_t getNumCtas(
         BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
@@ -540,9 +543,6 @@ public:
 
     // Returns true if the configuration of the cubin can be executed for the given params.
     bool isValidConfig(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
-
-    // Creates GemmOptions from kernel and data.
-    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
 private:
     // Aligns the pointer to the alignment

@@ -989,14 +989,20 @@ class PyExecutor:
 
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
+                        attn_metadata = getattr(self.model_engine,
+                                                'attn_metadata', None)
+                        kv_cache_dtype_byte_size = getattr(
+                            self.model_engine, 'kv_cache_dtype_byte_size', None)
                         self.resource_manager.update_resources(
-                            previous_scheduled_batch)
+                            previous_scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
                         self._remove_inflight_ids(previous_scheduled_batch)
 
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
 
                 if self._disagg_pp_termination_handler is not None:
@@ -1025,6 +1031,7 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             self._check_disagg_gen_transfer_status()
+            self._check_kv_transfer_timeout()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -1198,11 +1205,18 @@ class PyExecutor:
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
-                    self.resource_manager.update_resources(scheduled_batch)
+                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                            None)
+                    kv_cache_dtype_byte_size = getattr(
+                        self.model_engine, 'kv_cache_dtype_byte_size', None)
+                    self.resource_manager.update_resources(
+                        scheduled_batch, attn_metadata,
+                        kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
@@ -1387,6 +1401,7 @@ class PyExecutor:
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
@@ -1399,7 +1414,12 @@ class PyExecutor:
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.sample_state.scheduled_requests
-        self.resource_manager.update_resources(scheduled_requests)
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                           'kv_cache_dtype_byte_size', None)
+        self.resource_manager.update_resources(scheduled_requests,
+                                               attn_metadata,
+                                               kv_cache_dtype_byte_size)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -1595,6 +1615,34 @@ class PyExecutor:
 
         return
 
+    @nvtx_range("_check_kv_transfer_timeout")
+    def _check_kv_transfer_timeout(self):
+        if not self.kv_cache_transceiver:
+            return
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+
+        def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
+            current_time = time.time()
+            if req.py_kv_transfer_start_time is None:
+                return
+            elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
+            if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
+                logger.warning(
+                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
+                )
+                req.py_kv_transfer_timed_out = True
+
+        for req, _ in self.ctx_in_transmission_requests:
+            flag_if_kv_transfer_timed_out(req, "context")
+
+        for req in self.active_requests:
+            if req.is_disagg_generation_transmission_in_progress:
+                flag_if_kv_transfer_timed_out(req, "generation")
+
+        return
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -1669,6 +1717,7 @@ class PyExecutor:
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
+                req.py_kv_transfer_start_time = None
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -1691,6 +1740,11 @@ class PyExecutor:
         else:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_async(req)
+
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            for req in new_gen_reqs:
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
 
         block_transfer = all([
             req.is_disagg_generation_transmission_in_progress
@@ -1723,6 +1777,10 @@ class PyExecutor:
             req for req in scheduled_ctx_requests
             if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
+
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            for req in ctx_transmission_reqs:
+                req.py_kv_transfer_start_time = time.time()
 
         return ctx_transmission_reqs
 
@@ -2051,6 +2109,15 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
+            # Check if generation request needs cleanup due to KV cache transfer timeout
+            if request.py_kv_transfer_timed_out:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                if is_cancelled:
+                    self._handle_errors(
+                        error_msg=f"Request {request.py_request_id} timed out",
+                        requests=[request])
+                continue
+
             if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
@@ -2125,6 +2192,15 @@ class PyExecutor:
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
         for request, block_id in self.ctx_in_transmission_requests[:]:
+
+            if request.py_kv_transfer_timed_out:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                # If cancel is successful, mark as complete so it can be cleaned up
+                # Otherwise, try at next iteration
+                if is_cancelled:
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
             if request.is_disagg_context_complete_state:
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
