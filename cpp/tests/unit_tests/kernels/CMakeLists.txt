@@ -12,6 +12,7 @@
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_gtest(testInvokeConversion testInvokeConversion.cpp)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)

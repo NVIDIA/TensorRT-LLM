@@ -450,4 +450,10 @@ bool getEnvDisableChunkedAttentionInGenPhase()
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
 }
 
+bool getEnvEnableKVCachePrecisionConversion()
+{
+    static bool const enableKVCachePrecisionConversion = getBoolEnv("TRTLLM_ENABLE_KVCACHE_PRECISION_CONVERSION");
+    return enableKVCachePrecisionConversion;
+}
+
 } // namespace tensorrt_llm::common
