@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm import internal as _tllm_internal
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -43,20 +44,20 @@ class MoeAlltoAll:
     def _init_constants(cls):
         """Initialize constants from C++ if not already done."""
         if cls.FLAG_VAL_OFFSET_INDEX is None:
-            cls.FLAG_VAL_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_FLAG_VAL_OFFSET_INDEX(
-            )
-            cls.LOCAL_TOKEN_COUNTER_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX(
-            )
-            cls.SEND_COUNTERS_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_SEND_COUNTERS_OFFSET_INDEX(
-            )
-            cls.RECV_COUNTERS_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_RECV_COUNTERS_OFFSET_INDEX(
-            )
-            cls.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX(
-            )
-            cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX(
-            )
-            cls.PAYLOAD_DATA_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX(
-            )
+            thop = _tllm_internal.thop
+            cls.FLAG_VAL_OFFSET_INDEX = int(thop.MOE_A2A_FLAG_VAL_OFFSET_INDEX)
+            cls.LOCAL_TOKEN_COUNTER_OFFSET_INDEX = int(
+                thop.MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX)
+            cls.SEND_COUNTERS_OFFSET_INDEX = int(
+                thop.MOE_A2A_SEND_COUNTERS_OFFSET_INDEX)
+            cls.RECV_COUNTERS_OFFSET_INDEX = int(
+                thop.MOE_A2A_RECV_COUNTERS_OFFSET_INDEX)
+            cls.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = int(
+                thop.MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX)
+            cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = int(
+                thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX)
+            cls.PAYLOAD_DATA_OFFSET_INDEX = int(
+                thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
 
     def __init__(
         self,

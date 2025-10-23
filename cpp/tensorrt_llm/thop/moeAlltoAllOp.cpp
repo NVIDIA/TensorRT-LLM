@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -26,21 +27,6 @@
 
 namespace torch_ext
 {
-
-// Enum for indexing into moe_a2a_metainfo tensor
-enum MoeA2AMetaInfoIndex
-{
-    FLAG_VAL_OFFSET_INDEX = 0,
-    LOCAL_TOKEN_COUNTER_OFFSET_INDEX = 1,
-    SEND_COUNTERS_OFFSET_INDEX = 2,
-    RECV_COUNTERS_OFFSET_INDEX = 3,
-    // Dispatch completion flags offset
-    DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = 4,
-    // Combine completion flags offset
-    COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = 5,
-    PAYLOAD_DATA_OFFSET_INDEX = 6,
-    NUM_METAINFO_FIELDS = 7
-};
 
 namespace
 {
@@ -575,22 +561,6 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
 // PyTorch bindings
 TORCH_LIBRARY_FRAGMENT(trtllm, module)
 {
-    // Export metainfo index constants
-    module.def("MOE_A2A_FLAG_VAL_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::FLAG_VAL_OFFSET_INDEX); });
-    module.def("MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::LOCAL_TOKEN_COUNTER_OFFSET_INDEX); });
-    module.def("MOE_A2A_SEND_COUNTERS_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::SEND_COUNTERS_OFFSET_INDEX); });
-    module.def("MOE_A2A_RECV_COUNTERS_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::RECV_COUNTERS_OFFSET_INDEX); });
-    module.def("MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX); });
-    module.def("MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::COMBINE_COMPLETION_FLAGS_OFFSET_INDEX); });
-    module.def("MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX() -> int",
-        []() -> int64_t { return static_cast<int64_t>(torch_ext::PAYLOAD_DATA_OFFSET_INDEX); });
-
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor(a!) workspace, int "
         "max_tokens_per_rank, "
