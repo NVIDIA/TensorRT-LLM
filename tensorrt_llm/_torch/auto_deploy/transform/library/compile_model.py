@@ -51,7 +51,8 @@ class CompileModel(BaseTransform):
         compiler_cls = CompileBackendRegistry.get(self.config.compile_backend)
         egm_compiled = compiler_cls(
             gm,
-            args=cm.args,
+            args=(),
+            kwargs=cm.named_args,
             max_batch_size=cm.info.max_batch_size,
             **self.config.model_dump(),
         ).compile()

@@ -28,27 +28,6 @@ class Mistral3VLM(hf.AutoModelForImageTextToTextFactory):
 
         return extra_inputs
 
-    @staticmethod
-    def _strict_forward(
-        model: torch.nn.Module,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-        image_sizes: torch.Tensor,
-    ):
-        """A strict (args-only) forward pass for the model to functionalize the args.
-
-        It adds ``pixel_values`` and ``image_sizes`` as a positional argument as expected by
-        Mistral3Model in addition to the required ``input_ids`` and ``position_ids``.
-        """
-        return type(model).forward(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-        )
-
     @property
     def _example_image_dims(self) -> Tuple[int, int]:
         # The pixtral processor requires a minimum image size, which is larger than the default (16, 16)

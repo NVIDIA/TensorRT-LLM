@@ -165,6 +165,9 @@ class ModelDrafter(Drafter):
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
                                               request.get_tokens(0))
 
+        is_eagle_style = self.spec_config.spec_dec_mode.is_eagle3(
+        ) or self.spec_config.spec_dec_mode.is_mtp_eagle()
+
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
             # This is the first time the draft model is seeing this request.
@@ -174,10 +177,8 @@ class ModelDrafter(Drafter):
             return self._create_context_request(request, input_tokens)
 
         # For TRTLLM attention backend, we need to create a generation request for both no tokens accepted and tokens accepted
-        elif issubclass(
-                self.draft_model_engine.attn_backend, TrtllmAttention
-        ) and self.use_static_draft_loop and self.spec_config.spec_dec_mode.is_eagle3(
-        ):
+        elif issubclass(self.draft_model_engine.attn_backend, TrtllmAttention
+                        ) and self.use_static_draft_loop and is_eagle_style:
             return self._create_accepted_tokens_request_for_trtllm_attn(
                 request, input_tokens, num_accepted_tokens)
 
