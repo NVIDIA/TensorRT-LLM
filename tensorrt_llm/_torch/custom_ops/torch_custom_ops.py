@@ -1194,7 +1194,7 @@ class AllReduceRunner(TunableRunner):
         if tactic == -1:
             tactic = AllReduceStrategy.NCCL.value
 
-        torch.ops.trtllm.allreduce(
+        return torch.ops.trtllm.allreduce(
             input,
             residual,
             norm_weight,
@@ -1242,21 +1242,9 @@ def tunable_allreduce(
         [input, residual, norm_weight, scale, bias, workspace],
     )
 
-    if best_tactic == -1:
-        best_tactic = AllReduceStrategy.NCCL.value
-
-    return torch.ops.trtllm.allreduce(
-        input,
-        residual,
-        norm_weight,
-        scale,
-        bias,
-        workspace,
-        group,
-        best_tactic,
-        op,
-        eps,
-        trigger_completion_at_end,
+    return allreduce_runner(
+        [input, residual, norm_weight, scale, bias, workspace],
+        tactic=best_tactic,
     )
 
 

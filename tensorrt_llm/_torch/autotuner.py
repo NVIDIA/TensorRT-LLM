@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._utils import mpi_barrier
+from tensorrt_llm._utils import mpi_barrier, mpi_broadcast
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 
@@ -659,6 +659,13 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
+        """Profile runners and select the best tactic.
+
+        For multi-rank profiling, only rank 0 performs the actual profiling
+        to avoid sync issues when different ranks select different tactics.
+        The results are then broadcasted to all other ranks.
+        """
+
         min_time = float('inf')
         has_tuning_failure_occured = False
         best_runner_id, best_tactic = None, None
@@ -708,6 +715,13 @@ class AutoTuner:
                 if time_measured < min_time:
                     min_time = time_measured
                     best_runner_id, best_tactic = runner_id, tac
+
+        if self._is_sync_op(runner):
+            profiling_results = (best_runner_id, best_tactic, min_time,
+                                 has_tuning_failure_occured)
+            # Broadcast profiling results from rank 0 to all other ranks
+            profiling_results = mpi_broadcast(profiling_results, root=0)
+            best_runner_id, best_tactic, min_time, has_tuning_failure_occured = profiling_results
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occured
 
