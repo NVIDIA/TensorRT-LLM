@@ -252,31 +252,31 @@ private:
     std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>>* mObservers;
 };
 
-// Helper function to log memory usage - returns the memory values for potential error handling
-static std::pair<size_t, size_t> logMemoryUsage(char const* operation, CUcontext ctx)
+// Unified helper function for memory logging and error handling
+// If status is CUBLAS_STATUS_SUCCESS, it just logs memory usage
+// Otherwise, it logs and throws an error with memory diagnostics
+static void logMemoryAndHandleError(char const* operation, CUcontext ctx, cublasStatus_t status = CUBLAS_STATUS_SUCCESS)
 {
     size_t free_mem = 0, total_mem = 0;
     TLLM_CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
 
-    TLLM_LOG_DEBUG("%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx,
-        free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0, total_mem / (1024 * 1024));
+    size_t free_mb = free_mem / (1024 * 1024);
+    size_t total_mb = total_mem / (1024 * 1024);
+    float free_percent = (total_mem > 0) ? ((float) free_mem / total_mem * 100.0f) : 0.0f;
 
-    return {free_mem, total_mem};
-}
+    // Always log the memory state
+    TLLM_LOG_DEBUG(
+        "%s: Context=%p, Free Memory=%zu MB (%.1f%%), Total=%zu MB", operation, ctx, free_mb, free_percent, total_mb);
 
-// Helper function to handle memory-related errors for cublas handle creation.
-static void throwCublasMemoryError(char const* handleType, cublasStatus_t status, CUcontext ctx)
-{
-    // Re-fetch and log current memory state for debugging
-    auto [free_mem, total_mem] = logMemoryUsage(
-        (std::string("Failed to create ") + handleType + " - logging current memory state").c_str(), ctx);
-
-    TLLM_THROW(
-        "Failed to create %s. "
-        "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
-        "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
-        handleType, status, ctx, free_mem / (1024 * 1024), (float) free_mem / total_mem * 100.0,
-        total_mem / (1024 * 1024));
+    // If there's an error, throw with details
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        TLLM_THROW(
+            "Failed to create %s. "
+            "Status: %d, Context: %p, Free Memory: %zu MB (%.1f%%), Total: %zu MB. "
+            "Consider reducing kv_cache_config.free_gpu_memory_fraction.",
+            operation, status, ctx, free_mb, free_percent, total_mb);
+    }
 }
 
 } // namespace
@@ -287,7 +287,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
         []() -> auto
         {
             CUcontext ctx = getCurrentCudaCtx();
-            auto [free_mem, total_mem] = logMemoryUsage("Creating cublas handle", ctx);
+            logMemoryAndHandleError("Creating cublas handle", ctx);
 
             auto handle = std::make_unique<cublasHandle_t>();
 
@@ -295,7 +295,7 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                throwCublasMemoryError("cublas handle", status, ctx);
+                logMemoryAndHandleError("cublas handle", ctx, status);
             }
 
             return handle;
@@ -319,7 +319,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         []() -> auto
         {
             CUcontext ctx = getCurrentCudaCtx();
-            auto [free_mem, total_mem] = logMemoryUsage("Creating cublasLt handle", ctx);
+            logMemoryAndHandleError("Creating cublasLt handle", ctx);
 
             auto handle = std::make_unique<cublasLtHandle_t>();
 
@@ -327,7 +327,7 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
 
             if (status != CUBLAS_STATUS_SUCCESS)
             {
-                throwCublasMemoryError("cublasLt handle", status, ctx);
+                logMemoryAndHandleError("cublasLt handle", ctx, status);
             }
 
             return handle;
