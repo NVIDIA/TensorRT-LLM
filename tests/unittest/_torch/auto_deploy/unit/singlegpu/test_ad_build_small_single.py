@@ -4,37 +4,34 @@ import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
-from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
 
-def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
+def _check_ad_config(experiment_config: ExperimentConfig, ad_config: LlmArgs):
     # Verify that llm_args was captured
-    assert llm_args is not None, "llm_args should have been captured"
+    assert ad_config is not None, "llm_args should have been captured"
 
     # Check that llm_args is an instance of LlmArgs and also an instance of AutoDeployConfig
-    assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
-    assert isinstance(llm_args, AutoDeployConfig), (
-        f"Expected AutoDeployConfig, got {type(llm_args)}"
-    )
+    assert isinstance(ad_config, LlmArgs), f"Expected LlmArgs, got {type(ad_config)}"
 
     # check that llm_args and experiment_config have the same args
-    expected_ad_config: AutoDeployConfig = experiment_config.args
-    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.to_llm_kwargs())
-    assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
+    expected_llm_args: LlmArgs = experiment_config.args
+    assert expected_llm_args == ad_config, f"Expected llm args {expected_llm_args}, got {ad_config}"
 
     # check expected parallel config
-    world_size = expected_ad_config.world_size
+    world_size = expected_llm_args.world_size
     expected_parallel_config = _ParallelConfig(
         tp_size=world_size, gpus_per_node=expected_llm_args.gpus_per_node
     )
-    assert llm_args._parallel_config == expected_parallel_config, (
-        f"Expected parallel_config {expected_parallel_config}, got {llm_args._parallel_config}"
+    expected_parallel_config.world_size = world_size
+    assert ad_config._parallel_config == expected_parallel_config, (
+        f"Expected parallel_config {expected_parallel_config}, got {ad_config._parallel_config}"
     )
 
     # backend should always be "_autodeploy"
-    assert llm_args.backend == "_autodeploy", (
-        f"Expected backend '_autodeploy', got {llm_args.backend}"
+    assert ad_config.backend == "_autodeploy", (
+        f"Expected backend '_autodeploy', got {ad_config.backend}"
     )
 
 
@@ -198,7 +195,7 @@ def test_build_ad(model_hub_id: str, llm_extra_args: dict):
     original_build_from_config = ADEngine.build_from_config
 
     @classmethod
-    def check_and_original_build(cls, ad_config):
+    def check_and_original_build(cls, ad_config: LlmArgs):
         _check_ad_config(experiment_config, ad_config)
         return original_build_from_config.__func__(cls, ad_config)
 

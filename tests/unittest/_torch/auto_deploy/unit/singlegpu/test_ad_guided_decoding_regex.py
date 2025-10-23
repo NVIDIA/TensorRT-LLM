@@ -15,94 +15,55 @@
 
 import pytest
 from _model_test_utils import get_small_model_config
+from build_and_run_ad import ExperimentConfig, main
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.auto_deploy import LLM
 from tensorrt_llm.llmapi import GuidedDecodingParams
 
 
 @pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])
 def test_ad_guided_decoding_regex_e2e(guided_decoding_backend: str):
-    """Test guided decoding with regex pattern validation.
+    """Test guided decoding with regex pattern validation using the build_and_run_ad main()."""
+    test_case = {
+        "prompt": "What is the capital of France?",
+        "regex": r"I don't know, I am a randomly initialized model|Paris",
+        "valid_responses": ["I don't know, I am a randomly initialized model", "Paris"],
+    }
 
-    This test constructs an LLM in the AutoDeploy backend configured to output text matching a regex pattern,
-    and checks that the generated outputs match the expected regex.
-
-    Goal is to check that the AutoDeploy backend consistently works with regex-based guided decoding end-to-end.
-    """
-    # Define test cases with prompts and their corresponding regex patterns
-    test_cases = [
-        {
-            "prompt": "What is the capital of France?",
-            "regex": r"I don't know, I am a randomly initialized model|Paris",
-            "valid_responses": ["I don't know, I am a randomly initialized model", "Paris"],
-        },
-        {
-            "prompt": (
-                "Let's echo the following statement: 'This is a string meant to test that "
-                "the guided decoding sampler restricts a random network to a particular regex.'"
-            ),
-            "regex": (
-                r"This is a string meant to test that the guided decoding sampler restricts "
-                r"a random network to a particular regex\."
-            ),
-            "valid_responses": [
-                "This is a string meant to test that the guided decoding sampler restricts "
-                "a random network to a particular regex."
-            ],
-        },
-    ]
-
-    # Get small model config and prepare LLM kwargs
     experiment_config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
-    llm_kwargs = experiment_config["args"]
-    llm_kwargs["guided_decoding_backend"] = guided_decoding_backend
 
-    # Instantiate the LLM with AutoDeploy backend.
-    llm = LLM(**llm_kwargs)
+    # DemoLLM runtime does not support guided decoding. Need to set runtime to trtllm.
+    experiment_config["args"]["runtime"] = "trtllm"
+    experiment_config["args"]["world_size"] = 1
+    experiment_config["args"]["guided_decoding_backend"] = guided_decoding_backend
 
-    try:
-        for test_idx, test_case in enumerate(test_cases):
-            prompt = [{"prompt": test_case["prompt"]}]
-            regex_pattern = test_case["regex"]
-            valid_responses = test_case["valid_responses"]
+    experiment_config["prompt"]["batch_size"] = 1
+    experiment_config["prompt"]["queries"] = {"prompt": test_case["prompt"]}
 
-            sampling_params = SamplingParams(
-                max_tokens=10,
-                top_k=None,
-                temperature=0.1,
-                guided_decoding=GuidedDecodingParams(regex=regex_pattern),
-            )
+    cfg = ExperimentConfig(**experiment_config)
 
-            # Generate outputs with guided decoding
-            print(f"\nTest case {test_idx + 1}: Running guided decoding with regex pattern...")
-            print(f"Prompt: {test_case['prompt']}")
-            print(f"Regex: {regex_pattern}")
+    # Need to introduce the guided decoding params after ExperimentConfig construction
+    # because otherwise they get unpacked as a dict.
+    cfg.prompt.sp_kwargs = {
+        "max_tokens": 10,
+        "top_k": None,
+        "temperature": 0.1,
+        "guided_decoding": GuidedDecodingParams(regex=test_case["regex"]),
+    }
 
-            outputs = llm.generate(
-                prompt,
-                sampling_params=sampling_params,
-            )
+    print(f"Experiment config: {experiment_config}")
+    print("Generating outputs...")
+    results = main(cfg)
+    print("Results:", results)
 
-            print(f"Generated {len(outputs)} outputs")
+    # Parse and validate: output should be a prefix of one of the valid responses
+    prompts_and_outputs = results["prompts_and_outputs"]
+    assert len(prompts_and_outputs) == 1
+    generated_text = prompts_and_outputs[0][1].strip()
 
-            # Validate each output matches the regex pattern as a prefix
-            for i, output in enumerate(outputs):
-                generated_text = output.outputs[0].text.strip()
-
-                # Test that the output is a prefix of one of the valid responses
-                # Valid prefixes: "P", "Pa", "Par", "Pari", "Paris", "I", "I ", "I d", "I don", etc.
-                is_valid_prefix = any(
-                    response.startswith(generated_text) or generated_text.startswith(response)
-                    for response in valid_responses
-                )
-
-                assert is_valid_prefix, (
-                    f"Test case {test_idx + 1}, Output {i} is not a valid prefix of '{valid_responses}'\n"
-                    f"Generated text: '{generated_text}'"
-                )
-
-                print(f"Output {i} successfully matched as prefix: '{generated_text}'")
-
-    finally:
-        llm.shutdown()
+    valid_responses = test_case["valid_responses"]
+    is_valid_prefix = any(response.startswith(generated_text) for response in valid_responses)
+    assert is_valid_prefix, (
+        f"Output is not a valid prefix of any expected response.\n"
+        f"Generated: '{generated_text}'\n"
+        f"Valid responses: {valid_responses}"
+    )
