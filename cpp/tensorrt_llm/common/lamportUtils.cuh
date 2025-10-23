@@ -218,8 +218,8 @@ public:
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
             asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1) : "memory");
-#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-            asm volatile("red.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1) : "memory");
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+            asm volatile("red.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1) : "memory");
 #else
             atomicAdd(mFlagAccessPtr, 1);
 #endif
