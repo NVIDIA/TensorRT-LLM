@@ -325,7 +325,6 @@ class SamplingParams:
             )
 
         if self.guided_decoding is not None:
-            print(f"Validating guided decoding: {self.guided_decoding}")
             self.guided_decoding._validate()
 
         # correct types as users might pass in logprob=True for Top-1 logprobs
