@@ -10,25 +10,32 @@
 # prohibited.
 
 if(MOONCAKE_ROOT)
-  find_library(TRANSFER_ENGINE_LIB transfer_engine ${MOONCAKE_ROOT}/lib)
-  find_path(TRANSFER_ENGINE_INCLUDE_DIR transfer_engine_c.h
-            ${MOONCAKE_ROOT}/include)
+  set(IS_ROCKY8 FALSE)
+  if(EXISTS "/etc/redhat-release")
+    set(IS_ROCKY8 TRUE)
+  endif()
 
-  message(STATUS "Find transfer engine results:")
-  message(STATUS "  TRANSFER_ENGINE_LIB = ${TRANSFER_ENGINE_LIB}")
-  message(
-    STATUS "  TRANSFER_ENGINE_INCLUDE_DIR = ${TRANSFER_ENGINE_INCLUDE_DIR}")
+  if(NOT IS_ROCKY8)
+    find_library(TRANSFER_ENGINE_LIB transfer_engine ${MOONCAKE_ROOT}/lib)
+    find_path(TRANSFER_ENGINE_INCLUDE_DIR transfer_engine_c.h
+              ${MOONCAKE_ROOT}/include)
 
-  if(TRANSFER_ENGINE_LIB AND TRANSFER_ENGINE_INCLUDE_DIR)
-    set(MOONCAKE_WRAPPER_TARGET "tensorrt_llm_mooncake_wrapper")
+    message(STATUS "Find transfer engine results:")
+    message(STATUS "  TRANSFER_ENGINE_LIB = ${TRANSFER_ENGINE_LIB}")
+    message(
+      STATUS "  TRANSFER_ENGINE_INCLUDE_DIR = ${TRANSFER_ENGINE_INCLUDE_DIR}")
 
-    add_library(${MOONCAKE_WRAPPER_TARGET} SHARED transferAgent.cpp)
-    target_compile_options(${MOONCAKE_WRAPPER_TARGET} PRIVATE -Wno-error)
+    if(TRANSFER_ENGINE_LIB AND TRANSFER_ENGINE_INCLUDE_DIR)
+      set(MOONCAKE_WRAPPER_TARGET "tensorrt_llm_mooncake_wrapper")
 
-    target_include_directories(${MOONCAKE_WRAPPER_TARGET}
-                               PRIVATE ${TRANSFER_ENGINE_INCLUDE_DIR})
+      add_library(${MOONCAKE_WRAPPER_TARGET} SHARED transferAgent.cpp)
+      target_compile_options(${MOONCAKE_WRAPPER_TARGET} PRIVATE -Wno-error)
 
-    target_link_libraries(${MOONCAKE_WRAPPER_TARGET}
-                          PRIVATE ${TRANSFER_ENGINE_LIB} CUDA::cudart)
+      target_include_directories(${MOONCAKE_WRAPPER_TARGET}
+                                 PRIVATE ${TRANSFER_ENGINE_INCLUDE_DIR})
+
+      target_link_libraries(${MOONCAKE_WRAPPER_TARGET}
+                            PRIVATE ${TRANSFER_ENGINE_LIB} CUDA::cudart)
+    endif()
   endif()
 endif()

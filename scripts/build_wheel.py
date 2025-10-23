@@ -553,17 +553,6 @@ def main(*,
     if mooncake_root is not None:
         if on_windows:
             raise RuntimeError("Mooncake is not supported on Windows.")
-        try:
-            with open('/etc/os-release', 'r') as f:
-                os_info = f.read()
-            if 'Rocky Linux' in os_info and '8' in os_info:
-                raise RuntimeError(
-                    "Mooncake is not supported on Rocky Linux 8.")
-        except FileNotFoundError:
-            dist_info = platform.platform()
-            if 'rocky' in dist_info.lower() and '8' in dist_info:
-                raise RuntimeError(
-                    "Mooncake is not supported on Rocky Linux 8.")
         cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
     build_dir = get_build_dir(build_dir, build_type)

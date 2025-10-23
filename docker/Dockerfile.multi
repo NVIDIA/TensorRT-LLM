@@ -103,6 +103,14 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && rm install_nixl.sh
 COPY docker/common/install_etcd.sh install_etcd.sh
 RUN bash ./install_etcd.sh && rm install_etcd.sh
 
+# Install Mooncake
+COPY docker/common/install_mooncake.sh install_mooncake.sh
+RUN if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+    else \
+        bash ./install_mooncake.sh && rm install_mooncake.sh \
+    fi
+
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
@@ -118,6 +126,7 @@ COPY docker/common/install_triton.sh \
      docker/common/install_ucx.sh \
      docker/common/install_nixl.sh \
      docker/common/install_etcd.sh \
+     docker/common/install_mooncake.sh
      ./
 
 RUN bash ./install_triton.sh && rm install_triton.sh
