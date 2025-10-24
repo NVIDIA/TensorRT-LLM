@@ -432,7 +432,7 @@ class BaseWorker(GenerationExecutor):
             # default_max_tokens is the biggest available value
             if max_tokens is None:
                 return default_max_tokens
-            elif max_tokens > default_max_tokens:
+            elif max_tokens > default_max_tokens and default_max_tokens > 0:
                 logger.warning(
                     f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
                     f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
