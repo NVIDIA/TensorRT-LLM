@@ -2030,8 +2030,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y dnsutils rsync iputils-ping")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
-        sh "ping aus-cdot04-corp01"
-        sh "nslookup aus-cdot04-corp01"
+        sh "ping aus-cdot04-corp01.nvidia.com || true"
+        sh "ping 10.126.136.6 || true"
+        sh "nslookup aus-cdot04-corp01.nvidia.com || true"
         sh "ls -ll /mnt/sw-tensorrt-pvc"
 
         // install package
