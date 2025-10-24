@@ -495,4 +495,9 @@ int getEnvMoeA2ACombineBlockSize()
     return kBlock;
 }
 
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+}
+
 } // namespace tensorrt_llm::common
