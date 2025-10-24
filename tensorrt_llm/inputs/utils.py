@@ -165,10 +165,10 @@ async def async_load_image(
 
 
 def _load_video_by_cv2(video: str,
-               num_frames: int = 10,
-               fps: int = 30,
-               format: str = "pt",
-               device: str = "cpu") -> VideoData:
+                       num_frames: int = 10,
+                       fps: int = 30,
+                       format: str = "pt",
+                       device: str = "cpu") -> VideoData:
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
 
@@ -254,12 +254,11 @@ def load_base64_video(video: str) -> BytesIO:
     return content
 
 
-def load_video(
-        video: str,
-        num_frames: int = 10,
-        fps: int = 30,
-        format: str = "pt",
-        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
+def load_video(video: str,
+               num_frames: int = 10,
+               fps: int = 30,
+               format: str = "pt",
+               device: str = "cpu") -> VideoData:
     parsed_url = urlparse(video)
     results = None
     if parsed_url.scheme in ["http", "https", ""]:
@@ -279,13 +278,11 @@ def load_video(
     return results
 
 
-async def async_load_video(
-    video: str,
-    num_frames: int = 10,
-    fps: int = 30,
-    format: str = "pt",
-    device: str = "cpu"
-) -> VideoData:
+async def async_load_video(video: str,
+                           num_frames: int = 10,
+                           fps: int = 30,
+                           format: str = "pt",
+                           device: str = "cpu") -> VideoData:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -297,8 +294,8 @@ async def async_load_video(
                                                  suffix='.mp4') as tmp:
                     tmp.write(await response.content.read())
                     tmp.flush()
-                    results = _load_video_by_cv2(tmp.name, num_frames, fps, format,
-                                                 device)
+                    results = _load_video_by_cv2(tmp.name, num_frames, fps,
+                                                 format, device)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
         # TODO: any ways to read videos from memory, instead of writing to a tempfile?
