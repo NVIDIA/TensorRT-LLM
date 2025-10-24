@@ -208,7 +208,7 @@ class RayExecutor(GenerationExecutor):
             self.call_all_ray_workers("enqueue_request",
                                       leader_only=True,
                                       request=request,
-                                      async_call=False,
+                                      async_call=True,
                                       result_wait_queue=result.queue)
 
         return result
