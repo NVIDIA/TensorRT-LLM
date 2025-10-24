@@ -126,7 +126,6 @@ protected:
         auto constexpr sizePerHead = 1;
         auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
         auto const kvDtype = nvinfer1::DataType::kHALF;
-        bool onboardBlocks = true;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -135,7 +134,7 @@ protected:
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
-            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, onboardBlocks, cacheType);
+            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, cacheType);
     }
 
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()

@@ -679,13 +679,6 @@ parameters: {
     string_value: "${kv_cache_host_memory_bytes}"
   }
 }
-# kv_cache_onboard_blocks is for internal implementation.
-parameters: {
-  key: "kv_cache_onboard_blocks"
-  value: {
-    string_value: "${kv_cache_onboard_blocks}"
-  }
-}
 # enable_trt_overlap is deprecated and doesn't have any effect on the runtime
 # parameters: {
 #   key: "enable_trt_overlap"

@@ -156,7 +156,6 @@ def test_KvCacheConfig_declaration():
                            sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
-                           onboard_blocks=True,
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
@@ -171,7 +170,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
-    assert pybind_config.onboard_blocks == True
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
