@@ -297,8 +297,8 @@ public:
     [[nodiscard]] std::tuple<bool, SizeType32, BlockPtr> findMatchingBlock(
         BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
 
-    //! \brief Free block from previous block if present.
-    void freeLeafBlock();
+    //! \brief Free block from previous block if present. Ensure next blocks are also freed
+    void freeBlock();
 
     [[nodiscard]] bool isFull() const;
 
@@ -872,9 +872,6 @@ private:
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
-
-    //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
-    void freeLeafBlock(BlockPtr const& block);
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);

@@ -454,10 +454,17 @@ std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
     return {!block->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), block};
 }
 
-void KVCacheBlock::freeLeafBlock()
+void KVCacheBlock::freeBlock()
 {
-    // assure that this is a leaf block
-    TLLM_CHECK(isLeaf());
+    if (!mNextBlocks.empty())
+    {
+        // Ensure nextBlocks are cleared
+        for (auto& [blockKey, block] : mNextBlocks)
+        {
+            TLLM_CHECK(block->mPrevBlock == nullptr);
+        }
+        mNextBlocks.clear();
+    }
 
     // free from previous block
     if (mPrevBlock != nullptr)
@@ -898,13 +905,6 @@ void WindowBlockManager::startScheduling()
     }
 }
 
-void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
-{
-    // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
-    // This is so it can check if the parent should be queued for eviction.
-    block->freeLeafBlock();
-}
-
 void WindowBlockManager::freeChildren(BlockPtr const& block)
 {
     // Free all descendants of block
@@ -919,7 +919,7 @@ void WindowBlockManager::freeChildren(BlockPtr const& block)
     {
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
-    freeLeafBlock(block);
+    block->freeBlock();
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
@@ -1210,7 +1210,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 else
                 {
                     // Leaf block that nobody is using. Make block private and reuse
-                    freeLeafBlock(matchingBlock);
+                    matchingBlock->freeBlock();
                     mEvictionPolicy->claimBlock(
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
