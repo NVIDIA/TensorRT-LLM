@@ -1992,7 +1992,9 @@ void KVCacheManager::allocatePools(bool useUvm)
         }
         else
         {
-            cacheSizeBytes += (cacheVolume * 4) / 8;
+            // For both FP4 pools and block scale pools, container element is 8-bit.
+            int const numBytesPerContainerElement = 1;
+            cacheSizeBytes += cacheVolume * numBytesPerContainerElement;
         }
     }
     // Save the total number of bytes allocated for the KV-cache for KvCacheStats
