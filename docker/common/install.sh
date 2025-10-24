@@ -16,7 +16,6 @@ polygraphy=0
 mpi4py=0
 pytorch=0
 opencv=0
-protobuf=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -56,10 +55,6 @@ while [[ $# -gt 0 ]]; do
             opencv=1
             shift 1
             ;;
-        --protobuf)
-            protobuf=1
-            shift 1
-            ;;
         --all)
             base=1
             cmake=1
@@ -70,7 +65,6 @@ while [[ $# -gt 0 ]]; do
             mpi4py=1
             pytorch=1
             opencv=1
-            protobuf=1
             shift 1
             ;;
         *)
@@ -134,11 +128,4 @@ if [ $opencv -eq 1 ]; then
     pip3 uninstall -y opencv
     rm -rf /usr/local/lib/python3*/dist-packages/cv2/
     pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
-fi
-
-# WARs against security issues inherited from pytorch:25.06
-# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
-if [ $protobuf -eq 1 ]; then
-    pip3 install --upgrade --no-cache-dir \
-    "protobuf>=4.25.8"
 fi
