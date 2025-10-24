@@ -240,10 +240,10 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             # Get predicted number of tokens using get_num_tokens_per_video
             if model_type == 'llava_next':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=test_video)
+                    video=video_data.frames)
             elif model_type == 'qwen2_5_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video=test_video)
+                    video=video_data.frames)
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \
