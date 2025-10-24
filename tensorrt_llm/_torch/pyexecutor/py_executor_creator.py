@@ -39,6 +39,7 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+from .sampler import AsyncWorkerMixin
 
 
 class _ExecutorMemoryMonitor:
@@ -196,7 +197,7 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
 
 
 def maybe_start_sampler_async_worker(sampler):
-    if hasattr(sampler, 'async_worker_start') and sampler.use_async_worker:
+    if isinstance(sampler, AsyncWorkerMixin) and sampler.enable_async_worker:
         sampler.async_worker_start()
 
 
