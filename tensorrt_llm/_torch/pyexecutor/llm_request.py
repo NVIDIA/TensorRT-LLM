@@ -590,7 +590,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             use_fast_logits, mpi_world_rank)
         return LlmResponse(
             request_id=self.py_request_id
-            if self.is_child else self.parent_request_id,
+            if not self.is_child else self.parent_request_id,
             result=LlmResult(result, self.py_result, is_final),
             client_id=self.py_client_id) if len(result) > 0 else None
 
