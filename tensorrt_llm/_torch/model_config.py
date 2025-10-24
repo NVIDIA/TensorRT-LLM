@@ -585,7 +585,9 @@ class ModelConfig(Generic[TConfig]):
         This method is a hack to support the effort to switch to KvCacheManagerCpp.
         Currently, it is only tested for Gemma3ForCausalLM. For other models, it will return None.
         """
-        if self.pretrained_config.architectures[0] in ["Gemma3ForCausalLM"]:
+        if self.pretrained_config.architectures[0] in [
+                "Gemma3ForCausalLM", "Exaone4ForCausalLM"
+        ]:
             logger.debug(
                 f"Setting layer types for {self.pretrained_config.architectures}"
             )
