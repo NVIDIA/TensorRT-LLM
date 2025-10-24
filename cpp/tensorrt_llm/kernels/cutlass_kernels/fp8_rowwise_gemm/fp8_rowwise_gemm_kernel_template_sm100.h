@@ -99,15 +99,6 @@ struct DeviceGemmFp8RowwiseSm100
     using Cast = cutlass::epilogue::fusion::Sm90Compute<cutlass::epilogue::thread::Identity, OutElementType,
         ElementComputeEpilogue, cutlass::FloatRoundStyle::round_to_nearest>;
 
-    // static constexpr bool PONG = false;
-    // static constexpr bool FAST_ACCUM = true;
-    // static constexpr bool USE_BIAS = false;
-
-    // using StageCountType = cutlass::gemm::collective::StageCountAuto;     // Stage count maximized
-    //  based on the tile size
-    // using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto; // Kernel to launch based on the default
-    //  setting in the Collective Builder
-
     // Implement rowwise scaling epilogue.
     using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, ElementComputeEpilogue,
         ElementComputeEpilogue, cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
@@ -147,14 +138,6 @@ struct DeviceGemmFp8RowwiseSm100
         ElementComputeEpilogue, ElementC, LayoutC, AlignmentC, ElementOutput, LayoutOutput, AlignmentOutput,
         EpilogueScheduleTypeOverride, EpilogueEVT>::CollectiveOp;
 
-    // using DefaultSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
-    // using PongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
-    // using FastDefaultSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
-    // using FastPongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
-
-    // using SlowAccum = DefaultSchedule;
-    // using FastAccum = FastDefaultSchedule;
-    // using MainLoopSchedule = cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>;
     using MainLoopSchedule = cutlass::gemm::collective::KernelScheduleAuto;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
