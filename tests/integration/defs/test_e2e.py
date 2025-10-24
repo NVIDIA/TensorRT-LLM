@@ -3352,8 +3352,7 @@ def test_ptp_star_attention_example(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("model_name,model_path", [
     ("DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"),
 ])
-def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path,
-                         clear_flashinfer_cache):
+def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     print(f"Testing scaffolding {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
     input_file = Path(os.path.join(example_root, "test.jsonl"))
