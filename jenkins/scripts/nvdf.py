@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -26,12 +27,11 @@ DISABLE_NVDF_FOR_LOCAL_TEST = False
 NVDF_BASE_URL = os.getenv("NVDF_BASE_URL", "")
 NVDF_USERNAME = os.getenv("NVDF_CREDENTIALS_USR", "")
 NVDF_PASSWORD = os.getenv("NVDF_CREDENTIALS_PSW", "")
-NVDF_CREDENTIALS = os.getenv("NVDF_CREDENTIALS", "")
-print(f"NVDF_CREDENTIALS: {NVDF_CREDENTIALS}")
-print(f"NVDF_USERNAME: {NVDF_USERNAME}")
-print(f"NVDF_PASSWORD: {NVDF_PASSWORD}")
-print(f"NVDF_BASE_URL: {NVDF_BASE_URL}")
+
 if not NVDF_BASE_URL or not NVDF_USERNAME or not NVDF_PASSWORD:
+    print(f"NVDF_USERNAME: {NVDF_USERNAME}")
+    print(f"NVDF_PASSWORD: {NVDF_PASSWORD}")
+    print(f"NVDF_BASE_URL: {NVDF_BASE_URL}")
     raise Exception(
         "NVDF_BASE_URL or NVDF_USERNAME or NVDF_PASSWORD is not set")
 
@@ -92,6 +92,16 @@ class NVDF:
                     "Unknown key type! key:{}, value_type:{}".format(
                         key, type(value)))
         return json_data
+
+    @staticmethod
+    def add_id_of_json(data):
+        if isinstance(data, list):
+            for d in data:
+                NVDF.add_id_of_json(d)
+            return
+        assert isinstance(data, dict)
+        data_str = json.dumps(data, sort_keys=True, indent=2).encode("utf-8")
+        data["_id"] = hashlib.md5(data_str).hexdigest()
 
     @staticmethod
     def postStageInfoToNVDataFlow(json_data):
@@ -254,3 +264,6 @@ class NVDF:
 
         NVDF.query_build_id_cache[cache_key] = pr_numbers
         return pr_numbers
+
+
+NVDF.queryBuildIdFromNVDataFlow("LLM/main/L0_MergeRequest_PR")
