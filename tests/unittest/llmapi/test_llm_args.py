@@ -6,7 +6,6 @@ import yaml
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm import AutoParallelConfig
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -181,10 +180,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
-def test_KvCacheConfig_default_values():
-    check_defaults(KvCacheConfig, tle.KvCacheConfig)
-
-
 def test_CapacitySchedulerPolicy():
     val = CapacitySchedulerPolicy.MAX_UTILIZATION
     assert PybindMirror.maybe_to_pybind(
@@ -331,17 +326,9 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
         SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
                         GUARANTEED_NO_EVICT)
     }
-    plugin_config_dict = {
-        "_dtype": 'float16',
-        "nccl_plugin": None,
-    }
-    plugin_config = PluginConfig.from_dict(plugin_config_dict)
+    plugin_config = PluginConfig(dtype='float16', nccl_plugin=None)
     build_config = BuildConfig(max_input_len=1024,
                                lora_config=LoraConfig(lora_ckpt_source='hf'),
-                               auto_parallel_config=AutoParallelConfig(
-                                   world_size=1,
-                                   same_buffer_io={},
-                                   debug_outputs=[]),
                                plugin_config=plugin_config)
     extra_llm_args_dict = {
         "build_config": build_config.to_dict(),

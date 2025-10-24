@@ -87,7 +87,7 @@ def convert_and_save_hf(args):
     quant_config = args_to_quant_config(args)
 
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                    torch_dtype='auto',
+                                                    dtype='auto',
                                                     trust_remote_code=True)
 
     def convert_and_save_rank(args, rank):

@@ -120,8 +120,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(top_k <= 8 && top_k > 0,
-            "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(top_k <= 10 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=10 && top_k>0.");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {
@@ -130,7 +130,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
-    TORCH_CHECK(num_experts <= 256, "num_experts must be less than or equal to 256");
+    TORCH_CHECK(num_experts <= 512, "num_experts must be less than or equal to 512");
 
     // If both routing inputs are provided, they must be on the same device
     if (routing_logits.has_value() && topk_ids.has_value())
@@ -191,6 +191,12 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
             args.num_tokens, top_k, num_experts, tile_tokens_dim);
+    int32_t max_num_padded_tokens_gemm1
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+    int32_t max_num_padded_tokens_gemm2
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx
@@ -211,21 +217,22 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     at::Tensor gemm1_output_scale;
     if (dtype == btg::Dtype::E4m3)
     {
-        gemm1_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size}, at::ScalarType::Float8_e4m3fn,
-            hidden_states.device(), std::nullopt);
+        gemm1_output = at::detail::empty_cuda({max_num_padded_tokens_gemm1, intermediate_size},
+            at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
     }
     else
     {
-        gemm1_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 2},
+        gemm1_output = at::detail::empty_cuda({max_num_padded_tokens_gemm1, intermediate_size / 2},
             at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
 
-        int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens, intermediate_size / 16);
+        int64_t sf_size
+            = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1, intermediate_size / 16);
         gemm1_output_scale
             = at::detail::empty_cuda({sf_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
     }
 
     at::Tensor gemm2_output = at::detail::empty_cuda(
-        {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
+        {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -336,7 +343,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
-    workspace.total_max_padded_tokens = max_num_padded_tokens;
+    workspace.total_max_padded_tokens = std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
     workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
     workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
@@ -395,10 +402,31 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP4BlockScaleMoeRunner(int64_t tileTokensDim)
-        : mTileTokensDim(tileTokensDim)
+    explicit FP4BlockScaleMoeRunner()
+        // Update this as new cubins come in
+        : mSupportedTileN{8, 16, 32, 64, 128}
     {
-        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim);
+        for (int tileN : mSupportedTileN)
+        {
+            mRunners.emplace(tileN, std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tileN));
+        }
+    }
+
+    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    {
+        // returns (tileN, config)
+        std::vector<std::vector<int64_t>> tactics;
+        for (auto& [tileN, runner] : mRunners)
+        {
+            auto config_indices_per_runner
+                = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+            for (auto cfg : config_indices_per_runner)
+            {
+                tactics.push_back({tileN, cfg});
+            }
+        }
+        return tactics;
     }
 
     [[nodiscard]] std::vector<torch::Tensor> run(torch::optional<torch::Tensor> const& routing_logits,
@@ -410,42 +438,42 @@ public:
         int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
         std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
         int64_t const local_num_experts, std::optional<double> const routed_scaling_factor,
-        int64_t const routing_method_type, bool const do_finalize, int64_t moeConfigIndex,
+        int64_t const routing_method_type, bool const do_finalize, std::vector<int64_t> moeConfigIndex,
         torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
     {
+        // moeConfigIndex corresponds to pair (tileN, config)
+        auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
 
         // Autotuner has requested a default or 'fallback' config index
-        if (moeConfigIndex == -1)
+        if (tileN == -1 || config == -1)
         {
             auto const num_tokens = hidden_states.sizes()[0];
 
             // 2x FP4 per byte element
             auto const hidden_size = 2 * hidden_states.sizes()[1];
 
-            moeConfigIndex = mRunner->getDefaultValidConfigIndex(
+            float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
+            tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
+
+            config = mRunners[tileN]->getDefaultValidConfigIndex(
                 top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scales_scalar,
             output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
-            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, mTileTokensDim,
-            routing_method_type, do_finalize, mDtypeElt, *mRunner, moeConfigIndex, topk_weights, topk_ids);
-    }
-
-    [[nodiscard]] std::vector<int64_t> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
-    {
-        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
+            routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config, topk_weights, topk_ids);
     }
 
 private:
     using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
-    std::unique_ptr<RunnerType> mRunner;
+    std::vector<int32_t> const mSupportedTileN;
+    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+
     btg::Dtype mDtypeElt{btg::Dtype::E2m1};
     bool mUseDeepSeekFp8{false};
-    int64_t mTileTokensDim;
 };
 
 // Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow
@@ -453,11 +481,33 @@ private:
 class FP8FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP8FP4BlockScaleMoeRunner(int64_t tileTokensDim, int64_t actType)
-        : mTileTokensDim(tileTokensDim)
+    explicit FP8FP4BlockScaleMoeRunner(int64_t actType)
+        // Update this as new cubins come in
+        : mSupportedTileN{8, 16, 32, 64}
     {
-        mRunner = std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, mTileTokensDim,
-            static_cast<tensorrt_llm::kernels::ActType>(actType));
+        for (int tileN : mSupportedTileN)
+        {
+            mRunners.emplace(tileN,
+                std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
+                    static_cast<tensorrt_llm::kernels::ActType>(actType)));
+        }
+    }
+
+    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    {
+        // returns (tileN, config)
+        std::vector<std::vector<int64_t>> tactics;
+        for (auto& [tileN, runner] : mRunners)
+        {
+            auto config_indices_per_runner
+                = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+            for (auto cfg : config_indices_per_runner)
+            {
+                tactics.push_back({tileN, cfg});
+            }
+        }
+        return tactics;
     }
 
     [[nodiscard]] std::vector<torch::Tensor> run(torch::optional<torch::Tensor> const& routing_logits,
@@ -469,18 +519,23 @@ public:
         std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
-        int64_t moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
+        std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
         torch::optional<torch::Tensor> const& topk_ids)
     {
+        // moeConfigIndex corresponds to pair (tileN, config)
+        auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
 
         // Autotuner has requested a default or 'fallback' config index
-        if (moeConfigIndex == -1)
+        if (tileN == -1 || config == -1)
         {
             auto const num_tokens = hidden_states.sizes()[0];
 
             auto const hidden_size = hidden_states.sizes()[1];
 
-            moeConfigIndex = mRunner->getDefaultValidConfigIndex(
+            float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
+            tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
+
+            config = mRunners[tileN]->getDefaultValidConfigIndex(
                 top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
@@ -488,24 +543,19 @@ public:
             std::nullopt /*hidden_states_scale*/, gemm1_weights, gemm1_weights_scale, gemm2_weights,
             gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar, num_experts,
             top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-            routed_scaling_factor, mTileTokensDim, routing_method_type, do_finalize, mDtypeAct, *mRunner,
-            moeConfigIndex, topk_weights, topk_ids);
-    }
-
-    [[nodiscard]] std::vector<int64_t> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
-    {
-        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeAct, *mRunners[tileN], config,
+            topk_weights, topk_ids);
     }
 
 private:
     using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
-    std::unique_ptr<RunnerType> mRunner;
+    std::vector<int32_t> const mSupportedTileN;
+    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+
     btg::Dtype mDtypeAct{btg::Dtype::E4m3};
     btg::Dtype mDtypeWeights{btg::Dtype::E2m1};
     bool mUseDeepSeekFp8{false};
-    int64_t mTileTokensDim;
 };
 
 torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
@@ -518,11 +568,11 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
-        .def(torch::init<int64_t>())
+        .def(torch::init<>())
         .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
     m.class_<torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
-        .def(torch::init<int64_t, int64_t>())
+        .def(torch::init<int64_t>())
         .def("get_valid_configs", &torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::FP8FP4BlockScaleMoeRunner::run);
 }

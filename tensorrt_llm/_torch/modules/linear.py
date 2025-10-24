@@ -20,9 +20,12 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
@@ -715,6 +718,24 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
+    def post_load_weights(self, module: Linear):
+        super().post_load_weights(module)
+        if is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                 or module.disable_deep_gemm):
+            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
+                                                        module.weight_scale)
+            transfromed_scale = transform_sf_into_required_layout(
+                weight_scale,
+                mn=weight.shape[0],
+                k=weight.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
+            module.weight = nn.Parameter(weight, requires_grad=False)
+            module.weight_scale = nn.Parameter(
+                transfromed_scale,
+                requires_grad=False,
+            )
+
 
 class NVFP4LinearMethod(LinearMethodBase):
 
@@ -774,10 +795,15 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
+        elif IS_CUBLASLT_AVAILABLE and module.use_cublaslt_nvfp4_blockscaling_mm:
+            output = torch.ops.trtllm.nvfp4_gemm_cublaslt(
+                act_fp4, module.weight, act_sf, module.weight_scale,
+                module.alpha, module.dtype)
         else:
             output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
                                                  module.weight_scale,
                                                  module.alpha, module.dtype)
+
         if bias is not None:
             output = output + bias
         return output
@@ -1007,15 +1033,12 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                        tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
-                # The kernel we use will convert nvfp4 to e4m3 before matmul,
-                # so the range of the scale factor can only be [0,448/6].
-                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
                 weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
             if "weight_scale_2" in w:
                 if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
+                    weight_scale_2 = w["weight_scale_2"][...]
                 else:
-                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
+                    assert weight_scale_2 == w["weight_scale_2"][...], (
                         f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
                     )
 
@@ -1805,6 +1828,7 @@ class Linear(nn.Module):
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
+        use_cublaslt_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
@@ -1824,6 +1848,7 @@ class Linear(nn.Module):
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
+        self.use_cublaslt_nvfp4_blockscaling_mm = use_cublaslt_nvfp4_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features

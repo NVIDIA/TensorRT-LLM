@@ -6,7 +6,7 @@ import math
 import os
 import types
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
@@ -25,7 +25,6 @@ from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
-from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -166,6 +165,63 @@ class CudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
+class BaseSparseAttentionConfig(StrictBaseModel):
+    """
+    Configuration for sparse attention.
+    """
+    algorithm: Literal["rocket"] = Field(
+        default="rocket", description="The algorithm for sparse attention.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        # dispatch to the correct sparse attention config
+        config_classes = {
+            "rocket": RocketSparseAttentionConfig,
+        }
+
+        algorithm = data.get("algorithm", None)
+        if algorithm is None:
+            raise ValueError(f"Sparse attention algorithm is required")
+
+        config_class = config_classes.get(algorithm.lower())
+        if config_class is None:
+            raise ValueError(f"Invalid algorithm: {algorithm}")
+
+        return config_class(**data)
+
+    def _check_fields(self):
+        pass
+
+    def supports_backend(self, backend: str) -> bool:
+        """
+        Override if the speculation algorithm does not support
+        a subset of the possible backends.
+        """
+        return True
+
+
+class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
+    """
+    Configuration for rocket sparse attention.
+    """
+    window_size: Optional[int] = Field(
+        default=None, description="The window size for snap KV.")
+    kernel_size: Optional[int] = Field(
+        default=None, description="The kernel size for snap KV.")
+    topr: Optional[Union[int, float]] = Field(default=76, description="Top-r")
+    topk: Optional[int] = Field(default=128, description="Top-k")
+    prompt_budget: Optional[int] = Field(default=1266,
+                                         description="Prompt budget")
+    page_size: Optional[int] = Field(default=3, description="Page size")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
@@ -220,23 +276,21 @@ class AttentionDpConfig(StrictBaseModel):
         return cls(**data)
 
 
-@dataclass
-class _ParallelConfig:
-    ''' The model distribution configs for LLM.  '''
+class _ParallelConfig(StrictBaseModel):
+    """The model distribution configs for LLM."""
     tp_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
     gpus_per_node: int = 8
-    moe_cluster_size: int = 1
-    moe_tp_size: int = 1
-    moe_ep_size: int = 1
-    cp_config: dict = field(default_factory=dict)
+    # Set default for MoE fields to -1 to trigger auto-calculation in Mapping
+    moe_cluster_size: int = -1
+    moe_tp_size: int = -1
+    moe_ep_size: int = -1
+    cp_config: dict = Field(default_factory=dict)
     enable_attention_dp: bool = False
     enable_lm_head_tp_in_adp: bool = False
-    auto_parallel: bool = False
 
-    _world_size: int = field(default=1, init=False)
-    _devices: Optional[List[int]] = field(default=None, init=False)
+    _devices: Optional[List[int]] = PrivateAttr(default=None)
 
     @property
     def devices(self) -> List[int]:
@@ -253,18 +307,7 @@ class _ParallelConfig:
         self._devices = devices
 
     @property
-    def world_size(self) -> bool:
-
-        if self.auto_parallel:
-            if self.tp_size > 1 or self.pp_size > 1 or self.cp_size > 1:
-                raise RuntimeError(
-                    "manually TP and PP are not supported in auto parallel mode."
-                )
-            return self._world_size
-
-        if self._world_size > 1:
-            raise RuntimeError(
-                "world_size > 1 is only supported in auto parallel mode.")
+    def world_size(self) -> int:
         return self.tp_size * self.pp_size * self.cp_size
 
     @property
@@ -275,12 +318,9 @@ class _ParallelConfig:
 
     @world_size.setter
     def world_size(self, world_size: int):
-        if self.auto_parallel:
-            self._world_size = world_size
-        elif (not self.auto_parallel
-              ) and world_size != self.tp_size * self.pp_size * self.cp_size:
+        if world_size != self.tp_size * self.pp_size * self.cp_size:
             raise ValueError(
-                f"world_size {world_size} should be equal to tp_size * pp_size {self.tp_size * self.pp_size * self.cp_size} "
+                f"world_size {world_size} should be equal to tp_size * pp_size * cp_size {self.tp_size * self.pp_size * self.cp_size} "
             )
 
     @property
@@ -299,8 +339,7 @@ class _ParallelConfig:
                        enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
                        moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
-                       moe_ep_size=self.moe_ep_size,
-                       auto_parallel=self.auto_parallel)
+                       moe_ep_size=self.moe_ep_size)
 
 
 class CalibConfig(StrictBaseModel):
@@ -356,7 +395,14 @@ class _ModelFormatKind(Enum):
 
 
 class DecodingBaseConfig(StrictBaseModel):
+    # The number of the drafter layers.
     max_draft_len: Optional[int] = None
+    # The number of draft tokens in the draft tokens tree.
+    # If it's a linear tree, each draft layer will only generate one draft token.
+    # In this case, max_draft_len == max_total_draft_tokens.
+    # If it's a static or dynamic tree, each draft layer may generate more than one draft token.
+    # In this case, max_total_draft_tokens >= max_draft_len.
+    max_total_draft_tokens: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
     # PyTorch only.
@@ -365,6 +411,36 @@ class DecodingBaseConfig(StrictBaseModel):
     max_concurrency: Optional[int] = None
 
     load_format: Optional[str] = None
+    # PyTorch only.
+    # Rolling average window size (N) for acceptance length across completed requests.
+    # If not set or set to 0, the feature is disabled.
+    acceptance_window: Optional[int] = None
+    # PyTorch only.
+    # Threshold for average acceptance length; speculation will be disabled
+    # permanently once the rolling average over the last N completed requests
+    # (N = acceptance_window) drops below this value.
+    acceptance_length_threshold: Optional[float] = None
+
+    # Validate acceptance controls at field level so they run on model creation
+    @field_validator('acceptance_window')
+    @classmethod
+    def _validate_acceptance_window(cls, v: Optional[int]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_window must be >= 0 (0 disables), got {v}")
+        return v
+
+    @field_validator('acceptance_length_threshold')
+    @classmethod
+    def _validate_acceptance_length_threshold(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"acceptance_length_threshold must be >= 0, got {v}")
+        return v
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
@@ -439,6 +515,10 @@ class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Medusa only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -457,8 +537,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     use_dynamic_tree: Optional[bool] = False
     # The topK value for each layer when enable dynamic tree.
     dynamic_tree_max_topK: Optional[int] = None
-    # The number of draft tokens in the draft tokens tree.
-    max_total_draft_tokens: Optional[int] = None
     # The number of eagle layer. will not be used in pytorch flow, just for compatibility with TRT flow
     num_eagle_layers: Optional[int] = None
     # The number of non-leaves in each layer.
@@ -493,7 +571,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
         # Checks whether the input eagle choices is valid
         # and reset the max_draft_len and num_eagle_layers if necessary
         if self.eagle_choices is not None:
-            # If eagle_choices is provided, use_dynamic_tree will not be used
+            # If eagle_choices is provided, use_dynamic_tree should not be used
             assert not self.use_dynamic_tree, "If eagle_choices is provided, use_dynamic_tree need to be False"
 
             # Get num_eagle_layers from eagle_choices
@@ -564,6 +642,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
             return len(self.eagle3_layers_to_capture)
         return 3
 
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        if self.eagle_choices is None and self.use_dynamic_tree is False:
+            return True
+        return False
+
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     output_directory: str
@@ -616,6 +700,10 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
     drafter: object  # Type is Drafter
     resource_manager: object = None  # Type is Optional[ResourceManager]
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -648,6 +736,10 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_use_oldest: bool = True
     is_public_pool: bool = True
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current NGram only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -659,6 +751,10 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -689,10 +785,18 @@ class MTPDecodingConfig(DecodingBaseConfig):
     BEGIN_THINKING_PHASE_TOKEN: int = 128798
     END_THINKING_PHASE_TOKEN: int = 128799
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if 'num_nextn_predict_layers' in kwargs:
+            self.max_draft_len = kwargs['num_nextn_predict_layers']
+            self.max_total_draft_tokens = kwargs[
+                'num_nextn_predict_layers']  # Current MTP only support linear tree
+
     @classmethod
     def from_dict(cls, data: dict):
         out = cls(**data)
         out.max_draft_len = out.num_nextn_predict_layers
+        out.max_total_draft_tokens = out.num_nextn_predict_layers  # Current MTP only support linear tree
         return out
 
     decoding_type: ClassVar[str] = "MTP"
@@ -726,6 +830,10 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
     Attributes that are inherited from the base class are ignored.
     """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Auto only support linear tree
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1069,6 +1177,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 
     def __init__(self, **data):
         super().__init__(**data)
+        self.max_total_draft_tokens = self.max_draft_len  # Current Lookahead only support linear tree
         self._check_fields()
 
     def calculate_speculative_resource(self):
@@ -1103,6 +1212,10 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     AutoDecodingConfig,
 ]]
 
+SparseAttentionConfig: TypeAlias = Union[
+    RocketSparseAttentionConfig,
+]
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -1128,7 +1241,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Number of sink tokens (tokens to always keep in attention window).")
     free_gpu_memory_fraction: Optional[float] = Field(
-        default=None,
+        default=0.9,
         description=
         "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
@@ -1210,6 +1323,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
 
+    @field_validator('free_gpu_memory_fraction')
+    @classmethod
+    def validate_free_gpu_memory_fraction(cls, v: float):
+        """Validates that the fraction is between 0.0 and 1.0."""
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
     @field_validator('max_gpu_total_bytes')
     @classmethod
     def validate_max_gpu_total_bytes(cls, v: int):
@@ -1288,10 +1411,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
 
+    kv_transfer_timeout_ms: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=
+        "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
+    )
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
-            max_tokens_in_buffer=self.max_tokens_in_buffer)
+            max_tokens_in_buffer=self.max_tokens_in_buffer,
+            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms)
 
 
 @dataclass
@@ -1480,6 +1611,12 @@ class BaseLlmArgs(StrictBaseModel):
         description="Cache transceiver config.",
         status="prototype")
 
+    # Sparse attention config
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        default=None,
+        description="Sparse attention config.",
+        status="prototype")
+
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
@@ -1498,7 +1635,7 @@ class BaseLlmArgs(StrictBaseModel):
                                           description="The maximum beam width.")
 
     max_num_tokens: Optional[int] = Field(
-        default=None, description="The maximum number of tokens.")
+        default=8192, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
         default=False,
@@ -1559,7 +1696,7 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype",
     )
 
-    _parallel_config: Optional[object] = PrivateAttr(default=None)
+    _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
     _speculative_model_format: Optional[_ModelFormatKind] = PrivateAttr(
@@ -1797,13 +1934,15 @@ class BaseLlmArgs(StrictBaseModel):
 
         if self.max_batch_size is not None:
             if self.max_batch_size > self.build_config.max_batch_size:
-                raise ValueError(
-                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
+                self.max_batch_size = self.build_config.max_batch_size
+                logger.warning(
+                    f"max_batch_size [{self.max_batch_size}] is overridden by build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
         if self.max_num_tokens is not None:
             if self.max_num_tokens > self.build_config.max_num_tokens:
-                raise ValueError(
-                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
+                self.max_num_tokens = self.build_config.max_num_tokens
+                logger.warning(
+                    f"max_num_tokens [{self.max_num_tokens}] is overridden by build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
         if self.max_seq_len is not None:
             if self.max_seq_len != self.build_config.max_seq_len:
@@ -1832,7 +1971,7 @@ class BaseLlmArgs(StrictBaseModel):
                                                     is QuantAlgo.FP8):
             self._update_plugin_config("manage_weights", True)
 
-        if self.parallel_config._world_size == 1 and self.build_config:
+        if self.parallel_config.world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
 
         if self.enable_lora and self.backend != 'pytorch':
@@ -2035,7 +2174,6 @@ class BaseLlmArgs(StrictBaseModel):
         moe_cluster_size = pretrained_config.mapping.moe_cluster_size
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
-        world_size = pretrained_config.mapping.world_size
         gpus_per_node = pretrained_config.mapping.gpus_per_node
         # load parallel_config
         if self.parallel_config.tp_size != 1 and self.parallel_config.tp_size != tp_size:
@@ -2050,20 +2188,14 @@ class BaseLlmArgs(StrictBaseModel):
             raise ValueError(
                 f"cp_size {self.parallel_config.cp_size} is not consistent with the checkpoint's cp_size {cp_size}"
             )
-        if (self.parallel_config.auto_parallel
-                and self.parallel_config.world_size != 1 and world_size != 1):
-            raise ValueError(
-                f"auto parallel with world_size {self.parallel_config.world_size} does not support checkpoint with "
-                "world_size {world_size} > 1")
-        if not self.parallel_config.auto_parallel:
-            self._parallel_config = _ParallelConfig(
-                tp_size=tp_size,
-                pp_size=pp_size,
-                cp_size=cp_size,
-                gpus_per_node=gpus_per_node,
-                moe_cluster_size=moe_cluster_size,
-                moe_tp_size=moe_tp_size,
-                moe_ep_size=moe_ep_size)
+        self._parallel_config = _ParallelConfig(
+            tp_size=tp_size,
+            pp_size=pp_size,
+            cp_size=cp_size,
+            gpus_per_node=gpus_per_node,
+            moe_cluster_size=moe_cluster_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size)
 
     def get_runtime_sizes(self, ) -> Tuple[int, int, int, int]:
         return (
@@ -2075,21 +2207,6 @@ class BaseLlmArgs(StrictBaseModel):
 
 
 class TrtLlmArgs(BaseLlmArgs):
-
-    auto_parallel: bool = Field(
-        default=False,
-        description="Enable auto parallel mode.",
-        deprecated=
-        "Use tensor_parallel_size/pipeline_parallel_size/xxx_parallel_size instead.",
-    )
-
-    auto_parallel_world_size: Optional[int] = Field(
-        default=None,
-        description="The world size for auto parallel mode.",
-        deprecated=
-        "Use tensor_parallel_size/pipeline_parallel_size/xxx_parallel_size instead.",
-    )
-
     enable_tqdm: bool = Field(default=False,
                               description="Enable tqdm for progress bar.")
 
@@ -2141,15 +2258,9 @@ class TrtLlmArgs(BaseLlmArgs):
         default=False, description="Normalize log probabilities.")
 
     # Private attributes
-    _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
-        default=None)
     # This is used to hold the options for convert_checkpoint
     _convert_checkpoint_options: Dict[str,
                                       Any] = PrivateAttr(default_factory=dict)
-
-    @property
-    def auto_parallel_config(self) -> AutoParallelConfig:
-        return self._auto_parallel_config
 
     @field_validator('calib_config', mode='before')
     @classmethod
@@ -2176,26 +2287,6 @@ class TrtLlmArgs(BaseLlmArgs):
             self._convert_checkpoint_options['use_parallel_embedding'] = True
             self._convert_checkpoint_options['embedding_sharding_dim'] = 1
         # No else clause needed since validation already happened
-        return self
-
-    @model_validator(mode="after")
-    def validate_auto_parallel(self):
-        self._auto_parallel_config = AutoParallelConfig(
-            sharded_io_allowlist=[
-                "past_key_value_\\d+",
-                "present_key_value_\\d*",
-            ],
-            same_buffer_io={
-                "past_key_value_(\\d+)": "present_key_value_\\1",
-            },
-            **infer_cluster_config(),
-        )
-
-        self.parallel_config.auto_parallel = self.auto_parallel
-
-        if self.parallel_config.auto_parallel:
-            self.parallel_config.world_size = self.auto_parallel_world_size
-
         return self
 
     @model_validator(mode="after")
@@ -2419,7 +2510,13 @@ class TorchLlmArgs(BaseLlmArgs):
                                    status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
-        description="The checkpoint loader to use for this LLM instance.",
+        description=
+        "The checkpoint loader to use for this LLM instance. You may use a custom checkpoint loader by subclassing "
+        "`BaseCheckpointLoader` and providing an instance of the subclass here to load weights from a custom "
+        "checkpoint format.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         json_schema_extra={
             "type":
             "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
@@ -2429,7 +2526,12 @@ class TorchLlmArgs(BaseLlmArgs):
 
     checkpoint_format: Optional[str] = Field(
         default=None,
-        description="The format of the provided checkpoint.",
+        description=
+        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         status="prototype",
     )
 

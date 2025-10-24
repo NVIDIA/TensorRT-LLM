@@ -668,7 +668,7 @@ def find_mm_token_positions(
             "Provide either mm_token_ids or vocab_size to find multimodal token positions"
         )
     if mm_token_ids is not None and vocab_size is not None:
-        logger.warning(
+        logger.debug(
             "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
         )
 

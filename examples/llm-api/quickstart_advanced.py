@@ -84,7 +84,6 @@ def add_llm_args(parser):
     parser.add_argument('--disable_kv_cache_reuse',
                         default=False,
                         action='store_true')
-    parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     # Runtime
     parser.add_argument('--disable_overlap_scheduler',
@@ -157,6 +156,12 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--logprobs', default=False, action='store_true')
+
+    parser.add_argument('--additional_model_outputs',
+                        type=str,
+                        default=None,
+                        nargs='+')
+
     return parser
 
 
@@ -164,6 +169,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
     args = parser.parse_args()
     return args
 
@@ -279,7 +285,8 @@ def setup_llm(args, **kwargs):
         logprobs=args.logprobs,
         n=args.n,
         best_of=best_of,
-        use_beam_search=use_beam_search)
+        use_beam_search=use_beam_search,
+        additional_model_outputs=args.additional_model_outputs)
     return llm, sampling_params
 
 
@@ -318,6 +325,16 @@ def main():
                 )
             if args.logprobs:
                 print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
+
+            if args.additional_model_outputs:
+                for output_name in args.additional_model_outputs:
+                    if sequence.additional_context_outputs:
+                        print(
+                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
+                        )
+                    print(
+                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                    )
 
 
 if __name__ == '__main__':

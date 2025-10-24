@@ -249,6 +249,7 @@ class QKNormRoPEAttention(Attention):
             else:
                 return q, k, v
 
-        assert k is None and v is None, "The input should be a concatenated qkv tensor to apply_qk_norm_rope"
         qkv = q
+        if k is not None and v is not None:
+            qkv = torch.concat([q, k, v], dim=-1)
         return self.apply_qk_norm_rope(qkv, position_ids)

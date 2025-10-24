@@ -1,12 +1,14 @@
 import unittest
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+    KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
@@ -36,6 +38,12 @@ class Config:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
+
+
+class DummyKvCacheConnectorWorker(KvCacheConnectorWorker):
+
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+        pass
 
 
 class DummyModel(torch.nn.Module):
@@ -72,13 +80,17 @@ class DummyModelEngine(PyTorchModelEngine):
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
         model = DummyModel(self.dtype)
-        super().__init__(model_path="",
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        model_path = "dummy"
+        llm_args = TorchLlmArgs(model=model_path,
+                                max_batch_size=batch_size,
+                                max_seq_len=max_seq_len)
+        super().__init__(model_path=model_path,
                          pytorch_backend_config=pytorch_backend_config,
-                         checkpoint_loader=None,
-                         batch_size=batch_size,
-                         max_seq_len=max_seq_len,
                          mapping=mapping,
-                         model=model)
+                         model=model,
+                         llm_args=llm_args)
 
 
 def _create_request(num_tokens, req_id: int):
@@ -323,6 +335,87 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          "Custom max_batch_size should be respected")
         self.assertTrue(pytorch_config_custom.cuda_graph_padding_enabled,
                         "Custom enable_padding should be respected")
+
+    def test_forward_pass_callable_on_cuda_graph_on(self):
+        config = PyTorchConfig(use_cuda_graph=True,
+                               cuda_graph_padding_enabled=True)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+
+        mock_callable = Mock()
+        model_engine.register_forward_pass_callable(mock_callable)
+
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        mock_callable.assert_called_once()
+
+    def test_forward_pass_callable_on_cuda_graph_off(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+
+        mock_callable = Mock()
+        model_engine.register_forward_pass_callable(mock_callable)
+
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        mock_callable.assert_called_once()
+
+    def test_foward_pass_callable_off(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        self.assertTrue(model_engine.forward_pass_callable is None,
+                        "forward_pass_callback should be None by default")
+
+        # Assert we can run `forward` without a forward_pass_callback without error
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+    def test_foward_pass_callable_backward_compat(self):
+        config = PyTorchConfig(use_cuda_graph=False)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        self.assertTrue(model_engine.forward_pass_callable is None,
+                        "forward_pass_callback should be None by default")
+
+        # Assert we can run `forward` without a forward_pass_callback without error
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
 
     @skip_ray
     def test_prepare_tp_inputs_with_helix_parallelism(self) -> None:
