@@ -23,7 +23,7 @@ from transformers import AutoModelForCausalLM, LlamaTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
-from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
 
@@ -97,7 +97,7 @@ def TRTLLaMA(args, config):
     quantization_config = pretrained_config['quantization']
 
     build_config = config['build_config']
-    kv_cache_type = KVCacheType.from_string(build_config['kv_cache_type'])
+    kv_cache_type = KVCacheType(build_config['kv_cache_type'])
     plugin_config = build_config['plugin_config']
 
     dtype = pretrained_config['dtype']
