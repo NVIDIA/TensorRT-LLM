@@ -2,7 +2,6 @@ import dataclasses
 import datetime
 import functools
 import gc
-import itertools
 import os
 import pickle  # nosec B403
 import threading
@@ -1084,8 +1083,7 @@ class PyExecutor:
         )
 
         if self.drafter is not None and not self.use_spec_decode:
-            for request in itertools.chain(scheduled_batch.context_requests,
-                                           scheduled_batch.generation_requests):
+            for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
@@ -2350,10 +2348,6 @@ class PyExecutor:
                 self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
             else:
                 self.has_previous_draft_tokens = False
-                # We are not running the draft model. Remove the draft tokens and turn off spec
-                # decode so that the requests get handled correctly.
-                for request in scheduled_batch.generation_requests:
-                    request.py_draft_tokens = []
                 target_inputs, draft_outputs, draft_batch = None, None, None
 
         return target_inputs, draft_outputs, draft_batch
