@@ -618,7 +618,9 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[1] * num_gen_tokens,
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
-                    use_mrope=self.use_mrope)
+                    use_mrope=self.use_mrope,
+                    max_beam_width=self.max_beam_width,
+                    num_extra_decoding_steps=num_extra_decoding_steps)
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
                         range(num_ctx_requests, num_ctx_requests +
@@ -662,8 +664,8 @@ class PyTorchModelEngine(ModelEngine):
                 (2, 0),  # Non-one, pure context
                 (curr_max_num_tokens, 0),  # max_num_tokens, pure context
             ])
-            if reverse:
-                warmup_requests = sorted(list(warmup_requests), reverse=reverse)
+
+            warmup_requests = sorted(list(warmup_requests), reverse=reverse)
 
             for warmup_num_tokens, warmup_num_gen_tokens in warmup_requests:
                 with release_batch(
@@ -814,10 +816,11 @@ class PyTorchModelEngine(ModelEngine):
 
                     torch.cuda.synchronize()
 
-            # Also, we run a general warmup from large to small to make sure that blocks are allocated well.
-            # The cudagraph and piecewise cuda graph capture calls torch.cuda.empty_cache() and block may already
-            # be freed even we calls general_warmup for torch compile.
-            general_warmup(reverse=True)
+        # Also, we run a general warmup from large to small to make sure that blocks are allocated well.
+        # The cudagraph and piecewise cuda graph capture calls torch.cuda.empty_cache() and block may already
+        # be freed even we calls general_warmup for torch compile.
+        # Also the additional warmup helps trigger the runtime jit to avoid runtime jit overhead.
+        general_warmup(reverse=True)
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
