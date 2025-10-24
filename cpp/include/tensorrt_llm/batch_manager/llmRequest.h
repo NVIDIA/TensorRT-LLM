@@ -1691,22 +1691,22 @@ public:
         mDecodingIter = iter;
     }
 
-    void setKvCacheTransferStart(TimePoint const& time)
+    void setKvCacheTransferStart(TimePoint time) const
     {
         mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
     }
 
-    void setKvCacheTransferEnd(TimePoint const& time)
+    void setKvCacheTransferEnd(TimePoint time) const
     {
         mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
     }
 
-    TimePoint getKvCacheTransferStart()
+    TimePoint getKvCacheTransferStart() const
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferStart;
     }
 
-    TimePoint getKvCacheTransferEnd()
+    TimePoint getKvCacheTransferEnd() const
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
@@ -1865,13 +1865,11 @@ public:
         return mUseDraftModel;
     }
 
-    // If mGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // If sGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
     // time point
-    [[nodiscard]] TimePoint getSteadyClockNow() const
+    [[nodiscard]] static TimePoint getSteadyClockNow()
     {
-        const TimePoint time_point = std::chrono::steady_clock::now();
-
-        return maybeToGlobalSteadyClock(time_point);
+        return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
     }
 
     RequestIdType mRequestId;
@@ -1894,7 +1892,7 @@ public:
     SizeType32 mPtableCurrentPosition{0};
 
     // The offset between local steady clock and global steady clock (at rank 0)
-    inline static std::optional<Duration> mGlobalSteadyClockOffset{std::nullopt};
+    inline static std::optional<Duration> sGlobalSteadyClockOffset{std::nullopt};
 
 protected:
     bool mIsStreaming;
@@ -2028,9 +2026,9 @@ protected:
 
     std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
 
-    // Performance metrics.
+    // Performance metrics. Should be updatable even from a const LlmRequest reference.
     bool mReturnPerfMetrics{false};
-    executor::RequestPerfMetrics mPerfMetrics;
+    mutable executor::RequestPerfMetrics mPerfMetrics;
 
     // Guided decoding params.
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};
@@ -2183,16 +2181,13 @@ private:
         return tensor;
     }
 
-    TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point) const
+    static TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point)
     {
-        if (mGlobalSteadyClockOffset.has_value())
+        if (sGlobalSteadyClockOffset.has_value())
         {
-            return time_point + *mGlobalSteadyClockOffset;
+            return time_point + *sGlobalSteadyClockOffset;
         }
-        else
-        {
-            return time_point;
-        }
+        return time_point;
     }
 };
 
