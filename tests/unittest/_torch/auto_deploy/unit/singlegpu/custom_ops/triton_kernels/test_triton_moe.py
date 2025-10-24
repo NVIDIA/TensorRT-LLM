@@ -1,5 +1,6 @@
 import pytest
 import torch
+from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.load_moe_align import moe_align_block_size
@@ -217,6 +218,7 @@ def test_moe_align_kernel_groups_tokens_by_expert_and_block_padding():
     assert torch.all(ref_counts_all == counts_all)
 
 
+@skip_pre_hopper
 def test_triton_quant_fp8_moe_matches_torch_quant_fp8_moe():
     """Test triton_quant_fp8_moe against torch_quant_fp8_moe reference."""
     torch.manual_seed(0)
