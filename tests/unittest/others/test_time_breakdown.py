@@ -10,6 +10,7 @@ Run tests with:
 """
 
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -137,6 +138,36 @@ class TestTimingMetricsConfig(unittest.TestCase):
         for metric in ctx_metrics:
             self.assertEqual(metric.server_type, 'ctx')
 
+    def test_disagg_relay_metric_exists(self):
+        """Test that disagg_relay metric exists in default configuration."""
+        config = TimingMetricsConfig()
+
+        metric = config.get_metric_by_name('disagg_relay')
+        self.assertIsNotNone(metric)
+        self.assertEqual(metric.name, 'disagg_relay')
+        self.assertEqual(metric.display_name, 'Disagg Relay')
+        self.assertEqual(metric.start_field, 'ctx_server_first_token_time')
+        self.assertEqual(metric.end_field, 'gen_server_arrival_time')
+        self.assertEqual(metric.server_type, 'disagg')
+
+    def test_disagg_relay_calculation(self):
+        """Test disagg_relay duration calculation."""
+        config = TimingMetricsConfig()
+        metric = config.get_metric_by_name('disagg_relay')
+
+        # Test with valid timing data
+        timing_data = {
+            'ctx_server_first_token_time': 1.5,
+            'gen_server_arrival_time': 2.0
+        }
+        duration = metric.calculate_duration(timing_data)
+        self.assertAlmostEqual(duration, 0.5, places=5)
+
+        # Test with missing fields
+        timing_data_missing = {'ctx_server_first_token_time': 1.5}
+        duration = metric.calculate_duration(timing_data_missing)
+        self.assertEqual(duration, 0.0)
+
     def test_add_metric(self):
         """Test adding a new metric."""
         config = TimingMetricsConfig()
@@ -202,9 +233,9 @@ class TestRequestDataParser(unittest.TestCase):
         self.assertEqual(parsed['ctx_first_token_time'], 1.5)
         self.assertEqual(parsed['ctx_server_first_token_time'], 1.6)
 
-        # Gen metrics should be 0 in aggregated format
-        self.assertEqual(parsed['gen_server_arrival_time'], 0)
-        self.assertEqual(parsed['disagg_server_arrival_time'], 0)
+        # Gen metrics should be NaN in aggregated format
+        self.assertTrue(math.isnan(parsed['gen_server_arrival_time']))
+        self.assertTrue(math.isnan(parsed['disagg_server_arrival_time']))
 
     def test_parse_disaggregated_format(self):
         """Test parsing disaggregated format."""
@@ -267,10 +298,10 @@ class TestRequestDataParser(unittest.TestCase):
 
         parsed = parser.parse_request(request_data, 0)
 
-        # All timing fields should default to 0
-        self.assertEqual(parsed['ctx_server_arrival_time'], 0)
-        self.assertEqual(parsed['ctx_arrival_time'], 0)
-        self.assertEqual(parsed['gen_server_arrival_time'], 0)
+        # All timing fields should default to NaN
+        self.assertTrue(math.isnan(parsed['ctx_server_first_token_time']))
+        self.assertTrue(math.isnan(parsed['ctx_arrival_time']))
+        self.assertTrue(math.isnan(parsed['gen_server_arrival_time']))
 
     def test_parse_uses_index_as_fallback(self):
         """Test that index is used when request_id is missing."""
@@ -281,6 +312,52 @@ class TestRequestDataParser(unittest.TestCase):
         parsed = parser.parse_request(request_data, 42)
 
         self.assertEqual(parsed['request_index'], 42)
+
+    def test_parse_disagg_relay_fields(self):
+        """Test parsing disaggregated format includes disagg_relay timing fields."""
+        parser = RequestDataParser()
+
+        request_data = {
+            'ctx_perf_metrics': {
+                'request_id': 'req_relay',
+                'perf_metrics': {
+                    'timing_metrics': {
+                        'server_arrival_time': 1.0,
+                        'arrival_time': 1.1,
+                        'first_scheduled_time': 1.2,
+                        'first_token_time': 1.5,
+                        'server_first_token_time': 1.6  # End of disagg_relay
+                    }
+                }
+            },
+            'gen_perf_metrics': {
+                'perf_metrics': {
+                    'timing_metrics': {
+                        'server_arrival_time':
+                        2.0,  # Start of disagg_relay (from gen perspective)
+                        'arrival_time': 2.1,
+                        'first_scheduled_time': 2.2,
+                        'first_token_time': 2.5,
+                        'server_first_token_time': 2.6
+                    }
+                }
+            },
+            'disagg_server_arrival_time': 0.5,
+            'disagg_server_first_token_time': 3.0
+        }
+
+        parsed = parser.parse_request(request_data, 0)
+
+        # Verify that both fields required for disagg_relay are present
+        self.assertEqual(parsed['ctx_server_first_token_time'], 1.6)
+        self.assertEqual(parsed['gen_server_arrival_time'], 2.0)
+
+        # The relay time should be: gen_server_arrival_time - ctx_server_first_token_time
+        # = 2.0 - 1.6 = 0.4 seconds
+        config = TimingMetricsConfig()
+        disagg_relay_metric = config.get_metric_by_name('disagg_relay')
+        relay_duration = disagg_relay_metric.calculate_duration(parsed)
+        self.assertAlmostEqual(relay_duration, 0.4, places=5)
 
 
 class TestRequestTimeBreakdown(unittest.TestCase):
@@ -492,6 +569,62 @@ class TestIntegration(unittest.TestCase):
 
             # Verify parsing
             self.assertEqual(len(timing_data), 5)
+
+            # Mock the plot function to avoid actual file operations
+            with patch(
+                    'tensorrt_llm.serve.scripts.time_breakdown.time_breakdown.pyo.plot'
+            ):
+                analyzer.create_timing_diagram(timing_data, html_f.name)
+
+    def test_full_workflow_with_disagg_relay(self):
+        """Test the complete workflow with disaggregated data including disagg_relay."""
+        # Create disaggregated test data
+        test_data = [{
+            'ctx_perf_metrics': {
+                'request_id': i,
+                'perf_metrics': {
+                    'timing_metrics': {
+                        'server_arrival_time': float(i),
+                        'arrival_time': float(i) + 0.1,
+                        'first_scheduled_time': float(i) + 0.2,
+                        'first_token_time': float(i) + 0.5,
+                        'server_first_token_time': float(i) + 0.6
+                    }
+                }
+            },
+            'gen_perf_metrics': {
+                'perf_metrics': {
+                    'timing_metrics': {
+                        'server_arrival_time': float(i) + 1.0,
+                        'arrival_time': float(i) + 1.1,
+                        'first_scheduled_time': float(i) + 1.2,
+                        'first_token_time': float(i) + 1.5,
+                        'server_first_token_time': float(i) + 1.6
+                    }
+                }
+            },
+            'disagg_server_arrival_time': float(i) - 0.5,
+            'disagg_server_first_token_time': float(i) + 2.0
+        } for i in range(3)]
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as json_f, \
+             tempfile.NamedTemporaryFile(suffix='.html', delete=True) as html_f:
+            # Write test data to JSON file
+            json.dump(test_data, json_f)
+            json_f.flush()
+
+            analyzer = RequestTimeBreakdown()
+            timing_data = analyzer.parse_json_file(json_f.name)
+
+            # Verify parsing
+            self.assertEqual(len(timing_data), 3)
+
+            # Verify disagg_relay_time is calculated
+            for data in timing_data:
+                self.assertIn('disagg_relay_time', data)
+                # Expected relay time: gen_server_arrival_time - ctx_server_first_token_time
+                # = (i + 1.0) - (i + 0.6) = 0.4
+                self.assertAlmostEqual(data['disagg_relay_time'], 0.4, places=5)
 
             # Mock the plot function to avoid actual file operations
             with patch(
