@@ -383,8 +383,6 @@ class DeepseekV3WeightLoader:
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
-                elif names[-1] == "indexer" or 'mqa.indexer' in name:
-                    continue
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):

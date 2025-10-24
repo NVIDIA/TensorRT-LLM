@@ -1114,7 +1114,7 @@ class Indexer(nn.Module):
                                         weights.to(torch.float32))
 
 
-class DSATrtllmAttention(TrtllmAttention, nn.Module):
+class DSATrtllmAttention(TrtllmAttention):
     Metadata = DSAtrtllmAttentionMetadata
 
     def __init__(
@@ -1151,7 +1151,6 @@ class DSATrtllmAttention(TrtllmAttention, nn.Module):
             skip_create_weights_in_init=skip_create_weights_in_init,
             attention_chunk_size=attention_chunk_size,
             **kwargs)
-        nn.Module.__init__(self)
 
         self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
                                skip_create_weights_in_init,
