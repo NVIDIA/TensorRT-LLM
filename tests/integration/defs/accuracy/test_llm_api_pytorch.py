@@ -3338,7 +3338,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     ])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
                      overlap_scheduler, mocker):
-        MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -3352,7 +3351,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         dtype=kv_cache_dtype)
 
-        llm = LLM(MODEL_PATH,
+        llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
@@ -3368,7 +3367,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     def test_dummy_load_format(self):
         llm = LLM(
-            f"{llm_models_root()}/gpt_oss/gpt-oss-20b",
+            self.MODEL_PATH,
             load_format="dummy",
         )
         with llm:
@@ -3524,7 +3523,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_2gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
                       mocker):
-        MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -3536,7 +3534,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         dtype=kv_cache_dtype)
 
-        llm = LLM(MODEL_PATH,
+        llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
