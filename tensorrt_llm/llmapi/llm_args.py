@@ -1241,7 +1241,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Number of sink tokens (tokens to always keep in attention window).")
     free_gpu_memory_fraction: Optional[float] = Field(
-        default=None,
+        default=0.9,
         description=
         "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
@@ -1322,6 +1322,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+
+    @field_validator('free_gpu_memory_fraction')
+    @classmethod
+    def validate_free_gpu_memory_fraction(cls, v: float):
+        """Validates that the fraction is between 0.0 and 1.0."""
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
@@ -2501,7 +2511,13 @@ class TorchLlmArgs(BaseLlmArgs):
                                    status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
-        description="The checkpoint loader to use for this LLM instance.",
+        description=
+        "The checkpoint loader to use for this LLM instance. You may use a custom checkpoint loader by subclassing "
+        "`BaseCheckpointLoader` and providing an instance of the subclass here to load weights from a custom "
+        "checkpoint format.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         json_schema_extra={
             "type":
             "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
@@ -2511,7 +2527,12 @@ class TorchLlmArgs(BaseLlmArgs):
 
     checkpoint_format: Optional[str] = Field(
         default=None,
-        description="The format of the provided checkpoint.",
+        description=
+        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
+        "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
+        "and the default HfCheckpointLoader will be used.\n"
+        "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
         status="prototype",
     )
 

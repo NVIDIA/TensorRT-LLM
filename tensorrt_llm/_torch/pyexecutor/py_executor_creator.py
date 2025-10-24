@@ -17,7 +17,7 @@ from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy, LoadFormat,
-                                          PybindMirror, TorchLlmArgs)
+                                          TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -289,10 +289,7 @@ def create_py_executor(
     else:
         dist = MPIDist(mapping=mapping)
 
-    cache_transceiver_config = None
-    if llm_args.cache_transceiver_config is not None:
-        cache_transceiver_config = PybindMirror.maybe_to_pybind(
-            llm_args.cache_transceiver_config)
+    cache_transceiver_config = llm_args.cache_transceiver_config
 
     has_draft_model_engine = False
     has_spec_drafter = False
