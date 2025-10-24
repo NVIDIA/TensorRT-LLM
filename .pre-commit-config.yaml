@@ -12,7 +12,7 @@ repos:
     rev: v0.43.0
     hooks:
     -   id: yapf
-        exclude: ".*/auto_deploy/.*"
+        exclude: ".*/auto_deploy/.*|tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py"
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.1.0
     hooks:
