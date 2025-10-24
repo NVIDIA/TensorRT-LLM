@@ -929,11 +929,97 @@ Dynamo supports TensorRT LLM as one of its inference engine. For details on how 
 
 ## Qwen3-Next
 
-Below is the command to run the Qwen3-Next model.
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings. Note that we should set kv_cache_reuse to false. 
+
+```shell
+EXTRA_LLM_API_FILE=/tmp/config.yml
+
+cat << EOF > ${EXTRA_LLM_API_FILE}
+enable_attention_dp: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 720
+moe_config:
+    backend: TRTLLM
+stream_interval: 20
+num_postprocess_workers: 4
+kv_cache_config:
+    enable_block_reuse: false
+EOF
+```
+
+Below is an example command to launch the TRT-LLM server with the Qwen3-Next model from within the container. Note that we currently only support pytorch backend. 
+
+```shell
+trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --backend pytorch \
+    --max_batch_size 1 \
+    --max_num_tokens 4096 \
+    --kv_cache_free_gpu_memory_fraction 0.6 \
+    --tp_size 4 \
+    --ep_size 4 \
+    --trust_remote_code \
+    --extra_llm_api_options ${EXTRA_LLM_API_FILE}
+```
+
+
+After the TRT-LLM server is set up and shows Application startup complete, you can send requests to the server.
+
+```shell
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json"  -d '{
+    "model": "Qwen/Qwen3-Next-80B-A3B-Thinking",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Where is New York?"
+        }
+    ],
+    "max_tokens": 1024,
+    "top_p": 1.0
+}' -w "\n"
+```
+
+
+To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+
+```shell
+cat <<'EOF' > bench.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+concurrency_list="1 2 4 8 16 32 64 128 256"
+multi_round=5
+isl=1024
+osl=1024
+result_dir=/tmp/qwen3_output
+
+for concurrency in ${concurrency_list}; do
+    num_prompts=$((concurrency * multi_round))
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model Qwen/Qwen3-Next-80B-A3B-Thinking \
+        --backend openai \
+        --dataset-name "random" \
+        --random-input-len ${isl} \
+        --random-output-len ${osl} \
+        --random-prefix-len 0 \
+        --random-ids \
+        --num-prompts ${num_prompts} \
+        --max-concurrency ${concurrency} \
+        --ignore-eos \
+        --tokenize-on-client \
+        --percentile-metrics "ttft,tpot,itl,e2el"
+done
+EOF
+chmod +x bench.sh
+```
+
+
+In addition, below is the command to run the Qwen3-Next model using the `quickstart_advanced.py` file.
 
 ```bash
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickstart_advanced.py --model_dir /Qwen3-Next-80B-A3B-Thinking --kv_cache_fraction 0.6 --disable_kv_cache_reuse --max_batch_size 1 --tp_size 4
-
 ```
 
 ## Notes and Troubleshooting
