@@ -1,0 +1,3 @@
+
+
+def init_pg(arg0: object, arg1: object, arg2: str, /) -> None: ...
