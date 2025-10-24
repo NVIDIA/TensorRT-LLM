@@ -34,7 +34,9 @@ transforms:
   match_eager_attention:
     stage: pattern_matcher
     requires_shape_prop: true
-  match_grouped_attention:
+  match_grouped_attention_with_repeat_kv:
+    stage: pattern_matcher
+  match_grouped_attention_without_repeat_kv:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
@@ -122,8 +124,11 @@ transforms:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
     stage: post_load_fusion
-    backend: flashinfer
+    backend: triton
     requires_shape_prop: true
+  fuse_gated_rmsnorm:
+    stage: post_load_fusion
+
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################

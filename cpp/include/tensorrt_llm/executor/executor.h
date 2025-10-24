@@ -1521,13 +1521,15 @@ public:
         UCX = 2,
         NIXL = 3
     };
-    explicit CacheTransceiverConfig(
-        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
+    explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
+        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
+    void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
 
+    [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
 
@@ -1537,6 +1539,7 @@ private:
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
+    std::optional<int> mKvTransferTimeoutMs;
 };
 
 /// @brief Configuration class for the model executor
