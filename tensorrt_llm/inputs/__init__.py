@@ -9,18 +9,21 @@ from .registry import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
                        support_multimodal_disaggregated)
 from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
-                    ConversationMessage, MultimodalData, MultimodalDataTracker,
+                    BaseModalityData, ConversationMessage, MultimodalData,
+                    MultimodalDataTracker, VideoData,
                     add_multimodal_placeholders, apply_chat_template,
                     async_load_audio, async_load_image, async_load_video,
                     convert_image_mode, default_multimodal_input_loader,
-                    encode_base64_content_from_url, get_cache_salt_id,
-                    load_image, load_video)
+                    encode_base64_content_from_url, encode_base64_image,
+                    get_cache_salt_id, load_image, load_video)
 
 __all__ = [
     "ALL_SUPPORTED_MULTIMODAL_MODELS",
     "ALL_SUPPORTED_IMAGE_MODELS",
     "ALL_SUPPORTED_VIDEO_MODELS",
     "ALL_SUPPORTED_AUDIO_MODELS",
+    "BaseModalityData",
+    "VideoData",
     "PromptInputs",
     "prompt_inputs",
     "TextPrompt",
@@ -47,6 +50,7 @@ __all__ = [
     "convert_image_mode",
     "default_multimodal_input_loader",
     "encode_base64_content_from_url",
+    "encode_base64_image",
     "load_image",
     "load_video",
     "get_cache_salt_id",
