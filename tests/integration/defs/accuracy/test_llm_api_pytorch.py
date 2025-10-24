@@ -3761,6 +3761,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
 
+        mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
+        mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
+
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=True,
                               cuda_graph_config=CudaGraphConfig())
@@ -3790,14 +3793,27 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
             # GSM8K
             task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+            # GPQA Medium Reasoning
+            task = GPQADiamond(model_name)
+
+            chat_template_kwargs = dict(reasoning_effort="medium")
+            extra_evaluator_kwargs = {
+                **self.extra_evaluator_kwargs, "chat_template_kwargs":
+                chat_template_kwargs
+            }
+
             sampling_params = SamplingParams(
                 temperature=1.0,
                 top_p=1.0,
-                max_tokens=task.MAX_OUTPUT_LEN,
-                truncate_prompt_tokens=task.MAX_INPUT_LEN)
+                max_tokens=MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=MAX_INPUT_LEN)
+
             task.evaluate(llm,
                           sampling_params=sampling_params,
-                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
 
 @skip_pre_hopper
