@@ -61,6 +61,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> mla_tensor_params, std::optional<int64_t> attention_chunk_size,
     std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-    std::vector<std::optional<torch::Tensor>> sparse_attention_params);
+    std::vector<std::optional<torch::Tensor>> sparse_attention_params, std::optional<torch::Tensor> cu_q_seqlens,
+    std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
+    std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+    std::optional<torch::Tensor> quant_q_buffer);
 
 } // namespace torch_ext

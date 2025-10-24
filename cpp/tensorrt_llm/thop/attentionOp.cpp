@@ -86,7 +86,10 @@ public:
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
-        torch::optional<torch::Tensor> sparse_attn_offsets) const
+        torch::optional<torch::Tensor> sparse_attn_offsets, std::optional<torch::Tensor> cu_q_seqlens,
+        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
+        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+        std::optional<torch::Tensor> quant_q_buffer) const
         = 0;
 };
 
@@ -143,7 +146,10 @@ public:
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
-        torch::optional<torch::Tensor> sparse_attn_offsets) const override
+        torch::optional<torch::Tensor> sparse_attn_offsets, std::optional<torch::Tensor> cu_q_seqlens,
+        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
+        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+        std::optional<torch::Tensor> quant_q_buffer) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -197,6 +203,13 @@ public:
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
                 mla_params.k_buf = k_ptr;
                 mla_params.v_buf = v_ptr;
+
+                // For generation, helix position is in ropeOp
+                auto& mla_helix_position_offsets = mla_tensor_params[0];
+                if (mla_helix_position_offsets.has_value())
+                {
+                    mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
+                }
             }
             else
             {
@@ -209,6 +222,22 @@ public:
                 mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
                 mla_params.q_pe_ld = q_pe->strides()[1];
                 mla_params.q_pe_stride = q_pe->strides()[0];
+
+                mla_params.seqQOffset
+                    = cu_q_seqlens.has_value() ? reinterpret_cast<int*>(cu_q_seqlens.value().data_ptr()) : nullptr;
+                mla_params.cu_kv_seqlens
+                    = cu_kv_seqlens.has_value() ? reinterpret_cast<int*>(cu_kv_seqlens.value().data_ptr()) : nullptr;
+                mla_params.fmha_tile_counter = fmha_scheduler_counter.has_value()
+                    ? reinterpret_cast<uint32_t*>(fmha_scheduler_counter.value().data_ptr())
+                    : nullptr;
+                mla_params.bmm1_scale = mla_bmm1_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.bmm2_scale = mla_bmm2_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm2_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.quant_q_buf
+                    = quant_q_buffer.has_value() ? reinterpret_cast<void*>(quant_q_buffer.value().data_ptr()) : nullptr;
             }
             mla_params.q_buf = attention_input;
             mla_params.context_buf = reinterpret_cast<T*>(context_buf);
@@ -220,11 +249,6 @@ public:
             mla_params.meta = op.mMLAParams;
 
             mla_params.workspace = workspace_ptr;
-            auto& mla_helix_position_offsets = mla_tensor_params[0];
-            if (mla_helix_position_offsets.has_value())
-            {
-                mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
-            }
         }
 
         // Prepare sparse attention parameters
@@ -541,7 +565,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::vector<std::optional<torch::Tensor>> mla_tensor_params, std::optional<int64_t> attention_chunk_size,
     std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-    std::vector<std::optional<torch::Tensor>> sparse_attention_params)
+    std::vector<std::optional<torch::Tensor>> sparse_attention_params, std::optional<torch::Tensor> cu_q_seqlens,
+    std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
+    std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+    std::optional<torch::Tensor> quant_q_buffer)
 {
     // Decompress sparse attention parameters
     TORCH_CHECK(sparse_attention_params.size() == 4, "Expected 4 sparse attention parameters");
@@ -805,7 +832,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
-            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets);
+            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
+            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -822,7 +850,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
             mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
-            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets);
+            attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets,
+            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
