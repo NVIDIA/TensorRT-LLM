@@ -17,7 +17,7 @@ llm_perf_cluster_nim:
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:500,2000-quant:fp8]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200]
   # for chunked prefill cases
-  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500-reqs:200]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:3000,500-reqs:200]
   # Phi-4-multimodal-instruct
   - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-con:250]
   - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250]
