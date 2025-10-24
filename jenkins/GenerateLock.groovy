@@ -43,7 +43,10 @@ def generate()
     sh "pwd && ls -alh"
 
     container("alpine") {
-        LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
+        LLM_REPO = params.repoUrl
+        if (LLM_REPO == "Custom Repo") {
+            LLM_REPO = params.customRepoUrl
+        }
         sh "apt update"
         sh "apt install -y python3-dev git curl git-lfs"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
@@ -66,10 +69,10 @@ def generate()
             withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
                 def authedUrl = LLM_REPO.replaceFirst('https://', "https://${GIT_USER}:${GIT_PASS}@")
                 sh "git remote set-url origin ${authedUrl}"
-                sh "git fetch origin ${params.llmBranch}"
+                sh "git fetch origin ${params.branchName}"
                 sh "git status"
-                sh "git rebase origin/${params.llmBranch}"
-                sh "git push origin HEAD:${params.llmBranch}"
+                sh "git rebase origin/${params.branchName}"
+                sh "git push origin HEAD:${params.branchName}"
             }
         }
     }
@@ -81,7 +84,9 @@ pipeline {
         kubernetes createKubernetesPodConfig()
     }
     parameters {
-        string(name: 'llmBranch', defaultValue: 'main', description: 'the branch to generate the lock files')
+        string(name: 'branchName', defaultValue: 'main', description: 'the branch to generate the lock files')
+        choice(name: 'repoUrl', choices: ['https://github.com/NVIDIA/TensorRT-LLM.git','https://gitlab-master.nvidia.com/ftp/tekit.git', 'Custom Repo'], description: "The repo url to process, choose \"Custom repo\" if you want to set your own repo")
+        string(name: 'customRepoUrl', defaultValue: '', description: 'Your custom repo to get processed, need to select \"Custom repo\" for repoUrl, otherwise it will be ignored')
     }
     options {
         skipDefaultCheckout()
