@@ -349,6 +349,14 @@ std::string streamPrint(T v)
     return out.str();
 }
 
+template <typename C, typename... Args>
+std::string streamPrint(C callable, Args... remainingArgs)
+{
+    std::stringstream out;
+    out << callable(out, remainingArgs...);
+    return out.str();
+}
+
 //
 // Basic building block of KV cache.
 //
@@ -369,6 +377,8 @@ class KVCachePromptLookup
 public:
     explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
+    //! \brief Return vector of BlockKey for the first inputLength tokens of prompt stored in llmRequest.
+    //! \details If inputLength < 0, effective input length is total number of tokens + inputLength. If you want to skip the last token, you can simply do inputLength = -1.
     [[nodiscard]] std::vector<BlockKey> getBlockKeys(
         LlmRequest const& llmRequest, SizeType32 inputLength, bool allowPartiallyFilledBlock) const;
 
@@ -458,6 +468,9 @@ public:
     BlockPtr const& getPrevBlockInSeq() const;
     void setPrevBlockInSeq(BlockPtr prevBlock);
 
+    //! \brief Return previous block in search tree if this block is stored in search tree.
+    //! \details Returns nullptr if this block is not in search tree or it is at root level.
+    //! \details Previously this function would have returned pointer to a special 'root' block if already at root level.
     BlockPtr getPrevBlock() const;
 
     [[nodiscard]] bool isFull() const;
@@ -491,6 +504,12 @@ public:
 
     // get lookup node using this block. Can be nullptr
     [[nodiscard]] LookupNodePtr getLookupNode() const;
+
+    //! \brief Check if block is still valid for reuse.
+    [[nodiscard]] bool isValidForReuse() const
+    {
+	return mLookupNode != nullptr;
+    }
 
 private:
     // Linear ID of block independent of pool
@@ -988,6 +1007,8 @@ public:
     //! \brief Unpin blocks by starting from a block id and walking prev pointers.
     void unpinBlocksById(KVCacheBlock::IdType blockId);
 
+    [[nodiscard]] std::string printFreeQueues() const;
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -1392,6 +1413,13 @@ public:
     //! detach more than a single block since there may be more than one
     //! context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence);
+
+    //! \brief Print free queues maintained by eviction policy
+    //! \details This method is meant for debugging
+    [[nodiscard]] std::string printFreeQueues(SizeType32 windowSize) const
+    {
+	return mWindowBlockManagers.at(windowSize).printFreeQueues();
+    }
 
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const

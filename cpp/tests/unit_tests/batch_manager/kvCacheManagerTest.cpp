@@ -2211,71 +2211,70 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeBlockPriorityTest)
 
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
 
-    // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     llmRequest0->setKvCacheRetentionConfig(
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 90)}, 90));
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
+    // reserve blocks 0, 1 and 2 with tokens [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11] and priority 90
 
     // 5 blocks available.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 5);
 
-    // Add a token to request 0, which occupies a new block 3.
+    // Add a token to request 0
     kvCacheManager.addToken(0);
-    llmRequest0->addNewToken(0, 0); // block 3 contains [0]
+    llmRequest0->addNewToken(0, 0);
+    // reserve block 3 with tokens [0] and priority 90
 
     // 4 blocks left.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 4);
 
-    // uses up 3 more blocks 4, 5, 6. [12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, 23]
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23});
     auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     llmRequest1->setKvCacheRetentionConfig(
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 5)}, 5));
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
+    // reserve blocks 4, 5 and 6 with tokens [12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, 23] and priority 5
 
     // one block left.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 1);
 
-    // add another token, which occupies another new block
+    // add another token
     kvCacheManager.addToken(1);
-    llmRequest1->addNewToken(0, 0); // block 7 contains [0]
+    llmRequest1->addNewToken(0, 0);
+    // reserve block 7 with priority 5
 
     // no block available.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 0);
 
     // remove both sequences, blocks get stored
-    // leaf block 3 (priority 90), context blocks 2, 1, 0 (priority 5)
     (void) kvCacheManager.removeSequence(0, llmRequest0);
-    // leaf block 7 (priority 5), context blocks 6, 5, 4 (priority 90)
+    // store blocks 0, 1, 2 with priority 90. block 3 is released without being stored, but still has priority 90.
     (void) kvCacheManager.removeSequence(1, llmRequest1);
+    // store blocks 4, 5, 6 with priority 5. block 7 is released without being stored, but still has priority 5.
 
     // all blocks are available again.
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
 
     // no reuse, blocks are evicted by new request:
-    // evict block 2 (last block in sequence with lowest priority == 5)
-    // evict block 1 (second last block in sequence with lowest priority == 5)
-    // evict block 0 (third last block in sequence with lowest priority == 5)
     // uses up 3 blocks 2, 1, 0. [24, 25, 26, 27], [28, 29, 30, 31], [32, 33, 34]
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35});
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
+    // no reuse, reserve blocks 5, 6, 7 since they have lower priority than 0, 1, 2 and 3.
     kvCacheManager.removeSequence(2, llmRequest2);
 
-    // no reuse since blocks 0, 1 and 2 were evicted
-    // Uses 3 blocks 0, 1, 2 which contain [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10]
+    // reuse blocks 0, 1 and 2 with tokens [0,1,2,3] [4,5,6,7] [8,9,10,11]
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
 
-    // Two new blocks, since blocks 0 and 1 were evicted
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 0);
+    // Reused 11 out of the 12 input tokens.
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 11);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerTimedEvictionTest)
@@ -2412,8 +2411,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
         kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
         // Reserve new blocks [4,5,6]
         kvCacheManager.storeContextBlocks(*llmRequest1);
-        // Occupy a new block, block 3, adding 3 tokens to block 3.
-        // [1, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [0, 0, 0]
+        // Occupy a new block, block 7, adding 3 tokens to block 7.
+        // [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [0, 0, 0]
         for (int i = 0; i < 3; i++)
         {
             // i == 0 will reserve block 7 for generated tokens
@@ -2424,7 +2423,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
         // Store blocks 4,5,6,7 with tokens [0,1,2,3] [4,5,6,7] [8,9,10,11] [1,1,1]
         // Assigned priorities are 4(35) 5(35) 6(35) 7(100). Block 7 retains max priority for 20ms
         // Free queues at this point are:
-        //  35 : 4,5,6
+        //  35 : 4,5,6,8
         //  50 : 0,1,2,3
         // 100 : 7
     }
@@ -2432,7 +2431,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     // Allow block 7's max priority to expire, demoting block from priority 100 to 35.
     // Note that demoting block 7 priority puts block 7 at the back of the free queue,
     // Free queues at this point are:
-    //  35 : 7,4,5,6
+    //  35 : 7,4,5,6,8
     //  50 : 0,1,2,3
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     kvCacheManager.refreshBlocks();
@@ -2442,11 +2441,11 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
-    // No unused blocks available. Evict blocks 6,5 and reserve for new request.
+    // No unused blocks available. Evict blocks 8,6 and reserve for new request.
     kvCacheManager.removeSequence(2, llmRequest2);
-    // Store blocks [6,5] for reuse.
+    // Store blocks [8,6] for reuse.
     // Free queues at this point are:
-    //  35 : 6,5,7,4
+    //  35 : 8,6,7,4,5
     //  50 : 0,1,2,3
 
     // 12 tokens, reusing block 4, 5. Block 6 is overwritten so no reuse.
@@ -2454,9 +2453,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
-    // Reuse block 4. Evict blocks 7 and 5.
+    // Reuse block 4,5. Evict blocks 7
 
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 8);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
@@ -2489,37 +2488,79 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
         0, stream, maxSequenceLength, true, onboardBlocks);
     kvCacheManager.allocatePools(false);
 
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
-    // 12 tokens, get block 0, 1, 2
-    // [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Free queues:
+    // P : 35 : 0,1,2,3
+    // S : 35 : 4,5,6,7
     kvCacheManager.addSequence(0, inputLength0, beamWidth, llmRequest0);
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Reserve blocks 0,1,2 for tokens [0,1,2,3] [4,5,6,7] [8,9,10,11]
+    // Free queues:
+    // P : 35 : 3
+    // S : 35 : 4,5,6,7
     (void) kvCacheManager.removeSequence(0, llmRequest0);
-    // store blocks 0, 1, 2 for reuse ([0,1,2,3], [4,5,6,7], [8,9,10])
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Store blocks 0,1,2
+    // Free queues:
+    // P : 35 : 3,2,1,0
+    // S : 35 : 4,5,6,7
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[8,9,10]
 
     // Offload the last two blocks of llmRequest0 to secondary memory
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
 
-    // Uses blocks 3, 4, 5, block 2 and 1 to be offloaded to secondary
-    // Block 4 is now in primary (replacing 2)
-    // Block 5 is now in primary (replacing 1)
     kvCacheManager.addSequence(1, inputLength1, beamWidth, llmRequest1);
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // No reuse possible
+    // Reserve block 3
+    // Offload block 2 to 4. Reserve block 4
+    // Offload block 1 to 5. Reserve block 5
+    // Free queues:
+    // P : 35 : 0
+    // S : 45 : 6,7,2,1
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[8,9,10]
     (void) kvCacheManager.removeSequence(1, llmRequest1);
-    // store blocks 3, 4, 5 for reuse ([1,1,2,3], [4,5,6,7], [8,9,10])
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Store blocks 3,4,5
+    // Free queues:
+    // P : 35 : 0,5,4,3
+    // S : 45 : 6,7,2,1
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[8,9,10]
+    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> 5=[8,9,10]
 
-    // Match the middle block of request 0
-    // Uses block 6, block 0 is offloaded to secondary
-    // Block 6 copies content from block 0 to itselg.
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3});
     auto const inputLength2 = static_cast<SizeType32>(inputTokens2->size());
     auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, isStreaming);
-    // reuse block 0
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Partially reuse block 0 by copy. This involves the following steps:
+    //   getFreeBlock to partially copy tokens from block 0 into:
+    //     Offload block 0 to 6 (primary -> secondary)
+    //     return block 6
+    //   partially copy block 0 to 6 (secondary -> primary)
+    //   reserve block 6
+    // Block 0 is now in secondary, return block 6.
+    // TODO: This round-trip to host memory and back is stupid.
+    // It happens because the source (0) and destination chosen by getFreeBlock (0) are the same. Check for this.
+    // Free queues:
+    // P : 35 : 5,4,3
+    // S : 45 : 7,2,1,0
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[8,9,10]
+    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> 5=[8,9,10]
     EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 3);
     kvCacheManager.storeContextBlocks(*llmRequest2);
+    // Nothing stored since we only have 4 prompt tokens and we need at least 5 to get one full reusable block
 
     // Add a decode block that matches the contents of seq 0 block 1, add a unique decode block
     // The 4 tokens added has the same content as block 1.
@@ -2528,29 +2569,71 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
         llmRequest2->addNewToken(token, 0);
         kvCacheManager.addToken(2);
     }
-    // Add 2 more tokens, occupying another block
-    llmRequest2->addNewToken(0, 0);
-    kvCacheManager.addToken(2);
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Offload block 5 to 7. Reserve block 7
+    // Free queues:
+    // P : 35 : 4,3
+    // S : 45 : 2,1,0,5
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[8,9,10]
+    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> 5=[8,9,10]
 
+    // add two more tokens.
     llmRequest2->addNewToken(0, 0);
     kvCacheManager.addToken(2);
-    // The middle block remains in secondary, but the third block is in primary
-    // FIXME: When removing the sequence, we should observe whether released
-    // blocks can replace itself as the block reused in the search tree if
-    // the matching block is currently in secondary memory. We can release the
-    // block in secondary if so.
-    // If we do this, then the context current position at the bottom of this
-    // unit test will be 9 because then the block content [4,5,6,7] can be
-    // found and reused.
+    llmRequest2->addNewToken(0, 0);
+    kvCacheManager.addToken(2);
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Evict 2
+    // Offload block 4 to 2. Reserve block 2
+    // Free queues:
+    // P : 35 : 3
+    // S : 45 : 1,0,5,4
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> nil
+    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> 5=[8,9,10]
+
     (void) kvCacheManager.removeSequence(2, llmRequest2);
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Store blocks 6,7,2. Blocks 6, 7 are not stored since same state is already stored in tree
+    // Free queues:
+    // P : 35 : 3,2,7,6
+    // S : 45 : 1,0,5,4
+    // Cache:
+    // 0=[0,1,2,3] -> 1=[4,5,6,7] -> 2=[0]
+    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> 5=[8,9,10]
 
-    // 10 tokens, reusing the block 0 only because when we want to acquire
-    // the second block, contents of block 3 will be offloaded to block 1.
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 0, 0});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
-    // Check out FIXME note above. If addressed, this should be 9.
+    TLLM_LOG_DEBUG("%s;%d\n%s",__FILE__,__LINE__,blockManager.printFreeQueues(maxAttentionWindow).c_str());
+    // Reuse blocks 0,1,2 with tokens [0,1,2,3] [4,5,6,7] [0]
+    // The following steps are involved:
+    // Matched block 0
+    // Block 0 needs onboarding.
+    //   Evict block 1. Note that this will prevent further reuse
+    // P : 35 : 3,2,7,6
+    // S : 45 : 0,5,4
+    //   Offload block 3 to 1. Return block 1.
+    // P : 35 : 2,7,6
+    // S : 45 : 0,5,4,3
+    //   Onboard block 0 to 1. Reserve block 0.
+    // P : 35 : 2,7,6
+    // S : 45 : 5,4,3,1
+    // Matched block 1, but it has been evicted.
+    // Evict block 5
+    // Offload block 2 to block 5. Reserve block 5
+    // Note that this is wasted effort, since block 2's parent block was evicted
+    // P : 35 : 7,6
+    // S : 45 : 4,3,1,2
+    // Matched block 2, but previous block has been evicted so no longer valid for reuse.
+    // No need to offload block 7, it has no stored state
+    // P : 35 : 6
+    // S : 45 : 4,3,1,2
+    // Cache:
+    // 0=[0,1,2,3] -> nil         -> 2=[0]
+    // 3=[1,1,2,3] -> 4=[4,5,6,7] -> nil
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
 }
 

@@ -611,7 +611,7 @@ std::vector<BlockKey> KVCachePromptLookup::getBlockKeys(
         ? llmRequest.getUniqueTokens(beamIdx)
         : *(llmRequest.getEncoderUniqueTokens().value());
     auto usefulInputLength
-        = (inputLength <= 0) ? static_cast<SizeType32>(uniqueTokens.size()) + inputLength : inputLength;
+        = (inputLength < 0) ? static_cast<SizeType32>(uniqueTokens.size()) + inputLength : inputLength;
     usefulInputLength = std::max(0, usefulInputLength);
 
     // Ignore last token because it can't be recovered
@@ -1518,6 +1518,7 @@ BlockPtr WindowBlockManager::getFreeBlock(executor::RetentionPriority priority,
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
         // Remove block from secondary free queue
         mEvictionPolicy->claimBlock(offloadBlock);
+	TLLM_LOG_DEBUG("Offloading block %d to %d",block->getBlockId(),offloadBlock->getBlockId());
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
@@ -1541,7 +1542,11 @@ BlockPtr WindowBlockManager::getFreeBlock(executor::RetentionPriority priority,
         mEventManager->enqueueRemovedEvent(block, mWindowSize);
     }
     // Detach block from search structure
-    block->detachFromLookupNode();
+    if (block->getLookupNode() != nullptr)
+    {
+	TLLM_LOG_DEBUG("Evicting block %d",block->getBlockId());
+	block->detachFromLookupNode();
+    }
 
     return block;
 }
@@ -1704,12 +1709,17 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
     auto const beamWidth = sequence.getBeamWidth();
     SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
 
+    bool validForReuse = true;
     auto blockItr = matchedBlocks.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
         auto [partialMatch, numMatched, matchingBlock, matchingNode]
-            = blockItr != matchedBlocks.end() ? *(blockItr++) : std::make_tuple(false, 0, nullptr, nullptr);
-        if (matchingBlock != nullptr)
+            = validForReuse && blockItr != matchedBlocks.end() ? *(blockItr++) : std::make_tuple(false, 0, nullptr, nullptr);
+	TLLM_LOG_DEBUG("%s;%d",__FILE__,__LINE__);
+	// Check if matchingBlock is still valid for reuse.
+	// It is possible that a matching block has been evicted after the last scan of search tree.
+	validForReuse = validForReuse && matchingBlock != nullptr && matchingBlock->isValidForReuse();
+        if (validForReuse)
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
@@ -1730,14 +1740,13 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                 auto partialBlockKey = matchingNode->getBlockKey().clone(numMatched);
                 if (matchingBlock->hasRefs() || (!isSWA() && !matchingNode->isLeaf()))
                 {
-                    // Somebody else is using block or it is not a leaf, copy reusable tokens
+                    // Somebody else is using block or this is full attention and block is not a leaf, copy reusable tokens
                     auto newBlock
                         = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
                     // TODO: (optional) Send out event
+                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d into %d. Reserved block %d for sequence %lu", mLogPrefix.c_str(),matchingBlock->getBlockId(),newBlock->getBlockId(),newBlock->getBlockId(),sequence.getRequestId());
                     matchingBlock = newBlock;
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
-                        matchingBlockId);
                 }
                 else
                 {
@@ -1780,7 +1789,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
                                               executor::KvCacheRetentionConfig::kDefaultRetentionPriority),
                 perBlockRetentions[bi].durationMs, mode, directory);
             addBlockToAllBeams(freeBlock, sequence);
-            TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - No match, allocated new block %d for sequence %lu",
+            TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - No match. Reserved new block %d for sequence %lu",
                 mLogPrefix.c_str(), freeBlock->getBlockId(), sequence.getRequestId());
             /*
             // TODO: Clean this up. Does it need to be done here? Should be done when block is stored.
@@ -1942,6 +1951,11 @@ void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
         allocateBlock(sequence, /*shareAmongBeams=*/sequence.getBeamWidth() == 1);
         updateLastCacheBlockOffsets(sequence);
     }
+}
+
+std::string WindowBlockManager::printFreeQueues() const
+{
+    return mEvictionPolicy->printFreeQueues();
 }
 
 // There are two versions of BlockManager::addSequence function.
