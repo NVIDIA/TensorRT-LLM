@@ -75,25 +75,29 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
-def get_llm_args(model: str,
-                 tokenizer: Optional[str] = None,
-                 backend: str = "pytorch",
-                 max_beam_width: int = BuildConfig.max_beam_width,
-                 max_batch_size: int = BuildConfig.max_batch_size,
-                 max_num_tokens: int = BuildConfig.max_num_tokens,
-                 max_seq_len: int = BuildConfig.max_seq_len,
-                 tensor_parallel_size: int = 1,
-                 pipeline_parallel_size: int = 1,
-                 moe_expert_parallel_size: Optional[int] = None,
-                 gpus_per_node: Optional[int] = None,
-                 free_gpu_memory_fraction: float = 0.9,
-                 num_postprocess_workers: int = 0,
-                 trust_remote_code: bool = False,
-                 reasoning_parser: Optional[str] = None,
-                 fail_fast_on_attention_window_too_large: bool = False,
-                 otlp_traces_endpoint: Optional[str] = None,
-                 enable_chunked_prefill: bool = False,
-                 **llm_args_extra_dict: Any):
+def get_llm_args(
+        model: str,
+        tokenizer: Optional[str] = None,
+        backend: str = "pytorch",
+        max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
+    default,
+        max_batch_size: int = BuildConfig.model_fields["max_batch_size"].
+    default,
+        max_num_tokens: int = BuildConfig.model_fields["max_num_tokens"].
+    default,
+        max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        moe_expert_parallel_size: Optional[int] = None,
+        gpus_per_node: Optional[int] = None,
+        free_gpu_memory_fraction: Optional[float] = None,
+        num_postprocess_workers: int = 0,
+        trust_remote_code: bool = False,
+        reasoning_parser: Optional[str] = None,
+        fail_fast_on_attention_window_too_large: bool = False,
+        otlp_traces_endpoint: Optional[str] = None,
+        enable_chunked_prefill: bool = False,
+        **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -242,23 +246,23 @@ class ChoiceWithAlias(click.Choice):
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.max_beam_width,
+              default=BuildConfig.model_fields["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.max_batch_size,
+              default=BuildConfig.model_fields["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.max_num_tokens,
+    default=BuildConfig.model_fields["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.max_seq_len,
+    default=BuildConfig.model_fields["max_seq_len"].default,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
@@ -436,7 +440,7 @@ def serve(
               help="The logging level.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.max_batch_size,
+              default=BuildConfig.model_fields["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",

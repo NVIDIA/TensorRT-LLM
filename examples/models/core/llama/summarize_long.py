@@ -23,7 +23,7 @@ from transformers import AutoModelForCausalLM, LlamaTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
-from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
 

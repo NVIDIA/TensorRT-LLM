@@ -1,5 +1,4 @@
 import ast
-import copy
 import functools
 import json
 import math
@@ -1764,17 +1763,6 @@ class BaseLlmArgs(StrictBaseModel):
         ret = cls(**kwargs)
         return ret
 
-    def to_dict(self) -> dict:
-        """Dump `LlmArgs` instance to a dict.
-
-        Returns:
-            dict: The dict that contains all fields of the `LlmArgs` instance.
-        """
-        model_dict = self.model_dump(mode='json')
-        # TODO: the BuildConfig.to_dict and from_dict don't work well with pydantic
-        model_dict['build_config'] = copy.deepcopy(self.build_config)
-        return model_dict
-
     @staticmethod
     def _check_consistency(kwargs_dict: Dict[str, Any]) -> Dict[str, Any]:
         # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
@@ -1919,10 +1907,6 @@ class BaseLlmArgs(StrictBaseModel):
             if self.max_input_len:
                 kwargs["max_input_len"] = self.max_input_len
             self.build_config = BuildConfig(**kwargs)
-        else:
-            assert isinstance(
-                build_config,
-                BuildConfig), f"build_config is not initialized: {build_config}"
         return self
 
     @model_validator(mode="after")
@@ -2001,7 +1985,7 @@ class BaseLlmArgs(StrictBaseModel):
         # TODO: remove the checker when manage weights support all data types
         if is_trt_llm_args and self.fast_build and (self.quant_config.quant_algo
                                                     is QuantAlgo.FP8):
-            self._update_plugin_config("manage_weights", True)
+            self.build_config.plugin_config.manage_weights = True
 
         if self.parallel_config.world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
@@ -2166,9 +2150,6 @@ class BaseLlmArgs(StrictBaseModel):
                 "while LoRA prefetch is not supported")
         return self
 
-    def _update_plugin_config(self, key: str, value: Any):
-        setattr(self.build_config.plugin_config, key, value)
-
     def _load_config_from_engine(self, engine_dir: Path):
         engine_config = EngineConfig.from_json_file(engine_dir / "config.json")
         self._pretrained_config = engine_config.pretrained_config
@@ -2271,10 +2252,8 @@ class TrtLlmArgs(BaseLlmArgs):
     fast_build: bool = Field(default=False, description="Enable fast build.")
 
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
-    build_config: Optional[object] = Field(
-        default=None,
-        description="Build config.",
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+    build_config: Optional[BuildConfig] = Field(default=None,
+                                                description="Build config.")
 
     # Prompt adapter arguments
     enable_prompt_adapter: bool = Field(default=False,
@@ -2405,11 +2384,10 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
-    build_config: Optional[object] = Field(
+    build_config: Optional[BuildConfig] = Field(
         default=None,
         description="Build config.",
         exclude_from_json=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
         status="deprecated",
     )
 
@@ -2911,10 +2889,7 @@ def update_llm_args_with_extra_dict(
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             # Some fields need to be converted manually.
-            if field_name in [
-                    "speculative_config", "build_config",
-                    "sparse_attention_config"
-            ]:
+            if field_name in ["speculative_config", "sparse_attention_config"]:
                 llm_args_dict[field_name] = field_type.from_dict(
                     llm_args_dict[field_name])
             else:
