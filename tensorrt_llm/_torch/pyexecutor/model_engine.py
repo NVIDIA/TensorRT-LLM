@@ -618,7 +618,9 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[1] * num_gen_tokens,
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
-                    use_mrope=self.use_mrope)
+                    use_mrope=self.use_mrope,
+                    max_beam_width=self.max_beam_width,
+                    num_extra_decoding_steps=num_extra_decoding_steps)
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
                         range(num_ctx_requests, num_ctx_requests +
