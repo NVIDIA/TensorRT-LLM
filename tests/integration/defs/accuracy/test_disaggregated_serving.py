@@ -358,8 +358,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
     @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])

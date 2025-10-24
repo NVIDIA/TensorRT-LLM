@@ -1,6 +1,6 @@
 # Run benchmarking with `trtllm-serve`
 
-TensorRT LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
+TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
@@ -189,6 +189,10 @@ Across different requests, **average TPOT** is the mean of each request's TPOT (
 ```math
 \text{TPS} = \frac{\text{\#Output\ Tokens}}{T_{last} - T_{first}}
 ```
+
+### Request Time Breakdown
+
+To get more detailed metrics besides the key metrics above, there is an [experimental tool](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown) for request time breakdown.
 
 ## About `extra_llm_api_options`
    trtllm-serve provides `extra_llm_api_options` knob to **overwrite** the parameters specified by trtllm-serve.

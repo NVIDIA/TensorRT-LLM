@@ -45,11 +45,11 @@ def generate()
     container("alpine") {
         LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
         sh "apt update"
-        sh "apt install -y python3-dev git curl"
+        sh "apt install -y python3-dev git curl git-lfs"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
         sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
         sh "git config --global user.name \"TensorRT LLM\""
-        trtllm_utils.checkoutSource(LLM_REPO, params.llmBranch, env.WORKSPACE, false, false)
+        trtllm_utils.checkoutSource(LLM_REPO, params.llmBranch, env.WORKSPACE, false, true)
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.8.5 python3 -"
         sh "cd ${env.WORKSPACE}"
