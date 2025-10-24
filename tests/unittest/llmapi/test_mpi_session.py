@@ -8,6 +8,7 @@ from typing import Literal
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
                                              split_mpi_env)
@@ -68,8 +69,9 @@ def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"],
     print(' '.join(command))
 
     envs = os.environ.copy()
-    envs[
-        'TLLM_SPAWN_EXTRA_MAIN_PROCESS'] = "1" if spawn_extra_main_process else "0"
+    LlmLauncherEnvs.set_spawn_extra_main_process(spawn_extra_main_process)
+    envs[LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS] = os.environ[
+        LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS]
     with Popen(command,
                env=envs,
                stdout=PIPE,
