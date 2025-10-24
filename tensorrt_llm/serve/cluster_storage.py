@@ -107,7 +107,7 @@ def create_cluster_storage(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageServer(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name)
+        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -115,7 +115,7 @@ def create_cluster_storage_client(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageClient(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name)
+        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -138,7 +138,11 @@ def key_time():
 
 class HttpClusterStorageServer(ClusterStorage):
 
-    def __init__(self, cluster_uri, cluster_name, server: FastAPI = None):
+    def __init__(self,
+                 cluster_uri,
+                 cluster_name,
+                 server: FastAPI = None,
+                 **kwargs):
         self._storage = {}
         self._lock = asyncio.Lock()
         self._watch_handles = {}
@@ -291,7 +295,7 @@ class HttpClusterStorageServer(ClusterStorage):
 
 class HttpClusterStorageClient(ClusterStorage):
 
-    def __init__(self, cluster_uri, cluster_name):
+    def __init__(self, cluster_uri, cluster_name, **kwargs):
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
             total=5))
         self._cluster_uri = cluster_uri if cluster_uri.startswith(
@@ -430,7 +434,8 @@ class Etcd3ClusterStorage(ClusterStorage):
     def __init__(self,
                  cluster_uri: str,
                  cluster_name: str,
-                 one_single_lease: bool = False):
+                 one_single_lease: bool = False,
+                 **kwargs):
         cluster_uri = cluster_uri.replace("etcd://", "")
         host, port = cluster_uri.rsplit(":", 1)
         self._client = etcd3.client(host, port)
