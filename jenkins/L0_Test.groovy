@@ -39,7 +39,7 @@ LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
 // DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.10-py3"
-DLFW_IMAGE = "gitlab-master.nvidia.com:5005/dl/dgx/pytorch:25.10-py3.36764868-devel"
+DLFW_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:pytorch_25.10-py3.36764868-devel"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
