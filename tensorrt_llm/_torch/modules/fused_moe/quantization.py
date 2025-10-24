@@ -174,7 +174,7 @@ class FusedMoEMethodBase(ABC):
         w3_w1_bias_shape: Optional[tuple[int, int]] = None,
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
-        if module.use_prefetch:
+        if module.use_offload:
             w3_w1_weight = nn.Parameter(torch.empty(
                 w3_w1_weight_shape,
                 dtype=weight_dtype,
@@ -185,7 +185,7 @@ class FusedMoEMethodBase(ABC):
                             dtype=weight_dtype,
                             device=torch.device("cpu")).pin_memory(),
                 requires_grad=False)
-            module.prefetch_proxy.register_weight(w3_w1_weight, w2_weight)
+            module.offload_proxy.register_weight(w3_w1_weight, w2_weight)
         else:
             # Fused gate_up_proj (column parallel)
             w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
@@ -1887,7 +1887,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
         device = dst_w3_w1_weight.device
-        if module.use_prefetch:
+        if module.use_offload:
             assert (device.type == "cpu" and dst_w3_w1_weight.is_pinned())
         else:
             assert device.type == "cuda"
@@ -1929,7 +1929,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                               w2_weight: torch.Tensor,
                               dst_w2_weight: torch.Tensor):
         device = dst_w2_weight.device
-        if module.use_prefetch:
+        if module.use_offload:
             assert (device.type == "cpu" and dst_w2_weight.is_pinned())
         else:
             assert device.type == "cuda"

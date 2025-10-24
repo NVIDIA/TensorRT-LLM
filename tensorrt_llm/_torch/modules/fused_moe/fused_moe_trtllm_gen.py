@@ -16,7 +16,7 @@ from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor, ceil_div
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
-from .moe_prefetch_manager import MoEPrefetchProxy
+from .moe_offload_manager import MoeOffloadProxy
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
                            W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
@@ -74,7 +74,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
-        moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
+        moe_offload_proxy: Optional[MoeOffloadProxy] = None,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -90,7 +90,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
-            moe_prefetch_proxy=moe_prefetch_proxy,
+            moe_offload_proxy=moe_offload_proxy,
         )
 
         sm_version = get_sm_version()
@@ -478,11 +478,11 @@ class TRTLLMGenFusedMoE(MoE):
         w3_w1_weight = self.w3_w1_weight
         w2_weight = self.w2_weight
 
-        if self.use_prefetch:
+        if self.use_offload:
             torch.cuda.current_stream().wait_stream(
-                self.prefetch_proxy.prefetch_stream)
-            w3_w1_weight = self.prefetch_proxy.w3_w1_dst_buffer
-            w2_weight = self.prefetch_proxy.w2_dst_buffer
+                self.offload_proxy.offload_stream)
+            w3_w1_weight = self.offload_proxy.w3_w1_dst_buffer
+            w2_weight = self.offload_proxy.w2_dst_buffer
 
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
@@ -725,8 +725,8 @@ class TRTLLMGenFusedMoE(MoE):
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
             )
 
-        if self.use_prefetch:
-            self.prefetch_proxy.start_next_layer_prefetching(
+        if self.use_offload:
+            self.offload_proxy.start_next_layer_offloading(
                 torch.cuda.current_stream())
 
         # Combine results if using alltoall

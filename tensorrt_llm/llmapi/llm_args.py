@@ -265,6 +265,27 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
 
+class MoeOffloadConfig(StrictBaseModel):
+    """ Configuration for MoE weight offloading.
+
+        Supported with CUTLASS or TRTLLM MoE backends.
+    """
+    capacity: int = Field(
+        default=2,
+        description=
+        "Number of MoE layers (weights) that can be buffered concurrently on device."
+    )
+    stride: int = Field(
+        default=1,
+        description=
+        "Stride of MoE offloading layers, offload weights for one layer every stride layers."
+    )
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
 class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
@@ -297,47 +318,10 @@ class MoeConfig(StrictBaseModel):
         "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
     )
 
-    # moe weight prefetching config
-    use_moe_prefetch: bool = Field(
-        default=False, description="Whether to use MoE prefetching.")
-
-    moe_prefetch_capacity: Optional[int] = Field(
+    # moe weight offloading config
+    offload_config: Optional[MoeOffloadConfig] = Field(
         default=None,
-        description=
-        "Number of MoE layers (weights) that can be buffered concurrently on device"
-    )
-
-    moe_prefetch_stride: Optional[int] = Field(
-        default=None,
-        description=
-        "Stride of MoE prefetching layers -- offload weights for one layer every stride layers"
-    )
-
-    moe_prefetch_config: Optional[object] = Field(
-        default=None,
-        description="The configuration for MoE prefetching.",
-        json_schema_extra={
-            "type":
-            "Optional[tensorrt_llm._torch.model_config.MoEPrefetchConfig]"
-        })
-
-    @field_validator('moe_prefetch_capacity', 'moe_prefetch_stride')
-    @classmethod
-    def validate_positive_integers(cls, v):
-        if v is not None and (not isinstance(v, int) or v <= 0):
-            raise ValueError(
-                f"MoE prefetching capacity and stride must be positive, but got {v}"
-            )
-        return v
-
-    @model_validator(mode='after')
-    def validate_moe_prefetch_backend(self) -> 'MoeConfig':
-        if self.use_moe_prefetch and (self.backend != 'CUTLASS'
-                                      and self.backend != 'TRTLLM'):
-            raise ValueError(
-                f"MoE prefetching is only supported with CUTLASS or TRTLLM MoE backends, but got {self.backend}"
-            )
-        return self
+        description="The configuration for MoE weight offloading.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -2733,13 +2717,25 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
-    def validate_moe_prefetch_config(self):
-        from .._torch.model_config import MoEPrefetchConfig
-        if self.moe_config.use_moe_prefetch and self.moe_config.moe_prefetch_config is None:
-            capacity = self.moe_config.moe_prefetch_capacity or 2
-            stride = self.moe_config.moe_prefetch_stride or 1
-            self.moe_config.moe_prefetch_config = MoEPrefetchConfig(
-                prefetch_capacity=capacity, prefetch_stride=stride)
+    def validate_moe_offload_config(self):
+        config = self.moe_config.offload_config
+        if config is not None:
+            # validate moe backend if enabled offload
+            if self.moe_config.backend not in ('CUTLASS', 'TRTLLM'):
+                raise ValueError(
+                    f"MoE weight offloading is only supported with CUTLASS or TRTLLM MoE backends, "
+                    f"but got {self.moe_config.backend}")
+
+            # validate offload config
+            if config.capacity <= 0:
+                raise ValueError(
+                    f"MoE offloading capacity must be positive, but got {config.capacity}"
+                )
+
+            if config.stride <= 0:
+                raise ValueError(
+                    f"MoE offloading stride must be positive, but got {config.stride}"
+                )
         return self
 
     @model_validator(mode='after')
@@ -2913,7 +2909,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_backend=self.moe_config.backend,
             use_low_precision_moe_combine=self.moe_config.
             use_low_precision_moe_combine,
-            moe_prefetch_config=self.moe_config.moe_prefetch_config,
+            moe_offload_config=self.moe_config.offload_config,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,

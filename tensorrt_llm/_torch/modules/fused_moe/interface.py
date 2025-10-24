@@ -10,7 +10,7 @@ from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                       is_torch_compiling)
-from .moe_prefetch_manager import MoEPrefetchProxy
+from .moe_offload_manager import MoeOffloadProxy
 from .routing import BaseMoeRoutingMethod
 
 
@@ -142,7 +142,7 @@ class MoE(nn.Module):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         layer_idx: Optional[int] = None,
-        moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
+        moe_offload_proxy: Optional[MoeOffloadProxy] = None,
     ):
         from ...distributed import AllReduce
 
@@ -190,17 +190,17 @@ class MoE(nn.Module):
                                     strategy=model_config.allreduce_strategy,
                                     dtype=self.dtype)
 
-        # weight prefetching config
-        self.use_prefetch = False
-        if moe_prefetch_proxy is not None:
-            self.use_prefetch = True
-            self.prefetch_proxy = moe_prefetch_proxy
-            self.prefetch_param_lists = ['w3_w1_weight', 'w2_weight']
+        # weight offloading config
+        self.use_offload = False
+        if moe_offload_proxy is not None:
+            self.use_offload = True
+            self.offload_proxy = moe_offload_proxy
+            self.offload_param_lists = ['w3_w1_weight', 'w2_weight']
 
-    # support weight prefetching, avoid moving weight tensors to GPU when init
+    # support weight offloading, avoid moving weight tensors to GPU when init
     def _apply(self, fn):
-        if self.use_prefetch and (fn.__name__ == 'to'
-                                  or fn.__name__ == 'convert'):
+        if self.use_offload and (fn.__name__ == 'to'
+                                 or fn.__name__ == 'convert'):
             target_device = None
             if fn.__closure__:
                 for cell in fn.__closure__:
@@ -211,7 +211,7 @@ class MoE(nn.Module):
             if target_device == torch.device('cuda'):
                 cpu_params = {
                     param: self._parameters.pop(param)
-                    for param in self.prefetch_param_lists
+                    for param in self.offload_param_lists
                 }
                 module = super()._apply(fn)
                 self._parameters.update(cpu_params)

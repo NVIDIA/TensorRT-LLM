@@ -24,8 +24,9 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 SamplingParams, TorchCompileConfig)
+                                 MoeOffloadConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, SamplingParams,
+                                 TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -1984,17 +1985,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids(
         "moe_backend",
         ["CUTLASS", pytest.param("TRTLLM", marks=skip_pre_blackwell)])
-    def test_weight_prefetching(self, quant_dtype, tp_size, ep_size,
-                                moe_backend):
+    def test_weight_offloading(self, quant_dtype, tp_size, ep_size,
+                               moe_backend):
+        # Skip none quant_dtype with TRTLLM backend
+        if quant_dtype == "none" and moe_backend == "TRTLLM":
+            pytest.skip("TRTLLMGenFusedMoe doesn't support bf16")
+
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
         elif quant_dtype == "nvfp4":
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        pytorch_config = dict(moe_config=MoeConfig(backend=moe_backend,
-                                                   use_moe_prefetch=True), )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(moe_config=MoeConfig(
+            backend=moe_backend, offload_config=MoeOffloadConfig()), )
 
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

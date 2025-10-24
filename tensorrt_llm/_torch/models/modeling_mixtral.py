@@ -12,7 +12,7 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (MoEPrefetchProxy, RenormalizeMoeRoutingMethod,
+from ..modules.fused_moe import (MoeOffloadProxy, RenormalizeMoeRoutingMethod,
                                  create_moe)
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
@@ -27,7 +27,7 @@ class MixtralMoE(nn.Module):
                  model_config: ModelConfig[PretrainedConfig],
                  aux_stream: torch.cuda.Stream,
                  layer_idx: Optional[int] = None,
-                 moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None):
+                 moe_offload_proxy: Optional[MoeOffloadProxy] = None):
         super().__init__()
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
@@ -55,7 +55,7 @@ class MixtralMoE(nn.Module):
             reduce_results=reduce_results,
             model_config=model_config,
             layer_idx=layer_idx,
-            moe_prefetch_proxy=moe_prefetch_proxy)
+            moe_offload_proxy=moe_offload_proxy)
 
     def forward(
         self,
@@ -100,18 +100,17 @@ class MixtralDecoderLayer(DecoderLayer):
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
                  aux_stream: torch.cuda.Stream,
-                 moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None):
+                 moe_offload_proxy: Optional[MoeOffloadProxy] = None):
         super().__init__()
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(
-            model_config,
-            aux_stream,
-            layer_idx=layer_idx,
-            moe_prefetch_proxy=moe_prefetch_proxy)
+        self.block_sparse_moe = MixtralMoE(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx,
+                                           moe_offload_proxy=moe_offload_proxy)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -157,7 +156,7 @@ class MixtralModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
-        super().__moe_prefetch_init__(model_config)
+        super().__moe_offload_init__(model_config)
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
@@ -172,7 +171,7 @@ class MixtralModel(DecoderModel):
 
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(model_config, layer_idx, self.aux_stream,
-                                self.moe_prefetch_proxy_list[layer_idx])
+                                self.moe_offload_proxy_list[layer_idx])
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -199,9 +198,9 @@ class MixtralModel(DecoderModel):
 
         residual = None
 
-        if self.use_moe_prefetch:
+        if self.use_moe_offload:
             cur_stream = torch.cuda.current_stream()
-            self.moe_prefetch_manager.prefetch_initial_weights(cur_stream)
+            self.moe_offload_manager.offload_initial_weights(cur_stream)
 
         for decoder_layer in self.layers:
             hidden_states, residual = decoder_layer(position_ids=position_ids,

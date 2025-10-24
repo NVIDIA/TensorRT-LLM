@@ -4,8 +4,8 @@ from typing import Dict, List, Optional, Union
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 
-from ...llmapi.llm_args import LoadFormat, SamplerType
-from ..model_config import MoeLoadBalancerConfig, MoEPrefetchConfig
+from ...llmapi.llm_args import LoadFormat, MoeOffloadConfig, SamplerType
+from ..model_config import MoeLoadBalancerConfig
 from .resource_manager import BaseResourceManager
 
 
@@ -58,7 +58,7 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
-    moe_prefetch_config: Optional[MoEPrefetchConfig] = None
+    moe_offload_config: Optional[MoeOffloadConfig] = None
 
     moe_disable_finalize_fusion: bool = False
     use_low_precision_moe_combine: bool = False
