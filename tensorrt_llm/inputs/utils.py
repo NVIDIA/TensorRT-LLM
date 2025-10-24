@@ -352,6 +352,21 @@ def encode_base64_content_from_url(content_url: str) -> str:
     return result
 
 
+def encode_base64_image(
+    media: Image.Image,
+    *,
+    image_format: str = "JPEG",
+) -> str:
+    image = media
+
+    with BytesIO() as buffer:
+        image = convert_image_mode(image, "RGB")
+        image.save(buffer, image_format)
+        data = buffer.getvalue()
+
+    return base64.b64encode(data).decode("utf-8")
+
+
 """
 VLM input preparation.
 
