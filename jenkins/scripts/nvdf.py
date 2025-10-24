@@ -266,4 +266,4 @@ class NVDF:
         return pr_numbers
 
 
-NVDF.queryBuildIdFromNVDataFlow("LLM/main/L0_MergeRequest_PR")
+print(NVDF.queryBuildIdFromNVDataFlow("LLM/main/L0_MergeRequest_PR"))
