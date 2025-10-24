@@ -14,11 +14,17 @@
 # limitations under the License.
 
 import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
+from subprocess import PIPE, Popen
 
 import pytest
 from defs.common import venv_check_call
 from defs.conftest import llm_models_root, unittest_path
+
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
 
 
 def test_llmapi_chat_example(llm_root, llm_venv):
@@ -40,16 +46,8 @@ def test_llmapi_server_example(llm_root, llm_venv):
 
 
 ### LLMAPI examples
-def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
-                        *args):
-    example_root = Path(llm_root) / "examples" / "llm-api"
-    engine_dir = Path(engine_dir) / "llmapi"
-    if not engine_dir.exists():
-        engine_dir.mkdir(parents=True)
-    examples_script = example_root / script_name
-
-    run_command = [str(examples_script)] + list(args)
-
+def _setup_llmapi_example_softlinks(llm_venv):
+    """Create softlinks for LLM models to avoid duplicated downloading for llm api examples"""
     # Create llm models softlink to avoid duplicated downloading for llm api example
     src_dst_dict = {
         # TinyLlama-1.1B-Chat-v1.0
@@ -87,7 +85,96 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
                    cnn_dailymail_dst,
                    target_is_directory=True)
 
+
+def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
+                        *args):
+    example_root = Path(llm_root) / "examples" / "llm-api"
+    engine_dir = Path(engine_dir) / "llmapi"
+    if not engine_dir.exists():
+        engine_dir.mkdir(parents=True)
+    examples_script = example_root / script_name
+
+    run_command = [str(examples_script)] + list(args)
+
+    _setup_llmapi_example_softlinks(llm_venv)
+
     venv_check_call(llm_venv, run_command)
+
+
+def _mpirun_llmapi_example(llm_root,
+                           llm_venv,
+                           script_name: str,
+                           tp_size: int,
+                           spawn_extra_main_process: bool = True,
+                           *args):
+    """Run an llmapi example script with mpirun.
+
+    Args:
+        llm_root: Root directory of the LLM project
+        llm_venv: Virtual environment object
+        script_name: Name of the example script to run
+        tp_size: Tensor parallelism size (number of MPI processes)
+        spawn_extra_main_process: Whether to spawn extra main process (default: True)
+        *args: Additional arguments to pass to the example script
+    """
+    example_root = Path(llm_root) / "examples" / "llm-api"
+    examples_script = example_root / script_name
+
+    # Set environment variable for spawn_extra_main_process
+    env_vars = os.environ.copy()
+    LlmLauncherEnvs.set_spawn_extra_main_process(spawn_extra_main_process)
+    env_vars[LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS] = os.environ[
+        LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS]
+
+    run_command = [
+        "mpirun", "-n",
+        str(tp_size), "--oversubscribe", "--allow-run-as-root"
+    ]
+    # Pass environment variables through mpirun
+    for key, value in [(LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS,
+                        env_vars[LlmLauncherEnvs.TLLM_SPAWN_EXTRA_MAIN_PROCESS])
+                       ]:
+        run_command.extend(["-x", f"{key}={value}"])
+    run_command.extend(["python", str(examples_script)] + list(args))
+
+    _setup_llmapi_example_softlinks(llm_venv)
+
+    print(' '.join(run_command))
+
+    with Popen(run_command,
+               env=env_vars,
+               stdout=PIPE,
+               stderr=PIPE,
+               bufsize=1,
+               start_new_session=True,
+               universal_newlines=True,
+               cwd=llm_venv.get_working_directory()) as process:
+
+        # Function to read from a stream and write to output
+        def read_stream(stream, output_stream):
+            for line in stream:
+                output_stream.write(line)
+                output_stream.flush()
+
+        # Create threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=read_stream,
+                                         args=(process.stdout, sys.stdout))
+        stderr_thread = threading.Thread(target=read_stream,
+                                         args=(process.stderr, sys.stderr))
+
+        # Start both threads
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
+        return_code = process.wait()
+
+        # Wait for both threads to finish reading
+        stdout_thread.join()
+        stderr_thread.join()
+
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, run_command)
 
 
 def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
@@ -131,6 +218,19 @@ def test_llmapi_example_guided_decoding(llm_root, engine_dir, llm_venv):
 def test_llmapi_example_distributed_tp2(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv,
                         "llm_inference_distributed.py")
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize(
+    "spawn_extra_main_process", [True, False],
+    ids=["spawn_extra_main_process", "no_spawn_extra_main_process"])
+def test_llmapi_example_launch_distributed_tp2(llm_root, llm_venv,
+                                               spawn_extra_main_process: bool):
+    _mpirun_llmapi_example(llm_root,
+                           llm_venv,
+                           "llm_inference_distributed.py",
+                           tp_size=2,
+                           spawn_extra_main_process=spawn_extra_main_process)
 
 
 def test_llmapi_example_logits_processor(llm_root, engine_dir, llm_venv):

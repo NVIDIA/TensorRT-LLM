@@ -3,7 +3,9 @@ from typing import Literal
 
 import click
 
-from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
+from tensorrt_llm.llmapi.mpi_session import (MpiCommSession,
+                                             RemoteMpiCommSessionClient)
 from tensorrt_llm.llmapi.utils import print_colored
 
 
@@ -13,10 +15,15 @@ from tensorrt_llm.llmapi.utils import print_colored
               default="submit")
 def main(task_type: Literal["submit", "submit_sync"]):
     tasks = [0]
-    assert os.environ[
-        'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"
-    client = RemoteMpiCommSessionClient(
-        os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'])
+
+    if LlmLauncherEnvs.should_spawn_extra_main_process():
+        assert os.environ[
+            'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"
+        client = RemoteMpiCommSessionClient(
+            os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'])
+    else:
+        client = MpiCommSession(n_workers=2)
+
     for task in tasks:
         if task_type == "submit":
             client.submit(print_colored, f"{task}\n", "green")
