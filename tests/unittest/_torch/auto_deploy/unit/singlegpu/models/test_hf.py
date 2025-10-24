@@ -59,9 +59,15 @@ def test_hf_load_state_dict_with_device():
 
 @pytest.fixture
 def mock_factory():
+    # Create a mock config to return from AutoModelForCausalLMFactory._get_model_config
+    mock_config = Llama4Config()
+
     with (
         patch.object(AutoModelForCausalLMFactory, "prefetch_checkpoint"),
         patch.object(AutoModelForCausalLMFactory, "_load_quantization_config"),
+        patch.object(
+            AutoModelForCausalLMFactory, "_get_model_config", return_value=(mock_config, {})
+        ),
     ):
         # Create factory instance with mocked methods to avoid HTTP requests
         factory = AutoModelForCausalLMFactory(model="dummy_model")
