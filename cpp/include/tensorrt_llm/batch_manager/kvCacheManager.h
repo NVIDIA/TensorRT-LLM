@@ -285,13 +285,15 @@ using LookupResults = std::vector<LookupResult>;
 class KVCachePromptLookupNode
 {
 public:
-    explicit KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull);
+    explicit KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull, bool isRoot = false);
 
     void setBlockKey(BlockKey const& blockKey, bool isFull);
 
     BlockKey getBlockKey() const;
 
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
+
+    [[nodiscard]] bool isRoot() const;
 
     LookupNodePtr const& getPrevNode() const;
 
@@ -307,7 +309,7 @@ public:
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
     //! matched.
-    [[nodiscard]] LookupResult findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse) const;
+    [[nodiscard]] LookupResult findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const;
 
     void setBlock(SizeType32 windowSize, BlockPtr block);
 
@@ -319,11 +321,21 @@ public:
 
     [[nodiscard]] bool isLeaf() const;
 
+    [[nodiscard]] bool canBeDeleted() const;
+
+    [[nodiscard]] std::vector<BlockKey> getFullBlockKey() const;
+
+    void deleteNodeIfPossible();
+
+    void printSearchTree(std::ostream& os, SizeType32 indent) const;
+
 private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
     // Flag indicating if block is full
     bool mIsFull;
+    // Flag indicating if this is root node
+    bool mIsRoot;
     // Previous node in search structure
     LookupNodePtr mPrevNode;
     // Next node(s) in sequence(s)
@@ -416,6 +428,9 @@ public:
     //! \brief Print input prompt given by llmRequest.
     //! \details Uses some member variables for formatting, hence cannot be made static.
     std::string printPrompt(LlmRequest const& llmRequest) const;
+
+    //! \brief Print search tree.
+    std::string printSearchTree() const; 
 
 private:
     // Root of search structure
@@ -1419,6 +1434,12 @@ public:
     [[nodiscard]] std::string printFreeQueues(SizeType32 windowSize) const
     {
 	return mWindowBlockManagers.at(windowSize).printFreeQueues();
+    }
+
+    //! \brief Print search tree.
+    [[nodiscard]] std::string printSearchTree() const
+    {
+        return mLookup->printSearchTree();
     }
 
 private:

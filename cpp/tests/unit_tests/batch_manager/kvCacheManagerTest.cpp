@@ -4218,11 +4218,15 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
 
     events = getEvents(kvCacheManager);
 
-    // Expecting only 1 event, storeContextBlock is not called for sliding window.
-    EXPECT_EQ(events.size(), 1);
+    // Expecting 2 events now that storeContext is called for SWA.
+    EXPECT_EQ(events.size(), 2);
 
-    EXPECT_EQ(events.back().windowSize, maxAttentionWindow);
-    EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.back().data));
+    for (int i = 0; i < events.size(); ++i)
+    {
+	EXPECT_EQ(events.front().windowSize, slidingWindow);
+	EXPECT_TRUE(std::holds_alternative<tle::KVCacheStoredData>(events.front().data));
+	events.pop_front();
+    }
 }
 
 TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)

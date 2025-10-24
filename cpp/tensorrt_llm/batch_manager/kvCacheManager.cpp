@@ -475,6 +475,7 @@ void KVCacheBlock::detachFromLookupNode()
     if (mLookupNode != nullptr)
     {
         mLookupNode->setBlock(mWindowSize, nullptr);
+	mLookupNode->deleteNodeIfPossible();
     }
     mLookupNode = nullptr;
     mBlockKey = BlockKey();
@@ -487,7 +488,7 @@ LookupNodePtr KVCacheBlock::getLookupNode() const
 }
 
 KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock)
-    : mRoot(std::make_shared<KVCachePromptLookupNode>(BlockKey(), false))
+    : mRoot(std::make_shared<KVCachePromptLookupNode>(BlockKey(), false, true))
     , mCacheType(cacheType)
     , mTokensPerBlock(tokensPerBlock)
 {
@@ -514,6 +515,33 @@ std::string KVCachePromptLookup::printPrompt(LlmRequest const& llmRequest) const
         out << token.tokenId;
     }
     return out.str();
+}
+
+void KVCachePromptLookupNode::printSearchTree(std::ostream& os, SizeType32 indent) const
+{
+    std::stringstream ss;
+    for (int i = 0; i < indent; ++i)
+    {
+	ss << " ";
+    }
+    auto indentStr = ss.str();
+    os << getBlockKey() << "(" << getNextNodes().size() << " children)" << std::endl;
+    for (auto const& [key,child] : getNextNodes())
+    {
+	os << indentStr << "+ ";
+        child->printSearchTree(os, indent+2);
+    }
+}
+
+std::string KVCachePromptLookup::printSearchTree() const
+{
+    std::stringstream os;
+    os << "KVCachePromptLookup cache:" << std::endl;
+    for (auto const& [key,child] : mRoot->getNextNodes())
+    {
+	child->printSearchTree(os, 0);
+    }
+    return os.str();
 }
 
 std::ostream& operator<<(std::ostream& out, LookupResult const& match)
@@ -664,7 +692,7 @@ std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> KVCachePromptLooku
         {
             // Consider exact match
             LookupNodePtr nextSearchRoot = nullptr;
-            auto exactMatch = searchRoot->findMatchingNodes(blockKey, false);
+            auto exactMatch = searchRoot->findMatchingNodes(blockKey, false, true);
             TLLM_CHECK_WITH_INFO(
                 exactMatch.size() == 0 || exactMatch.size() == 1, "exactMatch must contain either one node or no node");
             if (exactMatch.size() == 1)
@@ -730,7 +758,7 @@ KVCachePromptLookup::lookupBlocks(std::map<SizeType32, WindowBlockManager> const
             // Consider exact match
             LookupNodePtr nextSearchRoot = nullptr;
             std::unordered_set<SizeType32> needPartials;
-            auto exactMatch = searchRoot->findMatchingNodes(blockKey, false);
+            auto exactMatch = searchRoot->findMatchingNodes(blockKey, false, true);
             TLLM_CHECK_WITH_INFO(
                 exactMatch.size() == 0 || exactMatch.size() == 1, "exactMatch must contain either one node or no node");
             if (exactMatch.size() == 1)
@@ -784,7 +812,7 @@ KVCachePromptLookup::lookupBlocks(std::map<SizeType32, WindowBlockManager> const
             if (!needPartials.empty())
             {
                 // Note: Returns partial matches sorted in descending order on num matched tokens.
-                auto partialMatches = searchRoot->findMatchingNodes(blockKey, true);
+                auto partialMatches = searchRoot->findMatchingNodes(blockKey, true, true);
                 for (auto windowSize : needPartials)
                 {
                     for (auto [partialMatch, numMatched, node] : partialMatches)
@@ -829,7 +857,7 @@ LookupResults KVCachePromptLookup::lookup(
     for (auto const& blockKey : blockKeys)
     {
         auto matches
-            = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, enablePartialReuse) : LookupResult();
+            = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, enablePartialReuse, false) : LookupResult();
         if (create && matches.empty())
         {
             // No match, create blank prompt node
@@ -878,7 +906,7 @@ std::unordered_map<SizeType32, BlockKey> KVCachePromptLookup::findNewContextBloc
     BlockKey prevBlockKey;
     for (auto const& blockKey : blockKeys)
     {
-        auto matches = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, false) : LookupResult();
+        auto matches = searchRoot != nullptr ? searchRoot->findMatchingNodes(blockKey, false, true) : LookupResult();
         [[maybe_unused]] auto const& [dummy1, dummy2, matchingNode]
             = matches.empty() ? std::make_tuple(false, 0, nullptr) : matches[0];
         for (auto const windowSize : windowSizes)
@@ -902,9 +930,10 @@ std::unordered_map<SizeType32, BlockKey> KVCachePromptLookup::findNewContextBloc
     return results;
 }
 
-KVCachePromptLookupNode::KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull)
+KVCachePromptLookupNode::KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull, bool isRoot)
     : mBlockKey{blockKey}
     , mIsFull{isFull}
+    , mIsRoot{isRoot}
     , mPrevNode{nullptr}
     , mNextNodes{}
     , mBlocks{}
@@ -925,6 +954,11 @@ BlockKey KVCachePromptLookupNode::getBlockKey() const
 VecUniqueTokens const& KVCachePromptLookupNode::getUniqueTokens() const
 {
     return mBlockKey.uniqueTokens;
+}
+
+bool KVCachePromptLookupNode::isRoot() const
+{
+    return mIsRoot;
 }
 
 LookupNodePtr const& KVCachePromptLookupNode::getPrevNode() const
@@ -952,7 +986,7 @@ void KVCachePromptLookupNode::removeNextNode(BlockKey const& blockKey)
     mNextNodes.erase(blockKey);
 }
 
-LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse) const
+LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey, bool enablePartialReuse, bool ignoreNodesWithoutBlocks) const
 {
     LookupResult result;
     if (blockKey.uniqueTokens.size() == 0 || mNextNodes.size() == 0)
@@ -961,7 +995,9 @@ LookupResult KVCachePromptLookupNode::findMatchingNodes(BlockKey const& blockKey
         return result;
     }
     auto itr = mNextNodes.find(blockKey);
-    if (itr != mNextNodes.end() && itr->second->hasBlocks())
+    // TODO: Skipping nodes that have no blocks only works when looking up blocks.
+    // When looking up nodes and possibly creating new nodes, we must ingore whether node has blocks or not.
+    if (itr != mNextNodes.end() && (!ignoreNodesWithoutBlocks || itr->second->hasBlocks()))
     {
         // found exact match
         auto node = itr->second;
@@ -1073,6 +1109,40 @@ bool KVCachePromptLookupNode::isFull() const
 bool KVCachePromptLookupNode::isLeaf() const
 {
     return mNextNodes.empty();
+}
+
+bool KVCachePromptLookupNode::canBeDeleted() const
+{
+    return !isRoot() && isLeaf() && !hasBlocks();
+}
+
+std::vector<BlockKey> KVCachePromptLookupNode::getFullBlockKey() const
+{
+    std::list<BlockKey> keys;
+    keys.emplace_back(getBlockKey());
+    for (auto prevNode = getPrevNode(); prevNode != nullptr && !prevNode->isRoot(); prevNode = prevNode->getPrevNode())
+    {
+        keys.emplace_back(prevNode->getBlockKey());
+    }
+    std::vector<BlockKey> retval;
+    if (!keys.empty())
+    {
+        retval.reserve(keys.size());
+        retval.insert(retval.end(), keys.rbegin(), keys.rend());
+    }
+    return retval;
+}
+
+void KVCachePromptLookupNode::deleteNodeIfPossible()
+{
+    if (canBeDeleted())
+    {
+	TLLM_LOG_DEBUG("Deleted node " + streamPrint(getFullBlockKey()));
+	auto prevNode = mPrevNode;
+	mPrevNode = nullptr;
+	prevNode->removeNextNode(getBlockKey());
+	prevNode->deleteNodeIfPossible();
+    }
 }
 
 // This function calculates the number of block a layer should have, given
@@ -1738,9 +1808,10 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(
             if (partialMatch)
             {
                 auto partialBlockKey = matchingNode->getBlockKey().clone(numMatched);
-                if (matchingBlock->hasRefs() || (!isSWA() && !matchingNode->isLeaf()))
+                if (matchingBlock->hasRefs() || !matchingNode->isLeaf())
                 {
                     // Somebody else is using block or this is full attention and block is not a leaf, copy reusable tokens
+                    // TODO: Consider whether non-leaf blocks should be reuse instead of copied for SWA layers.
                     auto newBlock
                         = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
