@@ -9,6 +9,7 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+import tensorrt_llm
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -520,6 +521,11 @@ class MultimodalParams:
         return bool(self.multimodal_input or self.multimodal_data)
 
 
+@dataclass
+class MultimodalServerConfig():
+    media_io_kwargs: Optional[dict] = None
+
+
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
 def serialize_item(obj: object) -> bytes:
     # Simple cases
@@ -554,6 +560,13 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         elif isinstance(image, list):
             # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
             for frame in image:
+                hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
+                hasher.update(serialize_item(frame))
+        elif isinstance(image, tensorrt_llm.inputs.utils.VideoData):
+            frames = image.frames
+            for frame in frames:
                 hasher.update(b"<frame>")
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
@@ -622,6 +635,8 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                     image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
+                if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                    item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 if isinstance(item[0], torch.Tensor):
                     item = [ToPILImage()(frame) for frame in item]

@@ -47,6 +47,9 @@ tensorrt_llm/deep_gemm/
 tensorrt_llm/deep_gemm_cpp_tllm.*.so
 tensorrt_llm/deep_gemm_cpp_tllm.pyi
 tensorrt_llm/pg_utils_bindings.*.so
+tensorrt_llm/flash_mla/
+tensorrt_llm/flash_mla_cpp_tllm.*.so
+tensorrt_llm/flash_mla_cpp_tllm.pyi
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
 docs/source/**/*.rst

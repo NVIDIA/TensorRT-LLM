@@ -17,7 +17,7 @@ from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy, LoadFormat,
-                                          PybindMirror, TorchLlmArgs)
+                                          TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -289,10 +289,7 @@ def create_py_executor(
     else:
         dist = MPIDist(mapping=mapping)
 
-    cache_transceiver_config = None
-    if llm_args.cache_transceiver_config is not None:
-        cache_transceiver_config = PybindMirror.maybe_to_pybind(
-            llm_args.cache_transceiver_config)
+    cache_transceiver_config = llm_args.cache_transceiver_config
 
     has_draft_model_engine = False
     has_spec_drafter = False
@@ -387,6 +384,7 @@ def create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
+    sparse_attention_config = model_engine.sparse_attention_config
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
@@ -495,7 +493,9 @@ def create_py_executor(
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
-
+        elif spec_config is not None:
+            raise NotImplementedError(
+                "KV connector is not supported with speculative decoding.")
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -555,7 +555,7 @@ def create_py_executor(
             pytorch_backend_config=pytorch_backend_config,
             speculative_config=spec_config,
             profiling_stage_data=profiling_stage_data,
-            sparse_attention_config=llm_args.sparse_attention_config,
+            sparse_attention_config=sparse_attention_config,
         )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
