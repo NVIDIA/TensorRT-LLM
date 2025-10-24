@@ -14,7 +14,7 @@ class DummyWorkerExtension:
 
 def test_worker_extension():
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              worker_extension_cls="test_executor.DummyWorkerExtension",
+              ray_worker_extension_cls="test_executor.DummyWorkerExtension",
               orchestrator_type="ray")
     result = llm._collective_rpc("additional_method")
     assert result[0] == "SUCCESS"

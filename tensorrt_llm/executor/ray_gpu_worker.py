@@ -62,8 +62,8 @@ class RayWorkerWrapper:
 
         torch.cuda.set_device(local_gpu)
 
-        worker_cls = self._inject_worker_extension(
-            worker_cls, worker_kwargs.pop("worker_extension_cls", None))
+        worker_cls = RayWorkerWrapper._inject_worker_extension(
+            worker_cls, worker_kwargs.pop("ray_worker_extension_cls", None))
         self.worker = worker_cls(device_id=local_gpu, **worker_kwargs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -82,14 +82,6 @@ class RayWorkerWrapper:
         local_id = self.physical_to_local_id(self.gpu)
         return get_device_uuid(local_id)
 
-    @staticmethod
-    def physical_to_local_id(phys_id: int) -> int:
-        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if not visible_devices:
-            return phys_id
-        id_mapping = list(map(int, visible_devices.split(",")))
-        return id_mapping.index(phys_id)
-
     def call_worker_method(self, method_name: str, *args, **kwargs):
         """Generic method to call any method on the underlying worker."""
         if hasattr(self.worker, method_name):
@@ -104,8 +96,28 @@ class RayWorkerWrapper:
             raise AttributeError(
                 f"The RayGPUWorker has no method called '{method_name}'.")
 
+    def __repr__(self) -> str:
+        """Customizes the actor's prefix in the Ray logs.
+
+        This makes it easier to identify which worker is producing specific log messages.
+        Refer to https://github.com/NVIDIA-NeMo/RL/blob/faad02113c3c502437ccb339cb848796334aedd9/nemo_rl/models/policy/dtensor_policy_worker_v2.py#L95
+        """
+        if torch.distributed.is_initialized():
+            return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
+        else:
+            return f"{self.__class__.__qualname__}"
+
+    @staticmethod
+    def physical_to_local_id(phys_id: int) -> int:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if not visible_devices:
+            return phys_id
+        id_mapping = list(map(int, visible_devices.split(",")))
+        return id_mapping.index(phys_id)
+
+    @staticmethod
     def _inject_worker_extension(
-            self, worker_class: Type[BaseWorker],
+            worker_class: Type[BaseWorker],
             extension_cls_name: Optional[str]) -> Type[BaseWorker]:
         """Inject worker extension into the worker class if specified."""
         if not extension_cls_name:
@@ -131,17 +143,6 @@ class RayWorkerWrapper:
         ExtendedWorker = type(derived_name, (worker_class, extension_cls),
                               {'__module__': worker_class.__module__})
         return ExtendedWorker
-
-    def __repr__(self) -> str:
-        """Customizes the actor's prefix in the Ray logs.
-
-        This makes it easier to identify which worker is producing specific log messages.
-        Refer to https://github.com/NVIDIA-NeMo/RL/blob/faad02113c3c502437ccb339cb848796334aedd9/nemo_rl/models/policy/dtensor_policy_worker_v2.py#L95
-        """
-        if torch.distributed.is_initialized():
-            return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
-        else:
-            return f"{self.__class__.__qualname__}"
 
 
 class RayGPUWorker(BaseWorker):

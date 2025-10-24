@@ -2574,7 +2574,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    worker_extension_cls: Optional[str] = Field(
+    ray_worker_extension_cls: Optional[str] = Field(
         default=None,
         description="The full worker extension class name including module path."
         "Allows users to extend the functions of the RayGPUWorker class.",
@@ -2796,10 +2796,10 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode='after')
-    def validate_worker_extension_cls(self) -> 'TorchLlmArgs':
-        if self.worker_extension_cls is not None and self.orchestrator_type != "ray":
+    def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
+        if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
-                f"worker_extension_cls is currently only supported with orchestrator_type='ray'"
+                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 
