@@ -508,6 +508,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
     def run_ex(self,
                full_test_name: str,
+               metric_type: PerfMetricType,
                venv: Optional[PythonVenvRunnerImpl],
                gpu_clock_lock: GPUClockLock,
                session_data_writer: SessionDataWriter,
@@ -602,6 +603,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
                 # Stop the timer
                 self._end_timestamp = datetime.utcnow()
+
+                # Store the test result
+                self.store_test_result(cmd_idx, metric_type, self._perf_result)
 
                 # Write results to output csv and/or yaml files.
                 self._write_result(full_test_name, session_data_writer,
